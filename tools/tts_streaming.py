@@ -282,15 +282,26 @@ class OpenAIStreamer(StreamingTTSProvider):
                 or None
             ),
         )
-        model = self.section.get("model", "gpt-4o-mini-tts")
-        voice = self.section.get("voice", "alloy")
-        with client.audio.speech.with_streaming_response.create(
-            model=model,
-            voice=voice,
-            input=text,
-            response_format="pcm",
-        ) as response:
-            yield from _capped(response.iter_bytes(), "OpenAI streaming TTS")
+        streaming_error = False
+        try:
+            model = self.section.get("model", "gpt-4o-mini-tts")
+            voice = self.section.get("voice", "alloy")
+            with client.audio.speech.with_streaming_response.create(
+                model=model,
+                voice=voice,
+                input=text,
+                response_format="pcm",
+            ) as response:
+                yield from _capped(response.iter_bytes(), "OpenAI streaming TTS")
+        except BaseException:
+            streaming_error = True
+            raise
+        finally:
+            try:
+                client.close()
+            except BaseException:
+                if not streaming_error:
+                    raise
 
 
 def _capped(chunks: Iterator[bytes], label: str) -> Iterator[bytes]:

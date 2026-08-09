@@ -11,6 +11,7 @@ import queue
 import tempfile
 import threading
 import time
+from typing import Generator, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -139,6 +140,9 @@ def test_openai_streamer_prefers_configured_api_key(monkeypatch):
             self.audio = MagicMock()
             self.audio.speech.with_streaming_response = _StreamingCreate()
 
+        def close(self):
+            pass
+
     monkeypatch.setattr(ts, "resolve_openai_audio_api_key", lambda: "env-key")
     monkeypatch.setattr(ts, "get_env_value", lambda key, *args: None)
     monkeypatch.setattr("openai.OpenAI", _OpenAI)
@@ -152,6 +156,167 @@ def test_openai_streamer_prefers_configured_api_key(monkeypatch):
     assert streamer is not None
     assert list(streamer.stream("Streaming test.")) == [b"\x01\x00"]
     assert captured["client"]["api_key"] == "cfg-key"
+
+
+class _FakeOpenAIResponse:
+    def __init__(
+        self,
+        events,
+        *,
+        chunks=(b"first", b"second"),
+        enter_error=None,
+        exit_error=None,
+        iteration_error=None,
+    ):
+        self.events = events
+        self.chunks = chunks
+        self.enter_error = enter_error
+        self.exit_error = exit_error
+        self.iteration_error = iteration_error
+
+    def __enter__(self):
+        if self.enter_error is not None:
+            raise self.enter_error
+        return self
+
+    def __exit__(self, *_args):
+        self.events.append("response-close")
+        if self.exit_error is not None:
+            raise self.exit_error
+        return False
+
+    def iter_bytes(self):
+        yield from self.chunks
+        if self.iteration_error is not None:
+            raise self.iteration_error
+
+
+def _patch_openai_stream(monkeypatch, response, *, create_error=None, close_error=None):
+    events = response.events if response is not None else []
+
+    class _StreamingCreate:
+        def create(self, **_kwargs):
+            if create_error is not None:
+                raise create_error
+            return response
+
+    class _OpenAI:
+        def __init__(self, **_kwargs):
+            self.audio = MagicMock()
+            self.audio.speech.with_streaming_response = _StreamingCreate()
+
+        def close(self):
+            events.append("client-close")
+            if close_error is not None:
+                raise close_error
+
+    monkeypatch.setattr("openai.OpenAI", _OpenAI)
+    return events
+
+
+def _openai_streamer():
+    return ts.OpenAIStreamer({}, {"api_key": "test-key"})
+
+
+def test_openai_stream_closes_response_before_client_after_exhaustion(monkeypatch):
+    events = []
+    response = _FakeOpenAIResponse(events)
+    _patch_openai_stream(monkeypatch, response)
+
+    assert list(_openai_streamer().stream("Streaming test.")) == [b"first", b"second"]
+    assert events == ["response-close", "client-close"]
+    assert events.count("client-close") == 1
+
+
+def test_openai_stream_closes_response_before_client_on_consumer_close(monkeypatch):
+    events = []
+    response = _FakeOpenAIResponse(events)
+    _patch_openai_stream(monkeypatch, response)
+
+    stream = cast(Generator[bytes, None, None], _openai_streamer().stream("Streaming test."))
+    assert next(stream) == b"first"
+    stream.close()
+
+    assert events == ["response-close", "client-close"]
+    assert events.count("client-close") == 1
+
+
+@pytest.mark.parametrize("failure", ("create", "context-enter", "context-exit", "iteration"))
+def test_openai_stream_closes_client_on_response_failures(monkeypatch, failure):
+    events = []
+    response_kwargs = {}
+    create_error = None
+    if failure == "create":
+        create_error = RuntimeError("create failed")
+        response = _FakeOpenAIResponse(events)
+    else:
+        response = _FakeOpenAIResponse(events)
+        if failure == "context-enter":
+            response_kwargs["enter_error"] = RuntimeError("context-enter failed")
+        elif failure == "context-exit":
+            response_kwargs["exit_error"] = RuntimeError("context-exit failed")
+        else:
+            response_kwargs["iteration_error"] = RuntimeError("iteration failed")
+        response = _FakeOpenAIResponse(events, **response_kwargs)
+
+    _patch_openai_stream(monkeypatch, response, create_error=create_error)
+
+    with pytest.raises(RuntimeError, match=failure):
+        list(_openai_streamer().stream("Streaming test."))
+
+    assert events.count("client-close") == 1
+    if "response-close" in events:
+        assert events.index("response-close") < events.index("client-close")
+
+
+def test_openai_stream_preserves_iteration_error_when_client_close_fails(monkeypatch):
+    events = []
+    response = _FakeOpenAIResponse(
+        events,
+        iteration_error=RuntimeError("iteration failed"),
+    )
+    _patch_openai_stream(
+        monkeypatch,
+        response,
+        close_error=RuntimeError("client close failed"),
+    )
+
+    with pytest.raises(RuntimeError, match="iteration failed"):
+        list(_openai_streamer().stream("Streaming test."))
+
+    assert events == ["response-close", "client-close"]
+
+
+def test_openai_stream_preserves_generator_exit_when_client_close_fails(monkeypatch):
+    events = []
+    response = _FakeOpenAIResponse(events)
+    _patch_openai_stream(
+        monkeypatch,
+        response,
+        close_error=RuntimeError("client close failed"),
+    )
+
+    stream = cast(Generator[bytes, None, None], _openai_streamer().stream("Streaming test."))
+    assert next(stream) == b"first"
+    with pytest.raises(GeneratorExit):
+        stream.throw(GeneratorExit)
+
+    assert events == ["response-close", "client-close"]
+
+
+def test_openai_stream_surfaces_client_close_failure_without_stream_error(monkeypatch):
+    events = []
+    response = _FakeOpenAIResponse(events, chunks=(b"first",))
+    _patch_openai_stream(
+        monkeypatch,
+        response,
+        close_error=RuntimeError("client close failed"),
+    )
+
+    with pytest.raises(RuntimeError, match="client close failed"):
+        list(_openai_streamer().stream("Streaming test."))
+
+    assert events == ["response-close", "client-close"]
 
 
 # ── Dispatch: chunked streamer path ──────────────────────────────────────
