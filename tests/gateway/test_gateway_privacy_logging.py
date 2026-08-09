@@ -99,7 +99,9 @@ def test_response_ready_log_resolves_platform_after_inbound_privacy_refactor(cap
     assert "-1001234567890" not in caplog.text
 
 
-def test_successful_agent_path_logs_and_returns_response(monkeypatch, tmp_path, caplog):
+def test_handle_message_with_agent_response_ready_path_logs_and_returns_response(
+    monkeypatch, tmp_path, caplog
+):
     runner = gateway_run.GatewayRunner(GatewayConfig())
     runner.adapters = {}
     runner._running_agents = {}
@@ -174,7 +176,7 @@ def test_successful_agent_path_logs_and_returns_response(monkeypatch, tmp_path, 
         )
 
     assert response == "intended response"
-    assert len(response) != 91
+    runner._run_agent.assert_awaited_once()
     response_logs = [
         record.getMessage()
         for record in caplog.records
