@@ -3161,30 +3161,86 @@ class TestCodexAuxiliaryAdapterTimeout:
         assert fake_client.responses.kwargs["stream"] is True
         assert response.choices[0].message.content == "summary"
 
-    def test_enforces_total_timeout_while_stream_keeps_emitting_events(self):
+    @pytest.mark.parametrize("case", range(1000))
+    def test_enforces_total_timeout_while_stream_keeps_emitting_events(self, case):
+        class _VirtualClock:
+            def __init__(self):
+                self.now_ms = 0
+                self.timestamps_ms = []
+
+            def monotonic(self):
+                return self.now_ms / 1000
+
+            def advance(self, milliseconds):
+                self.now_ms += milliseconds
+                self.timestamps_ms.append(self.now_ms)
+
+        class _ObservableTimer:
+            instances = []
+
+            def __init__(self, interval, function):
+                self.interval = interval
+                self.function = function
+                self.started = False
+                self.cancelled = False
+                self.__class__.instances.append(self)
+
+            def start(self):
+                self.started = True
+
+            def cancel(self):
+                self.cancelled = True
+
+        clock = _VirtualClock()
+        consumed_events = []
+        stream_close_count = []
+        client_close_count = []
+        request_kwargs = {}
+
         class _SlowAliveCreateStream:
             def __iter__(self):
-                for _ in range(5):
-                    time.sleep(0.03)
+                for event_number in range(1, 6):
+                    clock.advance(30)
+                    consumed_events.append(event_number)
                     yield SimpleNamespace(type="response.in_progress")
 
-            def close(self): pass
+            def close(self):
+                stream_close_count.append(True)
 
         class FakeResponses:
             def create(self, **kwargs):
+                request_kwargs.update(kwargs)
                 return _SlowAliveCreateStream()
 
-        fake_client = SimpleNamespace(responses=FakeResponses(), close=lambda: None)
+        fake_client = SimpleNamespace(
+            responses=FakeResponses(),
+            close=lambda: client_close_count.append(True),
+        )
         adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.5")
 
-        started = time.monotonic()
-        with pytest.raises(TimeoutError):
+        import agent.auxiliary_client as aux
+        with (
+            patch.object(aux.time, "monotonic", clock.monotonic),
+            patch.object(aux.threading, "Timer", _ObservableTimer),
+            pytest.raises(TimeoutError),
+        ):
             adapter.create(
                 messages=[{"role": "user", "content": "summarize this"}],
                 timeout=0.05,
             )
 
-        assert time.monotonic() - started < 0.14
+        assert clock.timestamps_ms == [30, 60]
+        assert consumed_events == [1, 2]
+        assert len(stream_close_count) == 1
+        assert len(client_close_count) == 1
+        assert request_kwargs["timeout"] == 0.05
+        assert request_kwargs["stream"] is True
+
+        assert len(_ObservableTimer.instances) == 1
+        timer = _ObservableTimer.instances[0]
+        assert timer.interval == 0.05
+        assert timer.started is True
+        assert timer.cancelled is True
 
 
 class TestCodexAuxiliaryAdapterCacheScope:
