@@ -3,13 +3,34 @@
 import asyncio
 import logging
 from datetime import datetime
+
+import pytest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 from gateway import run as gateway_run
-from gateway.config import GatewayConfig, Platform
-from gateway.platforms.base import MessageEvent
+from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
 from gateway.session import SessionEntry, SessionSource
+
+
+class _DispatchAdapter(BasePlatformAdapter):
+    def __init__(self, config, platform):
+        super().__init__(config, platform)
+        self.sent = []
+
+    async def connect(self, *, is_reconnect=False):
+        pass
+
+    async def disconnect(self):
+        pass
+
+    async def send(self, chat_id, content, **kwargs):
+        self.sent.append((chat_id, content, kwargs))
+        return SendResult(success=True, message_id="sent-response")
+
+    async def get_chat_info(self, chat_id):
+        return {}
 
 
 def test_inbound_info_log_omits_message_and_identifiers(caplog):
@@ -185,3 +206,89 @@ def test_handle_message_with_agent_response_ready_path_logs_and_returns_response
     assert response_logs
     assert "chat_hash=" in response_logs[-1]
     assert "-1001234567890" not in response_logs[-1]
+
+
+@pytest.mark.asyncio
+async def test_platform_dispatch_delivers_intended_response_not_generic_error(
+    monkeypatch, tmp_path
+):
+    runner = gateway_run.GatewayRunner(GatewayConfig())
+    runner._running_agents = {}
+    runner._running_agents_ts = {}
+    runner._pending_messages = {}
+    runner._pending_approvals = {}
+    runner._is_user_authorized = lambda _source: True
+    runner.config.get_home_channel = lambda _platform: object()
+    runner._set_session_env = lambda _context: None
+    runner._handle_active_session_busy_message = AsyncMock(return_value=False)
+    runner._session_db = MagicMock()
+    runner._recover_telegram_topic_thread_id = lambda _source: None
+    runner._cache_session_source = lambda _key, _source: None
+    runner._is_session_run_current = lambda _key, _generation: True
+    runner._reply_anchor_for_event = lambda _event: None
+    runner._get_guild_id = lambda _event: None
+    runner._should_send_voice_reply = lambda *_args, **_kwargs: False
+    runner.hooks = MagicMock()
+    runner.hooks.emit = AsyncMock()
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = SessionEntry(
+        session_key="agent:main:telegram:dm:-1001234567890",
+        session_id="sess-dispatch",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner.session_store.load_transcript.return_value = []
+    runner.session_store.append_to_transcript = MagicMock()
+    runner.session_store.update_session = MagicMock()
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"}
+    )
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length",
+        lambda *_args, **_kwargs: 100_000,
+    )
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "intended response",
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "intended response"},
+            ],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+            "api_calls": 1,
+            "failed": False,
+        }
+    )
+    adapter = _DispatchAdapter(
+        PlatformConfig(enabled=True, token="fake"), Platform.TELEGRAM
+    )
+    adapter.gateway_runner = runner
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    adapter.set_message_handler(runner._primary_message_handler())
+    event = MessageEvent(
+        text="hello",
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-1001234567890",
+            chat_type="dm",
+            user_id="12345",
+        ),
+        message_id="msg-dispatch",
+    )
+
+    await adapter.handle_message(event)
+    for _ in range(100):
+        if adapter.sent:
+            break
+        await asyncio.sleep(0.01)
+    await adapter.cancel_background_tasks()
+
+    assert [content for _chat_id, content, _kwargs in adapter.sent] == [
+        "intended response"
+    ]
+    assert "unexpected error" not in adapter.sent[0][1]
