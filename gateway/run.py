@@ -2498,9 +2498,9 @@ def _log_response_ready(
         else str(source.platform)
     )
     logger.info(
-        "response ready: platform=%s chat=%s time=%.1fs api_calls=%d response=%d chars",
+        "response ready: platform=%s chat_hash=%s time=%.1fs api_calls=%d response=%d chars",
         platform,
-        source.chat_id or "unknown",
+        _gateway_identifier_hash(source.chat_id or "unknown"),
         response_time,
         api_calls,
         response_length,
