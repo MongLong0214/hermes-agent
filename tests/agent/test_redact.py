@@ -17,6 +17,20 @@ def _ensure_redaction_enabled(monkeypatch):
 
 class TestKnownPrefixes:
 
+    def test_standalone_64_hex_private_key_is_fully_redacted(self):
+        secret = "a1" * 32
+        result = redact_sensitive_text(secret, force=True)
+        assert secret not in result
+        assert result == "[REDACTED 64-HEX SECRET]"
+
+    def test_docker_inspect_masks_opaque_secret_env_values(self):
+        from agent.redact import redact_terminal_output
+
+        secret = "opaque-database-password-without-vendor-prefix"
+        output = f'[{{"Config":{{"Env":["POSTGRES_PASSWORD={secret}"]}}}}]'
+        result = redact_terminal_output(output, "docker inspect abc", force=True)
+        assert secret not in result
+
 
 
 

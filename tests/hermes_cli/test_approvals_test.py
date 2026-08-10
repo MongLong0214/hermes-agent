@@ -48,6 +48,31 @@ def isolated_approvals(monkeypatch):
 
 
 class TestVerdicts:
+    @pytest.mark.parametrize("command", [
+        "git -C /tmp/repo push origin main",
+        "G=git; $G push origin main",
+        "git push https://github.com/acme/repo.git HEAD:main",
+    ])
+    def test_default_branch_push_denied_even_when_mode_off(
+        self, isolated_approvals, monkeypatch, command
+    ):
+        monkeypatch.setattr(A, "_get_approval_config", lambda: {"mode": "off"})
+        verdict = at.evaluate_command(command)
+        assert verdict["verdict"] == "hardline-deny"
+        assert verdict["exit_code"] == 3
+
+    @pytest.mark.parametrize("command", [
+        'echo x > ~/.hermes/config.yaml',
+        'python -c "import smtplib; smtplib.SMTP(\"mail.example\").sendmail(\"a\",\"b\",\"x\")"',
+        'buzz messages send --channel public --message x',
+    ])
+    def test_security_write_and_external_send_require_approval_under_mode_off(
+        self, isolated_approvals, monkeypatch, command
+    ):
+        monkeypatch.setattr(A, "_get_approval_config", lambda: {"mode": "off"})
+        verdict = at.evaluate_command(command)
+        assert verdict["verdict"] == "ask-approval"
+        assert verdict["exit_code"] == 2
     def test_benign_command_allows_with_exit_0(self, isolated_approvals, capsys):
         rc = at.approvals_test_command(_args(["ls", "-la"]))
         out = capsys.readouterr().out

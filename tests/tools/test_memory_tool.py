@@ -267,6 +267,45 @@ class TestMemoryStorePersistence:
         store = MemoryStore()
         store.load_from_disk()
         assert len(store.memory_entries) == 2
+        assert mem_file.read_text(encoding="utf-8") == (
+            "duplicate entry\n§\nunique entry"
+        )
+
+    @pytest.mark.parametrize(
+        ("target", "filename", "limit"),
+        [("memory", "MEMORY.md", 24), ("user", "USER.md", 18)],
+    )
+    def test_load_compacts_oversized_store_and_quarantines_omitted_entries(
+        self, tmp_path, monkeypatch, target, filename, limit
+    ):
+        """Pre-existing over-limit files must never enter the system prompt whole.
+
+        Load is also the repair boundary: under the per-file lock it keeps a
+        deterministic ordered subset that fits, atomically persists that same
+        bounded state, and preserves omitted entries in a quarantine file.
+        """
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+        path = tmp_path / filename
+        path.write_text(
+            "first fact\n§\nfirst fact\n§\n"
+            "this entry is far too large for the configured cap\n§\nlast",
+            encoding="utf-8",
+        )
+        store = MemoryStore(
+            memory_char_limit=limit if target == "memory" else 100,
+            user_char_limit=limit if target == "user" else 100,
+        )
+
+        store.load_from_disk()
+
+        entries = store.memory_entries if target == "memory" else store.user_entries
+        assert len("\n§\n".join(entries)) <= limit
+        assert entries == ["first fact", "last"]
+        snapshot = store.format_for_system_prompt(target)
+        assert "far too large" not in (snapshot or "")
+        assert path.read_text(encoding="utf-8") == "first fact\n§\nlast"
+        quarantine = path.with_suffix(path.suffix + ".quarantine")
+        assert "far too large" in quarantine.read_text(encoding="utf-8")
 
 
 class TestMemoryStoreSnapshot:

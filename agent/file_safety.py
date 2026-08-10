@@ -284,6 +284,21 @@ def get_read_block_error(path: str) -> Optional[str]:
         os.path.join("cache", "bws_cache.json"),
     )
     for hd in hermes_dirs:
+        # Buzz/bridge signing material is raw *.priv. Protect the directory
+        # pattern so newly provisioned identities cannot miss an enumeration.
+        try:
+            bridge_keys = (hd / "bridge" / "keys").resolve()
+            resolved.relative_to(bridge_keys)
+            if resolved.suffix.lower() == ".priv":
+                return (
+                    f"Access denied: {path} is a Hermes bridge private key "
+                    "and cannot be read directly. The bridge consumes it "
+                    "through its dedicated credential channel."
+                )
+        except ValueError:
+            pass
+        except Exception:
+            pass
         for name in credential_file_names:
             try:
                 blocked = (hd / name).resolve()

@@ -220,12 +220,12 @@ class MemoryStore:
         mem_dir = get_memory_dir()
         mem_dir.mkdir(parents=True, exist_ok=True)
 
-        self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
-        self.user_entries = self._read_file(mem_dir / "USER.md")
-
-        # Deduplicate entries (preserves order, keeps first occurrence)
-        self.memory_entries = list(dict.fromkeys(self.memory_entries))
-        self.user_entries = list(dict.fromkeys(self.user_entries))
+        # Loading is also the repair boundary for files written outside the
+        # memory tool. Apply the write caps before anything can reach the system
+        # prompt, and persist the canonical deduplicated view under the same
+        # per-file lock used by mutations.
+        self.memory_entries = self._load_target_bounded("memory")
+        self.user_entries = self._load_target_bounded("user")
 
         # Sanitize entries for the system-prompt snapshot only.  Live state
         # (memory_entries / user_entries) keeps the raw text so the user
@@ -238,6 +238,68 @@ class MemoryStore:
             "memory": self._render_block("memory", sanitized_memory),
             "user": self._render_block("user", sanitized_user),
         }
+
+    def _load_target_bounded(self, target: str) -> List[str]:
+        """Load one target as an ordered, deduplicated, bounded entry list.
+
+        Existing files can predate the write cap or be edited by another tool.
+        Keep each earliest entry that still fits, then continue past oversized
+        entries so later small facts are not needlessly lost. Omitted entries
+        are atomically preserved in ``<name>.quarantine`` before the canonical
+        bounded file is atomically rewritten. An unreadable source is never
+        rewritten.
+        """
+        path = self._path_for(target)
+        with self._file_lock(path):
+            raw, read_ok = self._read_raw_checked(path)
+            if not read_ok:
+                logger.warning("Memory file %s could not be read at load time", path.name)
+                return []
+
+            parsed = self._parse_entries(raw)
+            unique = list(dict.fromkeys(parsed))
+            limit = self._char_limit(target)
+            kept: List[str] = []
+            omitted: List[str] = []
+            for entry in unique:
+                candidate = kept + [entry]
+                if len(ENTRY_DELIMITER.join(candidate)) <= limit:
+                    kept.append(entry)
+                else:
+                    omitted.append(entry)
+
+            canonical = ENTRY_DELIMITER.join(kept)
+            if raw.strip() == canonical:
+                return kept
+
+            if omitted:
+                quarantine = path.with_suffix(path.suffix + ".quarantine")
+                old_quarantine, quarantine_ok = self._read_entries_checked(quarantine)
+                quarantined = list(dict.fromkeys(old_quarantine + omitted))
+                try:
+                    if not quarantine_ok:
+                        raise OSError("existing quarantine is unreadable")
+                    self._write_file(quarantine, quarantined)
+                except (OSError, RuntimeError) as exc:
+                    # Keep the prompt bounded, but do not destructively compact
+                    # disk unless omitted bytes have a durable recovery copy.
+                    logger.error(
+                        "Could not quarantine over-limit entries from %s; "
+                        "source file left unchanged: %s",
+                        path.name,
+                        exc,
+                    )
+                    return kept
+
+            self._write_file(path, kept)
+            logger.warning(
+                "Canonicalized %s at load time (%d kept, %d quarantined, limit=%d)",
+                path.name,
+                len(kept),
+                len(omitted),
+                limit,
+            )
+            return kept
 
     @staticmethod
     def _sanitize_entries_for_snapshot(entries: List[str], filename: str) -> List[str]:

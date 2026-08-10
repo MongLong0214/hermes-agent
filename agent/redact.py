@@ -360,6 +360,10 @@ _PRIVATE_KEY_RE = re.compile(
     r"-----BEGIN[A-Z ]*PRIVATE KEY-----[\s\S]*?-----END[A-Z ]*PRIVATE KEY-----"
 )
 
+# Raw Ed25519/secp256k1 private keys are commonly serialized as one 32-byte
+# hex token and have no vendor prefix. Mask the whole token (no head/tail).
+_RAW_64_HEX_SECRET_RE = re.compile(r"(?<![A-Fa-f0-9])[A-Fa-f0-9]{64}(?![A-Fa-f0-9])")
+
 # Database connection strings: protocol://user:PASSWORD@host
 # Catches postgres, mysql, mongodb, redis, amqp URLs and redacts the password.
 # The userinfo and password groups forbid whitespace ([^:\s]+ / [^@\s]+) so the
@@ -943,6 +947,10 @@ def redact_sensitive_text(
     if "BEGIN" in text and "-----" in text:
         text = _PRIVATE_KEY_RE.sub("[REDACTED PRIVATE KEY]", text)
 
+    # A standalone SHA-256 digest is indistinguishable from a raw 32-byte key;
+    # at a secret-output boundary the conservative false positive is safer.
+    text = _RAW_64_HEX_SECRET_RE.sub("[REDACTED 64-HEX SECRET]", text)
+
     # Database connection string passwords. With code_file=True, a password
     # group that is a pure ``{...}`` brace expression is an f-string template
     # reference (e.g. f"postgresql://{user}:{pass}@{host}"), not a literal
@@ -1124,7 +1132,11 @@ def redact_terminal_output(
     if not output:
         return output
     cmd = command or ""
-    code_file = not (is_env_dump_command(cmd) or _command_reads_env_file(cmd))
+    # docker inspect emits opaque KEY=value credentials in Config.Env JSON.
+    docker_inspect = bool(re.search(r"(?:^|[;&|]\s*)docker\s+inspect\b", cmd, re.IGNORECASE))
+    code_file = not (
+        is_env_dump_command(cmd) or _command_reads_env_file(cmd) or docker_inspect
+    )
     return redact_sensitive_text(output, force=force, code_file=code_file)
 
 
