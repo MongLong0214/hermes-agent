@@ -391,6 +391,21 @@ class _ScopeIndex(ast.NodeVisitor):
         self.current = previous
 
 
+class _CallableSummary:
+    """Bounded static summary of a local callable's possible returned callables."""
+
+    def __init__(
+        self,
+        returned: set[ast.FunctionDef | ast.AsyncFunctionDef] | None = None,
+        *,
+        unresolved: bool = False,
+        non_callable: bool = False,
+    ) -> None:
+        self.returned = returned or set()
+        self.unresolved = unresolved
+        self.non_callable = non_callable
+
+
 class _Resolver:
     """Scope-aware fixed-point resolver for imports and value aliases."""
 
@@ -623,6 +638,74 @@ class _Resolver:
             definitions.update(self._definition_nodes.get(symbol, set()))
         return definitions
 
+    def _summarize_definitions(
+        self,
+        definitions: set[ast.FunctionDef | ast.AsyncFunctionDef],
+        stack: set[int] | None = None,
+    ) -> _CallableSummary:
+        stack = stack or set()
+        summary = _CallableSummary()
+        for definition in definitions:
+            if id(definition) in stack:
+                summary.unresolved = True
+                continue
+            nested = self.callable_summary(definition, {*stack, id(definition)})
+            summary.returned.update(nested.returned)
+            summary.unresolved = summary.unresolved or nested.unresolved
+            summary.non_callable = summary.non_callable or nested.non_callable
+        return summary
+
+    def returned_callable_summary(
+        self,
+        call: ast.Call,
+        scope: _Scope | None = None,
+        stack: set[int] | None = None,
+    ) -> _CallableSummary:
+        """Resolve a local call's returned callable identities without executing it."""
+        scope = scope or self.scope(call)
+        definitions = self.local_definitions(call.func, self.scope(call.func))
+        if not definitions:
+            return _CallableSummary(unresolved=True)
+        return self._summarize_definitions(definitions, stack)
+
+    def callable_summary(
+        self,
+        definition: ast.FunctionDef | ast.AsyncFunctionDef,
+        stack: set[int] | None = None,
+    ) -> _CallableSummary:
+        """Summarize direct return statements while excluding nested callable bodies."""
+        stack = stack or set()
+        summary = _CallableSummary()
+        saw_return = False
+        for node in _iter_runtime_nodes(definition):
+            if not isinstance(node, ast.Return):
+                continue
+            saw_return = True
+            if node.value is None:
+                summary.non_callable = True
+                continue
+            returned = self.local_definitions(node.value, self.scope(node.value))
+            if returned:
+                summary.returned.update(returned)
+                continue
+            if isinstance(node.value, ast.Call):
+                nested = self.returned_callable_summary(
+                    node.value,
+                    self.scope(node.value),
+                    stack,
+                )
+                summary.returned.update(nested.returned)
+                summary.unresolved = summary.unresolved or nested.unresolved
+                summary.non_callable = summary.non_callable or nested.non_callable
+                continue
+            if _statically_non_callable(node.value):
+                summary.non_callable = True
+            else:
+                summary.unresolved = True
+        if not saw_return:
+            summary.non_callable = True
+        return summary
+
 
 def _lexical_path(node: ast.AST) -> str | None:
     parts: list[str] = []
@@ -633,6 +716,16 @@ def _lexical_path(node: ast.AST) -> str | None:
         return None
     parts.append(node.id)
     return ".".join(reversed(parts))
+
+
+def _statically_non_callable(node: ast.AST) -> bool:
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, (ast.Dict, ast.List, ast.Set, ast.Tuple)):
+        return True
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        return isinstance(node.operand, ast.Constant)
+    return False
 
 
 def _assignment_paths(target: ast.AST) -> list[str]:
@@ -1082,12 +1175,16 @@ def _scan_protected_contract_bindings(
 
 
 def _iter_runtime_nodes(root: ast.AST):
-    """Walk executable expressions without entering uncalled definitions."""
+    """Walk executable expressions without entering uncalled callable bodies."""
     pending: list[tuple[ast.AST, bool]] = [(root, True)]
     while pending:
         node, is_root = pending.pop()
         yield node
-        for child in reversed(list(ast.iter_child_nodes(node))):
+        if isinstance(node, ast.Lambda):
+            children = [node.args]
+        else:
+            children = list(ast.iter_child_nodes(node))
+        for child in reversed(children):
             if not is_root and isinstance(
                 child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
             ):
@@ -1179,6 +1276,36 @@ def _scan_unresolved_collection_call(
     )
 
 
+def _call_result_is_decorator_application(call: ast.Call, resolver: _Resolver) -> bool:
+    parent = resolver.parent(call)
+    return isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and any(
+        decorator is call for decorator in parent.decorator_list
+    )
+
+
+def _lambda_is_decorator_application(node: ast.Lambda, resolver: _Resolver) -> bool:
+    parent = resolver.parent(node)
+    return isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and any(
+        decorator is node for decorator in parent.decorator_list
+    )
+
+
+def _scan_unresolved_returned_callable(
+    call: ast.Call,
+    text: str,
+    findings: list[dict[str, object]],
+    seen: set[tuple[object, object, object]],
+) -> None:
+    _positive_finding(
+        findings,
+        seen,
+        "applicability_contract",
+        call,
+        text,
+        "immediately applied local call does not resolve exclusively to returned local callables",
+    )
+
+
 def _scan_applicability_expression(
     expression: ast.AST,
     text: str,
@@ -1200,11 +1327,63 @@ def _scan_applicability_expression(
 
     callable_nodes: set[ast.FunctionDef | ast.AsyncFunctionDef] = set()
     for node in _iter_runtime_nodes(expression):
-        if isinstance(node, ast.Call):
-            definitions = resolver.local_definitions(node.func, resolver.scope(node.func))
-            if not definitions:
-                _scan_unresolved_collection_call(node, text, resolver, findings, seen)
-            callable_nodes.update(definitions)
+        if node is not expression and isinstance(
+            node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        ):
+            _scan_definition_import_time(
+                node,
+                text,
+                resolver,
+                findings,
+                seen,
+                scan_body=False,
+                scan_nested_bodies=False,
+                annotations_evaluated=annotations_evaluated,
+                callable_stack=callable_stack,
+            )
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Call):
+            returned = resolver.returned_callable_summary(node.func, stack=callable_stack)
+            definitions = set(returned.returned)
+            if returned.unresolved or returned.non_callable or not definitions:
+                _scan_unresolved_returned_callable(node, text, findings, seen)
+        else:
+            definitions = resolver.local_definitions(
+                node.func,
+                resolver.scope(node.func),
+            )
+        if not definitions:
+            _scan_unresolved_collection_call(node, text, resolver, findings, seen)
+        callable_nodes.update(definitions)
+        if isinstance(node.func, ast.Lambda):
+            _scan_applicability_expression(
+                node.func.body,
+                text,
+                resolver,
+                findings,
+                seen,
+                annotations_evaluated=annotations_evaluated,
+                callable_stack=callable_stack,
+            )
+
+        if _call_result_is_decorator_application(node, resolver) and definitions:
+            returned = resolver.returned_callable_summary(node, stack=callable_stack)
+            if returned.unresolved or returned.non_callable or not returned.returned:
+                _scan_unresolved_returned_callable(node, text, findings, seen)
+            callable_nodes.update(returned.returned)
+    if isinstance(expression, ast.Lambda) and _lambda_is_decorator_application(
+        expression, resolver
+    ):
+        _scan_applicability_expression(
+            expression.body,
+            text,
+            resolver,
+            findings,
+            seen,
+            annotations_evaluated=annotations_evaluated,
+            callable_stack=callable_stack,
+        )
     if isinstance(expression, (ast.Name, ast.Attribute, ast.Call)):
         callable_node = expression.func if isinstance(expression, ast.Call) else expression
         callable_nodes.update(
@@ -1335,6 +1514,19 @@ def _scan_definition_import_time(
                 "pytest_generate_tests hook semantics are not proven; reject the definition",
             )
         for statement in node.body:
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                _scan_definition_import_time(
+                    statement,
+                    text,
+                    resolver,
+                    findings,
+                    seen,
+                    scan_body=False,
+                    scan_nested_bodies=False,
+                    annotations_evaluated=annotations_evaluated,
+                    callable_stack=callable_stack,
+                )
+                continue
             _scan_applicability_expression(
                 statement,
                 text,
@@ -1615,6 +1807,29 @@ def _safe_module_literal_assignment(tree: ast.Module, statement: ast.AST) -> boo
     return len(stores) == 1 and not loads
 
 
+def _safe_fixture_alias_assignment(statement: ast.AST, resolver: _Resolver) -> bool:
+    """Allow one-shot module/class aliases to the canonical fixture decorator."""
+    value: ast.AST | None = None
+    targets: tuple[ast.AST, ...] = ()
+    if isinstance(statement, ast.Assign):
+        value = statement.value
+        targets = tuple(statement.targets)
+    elif isinstance(statement, ast.AnnAssign) and statement.value is not None:
+        value = statement.value
+        targets = (statement.target,)
+    if value is None or not targets or not isinstance(value, (ast.Name, ast.Attribute)):
+        return False
+    if not all(isinstance(target, ast.Name) for target in targets):
+        return False
+    names = [target.id for target in targets if isinstance(target, ast.Name)]
+    if any(name in _PROTECTED_CONTRACT_ROOTS for name in names):
+        return False
+    scope = resolver.scope(statement)
+    if any(len(scope.equations.get(name, ())) != 1 for name in names):
+        return False
+    return resolver.reference(value, resolver.scope(value)) == {"pytest.fixture"}
+
+
 def _target_owned_yields(method: ast.FunctionDef | ast.AsyncFunctionDef):
     pending = list(ast.iter_child_nodes(method))
     while pending:
@@ -1656,7 +1871,9 @@ def _scan_positive_structural_contract(
             statement.value, ast.Constant
         ) and isinstance(statement.value.value, str):
             continue
-        if _safe_module_literal_assignment(tree, statement):
+        if _safe_module_literal_assignment(tree, statement) or _safe_fixture_alias_assignment(
+            statement, resolver
+        ):
             continue
         _positive_finding(
             findings,
@@ -1695,6 +1912,8 @@ def _scan_positive_structural_contract(
             and isinstance(statement.value, ast.Constant)
             and isinstance(statement.value.value, str)
         ):
+            continue
+        if _safe_fixture_alias_assignment(statement, resolver):
             continue
         _positive_finding(
             findings,
@@ -2592,7 +2811,140 @@ _D8_SELF_TEST_CASES = (
     ),
 )
 
-_SELF_TEST_CASES = _APPLICABILITY_SELF_TEST_CASES + _D8_SELF_TEST_CASES + (
+_D9_SELF_TEST_CASES = (
+    (
+        "d9_r1_returned_decorator_callable_sleep",
+        _fixture(
+            "pass",
+            imports="import time",
+            module_code=(
+                "def qa_returned_decorator(function):\n"
+                "    time.sleep(0)\n"
+                "    return function\n"
+                "def qa_decorator_factory():\n"
+                "    return qa_returned_decorator\n"
+                "@qa_decorator_factory()\n"
+                "def qa_decorated():\n"
+                "    pass"
+            ),
+        ),
+        False,
+        ("real_time_primitive",),
+    ),
+    (
+        "d9_r2_function_return_default_callable_sleep",
+        _fixture(
+            "pass",
+            imports="import time",
+            module_code=(
+                "def qa_returned_default():\n"
+                "    time.sleep(0)\n"
+                "    return 7\n"
+                "def qa_default_factory():\n"
+                "    return qa_returned_default\n"
+                "def qa_default(value=qa_default_factory()()):\n"
+                "    return value"
+            ),
+        ),
+        False,
+        ("real_time_primitive",),
+    ),
+    (
+        "d9_s1_false_assigned_autouse_module",
+        _fixture(
+            "pass",
+            module_code=(
+                "qa_fixture_alias = pytest.fixture\n"
+                "qa_fixture_alias_chain = qa_fixture_alias\n"
+                "@qa_fixture_alias_chain(autouse=())\n"
+                "def qa_inactive_fixture():\n"
+                "    pytest.skip('inactive fixture')"
+            ),
+        ),
+        True,
+        (),
+    ),
+    (
+        "d9_s2_false_assigned_autouse_class",
+        _fixture(
+            "pass",
+            class_code=(
+                "qa_fixture_alias = pytest.fixture\n"
+                "qa_fixture_alias_chain = qa_fixture_alias\n"
+                "@qa_fixture_alias_chain(autouse=0)\n"
+                "def qa_inactive_fixture(self):\n"
+                "    pytest.xfail('inactive fixture')"
+            ),
+        ),
+        True,
+        (),
+    ),
+    (
+        "d9_s3_called_factory_dormant_nested_helper",
+        _fixture(
+            "pass",
+            imports="import time",
+            module_code=(
+                "def qa_dormant_factory():\n"
+                "    def qa_dormant_helper():\n"
+                "        time.sleep(0)\n"
+                "    return 7\n"
+                "def qa_default(value=qa_dormant_factory()):\n"
+                "    return value"
+            ),
+        ),
+        True,
+        (),
+    ),
+    (
+        "d9_returned_callable_cycle_is_bounded",
+        _fixture(
+            "pass",
+            module_code=(
+                "def qa_cycle_first():\n"
+                "    return qa_cycle_second\n"
+                "def qa_cycle_second():\n"
+                "    return qa_cycle_first\n"
+                "def qa_default(value=qa_cycle_first()()()):\n"
+                "    return value"
+            ),
+        ),
+        True,
+        (),
+    ),
+    (
+        "d9_unresolved_returned_callable_fails_closed",
+        _fixture(
+            "pass",
+            module_code=(
+                "def qa_dynamic_factory(source):\n"
+                "    return source\n"
+                "def qa_default(value=qa_dynamic_factory(qa_dynamic_factory)()):\n"
+                "    return value"
+            ),
+        ),
+        False,
+        ("applicability_contract",),
+    ),
+    (
+        "d9_benign_returned_callable_control",
+        _fixture(
+            "pass",
+            module_code=(
+                "def qa_benign_callable():\n"
+                "    return 7\n"
+                "def qa_benign_factory():\n"
+                "    return qa_benign_callable\n"
+                "def qa_default(value=qa_benign_factory()()):\n"
+                "    return value"
+            ),
+        ),
+        True,
+        (),
+    ),
+)
+
+_SELF_TEST_CASES = _APPLICABILITY_SELF_TEST_CASES + _D8_SELF_TEST_CASES + _D9_SELF_TEST_CASES + (
     ("from_time_sleep_alias", _fixture("nap(0.03)", imports="from time import sleep as nap"), False, ("real_time_primitive",)),
     ("module_time_alias_sleep", _fixture("clock.sleep(0.03)", imports="import time as clock"), False, ("unapproved_symbol",)),
     ("from_time_monotonic_alias", _fixture("tick()", imports="from time import monotonic as tick"), False, ("real_time_primitive",)),
