@@ -400,10 +400,14 @@ class _CallableSummary:
         *,
         unresolved: bool = False,
         non_callable: bool = False,
+        applied: set[int] | None = None,
+        cyclic: bool = False,
     ) -> None:
         self.returned = returned or set()
         self.unresolved = unresolved
         self.non_callable = non_callable
+        self.applied = applied or set()
+        self.cyclic = cyclic
 
 
 class _Resolver:
@@ -641,41 +645,80 @@ class _Resolver:
     def _summarize_definitions(
         self,
         definitions: set[ast.FunctionDef | ast.AsyncFunctionDef],
-        stack: set[int] | None = None,
+        stack: set[tuple[int, int]] | None = None,
+        *,
+        call_layer: int,
+        applied: set[int] | None = None,
     ) -> _CallableSummary:
         stack = stack or set()
+        applied = applied or set()
         summary = _CallableSummary()
         for definition in definitions:
-            if id(definition) in stack:
+            marker = (id(definition), call_layer)
+            if marker in stack:
                 summary.unresolved = True
                 continue
-            nested = self.callable_summary(definition, {*stack, id(definition)})
+            if id(definition) in applied:
+                summary.cyclic = True
+            nested = self.callable_summary(
+                definition,
+                {*stack, marker},
+                {*applied, id(definition)},
+            )
             summary.returned.update(nested.returned)
             summary.unresolved = summary.unresolved or nested.unresolved
             summary.non_callable = summary.non_callable or nested.non_callable
+            summary.applied.update(nested.applied)
+            summary.applied.add(id(definition))
+            summary.cyclic = summary.cyclic or nested.cyclic
         return summary
 
     def returned_callable_summary(
         self,
         call: ast.Call,
         scope: _Scope | None = None,
-        stack: set[int] | None = None,
+        stack: set[tuple[int, int]] | None = None,
+        applied: set[int] | None = None,
     ) -> _CallableSummary:
-        """Resolve a local call's returned callable identities without executing it."""
+        """Resolve each immediately applied local call layer without executing it."""
         scope = scope or self.scope(call)
+        if isinstance(call.func, ast.Call):
+            returned = self.returned_callable_summary(
+                call.func,
+                self.scope(call.func),
+                stack,
+                applied,
+            )
+            if returned.unresolved or returned.non_callable or not returned.returned:
+                return returned
+            summarized = self._summarize_definitions(
+                returned.returned,
+                stack,
+                call_layer=id(call),
+                applied=returned.applied,
+            )
+            summarized.cyclic = summarized.cyclic or returned.cyclic
+            return summarized
         definitions = self.local_definitions(call.func, self.scope(call.func))
         if not definitions:
             return _CallableSummary(unresolved=True)
-        return self._summarize_definitions(definitions, stack)
+        return self._summarize_definitions(
+            definitions,
+            stack,
+            call_layer=id(call),
+            applied=applied,
+        )
 
     def callable_summary(
         self,
         definition: ast.FunctionDef | ast.AsyncFunctionDef,
-        stack: set[int] | None = None,
+        stack: set[tuple[int, int]] | None = None,
+        applied: set[int] | None = None,
     ) -> _CallableSummary:
         """Summarize direct return statements while excluding nested callable bodies."""
         stack = stack or set()
-        summary = _CallableSummary()
+        applied = applied or set()
+        summary = _CallableSummary(applied=set(applied))
         saw_return = False
         for node in _iter_runtime_nodes(definition):
             if not isinstance(node, ast.Return):
@@ -693,10 +736,13 @@ class _Resolver:
                     node.value,
                     self.scope(node.value),
                     stack,
+                    summary.applied,
                 )
                 summary.returned.update(nested.returned)
                 summary.unresolved = summary.unresolved or nested.unresolved
                 summary.non_callable = summary.non_callable or nested.non_callable
+                summary.applied.update(nested.applied)
+                summary.cyclic = summary.cyclic or nested.cyclic
                 continue
             if _statically_non_callable(node.value):
                 summary.non_callable = True
@@ -1176,20 +1222,18 @@ def _scan_protected_contract_bindings(
 
 def _iter_runtime_nodes(root: ast.AST):
     """Walk executable expressions without entering uncalled callable bodies."""
-    pending: list[tuple[ast.AST, bool]] = [(root, True)]
+    pending: list[ast.AST] = [root]
     while pending:
-        node, is_root = pending.pop()
+        node = pending.pop()
         yield node
         if isinstance(node, ast.Lambda):
             children = [node.args]
         else:
             children = list(ast.iter_child_nodes(node))
         for child in reversed(children):
-            if not is_root and isinstance(
-                child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
-            ):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 continue
-            pending.append((child, False))
+            pending.append(child)
 
 
 def _iter_runtime_references(root: ast.AST, resolver: _Resolver):
@@ -1344,7 +1388,7 @@ def _scan_applicability_expression(
         if not isinstance(node, ast.Call):
             continue
         if isinstance(node.func, ast.Call):
-            returned = resolver.returned_callable_summary(node.func, stack=callable_stack)
+            returned = resolver.returned_callable_summary(node.func)
             definitions = set(returned.returned)
             if returned.unresolved or returned.non_callable or not definitions:
                 _scan_unresolved_returned_callable(node, text, findings, seen)
@@ -1368,8 +1412,8 @@ def _scan_applicability_expression(
             )
 
         if _call_result_is_decorator_application(node, resolver) and definitions:
-            returned = resolver.returned_callable_summary(node, stack=callable_stack)
-            if returned.unresolved or returned.non_callable or not returned.returned:
+            returned = resolver.returned_callable_summary(node)
+            if returned.cyclic or returned.unresolved or returned.non_callable or not returned.returned:
                 _scan_unresolved_returned_callable(node, text, findings, seen)
             callable_nodes.update(returned.returned)
     if isinstance(expression, ast.Lambda) and _lambda_is_decorator_application(
@@ -2944,7 +2988,224 @@ _D9_SELF_TEST_CASES = (
     ),
 )
 
-_SELF_TEST_CASES = _APPLICABILITY_SELF_TEST_CASES + _D8_SELF_TEST_CASES + _D9_SELF_TEST_CASES + (
+_D10_SELF_TEST_CASES = (
+    (
+        "d10_r1_triple_returned_callable_chain",
+        _fixture(
+            "pass",
+            imports="import time",
+            module_code=(
+                "def qa_d10_sleep_decorator(function):\n"
+                "    time.sleep(0)\n"
+                "    return function\n"
+                "def qa_d10_leaf():\n"
+                "    return qa_d10_sleep_decorator\n"
+                "def qa_d10_middle():\n"
+                "    return qa_d10_leaf\n"
+                "def qa_d10_factory():\n"
+                "    return qa_d10_middle\n"
+                "@qa_d10_factory()()()\n"
+                "def qa_d10_decorated():\n"
+                "    pass"
+            ),
+        ),
+        False,
+        ("real_time_primitive",),
+    ),
+    (
+        "d10_r1_alias_at_each_returned_callable_layer",
+        _fixture(
+            "pass",
+            imports="import time",
+            module_code=(
+                "def qa_d10_alias_sleep(function):\n"
+                "    time.sleep(0)\n"
+                "    return function\n"
+                "qa_d10_leaf_alias = qa_d10_alias_sleep\n"
+                "def qa_d10_alias_next():\n"
+                "    return qa_d10_leaf_alias\n"
+                "qa_d10_middle_alias = qa_d10_alias_next\n"
+                "def qa_d10_alias_factory():\n"
+                "    return qa_d10_middle_alias\n"
+                "@qa_d10_alias_factory()()\n"
+                "def qa_d10_alias_decorated():\n"
+                "    pass"
+            ),
+        ),
+        False,
+        ("applicability_contract",),
+    ),
+    (
+        "d10_r2_mixed_branch_returned_callables",
+        _fixture(
+            "pass",
+            imports="import time",
+            module_code=(
+                "def qa_d10_safe_identity(function):\n"
+                "    return function\n"
+                "def qa_d10_branch_sleep(function):\n"
+                "    time.sleep(0)\n"
+                "    return function\n"
+                "def qa_d10_branch_factory():\n"
+                "    if True:\n"
+                "        return qa_d10_branch_sleep\n"
+                "    return qa_d10_safe_identity\n"
+                "@qa_d10_branch_factory()\n"
+                "def qa_d10_branch_decorated():\n"
+                "    pass"
+            ),
+        ),
+        False,
+        ("real_time_primitive",),
+    ),
+    (
+        "d10_r2_cyclic_returned_decorator_fails_closed",
+        _fixture(
+            "pass",
+            module_code=(
+                "def qa_d10_cycle_first():\n"
+                "    return qa_d10_cycle_second\n"
+                "def qa_d10_cycle_second():\n"
+                "    return qa_d10_cycle_first\n"
+                "@qa_d10_cycle_first()()()\n"
+                "def qa_d10_cycle_decorated():\n"
+                "    pass"
+            ),
+        ),
+        False,
+        ("applicability_contract",),
+    ),
+    (
+        "d10_r2_unresolved_returned_chain_fails_closed",
+        _fixture(
+            "pass",
+            module_code=(
+                "def qa_d10_unresolved_factory(source):\n"
+                "    return source\n"
+                "@qa_d10_unresolved_factory(qa_d10_unresolved_factory)()\n"
+                "def qa_d10_unresolved_decorated():\n"
+                "    pass"
+            ),
+        ),
+        False,
+        ("applicability_contract",),
+    ),
+    (
+        "d10_s1_dormant_nested_class_body_is_inert",
+        _fixture(
+            "pass",
+            imports="import time",
+            module_code=(
+                "def qa_d10_identity(function):\n"
+                "    return function\n"
+                "def qa_d10_dormant_class_factory():\n"
+                "    def qa_d10_dormant_helper():\n"
+                "        class QaD10DormantClass:\n"
+                "            def qa_d10_method(self):\n"
+                "                time.sleep(0)\n"
+                "        return QaD10DormantClass\n"
+                "    return qa_d10_identity\n"
+                "@qa_d10_dormant_class_factory()\n"
+                "def qa_d10_dormant_class_decorated():\n"
+                "    pass"
+            ),
+        ),
+        True,
+        (),
+    ),
+    (
+        "d10_s2_dormant_nested_async_body_is_inert",
+        _fixture(
+            "pass",
+            imports="import time",
+            module_code=(
+                "def qa_d10_identity(function):\n"
+                "    return function\n"
+                "def qa_d10_dormant_async_factory():\n"
+                "    async def qa_d10_dormant_async():\n"
+                "        time.sleep(0)\n"
+                "    return qa_d10_identity\n"
+                "@qa_d10_dormant_async_factory()\n"
+                "def qa_d10_dormant_async_decorated():\n"
+                "    pass"
+            ),
+        ),
+        True,
+        (),
+    ),
+    (
+        "d10_r3_nested_definition_decorator_executes",
+        _fixture(
+            "pass",
+            imports="import time",
+            module_code=(
+                "def qa_d10_identity(function):\n"
+                "    return function\n"
+                "def qa_d10_nested_decorator(function):\n"
+                "    time.sleep(0)\n"
+                "    return function\n"
+                "def qa_d10_nested_decorator_factory():\n"
+                "    @qa_d10_nested_decorator\n"
+                "    def qa_d10_nested_body():\n"
+                "        return 1\n"
+                "    return qa_d10_identity\n"
+                "@qa_d10_nested_decorator_factory()\n"
+                "def qa_d10_nested_decorator_target():\n"
+                "    pass"
+            ),
+        ),
+        False,
+        ("real_time_primitive",),
+    ),
+    (
+        "d10_r3_nested_definition_default_executes",
+        _fixture(
+            "pass",
+            imports="import time",
+            module_code=(
+                "def qa_d10_identity(function):\n"
+                "    return function\n"
+                "def qa_d10_nested_default_trigger():\n"
+                "    time.sleep(0)\n"
+                "    return 1\n"
+                "def qa_d10_nested_default_factory():\n"
+                "    def qa_d10_nested_body(value=qa_d10_nested_default_trigger()):\n"
+                "        return value\n"
+                "    return qa_d10_identity\n"
+                "@qa_d10_nested_default_factory()\n"
+                "def qa_d10_nested_default_target():\n"
+                "    pass"
+            ),
+        ),
+        False,
+        ("real_time_primitive",),
+    ),
+    (
+        "d10_r3_nested_class_base_executes",
+        _fixture(
+            "pass",
+            imports="import time",
+            module_code=(
+                "def qa_d10_identity(function):\n"
+                "    return function\n"
+                "def qa_d10_nested_base_trigger():\n"
+                "    time.sleep(0)\n"
+                "    return object\n"
+                "def qa_d10_nested_base_factory():\n"
+                "    class QaD10NestedClass(qa_d10_nested_base_trigger()):\n"
+                "        pass\n"
+                "    return qa_d10_identity\n"
+                "@qa_d10_nested_base_factory()\n"
+                "def qa_d10_nested_base_target():\n"
+                "    pass"
+            ),
+        ),
+        False,
+        ("real_time_primitive",),
+    ),
+)
+
+_SELF_TEST_CASES = _APPLICABILITY_SELF_TEST_CASES + _D8_SELF_TEST_CASES + _D9_SELF_TEST_CASES + _D10_SELF_TEST_CASES + (
     ("from_time_sleep_alias", _fixture("nap(0.03)", imports="from time import sleep as nap"), False, ("real_time_primitive",)),
     ("module_time_alias_sleep", _fixture("clock.sleep(0.03)", imports="import time as clock"), False, ("unapproved_symbol",)),
     ("from_time_monotonic_alias", _fixture("tick()", imports="from time import monotonic as tick"), False, ("real_time_primitive",)),
