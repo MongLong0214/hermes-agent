@@ -65,6 +65,22 @@ _DYNAMIC_GETATTRS = {"getattr", "builtins.getattr"}
 _PARTIALS = {"partial", "functools.partial"}
 _LESS_THAN_FUNCTIONS = {"lt", "le", "operator.lt", "operator.le"}
 _GREATER_THAN_FUNCTIONS = {"gt", "ge", "operator.gt", "operator.ge"}
+_PROVEN_COLLECTION_CALLS = {
+    "_aux_mod._aux_unhealthy_logged_at.clear",
+    "_aux_mod._aux_unhealthy_until.clear",
+    "agent.auxiliary_client._aux_unhealthy_logged_at.clear",
+    "agent.auxiliary_client._aux_unhealthy_until.clear",
+    "SimpleNamespace",
+    "classmethod",
+    "len",
+    "monkeypatch.delenv",
+    "patch.object",
+    "pytest.fixture",
+    "pytest.mark.parametrize",
+    "pytest.raises",
+    "range",
+    "staticmethod",
+}
 
 # Positive structural contract for the owned target.  The audit does not try to
 # prove arbitrary Python dataflow.  Instead, the target may use only the names
@@ -381,6 +397,9 @@ class _Resolver:
     def __init__(self, tree: ast.Module) -> None:
         self.tree = tree
         self.index = _ScopeIndex(tree)
+        self._definition_nodes: dict[
+            str, set[ast.FunctionDef | ast.AsyncFunctionDef]
+        ] = {}
         self._collect_bindings()
         self._resolve_fixed_point()
 
@@ -422,7 +441,12 @@ class _Resolver:
                 self._add_assignment(scope, node.target, node.value)
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 scope.local_names.add(node.name)
-                scope.add_binding(node.name, f"<definition:{node.name}>")
+                marker = f"<definition:{node.name}@{scope.identifier}>"
+                scope.add_binding(node.name, marker)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    self._definition_nodes.setdefault(
+                        marker, set()
+                    ).add(node)
             elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
                 scope.local_names.add(node.id)
             elif isinstance(node, ast.ExceptHandler) and node.name:
@@ -586,6 +610,18 @@ class _Resolver:
                 return []
             current = current.parent
         return []
+
+    def local_definitions(
+        self,
+        node: ast.AST,
+        scope: _Scope | None = None,
+    ) -> set[ast.FunctionDef | ast.AsyncFunctionDef]:
+        """Return function definitions proven reachable from a callable path."""
+        scope = scope or self.scope(node)
+        definitions: set[ast.FunctionDef | ast.AsyncFunctionDef] = set()
+        for symbol in self.reference(node, scope):
+            definitions.update(self._definition_nodes.get(symbol, set()))
+        return definitions
 
 
 def _lexical_path(node: ast.AST) -> str | None:
@@ -906,8 +942,40 @@ def _scan_protected_contract_bindings(
     """Require every approved root to retain its reviewed binding identity."""
     imported: dict[str, set[str]] = {name: set() for name in _PROTECTED_IMPORTS}
     module_scope = resolver.index.root
+    target_class = next(
+        (
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef) and node.name == _TARGET_CLASS
+        ),
+        None,
+    )
+    class_scope = (
+        resolver.index.owner_scope.get(target_class, module_scope)
+        if target_class is not None
+        else module_scope
+    )
+    method_scope = resolver.index.owner_scope.get(method, module_scope)
+    applicable_functions = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and (
+            resolver.scope(node) is module_scope
+            or resolver.scope(node) is class_scope
+        )
+        and _definition_body_is_applicable(
+            node, resolver, class_scope=resolver.scope(node) is class_scope
+        )
+    ]
+    relevant_scopes = {module_scope, class_scope, method_scope}
+    relevant_scopes.update(
+        resolver.index.owner_scope.get(node, module_scope)
+        for node in applicable_functions
+    )
+
     for node in ast.walk(tree):
-        if resolver.scope(node) is not module_scope:
+        if resolver.scope(node) not in relevant_scopes:
             continue
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -919,6 +987,14 @@ def _scan_protected_contract_bindings(
             module = "." * node.level + (node.module or "")
             for alias in node.names:
                 if alias.name == "*":
+                    _positive_finding(
+                        findings,
+                        seen,
+                        "binding_contract",
+                        node,
+                        text,
+                        "wildcard import leaves protected contract provenance ambiguous",
+                    )
                     continue
                 bound = alias.asname or alias.name
                 canonical = ".".join(
@@ -965,22 +1041,6 @@ def _scan_protected_contract_bindings(
                 f"{sorted(actual)}, expected {sorted(expected)}",
             )
 
-    relevant_scopes = {
-        resolver.index.root,
-        resolver.index.owner_scope.get(
-            next(
-                (
-                    node
-                    for node in ast.walk(tree)
-                    if isinstance(node, ast.ClassDef)
-                    and node.name == _TARGET_CLASS
-                ),
-                tree,
-            ),
-            resolver.index.root,
-        ),
-        resolver.index.owner_scope.get(method, resolver.index.root),
-    }
     for node, scope in resolver.index.scope_by_node.items():
         if scope not in relevant_scopes:
             continue
@@ -999,6 +1059,125 @@ def _scan_protected_contract_bindings(
                 f"protected contract root is rebound: {name}",
             )
 
+    for function in applicable_functions:
+        declarations = {
+            name
+            for statement in ast.walk(function)
+            if isinstance(statement, (ast.Global, ast.Nonlocal))
+            for name in statement.names
+        }
+        for node in ast.walk(function):
+            if not isinstance(node, ast.Name) or not isinstance(node.ctx, ast.Store):
+                continue
+            if node.id not in declarations or node.id not in _PROTECTED_CONTRACT_ROOTS:
+                continue
+            _positive_finding(
+                findings,
+                seen,
+                "binding_contract",
+                node,
+                text,
+                f"active applicability body writes protected root {node.id} through global/nonlocal binding",
+            )
+
+
+def _iter_runtime_nodes(root: ast.AST):
+    """Walk executable expressions without entering uncalled definitions."""
+    pending: list[tuple[ast.AST, bool]] = [(root, True)]
+    while pending:
+        node, is_root = pending.pop()
+        yield node
+        for child in reversed(list(ast.iter_child_nodes(node))):
+            if not is_root and isinstance(
+                child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+            ):
+                continue
+            pending.append((child, False))
+
+
+def _iter_runtime_references(root: ast.AST, resolver: _Resolver):
+    for node in _iter_runtime_nodes(root):
+        if _maximal_reference(node, resolver):
+            yield node, resolver.reference(node)
+
+
+def _annotation_nodes(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> list[ast.AST]:
+    arguments = [
+        *node.args.posonlyargs,
+        *node.args.args,
+        *node.args.kwonlyargs,
+        *([node.args.vararg] if node.args.vararg else []),
+        *([node.args.kwarg] if node.args.kwarg else []),
+    ]
+    return [
+        *[argument.annotation for argument in arguments if argument.annotation is not None],
+        *([node.returns] if node.returns is not None else []),
+    ]
+
+
+def _annotations_are_evaluated(tree: ast.Module) -> bool:
+    for statement in tree.body:
+        if not isinstance(statement, ast.ImportFrom) or statement.module != "__future__":
+            continue
+        if any(alias.name == "annotations" for alias in statement.names):
+            return False
+    return True
+
+
+def _fixture_autouse_status(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+    resolver: _Resolver,
+) -> bool | None:
+    for decorator in node.decorator_list:
+        if not isinstance(decorator, ast.Call):
+            continue
+        if resolver.reference(decorator.func, resolver.scope(decorator.func)) != {
+            "pytest.fixture"
+        }:
+            continue
+        values = [keyword.value for keyword in decorator.keywords if keyword.arg == "autouse"]
+        if not values:
+            return False
+        try:
+            return bool(ast.literal_eval(values[-1]))
+        except (ValueError, TypeError, SyntaxError):
+            return None
+    return False
+
+
+def _is_autouse_fixture(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+    resolver: _Resolver,
+) -> bool:
+    return _fixture_autouse_status(node, resolver) is True
+
+
+def _scan_unresolved_collection_call(
+    node: ast.Call,
+    text: str,
+    resolver: _Resolver,
+    findings: list[dict[str, object]],
+    seen: set[tuple[object, object, object]],
+) -> None:
+    symbols = resolver.reference(node.func, resolver.scope(node.func))
+    symbols.update(path for path in [_lexical_path(node.func)] if path)
+    if symbols & _PROVEN_COLLECTION_CALLS:
+        return
+    if any(_real_time_kind(symbol, node.func) for symbol in symbols):
+        return
+    if any(_escape_kind(symbol) for symbol in symbols):
+        return
+    _positive_finding(
+        findings,
+        seen,
+        "applicability_contract",
+        node,
+        text,
+        "collection-time call is not resolved to a reviewed local callable or safe primitive",
+    )
+
 
 def _scan_applicability_expression(
     expression: ast.AST,
@@ -1006,40 +1185,55 @@ def _scan_applicability_expression(
     resolver: _Resolver,
     findings: list[dict[str, object]],
     seen: set[tuple[object, object, object]],
+    *,
+    annotations_evaluated: bool = True,
+    callable_stack: set[int] | None = None,
 ) -> None:
-    _scan_escape_expression(
-        expression,
-        text,
-        resolver,
-        findings,
-        seen,
-        references=True,
-    )
-    for node, symbols in _iter_references(expression, resolver):
+    callable_stack = callable_stack or set()
+    for node, symbols in _iter_runtime_references(expression, resolver):
         for symbol in sorted(symbols):
-            classified = _real_time_kind(symbol, node)
+            classified = _escape_kind(symbol) or _real_time_kind(symbol, node)
             if classified:
                 kind, detail = classified
                 _append_unique(findings, seen, _finding(kind, node, text, detail))
                 break
 
+    callable_nodes: set[ast.FunctionDef | ast.AsyncFunctionDef] = set()
+    for node in _iter_runtime_nodes(expression):
+        if isinstance(node, ast.Call):
+            definitions = resolver.local_definitions(node.func, resolver.scope(node.func))
+            if not definitions:
+                _scan_unresolved_collection_call(node, text, resolver, findings, seen)
+            callable_nodes.update(definitions)
+    if isinstance(expression, (ast.Name, ast.Attribute, ast.Call)):
+        callable_node = expression.func if isinstance(expression, ast.Call) else expression
+        callable_nodes.update(
+            resolver.local_definitions(callable_node, resolver.scope(callable_node))
+        )
 
-def _is_autouse_fixture(
+    for node in callable_nodes:
+        if id(node) in callable_stack:
+            continue
+        _scan_definition_import_time(
+            node,
+            text,
+            resolver,
+            findings,
+            seen,
+            scan_body=True,
+            annotations_evaluated=annotations_evaluated,
+            callable_stack={*callable_stack, id(node)},
+        )
+
+
+def _definition_body_is_applicable(
     node: ast.FunctionDef | ast.AsyncFunctionDef,
+    resolver: _Resolver,
+    *,
+    class_scope: bool = False,
 ) -> bool:
-    for decorator in node.decorator_list:
-        if not isinstance(decorator, ast.Call):
-            continue
-        if _lexical_path(decorator.func) != "pytest.fixture":
-            continue
-        if any(
-            keyword.arg == "autouse"
-            and isinstance(keyword.value, ast.Constant)
-            and keyword.value.value is True
-            for keyword in decorator.keywords
-        ):
-            return True
-    return False
+    hooks = _CLASS_XUNIT_HOOKS if class_scope else _MODULE_XUNIT_HOOKS
+    return node.name in hooks or _is_autouse_fixture(node, resolver)
 
 
 def _scan_definition_import_time(
@@ -1051,7 +1245,10 @@ def _scan_definition_import_time(
     *,
     scan_body: bool,
     scan_nested_bodies: bool = True,
+    annotations_evaluated: bool = True,
+    callable_stack: set[int] | None = None,
 ) -> None:
+    callable_stack = callable_stack or set()
     expressions: list[ast.AST] = [*node.decorator_list]
     if isinstance(node, ast.ClassDef):
         expressions.extend([*node.bases, *(keyword.value for keyword in node.keywords)])
@@ -1061,8 +1258,33 @@ def _scan_definition_import_time(
             for default in [*node.args.defaults, *node.args.kw_defaults]
             if default is not None
         )
+        if annotations_evaluated:
+            expressions.extend(_annotation_nodes(node))
+        autouse_status = _fixture_autouse_status(node, resolver)
+        if autouse_status is None:
+            for decorator in node.decorator_list:
+                if isinstance(decorator, ast.Call) and any(
+                    keyword.arg == "autouse" for keyword in decorator.keywords
+                ):
+                    _positive_finding(
+                        findings,
+                        seen,
+                        "applicability_contract",
+                        decorator,
+                        text,
+                        "fixture autouse value is present but not statically resolvable",
+                    )
+                    break
     for expression in expressions:
-        _scan_applicability_expression(expression, text, resolver, findings, seen)
+        _scan_applicability_expression(
+            expression,
+            text,
+            resolver,
+            findings,
+            seen,
+            annotations_evaluated=annotations_evaluated,
+            callable_stack=callable_stack,
+        )
 
     if isinstance(node, ast.ClassDef):
         for statement in node.body:
@@ -1074,10 +1296,11 @@ def _scan_definition_import_time(
                     findings,
                     seen,
                     scan_body=scan_nested_bodies
-                    and (
-                        statement.name in _CLASS_XUNIT_HOOKS
-                        or _is_autouse_fixture(statement)
+                    and _definition_body_is_applicable(
+                        statement, resolver, class_scope=True
                     ),
+                    annotations_evaluated=annotations_evaluated,
+                    callable_stack=callable_stack,
                 )
             elif isinstance(statement, ast.ClassDef):
                 _scan_definition_import_time(
@@ -1088,6 +1311,8 @@ def _scan_definition_import_time(
                     seen,
                     scan_body=False,
                     scan_nested_bodies=False,
+                    annotations_evaluated=annotations_evaluated,
+                    callable_stack=callable_stack,
                 )
             else:
                 _scan_applicability_expression(
@@ -1096,6 +1321,8 @@ def _scan_definition_import_time(
                     resolver,
                     findings,
                     seen,
+                    annotations_evaluated=annotations_evaluated,
+                    callable_stack=callable_stack,
                 )
     elif scan_body:
         if node.name == "pytest_generate_tests":
@@ -1114,6 +1341,8 @@ def _scan_definition_import_time(
                 resolver,
                 findings,
                 seen,
+                annotations_evaluated=annotations_evaluated,
+                callable_stack=callable_stack,
             )
 
 
@@ -1125,6 +1354,7 @@ def _scan_definition_applicability(
     findings: list[dict[str, object]],
     seen: set[tuple[object, object, object]],
 ) -> None:
+    annotations_evaluated = _annotations_are_evaluated(tree)
     for statement in tree.body:
         if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
             _scan_definition_import_time(
@@ -1133,10 +1363,8 @@ def _scan_definition_applicability(
                 resolver,
                 findings,
                 seen,
-                scan_body=(
-                    statement.name in _MODULE_XUNIT_HOOKS
-                    or _is_autouse_fixture(statement)
-                ),
+                scan_body=_definition_body_is_applicable(statement, resolver),
+                annotations_evaluated=annotations_evaluated,
             )
         elif isinstance(statement, ast.ClassDef):
             _scan_definition_import_time(
@@ -1147,6 +1375,7 @@ def _scan_definition_applicability(
                 seen,
                 scan_body=False,
                 scan_nested_bodies=statement is target_class,
+                annotations_evaluated=annotations_evaluated,
             )
         else:
             _scan_applicability_expression(
@@ -1155,6 +1384,7 @@ def _scan_definition_applicability(
                 resolver,
                 findings,
                 seen,
+                annotations_evaluated=annotations_evaluated,
             )
 
     # The target class is the one class whose xunit hooks and autouse fixtures
@@ -1168,6 +1398,7 @@ def _scan_definition_applicability(
         seen,
         scan_body=False,
         scan_nested_bodies=True,
+        annotations_evaluated=annotations_evaluated,
     )
 
 
@@ -1347,6 +1578,54 @@ def _positive_finding(
     _append_unique(findings, seen, _finding(kind, node, text, detail))
 
 
+def _immutable_literal(node: ast.AST) -> bool:
+    if isinstance(node, ast.Constant):
+        return isinstance(node.value, (bool, bytes, complex, float, int, str, type(None)))
+    if isinstance(node, ast.Tuple):
+        return all(_immutable_literal(element) for element in node.elts)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        return isinstance(node.operand, ast.Constant) and isinstance(
+            node.operand.value, (int, float, complex)
+        )
+    return False
+
+
+def _safe_module_literal_assignment(tree: ast.Module, statement: ast.AST) -> bool:
+    if not isinstance(statement, ast.Assign) or len(statement.targets) != 1:
+        return False
+    target = statement.targets[0]
+    if not isinstance(target, ast.Name) or target.id in _PROTECTED_CONTRACT_ROOTS:
+        return False
+    if not _immutable_literal(statement.value):
+        return False
+    stores = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name)
+        and node.id == target.id
+        and isinstance(node.ctx, ast.Store)
+    ]
+    loads = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name)
+        and node.id == target.id
+        and isinstance(node.ctx, ast.Load)
+    ]
+    return len(stores) == 1 and not loads
+
+
+def _target_owned_yields(method: ast.FunctionDef | ast.AsyncFunctionDef):
+    pending = list(ast.iter_child_nodes(method))
+    while pending:
+        node = pending.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        if isinstance(node, (ast.Yield, ast.YieldFrom)):
+            yield node
+        pending.extend(ast.iter_child_nodes(node))
+
+
 def _scan_positive_structural_contract(
     tree: ast.Module,
     target_class: ast.ClassDef,
@@ -1377,6 +1656,8 @@ def _scan_positive_structural_contract(
             statement.value, ast.Constant
         ) and isinstance(statement.value.value, str):
             continue
+        if _safe_module_literal_assignment(tree, statement):
+            continue
         _positive_finding(
             findings,
             seen,
@@ -1405,16 +1686,34 @@ def _scan_positive_structural_contract(
             text,
             "the target class must not gain bases or metaclass keywords",
         )
-    for statement in target_class.body:
-        if not isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            _positive_finding(
-                findings,
-                seen,
-                "applicability_contract",
-                statement,
-                text,
-                "the target class permits only direct test methods",
-            )
+    for index, statement in enumerate(target_class.body):
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if (
+            index == 0
+            and isinstance(statement, ast.Expr)
+            and isinstance(statement.value, ast.Constant)
+            and isinstance(statement.value.value, str)
+        ):
+            continue
+        _positive_finding(
+            findings,
+            seen,
+            "applicability_contract",
+            statement,
+            text,
+            "the target class permits only a leading docstring and direct test methods",
+        )
+
+    for yield_node in _target_owned_yields(method):
+        _positive_finding(
+            findings,
+            seen,
+            "signature_contract",
+            yield_node,
+            text,
+            "the target method must not be a generator",
+        )
 
     decorator_dumps = [
         ast.dump(decorator, include_attributes=False)
@@ -1656,6 +1955,11 @@ def _audit_text(text: str, target: str) -> dict[str, object]:
         for node in ast.walk(tree)
         if isinstance(node, ast.ClassDef) and node.name == _TARGET_CLASS
     ]
+    direct_classes = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == _TARGET_CLASS
+    ]
     target_class: ast.ClassDef | None = None
     method: ast.FunctionDef | ast.AsyncFunctionDef | None = None
     if not classes:
@@ -1678,6 +1982,15 @@ def _audit_text(text: str, target: str) -> dict[str, object]:
         )
     else:
         target_class = classes[0]
+        if direct_classes != [target_class]:
+            _positive_finding(
+                findings,
+                seen,
+                "target_location_contract",
+                target_class,
+                text,
+                f"exactly one {_TARGET_CLASS} must be directly in module tree.body",
+            )
         methods = [
             child
             for child in target_class.body
@@ -1817,6 +2130,14 @@ def _scoped_alias_fixture() -> str:
     return _fixture(
         "import time as clock\nclock.sleep(0.01)",
         module_code="def unrelated():\n    import decimal as clock",
+    )
+
+
+def _nested_target_class_fixture() -> str:
+    text = _fixture("pass")
+    start = text.index(f"class {_TARGET_CLASS}:\n")
+    return text[:start] + "def qa_build_hidden_target():\n" + textwrap.indent(
+        text[start:], "    "
     )
 
 
@@ -2106,7 +2427,172 @@ _APPLICABILITY_SELF_TEST_CASES = (
     ),
 )
 
-_SELF_TEST_CASES = _APPLICABILITY_SELF_TEST_CASES + (
+_D8_SELF_TEST_CASES = (
+    (
+        "d8_r1_module_autouse_import_alias_skip",
+        _fixture(
+            "pass",
+            imports="from pytest import fixture as automatic",
+            module_code=(
+                "@automatic(autouse=True)\n"
+                "def qa_alias_guard():\n"
+                "    pytest.skip('alias autouse')"
+            ),
+        ),
+        False,
+        ("skip_or_xfail",),
+    ),
+    (
+        "d8_r2_class_autouse_truthy_integer_skip",
+        _fixture(
+            "pass",
+            class_code=(
+                "@pytest.fixture(autouse=1)\n"
+                "def qa_truthy_guard(self):\n"
+                "    pytest.skip('truthy autouse')"
+            ),
+        ),
+        False,
+        ("skip_or_xfail",),
+    ),
+    (
+        "d8_r3_indirect_default_factory_sleep",
+        _fixture(
+            "pass",
+            imports="import time",
+            module_code=(
+                "def qa_make_default():\n"
+                "    time.sleep(0)\n"
+                "    return None\n"
+                "def qa_indirect_default(value=qa_make_default()):\n"
+                "    return value"
+            ),
+        ),
+        False,
+        ("real_time_primitive",),
+    ),
+    (
+        "d8_r4_return_annotation_sleep",
+        _fixture(
+            "pass",
+            imports="import time",
+            module_code="def qa_return() -> time.sleep(0):\n    pass",
+        ),
+        False,
+        ("real_time_primitive",),
+    ),
+    (
+        "d8_r4_positional_annotation_skip",
+        _fixture(
+            "pass",
+            module_code="def qa_positional(value: pytest.skip('annotation')):\n    pass",
+        ),
+        False,
+        ("skip_or_xfail",),
+    ),
+    (
+        "d8_r4_keyword_annotation_sleep",
+        _fixture(
+            "pass",
+            imports="import time",
+            module_code="def qa_keyword(*, value: time.sleep(0)):\n    pass",
+        ),
+        False,
+        ("real_time_primitive",),
+    ),
+    (
+        "d8_r4_vararg_annotation_skip",
+        _fixture(
+            "pass",
+            module_code="def qa_vararg(*values: pytest.skip('annotation')):\n    pass",
+        ),
+        False,
+        ("skip_or_xfail",),
+    ),
+    (
+        "d8_r4_kwarg_annotation_sleep",
+        _fixture(
+            "pass",
+            imports="import time",
+            module_code="def qa_kwarg(**values: time.sleep(0)):\n    pass",
+        ),
+        False,
+        ("real_time_primitive",),
+    ),
+    (
+        "d8_r5_decorator_function_body_sleep",
+        _fixture(
+            "pass",
+            imports="import time",
+            module_code=(
+                "def qa_decorate(function):\n"
+                "    time.sleep(0)\n"
+                "    return function\n"
+                "@qa_decorate\n"
+                "def qa_decorated():\n"
+                "    pass"
+            ),
+        ),
+        False,
+        ("real_time_primitive",),
+    ),
+    (
+        "d8_r6_wildcard_import_binding_ambiguity",
+        _fixture("pass", module_code="from qa_shadow_star import *"),
+        False,
+        ("binding_contract",),
+    ),
+    (
+        "d8_r7_autouse_global_range_rebind",
+        _fixture(
+            "pass",
+            module_code=(
+                "@pytest.fixture(autouse=True)\n"
+                "def qa_range_rebinder():\n"
+                "    global range\n"
+                "    range = lambda *values: [1, 2]"
+            ),
+        ),
+        False,
+        ("binding_contract",),
+    ),
+    (
+        "d8_r8_generator_target",
+        _fixture("if False:\n    yield None"),
+        False,
+        ("signature_contract",),
+    ),
+    (
+        "d8_r9_target_class_nested_in_factory",
+        _nested_target_class_fixture(),
+        False,
+        ("target_location_contract",),
+    ),
+    (
+        "d8_s1_safe_module_literal_constant",
+        _fixture("pass", module_code="QA_UNRELATED_SENTINEL = 7"),
+        True,
+        (),
+    ),
+    (
+        "d8_s2_safe_target_class_docstring",
+        _fixture("pass", class_code="'QA harmless class documentation'"),
+        True,
+        (),
+    ),
+    (
+        "d8_annotation_postponed_semantics",
+        _fixture(
+            "pass",
+            imports="import time",
+            module_code="def qa_postponed(value: time.sleep(0)) -> pytest.skip('annotation'):\n    pass",
+        ).replace("import pytest\n", "from __future__ import annotations\nimport pytest\n", 1),
+        True,
+        (),
+    ),
+)
+
+_SELF_TEST_CASES = _APPLICABILITY_SELF_TEST_CASES + _D8_SELF_TEST_CASES + (
     ("from_time_sleep_alias", _fixture("nap(0.03)", imports="from time import sleep as nap"), False, ("real_time_primitive",)),
     ("module_time_alias_sleep", _fixture("clock.sleep(0.03)", imports="import time as clock"), False, ("unapproved_symbol",)),
     ("from_time_monotonic_alias", _fixture("tick()", imports="from time import monotonic as tick"), False, ("real_time_primitive",)),
