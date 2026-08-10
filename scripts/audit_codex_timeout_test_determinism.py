@@ -184,6 +184,43 @@ _ORDER_HELPER_ATTRIBUTES = {
     "sorted",
 }
 
+# Names that make the positive contract meaningful.  Their provenance is part
+# of the contract: a lexical ``pytest``/``range``/adapter spelling is not
+# enough if the module can replace the binding before pytest evaluates it.
+_PROTECTED_CONTRACT_ROOTS = {
+    "pytest": {"pytest"},
+    "range": {"range"},
+    "patch": {"unittest.mock.patch"},
+    "SimpleNamespace": {"types.SimpleNamespace"},
+    "_CodexCompletionsAdapter": {
+        "agent.auxiliary_client._CodexCompletionsAdapter"
+    },
+    "aux": {"agent.auxiliary_client"},
+    "len": {"len"},
+    "TimeoutError": {"TimeoutError"},
+    "object": {"object"},
+}
+_PROTECTED_IMPORTS = {
+    "pytest": {"pytest"},
+    "patch": {"unittest.mock.patch"},
+    "SimpleNamespace": {"types.SimpleNamespace"},
+    "_CodexCompletionsAdapter": {
+        "agent.auxiliary_client._CodexCompletionsAdapter"
+    },
+}
+_MODULE_XUNIT_HOOKS = {
+    "setup_module",
+    "teardown_module",
+    "setup_function",
+    "teardown_function",
+}
+_CLASS_XUNIT_HOOKS = {
+    "setup_class",
+    "teardown_class",
+    "setup_method",
+    "teardown_method",
+}
+
 
 class _Scope:
     """Lexical bindings and alias equations for one Python scope."""
@@ -383,6 +420,7 @@ class _Resolver:
                 self._add_assignment(scope, node.target, node.value)
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 scope.local_names.add(node.name)
+                scope.add_binding(node.name, f"<definition:{node.name}>")
             elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
                 scope.local_names.add(node.id)
             elif isinstance(node, ast.ExceptHandler) and node.name:
@@ -855,6 +893,268 @@ def _scan_escape_expression(
                 break
 
 
+def _scan_protected_contract_bindings(
+    tree: ast.Module,
+    method: ast.FunctionDef | ast.AsyncFunctionDef,
+    text: str,
+    resolver: _Resolver,
+    findings: list[dict[str, object]],
+    seen: set[tuple[object, object, object]],
+) -> None:
+    """Require every approved root to retain its reviewed binding identity."""
+    imported: dict[str, set[str]] = {name: set() for name in _PROTECTED_IMPORTS}
+    module_scope = resolver.index.root
+    for node in ast.walk(tree):
+        if resolver.scope(node) is not module_scope:
+            continue
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                bound = alias.asname or alias.name.split(".", 1)[0]
+                canonical = alias.name if alias.asname else bound
+                if bound in imported:
+                    imported[bound].add(canonical)
+        elif isinstance(node, ast.ImportFrom):
+            module = "." * node.level + (node.module or "")
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                bound = alias.asname or alias.name
+                canonical = ".".join(
+                    part for part in (module, alias.name) if part
+                )
+                if bound in imported:
+                    imported[bound].add(canonical)
+
+    for name, expected in _PROTECTED_IMPORTS.items():
+        if imported[name] != expected:
+            _positive_finding(
+                findings,
+                seen,
+                "binding_contract",
+                method,
+                text,
+                f"{name} must have reviewed import provenance {sorted(expected)}; "
+                f"found {sorted(imported[name])}",
+            )
+
+    checked_roots: set[int] = set()
+    for node in ast.walk(method):
+        candidate: ast.AST | None = node.func if isinstance(node, ast.Call) else node
+        if not isinstance(candidate, (ast.Name, ast.Attribute)):
+            continue
+        root_node = candidate
+        while isinstance(root_node, ast.Attribute):
+            root_node = root_node.value
+        if not isinstance(root_node, ast.Name):
+            continue
+        expected = _PROTECTED_CONTRACT_ROOTS.get(root_node.id)
+        if expected is None or id(root_node) in checked_roots:
+            continue
+        checked_roots.add(id(root_node))
+        actual = resolver.reference(root_node, resolver.scope(root_node))
+        if actual != expected:
+            _positive_finding(
+                findings,
+                seen,
+                "binding_contract",
+                root_node,
+                text,
+                f"protected contract root {root_node.id} resolves to "
+                f"{sorted(actual)}, expected {sorted(expected)}",
+            )
+
+    relevant_scopes = {
+        resolver.index.root,
+        resolver.index.owner_scope.get(
+            next(
+                (
+                    node
+                    for node in ast.walk(tree)
+                    if isinstance(node, ast.ClassDef)
+                    and node.name == _TARGET_CLASS
+                ),
+                tree,
+            ),
+            resolver.index.root,
+        ),
+        resolver.index.owner_scope.get(method, resolver.index.root),
+    }
+    for node, scope in resolver.index.scope_by_node.items():
+        if scope not in relevant_scopes:
+            continue
+        name: str | None = None
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            name = node.name
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            name = node.id
+        if name in _PROTECTED_CONTRACT_ROOTS:
+            _positive_finding(
+                findings,
+                seen,
+                "binding_contract",
+                node,
+                text,
+                f"protected contract root is rebound: {name}",
+            )
+
+
+def _scan_applicability_expression(
+    expression: ast.AST,
+    text: str,
+    resolver: _Resolver,
+    findings: list[dict[str, object]],
+    seen: set[tuple[object, object, object]],
+) -> None:
+    _scan_escape_expression(
+        expression,
+        text,
+        resolver,
+        findings,
+        seen,
+        references=True,
+    )
+    for node, symbols in _iter_references(expression, resolver):
+        for symbol in sorted(symbols):
+            classified = _real_time_kind(symbol, node)
+            if classified:
+                kind, detail = classified
+                _append_unique(findings, seen, _finding(kind, node, text, detail))
+                break
+
+
+def _is_autouse_fixture(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> bool:
+    for decorator in node.decorator_list:
+        if not isinstance(decorator, ast.Call):
+            continue
+        if _lexical_path(decorator.func) != "pytest.fixture":
+            continue
+        if any(
+            keyword.arg == "autouse"
+            and isinstance(keyword.value, ast.Constant)
+            and keyword.value.value is True
+            for keyword in decorator.keywords
+        ):
+            return True
+    return False
+
+
+def _scan_definition_import_time(
+    node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef,
+    text: str,
+    resolver: _Resolver,
+    findings: list[dict[str, object]],
+    seen: set[tuple[object, object, object]],
+    *,
+    scan_body: bool,
+) -> None:
+    expressions: list[ast.AST] = [*node.decorator_list]
+    if isinstance(node, ast.ClassDef):
+        expressions.extend([*node.bases, *(keyword.value for keyword in node.keywords)])
+    else:
+        expressions.extend(
+            default
+            for default in [*node.args.defaults, *node.args.kw_defaults]
+            if default is not None
+        )
+    for expression in expressions:
+        _scan_applicability_expression(expression, text, resolver, findings, seen)
+
+    if isinstance(node, ast.ClassDef):
+        for statement in node.body:
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                _scan_definition_import_time(
+                    statement,
+                    text,
+                    resolver,
+                    findings,
+                    seen,
+                    scan_body=(
+                        statement.name in _CLASS_XUNIT_HOOKS
+                        or _is_autouse_fixture(statement)
+                    ),
+                )
+            elif isinstance(statement, ast.ClassDef):
+                _scan_definition_import_time(
+                    statement,
+                    text,
+                    resolver,
+                    findings,
+                    seen,
+                    scan_body=False,
+                )
+            else:
+                _scan_applicability_expression(
+                    statement,
+                    text,
+                    resolver,
+                    findings,
+                    seen,
+                )
+    elif scan_body:
+        for statement in node.body:
+            _scan_applicability_expression(
+                statement,
+                text,
+                resolver,
+                findings,
+                seen,
+            )
+
+
+def _scan_definition_applicability(
+    tree: ast.Module,
+    target_class: ast.ClassDef,
+    text: str,
+    resolver: _Resolver,
+    findings: list[dict[str, object]],
+    seen: set[tuple[object, object, object]],
+) -> None:
+    for statement in tree.body:
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            _scan_definition_import_time(
+                statement,
+                text,
+                resolver,
+                findings,
+                seen,
+                scan_body=(
+                    statement.name in _MODULE_XUNIT_HOOKS
+                    or _is_autouse_fixture(statement)
+                ),
+            )
+        elif isinstance(statement, ast.ClassDef):
+            _scan_definition_import_time(
+                statement,
+                text,
+                resolver,
+                findings,
+                seen,
+                scan_body=False,
+            )
+        else:
+            _scan_applicability_expression(
+                statement,
+                text,
+                resolver,
+                findings,
+                seen,
+            )
+
+    # The target class is the one class whose xunit hooks and autouse fixtures
+    # can change the selected test's applicability.  Its class-body
+    # expressions also execute while pytest builds the class.
+    _scan_definition_import_time(
+        target_class,
+        text,
+        resolver,
+        findings,
+        seen,
+        scan_body=False,
+    )
+
+
 def _is_pytestmark_target(target: ast.AST) -> bool:
     return any(path.rsplit(".", 1)[-1] == "pytestmark" for path in _assignment_paths(target))
 
@@ -961,6 +1261,14 @@ def _scan_applicability(
         findings,
         seen,
     )
+    _scan_definition_applicability(
+        tree,
+        target_class,
+        text,
+        resolver,
+        findings,
+        seen,
+    )
 
 
 _APPROVED_CALLABLE_PATHS = {
@@ -1028,10 +1336,20 @@ def _scan_positive_structural_contract(
     target_class: ast.ClassDef,
     method: ast.FunctionDef | ast.AsyncFunctionDef,
     text: str,
+    resolver: _Resolver,
     findings: list[dict[str, object]],
     seen: set[tuple[object, object, object]],
 ) -> None:
     """Fail closed on any target structure outside the reviewed safe vocabulary."""
+    if isinstance(method, ast.AsyncFunctionDef):
+        _positive_finding(
+            findings,
+            seen,
+            "signature_contract",
+            method,
+            text,
+            "the target method must be a synchronous FunctionDef",
+        )
 
     for statement in tree.body:
         if isinstance(
@@ -1301,6 +1619,15 @@ def _scan_positive_structural_contract(
                 "ordering and upper-bound expressions require an exact positive AST allowlist occurrence",
             )
 
+    _scan_protected_contract_bindings(
+        tree,
+        method,
+        text,
+        resolver,
+        findings,
+        seen,
+    )
+
 
 def _audit_text(text: str, target: str) -> dict[str, object]:
     tree = ast.parse(text, filename=target)
@@ -1368,6 +1695,7 @@ def _audit_text(text: str, target: str) -> dict[str, object]:
             target_class,
             method,
             text,
+            resolver,
             findings,
             seen,
         )
@@ -1407,7 +1735,12 @@ def _fixture(
     method_decorators: str = "",
     parameters: str = "self, case",
 ) -> str:
-    lines: list[str] = []
+    lines: list[str] = [
+        "import pytest",
+        "from types import SimpleNamespace",
+        "from unittest.mock import patch",
+        "from agent.auxiliary_client import _CodexCompletionsAdapter",
+    ]
     lines.extend(line for line in imports.splitlines() if line.strip())
     lines.extend(line for line in module_code.splitlines() if line.strip())
     lines.extend(line for line in class_decorators.splitlines() if line.strip())
@@ -1471,7 +1804,144 @@ def _scoped_alias_fixture() -> str:
     )
 
 
-_SELF_TEST_CASES = (
+_APPLICABILITY_SELF_TEST_CASES = (
+    (
+        "applicability_module_range_shadow",
+        _fixture(
+            "pass",
+            imports="import pytest",
+            module_code=(
+                "import builtins as _review_builtins\n"
+                "def range(*args):\n"
+                "    if args == (1000,):\n"
+                "        return _review_builtins.range(1)\n"
+                "    return _review_builtins.range(*args)"
+            ),
+        ),
+        False,
+        ("binding_contract",),
+    ),
+    (
+        "applicability_setup_method_skip",
+        _fixture(
+            "pass",
+            imports="import pytest",
+            class_code='def setup_method(self):\n    pytest.skip("setup bypass")',
+        ),
+        False,
+        ("skip_or_xfail",),
+    ),
+    (
+        "applicability_setup_method_xfail",
+        _fixture(
+            "pass",
+            imports="import pytest",
+            class_code='def setup_method(self):\n    pytest.xfail("setup bypass")',
+        ),
+        False,
+        ("skip_or_xfail",),
+    ),
+    (
+        "applicability_setup_method_sleep",
+        _fixture(
+            "pass",
+            imports="import pytest\nimport time",
+            class_code="def setup_method(self):\n    time.sleep(0.001)",
+        ),
+        False,
+        ("real_time_primitive",),
+    ),
+    (
+        "applicability_teardown_method_sleep",
+        _fixture(
+            "pass",
+            imports="import pytest\nimport time",
+            class_code="def teardown_method(self):\n    time.sleep(0.001)",
+        ),
+        False,
+        ("real_time_primitive",),
+    ),
+    (
+        "applicability_class_autouse_fixture",
+        _fixture(
+            "pass",
+            imports="import pytest",
+            class_code=(
+                "@pytest.fixture(autouse=True)\n"
+                "def _review_autouse(self):\n"
+                "    pytest.skip(\"fixture bypass\")"
+            ),
+        ),
+        False,
+        ("skip_or_xfail",),
+    ),
+    (
+        "applicability_module_setup_module",
+        _fixture(
+            "pass",
+            imports="import pytest",
+            module_code='def setup_module(module):\n    pytest.skip("module bypass")',
+        ),
+        False,
+        ("skip_or_xfail",),
+    ),
+    (
+        "applicability_module_default_skip",
+        _fixture(
+            "pass",
+            imports="import pytest",
+            module_code='def _review_default(value=pytest.skip("default bypass")):\n    pass',
+        ),
+        False,
+        ("skip_or_xfail",),
+    ),
+    (
+        "applicability_module_default_sleep",
+        _fixture(
+            "pass",
+            imports="import pytest\nimport time",
+            module_code="def _review_default(value=time.sleep(0.001)):\n    pass",
+        ),
+        False,
+        ("real_time_primitive",),
+    ),
+    (
+        "applicability_module_pytest_shadow",
+        _fixture(
+            "pass",
+            imports="import pytest",
+            module_code="class pytest:\n    mark = pytest.mark\n    raises = pytest.raises",
+        ),
+        False,
+        ("binding_contract",),
+    ),
+    (
+        "applicability_module_production_adapter_shadow",
+        _fixture(
+            "pass",
+            imports="from agent.auxiliary_client import _CodexCompletionsAdapter",
+            module_code=(
+                "class _CodexCompletionsAdapter:\n"
+                "    def create(self, **kwargs):\n"
+                "        raise TimeoutError"
+            ),
+        ),
+        False,
+        ("binding_contract",),
+    ),
+    (
+        "applicability_async_target_conversion",
+        _fixture("pass").replace(
+            f"    def {_TARGET_TEST}(",
+            f"    async def {_TARGET_TEST}(",
+            1,
+        ),
+        False,
+        ("signature_contract",),
+    ),
+)
+
+_SELF_TEST_CASES = _APPLICABILITY_SELF_TEST_CASES + (
     ("from_time_sleep_alias", _fixture("nap(0.03)", imports="from time import sleep as nap"), False, ("real_time_primitive",)),
     ("module_time_alias_sleep", _fixture("clock.sleep(0.03)", imports="import time as clock"), False, ("unapproved_symbol",)),
     ("from_time_monotonic_alias", _fixture("tick()", imports="from time import monotonic as tick"), False, ("real_time_primitive",)),
