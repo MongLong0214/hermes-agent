@@ -66,6 +66,124 @@ _PARTIALS = {"partial", "functools.partial"}
 _LESS_THAN_FUNCTIONS = {"lt", "le", "operator.lt", "operator.le"}
 _GREATER_THAN_FUNCTIONS = {"gt", "ge", "operator.gt", "operator.ge"}
 
+# Positive structural contract for the owned target.  The audit does not try to
+# prove arbitrary Python dataflow.  Instead, the target may use only the names
+# and attributes already needed by the deterministic virtual-clock oracle.
+# Any new symbol or higher-order shape fails closed until it is reviewed and
+# explicitly added here.
+_APPROVED_TARGET_NAMES = {
+    "FakeResponses",
+    "SimpleNamespace",
+    "TimeoutError",
+    "_CodexCompletionsAdapter",
+    "_ObservableTimer",
+    "_SlowAliveCreateStream",
+    "_VirtualClock",
+    "adapter",
+    "aux",
+    "case",
+    "client_close_count",
+    "clock",
+    "consumed_events",
+    "event_number",
+    "fake_client",
+    "function",
+    "instances",
+    "interval",
+    "kwargs",
+    "len",
+    "milliseconds",
+    "patch",
+    "pytest",
+    "range",
+    "request_kwargs",
+    "self",
+    "stream_close_count",
+    "timer",
+}
+_APPROVED_TARGET_ATTRIBUTES = {
+    "__class__",
+    "advance",
+    "append",
+    "cancelled",
+    "create",
+    "function",
+    "instances",
+    "interval",
+    "mark",
+    "monotonic",
+    "now_ms",
+    "object",
+    "parametrize",
+    "raises",
+    "started",
+    "threading",
+    "time",
+    "timestamps_ms",
+    "update",
+}
+_APPROVED_NESTED_DEFINITIONS = {
+    "FakeResponses",
+    "_ObservableTimer",
+    "_SlowAliveCreateStream",
+    "_VirtualClock",
+    "__init__",
+    "__iter__",
+    "advance",
+    "cancel",
+    "close",
+    "create",
+    "monotonic",
+    "start",
+}
+_APPROVED_ARGUMENT_NAMES = {
+    "case",
+    "function",
+    "interval",
+    "kwargs",
+    "milliseconds",
+    "self",
+}
+_APPROVED_METHOD_DECORATOR = ast.dump(
+    ast.parse('@pytest.mark.parametrize("case", range(1000))\ndef _target(self, case):\n    pass\n').body[0].decorator_list[0],
+    include_attributes=False,
+)
+_APPROVED_METHOD_ARGUMENTS = ast.dump(
+    ast.parse("def _target(self, case):\n    pass\n").body[0].args,
+    include_attributes=False,
+)
+_APPROVED_PATCH_CALLS = {
+    "monotonic": ast.dump(
+        ast.parse('patch.object(aux.time, "monotonic", clock.monotonic)', mode="eval").body,
+        include_attributes=False,
+    ),
+    "timer": ast.dump(
+        ast.parse('patch.object(aux.threading, "Timer", _ObservableTimer)', mode="eval").body,
+        include_attributes=False,
+    ),
+}
+_APPROVED_AUX_IMPORT = ast.dump(
+    ast.parse("import agent.auxiliary_client as aux").body[0],
+    include_attributes=False,
+)
+# There are intentionally no ordering expressions in the current target.
+# Future safe order expressions require an exact AST occurrence here, rather
+# than another elapsed-dataflow heuristic.
+_APPROVED_ORDER_EXPRESSIONS: frozenset[str] = frozenset()
+_ORDER_HELPER_ATTRIBUTES = {
+    "__ge__",
+    "__gt__",
+    "__le__",
+    "__lt__",
+    "ge",
+    "gt",
+    "le",
+    "lt",
+    "max",
+    "min",
+    "sorted",
+}
+
 
 class _Scope:
     """Lexical bindings and alias equations for one Python scope."""
@@ -845,6 +963,345 @@ def _scan_applicability(
     )
 
 
+_APPROVED_CALLABLE_PATHS = {
+    "FakeResponses",
+    "SimpleNamespace",
+    "_CodexCompletionsAdapter",
+    "_SlowAliveCreateStream",
+    "_VirtualClock",
+    "adapter.create",
+    "client_close_count.append",
+    "clock.advance",
+    "clock.monotonic",
+    "consumed_events.append",
+    "len",
+    "patch.object",
+    "pytest.mark.parametrize",
+    "pytest.raises",
+    "range",
+    "request_kwargs.update",
+    "self.__class__.instances.append",
+    "self.timestamps_ms.append",
+    "stream_close_count.append",
+}
+_APPROVED_LAMBDA = ast.dump(
+    ast.parse("lambda: client_close_count.append(True)", mode="eval").body,
+    include_attributes=False,
+)
+
+
+def _parent_map(root: ast.AST) -> dict[ast.AST, ast.AST]:
+    return {
+        child: parent
+        for parent in ast.walk(root)
+        for child in ast.iter_child_nodes(parent)
+    }
+
+
+def _inside_approved_patch(
+    node: ast.AST,
+    parents: dict[ast.AST, ast.AST],
+) -> bool:
+    current: ast.AST | None = node
+    while current is not None:
+        if isinstance(current, ast.Call) and ast.dump(
+            current, include_attributes=False
+        ) in _APPROVED_PATCH_CALLS.values():
+            return True
+        current = parents.get(current)
+    return False
+
+
+def _positive_finding(
+    findings: list[dict[str, object]],
+    seen: set[tuple[object, object, object]],
+    kind: str,
+    node: ast.AST,
+    text: str,
+    detail: str,
+) -> None:
+    _append_unique(findings, seen, _finding(kind, node, text, detail))
+
+
+def _scan_positive_structural_contract(
+    tree: ast.Module,
+    target_class: ast.ClassDef,
+    method: ast.FunctionDef | ast.AsyncFunctionDef,
+    text: str,
+    findings: list[dict[str, object]],
+    seen: set[tuple[object, object, object]],
+) -> None:
+    """Fail closed on any target structure outside the reviewed safe vocabulary."""
+
+    for statement in tree.body:
+        if isinstance(
+            statement,
+            (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+        ):
+            continue
+        if isinstance(statement, ast.Expr) and isinstance(
+            statement.value, ast.Constant
+        ) and isinstance(statement.value.value, str):
+            continue
+        _positive_finding(
+            findings,
+            seen,
+            "applicability_contract",
+            statement,
+            text,
+            "module applicability permits only imports, definitions, and the module docstring",
+        )
+
+    if target_class.decorator_list:
+        for decorator in target_class.decorator_list:
+            _positive_finding(
+                findings,
+                seen,
+                "decorator_contract",
+                decorator,
+                text,
+                "the target class must remain undecorated",
+            )
+    if target_class.bases or target_class.keywords:
+        _positive_finding(
+            findings,
+            seen,
+            "applicability_contract",
+            target_class,
+            text,
+            "the target class must not gain bases or metaclass keywords",
+        )
+    for statement in target_class.body:
+        if not isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            _positive_finding(
+                findings,
+                seen,
+                "applicability_contract",
+                statement,
+                text,
+                "the target class permits only direct test methods",
+            )
+
+    decorator_dumps = [
+        ast.dump(decorator, include_attributes=False)
+        for decorator in method.decorator_list
+    ]
+    if decorator_dumps != [_APPROVED_METHOD_DECORATOR]:
+        node = method.decorator_list[0] if method.decorator_list else method
+        _positive_finding(
+            findings,
+            seen,
+            "decorator_contract",
+            node,
+            text,
+            "expected only @pytest.mark.parametrize('case', range(1000))",
+        )
+    if ast.dump(method.args, include_attributes=False) != _APPROVED_METHOD_ARGUMENTS:
+        _positive_finding(
+            findings,
+            seen,
+            "signature_contract",
+            method,
+            text,
+            "expected exact target signature (self, case) with no defaults",
+        )
+
+    method_nodes = list(ast.walk(method))
+    imports = [
+        node for node in method_nodes if isinstance(node, (ast.Import, ast.ImportFrom))
+    ]
+    exact_aux_imports = sum(
+        ast.dump(node, include_attributes=False) == _APPROVED_AUX_IMPORT
+        for node in imports
+    )
+    if exact_aux_imports != 1 or len(imports) != 1:
+        node = imports[0] if imports else method
+        _positive_finding(
+            findings,
+            seen,
+            "target_import_contract",
+            node,
+            text,
+            "expected exactly one target-local import: import agent.auxiliary_client as aux",
+        )
+
+    for node in method_nodes:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node is not method:
+            if node.name not in _APPROVED_NESTED_DEFINITIONS:
+                _positive_finding(
+                    findings,
+                    seen,
+                    "unapproved_definition",
+                    node,
+                    text,
+                    f"unapproved nested function: {node.name}",
+                )
+            if node.decorator_list or node.args.defaults or any(
+                default is not None for default in node.args.kw_defaults
+            ):
+                _positive_finding(
+                    findings,
+                    seen,
+                    "higher_order_contract",
+                    node,
+                    text,
+                    "nested decorators and default captures are not approved",
+                )
+        elif isinstance(node, ast.ClassDef) and node is not target_class:
+            if node.name not in _APPROVED_NESTED_DEFINITIONS:
+                _positive_finding(
+                    findings,
+                    seen,
+                    "unapproved_definition",
+                    node,
+                    text,
+                    f"unapproved nested class: {node.name}",
+                )
+            if node.decorator_list or node.bases or node.keywords:
+                _positive_finding(
+                    findings,
+                    seen,
+                    "higher_order_contract",
+                    node,
+                    text,
+                    "nested class decorators, bases, and keywords are not approved",
+                )
+        elif isinstance(node, ast.arg) and node.arg not in _APPROVED_ARGUMENT_NAMES:
+            _positive_finding(
+                findings,
+                seen,
+                "unapproved_symbol",
+                node,
+                text,
+                f"unapproved argument symbol: {node.arg}",
+            )
+        elif isinstance(node, ast.Name) and node.id not in _APPROVED_TARGET_NAMES:
+            _positive_finding(
+                findings,
+                seen,
+                "unapproved_symbol",
+                node,
+                text,
+                f"unapproved target symbol: {node.id}",
+            )
+        elif isinstance(node, ast.Attribute) and node.attr not in _APPROVED_TARGET_ATTRIBUTES:
+            _positive_finding(
+                findings,
+                seen,
+                "unapproved_symbol",
+                node,
+                text,
+                f"unapproved target attribute: {node.attr}",
+            )
+
+    for node in method_nodes:
+        if isinstance(node, ast.Call):
+            path = _lexical_path(node.func)
+            if path not in _APPROVED_CALLABLE_PATHS:
+                _positive_finding(
+                    findings,
+                    seen,
+                    "higher_order_contract",
+                    node,
+                    text,
+                    "call target is outside the reviewed deterministic callable allowlist",
+                )
+        elif isinstance(node, ast.Lambda):
+            if ast.dump(node, include_attributes=False) != _APPROVED_LAMBDA:
+                _positive_finding(
+                    findings,
+                    seen,
+                    "higher_order_contract",
+                    node,
+                    text,
+                    "lambda capture is outside the single reviewed fake-client close shape",
+                )
+        elif isinstance(
+            node,
+            (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp, ast.NamedExpr),
+        ):
+            _positive_finding(
+                findings,
+                seen,
+                "higher_order_contract",
+                node,
+                text,
+                "comprehension, generator, or walrus indirection is not approved",
+            )
+
+    parents = _parent_map(method)
+    patch_counts = {name: 0 for name in _APPROVED_PATCH_CALLS}
+    for node in method_nodes:
+        if isinstance(node, ast.Call):
+            dump = ast.dump(node, include_attributes=False)
+            for name, approved in _APPROVED_PATCH_CALLS.items():
+                if dump == approved:
+                    patch_counts[name] += 1
+    for name, count in patch_counts.items():
+        if count != 1:
+            _positive_finding(
+                findings,
+                seen,
+                "patch_contract",
+                method,
+                text,
+                f"expected exactly one approved {name} patch.object call, found {count}",
+            )
+
+    for node in method_nodes:
+        lexical = _lexical_path(node) if isinstance(node, (ast.Name, ast.Attribute)) else None
+        production_reference = bool(
+            lexical
+            and (
+                lexical == "aux.time"
+                or lexical.startswith("aux.time.")
+                or lexical == "aux.threading"
+                or lexical.startswith("aux.threading.")
+            )
+        )
+        patch_string = isinstance(node, ast.Constant) and node.value in {
+            "Timer",
+            "monotonic",
+        }
+        if (production_reference or patch_string) and not _inside_approved_patch(
+            node, parents
+        ):
+            _positive_finding(
+                findings,
+                seen,
+                "real_time_primitive",
+                node,
+                text,
+                "production time/threading symbols are allowed only in the two exact virtual replacement patches",
+            )
+
+    for node in method_nodes:
+        dump = ast.dump(node, include_attributes=False)
+        forbidden_order = isinstance(node, ast.Compare) and any(
+            isinstance(operator, (ast.Lt, ast.LtE, ast.Gt, ast.GtE))
+            for operator in node.ops
+        )
+        if isinstance(node, ast.Call):
+            path = _lexical_path(node.func)
+            terminal = (
+                path.rsplit(".", 1)[-1]
+                if path
+                else node.func.attr
+                if isinstance(node.func, ast.Attribute)
+                else ""
+            )
+            forbidden_order = forbidden_order or terminal in _ORDER_HELPER_ATTRIBUTES
+        if forbidden_order and dump not in _APPROVED_ORDER_EXPRESSIONS:
+            _positive_finding(
+                findings,
+                seen,
+                "wall_clock_bound",
+                node,
+                text,
+                "ordering and upper-bound expressions require an exact positive AST allowlist occurrence",
+            )
+
+
 def _audit_text(text: str, target: str) -> dict[str, object]:
     tree = ast.parse(text, filename=target)
     resolver = _Resolver(tree)
@@ -906,6 +1363,14 @@ def _audit_text(text: str, target: str) -> dict[str, object]:
             method = methods[0]
 
     if target_class is not None and method is not None:
+        _scan_positive_structural_contract(
+            tree,
+            target_class,
+            method,
+            text,
+            findings,
+            seen,
+        )
         _scan_real_time(method, text, resolver, findings, seen)
         _scan_wall_clock_bounds(method, text, resolver, findings, seen)
         _scan_applicability(
@@ -940,7 +1405,7 @@ def _fixture(
     class_code: str = "",
     class_decorators: str = "",
     method_decorators: str = "",
-    parameters: str = "self",
+    parameters: str = "self, case",
 ) -> str:
     lines: list[str] = []
     lines.extend(line for line in imports.splitlines() if line.strip())
@@ -948,9 +1413,27 @@ def _fixture(
     lines.extend(line for line in class_decorators.splitlines() if line.strip())
     lines.append(f"class {_TARGET_CLASS}:")
     lines.extend(f"    {line}" for line in class_code.splitlines() if line.strip())
+    lines.append('    @pytest.mark.parametrize("case", range(1000))')
     lines.extend(f"    {line}" for line in method_decorators.splitlines() if line.strip())
     lines.append(f"    def {_TARGET_TEST}({parameters}):")
     lines.extend(textwrap.indent(body, "        ").splitlines())
+    safety_scaffold = textwrap.dedent(
+        """\
+        class _VirtualClock:
+            def monotonic(self):
+                return 0.0
+        class _ObservableTimer:
+            pass
+        clock = _VirtualClock()
+        import agent.auxiliary_client as aux
+        with (
+            patch.object(aux.time, "monotonic", clock.monotonic),
+            patch.object(aux.threading, "Timer", _ObservableTimer),
+        ):
+            pass
+        """
+    )
+    lines.extend(textwrap.indent(safety_scaffold, "        ").splitlines())
     return "\n".join(lines) + "\n"
 
 
@@ -990,7 +1473,7 @@ def _scoped_alias_fixture() -> str:
 
 _SELF_TEST_CASES = (
     ("from_time_sleep_alias", _fixture("nap(0.03)", imports="from time import sleep as nap"), False, ("real_time_primitive",)),
-    ("module_time_alias_sleep", _fixture("clock.sleep(0.03)", imports="import time as clock"), False, ("real_time_primitive",)),
+    ("module_time_alias_sleep", _fixture("clock.sleep(0.03)", imports="import time as clock"), False, ("unapproved_symbol",)),
     ("from_time_monotonic_alias", _fixture("tick()", imports="from time import monotonic as tick"), False, ("real_time_primitive",)),
     ("module_threading_timer_alias", _fixture("th.Timer(1, lambda: None)", imports="import threading as th"), False, ("real_timer_constructor",)),
     ("from_threading_timer_alias", _fixture("Alarm(1, lambda: None)", imports="from threading import Timer as Alarm"), False, ("real_timer_constructor",)),
@@ -1037,6 +1520,49 @@ _SELF_TEST_CASES = (
     ("operator_elapsed_bound", _fixture("elapsed = 0.1\nassert operator.lt(elapsed, 0.2)", imports="import operator"), False, ("wall_clock_bound",)),
     ("dunder_elapsed_bound", _fixture("elapsed = 0.1\nassert elapsed.__lt__(0.2)"), False, ("wall_clock_bound",)),
     ("negated_elapsed_bound", _fixture("elapsed = 0.1\nassert not elapsed >= 0.2"), False, ("wall_clock_bound",)),
+    ("positive_module_list_callback", _fixture("_review_callbacks[0]", module_code="_review_callbacks = [time.sleep]"), False, ("applicability_contract", "unapproved_symbol")),
+    ("positive_module_tuple_callback", _fixture("_review_callbacks[0]", module_code="_review_callbacks = (time.sleep,)"), False, ("applicability_contract", "unapproved_symbol")),
+    ("positive_module_dict_callback", _fixture("_review_callbacks['callback']", module_code="_review_callbacks = {'callback': time.sleep}"), False, ("applicability_contract", "unapproved_symbol")),
+    ("positive_multihop_attribute", _fixture("_review_holder.layer.callback", module_code="class _ReviewLayer:\n    callback = time.sleep\nclass _ReviewHolder:\n    layer = _ReviewLayer()\n_review_holder = _ReviewHolder()"), False, ("applicability_contract", "unapproved_symbol")),
+    ("positive_function_return", _fixture("_review_factory()", module_code="def _review_factory():\n    return time.sleep"), False, ("unapproved_symbol", "higher_order_contract")),
+    ("positive_lambda_default", _fixture("_review_probe = lambda source=time.sleep: source", imports="import time"), False, ("higher_order_contract", "unapproved_symbol")),
+    ("positive_function_default", _fixture("def create(self, function=time.sleep):\n    return function", imports="import time"), False, ("higher_order_contract", "unapproved_symbol")),
+    ("positive_nested_closure", _fixture("def create(self):\n    def _review_read():\n        return time.sleep\n    return _review_read", imports="import time"), False, ("unapproved_definition", "unapproved_symbol")),
+    ("positive_list_comprehension", _fixture("_review_values = [value for value in [time.sleep]]", imports="import time"), False, ("higher_order_contract", "unapproved_symbol")),
+    ("positive_generator_expression", _fixture("_review_values = (value for value in [time.sleep])", imports="import time"), False, ("higher_order_contract", "unapproved_symbol")),
+    ("positive_callback_argument", _fixture("SimpleNamespace(close=time.sleep)", imports="import time"), False, ("unapproved_symbol",)),
+    ("positive_dynamic_vars", _fixture("vars(time)['sleep']", imports="import time"), False, ("unapproved_symbol", "higher_order_contract")),
+    ("positive_condition_wait", _fixture("condition.wait"), False, ("unapproved_symbol",)),
+    ("positive_queue_timeout", _fixture("queue.get(timeout=0.01)"), False, ("unapproved_symbol", "higher_order_contract")),
+    ("positive_select_wait", _fixture("select.select([], [], [], 0.01)"), False, ("unapproved_symbol", "higher_order_contract")),
+    ("positive_thread_join", _fixture("worker.join(0.01)"), False, ("unapproved_symbol", "higher_order_contract")),
+    ("positive_process_wait", _fixture("process.wait(timeout=0.01)"), False, ("unapproved_symbol", "higher_order_contract")),
+    ("positive_socket_timeout", _fixture("sock.settimeout(0.01)"), False, ("unapproved_symbol", "higher_order_contract")),
+    ("positive_reruns_escape", _fixture("pytest.mark.reruns"), False, ("unapproved_symbol",)),
+    ("positive_decorator_factory", _fixture("pass", module_code="def _review_mark_factory(mark=pytest.mark.skip):\n    return mark", method_decorators="@_review_mark_factory()"), False, ("decorator_contract", "unapproved_symbol")),
+    ("positive_indexed_decorator", _fixture("pass", module_code="_review_marks = [pytest.mark.skip]", method_decorators="@_review_marks[0]"), False, ("decorator_contract", "applicability_contract")),
+    ("positive_factory_pytestmark", _fixture("pass", module_code="def _review_mark_factory():\n    return pytest.mark.skip\npytestmark = _review_mark_factory()"), False, ("applicability_contract",)),
+    ("positive_class_pytestmark_factory", _fixture("pass", module_code="def _review_mark_factory():\n    return pytest.mark.skip", class_code="pytestmark = _review_mark_factory()"), False, ("applicability_contract",)),
+    ("positive_virtual_lt", _fixture("assert clock.monotonic() < 1"), False, ("wall_clock_bound",)),
+    ("positive_virtual_lte", _fixture("assert clock.monotonic() <= 1"), False, ("wall_clock_bound",)),
+    ("positive_virtual_operator_lt", _fixture("assert operator.lt(clock.monotonic(), 1)", imports="import operator"), False, ("wall_clock_bound",)),
+    ("positive_virtual_dunder_lt", _fixture("assert clock.monotonic().__lt__(1)"), False, ("wall_clock_bound",)),
+    ("positive_virtual_min_bound", _fixture("assert min(clock.monotonic(), 0.5) < 1"), False, ("wall_clock_bound",)),
+    ("positive_virtual_max_bound", _fixture("assert max(clock.monotonic(), 0.5) <= 1"), False, ("wall_clock_bound",)),
+    ("positive_virtual_not_ge", _fixture("assert not clock.monotonic() >= 1"), False, ("wall_clock_bound",)),
+    ("positive_bad_monotonic_replacement", _fixture().replace("clock.monotonic),", "_ObservableTimer),", 1), False, ("patch_contract",)),
+    ("positive_bad_timer_replacement", _fixture().replace("_ObservableTimer),", "clock.monotonic),", 1), False, ("patch_contract",)),
+    ("positive_missing_monotonic_patch", _fixture().replace('            patch.object(aux.time, "monotonic", clock.monotonic),\n', "", 1), False, ("patch_contract",)),
+    ("positive_missing_timer_patch", _fixture().replace('            patch.object(aux.threading, "Timer", _ObservableTimer),\n', "", 1), False, ("patch_contract",)),
+    ("positive_duplicate_monotonic_patch", _fixture().replace('            patch.object(aux.time, "monotonic", clock.monotonic),\n', '            patch.object(aux.time, "monotonic", clock.monotonic),\n            patch.object(aux.time, "monotonic", clock.monotonic),\n', 1), False, ("patch_contract",)),
+    ("positive_direct_aux_clock", _fixture("aux.time.monotonic", imports="import agent.auxiliary_client as aux"), False, ("real_time_primitive",)),
+    ("positive_direct_aux_timer", _fixture("aux.threading.Timer", imports="import agent.auxiliary_client as aux"), False, ("real_time_primitive",)),
+    ("positive_extra_target_import", _fixture("import time"), False, ("target_import_contract",)),
+    ("positive_signature_default", _fixture("pass", parameters="self, case=0"), False, ("signature_contract",)),
+    ("positive_safe_equality", _fixture("assert case == case"), True, ()),
+    ("positive_safe_count_equality", _fixture("consumed_events = []\nassert len(consumed_events) == 0"), True, ()),
+    ("positive_safe_virtual_reference", _fixture("assert clock.monotonic() == 0.0"), True, ()),
+    ("positive_safe_patch_quotes", _fixture().replace('"monotonic"', "'monotonic'", 1).replace('"Timer"', "'Timer'", 1), True, ()),
     ("duplicate_target_class", _duplicate_class_fixture(), False, ("duplicate_target_class",)),
     ("duplicate_target_method", _duplicate_method_fixture(), False, ("duplicate_target_method",)),
     ("safe_virtual_clock", _fixture(textwrap.dedent("""\
