@@ -209,12 +209,14 @@ _PROTECTED_IMPORTS = {
     },
 }
 _MODULE_XUNIT_HOOKS = {
+    "pytest_generate_tests",
     "setup_module",
     "teardown_module",
     "setup_function",
     "teardown_function",
 }
 _CLASS_XUNIT_HOOKS = {
+    "pytest_generate_tests",
     "setup_class",
     "teardown_class",
     "setup_method",
@@ -1048,6 +1050,7 @@ def _scan_definition_import_time(
     seen: set[tuple[object, object, object]],
     *,
     scan_body: bool,
+    scan_nested_bodies: bool = True,
 ) -> None:
     expressions: list[ast.AST] = [*node.decorator_list]
     if isinstance(node, ast.ClassDef):
@@ -1070,7 +1073,8 @@ def _scan_definition_import_time(
                     resolver,
                     findings,
                     seen,
-                    scan_body=(
+                    scan_body=scan_nested_bodies
+                    and (
                         statement.name in _CLASS_XUNIT_HOOKS
                         or _is_autouse_fixture(statement)
                     ),
@@ -1083,6 +1087,7 @@ def _scan_definition_import_time(
                     findings,
                     seen,
                     scan_body=False,
+                    scan_nested_bodies=False,
                 )
             else:
                 _scan_applicability_expression(
@@ -1093,6 +1098,15 @@ def _scan_definition_import_time(
                     seen,
                 )
     elif scan_body:
+        if node.name == "pytest_generate_tests":
+            _positive_finding(
+                findings,
+                seen,
+                "applicability_contract",
+                node,
+                text,
+                "pytest_generate_tests hook semantics are not proven; reject the definition",
+            )
         for statement in node.body:
             _scan_applicability_expression(
                 statement,
@@ -1132,6 +1146,7 @@ def _scan_definition_applicability(
                 findings,
                 seen,
                 scan_body=False,
+                scan_nested_bodies=statement is target_class,
             )
         else:
             _scan_applicability_expression(
@@ -1152,6 +1167,7 @@ def _scan_definition_applicability(
         findings,
         seen,
         scan_body=False,
+        scan_nested_bodies=True,
     )
 
 
@@ -1805,6 +1821,155 @@ def _scoped_alias_fixture() -> str:
 
 
 _APPLICABILITY_SELF_TEST_CASES = (
+    (
+        "applicability_module_pytest_generate_tests_skip",
+        _fixture(
+            "pass",
+            module_code=(
+                "def pytest_generate_tests(metafunc):\n"
+                "    pytest.skip(\"module bypass\", allow_module_level=True)"
+            ),
+        ),
+        False,
+        ("skip_or_xfail",),
+    ),
+    (
+        "applicability_class_pytest_generate_tests_skip",
+        _fixture(
+            "pass",
+            class_code=(
+                "def pytest_generate_tests(self, metafunc):\n"
+                "    pytest.skip(\"class bypass\")"
+            ),
+        ),
+        False,
+        ("skip_or_xfail",),
+    ),
+    (
+        "applicability_module_pytest_generate_tests_xfail",
+        _fixture(
+            "pass",
+            module_code=(
+                "def pytest_generate_tests(metafunc):\n"
+                "    pytest.xfail(\"module bypass\")"
+            ),
+        ),
+        False,
+        ("skip_or_xfail",),
+    ),
+    (
+        "applicability_class_pytest_generate_tests_xfail",
+        _fixture(
+            "pass",
+            class_code=(
+                "def pytest_generate_tests(self, metafunc):\n"
+                "    pytest.xfail(\"class bypass\")"
+            ),
+        ),
+        False,
+        ("skip_or_xfail",),
+    ),
+    (
+        "applicability_module_pytest_generate_tests_collection_reduction",
+        _fixture(
+            "pass",
+            module_code=(
+                "def pytest_generate_tests(metafunc):\n"
+                "    metafunc.parametrize(\"case\", range(1))"
+            ),
+        ),
+        False,
+        ("applicability_contract",),
+    ),
+    (
+        "applicability_class_pytest_generate_tests_parameter_mutation",
+        _fixture(
+            "pass",
+            class_code=(
+                "def pytest_generate_tests(self, metafunc):\n"
+                "    metafunc.parametrize(\"case\", range(1))"
+            ),
+        ),
+        False,
+        ("applicability_contract",),
+    ),
+    (
+        "applicability_module_pytest_generate_tests_retry_marker",
+        _fixture(
+            "pass",
+            module_code=(
+                "def pytest_generate_tests(metafunc):\n"
+                "    metafunc.definition.add_marker(pytest.mark.retry)"
+            ),
+        ),
+        False,
+        ("retry_or_repeat", "applicability_contract"),
+    ),
+    (
+        "applicability_class_pytest_generate_tests_retry_marker",
+        _fixture(
+            "pass",
+            class_code=(
+                "def pytest_generate_tests(self, metafunc):\n"
+                "    metafunc.definition.add_marker(pytest.mark.retry)"
+            ),
+        ),
+        False,
+        ("retry_or_repeat", "applicability_contract"),
+    ),
+    (
+        "applicability_module_pytest_generate_tests_real_time",
+        _fixture(
+            "pass",
+            imports="import time",
+            module_code=(
+                "def pytest_generate_tests(metafunc):\n"
+                "    time.monotonic()"
+            ),
+        ),
+        False,
+        ("real_time_primitive", "applicability_contract"),
+    ),
+    (
+        "applicability_class_pytest_generate_tests_real_time",
+        _fixture(
+            "pass",
+            imports="import time",
+            class_code=(
+                "def pytest_generate_tests(self, metafunc):\n"
+                "    time.monotonic()"
+            ),
+        ),
+        False,
+        ("real_time_primitive", "applicability_contract"),
+    ),
+    (
+        "applicability_unrelated_class_pytest_generate_tests",
+        _fixture(
+            "pass",
+            module_code=(
+                "class _ReviewOther:\n"
+                "    def pytest_generate_tests(self, metafunc):\n"
+                "        pytest.skip(\"unrelated\")"
+            ),
+        ),
+        True,
+        (),
+    ),
+    (
+        "applicability_nested_pytest_generate_tests_helper",
+        _fixture(
+            "pass",
+            module_code=(
+                "def _review_helper():\n"
+                "    def pytest_generate_tests(metafunc):\n"
+                "        pytest.skip(\"unrelated\")\n"
+                "    return pytest_generate_tests"
+            ),
+        ),
+        True,
+        (),
+    ),
     (
         "applicability_module_range_shadow",
         _fixture(
