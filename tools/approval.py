@@ -553,19 +553,36 @@ _WRAPPER_VALUE_OPTIONS = {
 _COMMAND_WRAPPERS = frozenset(
     {"sudo", "env", "exec", "nohup", "setsid", "time", "command", "nice"}
 )
+_MAX_GIT_CONFIG_ENTRIES = 64
+_MAX_GIT_LEADING_ASSIGNMENTS = 2 * _MAX_GIT_CONFIG_ENTRIES + 1
 
 
-def _strip_command_wrappers(argv: list[str]) -> list[str]:
-    """Return argv beginning at the wrapped executable, if structurally clear."""
+def _strip_command_wrappers_and_assignments(
+    argv: list[str],
+) -> tuple[list[str], dict[str, str], bool]:
+    """Return executable argv plus bounded literal leading assignments."""
     argv = list(argv)
-    while argv:
+    assignments: dict[str, str] = {}
+    captured = 0
+    assignment_limit_exceeded = False
+
+    def consume_assignments() -> None:
+        nonlocal assignment_limit_exceeded, captured
         while argv and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", argv[0]):
-            argv.pop(0)
+            name, value = argv.pop(0).split("=", 1)
+            if captured < _MAX_GIT_LEADING_ASSIGNMENTS:
+                assignments[name] = value
+            else:
+                assignment_limit_exceeded = True
+            captured += 1
+
+    while argv:
+        consume_assignments()
         if not argv:
-            return argv
+            return argv, assignments, assignment_limit_exceeded
         wrapper = os.path.basename(argv[0]).lower()
         if wrapper not in _COMMAND_WRAPPERS:
-            return argv
+            return argv, assignments, assignment_limit_exceeded
         argv.pop(0)
 
         value_options = _WRAPPER_VALUE_OPTIONS.get(wrapper, set())
@@ -581,9 +598,13 @@ def _strip_command_wrappers(argv: list[str]) -> list[str]:
                 i += 1
         argv = argv[i:]
         if wrapper == "env":
-            while argv and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", argv[0]):
-                argv.pop(0)
-    return argv
+            consume_assignments()
+    return argv, assignments, assignment_limit_exceeded
+
+
+def _strip_command_wrappers(argv: list[str]) -> list[str]:
+    """Return argv beginning at the wrapped executable, if structurally clear."""
+    return _strip_command_wrappers_and_assignments(argv)[0]
 
 
 _GIT_GLOBAL_VALUE_OPTIONS = {
@@ -593,6 +614,14 @@ _GIT_GLOBAL_VALUE_OPTIONS = {
 _GIT_PUSH_VALUE_OPTIONS = {
     "--exec", "--push-option", "--receive-pack", "--repo", "--server-option", "-o",
 }
+_GIT_BUILTIN_NON_PUSH_SUBCOMMANDS = frozenset({
+    "add", "am", "archive", "bisect", "blame", "branch", "bundle", "checkout",
+    "cherry-pick", "clean", "clone", "commit", "config", "describe", "diff",
+    "fetch", "format-patch", "gc", "grep", "help", "init", "log", "maintenance",
+    "merge", "mergetool", "mv", "notes", "pull", "range-diff", "rebase", "reflog",
+    "remote", "reset", "restore", "revert", "rm", "shortlog", "show", "stash",
+    "status", "submodule", "switch", "tag", "version", "worktree",
+})
 _GIT_DEFAULT_BRANCHES = frozenset({"main", "master"})
 _DOCKER_GLOBAL_VALUE_OPTIONS = frozenset({
     "--config", "-c", "--context", "-H", "--host", "-l", "--log-level",
@@ -760,45 +789,364 @@ def _git_alias_name(config_key: str) -> str | None:
     return match.group(1).lower() if match else None
 
 
+_MAX_GIT_ALIAS_DEPTH = 8
+_MAX_GIT_ALIAS_ENTRIES = 64
+_MAX_GIT_SHELL_RECURSION = 4
+_STRUCTURED_SHELL_EXECUTABLES = frozenset({"bash", "csh", "dash", "ksh", "sh", "tcsh", "zsh"})
+_GIT_SHELL_SAFE_COMMANDS = frozenset({":", "echo", "false", "printf", "true"})
+_GIT_SHELL_EXPLICIT_CARRIERS = frozenset({"eval", "find", "xargs"})
+
+
+def _git_alias_subcommand_index(alias_argv: list[str]) -> int | None:
+    """Locate an ordinary alias target after bounded Git global options."""
+    i = 0
+    while i < len(alias_argv) and alias_argv[i].startswith("-") and alias_argv[i] != "-":
+        token = alias_argv[i]
+        if token == "--":
+            i += 1
+            break
+        if token == "-c":
+            i += 1
+            if i >= len(alias_argv):
+                return None
+            i += 1
+            continue
+        if token.startswith("-c") and not token.startswith("--"):
+            i += 1
+            continue
+
+        option, separator, attached = token.partition("=")
+        i += 1
+        if option not in _GIT_GLOBAL_VALUE_OPTIONS:
+            continue
+        if separator:
+            if not attached:
+                return None
+            continue
+        if i >= len(alias_argv):
+            return None
+        i += 1
+    return i if i < len(alias_argv) else None
+
+
 def _git_alias_push_prefix(value: str) -> list[str] | None:
-    """Return fixed push arguments for a structurally known Git alias."""
+    """Return fixed push arguments for an ordinary Git push alias."""
     try:
         alias_argv = shlex.split(value, posix=True)
     except ValueError:
         return None
-    if not alias_argv:
+    target_index = _git_alias_subcommand_index(alias_argv)
+    if target_index is None or alias_argv[target_index].lower() != "push":
         return None
-    if alias_argv[0].lower() == "push":
-        return alias_argv[1:]
+    return alias_argv[target_index + 1:]
 
-    # Shell aliases begin with ``!``. Recognize only the bounded direct
-    # ``!git push ...`` form; other shell programs remain non-push aliases.
-    first = alias_argv[0]
-    if first == "!":
-        alias_argv = alias_argv[1:]
-    elif first.startswith("!"):
-        alias_argv = [first[1:], *alias_argv[1:]]
-    else:
+
+def _git_alias_definition(
+    value: str,
+    *,
+    alias_depth: int = 0,
+    alias_budget: list[int] | None = None,
+) -> tuple[str, list[str]]:
+    """Classify one bounded alias, including alias-local Git options."""
+    shell_value = value.lstrip()
+    if shell_value.startswith("!"):
+        # Preserve the raw shell body so quote-aware command segmentation can
+        # distinguish executable commands from push words printed as prose.
+        return "shell", [shell_value[1:].lstrip()]
+    if alias_depth >= _MAX_GIT_ALIAS_DEPTH:
+        return "ambiguous", []
+
+    try:
+        alias_argv = shlex.split(value, posix=True)
+    except ValueError:
+        return "dynamic", []
+
+    if alias_budget is None:
+        alias_budget = [_MAX_GIT_ALIAS_ENTRIES]
+    local_aliases: dict[str, tuple[str, list[str]]] = {}
+    local_config_ambiguity = False
+    i = 0
+    while i < len(alias_argv) and alias_argv[i].startswith("-") and alias_argv[i] != "-":
+        token = alias_argv[i]
+        if token == "--":
+            i += 1
+            break
+
+        config_entry: str | None = None
+        dynamic_config = False
+        if token == "-c":
+            i += 1
+            if i >= len(alias_argv):
+                return "dynamic", []
+            config_entry = alias_argv[i]
+            i += 1
+        elif token.startswith("-c") and not token.startswith("--"):
+            config_entry = token[2:]
+            i += 1
+        elif token == "--config-env":
+            dynamic_config = True
+            i += 1
+            if i >= len(alias_argv):
+                return "ambiguous", []
+            config_entry = alias_argv[i]
+            i += 1
+        elif token.startswith("--config-env="):
+            dynamic_config = True
+            config_entry = token.split("=", 1)[1]
+            i += 1
+        else:
+            option, separator, attached = token.partition("=")
+            i += 1
+            if option not in _GIT_GLOBAL_VALUE_OPTIONS:
+                continue
+            if separator:
+                if not attached:
+                    return "dynamic", []
+                continue
+            if i >= len(alias_argv):
+                return "dynamic", []
+            i += 1
+            continue
+
+        config_key, separator, config_value = config_entry.partition("=")
+        if not separator:
+            local_config_ambiguity = True
+            continue
+        if _git_config_key_is_dynamic_source(config_key):
+            local_config_ambiguity = True
+            continue
+        alias_name = _git_alias_name(config_key)
+        if alias_name is None:
+            continue
+        alias_budget[0] -= 1
+        if alias_budget[0] < 0:
+            return "ambiguous", []
+        if dynamic_config:
+            local_aliases[alias_name] = ("ambiguous", [])
+        else:
+            local_aliases[alias_name] = _git_alias_definition(
+                config_value,
+                alias_depth=alias_depth + 1,
+                alias_budget=alias_budget,
+            )
+
+    if i >= len(alias_argv):
+        return ("ambiguous" if local_config_ambiguity else "dynamic"), []
+    target = alias_argv[i].lower()
+    fixed_args = alias_argv[i + 1:]
+    if target == "push":
+        return "push", fixed_args
+    if target in _GIT_BUILTIN_NON_PUSH_SUBCOMMANDS:
+        return "safe", []
+    if target in local_aliases:
+        target_kind, target_prefix = _resolve_git_alias(target, local_aliases)
+        if target_kind == "safe":
+            return "safe", []
+        if target_kind == "dynamic":
+            target_kind = "ambiguous"
+        return target_kind, [*target_prefix, *fixed_args]
+    if local_config_ambiguity:
+        return "ambiguous", fixed_args
+    return "alias", [target, *fixed_args]
+
+
+def _resolve_git_alias(
+    subcommand: str,
+    aliases: dict[str, tuple[str, list[str]]],
+) -> tuple[str, list[str]]:
+    """Resolve explicit ordinary aliases under fixed depth and cycle guards."""
+    current = subcommand
+    prefix: list[str] = []
+    seen: set[str] = set()
+    for _depth in range(_MAX_GIT_ALIAS_DEPTH):
+        if current in _GIT_BUILTIN_NON_PUSH_SUBCOMMANDS:
+            return "safe", []
+        if current in seen:
+            return "ambiguous", prefix
+        seen.add(current)
+
+        definition = aliases.get(current)
+        if definition is None:
+            return "dynamic", prefix
+        kind, fixed_args = definition
+        if kind == "alias":
+            if not fixed_args:
+                return "dynamic", prefix
+            current = fixed_args[0].lower()
+            prefix = [*fixed_args[1:], *prefix]
+            continue
+        if kind == "push":
+            return "push", [*fixed_args, *prefix]
+        if kind == "safe":
+            return "safe", []
+        return kind, [*fixed_args, *prefix]
+    return "ambiguous", prefix
+
+
+def _git_config_key_is_dynamic_source(config_key: str) -> bool:
+    """Return whether a config key can load additional alias definitions."""
+    lowered = config_key.lower()
+    return lowered == "include.path" or (
+        lowered.startswith("includeif.") and lowered.endswith(".path")
+    )
+
+
+def _git_parameter_sq_dequote(
+    source: str, start: int
+) -> tuple[str, int] | None:
+    """Decode one Git single-quoted command-parameter token."""
+    if start >= len(source) or source[start] != "'":
         return None
-    if (
-        len(alias_argv) >= 2
-        and os.path.basename(alias_argv[0]).lower() == "git"
-        and alias_argv[1].lower() == "push"
-    ):
-        return alias_argv[2:]
+    decoded: list[str] = []
+    index = start + 1
+    while index < len(source):
+        char = source[index]
+        if char != "'":
+            decoded.append(char)
+            index += 1
+            continue
+
+        index += 1
+        if (
+            index + 2 < len(source)
+            and source[index] == "\\"
+            and source[index + 1] in {"'", "!"}
+            and source[index + 2] == "'"
+        ):
+            decoded.append(source[index + 1])
+            index += 3
+            continue
+        return "".join(decoded), index
     return None
+
+
+def _git_parameter_entries(
+    source: str,
+) -> tuple[list[tuple[str, str | None]], bool]:
+    """Parse Git's bounded old/new command-parameter token grammar."""
+    entries: list[tuple[str, str | None]] = []
+    index = 0
+    while True:
+        while index < len(source) and source[index].isspace():
+            index += 1
+        if index >= len(source):
+            return entries, False
+        if len(entries) >= _MAX_GIT_CONFIG_ENTRIES:
+            return [], True
+
+        parsed = _git_parameter_sq_dequote(source, index)
+        if parsed is None:
+            return [], True
+        key_or_entry, index = parsed
+
+        if index < len(source) and source[index] == "=":
+            config_key = key_or_entry
+            index += 1
+            if index < len(source) and source[index] == "'":
+                parsed = _git_parameter_sq_dequote(source, index)
+                if parsed is None:
+                    return [], True
+                config_value, index = parsed
+            elif index >= len(source) or source[index].isspace():
+                config_value = None
+            else:
+                return [], True
+        else:
+            config_key, separator, config_value = key_or_entry.partition("=")
+            if not separator:
+                config_value = None
+
+        if not config_key or (
+            index < len(source) and not source[index].isspace()
+        ):
+            return [], True
+        entries.append((config_key, config_value))
+
+
+def _git_parameter_config_analysis(
+    assignments: dict[str, str],
+    assignment_limit_exceeded: bool,
+) -> tuple[dict[str, tuple[str, list[str]]], bool]:
+    """Classify literal command-scoped ``GIT_CONFIG_PARAMETERS`` aliases."""
+    parameter_source = assignments.get("GIT_CONFIG_PARAMETERS")
+    if parameter_source is None:
+        return {}, assignment_limit_exceeded
+    if assignment_limit_exceeded:
+        return {}, True
+
+    entries, malformed = _git_parameter_entries(parameter_source)
+    if malformed:
+        return {}, True
+
+    aliases: dict[str, tuple[str, list[str]]] = {}
+    dynamic_alias_source = False
+    for config_key, config_value in entries:
+        if _git_config_key_is_dynamic_source(config_key):
+            dynamic_alias_source = True
+            continue
+        alias_name = _git_alias_name(config_key)
+        if alias_name is None:
+            continue
+        aliases[alias_name] = (
+            _git_alias_definition(config_value)
+            if config_value is not None
+            else ("ambiguous", [])
+        )
+    return aliases, dynamic_alias_source
+
+
+def _git_indexed_config_analysis(
+    assignments: dict[str, str],
+) -> tuple[dict[str, tuple[str, list[str]]], bool]:
+    """Classify bounded indexed aliases and unresolved config state."""
+    has_indexed_config = any(
+        name == "GIT_CONFIG_COUNT"
+        or re.fullmatch(r"GIT_CONFIG_(?:KEY|VALUE)_[0-9]+", name)
+        for name in assignments
+    )
+    if not has_indexed_config:
+        return {}, False
+
+    count_text = assignments.get("GIT_CONFIG_COUNT")
+    if count_text is None or not count_text.isdigit():
+        return {}, True
+    count = int(count_text)
+    if count > _MAX_GIT_CONFIG_ENTRIES:
+        return {}, True
+
+    aliases: dict[str, tuple[str, list[str]]] = {}
+    dynamic_alias_source = False
+    for index in range(count):
+        config_key = assignments.get(f"GIT_CONFIG_KEY_{index}")
+        config_value = assignments.get(f"GIT_CONFIG_VALUE_{index}")
+        if config_key is None or config_value is None:
+            dynamic_alias_source = True
+            continue
+        if _git_config_key_is_dynamic_source(config_key):
+            dynamic_alias_source = True
+            continue
+        alias_name = _git_alias_name(config_key)
+        if alias_name is None:
+            continue
+        aliases[alias_name] = _git_alias_definition(config_value)
+    return aliases, dynamic_alias_source
 
 
 def _git_global_options_and_aliases(
     argv: list[str],
-) -> tuple[int, dict[str, tuple[str, list[str]]]]:
+    assignments: dict[str, str],
+    assignment_limit_exceeded: bool,
+) -> tuple[int, dict[str, tuple[str, list[str]]], bool]:
     """Locate the Git subcommand and classify command-line alias definitions."""
     aliases: dict[str, tuple[str, list[str]]] = {}
+    dynamic_alias_source = False
+    alias_entries = 0
+    alias_limit_exceeded = False
     i = 1
     while i < len(argv) and argv[i].startswith("-") and argv[i] != "-":
         token = argv[i]
         if token == "--":
-            return i + 1, aliases
+            return i + 1, aliases, dynamic_alias_source
 
         config_entry: str | None = None
         dynamic_config = False
@@ -829,50 +1177,561 @@ def _git_global_options_and_aliases(
         if config_entry is None:
             continue
         config_key, separator, config_value = config_entry.partition("=")
+        if separator and _git_config_key_is_dynamic_source(config_key):
+            dynamic_alias_source = True
+            continue
         alias_name = _git_alias_name(config_key)
         if alias_name is None or not separator:
             continue
-        if dynamic_config:
-            aliases[alias_name] = ("dynamic", [])
+        alias_entries += 1
+        if alias_entries > _MAX_GIT_ALIAS_ENTRIES:
+            aliases.clear()
+            dynamic_alias_source = True
+            alias_limit_exceeded = True
             continue
-        push_prefix = _git_alias_push_prefix(config_value)
-        if push_prefix is None:
-            aliases[alias_name] = ("other", [])
-        else:
-            aliases[alias_name] = ("push", push_prefix)
-    return i, aliases
+        if alias_limit_exceeded:
+            continue
+        if dynamic_config:
+            if (
+                assignment_limit_exceeded
+                or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", config_value)
+                or config_value not in assignments
+            ):
+                aliases[alias_name] = ("dynamic", [])
+            else:
+                aliases[alias_name] = _git_alias_definition(
+                    assignments[config_value]
+                )
+            continue
+        aliases[alias_name] = _git_alias_definition(config_value)
+    return i, aliases, dynamic_alias_source
 
 
-def _is_default_branch_push(command: str) -> bool:
+def _git_shell_alias_simple_assignments(
+    shell_source: str,
+) -> tuple[dict[str, str], bool]:
+    """Collect bounded literal assignment-only shell segments.
+
+    Git shell aliases run as a fresh shell program.  Retain only simple values
+    assigned by standalone commands in that program; never evaluate general
+    shell expressions or consult the process environment.
+    """
+    assignments: dict[str, str] = {}
+    assignment_count = 0
+    limit_exceeded = False
+    for segment in _iter_top_level_shell_segments(shell_source):
+        argv = _parse_shell_segment_argv(segment)
+        if not argv:
+            continue
+        parsed: list[tuple[str, str]] = []
+        for token in argv:
+            match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)", token)
+            if match is None:
+                parsed = []
+                break
+            parsed.append((match.group(1), match.group(2)))
+        if not parsed:
+            continue
+        for name, value in parsed:
+            assignment_count += 1
+            if assignment_count > _MAX_GIT_LEADING_ASSIGNMENTS:
+                limit_exceeded = True
+                continue
+            if _is_simple_shell_literal(value):
+                assignments[name] = value
+            else:
+                assignments.pop(name, None)
+    return assignments, limit_exceeded
+
+
+_GIT_SHELL_COMMAND_VARIABLE_RE = re.compile(
+    r"\$(?:\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\}|"
+    r"(?P<plain>[A-Za-z_][A-Za-z0-9_]*))"
+)
+
+
+def _expand_git_shell_alias_command_variables(
+    shell_source: str,
+    assignments: dict[str, str],
+    assignment_limit_exceeded: bool,
+) -> tuple[str, bool]:
+    """Expand bounded literal variables only when used as command words."""
+    replacements: list[tuple[int, int, str]] = []
+    unresolved = False
+    for start, end, word in _iter_shell_command_word_spans(shell_source):
+        match = _GIT_SHELL_COMMAND_VARIABLE_RE.fullmatch(word)
+        if match is None:
+            continue
+        name = match.group("braced") or match.group("plain")
+        value = assignments.get(name)
+        if assignment_limit_exceeded or value is None:
+            unresolved = True
+            continue
+        replacements.append((start, end, value))
+    if not replacements:
+        return shell_source, unresolved
+
+    parts: list[str] = []
+    previous = 0
+    for start, end, value in replacements:
+        parts.extend((shell_source[previous:start], value))
+        previous = end
+    parts.append(shell_source[previous:])
+    return "".join(parts), unresolved
+
+
+def _git_shell_tolerant_command_words(
+    shell_source: str,
+    command_start: int,
+) -> list[str]:
+    """Read one bounded command argv even when trailing shell syntax is broken."""
+    words: list[str] = []
+    pos = command_start
+    for _ in range(_MAX_PAYLOAD_FINDINGS_PER_VARIANT):
+        pos = _skip_shell_whitespace(shell_source, pos)
+        if pos >= len(shell_source) or shell_source[pos] in ";&|\n":
+            break
+        start, end, raw_word = _read_shell_word(shell_source, pos)
+        if start == end:
+            break
+        word = _deobfuscate_shell_word_for_detection(raw_word)
+        # A command start inside nested $()/backticks sees the owning closing
+        # delimiters at the tail of its last word. They are syntax, not argv.
+        word = word.rstrip(")}`")
+        if word:
+            words.append(word)
+        pos = end
+    return words
+
+
+def _git_shell_source_has_protected_push_shape(
+    shell_source: str,
+    shell_recursion: int,
+) -> bool:
+    """Fail closed on command-position Git push shapes in executable shell text."""
+    for command_start in _iter_shell_command_starts(shell_source):
+        argv = _strip_command_wrappers(
+            _git_shell_tolerant_command_words(shell_source, command_start)
+        )
+        if not argv:
+            continue
+        executable = os.path.basename(argv[0]).lower()
+        if _GIT_SHELL_COMMAND_VARIABLE_RE.fullmatch(argv[0]):
+            # An unresolved command variable can name Git. Only treat it as
+            # protected-shaped when its next command-path word is actually push.
+            if len(argv) < 2 or argv[1].lower() != "push":
+                continue
+            argv = ["git", *argv[1:]]
+        elif executable != "git":
+            continue
+        if _is_default_branch_push(shlex.join(argv), shell_recursion + 1):
+            return True
+    return False
+
+
+def _git_shell_segment_is_safe(segment: str, shell_recursion: int) -> bool:
+    """Return whether one shell-alias segment has a known harmless target."""
+    argv = _parse_shell_segment_argv(segment)
+    if argv is None:
+        return False
+    argv, assignments, assignment_limit_exceeded = (
+        _strip_command_wrappers_and_assignments(argv)
+    )
+    if not argv:
+        return True
+
+    executable = os.path.basename(argv[0]).lower()
+    if executable in _GIT_SHELL_SAFE_COMMANDS:
+        return True
+    if executable in _STRUCTURED_SHELL_EXECUTABLES:
+        found, payload = _bash_exec_payload(argv[1:])
+        return bool(
+            found
+            and payload
+            and _git_shell_alias_analysis(payload, shell_recursion + 1) == "safe"
+        )
+    if executable != "git":
+        return False
+
+    i, aliases, _command_config_ambiguity = _git_global_options_and_aliases(
+        argv,
+        assignments,
+        assignment_limit_exceeded,
+    )
+    indexed_aliases, _indexed_ambiguity = _git_indexed_config_analysis(assignments)
+    parameter_aliases, _parameter_ambiguity = _git_parameter_config_analysis(
+        assignments,
+        assignment_limit_exceeded,
+    )
+    aliases = {**indexed_aliases, **parameter_aliases, **aliases}
+    if i >= len(argv) or len(aliases) > _MAX_GIT_ALIAS_ENTRIES:
+        return False
+
+    subcommand = argv[i].lower()
+    if subcommand == "push" or subcommand in _GIT_BUILTIN_NON_PUSH_SUBCOMMANDS:
+        return True
+    alias_kind, alias_prefix = _resolve_git_alias(subcommand, aliases)
+    if alias_kind in {"push", "safe"}:
+        return True
+    if alias_kind == "shell" and alias_prefix:
+        return (
+            _git_shell_alias_analysis(alias_prefix[0], shell_recursion + 1)
+            == "safe"
+        )
+    return False
+
+
+def _git_shell_control_segments(
+    shell_source: str,
+) -> tuple[list[str], bool] | None:
+    """Return executable segments from bounded shell control grammar.
+
+    Reserved words are recognized only at command position. Matching closure
+    words and case-clause punctuation remain delimiters, while commands after
+    ``then``, ``do``, ``)``, and command negation are reconstructed as argv for
+    the existing Git/carrier analyzers. ``None`` means no control syntax was
+    present; the boolean is false for malformed or unclosed control grammar.
+    """
+    try:
+        lexer = shlex.shlex(
+            shell_source,
+            posix=True,
+            punctuation_chars=";&|(){}!",
+        )
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        return None
+
+    controls: list[dict] = []
+    commands: list[str] = []
+    current: list[str] = []
+    command_start = True
+    recognized = False
+    malformed = False
+
+    def finish_command() -> None:
+        nonlocal current
+        if current:
+            commands.append(shlex.join(current))
+            current = []
+
+    for token in tokens:
+        lowered = token.lower()
+        top = controls[-1] if controls else None
+
+        if token and all(char in ";&|" for char in token):
+            finish_command()
+            command_start = True
+            if top and top["kind"] == "for" and top["phase"] == "header":
+                top["ready"] = True
+            elif (
+                top
+                and top["kind"] == "case"
+                and top["phase"] == "body"
+                and token.startswith(";;")
+            ):
+                top["phase"] = "pattern"
+            continue
+
+        top = controls[-1] if controls else None
+        if top and top["kind"] == "for" and top["phase"] == "header":
+            if lowered == "do" and command_start and top.get("ready"):
+                top["phase"] = "body"
+                recognized = True
+                command_start = True
+            continue
+        if top and top["kind"] == "case" and top["phase"] == "header":
+            if lowered == "in":
+                top["phase"] = "pattern"
+                recognized = True
+            continue
+        if top and top["kind"] == "case" and top["phase"] == "pattern":
+            if lowered == "esac" and command_start:
+                controls.pop()
+                recognized = True
+            elif token == ")":
+                top["phase"] = "body"
+                recognized = True
+                command_start = True
+            continue
+
+        if not command_start:
+            current.append(token)
+            continue
+
+        top = controls[-1] if controls else None
+        matching_closure = (
+            lowered == "fi" and top and top["kind"] == "if"
+        ) or (
+            lowered == "done" and top and top["kind"] in {"for", "loop"}
+        ) or (
+            lowered == "esac" and top and top["kind"] == "case"
+        )
+        if matching_closure:
+            controls.pop()
+            recognized = True
+            continue
+        if lowered in {"fi", "done", "esac"}:
+            recognized = True
+            malformed = True
+            continue
+
+        if lowered == "then" and top and top["kind"] == "if" and top["phase"] == "condition":
+            top["phase"] = "body"
+            recognized = True
+            continue
+        if lowered == "elif" and top and top["kind"] == "if" and top["phase"] in {"body", "else"}:
+            top["phase"] = "condition"
+            recognized = True
+            continue
+        if lowered == "else" and top and top["kind"] == "if" and top["phase"] == "body":
+            top["phase"] = "else"
+            recognized = True
+            continue
+        if lowered == "do" and top and top["kind"] == "loop" and top["phase"] == "condition":
+            top["phase"] = "body"
+            recognized = True
+            continue
+
+        if lowered == "if":
+            controls.append({"kind": "if", "phase": "condition"})
+            recognized = True
+            continue
+        if lowered in {"while", "until"}:
+            controls.append({"kind": "loop", "phase": "condition"})
+            recognized = True
+            continue
+        if lowered in {"for", "select"}:
+            controls.append({"kind": "for", "phase": "header", "ready": False})
+            recognized = True
+            continue
+        if lowered == "case":
+            controls.append({"kind": "case", "phase": "header"})
+            recognized = True
+            continue
+        if token == "!":
+            recognized = True
+            continue
+
+        current = [token]
+        command_start = False
+
+    finish_command()
+    if not recognized:
+        return None
+    return commands, not controls and not malformed
+
+
+def _git_shell_alias_analysis(shell_source: str, shell_recursion: int) -> str:
+    """Classify a shell alias as protected push, known safe, or opaque."""
+    if _command_parser_limit_exceeded(shell_source):
+        return "dynamic"
+
+    assignments, assignment_limit_exceeded = _git_shell_alias_simple_assignments(
+        shell_source
+    )
+    expanded_source, _unresolved_source = _expand_git_shell_alias_command_variables(
+        shell_source,
+        assignments,
+        assignment_limit_exceeded,
+    )
+    if _git_shell_source_has_protected_push_shape(expanded_source, shell_recursion):
+        return "push"
+    if shell_recursion >= _MAX_GIT_SHELL_RECURSION:
+        return "dynamic"
+
+    substitution_ambiguity = False
+    substitution_work = 0
+    for payload in _iter_executable_substitution_payloads(shell_source):
+        expanded_payload, unresolved = _expand_git_shell_alias_command_variables(
+            payload,
+            assignments,
+            assignment_limit_exceeded,
+        )
+        if _git_shell_source_has_protected_push_shape(
+            expanded_payload,
+            shell_recursion + 1,
+        ):
+            return "push"
+        substitution_work += 1
+        if substitution_work > _MAX_DETECTION_WORK_ITEMS:
+            substitution_ambiguity = True
+            continue
+        payload_kind = _git_shell_alias_analysis(
+            expanded_payload,
+            shell_recursion + 1,
+        )
+        if payload_kind == "push":
+            return "push"
+        if payload_kind != "safe" or unresolved:
+            substitution_ambiguity = True
+
+    # Compound commands and function bodies become visible only at their real,
+    # quote-aware command starts. Quoted push prose is left untouched.
+    marked_source = _mark_command_starts(shell_source)
+    for candidate in dict.fromkeys((shell_source, marked_source)):
+        if _is_default_branch_push(candidate, shell_recursion + 1):
+            return "push"
+
+    control_result = _git_shell_control_segments(shell_source)
+    if control_result is not None:
+        control_segments, control_is_complete = control_result
+        all_safe = bool(control_segments)
+        for segment in control_segments:
+            segment_kind = _git_shell_alias_analysis(segment, shell_recursion + 1)
+            if segment_kind == "push":
+                return "push"
+            if segment_kind != "safe":
+                all_safe = False
+        if not control_is_complete:
+            return "dynamic"
+        return "safe" if all_safe and not substitution_ambiguity else "dynamic"
+
+    # Shell -c/-lc owns another shell program. Inspect only that parsed payload
+    # and keep the recursion budget explicit; other execution mechanisms stay
+    # opaque rather than being searched for push words.
+    for description, payload in _execution_flag_findings(shell_source):
+        if description != "shell command via -c/-lc flag" or not payload:
+            return "dynamic"
+        nested_kind = _git_shell_alias_analysis(payload, shell_recursion + 1)
+        if nested_kind == "push":
+            return "push"
+        if nested_kind != "safe":
+            return "dynamic"
+
+    saw_command = False
+    carrier_work = 0
+    for segment in _iter_top_level_shell_segments(shell_source):
+        saw_carrier = False
+        carrier_is_safe = True
+        for payload in _iter_explicit_command_argv_payloads(
+            segment,
+            executables=_GIT_SHELL_EXPLICIT_CARRIERS,
+        ):
+            saw_carrier = True
+            expanded_payload, unresolved = _expand_git_shell_alias_command_variables(
+                payload,
+                assignments,
+                assignment_limit_exceeded,
+            )
+            # Inspect every already-exposed payload before honoring the work
+            # ceiling so a protected-shaped suffix cannot hide behind safe
+            # carriers that consumed the recursive-analysis budget. The shared
+            # outer variant stream remains authoritative for nested shell -c
+            # and further explicit carriers within this extracted argv.
+            if any(
+                variant != _PARSER_LIMIT_VARIANT
+                and _is_default_branch_push(variant, shell_recursion + 1)
+                for variant in _command_detection_variants(expanded_payload)
+            ):
+                return "push"
+            carrier_work += 1
+            if carrier_work > _MAX_DETECTION_WORK_ITEMS:
+                carrier_is_safe = False
+                continue
+            payload_kind = _git_shell_alias_analysis(
+                expanded_payload,
+                shell_recursion + 1,
+            )
+            if payload_kind == "push":
+                return "push"
+            if payload_kind != "safe" or unresolved:
+                carrier_is_safe = False
+        if saw_carrier:
+            saw_command = True
+            if not carrier_is_safe:
+                return "dynamic"
+            continue
+
+        parsed = _parse_shell_segment_argv(segment)
+        if parsed is None:
+            return "dynamic"
+        parsed = _strip_command_wrappers(parsed)
+        if not parsed:
+            continue
+        saw_command = True
+        if not _git_shell_segment_is_safe(segment, shell_recursion):
+            return "dynamic"
+    return "safe" if saw_command and not substitution_ambiguity else "dynamic"
+
+
+def _is_default_branch_push(command: str, shell_recursion: int = 0) -> bool:
     """Detect explicit or potentially implicit pushes to main/master.
 
     Wrapper/global/push options are parsed with their value arity. A push with
     no explicit safe branch destination fails closed because repository config
     can map it to the protected default branch.
     """
-    command = _expand_simple_shell_assignments(command)
     for segment in _iter_top_level_shell_segments(command):
         argv = _parse_shell_segment_argv(segment)
         if argv is None:
             continue
-        argv = _strip_command_wrappers(argv)
+        (
+            argv,
+            config_assignments,
+            assignment_limit_exceeded,
+        ) = _strip_command_wrappers_and_assignments(argv)
         if not argv or os.path.basename(argv[0]).lower() != "git":
             continue
 
-        i, aliases = _git_global_options_and_aliases(argv)
+        i, aliases, _command_config_ambiguity = _git_global_options_and_aliases(
+            argv,
+            config_assignments,
+            assignment_limit_exceeded,
+        )
+        indexed_aliases, _indexed_ambiguity = _git_indexed_config_analysis(
+            config_assignments
+        )
+        parameter_aliases, _parameter_ambiguity = _git_parameter_config_analysis(
+            config_assignments,
+            assignment_limit_exceeded,
+        )
+        aliases = {**indexed_aliases, **parameter_aliases, **aliases}
+        if len(aliases) > _MAX_GIT_ALIAS_ENTRIES:
+            aliases = {}
+            _command_config_ambiguity = True
         if i >= len(argv):
             continue
         subcommand = argv[i].lower()
         if subcommand == "push":
             push_args = argv[i + 1:]
+            ambiguous_alias = False
+            protected_ambiguity = False
         else:
-            alias_kind, alias_prefix = aliases.get(subcommand, ("other", []))
-            if alias_kind == "other":
+            alias_kind, alias_prefix = _resolve_git_alias(subcommand, aliases)
+            if alias_kind == "dynamic" and (
+                _command_config_ambiguity
+                or _indexed_ambiguity
+                or _parameter_ambiguity
+            ):
+                alias_kind = "ambiguous"
+            if alias_kind in {"other", "safe"}:
                 continue
-            # A dynamic --config-env alias is unknown. Parse its invocation as
-            # push-shaped and fail closed only when that shape may target the
-            # protected default branch.
-            push_args = [*alias_prefix, *argv[i + 1:]]
+            if alias_kind == "shell":
+                shell_kind = (
+                    _git_shell_alias_analysis(alias_prefix[0], shell_recursion)
+                    if alias_prefix
+                    else "dynamic"
+                )
+                if shell_kind == "push":
+                    return True
+                if shell_kind == "safe":
+                    continue
+                # An opaque shell program receives invocation operands as
+                # positional data. Protected-push-shaped operands are still
+                # alias/helper ambiguity; explicit feature refs remain safe.
+                push_args = [*alias_prefix[1:], *argv[i + 1:]]
+                ambiguous_alias = True
+                protected_ambiguity = False
+            else:
+                # An unresolved alias or external helper is unknown. Parse its
+                # invocation as push-shaped and fail closed only when that shape
+                # may target the protected default branch.
+                push_args = [*alias_prefix, *argv[i + 1:]]
+                ambiguous_alias = alias_kind in {"ambiguous", "dynamic"}
+                protected_ambiguity = alias_kind == "ambiguous"
 
         operands: list[str] = []
         remote_from_option = False
@@ -905,6 +1764,10 @@ def _is_default_branch_push(command: str) -> bool:
         refspecs = operands if remote_from_option else operands[1:]
         if not refspecs:
             if tags_only:
+                continue
+            if protected_ambiguity and not operands:
+                return True
+            if ambiguous_alias:
                 continue
             return True
 
@@ -950,10 +1813,16 @@ def detect_hardline_command(command: str) -> tuple:
     """
     if _command_parser_limit_exceeded(command):
         return (True, _PARSER_LIMIT_DESCRIPTION)
+    # Git alias parsing needs the shell's original quote boundaries. Analyze
+    # that semantic source before normalization can fold obfuscation spellings;
+    # normalized variants remain necessary for those prior bypass contracts.
+    raw_default_branch_push = _is_default_branch_push(command)
     command_variants = tuple(_command_detection_variants(command))
     if _PARSER_LIMIT_VARIANT in command_variants:
         return (True, _PARSER_LIMIT_DESCRIPTION)
-    if any(_is_default_branch_push(variant) for variant in command_variants):
+    if raw_default_branch_push or any(
+        _is_default_branch_push(variant) for variant in command_variants
+    ):
         return (True, "push to protected default branch (main/master)")
     # Docker inspect exposes Config.Env, including opaque credentials. Parse
     # global-option value ownership before identifying the subcommand.
@@ -1444,6 +2313,108 @@ def _approval_key_aliases(pattern_key: str) -> set[str]:
 # Detection
 # =========================================================================
 
+# Shell syntax characters retain executable meaning when escaped, so keep their
+# backslashes in normalized text. Removing ``\\ `` or ``\\(`` turns one literal
+# argv word into a separator/group and can promote inert carrier prose. Ordinary
+# unquoted word escapes such as ``r\\m`` still collapse to the executable ``rm``.
+_SHELL_ESCAPED_SYNTAX_CHARS = frozenset(" \t\r\n$`\\\"'\\;&|(){}<>!")
+
+
+def _strip_unquoted_shell_word_escapes(command: str) -> str:
+    """Collapse ordinary unquoted word escapes without creating shell syntax."""
+    normalized: list[str] = []
+    quote: str | None = None
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if char in {"'", '"'}:
+            if quote is None:
+                quote = char
+            elif quote == char:
+                quote = None
+            normalized.append(char)
+            index += 1
+            continue
+        if (
+            char == "\\"
+            and quote is None
+            and index + 1 < len(command)
+            and command[index + 1] not in _SHELL_ESCAPED_SYNTAX_CHARS
+        ):
+            normalized.append(command[index + 1])
+            index += 2
+            continue
+        normalized.append(char)
+        index += 1
+    return "".join(normalized)
+
+
+_PLAIN_UNQUOTED_WORD_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_./:@%+=,-"
+)
+
+
+def _strip_plain_word_empty_quotes(command: str) -> str:
+    """Remove empty quotes only when they split a plain unquoted word.
+
+    Empty quote pairs are shell no-ops in spellings such as ``r''m`` and
+    ``r\"\"m``.  They are not interchangeable with adjacent quote characters,
+    though: a POSIX close/escape/reopen splice uses an escaped quote beside a
+    real delimiter to reconstruct quoted argv.  Track the complete shell word's
+    provenance so normalization never removes a pair from a quoted, escaped, or
+    expanded argument (notably a command-scoped Git alias definition).
+    """
+    normalized: list[str] = []
+    quote: str | None = None
+    plain_word = True
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if quote is not None:
+            normalized.append(char)
+            if char == "\\" and quote == '"' and index + 1 < len(command):
+                normalized.append(command[index + 1])
+                index += 2
+                continue
+            if char == quote:
+                quote = None
+            index += 1
+            continue
+
+        if char.isspace() or char in ";&|(){}<>":
+            normalized.append(char)
+            plain_word = True
+            index += 1
+            continue
+        if char == "\\" and index + 1 < len(command):
+            normalized.extend(command[index:index + 2])
+            plain_word = False
+            index += 2
+            continue
+        if char in {"'", '"'}:
+            if (
+                plain_word
+                and command.startswith(char * 2, index)
+                and index > 0
+                and index + 2 < len(command)
+                and command[index - 1] in _PLAIN_UNQUOTED_WORD_CHARS
+                and command[index + 2] in _PLAIN_UNQUOTED_WORD_CHARS
+            ):
+                index += 2
+                continue
+            normalized.append(char)
+            plain_word = False
+            quote = char
+            index += 1
+            continue
+
+        normalized.append(char)
+        if char not in _PLAIN_UNQUOTED_WORD_CHARS:
+            plain_word = False
+        index += 1
+    return "".join(normalized)
+
+
 def _normalize_command_for_detection(command: str) -> str:
     """Normalize a command string before dangerous-pattern matching.
 
@@ -1486,10 +2457,13 @@ def _normalize_command_for_detection(command: str) -> str:
     # first would eat the prefix the Hermes-home fold needs.
     command = _rewrite_resolved_hermes_home(command)
     command = _rewrite_resolved_user_home(command)
-    # Strip shell backslash-escapes: r\m → rm. Prevents \-injection bypass.
-    command = re.sub(r'\\([^\n])', r'\1', command)
-    # Strip empty-string literals that split tokens: r''m → rm, r"\"m → rm.
-    command = re.sub(r"''|\"\"", '', command)
+    # Collapse only ordinary unquoted word escapes (r\m → rm). Preserve
+    # escapes that own shell syntax or whitespace, and every escape inside
+    # quoted argv, so normalization cannot manufacture a group/carrier.
+    command = _strip_unquoted_shell_word_escapes(command)
+    # Strip only empty literals that split an otherwise plain unquoted word:
+    # r''m / r""m → rm. Preserve quoted argv and POSIX quote splices verbatim.
+    command = _strip_plain_word_empty_quotes(command)
     # Collapse $IFS / ${IFS} word-separator expansions to a literal space.
     # In any POSIX shell the IFS variable defaults to <space><tab><newline>,
     # so `rm${IFS}-rf${IFS}/` is executed as `rm -rf /`. Because the dangerous
@@ -2219,7 +3193,7 @@ def _execution_flag_findings(command: str):
                 if any(token.startswith("<<") for token in tokens[1:]):
                     yield ("script execution via heredoc", None)
                     continue
-            if executable_name in {"bash", "sh", "zsh", "ksh"}:
+            if executable_name in _STRUCTURED_SHELL_EXECUTABLES:
                 found, payload = _bash_exec_payload(tokens[1:])
                 if found:
                     yield ("shell command via -c/-lc flag", payload)
@@ -2742,16 +3716,28 @@ def _xargs_command_start(argv: list[str]) -> int | None:
     return index if index < len(argv) else None
 
 
-def _iter_explicit_command_argv_payloads(command: str):
+def _iter_explicit_command_argv_payloads(
+    command: str,
+    *,
+    executables: frozenset[str] | None = None,
+):
     """Yield literal argv payloads owned by eval, xargs, and find -exec."""
+    supported = frozenset({"eval", "xargs", "find"})
+    enabled = supported if executables is None else executables
     for segment in _iter_top_level_shell_segments(command):
         for start, _, word in _iter_shell_command_word_spans(segment):
             executable = os.path.basename(
                 _deobfuscate_shell_word_for_detection(word)
             ).lower()
-            if executable not in {"eval", "xargs", "find"}:
+            if executable not in supported or executable not in enabled:
                 continue
             argv = _parse_shell_segment_argv(segment[start:])
+            if not argv:
+                # A recognized malformed carrier stays structurally inspectable
+                # through the existing bounded command-word reader. This is
+                # deliberately only a fallback for an executable already found
+                # at command position; quoted carrier prose is never promoted.
+                argv = _git_shell_tolerant_command_words(segment, start)
             if not argv:
                 continue
 
@@ -2898,6 +3884,11 @@ def _command_detection_variants(command: str):
     # (for example r\m or r''m). Keep that deobfuscation scoped to command
     # words so similarly shaped arguments do not become false positives.
     for word_start, word_end, word in _iter_shell_command_word_spans(normalized):
+        # Git's parameter grammar depends on its literal single-quote framing.
+        # Dequoting this assignment creates a synthetic malformed source that
+        # Git itself would never receive; the raw semantic variant handles it.
+        if word.startswith("GIT_CONFIG_PARAMETERS="):
+            continue
         deobfuscated = _deobfuscate_shell_word_for_detection(word)
         if not deobfuscated or deobfuscated == word:
             continue
