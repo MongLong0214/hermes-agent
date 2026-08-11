@@ -448,11 +448,13 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
         self._record_stream_stat()
 
     def _chmod_if_managed(self):
-        if self._managed:
-            try:
-                os.chmod(self.baseFilename, 0o660)
-            except OSError:
-                pass
+        # Gateway/agent logs routinely contain operational metadata. Keep
+        # normal installs owner-only; managed installs intentionally retain
+        # group sharing inside their administrator-controlled stateDir.
+        try:
+            os.chmod(self.baseFilename, 0o660 if self._managed else 0o600)
+        except OSError:
+            pass
 
     def _record_stream_stat(self) -> None:
         """Snapshot dev/ino of ``baseFilename`` so we can detect external rotation."""

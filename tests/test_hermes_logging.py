@@ -151,6 +151,13 @@ class TestGatewayMode:
         ]
         assert len(gw_handlers) == 1
 
+    def test_gateway_log_files_are_owner_only(self, hermes_home):
+        hermes_logging.setup_logging(hermes_home=hermes_home, mode="gateway")
+        hermes_logging.flush_log_queue()
+
+        for name in ("agent.log", "errors.log", "gateway.log"):
+            assert stat.S_IMODE((hermes_home / "logs" / name).stat().st_mode) == 0o600
+
     def test_gateway_log_not_created_in_cli_mode(self, hermes_home):
         hermes_logging.setup_logging(hermes_home=hermes_home, mode="cli")
         root = logging.getLogger()
