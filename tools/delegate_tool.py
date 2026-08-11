@@ -22,6 +22,7 @@ import contextvars
 import json
 import logging
 import re
+import selectors
 import subprocess
 import sys
 
@@ -2914,35 +2915,24 @@ class LocalRouterError(RuntimeError):
     """The profile-local dynamic router refused or could not route a spawn."""
 
 
-_LOCAL_ROUTER_ROLES = frozenset({"subagent_simple", "subagent", "boomer"})
+_LOCAL_ROUTER_ROLES = frozenset({"fast", "standard", "deliberate"})
 _LOCAL_TO_RUNTIME_PROVIDER = {
-    "codex": "openai-codex",
-    "claude": "anthropic",
-    "grok": "xai",
+    "anthropic": "anthropic",
+    "openai-codex": "openai-codex",
+    "xai": "xai",
 }
+_LOCAL_ROUTER_PICK_KEYS = frozenset({"model", "provider"})
+_LOCAL_ROUTER_MAX_STDOUT_BYTES = 4096
+_LOCAL_ROUTER_MAX_MODEL_BYTES = 256
+_LOCAL_ROUTER_MAX_PROVIDER_BYTES = 64
+_LOCAL_ROUTER_REQUIRED_CREDENTIAL_KEYS = frozenset(
+    {"model", "provider", "base_url", "api_key", "api_mode"}
+)
 
 
-def _local_router_safe_role(value: Any) -> str:
-    role = str(value or "").strip().lower()
-    return role if role in _LOCAL_ROUTER_ROLES else "unknown"
-
-
-def _local_router_safe_provider(value: Any) -> str:
-    provider = str(value or "").strip().lower()
-    return provider if provider in _LOCAL_TO_RUNTIME_PROVIDER else "unknown"
-
-
-def _local_router_context(command: str, value: Any) -> str:
-    if command == "pick":
-        return f"command=pick role={_local_router_safe_role(value)}"
-    if command == "record":
-        return f"command=record provider={_local_router_safe_provider(value)}"
-    return "command=unknown"
-
-
-def _local_router_error(code: str, command: str, value: Any) -> LocalRouterError:
-    """Create a stable router error without rendering untrusted process data."""
-    return LocalRouterError(f"{code}: {_local_router_context(command, value)}")
+def _local_router_error(code: str) -> LocalRouterError:
+    """Create a stable router error without rendering process-controlled data."""
+    return LocalRouterError(code)
 
 
 def _local_router_path():
@@ -2959,56 +2949,208 @@ def _local_router_enabled() -> bool:
 
 
 def _routing_role_for_task(task: Dict[str, Any], delegate_role: str) -> str:
-    """Map delegate capability roles onto local model-routing roles.
+    """Map delegate capability roles onto public-neutral routing profiles.
 
-    ``leaf`` and ``orchestrator`` govern delegation capability, not model cost,
-    so both default to the normal ``subagent`` pool. Callers opt into the cheap
-    mechanical pool or adversarial reviewer with ``routing_role``.
+    Capability and model routing are independent. Both delegate roles therefore
+    default to ``standard``; callers can select ``fast`` or ``deliberate`` when
+    latency or additional reasoning is more important for a particular task.
     """
     requested = str(task.get("routing_role") or "").strip().lower()
     if requested:
         if requested not in _LOCAL_ROUTER_ROLES:
-            raise _local_router_error("local_router_invalid_role", "pick", requested)
+            raise _local_router_error("local_router_invalid_role")
         return requested
-    return "subagent"
+    return "standard"
+
+
+def _is_bounded_router_string(value: Any, max_bytes: int) -> bool:
+    if type(value) is not str or not value or value != value.strip():
+        return False
+    try:
+        return len(value.encode("utf-8")) <= max_bytes
+    except UnicodeError:
+        return False
+
+
+def _terminate_and_reap_local_router(process: subprocess.Popen) -> None:
+    """Stop a router process and synchronously reap it."""
+    try:
+        if process.poll() is None:
+            process.terminate()
+    except OSError:
+        pass
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except OSError:
+            pass
+        process.wait()
+
+
+def _capture_local_router_stdout(
+    argv: List[str],
+    *,
+    max_stdout_bytes: int,
+    timeout_seconds: float,
+) -> tuple[int, bytes]:
+    """Capture at most ``max_stdout_bytes + 1`` bytes from a router process."""
+    process = None
+    selector = None
+    try:
+        process = subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        if process.stdout is None:
+            raise RuntimeError("router stdout pipe unavailable")
+
+        selector = selectors.DefaultSelector()
+        stdout_fd = process.stdout.fileno()
+        selector.register(stdout_fd, selectors.EVENT_READ)
+        deadline = time.monotonic() + timeout_seconds
+        captured = bytearray()
+
+        while True:
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                _terminate_and_reap_local_router(process)
+                raise _local_router_error("local_router_execution_failed")
+            if not selector.select(remaining_seconds):
+                _terminate_and_reap_local_router(process)
+                raise _local_router_error("local_router_execution_failed")
+
+            remaining_bytes = max_stdout_bytes + 1 - len(captured)
+            chunk = os.read(stdout_fd, remaining_bytes)
+            if not chunk:
+                break
+            captured.extend(chunk)
+            if len(captured) > max_stdout_bytes:
+                _terminate_and_reap_local_router(process)
+                raise _local_router_error("local_router_output_too_large")
+
+        remaining_seconds = deadline - time.monotonic()
+        if remaining_seconds <= 0:
+            _terminate_and_reap_local_router(process)
+            raise _local_router_error("local_router_execution_failed")
+        try:
+            returncode = process.wait(timeout=remaining_seconds)
+        except subprocess.TimeoutExpired:
+            _terminate_and_reap_local_router(process)
+            raise _local_router_error("local_router_execution_failed") from None
+        return returncode, bytes(captured)
+    except LocalRouterError:
+        raise
+    except Exception:
+        if process is not None:
+            _terminate_and_reap_local_router(process)
+        raise _local_router_error("local_router_execution_failed") from None
+    finally:
+        if selector is not None:
+            selector.close()
+        if process is not None and process.stdout is not None:
+            process.stdout.close()
 
 
 def _run_local_router(command: str, value: str) -> Dict[str, Any]:
-    """Invoke router.py and fail closed on any non-zero or malformed pick."""
-    router = _local_router_path()
+    """Invoke router.py and accept only a bounded, exact routing protocol."""
+    if command == "pick":
+        if type(value) is not str or value not in _LOCAL_ROUTER_ROLES:
+            raise _local_router_error("local_router_invalid_role")
+    elif command == "record":
+        if type(value) is not str or value not in _LOCAL_TO_RUNTIME_PROVIDER:
+            raise _local_router_error("local_router_invalid_provider")
+    else:
+        raise _local_router_error("local_router_invalid_command")
+
     try:
-        proc = subprocess.run(
-            [sys.executable, str(router), command, value],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
+        returncode, raw_stdout = _capture_local_router_stdout(
+            [sys.executable, str(_local_router_path()), command, value],
+            max_stdout_bytes=_LOCAL_ROUTER_MAX_STDOUT_BYTES,
+            timeout_seconds=30,
         )
+    except LocalRouterError:
+        raise
+    except Exception:
+        raise _local_router_error("local_router_execution_failed") from None
+
+    if type(raw_stdout) is not bytes:
+        raise _local_router_error("local_router_malformed_output")
+    if type(returncode) is not int:
+        raise _local_router_error("local_router_malformed_output")
+    if len(raw_stdout) > _LOCAL_ROUTER_MAX_STDOUT_BYTES:
+        raise _local_router_error("local_router_output_too_large")
+    if returncode != 0:
+        raise _local_router_error("local_router_command_failed")
+
+    try:
+        stdout = raw_stdout.decode("utf-8").strip()
+    except UnicodeError:
+        raise _local_router_error("local_router_malformed_output") from None
+
+    if command == "record":
+        return {}
+
+    try:
+        payload = json.loads(stdout)
+    except (TypeError, ValueError):
+        raise _local_router_error("local_router_malformed_output") from None
+
+    if not isinstance(payload, dict) or set(payload) != _LOCAL_ROUTER_PICK_KEYS:
+        raise _local_router_error("local_router_invalid_pick")
+    model = payload["model"]
+    provider = payload["provider"]
+    if not _is_bounded_router_string(model, _LOCAL_ROUTER_MAX_MODEL_BYTES):
+        raise _local_router_error("local_router_invalid_pick")
+    if not _is_bounded_router_string(provider, _LOCAL_ROUTER_MAX_PROVIDER_BYTES):
+        raise _local_router_error("local_router_invalid_pick")
+    if provider not in _LOCAL_TO_RUNTIME_PROVIDER:
+        raise _local_router_error("local_router_invalid_pick")
+    return {"model": model, "provider": provider}
+
+
+def _automatic_local_route_requested(
+    delegation_cfg: Dict[str, Any],
+    router_enabled: Optional[bool] = None,
+) -> bool:
+    if router_enabled is None:
+        router_enabled = _local_router_enabled()
+    if not router_enabled:
+        return False
+    return not any(
+        str(delegation_cfg.get(key) or "").strip()
+        for key in ("model", "provider", "base_url")
+    )
+
+
+def _resolve_local_router_credentials(
+    assignment: Dict[str, Any],
+    delegation_cfg: Dict[str, Any],
+    parent_agent,
+) -> tuple[Dict[str, Any], str]:
+    """Resolve a validated pick without exposing resolver-controlled failures."""
+    try:
+        record_provider = assignment["provider"]
+        runtime_provider = _LOCAL_TO_RUNTIME_PROVIDER[record_provider]
+        routed_cfg = dict(delegation_cfg)
+        routed_cfg["model"] = assignment["model"]
+        routed_cfg["provider"] = runtime_provider
+        credentials = _resolve_delegation_credentials(routed_cfg, parent_agent)
+        if not isinstance(credentials, dict):
+            raise TypeError("invalid credential result")
+        if not _LOCAL_ROUTER_REQUIRED_CREDENTIAL_KEYS.issubset(credentials):
+            raise KeyError("incomplete credential result")
+        if credentials["model"] != assignment["model"]:
+            raise ValueError("model mismatch")
+        if credentials["provider"] != runtime_provider:
+            raise ValueError("provider mismatch")
+        return credentials, record_provider
     except Exception:
         raise _local_router_error(
-            "local_router_execution_failed", command, value
+            "local_router_credential_resolution_failed"
         ) from None
-
-    stdout = (proc.stdout or "").strip()
-    if proc.returncode != 0:
-        raise _local_router_error("local_router_command_failed", command, value)
-
-    if command == "pick":
-        try:
-            payload = json.loads(stdout)
-        except (TypeError, ValueError):
-            raise _local_router_error(
-                "local_router_invalid_pick", command, value
-            ) from None
-        if (
-            not isinstance(payload, dict)
-            or payload.get("blocked")
-            or not payload.get("model")
-            or not payload.get("provider")
-        ):
-            raise _local_router_error("local_router_unusable_pick", command, value)
-        return payload
-    return {"output": stdout}
 
 
 def _build_child_with_local_routing(
@@ -3023,66 +3165,63 @@ def _build_child_with_local_routing(
 
     A successful AIAgent construction is the spawn commit point. ``record`` is
     never called before that point and is therefore absent on pick/build errors.
-    Router ledger locking supplies cross-thread/process record safety.
+    The profile-local router is responsible for record transaction safety.
     """
-    explicit_model = str(delegation_cfg.get("model") or "").strip()
-    explicit_provider = str(delegation_cfg.get("provider") or "").strip()
-    explicit_route = bool(
-        explicit_model
-        or explicit_provider
-        or str(delegation_cfg.get("base_url") or "").strip()
+    router_enabled = _local_router_enabled()
+    automatic_route = _automatic_local_route_requested(
+        delegation_cfg, router_enabled=router_enabled
     )
-
     record_provider = None
-    if _local_router_enabled() and not explicit_route:
+    if automatic_route:
         assignment = _run_local_router("pick", routing_role)
-        record_provider = str(assignment["provider"])
-        runtime_provider = _LOCAL_TO_RUNTIME_PROVIDER.get(
-            record_provider, record_provider
+        credentials, record_provider = _resolve_local_router_credentials(
+            assignment, delegation_cfg, parent_agent
         )
-        routed_cfg = dict(delegation_cfg)
-        routed_cfg["model"] = assignment["model"]
-        routed_cfg["provider"] = runtime_provider
-        credentials = _resolve_delegation_credentials(routed_cfg, parent_agent)
     else:
-        if _local_router_enabled() and (explicit_model or explicit_provider):
-            logger.warning(
-                "delegate_task routing policy exception: explicit delegation "
-                "model/provider override bypasses local router "
-                "(model=%r, provider=%r, routing_role=%s)",
-                explicit_model or None,
-                explicit_provider or None,
-                routing_role,
+        if router_enabled:
+            logger.warning("delegate_local_router_policy_override")
+        try:
+            credentials = default_credentials or _resolve_delegation_credentials(
+                delegation_cfg, parent_agent
             )
-        credentials = default_credentials or _resolve_delegation_credentials(
-            delegation_cfg, parent_agent
-        )
+        except Exception:
+            if router_enabled:
+                raise _local_router_error(
+                    "local_router_credential_resolution_failed"
+                ) from None
+            raise
 
-    routed_build_kwargs = dict(build_kwargs)
-    routed_build_kwargs.update(
-        model=credentials["model"],
-        override_provider=credentials["provider"],
-        override_base_url=credentials["base_url"],
-        override_api_key=credentials["api_key"],
-        override_api_mode=credentials["api_mode"],
-        override_request_overrides=credentials.get("request_overrides"),
-        override_max_tokens=credentials.get("max_output_tokens"),
-        override_acp_command=credentials.get("command"),
-        override_acp_args=credentials.get("args"),
-    )
+    try:
+        if not isinstance(credentials, dict):
+            raise TypeError("invalid credential result")
+        routed_build_kwargs = dict(build_kwargs)
+        routed_build_kwargs.update(
+            model=credentials["model"],
+            override_provider=credentials["provider"],
+            override_base_url=credentials["base_url"],
+            override_api_key=credentials["api_key"],
+            override_api_mode=credentials["api_mode"],
+            override_request_overrides=credentials.get("request_overrides"),
+            override_max_tokens=credentials.get("max_output_tokens"),
+            override_acp_command=credentials.get("command"),
+            override_acp_args=credentials.get("args"),
+        )
+    except Exception:
+        if router_enabled:
+            raise _local_router_error(
+                "local_router_credential_resolution_failed"
+            ) from None
+        raise
+
     child = _build_child_preserving_parent_tools(**routed_build_kwargs)
 
     if record_provider is not None:
         try:
             _run_local_router("record", record_provider)
         except LocalRouterError:
-            # The child is already spawned; do not misreport it as a spawn
-            # failure. Preserve the run and make ledger failure conspicuous.
-            logger.error(
-                "delegate_task spawned_child local_router_record_failed %s role=%s",
-                _local_router_context("record", record_provider),
-                _local_router_safe_role(routing_role),
-            )
+            # Construction already committed the spawn. Keep that child usable,
+            # but make the accounting failure conspicuous without metadata.
+            logger.error("delegate_local_router_record_failed")
     return child
 
 
@@ -3379,12 +3518,15 @@ def delegate_task(
     # Resolve delegation credentials (provider:model pair).
     # When delegation.provider is configured, this resolves the full credential
     # bundle (base_url, api_key, api_mode) via the same runtime provider system
-    # used by CLI/gateway startup.  When unconfigured, returns None values so
-    # children inherit from the parent.
+    # used by CLI/gateway startup. When unconfigured, returns inherited values.
     try:
         creds = _resolve_delegation_credentials(cfg, parent_agent)
-    except ValueError as exc:
-        return tool_error(str(exc))
+    except Exception as exc:
+        if _local_router_enabled():
+            return tool_error("local_router_credential_resolution_failed")
+        if isinstance(exc, ValueError):
+            return tool_error(str(exc))
+        raise
 
     # Normalize to task list
     max_children = _get_max_concurrent_children()
@@ -4051,12 +4193,8 @@ def _resolve_child_credential_pool(
             pool = load_pool(child_key)
             if pool is not None and pool.has_credentials():
                 return pool
-        except Exception as exc:
-            logger.debug(
-                "Could not resolve custom credential pool for child endpoint '%s': %s",
-                effective_base_url,
-                exc,
-            )
+        except Exception:
+            logger.debug("delegate_child_credential_pool_resolution_failed")
         return None
 
     if parent_pool is not None and effective_provider == parent_provider:
@@ -4068,12 +4206,8 @@ def _resolve_child_credential_pool(
         pool = load_pool(effective_provider)
         if pool is not None and pool.has_credentials():
             return pool
-    except Exception as exc:
-        logger.debug(
-            "Could not load credential pool for child provider '%s': %s",
-            effective_provider,
-            exc,
-        )
+    except Exception:
+        logger.debug("delegate_child_credential_pool_resolution_failed")
     return None
 
 
@@ -4422,12 +4556,11 @@ DELEGATE_TASK_SCHEMA = {
                         },
                         "routing_role": {
                             "type": "string",
-                            "enum": ["subagent_simple", "subagent", "boomer"],
+                            "enum": ["fast", "standard", "deliberate"],
                             "description": (
-                                "Local dynamic model-routing pool. Defaults to "
-                                "subagent for both leaf and orchestrator. Use "
-                                "subagent_simple for mechanical implementation "
-                                "and boomer for independent adversarial review."
+                                "Local model-routing profile. Defaults to standard. "
+                                "Use fast to prioritize latency or deliberate when "
+                                "the task benefits from additional reasoning."
                             ),
                         },
                         "output_schema": {
@@ -4458,11 +4591,11 @@ DELEGATE_TASK_SCHEMA = {
             },
             "routing_role": {
                 "type": "string",
-                "enum": ["subagent_simple", "subagent", "boomer"],
+                "enum": ["fast", "standard", "deliberate"],
                 "description": (
-                    "Local dynamic model-routing pool for the single-goal form. "
-                    "Defaults to subagent; independent of the leaf/orchestrator "
-                    "capability role."
+                    "Local model-routing profile for the single-goal form. "
+                    "Defaults to standard and is independent of the "
+                    "leaf/orchestrator capability role."
                 ),
             },
             "output_schema": {
