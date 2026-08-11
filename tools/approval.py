@@ -468,6 +468,13 @@ HARDLINE_PATTERNS = [
     (_CMDPOS + r'init\s+[06]\b', "init 0/6 (shutdown/reboot)"),
     (_CMDPOS + r'systemctl\s+(poweroff|reboot|halt|kexec)\b', "systemctl poweroff/reboot"),
     (_CMDPOS + r'telinit\s+[06]\b', "telinit 0/6 (shutdown/reboot)"),
+    # Credential-enumeration paths are never necessary through the agent. The
+    # dedicated bridge/container runtimes consume these internally.
+    (r'\b(?:cat|head|tail|less|more|nl|xxd|od)\b[^\n;|&]*\.hermes/bridge/keys/[^\s;|&]+\.priv\b',
+     "read Hermes bridge private key"),
+    (r'\bdocker\s+inspect\b', "inspect container credential environment"),
+    (r'\b(?:cat|head|tail|less|more|strings)\b[^\n;|&]*/proc/(?:\d+|self)/environ\b',
+     "read process credential environment"),
 ]
 
 # Pre-compiled variant used by the hot-path matcher. Building these at module
@@ -517,6 +524,82 @@ def _check_sudo_stdin_guard(command: str) -> tuple:
     return (False, None)
 
 
+def _expand_simple_shell_assignments(command: str) -> str:
+    """Expand bounded literal ``NAME=value; $NAME ...`` aliases only."""
+    assignments: dict[str, str] = {}
+    for match in re.finditer(
+        r"(?:^|[;\n])\s*([A-Za-z_][A-Za-z0-9_]*)=([A-Za-z0-9_./+-]+)\s*(?=;|\n)",
+        command,
+    ):
+        assignments[match.group(1)] = match.group(2)
+    expanded = command
+    for name, value in assignments.items():
+        expanded = re.sub(
+            rf"\$(?:\{{{re.escape(name)}\}}|{re.escape(name)}\b)", value, expanded
+        )
+    return expanded
+
+
+def _is_default_branch_push(command: str) -> bool:
+    """Structurally detect git pushes whose destination is main/master."""
+    command = _expand_simple_shell_assignments(command)
+    for segment in re.split(r"(?:&&|\|\||[;\n])", command):
+        try:
+            argv = shlex.split(segment.strip())
+        except ValueError:
+            continue
+        if not argv:
+            continue
+        while argv and (
+            re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", argv[0])
+            or argv[0] in {"sudo", "env", "exec", "nohup", "setsid", "time", "command"}
+        ):
+            argv.pop(0)
+        if not argv or os.path.basename(argv[0]).lower() != "git":
+            continue
+        i = 1
+        while i < len(argv) and argv[i].startswith("-"):
+            token = argv[i]
+            opt = token.split("=", 1)[0]
+            i += 1
+            if "=" not in token and opt in {
+                "-C", "-c", "--git-dir", "--work-tree", "--namespace"
+            }:
+                i += 1
+        if i >= len(argv) or argv[i] != "push":
+            continue
+        operands = [a for a in argv[i + 1:] if not a.startswith("-")]
+        for refspec in operands[1:]:
+            dest = refspec.rsplit(":", 1)[-1].removeprefix("refs/heads/")
+            if dest in {"main", "master"}:
+                return True
+    return False
+
+
+_MANDATORY_APPROVAL_PATTERNS = [
+    (re.compile(
+        r"(?:>>?|\btee\b[^\n]*)\s*[\"']?(?:~/.hermes|\$HERMES_HOME|\$\{HERMES_HOME\})/config\.yaml\b",
+        re.I,
+    ), "write Hermes security configuration"),
+    (re.compile(r"\b(?:python[23]?|pypy[23]?)\b[^\n]*(?:smtplib|sendmail\s*\()", re.I),
+     "send email through an interpreter/SMTP"),
+    (re.compile(r"\b(?:sendmail|msmtp|mailx|mutt|swaks)\b", re.I),
+     "send external email"),
+    (re.compile(r"\bbuzz(?:-real)?\s+messages\s+send\b", re.I),
+     "send an external Buzz message"),
+]
+
+
+def detect_mandatory_approval_command(command: str) -> tuple[bool, str | None]:
+    """Find side effects requiring a human even under yolo/mode=off."""
+    expanded = _expand_simple_shell_assignments(command)
+    for variant in _command_detection_variants(expanded):
+        for pattern, description in _MANDATORY_APPROVAL_PATTERNS:
+            if pattern.search(variant):
+                return True, description
+    return False, None
+
+
 def detect_hardline_command(command: str) -> tuple:
     """Check if a command matches hardline blocklist patterns.
 
@@ -525,6 +608,8 @@ def detect_hardline_command(command: str) -> tuple:
     Returns:
         (is_hardline, description) or (False, None)
     """
+    if _is_default_branch_push(command):
+        return (True, "push to protected default branch (main/master)")
     if _command_parser_limit_exceeded(command):
         return (True, _PARSER_LIMIT_DESCRIPTION)
     normalized = _normalize_command_for_detection(command)
@@ -948,6 +1033,11 @@ DANGEROUS_PATTERNS = [
      "sudo with privilege flag (stdin/askpass/shell/list)"),
     # Combined short-flag form: -nS, -ns, -sa, -las — sudo flags packed
     # into a single -X token. Catches the same threat class.
+    # Interpreter/Buzz outbound sends are side effects that require a human.
+    (r'\b(?:python[23]?|pypy[23]?)\b[^\n]*(?:smtplib|sendmail\s*\()',
+     "send email through an interpreter/SMTP"),
+    (r'\b(?:sendmail|msmtp|mailx|mutt|swaks)\b', "send external email"),
+    (r'\bbuzz(?:-real)?\s+messages\s+send\b', "send an external Buzz message"),
     (r'\bsudo\b[^;|&\n]*?\s+-[a-z]*[sa][a-z]*\b',
      "sudo with combined-flag privilege escalation"),
 ]
@@ -3779,13 +3869,20 @@ def check_all_command_guards(command: str, env_type: str,
                        deny_pattern, command[:200])
         return _user_deny_block_result(deny_pattern)
 
-    # --yolo or approvals.mode=off: bypass all approval prompts.
+    # Side effects that always require a live human are evaluated before the
+    # yolo/off bypass. They remain approvable in interactive/gateway contexts,
+    # but fail closed when no approver exists.
+    mandatory_approval, mandatory_desc = detect_mandatory_approval_command(command)
+
+    # --yolo or approvals.mode=off: bypass ordinary approval prompts only.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
     approval_mode = _get_approval_mode()
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
+    if (not mandatory_approval and (
+        _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off"
+    )):
         return {"approved": True, "message": None}
 
-    if _command_matches_permanent_allowlist(command):
+    if not mandatory_approval and _command_matches_permanent_allowlist(command):
         return {"approved": True, "message": None}
 
     is_cli = _is_interactive_cli()
@@ -3795,6 +3892,15 @@ def check_all_command_guards(command: str, env_type: str,
     # Preserve the existing non-interactive behavior: outside CLI/gateway/ask
     # flows, we do not block on approvals and we skip external guard work.
     if not is_cli and not is_gateway and not is_ask:
+        if mandatory_approval:
+            return {
+                "approved": False,
+                "mandatory_approval": True,
+                "message": (
+                    f"BLOCKED: {mandatory_desc} requires live human approval, "
+                    "but no interactive user or gateway approver is present."
+                ),
+            }
         # Cron sessions: respect cron_mode config
         if _is_cron_approval_context():
             if _get_cron_approval_mode() == "deny":

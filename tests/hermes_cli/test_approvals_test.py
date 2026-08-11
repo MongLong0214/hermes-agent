@@ -48,6 +48,31 @@ def isolated_approvals(monkeypatch):
 
 
 class TestVerdicts:
+    @pytest.mark.parametrize("command", [
+        "git -C /tmp/repo push origin main",
+        "G=git; $G push origin main",
+        "git push https://github.com/acme/repo.git HEAD:main",
+    ])
+    def test_default_branch_push_denied_even_when_mode_off(
+        self, isolated_approvals, monkeypatch, command
+    ):
+        monkeypatch.setattr(A, "_get_approval_config", lambda: {"mode": "off"})
+        verdict = at.evaluate_command(command)
+        assert verdict["verdict"] == "hardline-deny"
+        assert verdict["exit_code"] == 3
+
+    @pytest.mark.parametrize("command", [
+        'echo x > ~/.hermes/config.yaml',
+        'python -c "import smtplib; smtplib.SMTP(\"mail.example\").sendmail(\"a\",\"b\",\"x\")"',
+        'buzz messages send --channel public --message x',
+    ])
+    def test_security_write_and_external_send_require_approval_under_mode_off(
+        self, isolated_approvals, monkeypatch, command
+    ):
+        monkeypatch.setattr(A, "_get_approval_config", lambda: {"mode": "off"})
+        verdict = at.evaluate_command(command)
+        assert verdict["verdict"] == "ask-approval"
+        assert verdict["exit_code"] == 2
     def test_benign_command_allows_with_exit_0(self, isolated_approvals, capsys):
         rc = at.approvals_test_command(_args(["ls", "-la"]))
         out = capsys.readouterr().out
@@ -70,14 +95,38 @@ class TestVerdicts:
 
     def test_user_deny_rule_from_config_honored(self, isolated_approvals, capsys,
                                                 monkeypatch):
+        # The command must match the deny glob but NOT the hardline floor:
+        # a default-branch push is hardline-denied before user-deny runs
+        # (see test_hardline_deny_beats_user_deny_rule), so use a
+        # feature-branch push to isolate the user-deny path.
         monkeypatch.setattr(
             A, "_get_approval_config",
             lambda: {"mode": "manual", "deny": ["git push *"]})
-        rc = at.approvals_test_command(_args(["git", "push", "origin", "main"]))
+        rc = at.approvals_test_command(
+            _args(["git", "push", "origin", "feature-branch"]))
         out = capsys.readouterr().out
         assert rc == 3
         assert "user-deny" in out
         assert "git push *" in out
+
+    def test_hardline_deny_beats_user_deny_rule(self, isolated_approvals,
+                                                capsys, monkeypatch):
+        # Precedence contract: the hardline floor fires BEFORE user
+        # approvals.deny rules and is never bypassable. A command matching
+        # BOTH the deny glob and the default-branch-push detector must
+        # report hardline-deny — the user deny pattern never claims the
+        # verdict.
+        monkeypatch.setattr(
+            A, "_get_approval_config",
+            lambda: {"mode": "manual", "deny": ["git push *"]})
+        rc = at.approvals_test_command(
+            _args(["git", "push", "origin", "main"], as_json=True))
+        payload = json.loads(capsys.readouterr().out)
+        assert rc == 3
+        assert payload["verdict"] == "hardline-deny"
+        assert payload["rule"] == "push to protected default branch (main/master)"
+        # The user deny glob must NOT be claimed as the verdict's rule.
+        assert payload["rule"] != "git push *"
 
     def test_container_env_type_skips_guards_like_runtime(self, isolated_approvals,
                                                           capsys):
@@ -98,6 +147,64 @@ class TestVerdicts:
         assert "off" in out
         rc = at.approvals_test_command(_args(["sudo", "re" + "boot"]))
         assert rc == 3
+
+
+class TestCredentialHardlineRules:
+    """Regression coverage for the credential-enumeration hardline rules.
+
+    These three patterns block read access to material the agent never
+    needs: bridge private keys, container credential env, and process
+    environ. Each must hardline-deny (rc 3) regardless of mode.
+    """
+
+    @pytest.mark.parametrize("command", [
+        "cat ~/.hermes/bridge/keys/" + "telegram.priv",
+        "head -n 5 ~/.hermes/bridge/keys/" + "signing.priv",
+        "tail ~/.hermes/bridge/keys/" + "bot.priv",
+        "xxd ~/.hermes/bridge/keys/" + "signing.priv",
+    ])
+    def test_bridge_private_key_read_hardline_denied(self, isolated_approvals,
+                                                     capsys, command):
+        rc = at.approvals_test_command(_args([command], as_json=True))
+        payload = json.loads(capsys.readouterr().out)
+        assert rc == 3
+        assert payload["verdict"] == "hardline-deny"
+        assert payload["rule"] == "read Hermes bridge private key"
+
+    def test_docker_inspect_hardline_denied(self, isolated_approvals, capsys):
+        rc = at.approvals_test_command(
+            _args(["docker", "inspect", "my-container"], as_json=True))
+        payload = json.loads(capsys.readouterr().out)
+        assert rc == 3
+        assert payload["verdict"] == "hardline-deny"
+        assert payload["rule"] == "inspect container credential environment"
+
+    @pytest.mark.parametrize("command", [
+        "cat /proc/self/" + "environ",
+        "strings /proc/123/" + "environ",
+        "head /proc/self/" + "environ",
+    ])
+    def test_proc_environ_read_hardline_denied(self, isolated_approvals,
+                                               capsys, command):
+        rc = at.approvals_test_command(_args([command], as_json=True))
+        payload = json.loads(capsys.readouterr().out)
+        assert rc == 3
+        assert payload["verdict"] == "hardline-deny"
+        assert payload["rule"] == "read process credential environment"
+
+    @pytest.mark.parametrize("command", [
+        "docker ps",
+        "cat ~/.hermes/config.yaml",
+    ])
+    def test_benign_commands_not_hardline_denied(self, isolated_approvals,
+                                                 capsys, command):
+        # Negative control: non-matching commands must NOT be hardline
+        # denied by these patterns — they fall through to allow.
+        rc = at.approvals_test_command(_args([command], as_json=True))
+        payload = json.loads(capsys.readouterr().out)
+        assert rc == 0
+        assert payload["verdict"] == "allow"
+        assert payload["rule"] is None
 
 
 class TestNormalizationParity:
