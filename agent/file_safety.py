@@ -308,9 +308,9 @@ def get_read_block_error(path: str) -> Optional[str]:
             resolved_private_key = False
         if lexical_private_key or resolved_private_key:
             return (
-                f"Access denied: {path} is a Hermes bridge private key "
-                "and cannot be read directly. The bridge consumes it "
-                "through its dedicated credential channel."
+                "Access denied [credential_read_blocked]: Hermes bridge private "
+                "keys cannot be read directly. The bridge consumes them through "
+                "its dedicated credential channel."
             )
         for name in credential_file_names:
             try:
