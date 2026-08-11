@@ -67,22 +67,35 @@ def _clean_state():
 
 
 # ---------------------------------------------------------------------------
-# Container skip
+# Container reusable-prompting skip
 # ---------------------------------------------------------------------------
 
-class TestContainerSkip:
-    def test_docker_skips_both(self):
-        result = check_all_command_guards("rm -rf /", "docker")
-        assert result["approved"] is True
+class TestContainerPromptingSkip:
+    """Containers bypass reusable dangerous-command prompting, never hardline."""
 
+    def test_docker_bypasses_prompting_but_not_hardline(self):
+        hardline = check_all_command_guards("rm -rf /", "docker")
+        assert hardline["approved"] is False
+        assert hardline["hardline"] is True
 
-    def test_daytona_skips_both(self):
-        result = check_all_command_guards("rm -rf /", "daytona")
-        assert result["approved"] is True
+        recoverable = check_all_command_guards("rm -rf /tmp/scratch", "docker")
+        assert recoverable["approved"] is True
 
-    def test_vercel_sandbox_skips_both(self):
-        result = check_all_command_guards("rm -rf /", "vercel_sandbox")
-        assert result["approved"] is True
+    def test_daytona_bypasses_prompting_but_not_hardline(self):
+        hardline = check_all_command_guards("rm -rf /", "daytona")
+        assert hardline["approved"] is False
+        assert hardline["hardline"] is True
+
+        recoverable = check_all_command_guards("rm -rf /tmp/scratch", "daytona")
+        assert recoverable["approved"] is True
+
+    def test_vercel_sandbox_bypasses_prompting_but_not_hardline(self):
+        hardline = check_all_command_guards("rm -rf /", "vercel_sandbox")
+        assert hardline["approved"] is False
+        assert hardline["hardline"] is True
+
+        recoverable = check_all_command_guards("rm -rf /tmp/scratch", "vercel_sandbox")
+        assert recoverable["approved"] is True
 
 
 # ---------------------------------------------------------------------------
