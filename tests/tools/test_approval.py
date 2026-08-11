@@ -1624,3 +1624,351 @@ class TestContainerGuardPrecedence:
         )
 
         assert result == {"approved": True, "message": None}
+
+
+class TestGatewayDenialReasonPrivacy:
+    PRIVATE_REASON = (
+        "/Users/private-alice/work/launch.txt "
+        "user_id=user-private-482 session=session-private-731 "
+        "token=sk-private-marker-123456 private-message-marker"
+    )
+    PRIVATE_MARKERS = (
+        "/Users/private-alice/work/launch.txt",
+        "user-private-482",
+        "session-private-731",
+        "sk-private-marker-123456",
+        "private-message-marker",
+    )
+
+    @staticmethod
+    def _run_gateway_choice(monkeypatch, session_key, caller, choice, reason=None):
+        mod = approval_module
+        monkeypatch.setattr(mod, "_is_interactive_cli", lambda: False)
+        monkeypatch.setattr(mod, "_is_gateway_approval_context", lambda: True)
+        monkeypatch.setattr(mod, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setattr(mod, "_get_approval_timeout", lambda: 5)
+        monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        mod.clear_session(session_key)
+        mod._denial_tally.pop(session_key, None)
+
+        notified = []
+        notification_sent = threading.Event()
+
+        def notify(data):
+            notified.append(data)
+            notification_sent.set()
+
+        mod.register_gateway_notify(session_key, notify)
+        result_holder = {}
+
+        def run():
+            token = mod.set_current_session_key(session_key)
+            try:
+                result_holder["result"] = caller()
+            except Exception as exc:  # pragma: no cover - surfaced below
+                result_holder["error"] = exc
+            finally:
+                mod.reset_current_session_key(token)
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        try:
+            assert notification_sent.wait(timeout=5), "gateway notification was not sent"
+            assert mod.has_blocking_approval(session_key)
+            assert mod.resolve_gateway_approval(
+                session_key, choice, reason=reason
+            ) == 1
+            thread.join(timeout=5)
+            assert not thread.is_alive(), "gateway approval caller did not return"
+            assert "error" not in result_holder, result_holder.get("error")
+            return result_holder["result"], notified
+        finally:
+            mod.unregister_gateway_notify(session_key)
+            thread.join(timeout=5)
+            mod.clear_session(session_key)
+            mod._denial_tally.pop(session_key, None)
+
+    @classmethod
+    def _assert_private_reason_absent(cls, result):
+        returned_values = repr(result)
+        assert cls.PRIVATE_REASON not in returned_values
+        for marker in cls.PRIVATE_MARKERS:
+            assert marker not in returned_values
+
+    def test_run_approval_gate_omits_gateway_deny_reason(self, monkeypatch):
+        result, notified = self._run_gateway_choice(
+            monkeypatch,
+            "privacy-run-approval-gate",
+            lambda: approval_module.request_tool_approval(
+                "write_file", "plugin flagged this write"
+            ),
+            "deny",
+            self.PRIVATE_REASON,
+        )
+
+        assert len(notified) == 1
+        assert result["approved"] is False
+        assert result["user_consent"] is False
+        assert result["message"] == (
+            "BLOCKED: Action denied by user. The user has NOT consented to this "
+            "action. Do NOT retry it, do NOT rephrase it, and do NOT attempt the "
+            "same outcome via a different path."
+        )
+        assert "deny_reason" not in result
+        self._assert_private_reason_absent(result)
+
+    def test_mandatory_gateway_denial_omits_gateway_reason(self, monkeypatch):
+        command = "buzz messages send --channel public --message hello"
+        mandatory, description = approval_module.detect_mandatory_approval_command(command)
+        assert mandatory is True
+        assert description
+
+        result, notified = self._run_gateway_choice(
+            monkeypatch,
+            "privacy-mandatory-approval",
+            lambda: approval_module.check_all_command_guards(command, "local"),
+            "deny",
+            self.PRIVATE_REASON,
+        )
+
+        assert len(notified) == 1
+        assert result["approved"] is False
+        assert result["mandatory_approval"] is True
+        assert result["pattern_key"] == "mandatory-human-approval"
+        assert result["description"] == description
+        assert result["outcome"] == "denied"
+        assert result["user_consent"] is False
+        expected_message = (
+            f"BLOCKED: {description} requires live human approval and was denied "
+            "by the user. This action has NOT been approved. Do NOT retry, do NOT "
+            "rephrase it, and do NOT attempt the same outcome through another tool."
+        )
+        assert (result["message"], result["deny_reason"]) == (
+            expected_message,
+            None,
+        ), (
+            f"message_leaked={self.PRIVATE_REASON in result['message']}, "
+            f"field_leaked={result['deny_reason'] == self.PRIVATE_REASON}"
+        )
+        self._assert_private_reason_absent(result)
+
+    def test_combined_guard_gateway_denial_omits_gateway_reason(self, monkeypatch):
+        command = "rm -rf .git"
+        dangerous, pattern_key, description = approval_module.detect_dangerous_command(
+            command
+        )
+        assert dangerous is True
+        assert pattern_key
+        assert description
+        monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "manual")
+        monkeypatch.setattr(
+            "tools.tirith_security.check_command_security",
+            lambda _command: {"action": "allow", "findings": [], "summary": ""},
+        )
+
+        result, notified = self._run_gateway_choice(
+            monkeypatch,
+            "privacy-combined-command-guard",
+            lambda: approval_module.check_all_command_guards(command, "local"),
+            "deny",
+            self.PRIVATE_REASON,
+        )
+
+        assert len(notified) == 1
+        assert result["approved"] is False
+        assert result["pattern_key"] == pattern_key
+        assert result["description"] == description
+        assert result["outcome"] == "denied"
+        assert result["user_consent"] is False
+        expected_message = (
+            "BLOCKED: Command denied by user. The user has NOT consented to this "
+            "action. Do NOT retry this command, do NOT rephrase it, and do NOT "
+            "attempt the same outcome via a different command. Stop the current "
+            "workflow and wait for the user to respond before taking any further "
+            "destructive or irreversible action."
+        )
+        assert (result["message"], result["deny_reason"]) == (
+            expected_message,
+            None,
+        ), (
+            f"message_leaked={self.PRIVATE_REASON in result['message']}, "
+            f"field_leaked={result['deny_reason'] == self.PRIVATE_REASON}"
+        )
+        self._assert_private_reason_absent(result)
+
+    def test_execute_code_guard_gateway_denial_omits_gateway_reason(self, monkeypatch):
+        monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "manual")
+
+        result, notified = self._run_gateway_choice(
+            monkeypatch,
+            "privacy-execute-code-guard",
+            lambda: approval_module.check_execute_code_guard("print('safe')", "local"),
+            "deny",
+            self.PRIVATE_REASON,
+        )
+
+        assert len(notified) == 1
+        assert result["approved"] is False
+        assert result["pattern_key"] == "execute_code"
+        assert result["outcome"] == "denied"
+        assert result["user_consent"] is False
+        expected_message = (
+            "BLOCKED: execute_code script denied by user. The user has NOT "
+            "consented to running this code. Do NOT retry, do NOT rephrase the "
+            "script, and do NOT attempt the same outcome via a different tool."
+        )
+        assert (result["message"], result["deny_reason"]) == (
+            expected_message,
+            None,
+        ), (
+            f"message_leaked={self.PRIVATE_REASON in result['message']}, "
+            f"field_leaked={result['deny_reason'] == self.PRIVATE_REASON}"
+        )
+        self._assert_private_reason_absent(result)
+
+    @staticmethod
+    def _run_execute_code_decision(monkeypatch, session_key, decision):
+        mod = approval_module
+        monkeypatch.setattr(mod, "_is_interactive_cli", lambda: False)
+        monkeypatch.setattr(mod, "_is_gateway_approval_context", lambda: True)
+        monkeypatch.setattr(mod, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setattr(mod, "_get_approval_mode", lambda: "manual")
+        monkeypatch.setattr(
+            mod, "get_current_session_key", lambda default=None: session_key
+        )
+        monkeypatch.setattr(
+            mod, "_await_gateway_decision", lambda *_args, **_kwargs: decision
+        )
+        monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        mod.clear_session(session_key)
+        mod._denial_tally.pop(session_key, None)
+        monkeypatch.setitem(mod._gateway_notify_cbs, session_key, lambda _data: None)
+        return mod.check_execute_code_guard("print('safe')", "local")
+
+    def test_execute_code_guard_gateway_timeout_has_fixed_private_result(
+        self, monkeypatch
+    ):
+        result = self._run_execute_code_decision(
+            monkeypatch,
+            "privacy-execute-code-timeout",
+            {
+                "resolved": False,
+                "choice": None,
+                "reason": self.PRIVATE_REASON,
+            },
+        )
+
+        assert result == {
+            "approved": False,
+            "message": (
+                "BLOCKED: execute_code script timed out without user response. "
+                "The user has NOT consented to running this code. Do NOT retry, "
+                "do NOT rephrase the script, and do NOT attempt the same outcome "
+                "via a different tool. Silence is not consent."
+            ),
+            "pattern_key": "execute_code",
+            "description": (
+                "execute_code script execution. The script can spawn subprocesses "
+                "or mutate files without passing through terminal command approval; "
+                "approval is one-shot for this run."
+            ),
+            "outcome": "timeout",
+            "user_consent": False,
+            "deny_reason": None,
+        }
+        self._assert_private_reason_absent(result)
+
+    def test_execute_code_guard_notify_failure_has_fixed_private_result(
+        self, monkeypatch
+    ):
+        result = self._run_execute_code_decision(
+            monkeypatch,
+            "privacy-execute-code-notify-failed",
+            {
+                "resolved": False,
+                "choice": None,
+                "notify_failed": True,
+                "reason": f"RuntimeError: {self.PRIVATE_REASON}",
+            },
+        )
+
+        assert result == {
+            "approved": False,
+            "message": (
+                "BLOCKED: Failed to send execute_code approval request to user. "
+                "Do NOT retry."
+            ),
+            "pattern_key": "execute_code",
+            "description": (
+                "execute_code script execution. The script can spawn subprocesses "
+                "or mutate files without passing through terminal command approval; "
+                "approval is one-shot for this run."
+            ),
+            "outcome": "notify_failed",
+            "user_consent": False,
+        }
+        self._assert_private_reason_absent(result)
+
+    @pytest.mark.parametrize("choice", ["session", "always"])
+    def test_execute_code_guard_preserves_persistent_approval_scopes(
+        self, monkeypatch, choice
+    ):
+        mod = approval_module
+        session_key = f"privacy-execute-code-{choice}"
+        notifications = []
+        saved_allowlists = []
+        original_permanent_approved = mod._permanent_approved
+        original_execute_code_approved = "execute_code" in original_permanent_approved
+        monkeypatch.setattr(
+            mod, "_permanent_approved", set(original_permanent_approved)
+        )
+        monkeypatch.setattr(mod, "_is_interactive_cli", lambda: False)
+        monkeypatch.setattr(mod, "_is_gateway_approval_context", lambda: True)
+        monkeypatch.setattr(mod, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setattr(mod, "_get_approval_mode", lambda: "manual")
+        monkeypatch.setattr(
+            mod, "get_current_session_key", lambda default=None: session_key
+        )
+        monkeypatch.setattr(
+            mod,
+            "save_permanent_allowlist",
+            lambda approved: saved_allowlists.append(set(approved)),
+        )
+        monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        mod.clear_session(session_key)
+        mod._permanent_approved.discard("execute_code")
+
+        def notify(data):
+            notifications.append(data)
+            assert mod.resolve_gateway_approval(session_key, choice) == 1
+
+        mod.register_gateway_notify(session_key, notify)
+        try:
+            first = mod.check_execute_code_guard("print('first')", "local")
+            second = mod.check_execute_code_guard("print('second')", "local")
+
+            assert first == {
+                "approved": True,
+                "message": None,
+                "user_approved": True,
+                "description": (
+                    "execute_code script execution. The script can spawn "
+                    "subprocesses or mutate files without passing through terminal "
+                    "command approval; approval is one-shot for this run."
+                ),
+            }
+            assert second == {"approved": True, "message": None}
+            assert len(notifications) == 1
+            assert mod.is_approved(session_key, "execute_code") is True
+            assert ("execute_code" in mod._permanent_approved) is (choice == "always")
+            assert bool(saved_allowlists) is (choice == "always")
+        finally:
+            mod.unregister_gateway_notify(session_key)
+            mod.clear_session(session_key)
+            mod._permanent_approved.discard("execute_code")
+            assert (
+                "execute_code" in original_permanent_approved
+            ) is original_execute_code_approved

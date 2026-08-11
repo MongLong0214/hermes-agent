@@ -5046,7 +5046,6 @@ def _run_approval_gate(
                 }
             resolved = decision["resolved"]
             choice = decision["choice"]
-            deny_reason = decision.get("reason")
 
             if not resolved or choice is None or choice == "deny":
                 if not resolved:
@@ -5055,13 +5054,10 @@ def _run_approval_gate(
                 else:
                     reason = "denied by user"
                     timeout_addendum = ""
-                reason_addendum = ""
-                if resolved and deny_reason:
-                    reason_addendum = f' Reason given by the user: "{deny_reason}".'
                 return {
                     "approved": False,
                     "message": (
-                        f"BLOCKED: Action {reason}.{reason_addendum} The user "
+                        f"BLOCKED: Action {reason}. The user "
                         f"has NOT consented to this action. Do NOT retry it, "
                         f"do NOT rephrase it, and do NOT attempt the same "
                         f"outcome via a different path.{timeout_addendum}"
@@ -5494,7 +5490,6 @@ def _mandatory_human_block_result(
     description: str,
     *,
     outcome: str,
-    deny_reason: str | None = None,
 ) -> dict:
     """Build a fail-closed result for a mandatory one-operation decision."""
     if outcome == "timeout":
@@ -5506,17 +5501,12 @@ def _mandatory_human_block_result(
     else:
         reason = "was denied by the user"
         silence = ""
-    reason_addendum = (
-        f' Reason given by the user: "{deny_reason}".'
-        if outcome == "denied" and deny_reason
-        else ""
-    )
     return {
         "approved": False,
         "mandatory_approval": True,
         "message": (
             f"BLOCKED: {description} requires live human approval and {reason}."
-            f"{reason_addendum} This action has NOT been approved. Do NOT retry, "
+            " This action has NOT been approved. Do NOT retry, "
             "do NOT rephrase it, and do NOT attempt the same outcome through "
             f"another tool.{silence}"
         ),
@@ -5524,7 +5514,7 @@ def _mandatory_human_block_result(
         "description": description,
         "outcome": outcome,
         "user_consent": False,
-        "deny_reason": deny_reason,
+        "deny_reason": None,
     }
 
 
@@ -5600,7 +5590,6 @@ def _request_mandatory_human_approval(
             return _mandatory_human_block_result(
                 description,
                 outcome="denied",
-                deny_reason=decision.get("reason"),
             )
     elif is_cli:
         _fire_approval_hook(
@@ -5987,7 +5976,6 @@ def check_all_command_guards(command: str, env_type: str,
                 }
             resolved = decision["resolved"]
             choice = decision["choice"]
-            deny_reason = decision.get("reason")
 
             if not resolved or choice is None or choice == "deny":
                 # Consent contract: silence is NOT consent, and an explicit
@@ -6003,17 +5991,13 @@ def check_all_command_guards(command: str, env_type: str,
                     reason = "denied by user"
                     timeout_addendum = ""
                     outcome = "denied"
-                # An explicit deny may carry a free-text reason
-                # (``/deny <reason>``) so the agent can adapt rather than only
-                # hearing "denied". Relayed verbatim; generic attribution.
-                reason_addendum = ""
-                if outcome == "denied" and deny_reason:
-                    reason_addendum = f' Reason given by the user: "{deny_reason}".'
+                # Free-text deny reasons stay on the internal gateway transport
+                # and are intentionally omitted from this tool-facing result.
                 breaker_addendum = _denial_breaker_addendum(session_key)
                 return {
                     "approved": False,
                     "message": (
-                        f"BLOCKED: Command {reason}.{reason_addendum} The user "
+                        f"BLOCKED: Command {reason}. The user "
                         f"has NOT consented to this action. Do NOT retry this "
                         f"command, do NOT rephrase it, and do NOT attempt the "
                         f"same outcome via a different command. Stop the "
@@ -6025,7 +6009,7 @@ def check_all_command_guards(command: str, env_type: str,
                     "description": combined_desc,
                     "outcome": outcome,
                     "user_consent": False,
-                    "deny_reason": deny_reason,
+                    "deny_reason": None,
                 }
 
             # A smart-DENY owner override is always one operation, even if an
@@ -6356,28 +6340,26 @@ def check_execute_code_guard(code: str, env_type: str,
 
     resolved = decision["resolved"]
     choice = decision["choice"]
-    deny_reason = decision.get("reason")
 
     if not resolved or choice is None or choice == "deny":
         reason = "timed out without user response" if not resolved else "denied by user"
         addendum = " Silence is not consent." if not resolved else ""
-        reason_addendum = ""
-        if resolved and choice == "deny" and deny_reason:
-            reason_addendum = f' Reason given by the user: "{deny_reason}".'
+        # Free-text deny reasons stay on the internal gateway transport and are
+        # intentionally omitted from this tool-facing result.
         breaker_addendum = _denial_breaker_addendum(session_key)
         return {
             "approved": False,
             "message": (
-                f"BLOCKED: execute_code script {reason}.{reason_addendum} The "
-                f"user has NOT consented to running this code. Do NOT retry, "
-                f"do NOT rephrase the script, and do NOT attempt the same "
-                f"outcome via a different tool.{addendum}{breaker_addendum}"
+                f"BLOCKED: execute_code script {reason}. The user has NOT "
+                f"consented to running this code. Do NOT retry, do NOT "
+                f"rephrase the script, and do NOT attempt the same outcome "
+                f"via a different tool.{addendum}{breaker_addendum}"
             ),
             "pattern_key": pattern_key,
             "description": description,
             "outcome": "timeout" if not resolved else "denied",
             "user_consent": False,
-            "deny_reason": deny_reason,
+            "deny_reason": None,
         }
 
     # Never persist a smart-DENY override under the coarse execute_code key;
