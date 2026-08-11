@@ -17,6 +17,195 @@ def _ensure_redaction_enabled(monkeypatch):
 
 class TestKnownPrefixes:
 
+    def test_standalone_64_hex_private_key_is_fully_redacted(self):
+        secret = "a1" * 32
+        result = redact_sensitive_text(secret, force=True)
+        assert secret not in result
+        assert result == "[REDACTED 64-HEX SECRET]"
+
+    @pytest.mark.parametrize("command", [
+        "docker inspect example-container",
+        "docker container inspect example-container",
+        "docker --context example inspect example-container",
+        "docker --config /tmp/docker-cli -H unix:///tmp/docker.sock container inspect example-container",
+        "docker -H=unix:///tmp/docker.sock inspect example-container",
+        "(docker inspect example-container)",
+        "{ docker container inspect example-container; }",
+        "printf ready | (docker --context example inspect example-container)",
+    ])
+    def test_docker_inspect_masks_opaque_secret_env_values(self, command):
+        from agent.redact import redact_terminal_output
+
+        secret = "opaque-database-password-without-vendor-prefix"
+        output = f'[{{"Config":{{"Env":["POSTGRES_PASSWORD={secret}"]}}}}]'
+        result = redact_terminal_output(output, command, force=True)
+        assert secret not in result
+
+    def test_docker_inspect_forces_opaque_env_redaction_when_disabled(
+        self, monkeypatch
+    ):
+        from agent.redact import redact_terminal_output
+
+        monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
+        secret = "opaque-runtime-password-without-vendor-prefix"
+        output = f'[{{"Config":{{"Env":["SERVICE_PASSWORD={secret}"]}}}}]'
+        result = redact_terminal_output(
+            output,
+            "(docker --context example container inspect example-container)",
+        )
+        assert secret not in result
+
+    @pytest.mark.parametrize("command", [
+        "printf ready $(docker inspect example-container)",
+        "printf ready `docker container inspect example-container`",
+        "sh -c 'docker inspect example-container'",
+        'bash -c "docker container inspect example-container"',
+        'sh -c \'bash -c "docker inspect example-container"\'',
+    ])
+    def test_command_carried_docker_inspect_forces_opaque_env_redaction(
+        self, monkeypatch, command
+    ):
+        from agent.redact import redact_terminal_output
+
+        monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
+        secret = "opaque-carried-password-without-vendor-prefix"
+        output = f'[{{"Config":{{"Env":["SERVICE_PASSWORD={secret}"]}}}}]'
+        result = redact_terminal_output(output, command)
+        assert secret not in result
+
+    @pytest.mark.parametrize("command", [
+        "(docker ps)",
+        "{ docker container ls; }",
+        "(docker --context example ps)",
+        "{ docker --context example container ls; }",
+        "printf '%s' 'docker inspect example-container'",
+        "printf '%s' '$(docker inspect example-container)'",
+        "printf '%s' '`docker inspect example-container`'",
+        "sh -c 'docker ps'",
+        "bash -c 'docker container ls'",
+    ])
+    def test_grouped_benign_docker_output_keeps_opaque_env_value(self, command):
+        from agent.redact import redact_terminal_output
+
+        secret = "opaque-benign-value-without-vendor-prefix"
+        output = f'[{{"Config":{{"Env":["SERVICE_PASSWORD={secret}"]}}}}]'
+        result = redact_terminal_output(output, command, force=True)
+        assert secret in result
+
+    @pytest.mark.parametrize("command", [
+        'echo "$(docker inspect box)"',
+        'echo "`docker inspect box`"',
+        'sh -c \'echo "$(docker inspect box)"\'',
+        'echo "$(eval \'docker inspect box\')"',
+    ])
+    def test_executable_substitution_docker_inspect_forces_redaction(
+        self, monkeypatch, command
+    ):
+        from agent.redact import redact_terminal_output
+
+        monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
+        secret = "opaque-substitution-secret-without-vendor-prefix"
+        output = f'[{{"Config":{{"Env":["SERVICE_PASSWORD={secret}"]}}}}]'
+        result = redact_terminal_output(output, command)
+        assert secret not in result
+
+    @pytest.mark.parametrize("command", [
+        "eval 'docker inspect box'",
+        'printf x | xargs -0 --max-args=1 sh -c "docker inspect box"',
+        "find . -exec docker inspect box {} \\;",
+        "find . -execdir sh -c 'docker inspect box' _ {} +",
+    ])
+    def test_explicit_shell_carrier_docker_inspect_forces_redaction(
+        self, monkeypatch, command
+    ):
+        from agent.redact import redact_terminal_output
+
+        monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
+        secret = "opaque-explicit-carrier-secret-without-vendor-prefix"
+        output = f'[{{"Config":{{"Env":["SERVICE_PASSWORD={secret}"]}}}}]'
+        result = redact_terminal_output(output, command)
+        assert secret not in result
+
+    @pytest.mark.parametrize("command", [
+        "echo '$(docker inspect box)'",
+        "echo '`docker inspect box`'",
+        'echo "\\$(docker inspect box)"',
+        'echo "\\`docker inspect box\\`"',
+        "printf '%s' 'eval docker inspect box'",
+        "printf '%s' 'xargs sh -c docker inspect box'",
+        "printf '%s' 'find . -exec docker inspect box ;'",
+        "eval 'docker ps'",
+        "printf box | xargs printf '%s\\n'",
+        "find . -exec docker ps {} \\;",
+    ])
+    def test_inert_or_safe_docker_carrier_keeps_opaque_value(self, command):
+        from agent.redact import redact_terminal_output
+
+        secret = "opaque-safe-carrier-value-without-vendor-prefix"
+        output = f'[{{"Config":{{"Env":["SERVICE_PASSWORD={secret}"]}}}}]'
+        result = redact_terminal_output(output, command, force=True)
+        assert secret in result
+
+    def test_process_substitution_docker_inspect_stays_forced(self, monkeypatch):
+        from agent.redact import redact_terminal_output
+
+        monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
+        secret = "opaque-process-substitution-secret-without-vendor-prefix"
+        output = f'[{{"Config":{{"Env":["SERVICE_PASSWORD={secret}"]}}}}]'
+        result = redact_terminal_output(output, "cat <(docker inspect box)")
+        assert secret not in result
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "x" * 128_001,
+            "printf x " + " ".join('"$(printf x)"' for _ in range(200)),
+        ],
+        ids=["size-limit", "carrier-limit"],
+    )
+    def test_parser_limit_forces_opaque_redaction_before_variants(
+        self, monkeypatch, command
+    ):
+        import tools.approval as approval
+        from agent.redact import redact_terminal_output
+
+        def fail_if_called(_command):
+            raise AssertionError("variant generation ran before redaction preflight")
+
+        monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
+        monkeypatch.setattr(approval, "_command_detection_variants", fail_if_called)
+        secret = "opaque-parser-limit-secret-without-vendor-prefix"
+        output = f'[{{"Config":{{"Env":["SERVICE_PASSWORD={secret}"]}}}}]'
+
+        result = redact_terminal_output(output, command)
+
+        assert secret not in result
+
+    def test_variant_budget_exhaustion_forces_opaque_redaction(
+        self, monkeypatch
+    ):
+        import tools.approval as approval
+        from agent.redact import redact_terminal_output
+
+        command = "printf parser-budget-control"
+
+        def unique_findings(candidate):
+            if candidate != command:
+                return
+            for index in range(10_000):
+                if index == 600:
+                    raise AssertionError("payload findings were eagerly materialized")
+                yield ("synthetic executable payload", f"printf payload-{index}")
+
+        monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
+        monkeypatch.setattr(approval, "_execution_flag_findings", unique_findings)
+        secret = "opaque-variant-budget-secret-without-vendor-prefix"
+        output = f'[{{"Config":{{"Env":["SERVICE_PASSWORD={secret}"]}}}}]'
+
+        result = redact_terminal_output(output, command)
+
+        assert secret not in result
+
 
 
 
