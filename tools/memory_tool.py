@@ -889,15 +889,21 @@ class MemoryStore:
         return f"{separator}\n{header}\n{separator}\n{content}"
 
     @staticmethod
-    def _read_source_bytes_checked(path: Path) -> Tuple[bool, bytes, str, bool]:
-        """Read existence and one exact byte snapshot for load-time repair."""
-        if not path.exists():
+    def _read_source_bytes_checked(
+        path: Path,
+    ) -> Tuple[Optional[bool], bytes, str, bool]:
+        """Read one exact snapshot; ``None`` existence means source unknown."""
+        try:
+            source_exists = path.exists()
+        except Exception:
+            return None, b"", "", False
+        if not source_exists:
             return False, b"", "", True
         try:
             source_bytes = path.read_bytes()
             return True, source_bytes, source_bytes.decode("utf-8-sig"), True
-        except (OSError, IOError, UnicodeDecodeError):
-            return True, b"", "", False
+        except Exception:
+            return None, b"", "", False
 
     @staticmethod
     def _read_raw_checked(path: Path) -> Tuple[str, bool]:
