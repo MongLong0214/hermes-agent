@@ -1,5 +1,7 @@
 """Tests for blocked-command recovery guidance (parser-limit + backgrounding)."""
 
+import re
+
 import pytest
 
 from tools.approval import _hardline_block_result, _PARSER_LIMIT_DESCRIPTION, _MALFORMED_EXEC_DESCRIPTION
@@ -8,22 +10,30 @@ from tools.terminal_tool import _foreground_background_guidance
 
 class TestParserLimitRecovery:
     def test_parser_limit_block_saves_payload_and_names_it(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        hermes_home = tmp_path / ".hermes"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         cmd = "python3 -c '" + "x = 1; " * 900 + "'"
         r = _hardline_block_result(_PARSER_LIMIT_DESCRIPTION, cmd)
         assert r["approved"] is False
         assert "RECOVERY" in r["message"]
         assert "blocked-scripts" in r["message"]
-        import re as _re
-        m = _re.search(r"saved to (\S+\.sh)", r["message"])
+        m = re.search(
+            r"saved to (\$HERMES_HOME/cache/blocked-scripts/(blocked-[^/\s]+\.sh))",
+            r["message"],
+        )
         assert m, r["message"]
-        from pathlib import Path
-        saved = Path(m.group(1))
+        neutral_reference, basename = m.groups()
+        assert re.fullmatch(r"blocked-[0-9]+-[0-9a-f]{8}\.sh", basename)
+        assert str(tmp_path) not in r["message"]
+        assert str(hermes_home) not in r["message"]
+
+        saved = hermes_home / "cache" / "blocked-scripts" / basename
         assert saved.exists()
-        body = saved.read_text()
+        body = saved.read_text(encoding="utf-8")
         assert cmd in body
         assert body.startswith("#!/bin/bash")
-        assert f"bash {saved}" in r["message"]
+        assert f"bash {neutral_reference}" in r["message"]
+        assert f"bash {saved}" not in r["message"]
 
     def test_save_failure_falls_back_to_manual_recipe(self, monkeypatch):
         import tools.approval as ap
