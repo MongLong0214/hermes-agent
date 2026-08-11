@@ -7,6 +7,8 @@ gateway /yolo, approvals.mode=off, or cron approve mode.
 Inspired by Mercury Agent's permission-hardened blocklist.
 """
 
+import logging
+
 import pytest
 
 from tools.approval import (
@@ -569,16 +571,16 @@ def test_cron_approve_mode_cannot_bypass_hardline(clean_session, monkeypatch):
     assert result.get("hardline") is True
 
 
-def test_container_backends_still_bypass(clean_session):
-    """Containerized backends remain bypass-approved — they can't touch the host.
-
-    Hardline only protects environments with real host impact (local, ssh).
-    """
+def test_container_backends_bypass_dangerous_prompt_but_not_hardline_floor(
+    clean_session,
+):
+    """Containers may bypass reusable dangerous prompts, never the hardline floor."""
     for env in ("docker", "singularity", "modal", "daytona", "vercel_sandbox"):
         r1 = check_dangerous_command("rm -rf /", env)
         assert r1["approved"] is True, f"container {env} should still bypass"
         r2 = check_all_command_guards("rm -rf /", env)
-        assert r2["approved"] is True, f"container {env} should still bypass"
+        assert r2["approved"] is False, f"container {env} must not bypass hardline"
+        assert r2.get("hardline") is True
 
 
 def test_hardline_runs_before_dangerous_detection(clean_session):
@@ -675,3 +677,158 @@ def test_sudo_stdin_guard_container_bypass(clean_session):
         for cmd in _SUDO_STDIN_BLOCK:
             result = check_all_command_guards(cmd, env)
             assert result["approved"] is True, f"container {env} should bypass sudo guard on {cmd!r}"
+
+
+class TestProtectedPushGitAliases:
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "git -c alias.p=push p origin main",
+            "git -calias.p=push p origin main",
+            "git --config-env=alias.p=PUSH_ALIAS p origin main",
+            "git --config-env alias.p=PUSH_ALIAS p origin main",
+            "git -c 'alias.p=!git push' p origin main",
+        ],
+    )
+    def test_alias_push_to_default_branch_is_hardline_denied(self, command):
+        is_hardline, description = detect_hardline_command(command)
+
+        assert is_hardline is True
+        assert description == "push to protected default branch (main/master)"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "git -c alias.s=status s",
+            "git -calias.p=push p origin feature/topic",
+            "git --config-env=alias.p=PUSH_ALIAS p origin feature/topic",
+        ],
+    )
+    def test_non_push_or_feature_branch_alias_is_not_hardline_denied(self, command):
+        assert detect_hardline_command(command) == (False, None)
+
+
+class TestHardlinePublicDiagnostics:
+    @pytest.mark.parametrize(
+        "caller_name", ["check_dangerous_command", "check_all_command_guards"]
+    )
+    def test_credential_bearing_protected_push_has_fixed_warning_record(
+        self, caller_name, caplog
+    ):
+        import tools.approval as approval_mod
+
+        command = (
+            "git push "
+            "https://private-user:sensitive-credential-fixture@"
+            "example.invalid/Users/private-user/private-repo main"
+        )
+        caller = getattr(approval_mod, caller_name)
+
+        with caplog.at_level(logging.WARNING, logger="tools.approval"):
+            result = caller(command, "local")
+
+        assert result["approved"] is False
+        assert result.get("hardline") is True
+        assert [
+            (record.levelno, record.getMessage(), record.args, record.exc_info)
+            for record in caplog.records
+        ] == [(logging.WARNING, "command_hardline_blocked", (), None)]
+        public_text = result["message"] + caplog.text
+        for private_text in (
+            command,
+            "sensitive-credential-fixture",
+            "private-user",
+            "/Users/private-user",
+        ):
+            assert private_text not in public_text
+
+    @pytest.mark.parametrize(
+        "caller_name", ["check_dangerous_command", "check_all_command_guards"]
+    )
+    def test_user_deny_has_fixed_warning_record(
+        self, caller_name, monkeypatch, caplog
+    ):
+        import tools.approval as approval_mod
+
+        command = "deploy /Users/private-user/private-directory"
+        monkeypatch.setattr(
+            approval_mod,
+            "_get_approval_config",
+            lambda: {"mode": "manual", "deny": ["deploy *"]},
+        )
+        caller = getattr(approval_mod, caller_name)
+
+        with caplog.at_level(logging.WARNING, logger="tools.approval"):
+            result = caller(command, "local")
+
+        assert result["approved"] is False
+        assert result.get("user_deny") is True
+        assert [
+            (record.levelno, record.getMessage(), record.args, record.exc_info)
+            for record in caplog.records
+        ] == [(logging.WARNING, "command_user_deny_blocked", (), None)]
+        assert "/Users/private-user" not in result["message"] + caplog.text
+
+    def test_parser_limit_recovery_uses_neutral_validated_script_reference(
+        self, monkeypatch
+    ):
+        import tools.approval as approval_mod
+
+        saved = (
+            "/Users/private-user/.hermes/cache/blocked-scripts/"
+            "blocked-1234567890-deadbeef.sh"
+        )
+        monkeypatch.setattr(approval_mod, "_save_blocked_payload", lambda _cmd: saved)
+
+        result = approval_mod._hardline_block_result(
+            approval_mod._PARSER_LIMIT_DESCRIPTION, "echo oversized"
+        )
+
+        neutral = (
+            "$HERMES_HOME/cache/blocked-scripts/"
+            "blocked-1234567890-deadbeef.sh"
+        )
+        assert neutral in result["message"]
+        assert saved not in result["message"]
+        assert "/Users/" not in result["message"]
+        assert "private-user" not in result["message"]
+
+    def test_parser_limit_recovery_rejects_unvalidated_script_basename(
+        self, monkeypatch
+    ):
+        import tools.approval as approval_mod
+
+        saved = "/Users/private-user/.hermes/cache/blocked-scripts/private.txt"
+        monkeypatch.setattr(approval_mod, "_save_blocked_payload", lambda _cmd: saved)
+
+        result = approval_mod._hardline_block_result(
+            approval_mod._PARSER_LIMIT_DESCRIPTION, "echo oversized"
+        )
+
+        assert saved not in result["message"]
+        assert "/Users/" not in result["message"]
+        assert "$HERMES_HOME/cache/blocked-scripts/" not in result["message"]
+
+    def test_blocked_payload_save_failure_has_fixed_metadata_free_record(
+        self, monkeypatch, caplog
+    ):
+        import hermes_constants
+        import tools.approval as approval_mod
+
+        command = "private command at /Users/private-user/private-directory"
+
+        def fail_home_lookup():
+            raise RuntimeError("private failure at /Users/private-user/.hermes")
+
+        monkeypatch.setattr(hermes_constants, "get_hermes_home", fail_home_lookup)
+
+        with caplog.at_level(logging.DEBUG, logger="tools.approval"):
+            assert approval_mod._save_blocked_payload(command) is None
+
+        assert [
+            (record.levelno, record.getMessage(), record.args, record.exc_info)
+            for record in caplog.records
+        ] == [(logging.DEBUG, "blocked_payload_save_failed", (), None)]
+        assert command not in caplog.text
+        assert "private failure" not in caplog.text
+        assert "/Users/private-user" not in caplog.text
