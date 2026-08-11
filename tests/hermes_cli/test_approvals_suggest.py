@@ -125,7 +125,7 @@ class TestScan:
     def test_scan_finds_approved_dangerous_commands(self, db_path):
         path, con = db_path
         for _ in range(3):
-            _add_terminal_call(con, "git push --force origin main")
+            _add_terminal_call(con, "git push --force origin feature/topic")
         # A benign command never enters approval history.
         _add_terminal_call(con, "ls -la")
         records = scan_approval_history(path, days=0)
@@ -137,8 +137,8 @@ class TestScan:
     def test_days_window_filters_old_history(self, db_path):
         path, con = db_path
         old_ts = time.time() - 200 * 86400
-        _add_terminal_call(con, "git push --force origin main", ts=old_ts)
-        _add_terminal_call(con, "git push --force origin main")
+        _add_terminal_call(con, "git push --force origin feature/topic", ts=old_ts)
+        _add_terminal_call(con, "git push --force origin feature/topic")
         assert len(scan_approval_history(path, days=90)) == 1
         assert len(scan_approval_history(path, days=0)) == 2
 
@@ -179,7 +179,7 @@ class TestRankingAndSafety:
         for _ in range(5):
             _add_terminal_call(con, "docker restart web")
         for _ in range(2):
-            _add_terminal_call(con, "git push --force origin main")
+            _add_terminal_call(con, "git push --force origin feature/topic")
         records = scan_approval_history(path, days=0)
         proposals = build_proposals(records, min_count=2)
         assert [p.pattern for p in proposals] == ["docker restart *", "git push *"]
@@ -188,7 +188,7 @@ class TestRankingAndSafety:
 
     def test_min_count_threshold(self, db_path):
         path, con = db_path
-        _add_terminal_call(con, "git push --force origin main")
+        _add_terminal_call(con, "git push --force origin feature/topic")
         records = scan_approval_history(path, days=0)
         assert build_proposals(records, min_count=2) == []
         assert len(build_proposals(records, min_count=1)) == 1
@@ -229,7 +229,7 @@ class TestApply:
     def test_suggest_apply_end_to_end(self, db_path, isolated_allowlist, capsys):
         path, con = db_path
         for _ in range(4):
-            _add_terminal_call(con, "git push --force origin main")
+            _add_terminal_call(con, "git push --force origin feature/topic")
         for _ in range(3):
             _add_terminal_call(con, "docker restart web")
         rc = suggest_command(_args(path, apply_indices="1,2"))
@@ -244,7 +244,7 @@ class TestJsonOutput:
     def test_json_proposal_output(self, db_path, isolated_allowlist, capsys):
         path, con = db_path
         for _ in range(4):
-            _add_terminal_call(con, "git push --force origin main")
+            _add_terminal_call(con, "git push --force origin feature/topic")
         rc = suggest_command(_args(path, json=True))
         assert rc == 0
         payload = json.loads(capsys.readouterr().out)

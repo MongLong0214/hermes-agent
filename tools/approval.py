@@ -468,6 +468,12 @@ HARDLINE_PATTERNS = [
     (_CMDPOS + r'init\s+[06]\b', "init 0/6 (shutdown/reboot)"),
     (_CMDPOS + r'systemctl\s+(poweroff|reboot|halt|kexec)\b', "systemctl poweroff/reboot"),
     (_CMDPOS + r'telinit\s+[06]\b', "telinit 0/6 (shutdown/reboot)"),
+    # Credential-enumeration paths are never necessary through the agent. The
+    # dedicated bridge/container runtimes consume these internally.
+    (r'\b(?:cat|head|tail|less|more|nl|xxd|od)\b[^\n;|&]*\.hermes/bridge/keys/[^\s;|&]+\.priv\b',
+     "read Hermes bridge private key"),
+    (r'\b(?:cat|head|tail|less|more|strings)\b[^\n;|&]*/proc/(?:\d+|self)/environ\b',
+     "read process credential environment"),
 ]
 
 # Pre-compiled variant used by the hot-path matcher. Building these at module
@@ -517,6 +523,323 @@ def _check_sudo_stdin_guard(command: str) -> tuple:
     return (False, None)
 
 
+def _expand_simple_shell_assignments(command: str) -> str:
+    """Expand bounded literal ``NAME=value; $NAME ...`` aliases only."""
+    assignments: dict[str, str] = {}
+    for match in re.finditer(
+        r"(?:^|[;\n])\s*([A-Za-z_][A-Za-z0-9_]*)=([A-Za-z0-9_./+-]+)\s*(?=;|\n)",
+        command,
+    ):
+        assignments[match.group(1)] = match.group(2)
+    expanded = command
+    for name, value in assignments.items():
+        expanded = re.sub(
+            rf"\$(?:\{{{re.escape(name)}\}}|{re.escape(name)}\b)", value, expanded
+        )
+    return expanded
+
+
+_WRAPPER_VALUE_OPTIONS = {
+    "sudo": {
+        "-C", "--chdir", "-g", "--group", "-h", "--host", "-p", "--prompt",
+        "-R", "--chroot", "-r", "--role", "-T", "--command-timeout", "-t",
+        "--type", "-u", "--user",
+    },
+    "env": {"-C", "--chdir", "-S", "--split-string", "-u", "--unset"},
+    "exec": {"-a"},
+    "time": {"-f", "--format", "-o", "--output"},
+    "nice": {"-n", "--adjustment"},
+}
+_COMMAND_WRAPPERS = frozenset(
+    {"sudo", "env", "exec", "nohup", "setsid", "time", "command", "nice"}
+)
+
+
+def _strip_command_wrappers(argv: list[str]) -> list[str]:
+    """Return argv beginning at the wrapped executable, if structurally clear."""
+    argv = list(argv)
+    while argv:
+        while argv and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", argv[0]):
+            argv.pop(0)
+        if not argv:
+            return argv
+        wrapper = os.path.basename(argv[0]).lower()
+        if wrapper not in _COMMAND_WRAPPERS:
+            return argv
+        argv.pop(0)
+
+        value_options = _WRAPPER_VALUE_OPTIONS.get(wrapper, set())
+        i = 0
+        while i < len(argv) and argv[i].startswith("-") and argv[i] != "-":
+            token = argv[i]
+            if token == "--":
+                i += 1
+                break
+            option = token.split("=", 1)[0]
+            i += 1
+            if "=" not in token and option in value_options and i < len(argv):
+                i += 1
+        argv = argv[i:]
+        if wrapper == "env":
+            while argv and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", argv[0]):
+                argv.pop(0)
+    return argv
+
+
+_GIT_GLOBAL_VALUE_OPTIONS = {
+    "-C", "-c", "--config-env", "--exec-path", "--git-dir", "--namespace",
+    "--super-prefix", "--work-tree",
+}
+_GIT_PUSH_VALUE_OPTIONS = {
+    "--exec", "--push-option", "--receive-pack", "--repo", "--server-option", "-o",
+}
+_GIT_DEFAULT_BRANCHES = frozenset({"main", "master"})
+_DOCKER_GLOBAL_VALUE_OPTIONS = frozenset({
+    "--config", "-c", "--context", "-H", "--host", "-l", "--log-level",
+    "--tlscacert", "--tlscert", "--tlskey",
+})
+_DOCKER_CONTEXT_OPTIONS = frozenset({"-c", "--context"})
+_DOCKER_CONTEXT_REDIRECT_DESCRIPTION = (
+    "docker with daemon redirect (--context: alternate daemon)"
+)
+
+
+def _skip_leading_options(
+    argv: list[str],
+    start: int,
+    value_options: set[str],
+) -> int:
+    """Skip options plus their structurally required separate values."""
+    i = start
+    while i < len(argv) and argv[i].startswith("-") and argv[i] != "-":
+        token = argv[i]
+        if token == "--":
+            return i + 1
+        option = token.split("=", 1)[0]
+        i += 1
+        if "=" not in token and option in value_options and i < len(argv):
+            i += 1
+    return i
+
+
+def _parse_shell_segment_argv(segment: str) -> list[str] | None:
+    """Tokenize one shell segment and unwrap command-carrier delimiters.
+
+    Parentheses, braces, and backticks are shell syntax only when unquoted.
+    Giving them to ``shlex`` as punctuation separates ``(docker`` / ``main)``
+    without rewriting quoted arguments. Peeling the resulting delimiter tokens
+    lets the structural Git and Docker parsers inspect commands inside command
+    substitutions and compound groups while preserving ordinary argv contents.
+    """
+    try:
+        lexer = shlex.shlex(
+            segment.strip(),
+            posix=True,
+            punctuation_chars="`(){}",
+        )
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        argv = list(lexer)
+    except ValueError:
+        return None
+
+    while argv and argv[0] in {"`", "(", "{"}:
+        argv.pop(0)
+    while argv and argv[-1] in {"`", ")", "}"}:
+        argv.pop()
+    return argv
+
+
+def _docker_command_analysis(command: str) -> tuple[bool, bool]:
+    """Return ``(runs_inspect, context_is_safe_read_control)``.
+
+    Docker global options are parsed with their value arity so a value such as
+    ``example`` in ``--context example ps`` cannot be mistaken for the
+    subcommand. Ambiguous inspect-shaped input fails closed.
+    """
+    context_seen = False
+    all_contexts_safe = True
+    for segment in _iter_top_level_shell_segments(command):
+        argv = _parse_shell_segment_argv(segment)
+        if argv is None:
+            lowered = segment.lower()
+            if re.search(r"\bdocker\b", lowered) and re.search(r"\binspect\b", lowered):
+                return True, False
+            if re.search(r"\bdocker\b", lowered) and re.search(
+                r"(?:^|\s)(?:-c|--context)(?:=|\s)", lowered
+            ):
+                context_seen = True
+                all_contexts_safe = False
+            continue
+
+        argv = _strip_command_wrappers(argv)
+        if not argv or os.path.basename(argv[0]).lower() != "docker":
+            continue
+
+        i = 1
+        context_option = False
+        malformed = False
+        consumed_values: list[str] = []
+        while i < len(argv) and argv[i].startswith("-") and argv[i] != "-":
+            token = argv[i]
+            if token == "--":
+                i += 1
+                break
+            option, separator, attached = token.partition("=")
+            if option in _DOCKER_CONTEXT_OPTIONS:
+                context_option = True
+            i += 1
+            if option not in _DOCKER_GLOBAL_VALUE_OPTIONS:
+                continue
+            if separator:
+                if attached:
+                    consumed_values.append(attached.lower())
+                else:
+                    malformed = True
+            elif i < len(argv):
+                consumed_values.append(argv[i].lower())
+                i += 1
+            else:
+                malformed = True
+
+        command_words = tuple(word.lower() for word in argv[i:i + 2])
+        if command_words[:1] == ("inspect",) or command_words == (
+            "container", "inspect",
+        ):
+            return True, False
+        if not command_words and "inspect" in consumed_values:
+            return True, False
+        if malformed and any(word.lower() == "inspect" for word in argv[1:]):
+            return True, False
+
+        if context_option:
+            context_seen = True
+            safe_control = (
+                command_words[:1] == ("ps",)
+                or command_words == ("container", "ls")
+            )
+            if not safe_control:
+                all_contexts_safe = False
+
+    return False, context_seen and all_contexts_safe
+
+
+def _push_refspec_may_target_default(refspec: str) -> bool:
+    """Fail closed unless a refspec has an explicit non-default destination."""
+    refspec = refspec.lstrip("+")
+    if not refspec or refspec == ":":
+        return True
+    if refspec.startswith("^"):
+        # A negative refspec cannot establish a safe destination by itself.
+        return False
+    if "*" in refspec or "?" in refspec or "[" in refspec:
+        return True
+
+    if ":" in refspec:
+        destination = refspec.rsplit(":", 1)[-1].lstrip("+")
+        if not destination:
+            return True
+    else:
+        destination = refspec
+
+    destination = destination.removeprefix("refs/heads/")
+    if destination in _GIT_DEFAULT_BRANCHES:
+        return True
+    if destination in {"HEAD", "@"}:
+        return True
+    # Revision expressions and reflog selectors describe a source commit, not
+    # a provable destination branch, when no explicit destination was supplied.
+    if ":" not in refspec and any(marker in destination for marker in ("~", "^", "@{")):
+        return True
+    return False
+
+
+def _is_default_branch_push(command: str) -> bool:
+    """Detect explicit or potentially implicit pushes to main/master.
+
+    Wrapper/global/push options are parsed with their value arity. A push with
+    no explicit safe branch destination fails closed because repository config
+    can map it to the protected default branch.
+    """
+    command = _expand_simple_shell_assignments(command)
+    for segment in _iter_top_level_shell_segments(command):
+        argv = _parse_shell_segment_argv(segment)
+        if argv is None:
+            continue
+        argv = _strip_command_wrappers(argv)
+        if not argv or os.path.basename(argv[0]).lower() != "git":
+            continue
+
+        i = _skip_leading_options(argv, 1, _GIT_GLOBAL_VALUE_OPTIONS)
+        if i >= len(argv) or argv[i] != "push":
+            continue
+
+        operands: list[str] = []
+        remote_from_option = False
+        tags_only = False
+        j = i + 1
+        while j < len(argv):
+            token = argv[j]
+            if token == "--":
+                operands.extend(argv[j + 1:])
+                break
+            if token.startswith("-") and token != "-":
+                option = token.split("=", 1)[0]
+                if option in {"--all", "--mirror"}:
+                    return True
+                if option == "--tags":
+                    tags_only = True
+                if option == "--repo":
+                    remote_from_option = True
+                j += 1
+                if (
+                    "=" not in token
+                    and option in _GIT_PUSH_VALUE_OPTIONS
+                    and j < len(argv)
+                ):
+                    j += 1
+                continue
+            operands.append(token)
+            j += 1
+
+        refspecs = operands if remote_from_option else operands[1:]
+        if not refspecs:
+            if tags_only:
+                continue
+            return True
+
+        positive_refspecs = [ref for ref in refspecs if not ref.lstrip("+").startswith("^")]
+        if not positive_refspecs:
+            return True
+        if any(_push_refspec_may_target_default(ref) for ref in positive_refspecs):
+            return True
+    return False
+
+
+_MANDATORY_APPROVAL_PATTERNS = [
+    (re.compile(
+        r"(?:>>?|\btee\b[^\n]*)\s*[\"']?(?:~/.hermes|\$HERMES_HOME|\$\{HERMES_HOME\})/config\.yaml\b",
+        re.I,
+    ), "write Hermes security configuration"),
+    (re.compile(r"\b(?:python[23]?|pypy[23]?)\b[^\n]*(?:smtplib|sendmail\s*\()", re.I),
+     "send email through an interpreter/SMTP"),
+    (re.compile(r"\b(?:sendmail|msmtp|mailx|mutt|swaks)\b", re.I),
+     "send external email"),
+    (re.compile(r"\bbuzz(?:-real)?\s+messages\s+send\b", re.I),
+     "send an external Buzz message"),
+]
+
+
+def detect_mandatory_approval_command(command: str) -> tuple[bool, str | None]:
+    """Find side effects requiring a human even under yolo/mode=off."""
+    expanded = _expand_simple_shell_assignments(command)
+    for variant in _command_detection_variants(expanded):
+        for pattern, description in _MANDATORY_APPROVAL_PATTERNS:
+            if pattern.search(variant):
+                return True, description
+    return False, None
+
+
 def detect_hardline_command(command: str) -> tuple:
     """Check if a command matches hardline blocklist patterns.
 
@@ -527,11 +850,20 @@ def detect_hardline_command(command: str) -> tuple:
     """
     if _command_parser_limit_exceeded(command):
         return (True, _PARSER_LIMIT_DESCRIPTION)
+    command_variants = tuple(_command_detection_variants(command))
+    if _PARSER_LIMIT_VARIANT in command_variants:
+        return (True, _PARSER_LIMIT_DESCRIPTION)
+    if any(_is_default_branch_push(variant) for variant in command_variants):
+        return (True, "push to protected default branch (main/master)")
+    # Docker inspect exposes Config.Env, including opaque credentials. Parse
+    # global-option value ownership before identifying the subcommand.
+    if any(_docker_command_analysis(variant)[0] for variant in command_variants):
+        return (True, "inspect container credential environment")
     normalized = _normalize_command_for_detection(command)
     _, malformed_grep = _grep_safe_detection_variant(normalized)
     if malformed_grep:
         return (True, _MALFORMED_EXEC_DESCRIPTION)
-    for command_variant in _command_detection_variants(command):
+    for command_variant in command_variants:
         variant_lower = command_variant.lower()
         for pattern_re, description in HARDLINE_PATTERNS_COMPILED:
             if pattern_re.search(variant_lower):
@@ -799,9 +1131,9 @@ DANGEROUS_PATTERNS = [
     # the CLI at a DIFFERENT daemon, often a remote host over ssh/tcp.  A
     # command that looks local (`docker -H ssh://prod stop app`) silently
     # operates on remote infrastructure, so any docker/podman invocation
-    # carrying a redirect requires approval regardless of subcommand.  The
-    # redirect flag must appear in the global-flag position (before the
-    # subcommand) and -H/--host/--context must carry a value, which keeps
+    # carrying a redirect requires approval, except for structurally parsed
+    # read-only ps/container-ls controls. Redirect flags must appear before the
+    # subcommand and -H/--host/--context must carry a value, which keeps
     # `docker -h` (help) and subcommand flags like `docker run -h <hostname>`
     # out of the deny.  Listed BEFORE the lifecycle rules so a redirected
     # lifecycle command surfaces the more specific "remote daemon" reason.
@@ -811,7 +1143,7 @@ DANGEROUS_PATTERNS = [
     (r'\bdocker\s+(?:-{1,2}\S+(?:[=\s]\S+)?\s+)*(?:-h|--host)[=\s]+\S+',
      "docker with remote daemon redirect (-H/--host)"),
     (r'\bdocker\s+(?:-{1,2}\S+(?:[=\s]\S+)?\s+)*(?:-c|--context)[=\s]+\S+',
-     "docker with daemon redirect (--context: alternate daemon)"),
+     _DOCKER_CONTEXT_REDIRECT_DESCRIPTION),
     (r'\bdocker\s+context\s+use\b',
      "docker context use (switches default daemon for future commands)"),
     (r'\bpodman\s+(?:-{1,2}\S+(?:[=\s]\S+)?\s+)*(?:--url|--connection|--identity)[=\s]+\S+',
@@ -948,6 +1280,11 @@ DANGEROUS_PATTERNS = [
      "sudo with privilege flag (stdin/askpass/shell/list)"),
     # Combined short-flag form: -nS, -ns, -sa, -las — sudo flags packed
     # into a single -X token. Catches the same threat class.
+    # Interpreter/Buzz outbound sends are side effects that require a human.
+    (r'\b(?:python[23]?|pypy[23]?)\b[^\n]*(?:smtplib|sendmail\s*\()',
+     "send email through an interpreter/SMTP"),
+    (r'\b(?:sendmail|msmtp|mailx|mutt|swaks)\b', "send external email"),
+    (r'\bbuzz(?:-real)?\s+messages\s+send\b', "send an external Buzz message"),
     (r'\bsudo\b[^;|&\n]*?\s+-[a-z]*[sa][a-z]*\b',
      "sudo with combined-flag privilege escalation"),
 ]
@@ -1255,9 +1592,120 @@ _SHELL_PUNCTUATION = {";", "&", "&&", "|", "||", "(", ")", "{", "}"}
 _MAX_DETECTION_COMMAND_CHARS = 128_000
 _MAX_SEPARATOR_FREE_COMMAND_CHARS = 4_096
 _MAX_DETECTION_SEGMENTS = 25_000
+_MAX_EXECUTABLE_CARRIERS = 128
+_MAX_DETECTION_VARIANTS = 512
+_MAX_DETECTION_WORK_ITEMS = 256
+_MAX_PAYLOAD_FINDINGS_PER_VARIANT = 512
 _PARSER_LIMIT_DESCRIPTION = "command parser limit exceeded"
 _MALFORMED_EXEC_DESCRIPTION = "command parser limit or malformed executable payload"
+_PARSER_LIMIT_VARIANT = "__hermes_command_parser_limit_exceeded__"
+_EXPLICIT_COMMAND_CARRIER_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:eval|xargs|-exec(?:dir)?)(?![A-Za-z0-9_])",
+    re.IGNORECASE,
+)
 
+
+class _CommandDetectionBudgetExceeded(Exception):
+    """Internal control flow for bounded payload iteration."""
+
+
+def _executable_carrier_limit_exceeded(command: str) -> bool:
+    """Count executable command carriers without recursive or token parsing.
+
+    The substitution scan is iterative and quote-aware: unquoted and
+    double-quoted ``$()``/backticks count, while single-quoted and escaped
+    spellings stay inert. Explicit eval/xargs/find-exec spellings use a
+    conservative lexical upper bound; only commands with more than the high
+    carrier ceiling fail closed, so ordinary quoted prose remains unaffected.
+    """
+    carriers = 0
+
+    # Explicit program-bearing commands are cheap to count lexically. This can
+    # conservatively count high-volume prose, but never under-counts the normal
+    # eval/xargs/find -exec spellings before their token parsers run.
+    for _match in _EXPLICIT_COMMAND_CARRIER_RE.finditer(command):
+        carriers += 1
+        if carriers > _MAX_EXECUTABLE_CARRIERS:
+            return True
+
+    # Each frame is [terminator, active_quote, ordinary_parenthesis_depth].
+    # Pushing a frame for a substitution resets quote state because its payload
+    # is parsed as a fresh shell program. The outer quote remains on its frame
+    # and resumes when the substitution closes.
+    frames: list[list] = [[None, None, 0]]
+    index = 0
+    while index < len(command):
+        frame = frames[-1]
+        terminator = frame[0]
+        quote = frame[1]
+        char = command[index]
+
+        if quote == "'":
+            if char == "'":
+                frame[1] = None
+            index += 1
+            continue
+
+        if char == "\\" and index + 1 < len(command):
+            index += 2
+            continue
+
+        if quote == '"':
+            if char == '"':
+                frame[1] = None
+                index += 1
+                continue
+            if command.startswith("$(", index):
+                carriers += 1
+                if carriers > _MAX_EXECUTABLE_CARRIERS:
+                    return True
+                frames.append([")", None, 0])
+                index += 2
+                continue
+            if char == "`":
+                carriers += 1
+                if carriers > _MAX_EXECUTABLE_CARRIERS:
+                    return True
+                frames.append(["`", None, 0])
+                index += 1
+                continue
+            index += 1
+            continue
+
+        if char in {"'", '"'}:
+            frame[1] = char
+            index += 1
+            continue
+        if terminator == "`" and char == "`":
+            frames.pop()
+            index += 1
+            continue
+        if command.startswith("$(", index):
+            carriers += 1
+            if carriers > _MAX_EXECUTABLE_CARRIERS:
+                return True
+            frames.append([")", None, 0])
+            index += 2
+            continue
+        if char == "`":
+            carriers += 1
+            if carriers > _MAX_EXECUTABLE_CARRIERS:
+                return True
+            frames.append(["`", None, 0])
+            index += 1
+            continue
+        if terminator == ")":
+            if char == "(":
+                frame[2] += 1
+            elif char == ")":
+                if frame[2]:
+                    frame[2] -= 1
+                else:
+                    frames.pop()
+            index += 1
+            continue
+        index += 1
+    return False
 
 
 def _command_parser_limit_exceeded(command: str) -> bool:
@@ -1283,7 +1731,7 @@ def _command_parser_limit_exceeded(command: str) -> bool:
             separators += 1
             if separators >= _MAX_DETECTION_SEGMENTS:
                 return True
-    return False
+    return _executable_carrier_limit_exceeded(command)
 
 
 def _shell_tokens_with_spans(segment: str, start: int):
@@ -2091,14 +2539,180 @@ def _iter_shell_command_word_spans(command: str):
             break
 
 
+_XARGS_LONG_OPTIONS_WITH_ARG = frozenset({
+    "--arg-file", "--delimiter", "--max-args", "--max-chars", "--max-lines",
+    "--max-procs", "--process-slot-var", "--replace",
+})
+_XARGS_LONG_OPTIONS_WITH_OPTIONAL_ARG = frozenset({"--eof"})
+_XARGS_SHORT_OPTIONS_WITH_ARG = frozenset({
+    "-a", "-d", "-E", "-I", "-J", "-L", "-n", "-P", "-R", "-S", "-s",
+})
+_XARGS_SHORT_OPTIONS_WITH_OPTIONAL_ARG = frozenset({"-e", "-i"})
+
+
+def _iter_executable_substitution_payloads(command: str):
+    """Yield immediate executable ``$()``/backtick payloads without expansion.
+
+    The scan preserves the raw quote/escape state: substitutions execute when
+    unquoted or double-quoted, but not inside single quotes or when the opener
+    is escaped. Nested payloads are surfaced by the bounded work queue in
+    :func:`_command_detection_variants` rather than recursive Python calls.
+    """
+    quote: str | None = None
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if quote == "'":
+            if char == "'":
+                quote = None
+            index += 1
+            continue
+        if char == "\\" and index + 1 < len(command):
+            index += 2
+            continue
+        if char == "'" and quote is None:
+            quote = "'"
+            index += 1
+            continue
+        if char == '"':
+            quote = None if quote == '"' else '"'
+            index += 1
+            continue
+        if command.startswith("$(", index):
+            end = _scan_dollar_paren_end(command, index)
+            if end is None:
+                payload = command[index + 2:]
+                index = len(command)
+            else:
+                payload = command[index + 2:end - 1]
+                index = end
+            if payload.strip():
+                yield payload
+            continue
+        if char == "`":
+            end = _scan_backtick_end(command, index)
+            if end is None:
+                payload = command[index + 1:]
+                index = len(command)
+            else:
+                payload = command[index + 1:end - 1]
+                index = end
+            if payload.strip():
+                yield payload
+            continue
+        index += 1
+
+
+def _xargs_command_start(argv: list[str]) -> int | None:
+    """Return the explicit command argv index after bounded xargs options."""
+    index = 1
+    while index < len(argv):
+        token = argv[index]
+        if token == "--":
+            index += 1
+            break
+        if not token.startswith("-") or token == "-":
+            break
+        if token.startswith("--"):
+            option, separator, _value = token.partition("=")
+            if option in _XARGS_LONG_OPTIONS_WITH_ARG and not separator:
+                index += 2
+            elif option in _XARGS_LONG_OPTIONS_WITH_OPTIONAL_ARG:
+                index += 1
+            else:
+                # Flag-only and unknown options consume one argv.
+                index += 1
+            continue
+
+        option = token[:2]
+        if option in _XARGS_SHORT_OPTIONS_WITH_ARG:
+            index += 1 if len(token) > 2 else 2
+        elif option in _XARGS_SHORT_OPTIONS_WITH_OPTIONAL_ARG:
+            index += 1
+        else:
+            # Short flags (-0/-r/-t/-x/...) own no following argv.
+            index += 1
+    return index if index < len(argv) else None
+
+
+def _iter_explicit_command_argv_payloads(command: str):
+    """Yield literal argv payloads owned by eval, xargs, and find -exec."""
+    for segment in _iter_top_level_shell_segments(command):
+        for start, _, word in _iter_shell_command_word_spans(segment):
+            executable = os.path.basename(
+                _deobfuscate_shell_word_for_detection(word)
+            ).lower()
+            if executable not in {"eval", "xargs", "find"}:
+                continue
+            argv = _parse_shell_segment_argv(segment[start:])
+            if not argv:
+                continue
+
+            if executable == "eval":
+                # eval concatenates its literal argv with spaces, then asks the
+                # shell to parse that result as a new command string.
+                payload = " ".join(argv[1:])
+                if payload.strip():
+                    yield payload
+                continue
+
+            if executable == "xargs":
+                command_start = _xargs_command_start(argv)
+                if command_start is not None:
+                    yield shlex.join(argv[command_start:])
+                continue
+
+            index = 1
+            while index < len(argv):
+                if argv[index] not in {"-exec", "-execdir"}:
+                    index += 1
+                    continue
+                end = index + 1
+                while end < len(argv) and argv[end] not in {";", "+"}:
+                    end += 1
+                if end > index + 1:
+                    yield shlex.join(argv[index + 1:end])
+                index = end + 1
+
+
+def _iter_explicit_shell_payloads(command: str):
+    """Yield non-executing detection variants for explicit shell carriers."""
+    yield from _iter_executable_substitution_payloads(command)
+    yield from _iter_explicit_command_argv_payloads(command)
+
+
+def _iter_detection_payloads(shell_source: str, variant: str):
+    """Yield payloads lazily, with a finite per-variant findings budget."""
+    findings = 0
+    for _, payload in _execution_flag_findings(variant):
+        findings += 1
+        if findings > _MAX_PAYLOAD_FINDINGS_PER_VARIANT:
+            raise _CommandDetectionBudgetExceeded from None
+        if payload:
+            yield payload
+    for payload in _iter_explicit_shell_payloads(shell_source):
+        findings += 1
+        if findings > _MAX_PAYLOAD_FINDINGS_PER_VARIANT:
+            raise _CommandDetectionBudgetExceeded from None
+        yield payload
+
+
 def _command_detection_variants(command: str):
+    # Direct callers (including the approvals dry-run trace) receive a bounded,
+    # opaque fail-closed marker without running normalization or recursive shell
+    # scans when the initial preflight rejects the command.
+    if _command_parser_limit_exceeded(command):
+        yield _PARSER_LIMIT_VARIANT
+        return
+
     # Mask quoted newlines BEFORE normalization: normalization strips
     # backslash-escapes (\" -> ") and empty-string pairs (""), which would
     # corrupt quote tracking — e.g. `echo "a\""` normalizes to `echo "a` (an
     # unterminated quote), so masking the normalized text could swallow a
     # REAL unquoted newline separator that follows. The raw command carries
     # faithful shell quote state.
-    normalized = _normalize_command_for_detection(_mask_quoted_newlines(command))
+    raw_command = _mask_quoted_newlines(command)
+    normalized = _normalize_command_for_detection(raw_command)
     # Quote-aware grep parsing hides only structurally identified pattern
     # operands. Malformed/ambiguous input remains byte-for-byte intact.
     grep_safe, _ = _grep_safe_detection_variant(normalized)
@@ -2107,21 +2721,54 @@ def _command_detection_variants(command: str):
     # Program-bearing options are parsed in their owning command's context.
     # Surfacing only their payload lets the hardline floor inspect the command
     # that will actually run without promoting similar flags or quoted prose.
-    pending = [normalized]
+    pending = [(raw_command, normalized)]
+    queued = set(pending)
+    scanned: set[tuple[str, str]] = set()
     while pending:
-        variant = pending.pop()
-        for _, payload in _execution_flag_findings(variant):
-            if payload and payload not in seen:
-                seen.add(payload)
-                yield payload
-                # A payload can begin with an option-looking program and then
-                # invoke a hardline command after a separator. Mark its real
-                # command starts just as we do for the outer command.
-                marked_payload = _mark_command_starts(payload)
-                if marked_payload != payload and marked_payload not in seen:
-                    seen.add(marked_payload)
-                    yield marked_payload
-                pending.append(payload)
+        shell_source, variant = pending.pop()
+        scan_key = (shell_source, variant)
+        queued.discard(scan_key)
+        if scan_key in scanned:
+            continue
+        scanned.add(scan_key)
+        try:
+            payloads = _iter_detection_payloads(shell_source, variant)
+            for payload in payloads:
+                if _command_parser_limit_exceeded(payload):
+                    yield _PARSER_LIMIT_VARIANT
+                    return
+                normalized_payload = _normalize_command_for_detection(
+                    _mask_quoted_newlines(payload)
+                )
+                if not normalized_payload:
+                    continue
+                if normalized_payload not in seen:
+                    if len(seen) >= _MAX_DETECTION_VARIANTS - 1:
+                        yield _PARSER_LIMIT_VARIANT
+                        return
+                    seen.add(normalized_payload)
+                    yield normalized_payload
+                    # A payload can begin with an option-looking program and then
+                    # invoke a hardline command after a separator. Mark its real
+                    # command starts just as we do for the outer command.
+                    marked_payload = _mark_command_starts(normalized_payload)
+                    if marked_payload != normalized_payload and marked_payload not in seen:
+                        if len(seen) >= _MAX_DETECTION_VARIANTS - 1:
+                            yield _PARSER_LIMIT_VARIANT
+                            return
+                        seen.add(marked_payload)
+                        yield marked_payload
+                next_key = (payload, normalized_payload)
+                if next_key in scanned or next_key in queued:
+                    continue
+                if len(scanned) + len(queued) >= _MAX_DETECTION_WORK_ITEMS:
+                    yield _PARSER_LIMIT_VARIANT
+                    return
+                pending.append(next_key)
+                queued.add(next_key)
+        except _CommandDetectionBudgetExceeded:
+            yield _PARSER_LIMIT_VARIANT
+            return
     # Subshell `(cmd)` and brace-group `{ cmd; }` openers put `cmd` at a real
     # command position, but the flat `_CMDPOS`-anchored patterns can't see it:
     # their start-position class deliberately omits `(`/`{` because a bare
@@ -2135,6 +2782,9 @@ def _command_detection_variants(command: str):
     # the rm root/home/system floor) in one place.
     marked = _mark_command_starts(grep_safe)
     if marked != grep_safe and marked not in seen:
+        if len(seen) >= _MAX_DETECTION_VARIANTS - 1:
+            yield _PARSER_LIMIT_VARIANT
+            return
         seen.add(marked)
         yield marked
     # Shell quoting/escaping can spell a dangerous executable name in pieces
@@ -2147,6 +2797,9 @@ def _command_detection_variants(command: str):
         variant = normalized[:word_start] + deobfuscated + normalized[word_end:]
         if variant in seen:
             continue
+        if len(seen) >= _MAX_DETECTION_VARIANTS - 1:
+            yield _PARSER_LIMIT_VARIANT
+            return
         seen.add(variant)
         yield variant
 
@@ -2183,9 +2836,18 @@ def detect_dangerous_command(command: str) -> tuple:
     if _is_verification_artifact_cleanup(command):
         return (False, None, None)
 
-    for command_variant in _command_detection_variants(command):
+    command_variants = tuple(_command_detection_variants(command))
+    if _PARSER_LIMIT_VARIANT in command_variants:
+        return (True, _PARSER_LIMIT_DESCRIPTION, _PARSER_LIMIT_DESCRIPTION)
+    for command_variant in command_variants:
         command_lower = command_variant.lower()
+        _, safe_context_control = _docker_command_analysis(command_variant)
         for pattern_re, description in DANGEROUS_PATTERNS_COMPILED:
+            if (
+                safe_context_control
+                and description == _DOCKER_CONTEXT_REDIRECT_DESCRIPTION
+            ):
+                continue
             if pattern_re.search(command_lower):
                 pattern_key = description
                 return (True, pattern_key, description)
@@ -3731,6 +4393,164 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     return {"resolved": resolved, "choice": choice, "reason": entry.reason}
 
 
+def _mandatory_human_block_result(
+    description: str,
+    *,
+    outcome: str,
+    deny_reason: str | None = None,
+) -> dict:
+    """Build a fail-closed result for a mandatory one-operation decision."""
+    if outcome == "timeout":
+        reason = "timed out without user response"
+        silence = " Silence is not consent."
+    elif outcome == "notify_failed":
+        reason = "could not be presented to the user"
+        silence = ""
+    else:
+        reason = "was denied by the user"
+        silence = ""
+    reason_addendum = (
+        f' Reason given by the user: "{deny_reason}".'
+        if outcome == "denied" and deny_reason
+        else ""
+    )
+    return {
+        "approved": False,
+        "mandatory_approval": True,
+        "message": (
+            f"BLOCKED: {description} requires live human approval and {reason}."
+            f"{reason_addendum} This action has NOT been approved. Do NOT retry, "
+            "do NOT rephrase it, and do NOT attempt the same outcome through "
+            f"another tool.{silence}"
+        ),
+        "pattern_key": "mandatory-human-approval",
+        "description": description,
+        "outcome": outcome,
+        "user_consent": False,
+        "deny_reason": deny_reason,
+    }
+
+
+def _request_mandatory_human_approval(
+    command: str,
+    description: str,
+    *,
+    approval_callback,
+    is_cli: bool,
+    is_gateway: bool,
+    is_ask: bool,
+) -> dict:
+    """Request a fresh human decision that can never be reused.
+
+    Mandatory actions intentionally bypass the session/permanent allowlists and
+    smart approval.  Every UI is restricted to one-operation approval or deny,
+    and even a stale client returning ``session``/``always`` is treated only as
+    approval for this call without persisting any pattern.
+    """
+    session_key = get_current_session_key()
+    pattern_key = "mandatory-human-approval"
+
+    from agent.redact import redact_sensitive_text
+
+    display_command = redact_sensitive_text(command, force=True)
+    display_description = redact_sensitive_text(description, force=True)
+
+    if is_gateway or is_ask:
+        with _lock:
+            notify_cb = _gateway_notify_cbs.get(session_key)
+
+        approval_data = {
+            "command": display_command,
+            "pattern_key": pattern_key,
+            "pattern_keys": [pattern_key],
+            "description": display_description,
+            "mandatory_approval": True,
+            # Some adapters consume allow_session directly; older surfaces use
+            # smart_denied to render the established once/deny-only choice set.
+            "allow_permanent": False,
+            "allow_session": False,
+            "smart_denied": True,
+        }
+        if notify_cb is None:
+            submit_pending(session_key, approval_data)
+            return {
+                "approved": False,
+                "mandatory_approval": True,
+                "pattern_key": pattern_key,
+                "status": "pending_approval",
+                "approval_pending": True,
+                "command": display_command,
+                "description": display_description,
+                "allow_permanent": False,
+                "allow_session": False,
+                "message": (
+                    f"⚠️ {display_description}. Asking the user for one-operation "
+                    f"approval.\n\n**Command:**\n```\n{display_command}\n```"
+                ),
+            }
+
+        decision = _await_gateway_decision(
+            session_key, notify_cb, approval_data, surface="gateway"
+        )
+        if decision.get("notify_failed"):
+            return _mandatory_human_block_result(
+                description, outcome="notify_failed"
+            )
+        if not decision.get("resolved") or decision.get("choice") is None:
+            return _mandatory_human_block_result(description, outcome="timeout")
+        choice = decision.get("choice")
+        if choice not in {"once", "session", "always"}:
+            return _mandatory_human_block_result(
+                description,
+                outcome="denied",
+                deny_reason=decision.get("reason"),
+            )
+    elif is_cli:
+        _fire_approval_hook(
+            "pre_approval_request",
+            command=command,
+            description=description,
+            pattern_key=pattern_key,
+            pattern_keys=[pattern_key],
+            session_key=session_key,
+            surface="cli",
+        )
+        choice = prompt_dangerous_approval(
+            command,
+            description,
+            allow_permanent=False,
+            # The existing callback contract uses this flag for the
+            # once/deny-only UI. Persistence is independently prohibited here.
+            smart_denied=True,
+            approval_callback=approval_callback,
+        )
+        _fire_approval_hook(
+            "post_approval_response",
+            command=command,
+            description=description,
+            pattern_key=pattern_key,
+            pattern_keys=[pattern_key],
+            session_key=session_key,
+            surface="cli",
+            choice=choice,
+        )
+        if choice == "timeout":
+            return _mandatory_human_block_result(description, outcome="timeout")
+        if choice not in {"once", "session", "always"}:
+            return _mandatory_human_block_result(description, outcome="denied")
+    else:  # Defensive: the caller normally rejects this before dispatch.
+        return _mandatory_human_block_result(description, outcome="notify_failed")
+
+    _reset_denials(session_key)
+    return {
+        "approved": True,
+        "message": None,
+        "mandatory_approval": True,
+        "user_approved": True,
+        "description": description,
+    }
+
+
 def check_all_command_guards(command: str, env_type: str,
                              approval_callback=None,
                              has_host_access: bool = False) -> dict:
@@ -3779,18 +4599,48 @@ def check_all_command_guards(command: str, env_type: str,
                        deny_pattern, command[:200])
         return _user_deny_block_result(deny_pattern)
 
-    # --yolo or approvals.mode=off: bypass all approval prompts.
-    # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
-    approval_mode = _get_approval_mode()
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
-        return {"approved": True, "message": None}
-
-    if _command_matches_permanent_allowlist(command):
-        return {"approved": True, "message": None}
+    # Side effects that always require a live human are evaluated before every
+    # reusable or automated approval path. They take a dedicated one-operation
+    # branch: no yolo/off, allowlist, smart, session, or permanent shortcut can
+    # reach them.
+    mandatory_approval, mandatory_desc = detect_mandatory_approval_command(command)
 
     is_cli = _is_interactive_cli()
     is_gateway = _is_gateway_approval_context()
     is_ask = env_var_enabled("HERMES_EXEC_ASK")
+
+    if mandatory_approval:
+        mandatory_description = mandatory_desc or "mandatory action"
+        if not is_cli and not is_gateway and not is_ask:
+            return {
+                "approved": False,
+                "mandatory_approval": True,
+                "message": (
+                    f"BLOCKED: {mandatory_description} requires live human approval, "
+                    "but no interactive user or gateway approver is present."
+                ),
+            }
+        return _request_mandatory_human_approval(
+            command,
+            mandatory_description,
+            approval_callback=approval_callback,
+            is_cli=is_cli,
+            is_gateway=is_gateway,
+            is_ask=is_ask,
+        )
+
+    # --yolo or approvals.mode=off: bypass ordinary approval prompts only.
+    # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
+    approval_mode = _get_approval_mode()
+    if (
+        _YOLO_MODE_FROZEN
+        or is_current_session_yolo_enabled()
+        or approval_mode == "off"
+    ):
+        return {"approved": True, "message": None}
+
+    if _command_matches_permanent_allowlist(command):
+        return {"approved": True, "message": None}
 
     # Preserve the existing non-interactive behavior: outside CLI/gateway/ask
     # flows, we do not block on approvals and we skip external guard work.
