@@ -367,9 +367,8 @@ def _normalize_to_supported_image(
             _img.save(out_path, format="PNG")
         if out_path.exists() and out_path.stat().st_size > 0:
             return out_path, "image/png", None
-    except Exception as _exc:
-        logger.warning("Failed to normalize %s image to PNG: %s",
-                       detected_mime, _exc)
+    except Exception:
+        logger.warning("vision_image_normalization_failed")
     return (
         None,
         None,
@@ -1338,16 +1337,9 @@ async def vision_analyze_tool(
     if not isinstance(user_prompt, str):
         user_prompt = str(user_prompt) if user_prompt is not None else ""
     debug_call_data = {
-        "parameters": {
-            "image_url": image_url,
-            "user_prompt": user_prompt[:200] + "..." if len(user_prompt) > 200 else user_prompt,
-            "model": model
-        },
-        "error": None,
         "success": False,
         "analysis_length": 0,
-        "model_used": model,
-        "image_size_bytes": 0
+        "image_size_bytes": 0,
     }
     
     temp_image_path = None
@@ -1361,8 +1353,7 @@ async def vision_analyze_tool(
         if is_interrupted():
             return tool_error("Interrupted", success=False)
 
-        logger.info("Analyzing image: %s", image_url[:60])
-        logger.info("User prompt: %s", user_prompt[:100])
+        logger.info("vision_analysis_started")
 
         # Resolve the source to raw bytes through the single resolver (unifies
         # data:/http/file/local/container and enforces terminal-backend
@@ -1563,8 +1554,7 @@ async def vision_analyze_tool(
         return json.dumps(result, indent=2, ensure_ascii=False)
         
     except Exception as e:
-        error_msg = f"Error analyzing image: {str(e)}"
-        logger.error("%s", error_msg, exc_info=True)
+        logger.error("vision_analysis_failed")
         
         # Detect vision capability errors — give the model a clear message
         # so it can inform the user instead of a cryptic API error.
@@ -1572,43 +1562,68 @@ async def vision_analyze_tool(
         if any(hint in err_str for hint in (
             "402", "insufficient", "payment required", "credits", "billing",
         )):
+            public_error = "Vision analysis failed: billing required."
             analysis = (
                 "Insufficient credits or payment required. Please top up your "
-                f"API provider account and try again. Error: {e}"
+                "API provider account and try again."
             )
         elif any(hint in err_str for hint in (
             "does not support", "not support image",
             "content_policy", "multimodal",
             "unrecognized request argument", "image input",
         )):
+            public_error = "Vision analysis failed: vision unsupported."
             analysis = (
-                f"{model} does not support vision or our request was not "
-                f"accepted by the server. Error: {e}"
+                "The selected model does not support vision or the request was "
+                "not accepted by the server. Try a vision-capable model."
             )
         elif "invalid_request" in err_str or "image_url" in err_str:
+            public_error = "Vision analysis failed: invalid image."
             analysis = (
                 "The vision API rejected the image. This can happen when the "
                 "image is in an unsupported format, corrupted, or still too "
-                "large after auto-resize. Try a smaller JPEG/PNG and retry. "
-                f"Error: {e}"
+                "large after auto-resize. Try a smaller JPEG/PNG and retry."
+            )
+        elif "not a recognized image" in err_str:
+            public_error = (
+                "Vision analysis failed: invalid image (not a recognized image)."
+            )
+            analysis = "The supplied input is not a recognized image."
+        elif "secret-bearing environment file" in err_str:
+            public_error = (
+                "Vision analysis failed: access denied for a secret-bearing "
+                "environment file."
+            )
+            analysis = (
+                "The image could not be accessed because the source is a "
+                "secret-bearing environment file."
+            )
+        elif "blocked by website policy" in err_str:
+            public_error = "Vision analysis failed: Blocked by website policy."
+            analysis = "The image source was blocked by website policy."
+        elif any(hint in err_str for hint in (
+            "too large", "payload", "413", "content_too_large",
+            "request_too_large", "exceeds", "size limit",
+        )):
+            public_error = "Vision analysis failed: image too large."
+            analysis = (
+                "The image is too large for the vision API. Try a smaller or "
+                "compressed JPEG/PNG and retry."
             )
         else:
+            public_error = "Vision analysis failed."
             analysis = (
                 "There was a problem with the request and the image could not "
-                f"be analyzed. Error: {e}"
+                "be analyzed."
             )
         
         # Prepare error response
         result = {
             "success": False,
-            "error": error_msg,
+            "error": public_error,
             "analysis": analysis,
         }
-        
-        debug_call_data["error"] = error_msg
-        _debug.log_call("vision_analyze_tool", debug_call_data)
-        _debug.save()
-        
+
         return json.dumps(result, indent=2, ensure_ascii=False)
     
     finally:
@@ -1617,10 +1632,8 @@ async def vision_analyze_tool(
             try:
                 temp_image_path.unlink()
                 logger.debug("Cleaned up temporary image file")
-            except Exception as cleanup_error:
-                logger.warning(
-                    "Could not delete temporary file: %s", cleanup_error, exc_info=True
-                )
+            except Exception:
+                logger.warning("vision_temp_cleanup_failed")
 
 
 def check_vision_requirements() -> bool:

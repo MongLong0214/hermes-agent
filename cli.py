@@ -14112,8 +14112,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     load_config(),
                     requested_provider=(self.requested_provider or "").strip(),
                 )
-            except Exception as _img_exc:
-                logging.debug("image_routing decision failed, defaulting to text: %s", _img_exc)
+            except Exception:
+                logging.debug("image_routing_decision_failed")
                 _img_mode = "text"
 
             if _img_mode == "native":
@@ -14140,8 +14140,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         message = self._preprocess_images_with_vision(
                             message if isinstance(message, str) else "", images
                         )
-                except Exception as _img_exc:
-                    logging.warning("native image attach failed, falling back to text: %s", _img_exc)
+                except Exception:
+                    logging.warning("native_image_attachment_failed")
                     message = self._preprocess_images_with_vision(
                         message if isinstance(message, str) else "", images
                     )

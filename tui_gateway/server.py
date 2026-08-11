@@ -9875,9 +9875,9 @@ def _run_prompt_submit(
                     )
                     if getattr(agent, "api_mode", "") == "codex_app_server":
                         _mode = "text"
-                except Exception as _img_exc:
+                except Exception:
                     print(
-                        f"[tui_gateway] image_routing decision failed, defaulting to text: {_img_exc}",
+                        "[tui_gateway] image_routing_decision_failed",
                         file=sys.stderr,
                     )
                     _mode = "text"
@@ -9897,9 +9897,9 @@ def _run_prompt_submit(
                             run_message = _parts
                         else:
                             run_message = _enrich_with_attached_images(prompt, images)
-                    except Exception as _img_exc:
+                    except Exception:
                         print(
-                            f"[tui_gateway] native attach failed, falling back to text: {_img_exc}",
+                            "[tui_gateway] native_image_attachment_failed",
                             file=sys.stderr,
                         )
                         run_message = _enrich_with_attached_images(prompt, images)
