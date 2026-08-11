@@ -1568,3 +1568,59 @@ class TestCliApprovalTimeoutClassifiedSeparately:
         assert result.get("user_consent") is False
         assert "timed out without user response" in result["message"]
         assert "Silence is not consent" in result["message"]
+
+
+class TestContainerGuardPrecedence:
+    def test_mandatory_external_send_is_not_container_auto_approved(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(approval_module, "_is_interactive_cli", lambda: False)
+        monkeypatch.setattr(
+            approval_module, "_is_gateway_approval_context", lambda: False
+        )
+        monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+
+        result = approval_module.check_all_command_guards(
+            "buzz messages send --channel public --message hello", "docker"
+        )
+
+        assert result["approved"] is False
+        assert result.get("mandatory_approval") is True
+        assert "requires live human approval" in result["message"]
+
+    def test_protected_push_is_hardline_denied_in_container(self):
+        result = approval_module.check_all_command_guards(
+            "git push origin main", "docker"
+        )
+
+        assert result["approved"] is False
+        assert result.get("hardline") is True
+        assert "BLOCKED (hardline)" in result["message"]
+
+    def test_user_deny_rule_is_not_bypassed_in_container(self, monkeypatch):
+        monkeypatch.setattr(
+            approval_module,
+            "_get_approval_config",
+            lambda: {"mode": "manual", "deny": ["deploy production"]},
+        )
+
+        result = approval_module.check_all_command_guards(
+            "deploy production", "docker"
+        )
+
+        assert result["approved"] is False
+        assert result.get("user_deny") is True
+        assert "approvals.deny" in result["message"]
+
+    def test_ordinary_container_command_keeps_safe_shortcut(self, monkeypatch):
+        monkeypatch.setattr(
+            approval_module,
+            "_get_approval_config",
+            lambda: {"mode": "manual", "deny": []},
+        )
+
+        result = approval_module.check_all_command_guards(
+            "rm -rf /tmp/container-build", "docker"
+        )
+
+        assert result == {"approved": True, "message": None}

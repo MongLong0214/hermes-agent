@@ -754,6 +754,95 @@ def _push_refspec_may_target_default(refspec: str) -> bool:
     return False
 
 
+def _git_alias_name(config_key: str) -> str | None:
+    """Return a bounded alias name from one Git config key."""
+    match = re.fullmatch(r"alias\.([A-Za-z0-9][A-Za-z0-9_-]*)", config_key, re.I)
+    return match.group(1).lower() if match else None
+
+
+def _git_alias_push_prefix(value: str) -> list[str] | None:
+    """Return fixed push arguments for a structurally known Git alias."""
+    try:
+        alias_argv = shlex.split(value, posix=True)
+    except ValueError:
+        return None
+    if not alias_argv:
+        return None
+    if alias_argv[0].lower() == "push":
+        return alias_argv[1:]
+
+    # Shell aliases begin with ``!``. Recognize only the bounded direct
+    # ``!git push ...`` form; other shell programs remain non-push aliases.
+    first = alias_argv[0]
+    if first == "!":
+        alias_argv = alias_argv[1:]
+    elif first.startswith("!"):
+        alias_argv = [first[1:], *alias_argv[1:]]
+    else:
+        return None
+    if (
+        len(alias_argv) >= 2
+        and os.path.basename(alias_argv[0]).lower() == "git"
+        and alias_argv[1].lower() == "push"
+    ):
+        return alias_argv[2:]
+    return None
+
+
+def _git_global_options_and_aliases(
+    argv: list[str],
+) -> tuple[int, dict[str, tuple[str, list[str]]]]:
+    """Locate the Git subcommand and classify command-line alias definitions."""
+    aliases: dict[str, tuple[str, list[str]]] = {}
+    i = 1
+    while i < len(argv) and argv[i].startswith("-") and argv[i] != "-":
+        token = argv[i]
+        if token == "--":
+            return i + 1, aliases
+
+        config_entry: str | None = None
+        dynamic_config = False
+        if token == "-c":
+            i += 1
+            if i < len(argv):
+                config_entry = argv[i]
+                i += 1
+        elif token.startswith("-c") and not token.startswith("--"):
+            config_entry = token[2:]
+            i += 1
+        elif token == "--config-env":
+            dynamic_config = True
+            i += 1
+            if i < len(argv):
+                config_entry = argv[i]
+                i += 1
+        elif token.startswith("--config-env="):
+            dynamic_config = True
+            config_entry = token.split("=", 1)[1]
+            i += 1
+        else:
+            option, separator, _attached = token.partition("=")
+            i += 1
+            if not separator and option in _GIT_GLOBAL_VALUE_OPTIONS and i < len(argv):
+                i += 1
+
+        if config_entry is None:
+            continue
+        config_key, separator, config_value = config_entry.partition("=")
+        alias_name = _git_alias_name(config_key)
+        if alias_name is None or not separator:
+            continue
+        if dynamic_config:
+            aliases[alias_name] = ("dynamic", [])
+            continue
+        push_prefix = _git_alias_push_prefix(config_value)
+        if push_prefix is None:
+            aliases[alias_name] = ("other", [])
+        else:
+            aliases[alias_name] = ("push", push_prefix)
+    return i, aliases
+
+
 def _is_default_branch_push(command: str) -> bool:
     """Detect explicit or potentially implicit pushes to main/master.
 
@@ -770,18 +859,29 @@ def _is_default_branch_push(command: str) -> bool:
         if not argv or os.path.basename(argv[0]).lower() != "git":
             continue
 
-        i = _skip_leading_options(argv, 1, _GIT_GLOBAL_VALUE_OPTIONS)
-        if i >= len(argv) or argv[i] != "push":
+        i, aliases = _git_global_options_and_aliases(argv)
+        if i >= len(argv):
             continue
+        subcommand = argv[i].lower()
+        if subcommand == "push":
+            push_args = argv[i + 1:]
+        else:
+            alias_kind, alias_prefix = aliases.get(subcommand, ("other", []))
+            if alias_kind == "other":
+                continue
+            # A dynamic --config-env alias is unknown. Parse its invocation as
+            # push-shaped and fail closed only when that shape may target the
+            # protected default branch.
+            push_args = [*alias_prefix, *argv[i + 1:]]
 
         operands: list[str] = []
         remote_from_option = False
         tags_only = False
-        j = i + 1
-        while j < len(argv):
-            token = argv[j]
+        j = 0
+        while j < len(push_args):
+            token = push_args[j]
             if token == "--":
-                operands.extend(argv[j + 1:])
+                operands.extend(push_args[j + 1:])
                 break
             if token.startswith("-") and token != "-":
                 option = token.split("=", 1)[0]
@@ -795,7 +895,7 @@ def _is_default_branch_push(command: str) -> bool:
                 if (
                     "=" not in token
                     and option in _GIT_PUSH_VALUE_OPTIONS
-                    and j < len(argv)
+                    and j < len(push_args)
                 ):
                     j += 1
                 continue
@@ -959,7 +1059,7 @@ def _save_blocked_payload(command: str) -> Optional[str]:
         )
         return str(path)
     except Exception:
-        logger.debug("failed to save blocked payload", exc_info=True)
+        logger.debug("blocked_payload_save_failed")
         return None
 
 
@@ -981,12 +1081,19 @@ def _hardline_block_result(description: str, command: str = "") -> dict:
     # back to the manual write_file recipe when saving fails.
     if description in (_PARSER_LIMIT_DESCRIPTION, _MALFORMED_EXEC_DESCRIPTION):
         saved = _save_blocked_payload(command) if command else None
-        if saved:
+        saved_basename = os.path.basename(saved) if saved else ""
+        saved_reference = (
+            f"$HERMES_HOME/cache/blocked-scripts/{saved_basename}"
+            if re.fullmatch(r"blocked-[0-9]+-[0-9a-f]{8}\.sh", saved_basename)
+            else None
+        )
+        if saved_reference:
             message += (
                 " RECOVERY: this block fires on oversized/unparseable inline "
                 "command payloads (heredocs, giant one-liners), not on the "
-                f"operation itself. Your command was saved to {saved} — "
-                f"review it, then run: terminal(command=\"bash {saved}\"). "
+                f"operation itself. Your command was saved to {saved_reference} — "
+                "review it, then run: "
+                f"terminal(command=\"bash {saved_reference}\"). "
                 "Do not retry inline."
             )
         else:
@@ -4103,7 +4210,7 @@ def check_dangerous_command(command: str, env_type: str,
     # to wipe the disk or power the box off.
     is_hardline, hardline_desc = detect_hardline_command(command)
     if is_hardline:
-        logger.warning("Hardline block: %s (command: %s)", hardline_desc, command[:200])
+        logger.warning("command_hardline_blocked")
         return _hardline_block_result(hardline_desc, command)
 
     # User-defined deny rules (approvals.deny in config.yaml): like the
@@ -4111,8 +4218,7 @@ def check_dangerous_command(command: str, env_type: str,
     # user saying "never, even under yolo".
     deny_pattern = _match_user_deny_rule(command)
     if deny_pattern is not None:
-        logger.warning("User deny rule %r blocked command: %s",
-                       deny_pattern, command[:200])
+        logger.warning("command_user_deny_blocked")
         return _user_deny_block_result(deny_pattern)
 
     # --yolo: bypass all approval prompts. Gateway /yolo is session-scoped;
@@ -4565,51 +4671,24 @@ def check_all_command_guards(command: str, env_type: str,
     such a session is no longer isolated, so it goes through the normal flow
     instead of the container fast-path.
     """
-    # Skip isolated container backends for both checks. Docker stops skipping
-    # once host paths are bind-mounted into the sandbox.
-    if _should_skip_container_guards(env_type, has_host_access=has_host_access):
-        return {"approved": True, "message": None}
-
-    # Hardline floor: unconditional block for catastrophic commands
-    # (rm -rf /, mkfs, dd to raw device, shutdown/reboot, fork bomb,
-    # kill -1). Applies BEFORE yolo / mode=off / cron approve-mode so
-    # no session-level setting can bypass it.
+    # Hardline, user-deny, and mandatory-human rules are global floors. They
+    # protect external/public side effects as well as the local filesystem, so
+    # isolated containers must not bypass them.
     is_hardline, hardline_desc = detect_hardline_command(command)
     if is_hardline:
-        logger.warning("Hardline block: %s (command: %s)", hardline_desc, command[:200])
+        logger.warning("command_hardline_blocked")
         return _hardline_block_result(hardline_desc, command)
 
-    # == Sudo stdin guard ==
-    # Like the hardline floor above, this is unconditional: there is never a
-    # legitimate reason for the agent to pipe passwords to sudo -S when no
-    # SUDO_PASSWORD has been configured.  This must fire BEFORE the yolo
-    # check so even yolo/smart approval/mode=off cannot bypass it.
-    is_sudo_guess, sudo_guess_desc = _check_sudo_stdin_guard(command)
-    if is_sudo_guess:
-        logger.warning("Sudo stdin guard block: %s (command: %s)",
-                       sudo_guess_desc, command[:200])
-        return _sudo_stdin_block_result(sudo_guess_desc)
-
-    # User-defined deny rules (approvals.deny in config.yaml): like the
-    # hardline floor, these fire BEFORE the yolo / mode=off bypass — a deny
-    # rule is the user saying "never, even under yolo".
     deny_pattern = _match_user_deny_rule(command)
     if deny_pattern is not None:
-        logger.warning("User deny rule %r blocked command: %s",
-                       deny_pattern, command[:200])
+        logger.warning("command_user_deny_blocked")
         return _user_deny_block_result(deny_pattern)
 
-    # Side effects that always require a live human are evaluated before every
-    # reusable or automated approval path. They take a dedicated one-operation
-    # branch: no yolo/off, allowlist, smart, session, or permanent shortcut can
-    # reach them.
     mandatory_approval, mandatory_desc = detect_mandatory_approval_command(command)
-
-    is_cli = _is_interactive_cli()
-    is_gateway = _is_gateway_approval_context()
-    is_ask = env_var_enabled("HERMES_EXEC_ASK")
-
     if mandatory_approval:
+        is_cli = _is_interactive_cli()
+        is_gateway = _is_gateway_approval_context()
+        is_ask = env_var_enabled("HERMES_EXEC_ASK")
         mandatory_description = mandatory_desc or "mandatory action"
         if not is_cli and not is_gateway and not is_ask:
             return {
@@ -4628,6 +4707,26 @@ def check_all_command_guards(command: str, env_type: str,
             is_gateway=is_gateway,
             is_ask=is_ask,
         )
+
+    # The container shortcut applies only to ordinary reusable approval
+    # prompts after the global floors above have cleared the command.
+    if _should_skip_container_guards(env_type, has_host_access=has_host_access):
+        return {"approved": True, "message": None}
+
+    # == Sudo stdin guard ==
+    # Like the hardline floor above, this is unconditional: there is never a
+    # legitimate reason for the agent to pipe passwords to sudo -S when no
+    # SUDO_PASSWORD has been configured.  This must fire BEFORE the yolo
+    # check so even yolo/smart approval/mode=off cannot bypass it.
+    is_sudo_guess, sudo_guess_desc = _check_sudo_stdin_guard(command)
+    if is_sudo_guess:
+        logger.warning("Sudo stdin guard block: %s (command: %s)",
+                       sudo_guess_desc, command[:200])
+        return _sudo_stdin_block_result(sudo_guess_desc)
+
+    is_cli = _is_interactive_cli()
+    is_gateway = _is_gateway_approval_context()
+    is_ask = env_var_enabled("HERMES_EXEC_ASK")
 
     # --yolo or approvals.mode=off: bypass ordinary approval prompts only.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
