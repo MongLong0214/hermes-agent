@@ -1240,10 +1240,18 @@ def run_doctor(args):
                     provider_ids_to_accept.add(catalog_provider)
 
             if provider and provider != "auto":
-                if catalog_provider is None or (
-                    known_providers
-                    and not (provider_ids_to_accept & valid_provider_ids)
-                ):
+                # Accept any identity returned by the same auth/runtime alias
+                # resolver the agent uses. A catalog miss alone is not proof of
+                # an unknown provider (e.g. ``codex`` resolves to
+                # ``openai-codex`` at runtime but has no catalog row of its own).
+                provider_is_unknown = (
+                    (not known_providers and catalog_provider is None)
+                    or (
+                        bool(known_providers)
+                        and not (provider_ids_to_accept & valid_provider_ids)
+                    )
+                )
+                if provider_is_unknown:
                     known_list = ", ".join(sorted(known_providers)) if known_providers else "(unavailable)"
                     _fail_and_issue(
                         f"model.provider '{provider_raw}' is not a recognised provider",

@@ -4198,11 +4198,14 @@ def generate_launchd_plist() -> str:
     <key>ExitTimeOut</key>
     <integer>25</integer>
 {nofile_block}
+    <!-- Hermes writes gateway/agent/error logs through bounded rotating handlers.
+         Discard launchd's raw stdio so it cannot append unboundedly to those
+         same files or race their rotation. -->
     <key>StandardOutPath</key>
-    <string>{log_dir}/gateway.log</string>
-    
+    <string>/dev/null</string>
+
     <key>StandardErrorPath</key>
-    <string>{log_dir}/gateway.error.log</string>
+    <string>/dev/null</string>
 </dict>
 </plist>
 """
