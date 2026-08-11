@@ -97,6 +97,61 @@ def test_bridge_private_key_symlink_directory_cannot_escape_guard(
     assert "private key" in error.lower() or "credential" in error.lower()
 
 
+@pytest.mark.parametrize("path_shape", ["direct", "file-symlink", "directory-symlink"])
+def test_public_bridge_key_denial_is_path_neutral(
+    path_shape, tmp_path, monkeypatch
+):
+    import agent.file_safety as fs
+
+    private_home = (
+        tmp_path
+        / "private-users"
+        / "private-user"
+        / "uid-918273"
+        / "private-directory"
+        / ".hermes"
+    )
+    private_home.mkdir(parents=True)
+    monkeypatch.setattr(fs, "_hermes_home_path", lambda: private_home)
+    monkeypatch.setattr(fs, "_hermes_root_path", lambda: private_home)
+
+    keys = private_home / "bridge" / "keys"
+    keys.mkdir(parents=True)
+    if path_shape == "direct":
+        requested = keys / "signing-key.priv"
+        requested.write_text("dummy", encoding="utf-8")
+    elif path_shape == "file-symlink":
+        outside = tmp_path / "public-material.txt"
+        outside.write_text("dummy", encoding="utf-8")
+        requested = keys / "signing-key.priv"
+        requested.symlink_to(outside)
+    else:
+        outside = tmp_path / "external-private-directory"
+        outside.mkdir()
+        (outside / "rotation-key.priv").write_text("dummy", encoding="utf-8")
+        linked_dir = keys / "linked"
+        linked_dir.symlink_to(outside, target_is_directory=True)
+        requested = linked_dir / "rotation-key.priv"
+
+    with pytest.raises(ValueError) as exc_info:
+        fs.raise_if_read_blocked(str(requested))
+
+    message = str(exc_info.value)
+    assert message == (
+        "Access denied [credential_read_blocked]: Hermes bridge private keys "
+        "cannot be read directly. The bridge consumes them through its "
+        "dedicated credential channel."
+    )
+    for private_text in (
+        str(requested),
+        str(tmp_path),
+        "private-user",
+        "918273",
+        "private-directory",
+    ):
+        assert private_text not in message
+
+
 def test_symlinked_hermes_home_blocks_escaping_bridge_private_key_only(
     tmp_path, monkeypatch
 ):
