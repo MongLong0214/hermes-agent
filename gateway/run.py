@@ -28,7 +28,6 @@ import asyncio
 import concurrent.futures
 import dataclasses
 import faulthandler
-import hashlib
 import inspect
 import json
 import logging
@@ -2453,12 +2452,6 @@ from gateway.whatsapp_identity import (
 logger = logging.getLogger(__name__)
 
 
-def _gateway_identifier_hash(value: Any) -> str:
-    """Return a short stable correlation hash without logging the identifier."""
-    text = str(value or "unknown").encode("utf-8", errors="replace")
-    return hashlib.sha256(text).hexdigest()[:12]
-
-
 def _log_inbound_message(event: Any, source: Any) -> None:
     """Log ingress metadata without message bodies or identifiers."""
     platform = (
@@ -2497,12 +2490,10 @@ def _log_response_ready(
     )
 
 
-def _log_transcript_lag(session_key: str, *, disk_count: int, memory_count: int) -> None:
-    """Report a consistency lag without diagnosing unverified FTS corruption."""
+def _log_transcript_lag(*, disk_count: int, memory_count: int) -> None:
+    """Report consistency counts without a session-derived identifier."""
     logger.info(
-        "transcript_lag session_hash=%s disk=%d memory=%d "
-        "classification=unverified action=preserve_live_context",
-        _gateway_identifier_hash(session_key),
+        "transcript_lag disk=%d memory=%d classification=unverified",
         disk_count,
         memory_count,
     )
@@ -5304,7 +5295,6 @@ class TurnRunner:
             )
             if _selected is not agent_history:
                 _log_transcript_lag(
-                    ctx.session_key,
                     disk_count=len(agent_history),
                     memory_count=len(_selected),
                 )
