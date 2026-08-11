@@ -54,6 +54,15 @@ def test_arbitrary_hermes_home_file_not_blocked(fake_home):
     assert get_read_block_error(str(safe)) is None
 
 
+def test_bridge_private_key_is_blocked(fake_home):
+    from agent.file_safety import get_read_block_error
+
+    private_key = _create(fake_home, Path("bridge") / "keys" / "ceo2.priv")
+    error = get_read_block_error(str(private_key))
+    assert error is not None
+    assert "private key" in error.lower() or "credential" in error.lower()
+
+
 def test_subdirectory_named_auth_json_not_blocked(fake_home):
     """Only the top-level auth.json is the credential store; a file with the
     same name in a subdirectory (e.g., a skill mock) must remain readable."""
