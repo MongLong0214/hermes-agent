@@ -7788,6 +7788,7 @@ class AIAgent:
             tasks=_strip_model_hidden_task_fields(function_args.get("tasks")),
             max_iterations=function_args.get("max_iterations"),
             role=function_args.get("role"),
+            routing_role=function_args.get("routing_role"),
             background=(not _is_subagent),
             parent_agent=self,
         )

@@ -22,6 +22,8 @@ import contextvars
 import json
 import logging
 import re
+import subprocess
+import sys
 
 logger = logging.getLogger(__name__)
 import os
@@ -2908,6 +2910,182 @@ def _build_child_preserving_parent_tools(**kwargs):
     return child
 
 
+class LocalRouterError(RuntimeError):
+    """The profile-local dynamic router refused or could not route a spawn."""
+
+
+_LOCAL_ROUTER_ROLES = frozenset({"subagent_simple", "subagent", "boomer"})
+_LOCAL_TO_RUNTIME_PROVIDER = {
+    "codex": "openai-codex",
+    "claude": "anthropic",
+    "grok": "xai",
+}
+
+
+def _local_router_safe_role(value: Any) -> str:
+    role = str(value or "").strip().lower()
+    return role if role in _LOCAL_ROUTER_ROLES else "unknown"
+
+
+def _local_router_safe_provider(value: Any) -> str:
+    provider = str(value or "").strip().lower()
+    return provider if provider in _LOCAL_TO_RUNTIME_PROVIDER else "unknown"
+
+
+def _local_router_context(command: str, value: Any) -> str:
+    if command == "pick":
+        return f"command=pick role={_local_router_safe_role(value)}"
+    if command == "record":
+        return f"command=record provider={_local_router_safe_provider(value)}"
+    return "command=unknown"
+
+
+def _local_router_error(code: str, command: str, value: Any) -> LocalRouterError:
+    """Create a stable router error without rendering untrusted process data."""
+    return LocalRouterError(f"{code}: {_local_router_context(command, value)}")
+
+
+def _local_router_path():
+    """Return the active profile's opt-in local router path."""
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "routing" / "router.py"
+
+
+def _local_router_enabled() -> bool:
+    # The local router is profile policy, not an upstream Hermes requirement.
+    # Profiles without it retain delegate_task's existing inheritance behavior.
+    return _local_router_path().is_file()
+
+
+def _routing_role_for_task(task: Dict[str, Any], delegate_role: str) -> str:
+    """Map delegate capability roles onto local model-routing roles.
+
+    ``leaf`` and ``orchestrator`` govern delegation capability, not model cost,
+    so both default to the normal ``subagent`` pool. Callers opt into the cheap
+    mechanical pool or adversarial reviewer with ``routing_role``.
+    """
+    requested = str(task.get("routing_role") or "").strip().lower()
+    if requested:
+        if requested not in _LOCAL_ROUTER_ROLES:
+            raise _local_router_error("local_router_invalid_role", "pick", requested)
+        return requested
+    return "subagent"
+
+
+def _run_local_router(command: str, value: str) -> Dict[str, Any]:
+    """Invoke router.py and fail closed on any non-zero or malformed pick."""
+    router = _local_router_path()
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(router), command, value],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        raise _local_router_error(
+            "local_router_execution_failed", command, value
+        ) from None
+
+    stdout = (proc.stdout or "").strip()
+    if proc.returncode != 0:
+        raise _local_router_error("local_router_command_failed", command, value)
+
+    if command == "pick":
+        try:
+            payload = json.loads(stdout)
+        except (TypeError, ValueError):
+            raise _local_router_error(
+                "local_router_invalid_pick", command, value
+            ) from None
+        if (
+            not isinstance(payload, dict)
+            or payload.get("blocked")
+            or not payload.get("model")
+            or not payload.get("provider")
+        ):
+            raise _local_router_error("local_router_unusable_pick", command, value)
+        return payload
+    return {"output": stdout}
+
+
+def _build_child_with_local_routing(
+    *,
+    routing_role: str,
+    delegation_cfg: Dict[str, Any],
+    parent_agent,
+    build_kwargs: Dict[str, Any],
+    default_credentials: Optional[Dict[str, Any]] = None,
+):
+    """Execute the profile-local pick -> spawn -> record transaction.
+
+    A successful AIAgent construction is the spawn commit point. ``record`` is
+    never called before that point and is therefore absent on pick/build errors.
+    Router ledger locking supplies cross-thread/process record safety.
+    """
+    explicit_model = str(delegation_cfg.get("model") or "").strip()
+    explicit_provider = str(delegation_cfg.get("provider") or "").strip()
+    explicit_route = bool(
+        explicit_model
+        or explicit_provider
+        or str(delegation_cfg.get("base_url") or "").strip()
+    )
+
+    record_provider = None
+    if _local_router_enabled() and not explicit_route:
+        assignment = _run_local_router("pick", routing_role)
+        record_provider = str(assignment["provider"])
+        runtime_provider = _LOCAL_TO_RUNTIME_PROVIDER.get(
+            record_provider, record_provider
+        )
+        routed_cfg = dict(delegation_cfg)
+        routed_cfg["model"] = assignment["model"]
+        routed_cfg["provider"] = runtime_provider
+        credentials = _resolve_delegation_credentials(routed_cfg, parent_agent)
+    else:
+        if _local_router_enabled() and (explicit_model or explicit_provider):
+            logger.warning(
+                "delegate_task routing policy exception: explicit delegation "
+                "model/provider override bypasses local router "
+                "(model=%r, provider=%r, routing_role=%s)",
+                explicit_model or None,
+                explicit_provider or None,
+                routing_role,
+            )
+        credentials = default_credentials or _resolve_delegation_credentials(
+            delegation_cfg, parent_agent
+        )
+
+    routed_build_kwargs = dict(build_kwargs)
+    routed_build_kwargs.update(
+        model=credentials["model"],
+        override_provider=credentials["provider"],
+        override_base_url=credentials["base_url"],
+        override_api_key=credentials["api_key"],
+        override_api_mode=credentials["api_mode"],
+        override_request_overrides=credentials.get("request_overrides"),
+        override_max_tokens=credentials.get("max_output_tokens"),
+        override_acp_command=credentials.get("command"),
+        override_acp_args=credentials.get("args"),
+    )
+    child = _build_child_preserving_parent_tools(**routed_build_kwargs)
+
+    if record_provider is not None:
+        try:
+            _run_local_router("record", record_provider)
+        except LocalRouterError:
+            # The child is already spawned; do not misreport it as a spawn
+            # failure. Preserve the run and make ledger failure conspicuous.
+            logger.error(
+                "delegate_task spawned_child local_router_record_failed %s role=%s",
+                _local_router_context("record", record_provider),
+                _local_router_safe_role(routing_role),
+            )
+    return child
+
+
 def _parent_finalization_lock(parent_agent) -> threading.RLock:
     """Return the per-parent lock that serializes lifecycle side effects."""
     if parent_agent is None:
@@ -3126,6 +3304,7 @@ def delegate_task(
     tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
+    routing_role: Optional[str] = None,
     background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None,
     parent_agent=None,
@@ -3226,7 +3405,12 @@ def delegate_task(
             )
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
-        single_task: Dict[str, Any] = {"goal": goal, "context": context, "role": top_role}
+        single_task: Dict[str, Any] = {
+            "goal": goal,
+            "context": context,
+            "role": top_role,
+            "routing_role": routing_role,
+        }
         if output_schema is not None:
             single_task["output_schema"] = output_schema
         task_list = [single_task]
@@ -3325,6 +3509,10 @@ def delegate_task(
         # Per-task role beats top-level; normalise again so unknown
         # per-task values warn and degrade to leaf uniformly.
         effective_role = _normalize_role(t.get("role") or top_role)
+        try:
+            effective_routing_role = _routing_role_for_task(t, effective_role)
+        except LocalRouterError as exc:
+            return tool_error(str(exc))
         # T1-24: schema'd tasks get the contract appended to their context
         # so the child knows the expected output shape before it starts.
         _task_schema = task_schemas[i] if i < len(task_schemas) else None
@@ -3333,27 +3521,27 @@ def delegate_task(
             from tools.delegation_output_schema import append_output_contract
 
             _child_context = append_output_contract(_child_context, _task_schema)
-        child = _build_child_preserving_parent_tools(
-            task_index=i,
-            goal=t["goal"],
-            context=_child_context,
-            # Subagents always inherit the parent's toolsets; the model
-            # cannot choose or narrow them (no model-facing toolsets arg).
-            toolsets=None,
-            model=creds["model"],
-            max_iterations=effective_max_iter,
-            task_count=n_tasks,
-            parent_agent=parent_agent,
-            override_provider=creds["provider"],
-            override_base_url=creds["base_url"],
-            override_api_key=creds["api_key"],
-            override_api_mode=creds["api_mode"],
-            override_request_overrides=creds.get("request_overrides"),
-            override_max_tokens=creds.get("max_output_tokens"),
-            override_acp_command=creds.get("command"),
-            override_acp_args=creds.get("args"),
-            role=effective_role,
-        )
+        try:
+            child = _build_child_with_local_routing(
+                routing_role=effective_routing_role,
+                delegation_cfg=cfg,
+                parent_agent=parent_agent,
+                default_credentials=creds,
+                build_kwargs={
+                    "task_index": i,
+                    "goal": t["goal"],
+                    "context": _child_context,
+                    # Subagents always inherit the parent's toolsets; the model
+                    # cannot choose or narrow them (no model-facing toolsets arg).
+                    "toolsets": None,
+                    "max_iterations": effective_max_iter,
+                    "task_count": n_tasks,
+                    "parent_agent": parent_agent,
+                    "role": effective_role,
+                },
+            )
+        except LocalRouterError as exc:
+            return tool_error(str(exc))
         # Attach the validated schema for the completion-side validation
         # hook in _run_single_child. Absent (None) on schema-less tasks.
         if _task_schema is not None:
@@ -4232,6 +4420,16 @@ DELEGATE_TASK_SCHEMA = {
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
+                        "routing_role": {
+                            "type": "string",
+                            "enum": ["subagent_simple", "subagent", "boomer"],
+                            "description": (
+                                "Local dynamic model-routing pool. Defaults to "
+                                "subagent for both leaf and orchestrator. Use "
+                                "subagent_simple for mechanical implementation "
+                                "and boomer for independent adversarial review."
+                            ),
+                        },
                         "output_schema": {
                             "type": "object",
                             "description": (
@@ -4257,6 +4455,15 @@ DELEGATE_TASK_SCHEMA = {
                 "type": "string",
                 "enum": ["leaf", "orchestrator"],
                 "description": "(rebuilt at get_definitions() time)",
+            },
+            "routing_role": {
+                "type": "string",
+                "enum": ["subagent_simple", "subagent", "boomer"],
+                "description": (
+                    "Local dynamic model-routing pool for the single-goal form. "
+                    "Defaults to subagent; independent of the leaf/orchestrator "
+                    "capability role."
+                ),
             },
             "output_schema": {
                 "type": "object",
@@ -4337,6 +4544,7 @@ registry.register(
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
+        routing_role=args.get("routing_role"),
         background=_model_background_value(args, kw.get("parent_agent")),
         output_schema=args.get("output_schema"),
         parent_agent=kw.get("parent_agent"),
