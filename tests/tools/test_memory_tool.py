@@ -1,6 +1,7 @@
 """Tests for tools/memory_tool.py — MemoryStore, security scanning, and tool dispatcher."""
 
 import json
+import logging
 import pytest
 from pathlib import Path
 
@@ -260,13 +261,230 @@ class TestMemoryStorePersistence:
 
     def test_deduplication_on_load(self, tmp_path, monkeypatch):
         monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
-        # Write file with duplicates
+        # Write file with duplicates. Canonical repair is allowed only after an
+        # exact, durable recovery copy exists for every original byte.
         mem_file = tmp_path / "MEMORY.md"
-        mem_file.write_text("duplicate entry\n§\nduplicate entry\n§\nunique entry")
+        original = (
+            b"\xef\xbb\xbfduplicate entry\n\xc2\xa7\nduplicate entry\n\xc2\xa7\nunique entry"
+        )
+        mem_file.write_bytes(original)
 
         store = MemoryStore()
         store.load_from_disk()
         assert len(store.memory_entries) == 2
+        assert mem_file.read_text(encoding="utf-8") == (
+            "duplicate entry\n§\nunique entry"
+        )
+        backups = list(tmp_path.glob("MEMORY.md.bak.*"))
+        assert len(backups) == 1
+        assert backups[0].read_bytes() == original
+
+    def test_whitespace_repair_preserves_exact_original_bytes(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+        mem_file = tmp_path / "MEMORY.md"
+        original = b"first fact\n\xc2\xa7\n  second fact  \n\xc2\xa7\nthird fact"
+        mem_file.write_bytes(original)
+
+        store = MemoryStore()
+        store.load_from_disk()
+
+        assert store.memory_entries == ["first fact", "second fact", "third fact"]
+        assert mem_file.read_bytes() == b"first fact\n\xc2\xa7\nsecond fact\n\xc2\xa7\nthird fact"
+        backups = list(tmp_path.glob("MEMORY.md.bak.*"))
+        assert len(backups) == 1
+        assert backups[0].read_bytes() == original
+
+    @pytest.mark.parametrize(
+        ("target", "filename", "limit"),
+        [("memory", "MEMORY.md", 24), ("user", "USER.md", 18)],
+    )
+    def test_load_compacts_oversized_store_and_quarantines_omitted_entries(
+        self, tmp_path, monkeypatch, target, filename, limit
+    ):
+        """Pre-existing over-limit files must never enter the system prompt whole.
+
+        Load is also the repair boundary: under the per-file lock it keeps a
+        deterministic ordered subset that fits, atomically persists that same
+        bounded state, and preserves omitted entries in a quarantine file.
+        """
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+        path = tmp_path / filename
+        path.write_text(
+            "first fact\n§\nfirst fact\n§\n"
+            "this entry is far too large for the configured cap\n§\nlast",
+            encoding="utf-8",
+        )
+        store = MemoryStore(
+            memory_char_limit=limit if target == "memory" else 100,
+            user_char_limit=limit if target == "user" else 100,
+        )
+
+        store.load_from_disk()
+
+        entries = store.memory_entries if target == "memory" else store.user_entries
+        assert len("\n§\n".join(entries)) <= limit
+        assert entries == ["first fact", "last"]
+        snapshot = store.format_for_system_prompt(target)
+        assert "far too large" not in (snapshot or "")
+        assert path.read_text(encoding="utf-8") == "first fact\n§\nlast"
+        quarantine = path.with_suffix(path.suffix + ".quarantine")
+        assert "far too large" in quarantine.read_text(encoding="utf-8")
+
+    @pytest.mark.parametrize(
+        "initial_quarantine",
+        [pytest.param(b"", id="existing-empty"), pytest.param(None, id="nonexistent")],
+    )
+    def test_quarantine_backup_depends_on_preexisting_recovery_store(
+        self, tmp_path, monkeypatch, initial_quarantine
+    ):
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+        path = tmp_path / "MEMORY.md"
+        original = b"keep\n\xc2\xa7\nthis entry is too large"
+        path.write_bytes(original)
+        quarantine = path.with_suffix(path.suffix + ".quarantine")
+        if initial_quarantine is not None:
+            quarantine.write_bytes(initial_quarantine)
+
+        store = MemoryStore(memory_char_limit=4)
+        store.load_from_disk()
+
+        assert store.memory_entries == ["keep"]
+        assert path.read_text(encoding="utf-8") == "keep"
+        assert quarantine.read_text(encoding="utf-8") == "this entry is too large"
+        backups = list(tmp_path.glob("MEMORY.md.quarantine.bak.*"))
+        assert len(backups) == int(initial_quarantine is not None)
+        if initial_quarantine is not None:
+            assert backups[0].read_bytes() == initial_quarantine
+
+    def test_quarantine_failure_is_sanitized_and_refuses_source_rewrite(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+        path = tmp_path / "MEMORY.md"
+        original = b"keep\n\xc2\xa7\nthis entry is too large"
+        path.write_bytes(original)
+        real_write = MemoryStore._write_file
+
+        def fail_quarantine(write_path, entries):
+            if write_path.name.endswith(".quarantine"):
+                raise RuntimeError(f"private failure at {tmp_path}/secret-quarantine")
+            return real_write(write_path, entries)
+
+        monkeypatch.setattr(MemoryStore, "_write_file", staticmethod(fail_quarantine))
+        store = MemoryStore(memory_char_limit=4)
+
+        with caplog.at_level(logging.ERROR, logger="tools.memory_tool"):
+            store.load_from_disk()
+
+        assert path.read_bytes() == original
+        assert store.memory_entries == ["keep"]
+        assert "this entry is too large" not in (
+            store.format_for_system_prompt("memory") or ""
+        )
+        assert [record.getMessage() for record in caplog.records] == [
+            "memory_repair_failed code=quarantine_write_failed file=MEMORY.md"
+        ]
+        assert str(tmp_path) not in caplog.text
+        assert "private failure" not in caplog.text
+
+    def test_source_read_failure_has_stable_log_and_bounded_live_view(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+        path = tmp_path / "MEMORY.md"
+        original = b"private source bytes that exceed the configured limit"
+        path.write_bytes(original)
+        real_read_bytes = Path.read_bytes
+        failed = False
+
+        def fail_source_read_once(read_path):
+            nonlocal failed
+            if read_path == path and not failed:
+                failed = True
+                raise OSError(f"private failure at {tmp_path}/secret-source")
+            return real_read_bytes(read_path)
+
+        monkeypatch.setattr(Path, "read_bytes", fail_source_read_once)
+        store = MemoryStore(memory_char_limit=4)
+
+        with caplog.at_level(logging.WARNING, logger="tools.memory_tool"):
+            store.load_from_disk()
+
+        assert store.memory_entries == []
+        assert store.format_for_system_prompt("memory") is None
+        assert path.read_bytes() == original
+        assert [record.getMessage() for record in caplog.records] == [
+            "memory_repair_failed code=source_read_failed file=MEMORY.md"
+        ]
+        assert [record.levelno for record in caplog.records] == [logging.ERROR]
+        assert str(tmp_path) not in caplog.text
+        assert "private failure" not in caplog.text
+
+    def test_source_repair_failure_is_sanitized_and_keeps_original(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+        path = tmp_path / "MEMORY.md"
+        original = b"duplicate\n\xc2\xa7\nduplicate\n\xc2\xa7\nunique"
+        path.write_bytes(original)
+        real_write = MemoryStore._write_file
+
+        def fail_source_repair(write_path, entries):
+            if write_path == path:
+                raise RuntimeError(f"private failure at {tmp_path}/secret-source")
+            return real_write(write_path, entries)
+
+        monkeypatch.setattr(MemoryStore, "_write_file", staticmethod(fail_source_repair))
+        store = MemoryStore()
+
+        with caplog.at_level(logging.ERROR, logger="tools.memory_tool"):
+            store.load_from_disk()
+
+        assert path.read_bytes() == original
+        assert store.memory_entries == ["duplicate", "unique"]
+        backups = list(tmp_path.glob("MEMORY.md.bak.*"))
+        assert len(backups) == 1
+        assert backups[0].read_bytes() == original
+        assert [record.getMessage() for record in caplog.records] == [
+            "memory_repair_failed code=source_write_failed file=MEMORY.md"
+        ]
+        assert str(tmp_path) not in caplog.text
+        assert "private failure" not in caplog.text
+
+    def test_exact_backup_failure_refuses_rewrite_with_bounded_snapshot(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+        path = tmp_path / "MEMORY.md"
+        original = b"keep\n\xc2\xa7\nkeep\n\xc2\xa7\nthis entry is too large"
+        path.write_bytes(original)
+
+        def fail_exact_backup(_path, _source_bytes):
+            raise ValueError(f"private failure at {tmp_path}/secret-backup")
+
+        monkeypatch.setattr(
+            MemoryStore,
+            "_write_repair_backup",
+            staticmethod(fail_exact_backup),
+            raising=False,
+        )
+        store = MemoryStore(memory_char_limit=4)
+
+        with caplog.at_level(logging.ERROR, logger="tools.memory_tool"):
+            store.load_from_disk()
+
+        assert path.read_bytes() == original
+        assert store.memory_entries == ["keep"]
+        assert "this entry is too large" not in (
+            store.format_for_system_prompt("memory") or ""
+        )
+        assert [record.getMessage() for record in caplog.records] == [
+            "memory_repair_failed code=backup_write_failed file=MEMORY.md"
+        ]
+        assert str(tmp_path) not in caplog.text
+        assert "private failure" not in caplog.text
 
 
 class TestMemoryStoreSnapshot:

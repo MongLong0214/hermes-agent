@@ -25,6 +25,7 @@ Design:
 
 import json
 import logging
+import os
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -220,12 +221,12 @@ class MemoryStore:
         mem_dir = get_memory_dir()
         mem_dir.mkdir(parents=True, exist_ok=True)
 
-        self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
-        self.user_entries = self._read_file(mem_dir / "USER.md")
-
-        # Deduplicate entries (preserves order, keeps first occurrence)
-        self.memory_entries = list(dict.fromkeys(self.memory_entries))
-        self.user_entries = list(dict.fromkeys(self.user_entries))
+        # Loading is also the repair boundary for files written outside the
+        # memory tool. Apply the write caps before anything can reach the system
+        # prompt, and persist the canonical deduplicated view under the same
+        # per-file lock used by mutations.
+        self.memory_entries = self._load_target_bounded("memory")
+        self.user_entries = self._load_target_bounded("user")
 
         # Sanitize entries for the system-prompt snapshot only.  Live state
         # (memory_entries / user_entries) keeps the raw text so the user
@@ -238,6 +239,147 @@ class MemoryStore:
             "memory": self._render_block("memory", sanitized_memory),
             "user": self._render_block("user", sanitized_user),
         }
+
+    def _load_target_bounded(self, target: str) -> List[str]:
+        """Load one target as an ordered, deduplicated, bounded entry list.
+
+        Existing files can predate the write cap or be edited by another tool.
+        Keep each earliest entry that still fits, then continue past oversized
+        entries so later small facts are not needlessly lost. Before any
+        non-byte-identical rewrite, the exact source bytes are durably copied
+        to ``<name>.bak.<timestamp>``. Omitted entries are also atomically
+        preserved in ``<name>.quarantine``. If either preservation step fails,
+        the source is left unchanged while the live prompt view remains bounded.
+        An unreadable source is never rewritten.
+        """
+        path = self._path_for(target)
+        with self._file_lock(path):
+            _source_exists, source_bytes, raw, read_ok = (
+                self._read_source_bytes_checked(path)
+            )
+            if not read_ok:
+                self._log_repair_failure("source_read_failed", path)
+                return []
+
+            parsed = self._parse_entries(raw)
+            unique = list(dict.fromkeys(parsed))
+            limit = self._char_limit(target)
+            kept: List[str] = []
+            omitted: List[str] = []
+            for entry in unique:
+                candidate = kept + [entry]
+                if len(ENTRY_DELIMITER.join(candidate)) <= limit:
+                    kept.append(entry)
+                else:
+                    omitted.append(entry)
+
+            canonical = ENTRY_DELIMITER.join(kept)
+            if raw.strip() == canonical:
+                return kept
+
+            # Parsing, trimming, deduplication, and cap enforcement can all
+            # produce a non-byte-identical source. Preserve the exact bytes —
+            # including BOMs, duplicate delimiters, and whitespace — before
+            # any canonical rewrite. If durability cannot be established,
+            # refuse the rewrite but still expose only the bounded live view.
+            try:
+                self._write_repair_backup(path, source_bytes)
+            except Exception:
+                self._log_repair_failure("backup_write_failed", path)
+                return kept
+
+            if omitted:
+                quarantine = path.with_suffix(path.suffix + ".quarantine")
+                quarantine_exists, quarantine_bytes, quarantine_raw, quarantine_ok = (
+                    self._read_source_bytes_checked(quarantine)
+                )
+                old_quarantine = self._parse_entries(quarantine_raw)
+                quarantined = list(dict.fromkeys(old_quarantine + omitted))
+                quarantine_canonical = ENTRY_DELIMITER.join(quarantined).encode("utf-8")
+                if not quarantine_ok:
+                    self._log_repair_failure("quarantine_read_failed", path)
+                    return kept
+
+                # An existing quarantine is user recovery data too. Preserve
+                # its exact bytes before canonicalizing or extending it.
+                if quarantine_exists and quarantine_bytes != quarantine_canonical:
+                    try:
+                        self._write_repair_backup(quarantine, quarantine_bytes)
+                    except Exception:
+                        self._log_repair_failure("quarantine_backup_failed", path)
+                        return kept
+                try:
+                    if quarantine_bytes != quarantine_canonical:
+                        self._write_file(quarantine, quarantined)
+                except Exception:
+                    # Keep the prompt bounded, but do not destructively compact
+                    # disk unless omitted bytes have a durable recovery copy.
+                    self._log_repair_failure("quarantine_write_failed", path)
+                    return kept
+
+            try:
+                self._write_file(path, kept)
+            except Exception:
+                self._log_repair_failure("source_write_failed", path)
+                return kept
+            logger.warning(
+                "Canonicalized %s at load time (%d kept, %d quarantined, limit=%d)",
+                path.name,
+                len(kept),
+                len(omitted),
+                limit,
+            )
+            return kept
+
+    @staticmethod
+    def _log_repair_failure(code: str, path: Path) -> None:
+        """Log a load-time repair failure without exception or path details."""
+        logger.error("memory_repair_failed code=%s file=%s", code, path.name)
+
+    @staticmethod
+    def _write_repair_backup(path: Path, source_bytes: bytes) -> Path:
+        """Durably preserve exact source bytes in a new, non-clobbering backup."""
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+
+        fd = None
+        backup = None
+        for offset in range(100):
+            backup = path.with_suffix(path.suffix + f".bak.{time.time_ns() + offset}")
+            try:
+                fd = os.open(backup, flags, 0o600)
+                break
+            except FileExistsError:
+                continue
+        if fd is None or backup is None:
+            raise OSError("memory_repair_backup_name_exhausted")
+
+        try:
+            with os.fdopen(fd, "wb") as backup_file:
+                fd = None
+                backup_file.write(source_bytes)
+                backup_file.flush()
+                os.fsync(backup_file.fileno())
+
+            # The file contents and the directory entry must both reach stable
+            # storage before the destructive source rewrite is permitted.
+            if os.name != "nt":
+                directory_fd = os.open(path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+        except Exception:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            try:
+                backup.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+        return backup
 
     @staticmethod
     def _sanitize_entries_for_snapshot(entries: List[str], filename: str) -> List[str]:
@@ -747,6 +889,17 @@ class MemoryStore:
         return f"{separator}\n{header}\n{separator}\n{content}"
 
     @staticmethod
+    def _read_source_bytes_checked(path: Path) -> Tuple[bool, bytes, str, bool]:
+        """Read existence and one exact byte snapshot for load-time repair."""
+        if not path.exists():
+            return False, b"", "", True
+        try:
+            source_bytes = path.read_bytes()
+            return True, source_bytes, source_bytes.decode("utf-8-sig"), True
+        except (OSError, IOError, UnicodeDecodeError):
+            return True, b"", "", False
+
+    @staticmethod
     def _read_raw_checked(path: Path) -> Tuple[str, bool]:
         """Read a memory file's raw text, distinguishing unreadable from empty.
 
@@ -880,8 +1033,8 @@ class MemoryStore:
         content = ENTRY_DELIMITER.join(entries) if entries else ""
         try:
             atomic_write_text(path, content, tmp_prefix=".mem_")
-        except (OSError, IOError) as e:
-            raise RuntimeError(f"Failed to write memory file {path}: {e}")
+        except (OSError, IOError):
+            raise RuntimeError(f"memory_write_failed file={path.name}") from None
 
 
 def load_on_disk_store() -> "MemoryStore":
