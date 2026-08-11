@@ -2489,6 +2489,53 @@ from gateway.whatsapp_identity import (
 logger = logging.getLogger(__name__)
 
 
+def _log_inbound_message(event: Any, source: Any) -> None:
+    """Log ingress metadata without message bodies or identifiers."""
+    platform = (
+        source.platform.value
+        if hasattr(source.platform, "value")
+        else str(source.platform)
+    )
+    text = event.text or ""
+    logger.info(
+        "inbound message: platform=%s chars=%d has_reply=%s",
+        platform,
+        len(text),
+        bool(getattr(event, "reply_to_message_id", None)),
+    )
+
+
+def _log_response_ready(
+    source: Any,
+    *,
+    response_time: float,
+    api_calls: int,
+    response_length: int,
+) -> None:
+    """Log response completion metadata using the current message source."""
+    platform = (
+        source.platform.value
+        if hasattr(source.platform, "value")
+        else str(source.platform)
+    )
+    logger.info(
+        "response ready: platform=%s time=%.1fs api_calls=%d response=%d chars",
+        platform,
+        response_time,
+        api_calls,
+        response_length,
+    )
+
+
+def _log_transcript_lag(*, disk_count: int, memory_count: int) -> None:
+    """Report consistency counts without a session-derived identifier."""
+    logger.info(
+        "transcript_lag disk=%d memory=%d classification=unverified",
+        disk_count,
+        memory_count,
+    )
+
+
 _OWN_POLICY_OPEN_ENV = {
     Platform.WECOM: ("WECOM_DM_POLICY", "WECOM_GROUP_POLICY", "WECOM_ALLOW_ALL_USERS"),
     Platform.WEIXIN: ("WEIXIN_DM_POLICY", "WEIXIN_GROUP_POLICY", "WEIXIN_ALLOW_ALL_USERS"),
@@ -5291,11 +5338,9 @@ class TurnRunner:
                 agent_history, getattr(agent, "_session_messages", None)
             )
             if _selected is not agent_history:
-                logger.warning(
-                    "Persisted transcript lagged live cached history for "
-                    "session %s (disk=%d, memory=%d); preserving live "
-                    "conversation context (possible FTS write corruption)",
-                    ctx.session_key, len(agent_history), len(_selected),
+                _log_transcript_lag(
+                    disk_count=len(agent_history),
+                    memory_count=len(_selected),
                 )
                 # The live in-memory history bypassed the
                 # _build_gateway_agent_history cleanup pipeline above —
@@ -16795,15 +16840,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
-        _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
-        _msg_preview = (event.text or "")[:80].replace("\n", " ")
-        _reply_id = getattr(event, "reply_to_message_id", None)
-        _reply_txt = (getattr(event, "reply_to_text", None) or "")[:80].replace("\n", " ")
-        logger.info(
-            "inbound message: platform=%s user=%s chat=%s msg=%r reply_to_id=%s reply_to_text=%r",
-            _platform_name, source.user_name or source.user_id or "unknown",
-            source.chat_id or "unknown", _msg_preview, _reply_id, _reply_txt,
-        )
+        _log_inbound_message(event, source)
 
         # Get or create session
         # Topic-mode DMs: rewrite a stale/foreign thread_id to the user's
@@ -18166,10 +18203,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _response_time = time.time() - _msg_start_time
             _api_calls = agent_result.get("api_calls", 0)
             _resp_len = len(response)
-            logger.info(
-                "response ready: platform=%s chat=%s time=%.1fs api_calls=%d response=%d chars",
-                _platform_name, source.chat_id or "unknown",
-                _response_time, _api_calls, _resp_len,
+            _log_response_ready(
+                source,
+                response_time=_response_time,
+                api_calls=_api_calls,
+                response_length=_resp_len,
             )
 
             # NOTE: the cross-process cache-coherence re-baseline
