@@ -680,6 +680,187 @@ def test_sudo_stdin_guard_container_bypass(clean_session):
 
 
 class TestProtectedPushGitAliases:
+    def test_indexed_config_alias_push_is_hardline_at_public_and_container_boundaries(
+        self, clean_session
+    ):
+        command = (
+            "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.p "
+            "GIT_CONFIG_VALUE_0=push git p origin main"
+        )
+
+        assert detect_hardline_command(command) == (
+            True,
+            "push to protected default branch (main/master)",
+        )
+        result = check_all_command_guards(command, "docker")
+        assert result["approved"] is False
+        assert result["hardline"] is True
+
+    def test_literal_git_config_parameters_bare_push_alias_is_hardline_at_boundaries(
+        self, clean_session
+    ):
+        command = "GIT_CONFIG_PARAMETERS=\"'alias.p=push'\" git p"
+
+        assert detect_hardline_command(command) == (
+            True,
+            "push to protected default branch (main/master)",
+        )
+        result = check_all_command_guards(command, "docker")
+        assert result["approved"] is False
+        assert result["hardline"] is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "GIT_CONFIG_PARAMETERS=\"'alias.p=q' 'alias.q=push'\" git p",
+            "GIT_CONFIG_PARAMETERS=\"'alias.p'='push'\" git p",
+            (
+                r'''GIT_CONFIG_PARAMETERS="'alias.p'='\!'echo '''
+                r'''\'\''ready'\''; git push origin main'" git p'''
+            ),
+            "GIT_CONFIG_PARAMETERS=\"'include.path=/synthetic/config'\" git p",
+            (
+                "GIT_CONFIG_PARAMETERS=\""
+                "'includeIf.onbranch:main.path=/synthetic/config'\" git p"
+            ),
+            "GIT_CONFIG_PARAMETERS=\"'alias.p=push\" git p",
+            "GIT_CONFIG_PARAMETERS=$PARAMETERS git p",
+            (
+                "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.p "
+                "GIT_CONFIG_VALUE_0=status "
+                "GIT_CONFIG_PARAMETERS=\"'alias.p=push'\" git p"
+            ),
+            (
+                "GIT_CONFIG_PARAMETERS=\"'alias.p=status'\" "
+                "git -c alias.p=push p"
+            ),
+            (
+                "GIT_CONFIG_PARAMETERS=\"'alias.p=status' "
+                "'alias.p=push'\" git p"
+            ),
+        ],
+    )
+    def test_git_config_parameters_alias_grammar_is_hardline_at_boundaries(
+        self, command, clean_session
+    ):
+        assert detect_hardline_command(command) == (
+            True,
+            "push to protected default branch (main/master)",
+        )
+        result = check_all_command_guards(command, "docker")
+        assert result["approved"] is False
+        assert result["hardline"] is True
+
+    def test_git_config_parameters_entry_overflow_fails_closed_at_boundaries(
+        self, clean_session
+    ):
+        parameter_source = " ".join(
+            f"'alias.local{index}=status'" for index in range(65)
+        )
+        command = f'GIT_CONFIG_PARAMETERS="{parameter_source}" git p'
+
+        assert detect_hardline_command(command) == (
+            True,
+            "push to protected default branch (main/master)",
+        )
+        result = check_all_command_guards(command, "docker")
+        assert result["approved"] is False
+        assert result["hardline"] is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "GIT_CONFIG_PARAMETERS=\"'alias.s=status'\" git s --short",
+            (
+                "GIT_CONFIG_PARAMETERS=\"'alias.p=push origin feature/topic'\" "
+                "git p"
+            ),
+            (
+                "GIT_CONFIG_PARAMETERS=\"'include.path=/synthetic/config'\" "
+                "git status main"
+            ),
+            "GIT_CONFIG_PARAMETERS=\"'not-an-operation prose'\" git status main",
+            "GIT_CONFIG_PARAMETERS=$PARAMETERS git status main",
+            "GIT_CONFIG_PARAMETERS=$PARAMETERS git p origin feature/topic",
+            (
+                "GIT_CONFIG_PARAMETERS=\"'alias.p=push' 'alias.p=status'\" "
+                "git p"
+            ),
+            (
+                "GIT_CONFIG_PARAMETERS=\"'alias.p=push'\" "
+                "git -c alias.p=status p"
+            ),
+            (
+                "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.p "
+                "GIT_CONFIG_VALUE_0=push "
+                "GIT_CONFIG_PARAMETERS=\"'alias.p=status'\" git p"
+            ),
+            "GIT_CONFIG_PARAMETERS=\"'alias.s'='status'\" git s --short",
+        ],
+    )
+    def test_git_config_parameters_preserves_status_feature_and_prose_controls(
+        self, command, clean_session
+    ):
+        assert detect_hardline_command(command) == (False, None)
+        result = check_all_command_guards(command, "docker")
+        assert result["approved"] is True
+        assert result.get("hardline") is not True
+
+    def test_git_config_parameters_is_not_read_from_ambient_environment(
+        self, monkeypatch, clean_session
+    ):
+        monkeypatch.setenv("GIT_CONFIG_PARAMETERS", "'alias.p=push'")
+
+        assert detect_hardline_command("git p") == (False, None)
+        result = check_all_command_guards("git p", "docker")
+        assert result["approved"] is True
+        assert result.get("hardline") is not True
+
+    def test_dynamic_include_alias_push_is_hardline_at_public_and_container_boundaries(
+        self, clean_session
+    ):
+        command = "git -c include.path=/synthetic/config p origin main"
+
+        assert detect_hardline_command(command) == (
+            True,
+            "push to protected default branch (main/master)",
+        )
+        result = check_all_command_guards(command, "docker")
+        assert result["approved"] is False
+        assert result["hardline"] is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            (
+                "env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.p "
+                "GIT_CONFIG_VALUE_0=push git p origin master"
+            ),
+            "git -cinclude.path=/synthetic/config p origin main",
+            "git -c includeIf.onbranch:main.path=/synthetic/config p origin main",
+            "git --config-env=include.path=INCLUDE_FILE p origin main",
+            (
+                "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=include.path "
+                "GIT_CONFIG_VALUE_0=/synthetic/config git p origin main"
+            ),
+            (
+                "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.p "
+                "git p origin main"
+            ),
+            (
+                "GIT_CONFIG_COUNT=65 GIT_CONFIG_KEY_0=alias.p "
+                "GIT_CONFIG_VALUE_0=push git p origin main"
+            ),
+        ],
+    )
+    def test_dynamic_or_malformed_command_config_push_shape_fails_closed(
+        self, command
+    ):
+        assert detect_hardline_command(command) == (
+            True,
+            "push to protected default branch (main/master)",
+        )
+
     @pytest.mark.parametrize(
         "command",
         [
@@ -705,6 +886,967 @@ class TestProtectedPushGitAliases:
         ],
     )
     def test_non_push_or_feature_branch_alias_is_not_hardline_denied(self, command):
+        assert detect_hardline_command(command) == (False, None)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            (
+                "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.s "
+                "GIT_CONFIG_VALUE_0=status git s main"
+            ),
+            (
+                "env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.s "
+                "GIT_CONFIG_VALUE_0=status git s"
+            ),
+            (
+                "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.p "
+                "GIT_CONFIG_VALUE_0=push git p origin feature/topic"
+            ),
+            "git -c include.path=/synthetic/config status main",
+            "git -c include.path=/synthetic/config p origin feature/topic",
+            "git -c include.path=/synthetic/config p status",
+            "git -c include.path=/synthetic/config show origin main",
+            "git -c include.path=/synthetic/config branch main",
+            "git -c include.path=/synthetic/config",
+        ],
+    )
+    def test_command_config_controls_are_not_hardline_denied(self, command):
+        assert detect_hardline_command(command) == (False, None)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "git p origin main",
+            "git p origin master",
+            "GIT_CONFIG_GLOBAL=/synthetic/global git p origin main",
+            "GIT_CONFIG_SYSTEM=/synthetic/system git p origin main",
+            "GIT_CONFIG_PARAMETERS='alias.p=push' git p origin main",
+            "HOME=/synthetic/home git p origin main",
+            "XDG_CONFIG_HOME=/synthetic/xdg git p origin main",
+            "GIT_DIR=/synthetic/repo/.git git p origin main",
+            "GIT_COMMON_DIR=/synthetic/common git p origin main",
+            "git --git-dir=/synthetic/repo/.git p origin main",
+        ],
+    )
+    def test_unknown_alias_or_external_helper_push_shape_is_hardline_at_boundaries(
+        self, command, clean_session
+    ):
+        assert detect_hardline_command(command) == (
+            True,
+            "push to protected default branch (main/master)",
+        )
+        result = check_all_command_guards(command, "docker")
+        assert result["approved"] is False
+        assert result["hardline"] is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "git p origin feature/topic",
+            "GIT_CONFIG_GLOBAL=/synthetic/global git p origin feature/topic",
+            "GIT_CONFIG_SYSTEM=/synthetic/system git status main",
+            "GIT_CONFIG_PARAMETERS='alias.p=push' git show origin main",
+            "HOME=/synthetic/home git branch main",
+        ],
+    )
+    def test_unknown_alias_floor_preserves_feature_and_builtin_controls(self, command):
+        assert detect_hardline_command(command) == (False, None)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "git -c alias.p=q -c alias.q=push p origin main",
+            "git -c alias.p=q -c 'alias.q=push origin main' p",
+            "git -c alias.p=q p origin main",
+            "git -c alias.p=q -c alias.q=p p origin master",
+            (
+                "git -c alias.a=b -c alias.b=c -c alias.c=d -c alias.d=e "
+                "-c alias.e=f -c alias.f=g -c alias.g=h -c alias.h=i "
+                "-c alias.i=j -c alias.j=push a origin main"
+            ),
+        ],
+    )
+    def test_bounded_alias_chains_and_ambiguity_are_hardline_at_boundaries(
+        self, command, clean_session
+    ):
+        assert detect_hardline_command(command) == (
+            True,
+            "push to protected default branch (main/master)",
+        )
+        result = check_all_command_guards(command, "docker")
+        assert result["approved"] is False
+        assert result["hardline"] is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "git -c alias.p=q -c alias.q=push p origin feature/topic",
+            "git -c alias.p=q -c 'alias.q=push origin feature/topic' p",
+            "git -c alias.s=t -c alias.t=status s main",
+        ],
+    )
+    def test_bounded_alias_chains_preserve_feature_and_builtin_controls(self, command):
+        assert detect_hardline_command(command) == (False, None)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "PUSH_ALIAS='push origin main' git --config-env=alias.p=PUSH_ALIAS p",
+            (
+                "env PUSH_ALIAS='push origin master' "
+                "git --config-env alias.p=PUSH_ALIAS p"
+            ),
+            "PUSH_ALIAS='push \"' git --config-env=alias.p=PUSH_ALIAS p origin main",
+            "git --config-env=alias.p=ABSENT_ALIAS p origin master",
+        ],
+    )
+    def test_literal_config_env_aliases_and_ambiguity_are_hardline_at_boundaries(
+        self, command, clean_session
+    ):
+        assert detect_hardline_command(command) == (
+            True,
+            "push to protected default branch (main/master)",
+        )
+        result = check_all_command_guards(command, "docker")
+        assert result["approved"] is False
+        assert result["hardline"] is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "PUSH_ALIAS=status git --config-env=alias.p=PUSH_ALIAS p",
+            "env PUSH_ALIAS=status git --config-env alias.p=PUSH_ALIAS p main",
+            (
+                "PUSH_ALIAS='push origin feature/topic' "
+                "git --config-env=alias.p=PUSH_ALIAS p"
+            ),
+        ],
+    )
+    def test_literal_config_env_preserves_status_and_feature_controls(self, command):
+        assert detect_hardline_command(command) == (False, None)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "git -c 'alias.p=!git push origin main' p",
+            "git -c 'alias.p=!sh -c \"git push origin master\"' p",
+            "git -c 'alias.p=!f() { git push origin main; }; f' p",
+            "git -c 'alias.p=!echo ready && git push origin master' p",
+            "git -c 'alias.p=!custom-helper' p origin main",
+        ],
+    )
+    def test_shell_alias_pushes_and_opaque_push_shapes_are_hardline_at_boundaries(
+        self, command, clean_session
+    ):
+        assert detect_hardline_command(command) == (
+            True,
+            "push to protected default branch (main/master)",
+        )
+        result = check_all_command_guards(command, "docker")
+        assert result["approved"] is False
+        assert result["hardline"] is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'git -c \'alias.p=!g=git; echo "$($g push origin main)"\' p',
+            (
+                'git -c \'alias.p=!g=git; case "$($g push origin main)" '
+                "in *) :;; esac' p"
+            ),
+        ],
+    )
+    def test_shell_alias_executable_substitutions_are_hardline_at_boundaries(
+        self, command, clean_session
+    ):
+        detector_result = detect_hardline_command(command)
+        guard_result = check_all_command_guards(command, "docker")
+
+        assert detector_result == (
+            True,
+            "push to protected default branch (main/master)",
+        )
+        assert guard_result["approved"] is False
+        assert guard_result["hardline"] is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'git -c \'alias.p=!g=git; echo "`$g push origin main`"\' p',
+            'git -c \'alias.p=!g=git; echo "$($g push origin main"\' p',
+            (
+                "git -c 'alias.p=!g=git; echo "
+                "$(echo $(echo $(echo $($g push origin main))))' p"
+            ),
+        ],
+    )
+    def test_shell_alias_substitution_edges_fail_closed_at_boundaries(
+        self, command, clean_session
+    ):
+        detector_result = detect_hardline_command(command)
+        guard_result = check_all_command_guards(command, "docker")
+
+        assert detector_result == (
+            True,
+            "push to protected default branch (main/master)",
+        )
+        assert guard_result["approved"] is False
+        assert guard_result["hardline"] is True
+
+    def test_shell_alias_substitution_work_overflow_with_push_fails_closed(
+        self, clean_session, monkeypatch
+    ):
+        import tools.approval as approval_mod
+
+        monkeypatch.setattr(approval_mod, "_MAX_DETECTION_WORK_ITEMS", 1)
+        command = (
+            'git -c \'alias.p=!g=git; echo "$($g status --short)" '
+            '"$($g push origin main)"\' p'
+        )
+
+        detector_result = detect_hardline_command(command)
+        guard_result = check_all_command_guards(command, "docker")
+
+        assert detector_result == (
+            True,
+            "push to protected default branch (main/master)",
+        )
+        assert guard_result["approved"] is False
+        assert guard_result["hardline"] is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'git -c \'alias.s=!g=git; echo "$($g status --short)"\' s',
+            (
+                'git -c \'alias.s=!g=git; case "$($g status --short)" '
+                "in *) :;; esac' s"
+            ),
+            'git -c "alias.s=!g=git; echo \'$($g push origin main)\'" s',
+            'git -c \'alias.s=!g=git; echo "\\$($g push origin main)"\' s',
+            'git -c \'alias.s=!g=git; echo "`$g status --short`"\' s',
+            'git -c "alias.s=!g=git; echo \'`$g push origin main`\'" s',
+            'git -c \'alias.s=!g=git; echo "\\`$g push origin main\\`"\' s',
+            "git -c 'alias.s=!echo harmless' s",
+            "git -c 'alias.s=!printf \"%s\" harmless' s",
+        ],
+    )
+    def test_shell_alias_substitution_controls_remain_safe(self, command):
+        assert detect_hardline_command(command) == (False, None)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "git -c 'alias.p=!git status' p origin main",
+            "git -c 'alias.p=!echo harmless' p origin master",
+            "git -c 'alias.p=!git push origin feature/topic' p",
+            "git -c 'alias.p=!echo \"git push origin main\"' p",
+            "git -c 'alias.p=!printf \"%s\" \"git push origin main\"' p origin main",
+            "git -c 'alias.p=!custom-helper' p origin feature/topic",
+        ],
+    )
+    def test_shell_aliases_preserve_harmless_prose_and_feature_controls(self, command):
+        assert detect_hardline_command(command) == (False, None)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "git -c \"alias.p=!eval 'git push origin main'\" p",
+            "git -c \"alias.p=!eval 'git push origin main\" p",
+        ],
+    )
+    def test_shell_alias_eval_push_is_hardline_at_boundaries(
+        self, command, clean_session
+    ):
+        assert detect_hardline_command(command) == (
+            True,
+            "push to protected default branch (main/master)",
+        )
+        result = check_all_command_guards(command, "docker")
+        assert result["approved"] is False
+        assert result["hardline"] is True
+
+    def test_shell_alias_grouped_eval_push_is_hardline_at_boundaries(
+        self, clean_session
+    ):
+        command = "git -c \"alias.p=!( eval 'git push origin main' )\" p"
+
+        assert detect_hardline_command(command) == (
+            True,
+            "push to protected default branch (main/master)",
+        )
+        result = check_all_command_guards(command, "docker")
+        assert result["approved"] is False
+        assert result["hardline"] is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "git -c \"alias.p=!( eval 'git status --short' )\" p",
+            (
+                "git -c \"alias.p=!( eval "
+                "'git push origin feature/topic' )\" p"
+            ),
+            (
+                "git -c 'alias.s=!printf \"%s\" "
+                "\"( eval git push origin main )\"' s"
+            ),
+            (
+                "git -c 'alias.s=!printf \"%s\" "
+                "\\(\\ eval\\ git\\ push\\ origin\\ main\\ \\)' s"
+            ),
+        ],
+    )
+    def test_shell_alias_grouped_eval_controls_remain_safe_at_boundaries(
+        self, command, clean_session
+    ):
+        assert detect_hardline_command(command) == (False, None)
+        result = check_all_command_guards(command, "docker")
+        assert result["approved"] is True
+        assert result.get("hardline") is not True
+
+    def test_shell_alias_eval_work_overflow_with_push_fails_closed(
+        self, monkeypatch, clean_session
+    ):
+        import tools.approval as approval_mod
+
+        monkeypatch.setattr(approval_mod, "_MAX_DETECTION_WORK_ITEMS", 1)
+        command = (
+            "git -c \"alias.p=!eval 'git status --short'; "
+            "eval 'git push origin main'\" p"
+        )
+
+        assert detect_hardline_command(command) == (
+            True,
+            "push to protected default branch (main/master)",
+        )
+        result = check_all_command_guards(command, "docker")
+        assert result["approved"] is False
+        assert result["hardline"] is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "git -c \"alias.s=!eval 'git status --short'\" s",
+            "git -c \"alias.s=!eval 'git status --short\" s",
+            "git -c \"alias.p=!eval 'git push origin feature/topic'\" p",
+            "git -c 'alias.s=!printf \"%s\" \"eval git push origin main\"' s",
+            "git -c 'alias.s=!printf \"%s\" eval\\ git\\ push\\ origin\\ main' s",
+        ],
+    )
+    def test_shell_alias_eval_controls_remain_safe_at_boundaries(
+        self, command, clean_session
+    ):
+        assert detect_hardline_command(command) == (False, None)
+        result = check_all_command_guards(command, "docker")
+        assert result["approved"] is True
+        assert result.get("hardline") is not True
+
+    def test_nested_xargs_dash_push_is_hardline_at_boundaries(
+        self, clean_session
+    ):
+        command = (
+            r'''git -c 'alias.p=!printf x | xargs -0 dash -c "git push origin master"' p'''
+        )
+
+        assert detect_hardline_command(command) == (
+            True,
+            "push to protected default branch (main/master)",
+        )
+        result = check_all_command_guards(command, "docker")
+        assert result["approved"] is False
+        assert result["hardline"] is True
+
+    def test_direct_dash_shell_alias_push_is_hardline_at_boundaries(
+        self, clean_session
+    ):
+        command = r'''git -c 'alias.p=!/bin/dash -c "git push origin main"' p'''
+
+        assert detect_hardline_command(command) == (
+            True,
+            "push to protected default branch (main/master)",
+        )
+        result = check_all_command_guards(command, "docker")
+        assert result["approved"] is False
+        assert result["hardline"] is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            r'''git -c 'alias.s=!printf x | xargs -0 dash -c "git status --short"' s''',
+            r'''git -c 'alias.p=!printf x | xargs -0 dash -c "git push origin feature/topic"' p''',
+            r'''git -c 'alias.s=!/bin/dash -c "git status --short"' s''',
+            r'''git -c 'alias.s=!printf "%s" "dash -c git push origin main"' s''',
+        ],
+    )
+    def test_dash_shell_alias_controls_remain_safe_at_boundaries(
+        self, command, clean_session
+    ):
+        assert detect_hardline_command(command) == (False, None)
+        result = check_all_command_guards(command, "docker")
+        assert result["approved"] is True
+        assert result.get("hardline") is not True
+
+    def test_nested_xargs_csh_push_is_hardline_at_boundaries(
+        self, clean_session
+    ):
+        command = (
+            r'''git -c 'alias.p=!printf x | xargs -0 csh -c "git push origin master"' p'''
+        )
+
+        assert detect_hardline_command(command) == (
+            True,
+            "push to protected default branch (main/master)",
+        )
+        result = check_all_command_guards(command, "docker")
+        assert result["approved"] is False
+        assert result["hardline"] is True
+
+    @pytest.mark.parametrize("shell", ["csh", "/bin/csh"])
+    def test_direct_csh_shell_alias_push_is_hardline_at_boundaries(
+        self, shell, clean_session
+    ):
+        command = rf'''git -c 'alias.p=!{shell} -c "git push origin main"' p'''
+
+        assert detect_hardline_command(command) == (
+            True,
+            "push to protected default branch (main/master)",
+        )
+        result = check_all_command_guards(command, "docker")
+        assert result["approved"] is False
+        assert result["hardline"] is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            r'''git -c 'alias.s=!printf x | xargs -0 csh -c "git status --short"' s''',
+            r'''git -c 'alias.p=!printf x | xargs -0 csh -c "git push origin feature/topic"' p''',
+            r'''git -c 'alias.s=!csh -c "git status --short"' s''',
+            r'''git -c 'alias.s=!/bin/csh -c "git status --short"' s''',
+            r'''git -c 'alias.s=!printf "%s" "csh -c git push origin main"' s''',
+        ],
+    )
+    def test_csh_shell_alias_controls_remain_safe_at_boundaries(
+        self, command, clean_session
+    ):
+        assert detect_hardline_command(command) == (False, None)
+        result = check_all_command_guards(command, "docker")
+        assert result["approved"] is True
+        assert result.get("hardline") is not True
+
+    def test_nested_xargs_tcsh_push_is_hardline_at_boundaries(
+        self, clean_session
+    ):
+        command = (
+            r'''git -c 'alias.p=!printf x | xargs -0 tcsh -c "git push origin master"' p'''
+        )
+
+        assert detect_hardline_command(command) == (
+            True,
+            "push to protected default branch (main/master)",
+        )
+        result = check_all_command_guards(command, "docker")
+        assert result["approved"] is False
+        assert result["hardline"] is True
+
+    @pytest.mark.parametrize("shell", ["tcsh", "/bin/tcsh"])
+    def test_direct_tcsh_shell_alias_push_is_hardline_at_boundaries(
+        self, shell, clean_session
+    ):
+        command = rf'''git -c 'alias.p=!{shell} -c "git push origin main"' p'''
+
+        assert detect_hardline_command(command) == (
+            True,
+            "push to protected default branch (main/master)",
+        )
+        result = check_all_command_guards(command, "docker")
+        assert result["approved"] is False
+        assert result["hardline"] is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            r'''git -c 'alias.s=!printf x | xargs -0 tcsh -c "git status --short"' s''',
+            r'''git -c 'alias.p=!printf x | xargs -0 tcsh -c "git push origin feature/topic"' p''',
+            r'''git -c 'alias.s=!tcsh -c "git status --short"' s''',
+            r'''git -c 'alias.s=!/bin/tcsh -c "git status --short"' s''',
+            r'''git -c 'alias.s=!printf "%s" "tcsh -c git push origin main"' s''',
+        ],
+    )
+    def test_tcsh_shell_alias_controls_remain_safe_at_boundaries(
+        self, command, clean_session
+    ):
+        assert detect_hardline_command(command) == (False, None)
+        result = check_all_command_guards(command, "docker")
+        assert result["approved"] is True
+        assert result.get("hardline") is not True
+
+    def test_nested_xargs_shell_eval_push_is_hardline_at_boundaries(
+        self, clean_session
+    ):
+        command = (
+            r'''git -c 'alias.p=!printf x | xargs -0 sh -c "eval \"git push origin main\""' p'''
+        )
+
+        assert detect_hardline_command(command) == (
+            True,
+            "push to protected default branch (main/master)",
+        )
+        result = check_all_command_guards(command, "docker")
+        assert result["approved"] is False
+        assert result["hardline"] is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            r'''git -c 'alias.s=!echo '\''$(git push origin main)'\''' s''',
+            r'''git -c 'alias.s=!echo '\''`git push origin main`'\''' s''',
+        ],
+    )
+    def test_single_quoted_substitution_prose_remains_safe_at_boundaries(
+        self, command, clean_session
+    ):
+        assert detect_hardline_command(command) == (False, None)
+        result = check_all_command_guards(command, "docker")
+        assert result["approved"] is True
+        assert result.get("hardline") is not True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            r'''git -c 'alias.s=!printf x | xargs -0 sh -c "eval \"git status --short\""' s''',
+            r'''git -c 'alias.p=!printf x | xargs -0 sh -c "eval \"git push origin feature/topic\""' p''',
+        ],
+    )
+    def test_nested_xargs_shell_eval_controls_remain_safe_at_boundaries(
+        self, command, clean_session
+    ):
+        assert detect_hardline_command(command) == (False, None)
+        result = check_all_command_guards(command, "docker")
+        assert result["approved"] is True
+        assert result.get("hardline") is not True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            r'''git -c 'alias.p=!echo "$(git push origin main)"' p''',
+            r'''git -c 'alias.p=!echo "`git push origin main`"' p''',
+        ],
+    )
+    def test_double_quoted_substitutions_remain_hardline_at_boundaries(
+        self, command, clean_session
+    ):
+        assert detect_hardline_command(command) == (
+            True,
+            "push to protected default branch (main/master)",
+        )
+        result = check_all_command_guards(command, "docker")
+        assert result["approved"] is False
+        assert result["hardline"] is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            r'''git -c 'alias.s=!echo "\$(git push origin main)"' s''',
+            r'''git -c 'alias.s=!echo "\`git push origin main\`"' s''',
+        ],
+    )
+    def test_escaped_substitution_prose_remains_safe_at_boundaries(
+        self, command, clean_session
+    ):
+        assert detect_hardline_command(command) == (False, None)
+        result = check_all_command_guards(command, "docker")
+        assert result["approved"] is True
+        assert result.get("hardline") is not True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            (
+                "git -c 'alias.p=!printf x | xargs -0 --max-args=1 "
+                "sh -c \"git push origin main\"' p"
+            ),
+            (
+                "git -c 'alias.p=!printf x | xargs -0 "
+                "sh -c \"git push origin main' p"
+            ),
+        ],
+    )
+    def test_shell_alias_xargs_push_is_hardline_at_boundaries(
+        self, command, clean_session
+    ):
+        assert detect_hardline_command(command) == (
+            True,
+            "push to protected default branch (main/master)",
+        )
+        result = check_all_command_guards(command, "docker")
+        assert result["approved"] is False
+        assert result["hardline"] is True
+
+    def test_shell_alias_xargs_work_overflow_with_push_fails_closed(
+        self, monkeypatch, clean_session
+    ):
+        import tools.approval as approval_mod
+
+        monkeypatch.setattr(approval_mod, "_MAX_DETECTION_WORK_ITEMS", 1)
+        command = (
+            "git -c 'alias.p=!printf x | xargs sh -c \"git status --short\"; "
+            "printf x | xargs sh -c \"git push origin main\"' p"
+        )
+
+        assert detect_hardline_command(command) == (
+            True,
+            "push to protected default branch (main/master)",
+        )
+        result = check_all_command_guards(command, "docker")
+        assert result["approved"] is False
+        assert result["hardline"] is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            (
+                "git -c 'alias.s=!printf x | xargs -0 --max-args=1 "
+                "sh -c \"git status --short\"' s"
+            ),
+            (
+                "git -c 'alias.s=!printf x | xargs -0 "
+                "sh -c \"git status --short' s"
+            ),
+            (
+                "git -c 'alias.p=!printf x | xargs sh -c "
+                "\"git push origin feature/topic\"' p"
+            ),
+            "git -c 'alias.s=!printf \"%s\" \"xargs sh -c git push origin main\"' s",
+        ],
+    )
+    def test_shell_alias_xargs_controls_remain_safe_at_boundaries(
+        self, command, clean_session
+    ):
+        assert detect_hardline_command(command) == (False, None)
+        result = check_all_command_guards(command, "docker")
+        assert result["approved"] is True
+        assert result.get("hardline") is not True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "git -c 'alias.p=!find . -exec git push origin main {} \\;' p",
+            "git -c 'alias.p=!find . -exec git push origin main {}' p",
+        ],
+    )
+    def test_shell_alias_find_exec_push_is_hardline_at_boundaries(
+        self, command, clean_session
+    ):
+        assert detect_hardline_command(command) == (
+            True,
+            "push to protected default branch (main/master)",
+        )
+        result = check_all_command_guards(command, "docker")
+        assert result["approved"] is False
+        assert result["hardline"] is True
+
+    def test_shell_alias_nested_group_find_exec_push_is_hardline_at_boundaries(
+        self, clean_session
+    ):
+        command = (
+            "git -c \"alias.p=!{ ( find . -exec git push origin main {} "
+            "\\\\; ); }\" p"
+        )
+
+        assert detect_hardline_command(command) == (
+            True,
+            "push to protected default branch (main/master)",
+        )
+        result = check_all_command_guards(command, "docker")
+        assert result["approved"] is False
+        assert result["hardline"] is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            (
+                "git -c \"alias.p=!{ ( find . -exec git status --short {} "
+                "\\\\; ); }\" p"
+            ),
+            (
+                "git -c \"alias.p=!{ ( find . -exec git push origin "
+                "feature/topic {} \\\\; ); }\" p"
+            ),
+            (
+                "git -c 'alias.s=!printf \"%s\" "
+                "\"{ ( find . -exec git push origin main {} \\; ); }\"' s"
+            ),
+            (
+                "git -c 'alias.s=!printf \"%s\" "
+                "\\{\\ \\(\\ find\\ .\\ -exec\\ git\\ push\\ origin\\ main"
+                "\\ \\{\\}\\ \\\\;\\ \\)\\;\\ \\}' s"
+            ),
+        ],
+    )
+    def test_shell_alias_nested_group_find_controls_remain_safe_at_boundaries(
+        self, command, clean_session
+    ):
+        assert detect_hardline_command(command) == (False, None)
+        result = check_all_command_guards(command, "docker")
+        assert result["approved"] is True
+        assert result.get("hardline") is not True
+
+    def test_shell_alias_find_execdir_shell_push_is_hardline_at_boundaries(
+        self, clean_session
+    ):
+        command = (
+            "git -c \"alias.p=!find . -execdir sh -c "
+            "'git push origin main' _ {} +\" p"
+        )
+
+        assert detect_hardline_command(command) == (
+            True,
+            "push to protected default branch (main/master)",
+        )
+        result = check_all_command_guards(command, "docker")
+        assert result["approved"] is False
+        assert result["hardline"] is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            (
+                "git -c \"alias.p=!find . -execdir sh -c "
+                "'git status --short' _ {} +\" p"
+            ),
+            (
+                "git -c \"alias.p=!find . -execdir sh -c "
+                "'git push origin feature/topic' _ {} +\" p"
+            ),
+            (
+                "git -c 'alias.s=!printf \"%s\" "
+                "\"find . -execdir sh -c git push origin main\"' s"
+            ),
+            (
+                "git -c 'alias.s=!printf \"%s\" "
+                "find\\ .\\ -execdir\\ sh\\ -c\\ git\\ push\\ origin\\ main' s"
+            ),
+        ],
+    )
+    def test_shell_alias_find_execdir_controls_remain_safe_at_boundaries(
+        self, command, clean_session
+    ):
+        assert detect_hardline_command(command) == (False, None)
+        result = check_all_command_guards(command, "docker")
+        assert result["approved"] is True
+        assert result.get("hardline") is not True
+
+    def test_shell_alias_find_exec_work_overflow_with_push_fails_closed(
+        self, monkeypatch, clean_session
+    ):
+        import tools.approval as approval_mod
+
+        monkeypatch.setattr(approval_mod, "_MAX_DETECTION_WORK_ITEMS", 1)
+        command = (
+            "git -c 'alias.p=!find . -exec git status --short {} \\;; "
+            "find . -exec git push origin main {} \\;' p"
+        )
+
+        assert detect_hardline_command(command) == (
+            True,
+            "push to protected default branch (main/master)",
+        )
+        result = check_all_command_guards(command, "docker")
+        assert result["approved"] is False
+        assert result["hardline"] is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "git -c 'alias.s=!find . -exec git status --short {} \\;' s",
+            "git -c 'alias.s=!find . -exec git status --short {}' s",
+            (
+                "git -c 'alias.p=!find . -exec git push origin "
+                "feature/topic {} \\;' p"
+            ),
+            "git -c 'alias.s=!printf \"%s\" \"find . -exec git push origin main\"' s",
+        ],
+    )
+    def test_shell_alias_find_exec_controls_remain_safe_at_boundaries(
+        self, command, clean_session
+    ):
+        assert detect_hardline_command(command) == (False, None)
+        result = check_all_command_guards(command, "docker")
+        assert result["approved"] is True
+        assert result.get("hardline") is not True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "git -c 'alias.p=!if true; then git push origin main; fi' p",
+            "git -c 'alias.p=!case x in x) git push origin main;; esac' p",
+            "git -c 'alias.p=!for branch in x; do git push origin main; done' p",
+            "git -c 'alias.p=!! git push origin main' p",
+            "git -c 'alias.p=!if true; then git push origin main' p",
+        ],
+    )
+    def test_shell_control_alias_pushes_are_hardline_at_boundaries(
+        self, command, clean_session
+    ):
+        assert detect_hardline_command(command) == (
+            True,
+            "push to protected default branch (main/master)",
+        )
+        result = check_all_command_guards(command, "docker")
+        assert result["approved"] is False
+        assert result["hardline"] is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "git -c 'alias.s=!if true; then git status --short; fi' s",
+            "git -c 'alias.s=!case x in x) git status --short;; esac' s",
+            "git -c 'alias.s=!for branch in x; do git status --short; done' s",
+            "git -c 'alias.s=!! git status --short' s",
+            (
+                "git -c 'alias.s=!if true; then "
+                "echo \"git push origin main\"; fi' s"
+            ),
+            (
+                "git -c 'alias.s=!case x in x) "
+                "printf \"%s\" \"git push origin main\";; esac' s"
+            ),
+        ],
+    )
+    def test_shell_control_aliases_preserve_status_and_quoted_prose(self, command):
+        assert detect_hardline_command(command) == (False, None)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "git -c 'alias.p=-c color.ui=false push' p",
+            "git -c 'alias.p=-ccolor.ui=false push origin main' p",
+            (
+                "git -c 'alias.p=--git-dir=/synthetic/repo "
+                "push origin master' p"
+            ),
+            "git -c 'alias.p=--work-tree /synthetic/tree push' p",
+            "git -c 'alias.p=-c color.ui=false' p origin main",
+        ],
+    )
+    def test_global_option_prefixed_alias_pushes_are_hardline_at_boundaries(
+        self, command, clean_session
+    ):
+        assert detect_hardline_command(command) == (
+            True,
+            "push to protected default branch (main/master)",
+        )
+        result = check_all_command_guards(command, "docker")
+        assert result["approved"] is False
+        assert result["hardline"] is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "git -c 'alias.p=-c alias.q=push q' p",
+            "git -c 'alias.p=-calias.q=push q' p",
+            "git -c 'alias.p=-c alias.q=r -calias.r=push q' p",
+        ],
+    )
+    def test_alias_local_config_recursion_is_hardline_at_boundaries(
+        self, command, clean_session
+    ):
+        detector_result = detect_hardline_command(command)
+        guard_result = check_all_command_guards(command, "docker")
+
+        assert detector_result == (
+            True,
+            "push to protected default branch (main/master)",
+        )
+        assert guard_result["approved"] is False
+        assert guard_result["hardline"] is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "git -c 'alias.p=-c alias.q=r -c alias.r=q q' p",
+            "git -c 'alias.p=--config-env=alias.q=PUSH_ALIAS q' p",
+            "git -c 'alias.p=--config-env alias.q=PUSH_ALIAS q' p",
+            (
+                "git -c 'alias.p=-c alias.q=a -c alias.a=b -c alias.b=c "
+                "-c alias.c=d -c alias.d=e -c alias.e=f -c alias.f=g "
+                "-c alias.g=h -c alias.h=i -c alias.i=push q' p"
+            ),
+        ],
+    )
+    def test_alias_local_config_ambiguity_fails_closed_at_boundaries(
+        self, command, clean_session
+    ):
+        detector_result = detect_hardline_command(command)
+        guard_result = check_all_command_guards(command, "docker")
+
+        assert detector_result == (
+            True,
+            "push to protected default branch (main/master)",
+        )
+        assert guard_result["approved"] is False
+        assert guard_result["hardline"] is True
+
+    def test_alias_local_config_entry_overflow_fails_closed_at_boundaries(
+        self, clean_session
+    ):
+        local_entries = " ".join(
+            f"-c alias.local{index}=status" for index in range(65)
+        )
+        command = f"git -c 'alias.p={local_entries} q' p"
+
+        detector_result = detect_hardline_command(command)
+        guard_result = check_all_command_guards(command, "docker")
+
+        assert detector_result == (
+            True,
+            "push to protected default branch (main/master)",
+        )
+        assert guard_result["approved"] is False
+        assert guard_result["hardline"] is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "git -c 'alias.s=-c alias.t=status t' s --short",
+            "git -c 'alias.s=-calias.t=status t' s --short",
+            "git -c 'alias.s=-c alias.t=u -calias.u=status t' s --short",
+            "git -c 'alias.p=-c alias.q=push q origin feature/topic' p",
+            "git -c 'alias.s=--config-env=alias.t=STATUS_ALIAS status' s",
+            (
+                "git -c 'alias.p=-c alias.q=r -c alias.r=q q' "
+                "p origin feature/topic"
+            ),
+            (
+                "git -c 'alias.p=--config-env=alias.q=PUSH_ALIAS q' "
+                "p origin feature/topic"
+            ),
+        ],
+    )
+    def test_alias_local_config_preserves_status_and_feature_controls(self, command):
+        assert detect_hardline_command(command) == (False, None)
+
+    def test_alias_local_config_entry_overflow_preserves_feature_control(self):
+        local_entries = " ".join(
+            f"-c alias.local{index}=status" for index in range(65)
+        )
+        command = f"git -c 'alias.p={local_entries} q' p origin feature/topic"
+
+        assert detect_hardline_command(command) == (False, None)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "git -c 'alias.p=-c color.ui=false push origin feature/topic' p",
+            "git -c 'alias.p=-ccolor.ui=false push origin feature/topic' p",
+            "git -c 'alias.s=-c color.ui=false status' s",
+            "git -c 'alias.s=--git-dir=/synthetic/repo status' s",
+            "git -c 'alias.p=-c color.ui=false' p",
+        ],
+    )
+    def test_global_option_prefixed_aliases_preserve_safe_controls(self, command):
         assert detect_hardline_command(command) == (False, None)
 
 
