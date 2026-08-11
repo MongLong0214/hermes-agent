@@ -232,6 +232,14 @@ class TestGeneratedSystemdUnits:
         assert str(local_bin) in plist
         assert str(profile_node_bin) not in plist
 
+    def test_launchd_stdio_does_not_bypass_bounded_application_logs(self):
+        """launchd must not append forever to the same files Hermes rotates itself."""
+        plist = gateway_cli.generate_launchd_plist()
+
+        assert "<key>StandardOutPath</key>\n    <string>/dev/null</string>" in plist
+        assert "<key>StandardErrorPath</key>\n    <string>/dev/null</string>" in plist
+        assert "/gateway.error.log</string>" not in plist
+
 
 
 class TestGatewayStopCleanup:
