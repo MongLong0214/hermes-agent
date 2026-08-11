@@ -633,10 +633,8 @@ def _transcode_to_png(raw: bytes) -> Optional[bytes]:
             buf = BytesIO()
             im.save(buf, format="PNG", optimize=False)
             return buf.getvalue()
-    except Exception as exc:
-        logger.info(
-            "image_routing: Pillow could not transcode image to PNG -- %s", exc
-        )
+    except Exception:
+        logger.info("image_attachment_transcode_decode_failed")
         return None
 
 
@@ -692,8 +690,8 @@ def _file_to_data_url(path: Path) -> Optional[str]:
         from agent.file_safety import raise_if_read_blocked
 
         raise_if_read_blocked(str(path))
-    except ValueError as exc:
-        logger.warning("image_routing: blocked local image attachment %s -- %s", path, exc)
+    except ValueError:
+        logger.warning("image_attachment_read_blocked")
         return None
     except Exception:
         # Keep attachment routing best-effort if the guard itself is unavailable.
@@ -701,24 +699,16 @@ def _file_to_data_url(path: Path) -> Optional[str]:
 
     try:
         raw = path.read_bytes()
-    except Exception as exc:
-        logger.warning("image_routing: failed to read %s — %s", path, exc)
+    except Exception:
+        logger.warning("image_attachment_read_failed")
         return None
     mime = _guess_mime(path, raw=raw)
     if mime not in _UNIVERSALLY_SUPPORTED_MIMES:
         transcoded = _transcode_to_png(raw)
         if transcoded is None:
-            logger.warning(
-                "image_routing: %s is %s which is not accepted by all major "
-                "vision providers and could not be transcoded to PNG; "
-                "skipping this attachment.",
-                path, mime,
-            )
+            logger.warning("image_attachment_transcode_failed")
             return None
-        logger.info(
-            "image_routing: transcoded %s (%s) -> image/png for provider compatibility",
-            path.name, mime,
-        )
+        logger.info("image_attachment_transcoded")
         raw = transcoded
         mime = "image/png"
     b64 = base64.b64encode(raw).decode("ascii")

@@ -420,14 +420,115 @@ class TestFormatCompatibility:
         b64 = url.split(",", 1)[1]
         assert base64.b64decode(b64) == _png_bytes()
 
-    def test_file_to_data_url_blocks_read_denied_image_path(self, tmp_path: Path):
+    def test_file_to_data_url_blocks_read_denied_image_path(
+        self, tmp_path: Path, caplog
+    ):
         """Native image routing must honor the shared credential read guard."""
+        import hashlib
+        import logging
+
+        import pytest
+
+        from agent.file_safety import raise_if_read_blocked
         from agent.image_routing import _file_to_data_url
 
-        img_path = tmp_path / ".env"
+        private_root = tmp_path / "credential-user-temp-root"
+        private_root.mkdir()
+        img_path = private_root / ".env"
         img_path.write_bytes(_png_bytes())
 
-        assert _file_to_data_url(img_path) is None
+        with caplog.at_level(logging.WARNING, logger="agent.image_routing"):
+            with pytest.raises(ValueError) as denied:
+                raise_if_read_blocked(str(img_path))
+            assert _file_to_data_url(img_path) is None
+
+        exception_text = str(denied.value)
+        assert caplog.records
+        public_logs = "\n".join(record.getMessage() for record in caplog.records)
+        for private in (
+            str(img_path),
+            img_path.name,
+            exception_text,
+            "credential-user-temp-root",
+            str(tmp_path),
+            hashlib.sha256(str(img_path).encode()).hexdigest()[:12],
+        ):
+            assert private not in public_logs
+
+    def test_file_to_data_url_operational_logs_are_attachment_neutral(
+        self, tmp_path: Path, caplog
+    ):
+        import hashlib
+        import logging
+        from unittest.mock import patch
+
+        from agent.image_routing import _file_to_data_url
+
+        private_root = tmp_path / "credential-bearing-image-root"
+        private_root.mkdir()
+        missing = private_root / "read-failure-private.png"
+        unsupported = private_root / "unsupported-private.svg"
+        unsupported.write_bytes(b'<svg xmlns="http://www.w3.org/2000/svg"/>')
+        transcoded = private_root / "transcoded-private.bmp"
+        transcoded.write_bytes(b"BM" + b"private-source-bytes")
+
+        with caplog.at_level(logging.INFO, logger="agent.image_routing"):
+            assert _file_to_data_url(missing) is None
+            with patch("agent.image_routing._transcode_to_png", return_value=None):
+                assert _file_to_data_url(unsupported) is None
+            with patch(
+                "agent.image_routing._transcode_to_png", return_value=_png_bytes()
+            ):
+                result = _file_to_data_url(transcoded)
+
+        assert result is not None
+        assert result.startswith("data:image/png;base64,")
+        assert [
+            (record.levelno, record.getMessage(), record.args, record.exc_info)
+            for record in caplog.records
+        ] == [
+            (logging.WARNING, "image_attachment_read_failed", (), None),
+            (logging.WARNING, "image_attachment_transcode_failed", (), None),
+            (logging.INFO, "image_attachment_transcoded", (), None),
+        ]
+        public_logs = "\n".join(record.getMessage() for record in caplog.records)
+        for private in (
+            str(private_root),
+            private_root.name,
+            str(tmp_path),
+            missing.name,
+            unsupported.name,
+            transcoded.name,
+            hashlib.sha256(str(missing).encode()).hexdigest()[:12],
+        ):
+            assert private not in public_logs
+
+    def test_transcode_decode_failure_log_omits_exception_text(self, caplog):
+        import logging
+        from unittest.mock import patch
+
+        from PIL import Image as image_module
+
+        from agent.image_routing import _transcode_to_png
+
+        private_exception = (
+            "decoder failed at /Users/credential-user/private-temp-root/secret.bmp"
+        )
+        with patch.object(
+            image_module, "open", side_effect=RuntimeError(private_exception)
+        ):
+            with caplog.at_level(logging.INFO, logger="agent.image_routing"):
+                assert _transcode_to_png(b"private-image-bytes") is None
+
+        assert [
+            (record.levelno, record.getMessage(), record.args, record.exc_info)
+            for record in caplog.records
+        ] == [
+            (logging.INFO, "image_attachment_transcode_decode_failed", (), None)
+        ]
+        assert private_exception not in caplog.text
+        assert "credential-user" not in caplog.text
+        assert "private-temp-root" not in caplog.text
 
 
     def test_native_content_parts_blocks_image_symlink_to_read_denied_file(self, tmp_path: Path):

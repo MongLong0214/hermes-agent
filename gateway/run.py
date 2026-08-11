@@ -2536,6 +2536,21 @@ def _log_transcript_lag(*, disk_count: int, memory_count: int) -> None:
     )
 
 
+def _build_native_run_message(message: Any, image_paths: List[str]) -> Any:
+    """Build a native-image turn while keeping gateway logs path-neutral."""
+    try:
+        from agent.image_routing import build_native_content_parts
+
+        parts, skipped = build_native_content_parts(message, image_paths)
+        if skipped:
+            logger.warning("native_image_attachment_skipped count=%d", len(skipped))
+        if any(part.get("type") == "image_url" for part in parts):
+            return parts
+    except Exception:
+        logger.warning("native_image_attachment_failed")
+    return message
+
+
 _OWN_POLICY_OPEN_ENV = {
     Platform.WECOM: ("WECOM_DM_POLICY", "WECOM_GROUP_POLICY", "WECOM_ALLOW_ALL_USERS"),
     Platform.WEIXIN: ("WEIXIN_DM_POLICY", "WEIXIN_GROUP_POLICY", "WEIXIN_ALLOW_ALL_USERS"),
@@ -4666,13 +4681,11 @@ class TurnRunner:
                 session_key=ctx.session_key,
                 user_config=ctx.user_config,
             )
-            logger.debug(
-                "run_agent resolved: model=%s provider=%s session=%s",
-                model, runtime_kwargs.get("provider"), ctx.session_key or "",
-            )
-        except Exception as exc:
+            logger.debug("run_agent_runtime_resolved")
+        except Exception:
+            logger.debug("run_agent_runtime_resolution_failed")
             return {
-                "final_response": f"⚠️ Provider authentication failed: {exc}",
+                "final_response": "⚠️ Provider authentication failed.",
                 "messages": [],
                 "api_calls": 0,
                 "tools": [],
@@ -4973,7 +4986,7 @@ class TurnRunner:
                         # Refresh agent max_iterations from current config
                         # (cached agent may have been created with old config)
                         agent.max_iterations = max_iterations
-                        logger.debug("Reusing cached agent for session %s", ctx.session_key)
+                        logger.debug("agent_cache_reused")
                         reused_cached_agent = True
 
         # Lock released — refresh the fallback chain from disk for the
@@ -5059,7 +5072,7 @@ class TurnRunner:
                         agent, _sig, _current_msg_count, ctx.session_id,
                     )
                     self._runner._enforce_agent_cache_cap()
-            logger.debug("Created new agent for session %s (sig=%s)", ctx.session_key, _sig)
+            logger.debug("agent_cache_created")
 
         # Per-message state — callbacks and reasoning config change every
         # turn and must not be baked into the cached agent constructor.
@@ -5612,28 +5625,7 @@ class TurnRunner:
             # runner instance don't re-attach stale images.
             _native_imgs = self._runner._consume_pending_native_image_paths(ctx.session_key)
             if _native_imgs:
-                try:
-                    from agent.image_routing import build_native_content_parts
-                    _parts, _skipped = build_native_content_parts(
-                        ctx.message,
-                        _native_imgs,
-                    )
-                    if _skipped:
-                        logger.warning(
-                            "Native image attachment: skipped %d unreadable path(s): %s",
-                            len(_skipped), _skipped,
-                        )
-                    if any(p.get("type") == "image_url" for p in _parts):
-                        _run_message: Any = _parts
-                    else:
-                        # All images failed to read — fall back to plain text.
-                        _run_message = ctx.message
-                except Exception as _img_exc:
-                    logger.warning(
-                        "Native image attachment failed, falling back to text: %s",
-                        _img_exc,
-                    )
-                    _run_message = ctx.message
+                _run_message = _build_native_run_message(ctx.message, _native_imgs)
             else:
                 _run_message = ctx.message
 
@@ -16388,13 +16380,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         session_key
                     ).persistent.native_image_paths = list(image_paths)
                     logger.info(
-                        "Image routing: native (model supports vision). %d image(s) will be attached inline.",
+                        "image_routing_native count=%d",
                         len(image_paths),
                     )
                 else:
                     logger.info(
-                        "Image routing: text (mode=%s). Pre-analyzing %d image(s) via vision_analyze.",
-                        _img_mode, len(image_paths),
+                        "image_routing_text count=%d",
+                        len(image_paths),
                     )
                     # Vision enrichment runs before AIAgent.run_conversation(),
                     # so bind this session's resolved runtime explicitly rather
@@ -16408,10 +16400,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         vision_runtime = dict(runtime_kwargs or {})
                         vision_runtime["model"] = turn_model
                     except Exception:
-                        logger.debug(
-                            "vision enrichment: session runtime resolution failed",
-                            exc_info=True,
-                        )
+                        logger.debug("vision_enrichment_runtime_resolution_failed")
 
                     from agent.auxiliary_client import scoped_runtime_main
 
@@ -20194,8 +20183,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         enriched_prompt = await self._enrich_message_with_vision(
                             prompt, image_paths,
                         )
-                    except Exception as e:
-                        logger.warning("Background task vision enrichment failed: %s", e)
+                    except Exception:
+                        logger.warning("background_vision_enrichment_failed")
 
             def run_sync():
                 agent = AIAgent(
@@ -22148,11 +22137,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         resolved_provider = runtime_provider.strip()
                     if isinstance(runtime_requested_provider, str):
                         resolved_requested_provider = runtime_requested_provider.strip()
-                except Exception as exc:
-                    logger.debug(
-                        "image_routing: session runtime resolution failed, falling back to config — %s",
-                        exc,
-                    )
+                except Exception:
+                    logger.debug("image_routing_runtime_resolution_failed")
 
             if not resolved_provider:
                 resolved_provider = _read_main_provider()
@@ -22165,8 +22151,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 cfg,
                 requested_provider=resolved_requested_provider,
             )
-        except Exception as exc:
-            logger.debug("image_routing: decision failed, falling back to text — %s", exc)
+        except Exception:
+            logger.debug("image_routing_decision_failed")
             return "text"
 
     async def _enrich_message_with_vision(
@@ -22204,7 +22190,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         enriched_parts = []
         for path in image_paths:
             try:
-                logger.debug("Auto-analyzing user image: %s", path)
+                logger.debug("vision_enrichment_started")
                 result_json = await vision_analyze_tool(
                     image_url=path,
                     user_prompt=analysis_prompt,
@@ -22224,8 +22210,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "this time (>_<) You can try looking at it yourself "
                         f"with vision_analyze using image_url: {path}]"
                     )
-            except Exception as e:
-                logger.error("Vision auto-analysis error: %s", e)
+            except Exception:
+                logger.error("vision_enrichment_failed")
                 enriched_parts.append(
                     f"[The user sent an image but something went wrong when I "
                     f"tried to look at it~ You can try examining it yourself "

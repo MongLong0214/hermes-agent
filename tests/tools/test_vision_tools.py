@@ -200,8 +200,8 @@ class TestErrorLoggingExcInfo:
             assert error_records[0].exc_info is not None
 
     @pytest.mark.asyncio
-    async def test_cleanup_error_logs_exc_info(self, tmp_path, caplog):
-        """Temp file cleanup failure should log warning with exc_info."""
+    async def test_cleanup_error_log_is_metadata_free(self, tmp_path, caplog):
+        """Cleanup failure logs one fixed, metadata-free warning event."""
         # A data: URL resolves to bytes without any network, materializes to a
         # vision temp file, then the analysis runs — exercising the temp-cleanup
         # path in the finally block. A tiny valid JPEG (magic bytes) passes the
@@ -224,7 +224,7 @@ class TestErrorLoggingExcInfo:
             with (
                 patch("tools.vision_tools.async_call_llm", new_callable=AsyncMock, return_value=mock_response),
             ):
-                # Make unlink fail to trigger the cleanup warning.
+                # Make unlink fail to exercise the fixed cleanup-failure event.
                 def failing_unlink(self, *args, **kwargs):
                     raise PermissionError("no permission")
 
@@ -232,13 +232,109 @@ class TestErrorLoggingExcInfo:
                     await vision_analyze_tool(data_url, "describe", "test/model")
 
             warning_records = [
-                r
-                for r in caplog.records
-                if r.levelno == logging.WARNING
-                and "temporary file" in r.getMessage().lower()
+                record
+                for record in caplog.records
+                if record.name == "tools.vision_tools"
+                and record.levelno == logging.WARNING
             ]
-            assert len(warning_records) >= 1
-            assert warning_records[0].exc_info is not None
+            assert [
+                (record.levelno, record.getMessage(), record.args, record.exc_info)
+                for record in warning_records
+            ] == [(logging.WARNING, "vision_temp_cleanup_failed", (), None)]
+
+            record = warning_records[0]
+            log_metadata = (
+                f"{record.getMessage()} {record.args!r} {record.exc_info!r}"
+            ).lower()
+            for private_marker in (
+                "no permission",
+                "permissionerror",
+                "traceback",
+                "temporary file",
+                str(tmp_path).lower(),
+                "/",
+                "\\",
+            ):
+                assert private_marker not in log_metadata
+
+    @pytest.mark.asyncio
+    async def test_actual_normalization_failure_log_is_fixed_and_private(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        from tools import image_source
+
+        private_home = (
+            tmp_path
+            / "private-user"
+            / "private-temp-root"
+            / "uid-918273"
+            / ".hermes"
+        )
+        private_source = (
+            "/Users/private-user/private-temp-root/uid-918273/"
+            "credential-image.bmp"
+        )
+
+        async def _invalid_bmp_resolver(*_args, **_kwargs):
+            return image_source.ResolvedImage(
+                data=b"invalid-bmp-payload",
+                mime="image/bmp",
+                origin="local",
+            )
+
+        monkeypatch.setenv("HERMES_HOME", str(private_home))
+        monkeypatch.setattr(
+            image_source, "resolve_image_source", _invalid_bmp_resolver
+        )
+
+        with caplog.at_level(logging.INFO):
+            result_json = await vision_analyze_tool(
+                private_source,
+                "describe this invalid image",
+                "private-provider/private-vision-model",
+            )
+
+        warning_records = [
+            record
+            for record in caplog.records
+            if record.name == "tools.vision_tools"
+            and record.levelno == logging.WARNING
+        ]
+        assert [
+            (record.levelno, record.getMessage(), record.args, record.exc_info)
+            for record in warning_records
+        ] == [
+            (logging.WARNING, "vision_image_normalization_failed", (), None)
+        ]
+        assert json.loads(result_json) == {
+            "success": False,
+            "error": "Vision analysis failed.",
+            "analysis": (
+                "There was a problem with the request and the image could not "
+                "be analyzed."
+            ),
+        }
+        operational = "\n".join(
+            f"{record.name} {record.levelname} {record.getMessage()} "
+            f"args={record.args!r} exc_info={record.exc_info!r}"
+            for record in caplog.records
+        )
+        for private_marker in (
+            str(private_home),
+            str(tmp_path),
+            private_source,
+            "credential-image.bmp",
+            "private-user",
+            "private-temp-root",
+            "uid-918273",
+            "cannot identify image file",
+            "unidentifiedimageerror",
+            "invalid-bmp-payload",
+            "traceback",
+        ):
+            assert private_marker.lower() not in operational.lower()
+            assert private_marker.lower() not in result_json.lower()
+        assert not list((private_home / "cache" / "vision").glob("*.img"))
 
 
 class TestVisionConfig:
