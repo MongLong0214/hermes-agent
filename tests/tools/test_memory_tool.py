@@ -422,6 +422,58 @@ class TestMemoryStorePersistence:
         assert str(tmp_path) not in caplog.text
         assert "private failure" not in caplog.text
 
+    @pytest.mark.parametrize("failure_point", ["exists", "read_bytes"])
+    def test_unexpected_source_probe_failure_is_stable_and_non_destructive(
+        self, failure_point, tmp_path, monkeypatch, caplog
+    ):
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+        path = tmp_path / "MEMORY.md"
+        original = b"private source bytes that exceed the configured limit"
+        path.write_bytes(original)
+        real_exists = Path.exists
+        real_read_bytes = Path.read_bytes
+        failed = False
+
+        def fail_exists_once(probe_path):
+            nonlocal failed
+            if probe_path == path and not failed:
+                failed = True
+                raise RuntimeError(
+                    f"private failure at {tmp_path}/private-user/MEMORY.md"
+                )
+            return real_exists(probe_path)
+
+        def fail_read_once(read_path):
+            nonlocal failed
+            if read_path == path and not failed:
+                failed = True
+                raise RuntimeError(
+                    f"private failure at {tmp_path}/private-user/MEMORY.md"
+                )
+            return real_read_bytes(read_path)
+
+        if failure_point == "exists":
+            monkeypatch.setattr(Path, "exists", fail_exists_once)
+        else:
+            monkeypatch.setattr(Path, "read_bytes", fail_read_once)
+        store = MemoryStore(memory_char_limit=4)
+
+        with caplog.at_level(logging.WARNING, logger="tools.memory_tool"):
+            store.load_from_disk()
+
+        assert store.memory_entries == []
+        assert store.format_for_system_prompt("memory") is None
+        assert path.read_bytes() == original
+        assert not list(tmp_path.glob("MEMORY.md.bak.*"))
+        assert not path.with_suffix(".md.quarantine").exists()
+        assert [record.getMessage() for record in caplog.records] == [
+            "memory_repair_failed code=source_read_failed file=MEMORY.md"
+        ]
+        assert [record.levelno for record in caplog.records] == [logging.ERROR]
+        assert str(tmp_path) not in caplog.text
+        assert "private failure" not in caplog.text
+        assert "private-user" not in caplog.text
+
     def test_source_repair_failure_is_sanitized_and_keeps_original(
         self, tmp_path, monkeypatch, caplog
     ):
