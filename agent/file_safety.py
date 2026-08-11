@@ -236,24 +236,27 @@ def get_read_block_error(path: str) -> Optional[str]:
     ``"auth.json"`` would otherwise miss the denylist when the task's
     terminal cwd differs from the process cwd.
     """
-    resolved = Path(path).expanduser().resolve()
+    requested = Path(os.path.abspath(Path(path).expanduser()))
+    resolved = requested.resolve()
 
     # Resolve BOTH the active HERMES_HOME (profile-aware) AND the global
     # Hermes root so credential stores at <root>/auth.json etc. are also
     # blocked when running under a profile (HERMES_HOME points at
     # <root>/profiles/<name> in profile mode). Same shape as the write
     # deny widening (#15981, #14157).
-    hermes_dirs: list[Path] = []
+    hermes_dirs: list[tuple[Path, Path]] = []
     for base in (_hermes_home_path(), _hermes_root_path()):
         try:
+            lexical = Path(os.path.abspath(base.expanduser()))
             real = base.resolve()
-            if real not in hermes_dirs:
-                hermes_dirs.append(real)
+            pair = (lexical, real)
+            if pair not in hermes_dirs:
+                hermes_dirs.append(pair)
         except Exception:
             continue
 
     # Skills .hub: prompt-injection carriers.
-    for hd in hermes_dirs:
+    for _, hd in hermes_dirs:
         blocked_dirs = [
             hd / "skills" / ".hub" / "index-cache",
             hd / "skills" / ".hub",
@@ -283,22 +286,32 @@ def get_read_block_error(path: str) -> Optional[str]:
         # was introduced by #31968 but not added to this guard.
         os.path.join("cache", "bws_cache.json"),
     )
-    for hd in hermes_dirs:
-        # Buzz/bridge signing material is raw *.priv. Protect the directory
-        # pattern so newly provisioned identities cannot miss an enumeration.
+    for hd_lexical, hd in hermes_dirs:
+        # Bridge signing material is raw *.priv. Check both the lexical request
+        # and resolved target: a symlink file or directory beneath bridge/keys
+        # must not escape the guard merely because it resolves outside.
         try:
-            bridge_keys = (hd / "bridge" / "keys").resolve()
-            resolved.relative_to(bridge_keys)
-            if resolved.suffix.lower() == ".priv":
-                return (
-                    f"Access denied: {path} is a Hermes bridge private key "
-                    "and cannot be read directly. The bridge consumes it "
-                    "through its dedicated credential channel."
-                )
+            bridge_keys_lexical = hd_lexical / "bridge" / "keys"
+            requested.relative_to(bridge_keys_lexical)
+            lexical_private_key = requested.suffix.lower() == ".priv"
         except ValueError:
-            pass
+            lexical_private_key = False
         except Exception:
-            pass
+            lexical_private_key = False
+        try:
+            bridge_keys_resolved = (hd / "bridge" / "keys").resolve()
+            resolved.relative_to(bridge_keys_resolved)
+            resolved_private_key = resolved.suffix.lower() == ".priv"
+        except ValueError:
+            resolved_private_key = False
+        except Exception:
+            resolved_private_key = False
+        if lexical_private_key or resolved_private_key:
+            return (
+                f"Access denied: {path} is a Hermes bridge private key "
+                "and cannot be read directly. The bridge consumes it "
+                "through its dedicated credential channel."
+            )
         for name in credential_file_names:
             try:
                 blocked = (hd / name).resolve()
@@ -315,7 +328,7 @@ def get_read_block_error(path: str) -> Optional[str]:
 
     # mcp-tokens/: directory prefix match — anything inside is OAuth
     # token material.
-    for hd in hermes_dirs:
+    for _, hd in hermes_dirs:
         try:
             mcp_tokens = (hd / "mcp-tokens").resolve()
         except Exception:
