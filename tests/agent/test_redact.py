@@ -23,12 +23,33 @@ class TestKnownPrefixes:
         assert secret not in result
         assert result == "[REDACTED 64-HEX SECRET]"
 
-    def test_docker_inspect_masks_opaque_secret_env_values(self):
+    @pytest.mark.parametrize("command", [
+        "docker inspect example-container",
+        "docker container inspect example-container",
+        "docker --context example inspect example-container",
+        "docker --config /tmp/docker-cli -H unix:///tmp/docker.sock container inspect example-container",
+        "docker -H=unix:///tmp/docker.sock inspect example-container",
+    ])
+    def test_docker_inspect_masks_opaque_secret_env_values(self, command):
         from agent.redact import redact_terminal_output
 
         secret = "opaque-database-password-without-vendor-prefix"
         output = f'[{{"Config":{{"Env":["POSTGRES_PASSWORD={secret}"]}}}}]'
-        result = redact_terminal_output(output, "docker inspect abc", force=True)
+        result = redact_terminal_output(output, command, force=True)
+        assert secret not in result
+
+    def test_docker_inspect_forces_opaque_env_redaction_when_disabled(
+        self, monkeypatch
+    ):
+        from agent.redact import redact_terminal_output
+
+        monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
+        secret = "opaque-runtime-password-without-vendor-prefix"
+        output = f'[{{"Config":{{"Env":["SERVICE_PASSWORD={secret}"]}}}}]'
+        result = redact_terminal_output(
+            output,
+            "docker --context example container inspect example-container",
+        )
         assert secret not in result
 
 

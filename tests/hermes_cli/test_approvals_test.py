@@ -19,6 +19,9 @@ import tools.approval as A
 from hermes_cli import approvals_test as at
 
 
+_REAL_PROMPT_DANGEROUS_APPROVAL = A.prompt_dangerous_approval
+
+
 def _args(command, env_type="local", as_json=False):
     return argparse.Namespace(
         command_words=list(command) if isinstance(command, (list, tuple)) else [command],
@@ -149,6 +152,211 @@ class TestVerdicts:
         assert rc == 3
 
 
+class TestProtectedDefaultBranchDetection:
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "sudo -n -u root git -C /tmp/repo push origin main",
+            "env -i -- git push origin HEAD:refs/heads/master",
+            "command -p git push origin main",
+            "git push origin +refs/heads/main",
+            "git push origin",
+            "git push origin HEAD",
+            "git push --all origin",
+            "git push --mirror origin",
+        ],
+    )
+    def test_wrapped_forced_or_ambiguous_default_branch_push_fails_closed(
+        self, isolated_approvals, command
+    ):
+        verdict = at.evaluate_command(command)
+        assert verdict["verdict"] == "hardline-deny"
+        assert verdict["rule"] == "push to protected default branch (main/master)"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "sudo -n git -C /tmp/repo push --set-upstream origin feature/topic",
+            "env -i git push origin HEAD:refs/heads/feature/topic",
+            "git push --delete origin old-feature",
+            "git push origin +refs/heads/feature/topic",
+        ],
+    )
+    def test_explicit_non_default_branch_push_remains_safe(
+        self, isolated_approvals, command
+    ):
+        verdict = at.evaluate_command(command)
+        assert verdict["verdict"] == "allow"
+        assert verdict["rule"] is None
+
+
+class TestMandatoryHumanApproval:
+    """Mandatory side effects always use one-operation human approval."""
+
+    command = "buzz messages send --channel public --message hello"
+    pattern_key = "external-message-send"
+
+    @staticmethod
+    def _configure_cli(monkeypatch, *, mode="manual"):
+        import tools.tirith_security as tirith_security
+
+        monkeypatch.setattr(A, "_get_approval_config", lambda: {"mode": mode})
+        monkeypatch.setattr(A, "_is_interactive_cli", lambda: True)
+        monkeypatch.setattr(A, "_is_gateway_approval_context", lambda: False)
+        monkeypatch.setattr(A, "prompt_dangerous_approval", _REAL_PROMPT_DANGEROUS_APPROVAL)
+        monkeypatch.setattr(
+            tirith_security,
+            "check_command_security",
+            lambda _command: {"action": "allow", "findings": [], "summary": ""},
+        )
+        monkeypatch.setattr(
+            A,
+            "detect_dangerous_command",
+            lambda _command: (True, TestMandatoryHumanApproval.pattern_key, "external send"),
+        )
+
+    @pytest.mark.parametrize("scope", ["session", "permanent"])
+    def test_existing_pattern_approval_cannot_bypass_live_human(
+        self, isolated_approvals, monkeypatch, scope
+    ):
+        self._configure_cli(monkeypatch)
+        session_key = f"mandatory-preapproved-{scope}"
+        token = A.set_current_session_key(session_key)
+        try:
+            if scope == "session":
+                A.approve_session(session_key, self.pattern_key)
+            else:
+                A.approve_permanent(self.pattern_key)
+
+            prompts = []
+
+            def approve_once(command, description, **kwargs):
+                prompts.append((command, description, kwargs))
+                return "once"
+
+            result = A.check_all_command_guards(
+                self.command, "local", approval_callback=approve_once
+            )
+
+            assert result["approved"] is True
+            assert len(prompts) == 1
+            assert prompts[0][2] == {
+                "allow_permanent": False,
+                "smart_denied": True,
+            }
+        finally:
+            A.clear_session(session_key)
+            A.reset_current_session_key(token)
+            A._permanent_approved.discard(self.pattern_key)
+
+    def test_smart_approval_cannot_replace_live_human(
+        self, isolated_approvals, monkeypatch
+    ):
+        self._configure_cli(monkeypatch, mode="smart")
+        session_key = "mandatory-smart"
+        token = A.set_current_session_key(session_key)
+        smart_calls = []
+        prompts = []
+        monkeypatch.setattr(
+            A,
+            "_smart_approve",
+            lambda command, description: smart_calls.append((command, description)) or "approve",
+        )
+        try:
+            result = A.check_all_command_guards(
+                self.command,
+                "local",
+                approval_callback=lambda *args, **kwargs: prompts.append(
+                    (args, kwargs)
+                )
+                or "once",
+            )
+
+            assert result["approved"] is True
+            assert smart_calls == []
+            assert len(prompts) == 1
+            assert prompts[0][1] == {
+                "allow_permanent": False,
+                "smart_denied": True,
+            }
+        finally:
+            A.clear_session(session_key)
+            A.reset_current_session_key(token)
+
+    @pytest.mark.parametrize("choice", ["session", "always"])
+    def test_cli_never_offers_or_stores_reusable_mandatory_approval(
+        self, isolated_approvals, monkeypatch, choice
+    ):
+        self._configure_cli(monkeypatch)
+        session_key = f"mandatory-one-operation-{choice}"
+        token = A.set_current_session_key(session_key)
+        callback_kwargs = []
+        try:
+            result = A.check_all_command_guards(
+                self.command,
+                "local",
+                approval_callback=lambda _command, _description, **kwargs: (
+                    callback_kwargs.append(kwargs) or choice
+                ),
+            )
+
+            assert result["approved"] is True
+            assert callback_kwargs == [{
+                "allow_permanent": False,
+                "smart_denied": True,
+            }]
+            assert not A.is_approved(session_key, self.pattern_key)
+            assert self.pattern_key not in A._permanent_approved
+        finally:
+            A.clear_session(session_key)
+            A.reset_current_session_key(token)
+            A._permanent_approved.discard(self.pattern_key)
+
+    def test_gateway_never_offers_or_stores_reusable_mandatory_approval(
+        self, isolated_approvals, monkeypatch
+    ):
+        import tools.tirith_security as tirith_security
+
+        monkeypatch.setattr(A, "_is_interactive_cli", lambda: False)
+        monkeypatch.setattr(A, "_is_gateway_approval_context", lambda: True)
+        monkeypatch.setattr(
+            tirith_security,
+            "check_command_security",
+            lambda _command: {"action": "allow", "findings": [], "summary": ""},
+        )
+        monkeypatch.setattr(
+            A,
+            "detect_dangerous_command",
+            lambda _command: (True, self.pattern_key, "external send"),
+        )
+        approval_payloads = []
+        monkeypatch.setattr(
+            A,
+            "_await_gateway_decision",
+            lambda _session, _notify, data, **_kwargs: (
+                approval_payloads.append(data)
+                or {"resolved": True, "choice": "always", "reason": None}
+            ),
+        )
+        session_key = "mandatory-gateway-one-operation"
+        token = A.set_current_session_key(session_key)
+        A.register_gateway_notify(session_key, lambda _data: None)
+        try:
+            result = A.check_all_command_guards(self.command, "local")
+
+            assert result["approved"] is True
+            assert len(approval_payloads) == 1
+            assert approval_payloads[0]["allow_permanent"] is False
+            assert approval_payloads[0]["allow_session"] is False
+            assert not A.is_approved(session_key, self.pattern_key)
+            assert self.pattern_key not in A._permanent_approved
+        finally:
+            A.unregister_gateway_notify(session_key)
+            A.clear_session(session_key)
+            A.reset_current_session_key(token)
+            A._permanent_approved.discard(self.pattern_key)
+
+
 class TestCredentialHardlineRules:
     """Regression coverage for the credential-enumeration hardline rules.
 
@@ -158,10 +366,10 @@ class TestCredentialHardlineRules:
     """
 
     @pytest.mark.parametrize("command", [
-        "cat ~/.hermes/bridge/keys/" + "telegram.priv",
-        "head -n 5 ~/.hermes/bridge/keys/" + "signing.priv",
-        "tail ~/.hermes/bridge/keys/" + "bot.priv",
-        "xxd ~/.hermes/bridge/keys/" + "signing.priv",
+        "cat ~/.hermes/bridge/keys/" + "sample-alpha.priv",
+        "head -n 5 ~/.hermes/bridge/keys/" + "sample-beta.priv",
+        "tail ~/.hermes/bridge/keys/" + "sample-gamma.priv",
+        "xxd ~/.hermes/bridge/keys/" + "sample-delta.priv",
     ])
     def test_bridge_private_key_read_hardline_denied(self, isolated_approvals,
                                                      capsys, command):
@@ -171,9 +379,32 @@ class TestCredentialHardlineRules:
         assert payload["verdict"] == "hardline-deny"
         assert payload["rule"] == "read Hermes bridge private key"
 
-    def test_docker_inspect_hardline_denied(self, isolated_approvals, capsys):
-        rc = at.approvals_test_command(
-            _args(["docker", "inspect", "my-container"], as_json=True))
+    @pytest.mark.parametrize("command", [
+        "docker inspect example-container",
+        "docker container inspect example-container",
+        "docker --context example inspect example-container",
+        "docker --config /tmp/docker-cli -H unix:///tmp/docker.sock container inspect example-container",
+        "docker -H=unix:///tmp/docker.sock inspect example-container",
+        "docker --log-level debug inspect example-container",
+        "docker --tlscacert /tmp/ca.pem container inspect example-container",
+    ])
+    def test_docker_inspect_hardline_denied(
+        self, isolated_approvals, capsys, command
+    ):
+        rc = at.approvals_test_command(_args([command], as_json=True))
+        payload = json.loads(capsys.readouterr().out)
+        assert rc == 3
+        assert payload["verdict"] == "hardline-deny"
+        assert payload["rule"] == "inspect container credential environment"
+
+    @pytest.mark.parametrize("command", [
+        "docker --context inspect",
+        'docker --context "example inspect example-container',
+    ])
+    def test_ambiguous_docker_inspect_fails_closed(
+        self, isolated_approvals, capsys, command
+    ):
+        rc = at.approvals_test_command(_args([command], as_json=True))
         payload = json.loads(capsys.readouterr().out)
         assert rc == 3
         assert payload["verdict"] == "hardline-deny"
@@ -194,6 +425,11 @@ class TestCredentialHardlineRules:
 
     @pytest.mark.parametrize("command", [
         "docker ps",
+        "docker --context example ps",
+        "docker --context example container ls",
+        "docker --config /tmp/docker-cli ps",
+        "docker --log-level debug container ls",
+        "docker container ls",
         "cat ~/.hermes/config.yaml",
     ])
     def test_benign_commands_not_hardline_denied(self, isolated_approvals,

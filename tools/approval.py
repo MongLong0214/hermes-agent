@@ -472,7 +472,6 @@ HARDLINE_PATTERNS = [
     # dedicated bridge/container runtimes consume these internally.
     (r'\b(?:cat|head|tail|less|more|nl|xxd|od)\b[^\n;|&]*\.hermes/bridge/keys/[^\s;|&]+\.priv\b',
      "read Hermes bridge private key"),
-    (r'\bdocker\s+inspect\b', "inspect container credential environment"),
     (r'\b(?:cat|head|tail|less|more|strings)\b[^\n;|&]*/proc/(?:\d+|self)/environ\b',
      "read process credential environment"),
 ]
@@ -540,39 +539,254 @@ def _expand_simple_shell_assignments(command: str) -> str:
     return expanded
 
 
+_WRAPPER_VALUE_OPTIONS = {
+    "sudo": {
+        "-C", "--chdir", "-g", "--group", "-h", "--host", "-p", "--prompt",
+        "-R", "--chroot", "-r", "--role", "-T", "--command-timeout", "-t",
+        "--type", "-u", "--user",
+    },
+    "env": {"-C", "--chdir", "-S", "--split-string", "-u", "--unset"},
+    "exec": {"-a"},
+    "time": {"-f", "--format", "-o", "--output"},
+    "nice": {"-n", "--adjustment"},
+}
+_COMMAND_WRAPPERS = frozenset(
+    {"sudo", "env", "exec", "nohup", "setsid", "time", "command", "nice"}
+)
+
+
+def _strip_command_wrappers(argv: list[str]) -> list[str]:
+    """Return argv beginning at the wrapped executable, if structurally clear."""
+    argv = list(argv)
+    while argv:
+        while argv and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", argv[0]):
+            argv.pop(0)
+        if not argv:
+            return argv
+        wrapper = os.path.basename(argv[0]).lower()
+        if wrapper not in _COMMAND_WRAPPERS:
+            return argv
+        argv.pop(0)
+
+        value_options = _WRAPPER_VALUE_OPTIONS.get(wrapper, set())
+        i = 0
+        while i < len(argv) and argv[i].startswith("-") and argv[i] != "-":
+            token = argv[i]
+            if token == "--":
+                i += 1
+                break
+            option = token.split("=", 1)[0]
+            i += 1
+            if "=" not in token and option in value_options and i < len(argv):
+                i += 1
+        argv = argv[i:]
+        if wrapper == "env":
+            while argv and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", argv[0]):
+                argv.pop(0)
+    return argv
+
+
+_GIT_GLOBAL_VALUE_OPTIONS = {
+    "-C", "-c", "--config-env", "--exec-path", "--git-dir", "--namespace",
+    "--super-prefix", "--work-tree",
+}
+_GIT_PUSH_VALUE_OPTIONS = {
+    "--exec", "--push-option", "--receive-pack", "--repo", "--server-option", "-o",
+}
+_GIT_DEFAULT_BRANCHES = frozenset({"main", "master"})
+_DOCKER_GLOBAL_VALUE_OPTIONS = frozenset({
+    "--config", "-c", "--context", "-H", "--host", "-l", "--log-level",
+    "--tlscacert", "--tlscert", "--tlskey",
+})
+_DOCKER_CONTEXT_OPTIONS = frozenset({"-c", "--context"})
+_DOCKER_CONTEXT_REDIRECT_DESCRIPTION = (
+    "docker with daemon redirect (--context: alternate daemon)"
+)
+
+
+def _skip_leading_options(
+    argv: list[str],
+    start: int,
+    value_options: set[str],
+) -> int:
+    """Skip options plus their structurally required separate values."""
+    i = start
+    while i < len(argv) and argv[i].startswith("-") and argv[i] != "-":
+        token = argv[i]
+        if token == "--":
+            return i + 1
+        option = token.split("=", 1)[0]
+        i += 1
+        if "=" not in token and option in value_options and i < len(argv):
+            i += 1
+    return i
+
+
+def _docker_command_analysis(command: str) -> tuple[bool, bool]:
+    """Return ``(runs_inspect, context_is_safe_read_control)``.
+
+    Docker global options are parsed with their value arity so a value such as
+    ``example`` in ``--context example ps`` cannot be mistaken for the
+    subcommand. Ambiguous inspect-shaped input fails closed.
+    """
+    context_seen = False
+    all_contexts_safe = True
+    for segment in _iter_top_level_shell_segments(command):
+        try:
+            argv = shlex.split(segment.strip())
+        except ValueError:
+            lowered = segment.lower()
+            if re.search(r"\bdocker\b", lowered) and re.search(r"\binspect\b", lowered):
+                return True, False
+            if re.search(r"\bdocker\b", lowered) and re.search(
+                r"(?:^|\s)(?:-c|--context)(?:=|\s)", lowered
+            ):
+                context_seen = True
+                all_contexts_safe = False
+            continue
+
+        argv = _strip_command_wrappers(argv)
+        if not argv or os.path.basename(argv[0]).lower() != "docker":
+            continue
+
+        i = 1
+        context_option = False
+        malformed = False
+        consumed_values: list[str] = []
+        while i < len(argv) and argv[i].startswith("-") and argv[i] != "-":
+            token = argv[i]
+            if token == "--":
+                i += 1
+                break
+            option, separator, attached = token.partition("=")
+            if option in _DOCKER_CONTEXT_OPTIONS:
+                context_option = True
+            i += 1
+            if option not in _DOCKER_GLOBAL_VALUE_OPTIONS:
+                continue
+            if separator:
+                if attached:
+                    consumed_values.append(attached.lower())
+                else:
+                    malformed = True
+            elif i < len(argv):
+                consumed_values.append(argv[i].lower())
+                i += 1
+            else:
+                malformed = True
+
+        command_words = tuple(word.lower() for word in argv[i:i + 2])
+        if command_words[:1] == ("inspect",) or command_words == (
+            "container", "inspect",
+        ):
+            return True, False
+        if not command_words and "inspect" in consumed_values:
+            return True, False
+        if malformed and any(word.lower() == "inspect" for word in argv[1:]):
+            return True, False
+
+        if context_option:
+            context_seen = True
+            safe_control = (
+                command_words[:1] == ("ps",)
+                or command_words == ("container", "ls")
+            )
+            if not safe_control:
+                all_contexts_safe = False
+
+    return False, context_seen and all_contexts_safe
+
+
+def _push_refspec_may_target_default(refspec: str) -> bool:
+    """Fail closed unless a refspec has an explicit non-default destination."""
+    refspec = refspec.lstrip("+")
+    if not refspec or refspec == ":":
+        return True
+    if refspec.startswith("^"):
+        # A negative refspec cannot establish a safe destination by itself.
+        return False
+    if "*" in refspec or "?" in refspec or "[" in refspec:
+        return True
+
+    if ":" in refspec:
+        destination = refspec.rsplit(":", 1)[-1].lstrip("+")
+        if not destination:
+            return True
+    else:
+        destination = refspec
+
+    destination = destination.removeprefix("refs/heads/")
+    if destination in _GIT_DEFAULT_BRANCHES:
+        return True
+    if destination in {"HEAD", "@"}:
+        return True
+    # Revision expressions and reflog selectors describe a source commit, not
+    # a provable destination branch, when no explicit destination was supplied.
+    if ":" not in refspec and any(marker in destination for marker in ("~", "^", "@{")):
+        return True
+    return False
+
+
 def _is_default_branch_push(command: str) -> bool:
-    """Structurally detect git pushes whose destination is main/master."""
+    """Detect explicit or potentially implicit pushes to main/master.
+
+    Wrapper/global/push options are parsed with their value arity. A push with
+    no explicit safe branch destination fails closed because repository config
+    can map it to the protected default branch.
+    """
     command = _expand_simple_shell_assignments(command)
     for segment in re.split(r"(?:&&|\|\||[;\n])", command):
         try:
             argv = shlex.split(segment.strip())
         except ValueError:
             continue
-        if not argv:
-            continue
-        while argv and (
-            re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", argv[0])
-            or argv[0] in {"sudo", "env", "exec", "nohup", "setsid", "time", "command"}
-        ):
-            argv.pop(0)
+        argv = _strip_command_wrappers(argv)
         if not argv or os.path.basename(argv[0]).lower() != "git":
             continue
-        i = 1
-        while i < len(argv) and argv[i].startswith("-"):
-            token = argv[i]
-            opt = token.split("=", 1)[0]
-            i += 1
-            if "=" not in token and opt in {
-                "-C", "-c", "--git-dir", "--work-tree", "--namespace"
-            }:
-                i += 1
+
+        i = _skip_leading_options(argv, 1, _GIT_GLOBAL_VALUE_OPTIONS)
         if i >= len(argv) or argv[i] != "push":
             continue
-        operands = [a for a in argv[i + 1:] if not a.startswith("-")]
-        for refspec in operands[1:]:
-            dest = refspec.rsplit(":", 1)[-1].removeprefix("refs/heads/")
-            if dest in {"main", "master"}:
-                return True
+
+        operands: list[str] = []
+        remote_from_option = False
+        tags_only = False
+        j = i + 1
+        while j < len(argv):
+            token = argv[j]
+            if token == "--":
+                operands.extend(argv[j + 1:])
+                break
+            if token.startswith("-") and token != "-":
+                option = token.split("=", 1)[0]
+                if option in {"--all", "--mirror"}:
+                    return True
+                if option == "--tags":
+                    tags_only = True
+                if option == "--repo":
+                    remote_from_option = True
+                j += 1
+                if (
+                    "=" not in token
+                    and option in _GIT_PUSH_VALUE_OPTIONS
+                    and j < len(argv)
+                ):
+                    j += 1
+                continue
+            operands.append(token)
+            j += 1
+
+        refspecs = operands if remote_from_option else operands[1:]
+        if not refspecs:
+            if tags_only:
+                continue
+            return True
+
+        positive_refspecs = [ref for ref in refspecs if not ref.lstrip("+").startswith("^")]
+        if not positive_refspecs:
+            return True
+        if any(_push_refspec_may_target_default(ref) for ref in positive_refspecs):
+            return True
     return False
 
 
@@ -610,6 +824,11 @@ def detect_hardline_command(command: str) -> tuple:
     """
     if _is_default_branch_push(command):
         return (True, "push to protected default branch (main/master)")
+    # Docker inspect exposes Config.Env, including opaque credentials. Parse
+    # global-option value ownership before identifying the subcommand.
+    docker_inspect, _ = _docker_command_analysis(command)
+    if docker_inspect:
+        return (True, "inspect container credential environment")
     if _command_parser_limit_exceeded(command):
         return (True, _PARSER_LIMIT_DESCRIPTION)
     normalized = _normalize_command_for_detection(command)
@@ -884,9 +1103,9 @@ DANGEROUS_PATTERNS = [
     # the CLI at a DIFFERENT daemon, often a remote host over ssh/tcp.  A
     # command that looks local (`docker -H ssh://prod stop app`) silently
     # operates on remote infrastructure, so any docker/podman invocation
-    # carrying a redirect requires approval regardless of subcommand.  The
-    # redirect flag must appear in the global-flag position (before the
-    # subcommand) and -H/--host/--context must carry a value, which keeps
+    # carrying a redirect requires approval, except for structurally parsed
+    # read-only ps/container-ls controls. Redirect flags must appear before the
+    # subcommand and -H/--host/--context must carry a value, which keeps
     # `docker -h` (help) and subcommand flags like `docker run -h <hostname>`
     # out of the deny.  Listed BEFORE the lifecycle rules so a redirected
     # lifecycle command surfaces the more specific "remote daemon" reason.
@@ -896,7 +1115,7 @@ DANGEROUS_PATTERNS = [
     (r'\bdocker\s+(?:-{1,2}\S+(?:[=\s]\S+)?\s+)*(?:-h|--host)[=\s]+\S+',
      "docker with remote daemon redirect (-H/--host)"),
     (r'\bdocker\s+(?:-{1,2}\S+(?:[=\s]\S+)?\s+)*(?:-c|--context)[=\s]+\S+',
-     "docker with daemon redirect (--context: alternate daemon)"),
+     _DOCKER_CONTEXT_REDIRECT_DESCRIPTION),
     (r'\bdocker\s+context\s+use\b',
      "docker context use (switches default daemon for future commands)"),
     (r'\bpodman\s+(?:-{1,2}\S+(?:[=\s]\S+)?\s+)*(?:--url|--connection|--identity)[=\s]+\S+',
@@ -2275,7 +2494,13 @@ def detect_dangerous_command(command: str) -> tuple:
 
     for command_variant in _command_detection_variants(command):
         command_lower = command_variant.lower()
+        _, safe_context_control = _docker_command_analysis(command_variant)
         for pattern_re, description in DANGEROUS_PATTERNS_COMPILED:
+            if (
+                safe_context_control
+                and description == _DOCKER_CONTEXT_REDIRECT_DESCRIPTION
+            ):
+                continue
             if pattern_re.search(command_lower):
                 pattern_key = description
                 return (True, pattern_key, description)
@@ -3821,6 +4046,164 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     return {"resolved": resolved, "choice": choice, "reason": entry.reason}
 
 
+def _mandatory_human_block_result(
+    description: str,
+    *,
+    outcome: str,
+    deny_reason: str | None = None,
+) -> dict:
+    """Build a fail-closed result for a mandatory one-operation decision."""
+    if outcome == "timeout":
+        reason = "timed out without user response"
+        silence = " Silence is not consent."
+    elif outcome == "notify_failed":
+        reason = "could not be presented to the user"
+        silence = ""
+    else:
+        reason = "was denied by the user"
+        silence = ""
+    reason_addendum = (
+        f' Reason given by the user: "{deny_reason}".'
+        if outcome == "denied" and deny_reason
+        else ""
+    )
+    return {
+        "approved": False,
+        "mandatory_approval": True,
+        "message": (
+            f"BLOCKED: {description} requires live human approval and {reason}."
+            f"{reason_addendum} This action has NOT been approved. Do NOT retry, "
+            "do NOT rephrase it, and do NOT attempt the same outcome through "
+            f"another tool.{silence}"
+        ),
+        "pattern_key": "mandatory-human-approval",
+        "description": description,
+        "outcome": outcome,
+        "user_consent": False,
+        "deny_reason": deny_reason,
+    }
+
+
+def _request_mandatory_human_approval(
+    command: str,
+    description: str,
+    *,
+    approval_callback,
+    is_cli: bool,
+    is_gateway: bool,
+    is_ask: bool,
+) -> dict:
+    """Request a fresh human decision that can never be reused.
+
+    Mandatory actions intentionally bypass the session/permanent allowlists and
+    smart approval.  Every UI is restricted to one-operation approval or deny,
+    and even a stale client returning ``session``/``always`` is treated only as
+    approval for this call without persisting any pattern.
+    """
+    session_key = get_current_session_key()
+    pattern_key = "mandatory-human-approval"
+
+    from agent.redact import redact_sensitive_text
+
+    display_command = redact_sensitive_text(command, force=True)
+    display_description = redact_sensitive_text(description, force=True)
+
+    if is_gateway or is_ask:
+        with _lock:
+            notify_cb = _gateway_notify_cbs.get(session_key)
+
+        approval_data = {
+            "command": display_command,
+            "pattern_key": pattern_key,
+            "pattern_keys": [pattern_key],
+            "description": display_description,
+            "mandatory_approval": True,
+            # Some adapters consume allow_session directly; older surfaces use
+            # smart_denied to render the established once/deny-only choice set.
+            "allow_permanent": False,
+            "allow_session": False,
+            "smart_denied": True,
+        }
+        if notify_cb is None:
+            submit_pending(session_key, approval_data)
+            return {
+                "approved": False,
+                "mandatory_approval": True,
+                "pattern_key": pattern_key,
+                "status": "pending_approval",
+                "approval_pending": True,
+                "command": display_command,
+                "description": display_description,
+                "allow_permanent": False,
+                "allow_session": False,
+                "message": (
+                    f"⚠️ {display_description}. Asking the user for one-operation "
+                    f"approval.\n\n**Command:**\n```\n{display_command}\n```"
+                ),
+            }
+
+        decision = _await_gateway_decision(
+            session_key, notify_cb, approval_data, surface="gateway"
+        )
+        if decision.get("notify_failed"):
+            return _mandatory_human_block_result(
+                description, outcome="notify_failed"
+            )
+        if not decision.get("resolved") or decision.get("choice") is None:
+            return _mandatory_human_block_result(description, outcome="timeout")
+        choice = decision.get("choice")
+        if choice not in {"once", "session", "always"}:
+            return _mandatory_human_block_result(
+                description,
+                outcome="denied",
+                deny_reason=decision.get("reason"),
+            )
+    elif is_cli:
+        _fire_approval_hook(
+            "pre_approval_request",
+            command=command,
+            description=description,
+            pattern_key=pattern_key,
+            pattern_keys=[pattern_key],
+            session_key=session_key,
+            surface="cli",
+        )
+        choice = prompt_dangerous_approval(
+            command,
+            description,
+            allow_permanent=False,
+            # The existing callback contract uses this flag for the
+            # once/deny-only UI. Persistence is independently prohibited here.
+            smart_denied=True,
+            approval_callback=approval_callback,
+        )
+        _fire_approval_hook(
+            "post_approval_response",
+            command=command,
+            description=description,
+            pattern_key=pattern_key,
+            pattern_keys=[pattern_key],
+            session_key=session_key,
+            surface="cli",
+            choice=choice,
+        )
+        if choice == "timeout":
+            return _mandatory_human_block_result(description, outcome="timeout")
+        if choice not in {"once", "session", "always"}:
+            return _mandatory_human_block_result(description, outcome="denied")
+    else:  # Defensive: the caller normally rejects this before dispatch.
+        return _mandatory_human_block_result(description, outcome="notify_failed")
+
+    _reset_denials(session_key)
+    return {
+        "approved": True,
+        "message": None,
+        "mandatory_approval": True,
+        "user_approved": True,
+        "description": description,
+    }
+
+
 def check_all_command_guards(command: str, env_type: str,
                              approval_callback=None,
                              has_host_access: bool = False) -> dict:
@@ -3869,38 +4252,52 @@ def check_all_command_guards(command: str, env_type: str,
                        deny_pattern, command[:200])
         return _user_deny_block_result(deny_pattern)
 
-    # Side effects that always require a live human are evaluated before the
-    # yolo/off bypass. They remain approvable in interactive/gateway contexts,
-    # but fail closed when no approver exists.
+    # Side effects that always require a live human are evaluated before every
+    # reusable or automated approval path. They take a dedicated one-operation
+    # branch: no yolo/off, allowlist, smart, session, or permanent shortcut can
+    # reach them.
     mandatory_approval, mandatory_desc = detect_mandatory_approval_command(command)
-
-    # --yolo or approvals.mode=off: bypass ordinary approval prompts only.
-    # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
-    approval_mode = _get_approval_mode()
-    if (not mandatory_approval and (
-        _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off"
-    )):
-        return {"approved": True, "message": None}
-
-    if not mandatory_approval and _command_matches_permanent_allowlist(command):
-        return {"approved": True, "message": None}
 
     is_cli = _is_interactive_cli()
     is_gateway = _is_gateway_approval_context()
     is_ask = env_var_enabled("HERMES_EXEC_ASK")
 
-    # Preserve the existing non-interactive behavior: outside CLI/gateway/ask
-    # flows, we do not block on approvals and we skip external guard work.
-    if not is_cli and not is_gateway and not is_ask:
-        if mandatory_approval:
+    if mandatory_approval:
+        mandatory_description = mandatory_desc or "mandatory action"
+        if not is_cli and not is_gateway and not is_ask:
             return {
                 "approved": False,
                 "mandatory_approval": True,
                 "message": (
-                    f"BLOCKED: {mandatory_desc} requires live human approval, "
+                    f"BLOCKED: {mandatory_description} requires live human approval, "
                     "but no interactive user or gateway approver is present."
                 ),
             }
+        return _request_mandatory_human_approval(
+            command,
+            mandatory_description,
+            approval_callback=approval_callback,
+            is_cli=is_cli,
+            is_gateway=is_gateway,
+            is_ask=is_ask,
+        )
+
+    # --yolo or approvals.mode=off: bypass ordinary approval prompts only.
+    # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
+    approval_mode = _get_approval_mode()
+    if (
+        _YOLO_MODE_FROZEN
+        or is_current_session_yolo_enabled()
+        or approval_mode == "off"
+    ):
+        return {"approved": True, "message": None}
+
+    if _command_matches_permanent_allowlist(command):
+        return {"approved": True, "message": None}
+
+    # Preserve the existing non-interactive behavior: outside CLI/gateway/ask
+    # flows, we do not block on approvals and we skip external guard work.
+    if not is_cli and not is_gateway and not is_ask:
         # Cron sessions: respect cron_mode config
         if _is_cron_approval_context():
             if _get_cron_approval_mode() == "deny":

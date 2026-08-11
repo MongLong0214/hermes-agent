@@ -1106,6 +1106,80 @@ def is_env_dump_command(command: str | None) -> bool:
     return False
 
 
+def _command_runs_docker_inspect(command: str | None) -> bool:
+    """Recognize Docker inspect across global options and command forms."""
+    if not command or not isinstance(command, str):
+        return False
+
+    docker_value_options = {
+        "--config", "-c", "--context", "-H", "--host", "-l", "--log-level",
+        "--tlscacert", "--tlscert", "--tlskey",
+    }
+    wrapper_value_options = {
+        "sudo": {
+            "-C", "--chdir", "-g", "--group", "-h", "--host", "-p", "--prompt",
+            "-R", "--chroot", "-r", "--role", "-T", "--command-timeout", "-t",
+            "--type", "-u", "--user",
+        },
+        "env": {"-C", "--chdir", "-S", "--split-string", "-u", "--unset"},
+        "exec": {"-a"},
+        "time": {"-f", "--format", "-o", "--output"},
+        "nice": {"-n", "--adjustment"},
+    }
+    wrappers = {
+        "sudo", "env", "exec", "nohup", "setsid", "time", "command", "nice",
+    }
+
+    for segment in re.split(r"(?:&&|\|\||[;|\n])", command):
+        try:
+            argv = shlex.split(segment.strip())
+        except ValueError:
+            continue
+        while argv:
+            while argv and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", argv[0]):
+                argv.pop(0)
+            if not argv:
+                break
+            wrapper = os.path.basename(argv[0]).lower()
+            if wrapper not in wrappers:
+                break
+            argv.pop(0)
+            value_options = wrapper_value_options.get(wrapper, set())
+            i = 0
+            while i < len(argv) and argv[i].startswith("-") and argv[i] != "-":
+                token = argv[i]
+                if token == "--":
+                    i += 1
+                    break
+                option = token.split("=", 1)[0]
+                i += 1
+                if "=" not in token and option in value_options and i < len(argv):
+                    i += 1
+            argv = argv[i:]
+            if wrapper == "env":
+                while argv and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", argv[0]):
+                    argv.pop(0)
+
+        if not argv or os.path.basename(argv[0]).lower() != "docker":
+            continue
+        i = 1
+        while i < len(argv) and argv[i].startswith("-") and argv[i] != "-":
+            token = argv[i]
+            if token == "--":
+                i += 1
+                break
+            option = token.split("=", 1)[0]
+            i += 1
+            if "=" not in token and option in docker_value_options and i < len(argv):
+                i += 1
+        command_words = [word.lower() for word in argv[i:i + 2]]
+        if command_words[:1] == ["inspect"]:
+            return True
+        if command_words == ["container", "inspect"]:
+            return True
+    return False
+
+
 def redact_terminal_output(
     output: str, command: str | None = None, *, force: bool = False
 ) -> str:
@@ -1123,21 +1197,28 @@ def redact_terminal_output(
       Per AGENTS.md, ``.env`` files contain only secrets, so the generic
       ENV pass is the right one (keys whose names carry no secret keyword
       can still slip through it — same limit as the env-dump path).
+    - Docker inspect (direct or ``docker container inspect``, including Docker
+      global options) → ``code_file=False`` and forced redaction because
+      ``Config.Env`` can contain opaque credential values.
     - anything else (or unknown command) → ``code_file=True`` to avoid
       false positives on source/config dumps.
 
     ``force=True`` bypasses the global ``security.redact_secrets`` preference
-    for safety boundaries that must never emit raw credentials.
+    for safety boundaries that must never emit raw credentials. Docker inspect
+    output is always such a boundary regardless of the caller's flag.
     """
     if not output:
         return output
     cmd = command or ""
-    # docker inspect emits opaque KEY=value credentials in Config.Env JSON.
-    docker_inspect = bool(re.search(r"(?:^|[;&|]\s*)docker\s+inspect\b", cmd, re.IGNORECASE))
+    docker_inspect = _command_runs_docker_inspect(cmd)
     code_file = not (
         is_env_dump_command(cmd) or _command_reads_env_file(cmd) or docker_inspect
     )
-    return redact_sensitive_text(output, force=force, code_file=code_file)
+    return redact_sensitive_text(
+        output,
+        force=force or docker_inspect,
+        code_file=code_file,
+    )
 
 
 # Substrings used to gate ``_PREFIX_RE`` execution. If none of these appear in
