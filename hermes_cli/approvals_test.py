@@ -5,13 +5,14 @@ running it, prompting anyone, or persisting anything. It composes the REAL
 runtime evaluators from ``tools.approval`` in the same order the runtime
 guard (``check_all_command_guards``) applies them:
 
-    1. container-skip gate (isolated backends bypass all guards),
-    2. hardline blocklist (never bypassable, fires before yolo/off),
-    3. sudo-stdin guard (unconditional),
-    4. user ``approvals.deny`` rules (fire before yolo/off),
-    5. yolo / ``approvals.mode: off`` bypass,
-    6. permanent ``command_allowlist``,
-    7. dangerous-pattern detection → would ask for approval.
+    1. hardline blocklist (never bypassable, fires before yolo/off),
+    2. user ``approvals.deny`` rules (fire before yolo/off),
+    3. mandatory human-approval side effects,
+    4. container-skip gate (isolated backends skip ordinary guards),
+    5. sudo-stdin guard (unconditional outside isolated backends),
+    6. yolo / ``approvals.mode: off`` bypass,
+    7. permanent ``command_allowlist``,
+    8. dangerous-pattern detection → would ask for approval.
 
 Because the same functions run — including ``_command_detection_variants``'s
 normalization/de-obfuscation path — an obfuscated command (``r\\m -rf /``)
@@ -77,17 +78,12 @@ def evaluate_command(command: str, env_type: str = "local") -> dict:
             "normalized_variants": variants,
         }
 
-    # 1. Isolated container backends skip every guard (runtime parity:
-    #    this fires BEFORE the hardline floor in check_all_command_guards).
-    if approval._should_skip_container_guards(env_type):
-        return result(
-            "allow",
-            detail=(f"env_type '{env_type}' is an isolated container backend; "
-                    "the runtime skips all command guards for it"),
-        )
-
-    # 2. Hardline blocklist — never bypassable, even under yolo.
-    is_hardline, hardline_desc = approval.detect_hardline_command(command)
+    # 1. Hardline blocklist — never bypassable, even under yolo.
+    mandatory_analysis = approval._analyze_mandatory_approval_command(command)
+    is_hardline, hardline_desc = approval.detect_hardline_command(
+        command,
+        _mandatory_analysis=mandatory_analysis,
+    )
     if is_hardline:
         return result(
             "hardline-deny", rule=hardline_desc,
@@ -95,15 +91,7 @@ def evaluate_command(command: str, env_type: str = "local") -> dict:
                    "blocked even under --yolo / approvals.mode=off)",
         )
 
-    # 3. Sudo stdin guard — unconditional, like the hardline floor.
-    is_sudo_guess, sudo_desc = approval._check_sudo_stdin_guard(command)
-    if is_sudo_guess:
-        return result(
-            "hardline-deny", rule=sudo_desc,
-            detail="sudo stdin guard (unconditional block)",
-        )
-
-    # 4. User-defined approvals.deny rules — fire before yolo/off.
+    # 2. User-defined approvals.deny rules — fire before yolo/off.
     deny_pattern = approval._match_user_deny_rule(command)
     if deny_pattern is not None:
         return result(
@@ -112,12 +100,28 @@ def evaluate_command(command: str, env_type: str = "local") -> dict:
                    "config.yaml (blocked even under --yolo / mode=off)",
         )
 
-    # 5. Mandatory human-approval side effects are not bypassed by yolo/off.
-    mandatory, mandatory_desc = approval.detect_mandatory_approval_command(command)
+    # 3. Mandatory human-approval side effects are not bypassed by yolo/off.
+    mandatory, mandatory_desc = mandatory_analysis.public_result()
     if mandatory:
         return result(
             "ask-approval", rule=mandatory_desc,
             detail="mandatory human approval (not bypassable by --yolo or approvals.mode=off)",
+        )
+
+    # 4. Isolated containers skip ordinary reusable approval guards only.
+    if approval._should_skip_container_guards(env_type):
+        return result(
+            "allow",
+            detail=(f"env_type '{env_type}' is an isolated container backend; "
+                    "the runtime skips ordinary command guards for it"),
+        )
+
+    # 5. Sudo stdin guard — unconditional outside isolated containers.
+    is_sudo_guess, sudo_desc = approval._check_sudo_stdin_guard(command)
+    if is_sudo_guess:
+        return result(
+            "hardline-deny", rule=sudo_desc,
+            detail="sudo stdin guard (unconditional block)",
         )
 
     # 6. Yolo / approvals.mode=off bypass.
@@ -130,7 +134,7 @@ def evaluate_command(command: str, env_type: str = "local") -> dict:
                    "only hardline/deny rules would block",
         )
 
-    # 6. Permanent command_allowlist.
+    # 7. Permanent command_allowlist.
     if approval._command_matches_permanent_allowlist(command):
         return result(
             "allow",
@@ -138,7 +142,7 @@ def evaluate_command(command: str, env_type: str = "local") -> dict:
                    "(permanently approved)",
         )
 
-    # 7. Dangerous-pattern detection → would prompt.
+    # 8. Dangerous-pattern detection → would prompt.
     is_dangerous, pattern_key, description = approval.detect_dangerous_command(command)
     if is_dangerous:
         return result(

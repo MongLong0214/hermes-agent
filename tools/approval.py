@@ -8,6 +8,7 @@ This module is the single source of truth for the dangerous command system:
 - Permanent allowlist persistence (config.yaml)
 """
 
+import ast
 import contextlib
 import contextvars
 import fnmatch
@@ -22,6 +23,8 @@ import tempfile
 import threading
 import time
 import unicodedata
+from dataclasses import dataclass
+from enum import Enum
 from typing import Optional
 from hermes_cli.config import cfg_get
 
@@ -521,22 +524,6 @@ def _check_sudo_stdin_guard(command: str) -> tuple:
     if _SUDO_STDIN_RE.search(normalized):
         return (True, "sudo password guessing via stdin (sudo -S)")
     return (False, None)
-
-
-def _expand_simple_shell_assignments(command: str) -> str:
-    """Expand bounded literal ``NAME=value; $NAME ...`` aliases only."""
-    assignments: dict[str, str] = {}
-    for match in re.finditer(
-        r"(?:^|[;\n])\s*([A-Za-z_][A-Za-z0-9_]*)=([A-Za-z0-9_./+-]+)\s*(?=;|\n)",
-        command,
-    ):
-        assignments[match.group(1)] = match.group(2)
-    expanded = command
-    for name, value in assignments.items():
-        expanded = re.sub(
-            rf"\$(?:\{{{re.escape(name)}\}}|{re.escape(name)}\b)", value, expanded
-        )
-    return expanded
 
 
 _WRAPPER_VALUE_OPTIONS = {
@@ -1207,77 +1194,975 @@ def _git_global_options_and_aliases(
     return i, aliases, dynamic_alias_source
 
 
-def _git_shell_alias_simple_assignments(
-    shell_source: str,
-) -> tuple[dict[str, str], bool]:
-    """Collect bounded literal assignment-only shell segments.
-
-    Git shell aliases run as a fresh shell program.  Retain only simple values
-    assigned by standalone commands in that program; never evaluate general
-    shell expressions or consult the process environment.
-    """
-    assignments: dict[str, str] = {}
-    assignment_count = 0
-    limit_exceeded = False
-    for segment in _iter_top_level_shell_segments(shell_source):
-        argv = _parse_shell_segment_argv(segment)
-        if not argv:
-            continue
-        parsed: list[tuple[str, str]] = []
-        for token in argv:
-            match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)", token)
-            if match is None:
-                parsed = []
-                break
-            parsed.append((match.group(1), match.group(2)))
-        if not parsed:
-            continue
-        for name, value in parsed:
-            assignment_count += 1
-            if assignment_count > _MAX_GIT_LEADING_ASSIGNMENTS:
-                limit_exceeded = True
-                continue
-            if _is_simple_shell_literal(value):
-                assignments[name] = value
-            else:
-                assignments.pop(name, None)
-    return assignments, limit_exceeded
+class _ShellVariableStatus(Enum):
+    RESOLVED = "resolved"
+    UNRESOLVED = "unresolved"
+    OVERFLOW = "overflow"
 
 
-_GIT_SHELL_COMMAND_VARIABLE_RE = re.compile(
-    r"\$(?:\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\}|"
-    r"(?P<plain>[A-Za-z_][A-Za-z0-9_]*))"
-)
+class _ShellPayloadKind(Enum):
+    SAME_SHELL = "same-shell"
+    FRESH_SHELL = "fresh-shell"
+    FRESH_PROCESS = "fresh-process"
 
 
-def _expand_git_shell_alias_command_variables(
-    shell_source: str,
-    assignments: dict[str, str],
-    assignment_limit_exceeded: bool,
-) -> tuple[str, bool]:
-    """Expand bounded literal variables only when used as command words."""
-    replacements: list[tuple[int, int, str]] = []
-    unresolved = False
-    for start, end, word in _iter_shell_command_word_spans(shell_source):
-        match = _GIT_SHELL_COMMAND_VARIABLE_RE.fullmatch(word)
-        if match is None:
-            continue
-        name = match.group("braced") or match.group("plain")
-        value = assignments.get(name)
-        if assignment_limit_exceeded or value is None:
-            unresolved = True
-            continue
-        replacements.append((start, end, value))
-    if not replacements:
-        return shell_source, unresolved
+@dataclass(frozen=True)
+class _ShellPayload:
+    source: str
+    kind: _ShellPayloadKind
 
+
+@dataclass(frozen=True)
+class _ShellWordFragment:
+    span: tuple[int, int]
+    kind: str
+    quote_mode: str
+    text: str = ""
+    name: str | None = None
+
+
+@dataclass(frozen=True)
+class _ShellWordResolution:
+    fragments: tuple[_ShellWordFragment, ...]
+    status: _ShellVariableStatus
+    value: str | None
+    variable_seen: bool
+
+
+@dataclass(frozen=True)
+class _ShellCommandEvent:
+    span: tuple[int, int]
+    preceding_separator: str | None
+    raw_words: tuple[str, ...]
+    redirections: tuple[tuple[str, str], ...]
+    prefix_assignments: tuple[tuple[str, str | None], ...]
+    executable: _ShellWordResolution | None
+    word_resolutions: tuple[_ShellWordResolution, ...]
+    executable_index: int | None
+    resolved_basename: str | None
+    kind: str
+    trusted_bindings: tuple[tuple[str, str], ...] | None = ()
+
+
+@dataclass(frozen=True)
+class _ShellProgramResolution:
+    events: tuple[_ShellCommandEvent, ...]
+    status: _ShellVariableStatus
+
+
+@dataclass
+class _ShellVariableBudget:
+    assignments: int = 0
+    commands: int = 0
+    fragments: int = 0
+    replacements: int = 0
+    emitted_bytes: int = 0
+    payload_work: int = 0
+    depth: int = 0
+    overflowed: bool = False
+    ast_overflowed: bool = False
+
+    def _take(self, field: str, amount: int, limit: int) -> bool:
+        value = getattr(self, field) + amount
+        setattr(self, field, value)
+        if value > limit:
+            self.overflowed = True
+            return False
+        return True
+
+    def take_assignment(self) -> bool:
+        return self._take("assignments", 1, _MAX_GIT_LEADING_ASSIGNMENTS)
+
+    def take_command(self) -> bool:
+        return self._take("commands", 1, _MAX_DETECTION_WORK_ITEMS)
+
+    def take_fragment(self) -> bool:
+        return self._take("fragments", 1, _MAX_SHELL_VARIABLE_FRAGMENTS)
+
+    def take_replacement(self) -> bool:
+        return self._take("replacements", 1, _MAX_SHELL_VARIABLE_REPLACEMENTS)
+
+    def take_emitted(self, text: str) -> bool:
+        return self._take(
+            "emitted_bytes",
+            len(text.encode("utf-8")),
+            _MAX_SHELL_VARIABLE_EMITTED_BYTES,
+        )
+
+    def take_emitted_argv(self, words: list[str]) -> bool:
+        """Reserve a conservative shell-quoted argv size before joining it."""
+        amount = sum(4 * len(word.encode("utf-8")) + 3 for word in words)
+        return self._take(
+            "emitted_bytes",
+            amount,
+            _MAX_SHELL_VARIABLE_EMITTED_BYTES,
+        )
+
+    def take_payload(self) -> bool:
+        return self._take("payload_work", 1, _MAX_DETECTION_WORK_ITEMS)
+
+
+_MAX_SHELL_VARIABLE_FRAGMENTS = 512
+_MAX_SHELL_VARIABLE_REPLACEMENTS = 512
+_MAX_SHELL_VARIABLE_EMITTED_BYTES = 128_000
+_SHELL_VARIABLE_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _materialize_shell_word(parts: list[str]) -> str:
+    """Join a word only after every cumulative expansion budget has passed."""
+    return "".join(parts)
+
+
+def _overflow_shell_word(
+    fragments: list[_ShellWordFragment], variable_seen: bool
+) -> _ShellWordResolution:
+    return _ShellWordResolution(
+        tuple(fragments), _ShellVariableStatus.OVERFLOW, None, variable_seen
+    )
+
+
+def _resolve_shell_word(
+    raw_word: str,
+    bindings: dict[str, str],
+    budget: _ShellVariableBudget,
+    *,
+    source_offset: int = 0,
+) -> _ShellWordResolution:
+    """Resolve one raw shell word while retaining quote and escape provenance."""
+    fragments: list[_ShellWordFragment] = []
     parts: list[str] = []
-    previous = 0
-    for start, end, value in replacements:
-        parts.extend((shell_source[previous:start], value))
-        previous = end
-    parts.append(shell_source[previous:])
-    return "".join(parts), unresolved
+    variable_seen = False
+    unresolved = False
+    quote: str | None = None
+    index = 0
+
+    def add_literal(start: int, end: int, text: str, mode: str) -> bool:
+        if not budget.take_fragment() or not budget.take_emitted(text):
+            return False
+        fragments.append(
+            _ShellWordFragment(
+                (source_offset + start, source_offset + end),
+                "literal",
+                mode,
+                text=text,
+            )
+        )
+        parts.append(text)
+        return True
+
+    while index < len(raw_word):
+        char = raw_word[index]
+        if quote == "'":
+            end = raw_word.find("'", index)
+            if end == -1:
+                if not add_literal(index, len(raw_word), raw_word[index:], "single"):
+                    return _overflow_shell_word(fragments, variable_seen)
+                unresolved = True
+                index = len(raw_word)
+            else:
+                if not add_literal(index, end, raw_word[index:end], "single"):
+                    return _overflow_shell_word(fragments, variable_seen)
+                quote = None
+                index = end + 1
+            continue
+        if char == "'" and quote is None:
+            quote = "'"
+            index += 1
+            if index < len(raw_word) and raw_word[index] == "'":
+                if not add_literal(index, index, "", "single"):
+                    return _overflow_shell_word(fragments, variable_seen)
+                quote = None
+                index += 1
+            continue
+        if char == '"':
+            quote = None if quote == '"' else '"'
+            index += 1
+            if quote == '"' and index < len(raw_word) and raw_word[index] == '"':
+                if not add_literal(index, index, "", "double"):
+                    return _overflow_shell_word(fragments, variable_seen)
+                quote = None
+                index += 1
+            continue
+        mode = "double" if quote == '"' else "unquoted"
+        if char == "\\":
+            if index + 1 >= len(raw_word):
+                unresolved = True
+                if not add_literal(index, index + 1, "\\", "escaped"):
+                    return _overflow_shell_word(fragments, variable_seen)
+                index += 1
+                continue
+            escaped = raw_word[index + 1]
+            if escaped == "\n":
+                index += 2
+                continue
+            if mode == "double" and escaped not in {'$', '`', '"', "\\"}:
+                text = raw_word[index:index + 2]
+                if not add_literal(index, index + 2, text, "double"):
+                    return _overflow_shell_word(fragments, variable_seen)
+                index += 2
+                continue
+            if not add_literal(index, index + 2, escaped, "escaped"):
+                return _overflow_shell_word(fragments, variable_seen)
+            index += 2
+            continue
+        if raw_word.startswith("$(", index):
+            end = _scan_dollar_paren_end(raw_word, index)
+            end = len(raw_word) if end is None else end
+            if not budget.take_fragment() or not budget.take_replacement():
+                return _overflow_shell_word(fragments, variable_seen)
+            fragments.append(
+                _ShellWordFragment(
+                    (source_offset + index, source_offset + end),
+                    "parameter",
+                    mode,
+                )
+            )
+            variable_seen = True
+            unresolved = True
+            index = end
+            continue
+        if char == "`":
+            end = _scan_backtick_end(raw_word, index)
+            end = len(raw_word) if end is None else end
+            if not budget.take_fragment() or not budget.take_replacement():
+                return _overflow_shell_word(fragments, variable_seen)
+            fragments.append(
+                _ShellWordFragment(
+                    (source_offset + index, source_offset + end),
+                    "parameter",
+                    mode,
+                )
+            )
+            variable_seen = True
+            unresolved = True
+            index = end
+            continue
+        if char == "$":
+            name: str | None = None
+            end = index + 1
+            if raw_word.startswith("${", index):
+                close = raw_word.find("}", index + 2)
+                if close != -1:
+                    candidate = raw_word[index + 2:close]
+                    if _SHELL_VARIABLE_NAME_RE.fullmatch(candidate):
+                        name = candidate
+                    end = close + 1
+                else:
+                    end = len(raw_word)
+            else:
+                match = _SHELL_VARIABLE_NAME_RE.match(raw_word, index + 1)
+                if match is not None:
+                    name = match.group(0)
+                    end = match.end()
+            if not budget.take_fragment() or not budget.take_replacement():
+                return _overflow_shell_word(fragments, True)
+            value = bindings.get(name) if name is not None else None
+            fragments.append(
+                _ShellWordFragment(
+                    (source_offset + index, source_offset + end),
+                    "parameter",
+                    mode,
+                    name=name,
+                )
+            )
+            variable_seen = True
+            if value is None:
+                unresolved = True
+            else:
+                if not budget.take_emitted(value):
+                    return _overflow_shell_word(fragments, variable_seen)
+                parts.append(value)
+            index = end
+            continue
+
+        end = index + 1
+        while end < len(raw_word) and raw_word[end] not in "'\"\\$`":
+            end += 1
+        if not add_literal(index, end, raw_word[index:end], mode):
+            return _overflow_shell_word(fragments, variable_seen)
+        index = end
+
+    if quote is not None:
+        unresolved = True
+    if budget.overflowed:
+        return _overflow_shell_word(fragments, variable_seen)
+    status = (
+        _ShellVariableStatus.UNRESOLVED
+        if unresolved
+        else _ShellVariableStatus.RESOLVED
+    )
+    value = None if unresolved else _materialize_shell_word(parts)
+    return _ShellWordResolution(tuple(fragments), status, value, variable_seen)
+
+
+def _iter_shell_event_spans(shell_source: str):
+    """Yield raw root-level event spans with their preceding separator."""
+    start = 0
+    preceding: str | None = None
+    quote: str | None = None
+    index = 0
+    while index < len(shell_source):
+        char = shell_source[index]
+        if quote == "'":
+            if char == "'":
+                quote = None
+            index += 1
+            continue
+        if char == "\\" and index + 1 < len(shell_source):
+            index += 2
+            continue
+        if char == "'" and quote is None:
+            quote = "'"
+            index += 1
+            continue
+        if char == '"':
+            quote = None if quote == '"' else '"'
+            index += 1
+            continue
+        if shell_source.startswith("$(", index):
+            end = _scan_dollar_paren_end(shell_source, index)
+            index = len(shell_source) if end is None else end
+            continue
+        if char == "`":
+            end = _scan_backtick_end(shell_source, index)
+            index = len(shell_source) if end is None else end
+            continue
+        if quote == '"':
+            index += 1
+            continue
+        if char not in ";&|\n":
+            index += 1
+            continue
+        separator = char
+        separator_end = index + 1
+        if char in "&|" and separator_end < len(shell_source):
+            if shell_source[separator_end] == char:
+                separator += char
+                separator_end += 1
+        yield start, index, preceding
+        preceding = separator
+        start = separator_end
+        index = separator_end
+    yield start, len(shell_source), preceding
+
+
+def _shell_event_word_spans(
+    shell_source: str, start: int, end: int
+) -> list[tuple[int, int, str]]:
+    words: list[tuple[int, int, str]] = []
+    position = start
+    while position < end:
+        word_start, word_end, word = _read_shell_word(shell_source, position)
+        if word_start >= end or word_start == word_end:
+            break
+        word_end = min(word_end, end)
+        words.append((word_start, word_end, shell_source[word_start:word_end]))
+        position = word_end
+    return words
+
+
+def _shell_assignment_name(raw_word: str) -> str | None:
+    match = re.match(r"([A-Za-z_][A-Za-z0-9_]*)=", raw_word)
+    return match.group(1) if match is not None else None
+
+
+def _resolve_shell_program(
+    shell_source: str,
+    *,
+    budget: _ShellVariableBudget | None = None,
+    initial_bindings: dict[str, str] | None = None,
+    initially_poisoned: bool = False,
+) -> _ShellProgramResolution:
+    """Coordinate trusted assignment-only state in strict source order."""
+    if budget is None:
+        budget = _ShellVariableBudget()
+    if _command_parser_limit_exceeded(shell_source):
+        budget.overflowed = True
+        return _ShellProgramResolution((), _ShellVariableStatus.OVERFLOW)
+
+    bindings = dict(initial_bindings or {})
+    poisoned = initially_poisoned
+    events: list[_ShellCommandEvent] = []
+    saw_unresolved = False
+    for start, end, preceding in _iter_shell_event_spans(shell_source):
+        if preceding not in {None, ";", "\n"}:
+            bindings.clear()
+            poisoned = True
+        word_spans = _shell_event_word_spans(shell_source, start, end)
+        if not word_spans:
+            continue
+        if not budget.take_command():
+            return _ShellProgramResolution(
+                tuple(events), _ShellVariableStatus.OVERFLOW
+            )
+        trusted_bindings = None if poisoned else tuple(bindings.items())
+
+        assignment_resolutions: list[_ShellWordResolution] = []
+        assignments: list[tuple[str, str | None]] = []
+        assignment_count = 0
+        for word_start, _word_end, raw_word in word_spans:
+            name = _shell_assignment_name(raw_word)
+            if name is None:
+                break
+            if not budget.take_assignment():
+                return _ShellProgramResolution(
+                    tuple(events), _ShellVariableStatus.OVERFLOW
+                )
+            resolution = _resolve_shell_word(
+                raw_word, {}, budget, source_offset=word_start
+            )
+            assignment_resolutions.append(resolution)
+            assignment_count += 1
+            value = None
+            if resolution.status == _ShellVariableStatus.RESOLVED:
+                candidate = resolution.value.split("=", 1)[1]
+                if _is_simple_shell_literal(candidate):
+                    value = candidate
+            assignments.append((name, value))
+
+        assignment_only = assignment_count == len(word_spans)
+        if assignment_only:
+            event_status = _ShellVariableStatus.RESOLVED
+            if any(value is None for _name, value in assignments):
+                event_status = _ShellVariableStatus.UNRESOLVED
+                saw_unresolved = True
+                bindings.clear()
+                poisoned = True
+            elif not poisoned:
+                for name, value in assignments:
+                    bindings[name] = value
+            events.append(
+                _ShellCommandEvent(
+                    (start, end),
+                    preceding,
+                    tuple(word for _s, _e, word in word_spans),
+                    (),
+                    tuple(assignments),
+                    None,
+                    tuple(assignment_resolutions),
+                    None,
+                    None,
+                    "assignment" if event_status == _ShellVariableStatus.RESOLVED else "dynamic",
+                    trusted_bindings,
+                )
+            )
+            continue
+
+        snapshot = dict(bindings) if not poisoned else {}
+        resolutions = list(assignment_resolutions)
+        for word_start, _word_end, raw_word in word_spans[assignment_count:]:
+            resolution = _resolve_shell_word(
+                raw_word, snapshot, budget, source_offset=word_start
+            )
+            resolutions.append(resolution)
+            if resolution.status == _ShellVariableStatus.UNRESOLVED:
+                saw_unresolved = True
+            if resolution.status == _ShellVariableStatus.OVERFLOW:
+                return _ShellProgramResolution(
+                    tuple(events), _ShellVariableStatus.OVERFLOW
+                )
+        executable = resolutions[assignment_count]
+        resolved_basename = (
+            os.path.basename(executable.value).lower()
+            if executable.status == _ShellVariableStatus.RESOLVED
+            and executable.value is not None
+            else None
+        )
+        events.append(
+            _ShellCommandEvent(
+                (start, end),
+                preceding,
+                tuple(word for _s, _e, word in word_spans),
+                (),
+                tuple(assignments),
+                executable,
+                tuple(resolutions),
+                assignment_count,
+                resolved_basename,
+                "executable",
+                trusted_bindings,
+            )
+        )
+        bindings.clear()
+        poisoned = True
+
+    status = (
+        _ShellVariableStatus.OVERFLOW
+        if budget.overflowed
+        else (
+            _ShellVariableStatus.UNRESOLVED
+            if saw_unresolved
+            else _ShellVariableStatus.RESOLVED
+        )
+    )
+    return _ShellProgramResolution(tuple(events), status)
+
+
+def _shell_word_could_form_basename(
+    resolution: _ShellWordResolution,
+    target: str,
+    bindings: dict[str, str] | None = None,
+) -> bool:
+    """Compare bounded literal/parameter fragments with one finite basename."""
+    if resolution.status == _ShellVariableStatus.RESOLVED:
+        return bool(
+            resolution.value is not None
+            and os.path.basename(resolution.value).lower() == target
+        )
+    if not resolution.variable_seen:
+        return False
+
+    known = bindings or {}
+    prefixes: set[str] = {""}
+    target = target.lower()
+    for fragment in resolution.fragments:
+        if fragment.kind == "parameter":
+            value = known.get(fragment.name) if fragment.name is not None else None
+            if value is None:
+                prefixes = {target[:index] for index in range(len(target) + 1)}
+                continue
+            text = value.lower()
+        else:
+            text = fragment.text.lower()
+        if "/" in text:
+            suffix = text.rsplit("/", 1)[1]
+            prefixes = {suffix} if target.startswith(suffix) else set()
+        else:
+            prefixes = {
+                prefix + text
+                for prefix in prefixes
+                if target.startswith(prefix + text)
+            }
+        if not prefixes:
+            return False
+    return target in prefixes
+
+
+def _shell_event_default_branch_push(
+    event: _ShellCommandEvent, shell_recursion: int
+) -> bool:
+    if event.executable is None or event.executable_index is None:
+        return False
+
+    synthesized: list[str] = []
+    for index, resolution in enumerate(event.word_resolutions):
+        if index < event.executable_index:
+            if resolution.status != _ShellVariableStatus.RESOLVED:
+                continue
+            synthesized.append(resolution.value)
+            continue
+        if index == event.executable_index:
+            synthesized.append(
+                resolution.value
+                if resolution.status == _ShellVariableStatus.RESOLVED
+                else "git"
+            )
+            continue
+        synthesized.append(
+            resolution.value
+            if resolution.status == _ShellVariableStatus.RESOLVED
+            else "HEAD"
+        )
+
+    executable = event.executable
+    if executable.status == _ShellVariableStatus.RESOLVED:
+        effective_argv = _strip_command_wrappers(
+            synthesized[event.executable_index:]
+        )
+        if (
+            not effective_argv
+            or os.path.basename(effective_argv[0]).lower() != "git"
+        ):
+            return False
+    else:
+        if not _shell_word_could_form_basename(executable, "git"):
+            return False
+        next_index = event.executable_index + 1
+        if next_index >= len(event.word_resolutions):
+            return False
+        next_word = event.word_resolutions[next_index]
+        if (
+            next_word.status != _ShellVariableStatus.RESOLVED
+            or next_word.value is None
+            or next_word.value.lower() != "push"
+        ):
+            return False
+
+    return _is_default_branch_push(
+        shlex.join(synthesized),
+        shell_recursion + 1,
+        resolve_variables=False,
+    )
+
+
+def _git_alias_definition_word_indexes(
+    event: _ShellCommandEvent,
+) -> tuple[int, ...]:
+    """Return Git ``-c alias.*=...`` words owned by alias parsing."""
+    if event.resolved_basename != "git" or event.executable_index is None:
+        return ()
+
+    def is_alias_entry(index: int, *, attached: bool = False) -> bool:
+        resolution = event.word_resolutions[index]
+        source = (
+            resolution.value
+            if resolution.status == _ShellVariableStatus.RESOLVED
+            and resolution.value is not None
+            else event.raw_words[index]
+        )
+        if attached:
+            source = source[2:]
+        source = source.lstrip("'\"")
+        config_key, separator, _value = source.partition("=")
+        return bool(separator and _git_alias_name(config_key) is not None)
+
+    owned: list[int] = []
+    index = event.executable_index + 1
+    while index < len(event.word_resolutions):
+        resolution = event.word_resolutions[index]
+        if (
+            resolution.status != _ShellVariableStatus.RESOLVED
+            or resolution.value is None
+        ):
+            break
+        token = resolution.value
+        if token == "--" or not token.startswith("-") or token == "-":
+            break
+        if token == "-c":
+            value_index = index + 1
+            if value_index >= len(event.word_resolutions):
+                break
+            if is_alias_entry(value_index):
+                owned.append(value_index)
+            index += 2
+            continue
+        if token.startswith("-c") and not token.startswith("--"):
+            if is_alias_entry(index, attached=True):
+                owned.append(index)
+            index += 1
+            continue
+
+        option, separator, _attached_value = token.partition("=")
+        index += 1
+        if (
+            not separator
+            and option in _GIT_GLOBAL_VALUE_OPTIONS
+            and index < len(event.word_resolutions)
+        ):
+            index += 1
+    return tuple(owned)
+
+
+def _shell_event_payload_source(
+    shell_source: str, event: _ShellCommandEvent
+) -> str:
+    """Mask only Git alias-definition words before sibling payload traversal."""
+    owned = _git_alias_definition_word_indexes(event)
+    event_source = shell_source[event.span[0]:event.span[1]]
+    if not owned:
+        return event_source
+
+    chars = list(event_source)
+    word_spans = _shell_event_word_spans(shell_source, *event.span)
+    for index in owned:
+        if index >= len(word_spans):
+            continue
+        start, end, _raw_word = word_spans[index]
+        relative_start = start - event.span[0]
+        relative_end = end - event.span[0]
+        chars[relative_start:relative_end] = " " * (relative_end - relative_start)
+    return "".join(chars)
+
+
+def _iter_outer_alias_substitution_payloads(event: _ShellCommandEvent):
+    """Yield substitutions executable in a Git alias-definition word."""
+    for index in _git_alias_definition_word_indexes(event):
+        if index >= len(event.raw_words):
+            continue
+        alias_source = event.raw_words[index]
+        if (
+            len(alias_source) >= 2
+            and alias_source[0] == alias_source[-1] == '"'
+        ):
+            # Discard an enclosing outer double quote while retaining the alias
+            # value's own quote/escape provenance. An outer single quote must
+            # remain because it makes every substitution in the word inert.
+            alias_source = alias_source[1:-1]
+        yield from _iter_executable_substitution_payloads(alias_source)
+
+
+def _env_split_string_argv(source: str) -> list[str] | None:
+    """Parse the quote-safe subset of ``env -S`` without ambient expansion.
+
+    Coreutils/BSD split-string operands are another argv source. Ordinary
+    whitespace and shell-style quotes are deterministic here; env-specific
+    escapes and parameter expansion are intentionally unresolved rather than
+    guessed or looked up in the process environment.
+    """
+    quote: str | None = None
+    index = 0
+    while index < len(source):
+        char = source[index]
+        if quote == "'":
+            if char == "'":
+                quote = None
+            index += 1
+            continue
+        if char == '"':
+            quote = None if quote == '"' else '"'
+            index += 1
+            continue
+        if char == "'" and quote is None:
+            quote = "'"
+            index += 1
+            continue
+        if char == "\\":
+            if index + 1 >= len(source):
+                return None
+            escaped = source[index + 1]
+            if escaped not in {" ", "\t", "\n", "'", '"', "\\"}:
+                return None
+            index += 2
+            continue
+        if char == "$":
+            # env -S can expand ambient variables. Static approval parsing must
+            # not do that, so retain an explicit unresolved result.
+            return None
+        index += 1
+    if quote is not None:
+        return None
+    try:
+        return shlex.split(source, comments=False, posix=True)
+    except ValueError:
+        return None
+
+
+def _shell_event_env_split_payloads(
+    event: _ShellCommandEvent,
+    budget: _ShellVariableBudget,
+    shell_recursion: int,
+) -> tuple[tuple[str, ...], _ShellVariableStatus, bool]:
+    """Expose env split-string argv under the shared shell-work budget.
+
+    The boolean records a malformed/unresolved operand that still has a
+    structural protected-Git shape. Benign malformed status/prose remains only
+    ``UNRESOLVED`` and is not promoted to a hardline match.
+    """
+    if event.executable_index is None:
+        return (), _ShellVariableStatus.RESOLVED, False
+
+    resolutions = event.word_resolutions
+    index = event.executable_index
+    while index < len(resolutions):
+        wrapper_resolution = resolutions[index]
+        if (
+            wrapper_resolution.status != _ShellVariableStatus.RESOLVED
+            or wrapper_resolution.value is None
+        ):
+            return (), _ShellVariableStatus.UNRESOLVED, False
+        wrapper = os.path.basename(wrapper_resolution.value).lower()
+        if wrapper not in _COMMAND_WRAPPERS:
+            break
+        index += 1
+
+        value_options = _WRAPPER_VALUE_OPTIONS.get(wrapper, set())
+        while index < len(resolutions):
+            option_resolution = resolutions[index]
+            if (
+                option_resolution.status != _ShellVariableStatus.RESOLVED
+                or option_resolution.value is None
+            ):
+                return (), _ShellVariableStatus.UNRESOLVED, False
+            token = option_resolution.value
+            if token == "--":
+                index += 1
+                break
+            if not token.startswith("-") or token == "-":
+                break
+
+            option, separator, attached = token.partition("=")
+            split_option = wrapper == "env" and option in {"-S", "--split-string"}
+            operand_index = index
+            if split_option and not separator:
+                operand_index = index + 1
+                if operand_index >= len(resolutions):
+                    return (), _ShellVariableStatus.UNRESOLVED, False
+
+            if split_option:
+                operand_resolution = resolutions[operand_index]
+                if separator:
+                    split_source = attached
+                    raw_source = event.raw_words[index].partition("=")[2]
+                else:
+                    split_source = (
+                        operand_resolution.value
+                        if operand_resolution.status == _ShellVariableStatus.RESOLVED
+                        and operand_resolution.value is not None
+                        else None
+                    )
+                    raw_source = event.raw_words[operand_index]
+
+                tail_start = operand_index + 1
+                tail: list[str] = []
+                tail_unresolved = False
+                for tail_index in range(tail_start, len(resolutions)):
+                    tail_resolution = resolutions[tail_index]
+                    if (
+                        tail_resolution.status == _ShellVariableStatus.RESOLVED
+                        and tail_resolution.value is not None
+                    ):
+                        tail.append(tail_resolution.value)
+                    else:
+                        tail_unresolved = True
+                        tail.append(_strip_shell_word_syntax(event.raw_words[tail_index]))
+
+                split_argv = (
+                    _env_split_string_argv(split_source)
+                    if split_source is not None
+                    else None
+                )
+                if split_argv is not None and not tail_unresolved:
+                    payload_argv = ["env", *split_argv, *tail]
+                    if not budget.take_emitted_argv(payload_argv):
+                        return (), _ShellVariableStatus.OVERFLOW, False
+                    return (
+                        (shlex.join(payload_argv),),
+                        _ShellVariableStatus.RESOLVED,
+                        False,
+                    )
+
+                shape_source = _strip_shell_word_syntax(
+                    split_source if split_source is not None else raw_source
+                )
+                if tail:
+                    shape_source = " ".join((shape_source, *tail))
+                protected_shape = _git_shell_source_has_protected_push_shape(
+                    shape_source,
+                    shell_recursion,
+                )
+                return (), _ShellVariableStatus.UNRESOLVED, protected_shape
+
+            index += 1
+            if not separator and option in value_options:
+                if index >= len(resolutions):
+                    return (), _ShellVariableStatus.UNRESOLVED, False
+                value_resolution = resolutions[index]
+                if (
+                    value_resolution.status != _ShellVariableStatus.RESOLVED
+                    or value_resolution.value is None
+                ):
+                    return (), _ShellVariableStatus.UNRESOLVED, False
+                index += 1
+
+        if wrapper == "env":
+            while index < len(resolutions):
+                assignment = resolutions[index]
+                if (
+                    assignment.status != _ShellVariableStatus.RESOLVED
+                    or assignment.value is None
+                    or not _ENV_ASSIGNMENT_RE.fullmatch(assignment.value)
+                ):
+                    break
+                index += 1
+    return (), _ShellVariableStatus.RESOLVED, False
+
+
+def _shell_variable_default_branch_push(
+    shell_source: str,
+    shell_recursion: int = 0,
+    *,
+    budget: _ShellVariableBudget | None = None,
+    initial_bindings: dict[str, str] | None = None,
+    initially_poisoned: bool = False,
+) -> tuple[bool, _ShellVariableStatus]:
+    """Resolve variable-backed Git calls in raw source and nested raw payloads."""
+    if budget is None:
+        budget = _ShellVariableBudget(depth=shell_recursion)
+    budget.depth = max(budget.depth, shell_recursion)
+    if shell_recursion > _MAX_GIT_SHELL_RECURSION:
+        budget.overflowed = True
+        return False, _ShellVariableStatus.OVERFLOW
+
+    program = _resolve_shell_program(
+        shell_source,
+        budget=budget,
+        initial_bindings=initial_bindings,
+        initially_poisoned=initially_poisoned,
+    )
+    if program.status == _ShellVariableStatus.OVERFLOW:
+        return False, program.status
+    if any(
+        _shell_event_default_branch_push(event, shell_recursion)
+        for event in program.events
+    ):
+        return True, program.status
+
+    saw_unresolved = program.status == _ShellVariableStatus.UNRESOLVED
+    for event in program.events:
+        # Git alias-definition words retain their inner quote provenance for
+        # Git alias parsing. Extract their outer-shell substitutions first,
+        # then mask the inert alias remainder while retaining sibling payloads.
+        outer_alias_payloads = _iter_outer_alias_substitution_payloads(event)
+        event_source = _shell_event_payload_source(shell_source, event)
+        seen_payloads: set[_ShellPayload] = set()
+        env_payloads, env_status, protected_env_shape = (
+            _shell_event_env_split_payloads(event, budget, shell_recursion)
+        )
+        if env_status == _ShellVariableStatus.OVERFLOW:
+            return False, env_status
+        if protected_env_shape:
+            return True, _ShellVariableStatus.UNRESOLVED
+        if env_status == _ShellVariableStatus.UNRESOLVED:
+            saw_unresolved = True
+
+        def event_payloads():
+            for payload in outer_alias_payloads:
+                yield _ShellPayload(payload, _ShellPayloadKind.SAME_SHELL)
+            for payload in env_payloads:
+                yield _ShellPayload(payload, _ShellPayloadKind.FRESH_PROCESS)
+            yield from _iter_detection_payload_records(event_source, event_source)
+
+        payloads = iter(event_payloads())
+        while True:
+            try:
+                payload = next(payloads)
+            except StopIteration:
+                break
+            except _CommandDetectionBudgetExceeded:
+                budget.overflowed = True
+                return False, _ShellVariableStatus.OVERFLOW
+            if not payload.source or payload in seen_payloads:
+                continue
+            seen_payloads.add(payload)
+            if not budget.take_payload():
+                return False, _ShellVariableStatus.OVERFLOW
+            if shell_recursion >= _MAX_GIT_SHELL_RECURSION:
+                budget.overflowed = True
+                return False, _ShellVariableStatus.OVERFLOW
+            initial_bindings, initially_poisoned = _shell_payload_expansion_state(
+                event, payload
+            )
+            child_push, child_status = _shell_variable_default_branch_push(
+                payload.source,
+                shell_recursion + 1,
+                budget=budget,
+                initial_bindings=initial_bindings,
+                initially_poisoned=initially_poisoned,
+            )
+            if child_push:
+                return True, child_status
+            if child_status == _ShellVariableStatus.OVERFLOW:
+                return False, child_status
+            if child_status == _ShellVariableStatus.UNRESOLVED:
+                saw_unresolved = True
+    return (
+        False,
+        (
+            _ShellVariableStatus.UNRESOLVED
+            if saw_unresolved
+            else _ShellVariableStatus.RESOLVED
+        ),
+    )
 
 
 def _git_shell_tolerant_command_words(
@@ -1316,15 +2201,11 @@ def _git_shell_source_has_protected_push_shape(
         if not argv:
             continue
         executable = os.path.basename(argv[0]).lower()
-        if _GIT_SHELL_COMMAND_VARIABLE_RE.fullmatch(argv[0]):
-            # An unresolved command variable can name Git. Only treat it as
-            # protected-shaped when its next command-path word is actually push.
-            if len(argv) < 2 or argv[1].lower() != "push":
-                continue
-            argv = ["git", *argv[1:]]
-        elif executable != "git":
+        if executable != "git":
             continue
-        if _is_default_branch_push(shlex.join(argv), shell_recursion + 1):
+        if _is_default_branch_push(
+            shlex.join(argv), shell_recursion + 1, resolve_variables=False
+        ):
             return True
     return False
 
@@ -1529,50 +2410,37 @@ def _git_shell_alias_analysis(shell_source: str, shell_recursion: int) -> str:
     if _command_parser_limit_exceeded(shell_source):
         return "dynamic"
 
-    assignments, assignment_limit_exceeded = _git_shell_alias_simple_assignments(
-        shell_source
+    variable_push, variable_status = _shell_variable_default_branch_push(
+        shell_source, shell_recursion
     )
-    expanded_source, _unresolved_source = _expand_git_shell_alias_command_variables(
-        shell_source,
-        assignments,
-        assignment_limit_exceeded,
-    )
-    if _git_shell_source_has_protected_push_shape(expanded_source, shell_recursion):
+    if variable_push:
+        return "push"
+    if _git_shell_source_has_protected_push_shape(shell_source, shell_recursion):
         return "push"
     if shell_recursion >= _MAX_GIT_SHELL_RECURSION:
         return "dynamic"
 
-    substitution_ambiguity = False
-    substitution_work = 0
+    # The raw coordinator above owns every executable substitution and carries
+    # the source-ordered binding snapshot at its containing event. Re-expanding
+    # payloads here from a final assignment map would let later writes rewrite
+    # earlier commands.
+    substitution_ambiguity = variable_status == _ShellVariableStatus.OVERFLOW
     for payload in _iter_executable_substitution_payloads(shell_source):
-        expanded_payload, unresolved = _expand_git_shell_alias_command_variables(
-            payload,
-            assignments,
-            assignment_limit_exceeded,
+        payload_push, payload_status = _shell_variable_default_branch_push(
+            payload, shell_recursion + 1
         )
-        if _git_shell_source_has_protected_push_shape(
-            expanded_payload,
-            shell_recursion + 1,
-        ):
+        if payload_push:
             return "push"
-        substitution_work += 1
-        if substitution_work > _MAX_DETECTION_WORK_ITEMS:
-            substitution_ambiguity = True
-            continue
-        payload_kind = _git_shell_alias_analysis(
-            expanded_payload,
-            shell_recursion + 1,
-        )
-        if payload_kind == "push":
-            return "push"
-        if payload_kind != "safe" or unresolved:
+        if payload_status == _ShellVariableStatus.OVERFLOW:
             substitution_ambiguity = True
 
     # Compound commands and function bodies become visible only at their real,
     # quote-aware command starts. Quoted push prose is left untouched.
     marked_source = _mark_command_starts(shell_source)
     for candidate in dict.fromkeys((shell_source, marked_source)):
-        if _is_default_branch_push(candidate, shell_recursion + 1):
+        if _is_default_branch_push(
+            candidate, shell_recursion + 1, resolve_variables=False
+        ):
             return "push"
 
     control_result = _git_shell_control_segments(shell_source)
@@ -1603,6 +2471,7 @@ def _git_shell_alias_analysis(shell_source: str, shell_recursion: int) -> str:
 
     saw_command = False
     carrier_work = 0
+    carrier_ambiguity = False
     for segment in _iter_top_level_shell_segments(shell_source):
         saw_carrier = False
         carrier_is_safe = True
@@ -1611,20 +2480,15 @@ def _git_shell_alias_analysis(shell_source: str, shell_recursion: int) -> str:
             executables=_GIT_SHELL_EXPLICIT_CARRIERS,
         ):
             saw_carrier = True
-            expanded_payload, unresolved = _expand_git_shell_alias_command_variables(
-                payload,
-                assignments,
-                assignment_limit_exceeded,
-            )
-            # Inspect every already-exposed payload before honoring the work
-            # ceiling so a protected-shaped suffix cannot hide behind safe
-            # carriers that consumed the recursive-analysis budget. The shared
-            # outer variant stream remains authoritative for nested shell -c
-            # and further explicit carriers within this extracted argv.
+            # Inspect every already-exposed raw payload before honoring the work
+            # ceiling. Detection variants are structural fallbacks only; the
+            # source-ordered coordinator above is authoritative for variables.
             if any(
                 variant != _PARSER_LIMIT_VARIANT
-                and _is_default_branch_push(variant, shell_recursion + 1)
-                for variant in _command_detection_variants(expanded_payload)
+                and _is_default_branch_push(
+                    variant, shell_recursion + 1, resolve_variables=False
+                )
+                for variant in _command_detection_variants(payload)
             ):
                 return "push"
             carrier_work += 1
@@ -1632,17 +2496,17 @@ def _git_shell_alias_analysis(shell_source: str, shell_recursion: int) -> str:
                 carrier_is_safe = False
                 continue
             payload_kind = _git_shell_alias_analysis(
-                expanded_payload,
+                payload,
                 shell_recursion + 1,
             )
             if payload_kind == "push":
                 return "push"
-            if payload_kind != "safe" or unresolved:
+            if payload_kind != "safe":
                 carrier_is_safe = False
         if saw_carrier:
             saw_command = True
             if not carrier_is_safe:
-                return "dynamic"
+                carrier_ambiguity = True
             continue
 
         parsed = _parse_shell_segment_argv(segment)
@@ -1654,16 +2518,32 @@ def _git_shell_alias_analysis(shell_source: str, shell_recursion: int) -> str:
         saw_command = True
         if not _git_shell_segment_is_safe(segment, shell_recursion):
             return "dynamic"
-    return "safe" if saw_command and not substitution_ambiguity else "dynamic"
+    return (
+        "safe"
+        if saw_command and not substitution_ambiguity and not carrier_ambiguity
+        else "dynamic"
+    )
 
 
-def _is_default_branch_push(command: str, shell_recursion: int = 0) -> bool:
+def _is_default_branch_push(
+    command: str,
+    shell_recursion: int = 0,
+    *,
+    resolve_variables: bool = True,
+) -> bool:
     """Detect explicit or potentially implicit pushes to main/master.
 
     Wrapper/global/push options are parsed with their value arity. A push with
     no explicit safe branch destination fails closed because repository config
     can map it to the protected default branch.
     """
+    if resolve_variables:
+        variable_push, variable_status = _shell_variable_default_branch_push(
+            command, shell_recursion
+        )
+        if variable_push or variable_status == _ShellVariableStatus.OVERFLOW:
+            return True
+
     for segment in _iter_top_level_shell_segments(command):
         argv = _parse_shell_segment_argv(segment)
         if argv is None:
@@ -1779,31 +2659,830 @@ def _is_default_branch_push(command: str, shell_recursion: int = 0) -> bool:
     return False
 
 
-_MANDATORY_APPROVAL_PATTERNS = [
-    (re.compile(
-        r"(?:>>?|\btee\b[^\n]*)\s*[\"']?(?:~/.hermes|\$HERMES_HOME|\$\{HERMES_HOME\})/config\.yaml\b",
-        re.I,
-    ), "write Hermes security configuration"),
-    (re.compile(r"\b(?:python[23]?|pypy[23]?)\b[^\n]*(?:smtplib|sendmail\s*\()", re.I),
-     "send email through an interpreter/SMTP"),
-    (re.compile(r"\b(?:sendmail|msmtp|mailx|mutt|swaks)\b", re.I),
-     "send external email"),
-    (re.compile(r"\bbuzz(?:-real)?\s+messages\s+send\b", re.I),
-     "send an external Buzz message"),
-]
+def _shell_event_effective_executable_index(
+    event: _ShellCommandEvent,
+) -> int | None:
+    """Locate the executable reached through the shared wrapper grammar."""
+    index = event.executable_index
+    if event.executable is None or index is None:
+        return None
+
+    while index < len(event.word_resolutions):
+        resolution = event.word_resolutions[index]
+        if (
+            resolution.status != _ShellVariableStatus.RESOLVED
+            or resolution.value is None
+        ):
+            return index
+        wrapper = os.path.basename(resolution.value).lower()
+        if wrapper not in _COMMAND_WRAPPERS:
+            return index
+        index += 1
+
+        value_options = _WRAPPER_VALUE_OPTIONS.get(wrapper, set())
+        while index < len(event.word_resolutions):
+            option_resolution = event.word_resolutions[index]
+            if (
+                option_resolution.status != _ShellVariableStatus.RESOLVED
+                or option_resolution.value is None
+            ):
+                return None
+            token = option_resolution.value
+            if not token.startswith("-") or token == "-":
+                break
+            index += 1
+            if token == "--":
+                break
+            option = token.split("=", 1)[0]
+            if "=" not in token and option in value_options:
+                if index >= len(event.word_resolutions):
+                    return None
+                value_resolution = event.word_resolutions[index]
+                if (
+                    value_resolution.status != _ShellVariableStatus.RESOLVED
+                    or value_resolution.value is None
+                ):
+                    return None
+                index += 1
+
+        if wrapper == "env":
+            while index < len(event.word_resolutions):
+                assignment = event.word_resolutions[index]
+                if (
+                    assignment.status != _ShellVariableStatus.RESOLVED
+                    or assignment.value is None
+                    or not _ENV_ASSIGNMENT_RE.fullmatch(assignment.value)
+                ):
+                    break
+                index += 1
+    return None
+
+
+def _shell_event_fresh_environment(
+    event: _ShellCommandEvent,
+) -> tuple[dict[str, str], bool]:
+    """Return only bindings explicitly exported to this event's child."""
+    bindings: dict[str, str] = {}
+    unresolved = False
+    for name, value in event.prefix_assignments:
+        if value is None:
+            bindings.pop(name, None)
+            unresolved = True
+        else:
+            bindings[name] = value
+
+    index = event.executable_index
+    if event.executable is None or index is None:
+        return bindings, unresolved
+    while index < len(event.word_resolutions):
+        resolution = event.word_resolutions[index]
+        if (
+            resolution.status != _ShellVariableStatus.RESOLVED
+            or resolution.value is None
+        ):
+            return bindings, True
+        wrapper = os.path.basename(resolution.value).lower()
+        if wrapper not in _COMMAND_WRAPPERS:
+            break
+        index += 1
+
+        value_options = _WRAPPER_VALUE_OPTIONS.get(wrapper, set())
+        while index < len(event.word_resolutions):
+            option_resolution = event.word_resolutions[index]
+            if (
+                option_resolution.status != _ShellVariableStatus.RESOLVED
+                or option_resolution.value is None
+            ):
+                return bindings, True
+            token = option_resolution.value
+            if token == "--":
+                index += 1
+                break
+            if not token.startswith("-") or token == "-":
+                break
+            option, separator, attached = token.partition("=")
+            index += 1
+            option_value = attached if separator else None
+            if not separator and option in value_options:
+                if index >= len(event.word_resolutions):
+                    return bindings, True
+                value_resolution = event.word_resolutions[index]
+                if (
+                    value_resolution.status != _ShellVariableStatus.RESOLVED
+                    or value_resolution.value is None
+                ):
+                    return bindings, True
+                option_value = value_resolution.value
+                index += 1
+            if wrapper == "env" and option in {"-u", "--unset"}:
+                if option_value is None:
+                    return bindings, True
+                bindings.pop(option_value, None)
+
+        if wrapper == "env":
+            while index < len(event.word_resolutions):
+                assignment = event.word_resolutions[index]
+                if (
+                    assignment.status != _ShellVariableStatus.RESOLVED
+                    or assignment.value is None
+                    or not _ENV_ASSIGNMENT_RE.fullmatch(assignment.value)
+                ):
+                    break
+                name, value = assignment.value.split("=", 1)
+                if not _is_simple_shell_literal(value):
+                    bindings.pop(name, None)
+                    unresolved = True
+                else:
+                    bindings[name] = value
+                index += 1
+    return bindings, unresolved
+
+
+def _shell_payload_expansion_state(
+    event: _ShellCommandEvent,
+    payload: _ShellPayload,
+) -> tuple[dict[str, str] | None, bool]:
+    """Bind payload expansion according to its actual shell ownership."""
+    if payload.kind == _ShellPayloadKind.SAME_SHELL:
+        return (
+            dict(event.trusted_bindings)
+            if event.trusted_bindings is not None
+            else None,
+            event.trusted_bindings is None,
+        )
+    if payload.kind == _ShellPayloadKind.FRESH_SHELL:
+        bindings, unresolved = _shell_event_fresh_environment(event)
+        return bindings, unresolved
+    return {}, False
+
+
+def _mandatory_buzz_event(event: _ShellCommandEvent) -> bool:
+    """Return whether one raw event can execute a literal Buzz send."""
+    executable_index = _shell_event_effective_executable_index(event)
+    if executable_index is None:
+        return False
+    executable = event.word_resolutions[executable_index]
+    executable_is_buzz = bool(
+        executable.status == _ShellVariableStatus.RESOLVED
+        and executable.value is not None
+        and os.path.basename(executable.value).lower() in {"buzz", "buzz-real"}
+    )
+    if not executable_is_buzz and executable.status != _ShellVariableStatus.RESOLVED:
+        executable_is_buzz = any(
+            _shell_word_could_form_basename(executable, target)
+            for target in ("buzz", "buzz-real")
+        )
+    if not executable_is_buzz:
+        return False
+    argument_index = executable_index + 1
+    if argument_index + 1 >= len(event.word_resolutions):
+        return False
+    arguments = event.word_resolutions[argument_index:argument_index + 2]
+    return all(
+        resolution.status == _ShellVariableStatus.RESOLVED
+        and resolution.value is not None
+        and resolution.value.lower() == expected
+        for resolution, expected in zip(arguments, ("messages", "send"), strict=True)
+    )
+
+
+def _shell_word_is_hermes_config(resolution: _ShellWordResolution) -> bool:
+    """Match one resolved or protected-shaped config write target."""
+    if resolution.status == _ShellVariableStatus.RESOLVED:
+        if resolution.value is None:
+            return False
+        path = resolution.value.lower()
+        return path == "~/.hermes/config.yaml" or (
+            path.startswith("/") and path.endswith("/.hermes/config.yaml")
+        )
+    if not resolution.variable_seen:
+        return False
+
+    last_parameter = -1
+    parameters: list[_ShellWordFragment] = []
+    for index, fragment in enumerate(resolution.fragments):
+        if fragment.kind == "parameter":
+            last_parameter = index
+            parameters.append(fragment)
+    if last_parameter < 0:
+        return False
+    literal_tail = "".join(
+        fragment.text
+        for fragment in resolution.fragments[last_parameter + 1:]
+        if fragment.kind == "literal"
+    ).lower()
+    return (
+        literal_tail.endswith("/.hermes/config.yaml")
+        or (
+            literal_tail == "/config.yaml"
+            and any(
+                fragment.name is not None
+                and fragment.name.lower() == "hermes_home"
+                for fragment in parameters
+            )
+        )
+    )
+
+
+def _output_redirect_target_suffix(raw_word: str) -> str | None:
+    """Return the raw target suffix for the first unquoted > or >>."""
+    quote: str | None = None
+    index = 0
+    while index < len(raw_word):
+        char = raw_word[index]
+        if quote is not None:
+            if char == "\\" and quote == '"' and index + 1 < len(raw_word):
+                index += 2
+                continue
+            if char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            index += 1
+            continue
+        if char == "\\" and index + 1 < len(raw_word):
+            index += 2
+            continue
+        if raw_word.startswith("$(", index):
+            end = _scan_dollar_paren_end(raw_word, index)
+            index = len(raw_word) if end is None else end
+            continue
+        if raw_word.startswith("${", index):
+            close = raw_word.find("}", index + 2)
+            index = len(raw_word) if close == -1 else close + 1
+            continue
+        if char == "`":
+            end = _scan_backtick_end(raw_word, index)
+            index = len(raw_word) if end is None else end
+            continue
+        if char == ">":
+            operator_end = index + 2 if raw_word.startswith(">>", index) else index + 1
+            return raw_word[operator_end:]
+        index += 1
+    return None
+
+
+def _mandatory_config_event(
+    event: _ShellCommandEvent, budget: _ShellVariableBudget
+) -> bool:
+    """Identify Hermes config redirection and tee targets structurally."""
+    bindings = dict(event.trusted_bindings or ())
+    for index, raw_word in enumerate(event.raw_words):
+        target_suffix = _output_redirect_target_suffix(raw_word)
+        if target_suffix is None:
+            continue
+        if target_suffix:
+            target = _resolve_shell_word(target_suffix, bindings, budget)
+        elif index + 1 < len(event.word_resolutions):
+            target = event.word_resolutions[index + 1]
+        else:
+            continue
+        if _shell_word_is_hermes_config(target):
+            return True
+
+    executable_index = _shell_event_effective_executable_index(event)
+    if executable_index is None:
+        return False
+    executable = event.word_resolutions[executable_index]
+    if (
+        executable.status != _ShellVariableStatus.RESOLVED
+        or executable.value is None
+        or os.path.basename(executable.value).lower() != "tee"
+    ):
+        return False
+    options_done = False
+    for index in range(executable_index + 1, len(event.word_resolutions)):
+        target = event.word_resolutions[index]
+        if not options_done and target.status == _ShellVariableStatus.RESOLVED:
+            if target.value == "--":
+                options_done = True
+                continue
+            if target.value is not None and target.value.startswith("-") and target.value != "-":
+                continue
+        if _shell_word_is_hermes_config(target):
+            return True
+    return False
+
+
+_MAX_PYTHON_SMTP_AST_NODES = 1_024
+_PYTHON_UNKNOWN_SMTP_NAME = "__hermes_unknown_smtp_target__"
+
+
+def _python_ast_has_smtp_effect(
+    code: str,
+    budget: _ShellVariableBudget,
+    *,
+    unknown_import_name: str | None = None,
+) -> bool:
+    """Inspect bounded Python syntax without evaluating or importing code."""
+    try:
+        tree = ast.parse(code, mode="exec")
+    except (SyntaxError, TypeError, ValueError):
+        return False
+
+    stack: list[ast.AST] = [tree]
+    visited = 0
+    has_smtp_effect = False
+    while stack:
+        node = stack.pop()
+        visited += 1
+        if visited > _MAX_PYTHON_SMTP_AST_NODES:
+            budget.overflowed = True
+            budget.ast_overflowed = True
+            return False
+
+        if isinstance(node, ast.Import):
+            if any(
+                alias.name == "smtplib"
+                or alias.name.startswith("smtplib.")
+                or alias.name == unknown_import_name
+                for alias in node.names
+            ):
+                has_smtp_effect = True
+        elif isinstance(node, ast.ImportFrom):
+            if (
+                node.module == "smtplib"
+                or (node.module or "").startswith("smtplib.")
+                or node.module == unknown_import_name
+            ):
+                has_smtp_effect = True
+        elif isinstance(node, ast.Call):
+            function = node.func
+            if (
+                isinstance(function, ast.Attribute)
+                and function.attr.lower() == "sendmail"
+            ) or (
+                isinstance(function, ast.Name)
+                and function.id.lower() == "sendmail"
+            ):
+                has_smtp_effect = True
+
+        for child in ast.iter_child_nodes(node):
+            if visited + len(stack) >= _MAX_PYTHON_SMTP_AST_NODES:
+                budget.overflowed = True
+                budget.ast_overflowed = True
+                return False
+            stack.append(child)
+    return has_smtp_effect
+
+
+def _shell_code_has_smtp_shape(
+    resolution: _ShellWordResolution,
+    budget: _ShellVariableBudget,
+) -> bool:
+    """Inspect only semantic imports/calls in the interpreter-owned code."""
+    if resolution.status == _ShellVariableStatus.RESOLVED:
+        return bool(
+            resolution.value
+            and _python_ast_has_smtp_effect(resolution.value, budget)
+        )
+    if not resolution.variable_seen:
+        return False
+
+    parts: list[str] = []
+    for fragment in resolution.fragments:
+        text = (
+            fragment.text
+            if fragment.kind == "literal"
+            else _PYTHON_UNKNOWN_SMTP_NAME
+        )
+        if not budget.take_emitted(text):
+            return False
+        parts.append(text)
+    code = _materialize_shell_word(parts)
+    return _python_ast_has_smtp_effect(
+        code,
+        budget,
+        unknown_import_name=_PYTHON_UNKNOWN_SMTP_NAME,
+    )
+
+
+def _python_code_operand(event: _ShellCommandEvent) -> _ShellWordResolution | None:
+    """Return code owned by an exact supported Python -c spelling."""
+    executable_index = _shell_event_effective_executable_index(event)
+    if executable_index is None:
+        return None
+    executable = event.word_resolutions[executable_index]
+    python_names = ("python", "python2", "python3", "pypy", "pypy2", "pypy3")
+    executable_is_python = bool(
+        executable.status == _ShellVariableStatus.RESOLVED
+        and executable.value is not None
+        and _interpreter_family(executable.value) == "python"
+    )
+    if not executable_is_python and executable.status != _ShellVariableStatus.RESOLVED:
+        executable_is_python = any(
+            _shell_word_could_form_basename(executable, name)
+            for name in python_names
+        )
+    if not executable_is_python:
+        return None
+
+    args = [
+        resolution.value
+        if resolution.status == _ShellVariableStatus.RESOLVED
+        and resolution.value is not None
+        else ""
+        for resolution in event.word_resolutions[executable_index + 1 :]
+    ]
+    owned = _interpreter_exec_option("python", args)
+    if owned is None or owned[0] != "-c":
+        return None
+    _, owner_index, payload_offset = owned
+    option_index = executable_index + 1 + owner_index
+    if payload_offset is None:
+        return (
+            event.word_resolutions[option_index + 1]
+            if option_index + 1 < len(event.word_resolutions)
+            else None
+        )
+    option = event.word_resolutions[option_index]
+    return _ShellWordResolution(
+        option.fragments,
+        option.status,
+        (option.value or "")[payload_offset:],
+        option.variable_seen,
+    )
+
+
+def _mandatory_interpreter_smtp_event(
+    event: _ShellCommandEvent,
+    budget: _ShellVariableBudget,
+) -> bool:
+    code = _python_code_operand(event)
+    return code is not None and _shell_code_has_smtp_shape(code, budget)
+
+
+_EXTERNAL_EMAIL_EXECUTABLES = frozenset(
+    {"sendmail", "msmtp", "mailx", "mutt", "swaks"}
+)
+
+
+def _mandatory_external_email_event(event: _ShellCommandEvent) -> bool:
+    """Match only an exact, fully resolved external-email executable."""
+    executable_index = _shell_event_effective_executable_index(event)
+    if executable_index is None:
+        return False
+    executable = event.word_resolutions[executable_index]
+    return bool(
+        executable.status == _ShellVariableStatus.RESOLVED
+        and executable.value is not None
+        and os.path.basename(executable.value).lower() in _EXTERNAL_EMAIL_EXECUTABLES
+    )
+
+
+_MAX_HEREDOC_DELIMITER_CHARS = 256
+_MAX_PENDING_HEREDOCS = 64
+
+
+def _unquoted_heredoc_substitution_spans(
+    body_line: str,
+) -> tuple[tuple[tuple[int, int], ...], bool]:
+    """Keep command substitutions that an unquoted heredoc still executes."""
+    spans: list[tuple[int, int]] = []
+    index = 0
+    while index < len(body_line):
+        if body_line[index] == "\\":
+            index += 2 if index + 1 < len(body_line) else 1
+            continue
+        if body_line.startswith("$(", index):
+            end = _scan_dollar_paren_end(body_line, index)
+            if end is None:
+                return tuple(spans), True
+            spans.append((index, end))
+            index = end
+            continue
+        if body_line[index] == "`":
+            end = _scan_backtick_end(body_line, index)
+            if end is None:
+                return tuple(spans), True
+            spans.append((index, end))
+            index = end
+            continue
+        index += 1
+    return tuple(spans), False
+
+
+def _mask_shell_non_executable_text(
+    shell_source: str,
+    budget: _ShellVariableBudget,
+) -> tuple[str, _ShellVariableStatus]:
+    """Mask shell comments and heredoc data while preserving source offsets."""
+    if len(shell_source) > _MAX_DETECTION_COMMAND_CHARS:
+        budget.overflowed = True
+        return shell_source, _ShellVariableStatus.OVERFLOW
+
+    masked = list(shell_source)
+    pending_heredocs: list[tuple[str, bool, bool]] = []
+    active_heredoc: tuple[str, bool, bool] | None = None
+    index = 0
+    quote: str | None = None
+    at_word_start = True
+
+    while index < len(shell_source):
+        if active_heredoc is not None:
+            line_end = shell_source.find("\n", index)
+            if line_end < 0:
+                line_end = len(shell_source)
+            delimiter, strip_tabs, expand_body = active_heredoc
+            body_line = shell_source[index:line_end]
+            candidate = body_line.lstrip("\t") if strip_tabs else body_line
+            if candidate == delimiter:
+                for offset in range(index, line_end):
+                    masked[offset] = " "
+                active_heredoc = (
+                    pending_heredocs.pop(0) if pending_heredocs else None
+                )
+                if active_heredoc is None:
+                    at_word_start = True
+            else:
+                spans: tuple[tuple[int, int], ...] = ()
+                malformed_expansion = False
+                if expand_body:
+                    spans, malformed_expansion = (
+                        _unquoted_heredoc_substitution_spans(body_line)
+                    )
+                for offset in range(index, line_end):
+                    relative = offset - index
+                    if not any(start <= relative < end for start, end in spans):
+                        masked[offset] = " "
+                if malformed_expansion:
+                    return "".join(masked), _ShellVariableStatus.UNRESOLVED
+            index = line_end
+            if index < len(shell_source):
+                index += 1
+            elif active_heredoc is not None:
+                return "".join(masked), _ShellVariableStatus.UNRESOLVED
+            continue
+
+        char = shell_source[index]
+        if char == "\n":
+            if quote is None and pending_heredocs:
+                active_heredoc = pending_heredocs.pop(0)
+            at_word_start = True
+            index += 1
+            continue
+
+        if quote is not None:
+            if char == quote:
+                quote = None
+            elif char == "\\" and quote == '"' and index + 1 < len(shell_source):
+                index += 1
+            at_word_start = False
+            index += 1
+            continue
+
+        if char in "'\"":
+            quote = char
+            at_word_start = False
+            index += 1
+            continue
+        if char == "\\":
+            if index + 1 < len(shell_source) and shell_source[index + 1] == "\n":
+                # Backslash-newline is removed by the shell and does not itself
+                # begin a word; retain the ownership state on both sides.
+                index += 2
+                continue
+            at_word_start = False
+            index += 2 if index + 1 < len(shell_source) else 1
+            continue
+        if char == "#" and at_word_start:
+            line_end = shell_source.find("\n", index)
+            if line_end < 0:
+                line_end = len(shell_source)
+            for offset in range(index, line_end):
+                masked[offset] = " "
+            index = line_end
+            continue
+        if (
+            char == "<"
+            and index + 1 < len(shell_source)
+            and shell_source[index + 1] == "<"
+        ):
+            if index + 2 < len(shell_source) and shell_source[index + 2] == "<":
+                # A here-string owns one ordinary shell word, not a body.
+                at_word_start = True
+                index += 3
+                continue
+            cursor = index + 2
+            strip_tabs = False
+            if cursor < len(shell_source) and shell_source[cursor] == "-":
+                strip_tabs = True
+                cursor += 1
+            while cursor < len(shell_source) and shell_source[cursor] in " \t":
+                cursor += 1
+
+            delimiter_parts: list[str] = []
+            delimiter_quote: str | None = None
+            delimiter_quoted = False
+            while cursor < len(shell_source):
+                delimiter_char = shell_source[cursor]
+                if delimiter_char == "\n":
+                    if delimiter_quote is not None:
+                        return "".join(masked), _ShellVariableStatus.UNRESOLVED
+                    break
+                if delimiter_quote is not None:
+                    if delimiter_char == delimiter_quote:
+                        delimiter_quote = None
+                    elif delimiter_char == "\\" and delimiter_quote == '"':
+                        if cursor + 1 < len(shell_source):
+                            cursor += 1
+                            delimiter_parts.append(shell_source[cursor])
+                    else:
+                        delimiter_parts.append(delimiter_char)
+                    cursor += 1
+                    continue
+                if delimiter_char in "'\"":
+                    delimiter_quote = delimiter_char
+                    delimiter_quoted = True
+                    cursor += 1
+                    continue
+                if delimiter_char == "\\":
+                    if (
+                        cursor + 1 >= len(shell_source)
+                        or shell_source[cursor + 1] == "\n"
+                    ):
+                        return "".join(masked), _ShellVariableStatus.UNRESOLVED
+                    delimiter_quoted = True
+                    cursor += 1
+                    delimiter_parts.append(shell_source[cursor])
+                    cursor += 1
+                    continue
+                if delimiter_char.isspace() or delimiter_char in ";&|()<>":
+                    break
+                delimiter_parts.append(delimiter_char)
+                if len(delimiter_parts) > _MAX_HEREDOC_DELIMITER_CHARS:
+                    budget.overflowed = True
+                    return shell_source, _ShellVariableStatus.OVERFLOW
+                cursor += 1
+
+            delimiter = "".join(delimiter_parts)
+            if not delimiter or delimiter_quote is not None:
+                return "".join(masked), _ShellVariableStatus.UNRESOLVED
+            if len(pending_heredocs) >= _MAX_PENDING_HEREDOCS:
+                budget.overflowed = True
+                return shell_source, _ShellVariableStatus.OVERFLOW
+            pending_heredocs.append(
+                (delimiter, strip_tabs, not delimiter_quoted)
+            )
+            at_word_start = True
+            index = max(cursor, index + 2)
+            continue
+        if char.isspace() or char in ";&|()<>":
+            at_word_start = True
+        else:
+            at_word_start = False
+        index += 1
+
+    if active_heredoc is not None or pending_heredocs:
+        return "".join(masked), _ShellVariableStatus.UNRESOLVED
+    return "".join(masked), _ShellVariableStatus.RESOLVED
+
+
+def _mandatory_program_effect(
+    shell_source: str,
+    *,
+    budget: _ShellVariableBudget,
+    shell_recursion: int = 0,
+    initial_bindings: dict[str, str] | None = None,
+    initially_poisoned: bool = False,
+) -> tuple[str | None, _ShellVariableStatus]:
+    """Inspect one raw program and its bounded executable payloads."""
+    budget.depth = max(budget.depth, shell_recursion)
+    if shell_recursion > _MAX_GIT_SHELL_RECURSION:
+        budget.overflowed = True
+        return None, _ShellVariableStatus.OVERFLOW
+
+    semantic_source, semantic_status = _mask_shell_non_executable_text(
+        shell_source, budget
+    )
+    if semantic_status == _ShellVariableStatus.OVERFLOW or budget.overflowed:
+        return None, _ShellVariableStatus.OVERFLOW
+    program = _resolve_shell_program(
+        semantic_source,
+        budget=budget,
+        initial_bindings=initial_bindings,
+        initially_poisoned=initially_poisoned,
+    )
+    if program.status == _ShellVariableStatus.OVERFLOW:
+        return None, program.status
+
+    policy_handlers = (
+        (_mandatory_buzz_event, "send an external Buzz message"),
+        (
+            lambda event: _mandatory_config_event(event, budget),
+            "write Hermes security configuration",
+        ),
+        (
+            lambda event: _mandatory_interpreter_smtp_event(event, budget),
+            "send email through an interpreter/SMTP",
+        ),
+        (_mandatory_external_email_event, "send external email"),
+    )
+    description: str | None = None
+    for handler, policy_description in policy_handlers:
+        for event in program.events:
+            matched = handler(event)
+            if budget.overflowed:
+                return None, _ShellVariableStatus.OVERFLOW
+            if matched and description is None:
+                description = policy_description
+
+    saw_unresolved = program.status == _ShellVariableStatus.UNRESOLVED
+    for event in program.events:
+        outer_alias_payloads = _iter_outer_alias_substitution_payloads(event)
+        event_source = _shell_event_payload_source(semantic_source, event)
+        seen_payloads: set[_ShellPayload] = set()
+        env_payloads, env_status, _protected_env_shape = (
+            _shell_event_env_split_payloads(event, budget, shell_recursion)
+        )
+        if env_status == _ShellVariableStatus.OVERFLOW:
+            return None, env_status
+        if env_status == _ShellVariableStatus.UNRESOLVED:
+            saw_unresolved = True
+
+        def event_payloads():
+            for payload in outer_alias_payloads:
+                yield _ShellPayload(payload, _ShellPayloadKind.SAME_SHELL)
+            for payload in env_payloads:
+                yield _ShellPayload(payload, _ShellPayloadKind.FRESH_PROCESS)
+            yield from _iter_detection_payload_records(event_source, event_source)
+
+        payloads = iter(event_payloads())
+        while True:
+            try:
+                payload = next(payloads)
+            except StopIteration:
+                break
+            except _CommandDetectionBudgetExceeded:
+                budget.overflowed = True
+                return None, _ShellVariableStatus.OVERFLOW
+            if not payload.source or payload in seen_payloads:
+                continue
+            seen_payloads.add(payload)
+            if not budget.take_payload():
+                return None, _ShellVariableStatus.OVERFLOW
+            if shell_recursion >= _MAX_GIT_SHELL_RECURSION:
+                budget.overflowed = True
+                return None, _ShellVariableStatus.OVERFLOW
+            initial_bindings, initially_poisoned = _shell_payload_expansion_state(
+                event, payload
+            )
+            child_description, child_status = _mandatory_program_effect(
+                payload.source,
+                budget=budget,
+                shell_recursion=shell_recursion + 1,
+                initial_bindings=initial_bindings,
+                initially_poisoned=initially_poisoned,
+            )
+            if child_status == _ShellVariableStatus.OVERFLOW:
+                return None, child_status
+            if description is None and child_description is not None:
+                description = child_description
+            if child_status == _ShellVariableStatus.UNRESOLVED:
+                saw_unresolved = True
+
+    return (
+        description,
+        _ShellVariableStatus.UNRESOLVED
+        if saw_unresolved
+        else _ShellVariableStatus.RESOLVED,
+    )
+
+
+@dataclass(frozen=True)
+class _MandatoryApprovalAnalysis:
+    description: str | None
+    status: _ShellVariableStatus
+    ast_overflowed: bool = False
+
+    def public_result(self) -> tuple[bool, str | None]:
+        if self.status == _ShellVariableStatus.OVERFLOW:
+            return True, _PARSER_LIMIT_DESCRIPTION
+        return self.description is not None, self.description
+
+
+def _analyze_mandatory_approval_command(command: str) -> _MandatoryApprovalAnalysis:
+    """Return one bounded mandatory-effect analysis for layered callers."""
+    budget = _ShellVariableBudget()
+    description, status = _mandatory_program_effect(command, budget=budget)
+    if status == _ShellVariableStatus.OVERFLOW or budget.overflowed:
+        status = _ShellVariableStatus.OVERFLOW
+        description = None
+    return _MandatoryApprovalAnalysis(description, status, budget.ast_overflowed)
 
 
 def detect_mandatory_approval_command(command: str) -> tuple[bool, str | None]:
     """Find side effects requiring a human even under yolo/mode=off."""
-    expanded = _expand_simple_shell_assignments(command)
-    for variant in _command_detection_variants(expanded):
-        for pattern, description in _MANDATORY_APPROVAL_PATTERNS:
-            if pattern.search(variant):
-                return True, description
-    return False, None
+    return _analyze_mandatory_approval_command(command).public_result()
 
 
-def detect_hardline_command(command: str) -> tuple:
+def detect_hardline_command(
+    command: str,
+    *,
+    _mandatory_analysis: _MandatoryApprovalAnalysis | None = None,
+) -> tuple:
     """Check if a command matches hardline blocklist patterns.
 
     Hardline patterns are NEVER bypassable, even in YOLO mode.
@@ -1813,31 +3492,86 @@ def detect_hardline_command(command: str) -> tuple:
     """
     if _command_parser_limit_exceeded(command):
         return (True, _PARSER_LIMIT_DESCRIPTION)
-    # Git alias parsing needs the shell's original quote boundaries. Analyze
-    # that semantic source before normalization can fold obfuscation spellings;
-    # normalized variants remain necessary for those prior bypass contracts.
-    raw_default_branch_push = _is_default_branch_push(command)
-    command_variants = tuple(_command_detection_variants(command))
-    if _PARSER_LIMIT_VARIANT in command_variants:
+    mandatory_analysis = (
+        _mandatory_analysis
+        if _mandatory_analysis is not None
+        else _analyze_mandatory_approval_command(command)
+    )
+    mandatory_overflow = mandatory_analysis.status == _ShellVariableStatus.OVERFLOW
+    if mandatory_overflow and mandatory_analysis.ast_overflowed:
         return (True, _PARSER_LIMIT_DESCRIPTION)
-    if raw_default_branch_push or any(
-        _is_default_branch_push(variant) for variant in command_variants
-    ):
-        return (True, "push to protected default branch (main/master)")
-    # Docker inspect exposes Config.Env, including opaque credentials. Parse
-    # global-option value ownership before identifying the subcommand.
-    if any(_docker_command_analysis(variant)[0] for variant in command_variants):
-        return (True, "inspect container credential environment")
-    normalized = _normalize_command_for_detection(command)
-    _, malformed_grep = _grep_safe_detection_variant(normalized)
-    if malformed_grep:
-        return (True, _MALFORMED_EXEC_DESCRIPTION)
-    for command_variant in command_variants:
-        variant_lower = command_variant.lower()
-        for pattern_re, description in HARDLINE_PATTERNS_COMPILED:
-            if pattern_re.search(variant_lower):
-                return (True, description)
-    return (False, None)
+    budget = _ShellVariableBudget()
+    semantic_source, semantic_status = _mask_shell_non_executable_text(
+        command, budget
+    )
+    if semantic_status == _ShellVariableStatus.OVERFLOW or budget.overflowed:
+        return (True, _PARSER_LIMIT_DESCRIPTION)
+    if mandatory_overflow:
+        # A protected push already established by the bounded Git parser is
+        # more specific than later sibling-payload work exhaustion. AST
+        # exhaustion above remains an authoritative parser-limit floor.
+        if _is_default_branch_push(semantic_source, resolve_variables=False):
+            return (True, "push to protected default branch (main/master)")
+        return (True, _PARSER_LIMIT_DESCRIPTION)
+
+    def semantic_finding(source: str) -> tuple[str | None, bool]:
+        """Classify one offset-preserving executable shell source."""
+        # Git alias parsing needs the shell's original quote boundaries.
+        # Analyze that semantic source before normalization can fold
+        # obfuscation spellings; normalized variants remain necessary for
+        # those prior bypass contracts.
+        raw_default_branch_push, raw_variable_status = (
+            _shell_variable_default_branch_push(source, budget=budget)
+        )
+        if raw_variable_status == _ShellVariableStatus.OVERFLOW:
+            return _PARSER_LIMIT_DESCRIPTION, True
+        raw_default_branch_push = (
+            raw_default_branch_push
+            or _is_default_branch_push(source, resolve_variables=False)
+        )
+        command_variants = tuple(_command_detection_variants(source))
+        if _PARSER_LIMIT_VARIANT in command_variants:
+            return _PARSER_LIMIT_DESCRIPTION, True
+        if raw_default_branch_push or any(
+            _is_default_branch_push(variant, resolve_variables=False)
+            for variant in command_variants
+        ):
+            return "push to protected default branch (main/master)", False
+        # Docker inspect exposes Config.Env, including opaque credentials.
+        # Parse global-option value ownership before identifying the subcommand.
+        if any(_docker_command_analysis(variant)[0] for variant in command_variants):
+            return "inspect container credential environment", False
+        normalized = _normalize_command_for_detection(source)
+        _, malformed_grep = _grep_safe_detection_variant(normalized)
+        if malformed_grep:
+            return _MALFORMED_EXEC_DESCRIPTION, False
+        for command_variant in command_variants:
+            variant_lower = command_variant.lower()
+            for pattern_re, description in HARDLINE_PATTERNS_COMPILED:
+                if pattern_re.search(variant_lower):
+                    return description, False
+        return None, False
+
+    finding, parser_overflow = semantic_finding(semantic_source)
+    if parser_overflow:
+        return (True, _PARSER_LIMIT_DESCRIPTION)
+
+    if semantic_status == _ShellVariableStatus.UNRESOLVED:
+        # An incomplete/malformed heredoc is benign unless the ambiguous bytes
+        # retain a protected command shape. Analyze both the raw source and the
+        # body-shaped suffix: an unmatched quote in a malformed delimiter can
+        # otherwise hide every later line from quote-aware command-start logic.
+        ambiguous_sources = [command]
+        if "\n" in command:
+            ambiguous_sources.append(command.split("\n", 1)[1])
+        for ambiguous_source in ambiguous_sources:
+            ambiguous_finding, ambiguous_overflow = semantic_finding(
+                ambiguous_source
+            )
+            if ambiguous_finding is not None or ambiguous_overflow:
+                return (True, _PARSER_LIMIT_DESCRIPTION)
+
+    return (True, finding) if finding is not None else (False, None)
 
 
 def _match_user_deny_rule(command: str) -> str | None:
@@ -2589,7 +4323,7 @@ def _rewrite_resolved_hermes_home(command: str) -> str:
 
 _PARAM_REPLACEMENT_RE = re.compile(r"\$\{[^}/\s]+/[^}/]*/(?P<replacement>[^}]*)\}")
 _PARAM_DEFAULT_RE = re.compile(r"\$\{[^}:}\s]+:-(?P<default>[^}]*)\}")
-_SIMPLE_SHELL_LITERAL_RE = re.compile(r"^[A-Za-z0-9_./:@%+=,-]+$")
+_SIMPLE_SHELL_LITERAL_RE = re.compile(r"^[A-Za-z0-9_./:@%+=,\\-]+$")
 _ENV_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
 _COMMAND_WRAPPER_WORDS = {
     "sudo",
@@ -2980,7 +4714,10 @@ def _grep_safe_detection_variant(command: str) -> tuple[str, bool]:
 
 def _interpreter_family(executable: str) -> str | None:
     name = os.path.basename(executable).lower()
-    if re.fullmatch(r"py(?:\.exe)?|python[23]?(?:\.\d+)*(?:\.exe)?", name):
+    if re.fullmatch(
+        r"py(?:\.exe)?|(?:python|pypy)[23]?(?:\.\d+)*(?:\.exe)?",
+        name,
+    ):
         return "python"
     if re.fullmatch(r"node(?:js)?(?:\.exe)?", name):
         return "node"
@@ -3046,44 +4783,57 @@ def _split_option(token: str) -> tuple[str, str | None]:
     return token, None
 
 
-def _interpreter_exec_flag(family: str, args: list[str]) -> str | None:
-    """Return an execution-bearing interpreter option, if present."""
+def _interpreter_exec_option(
+    family: str,
+    args: list[str],
+) -> tuple[str, int, int | None] | None:
+    """Return an execution option and the exact payload location it owns.
+
+    The tuple is ``(flag, token_index, payload_offset)``. A ``None`` offset
+    means the following token is the payload; otherwise the payload is the
+    suffix of ``args[token_index]`` beginning at that character offset.
+    """
     flags = _INTERPRETER_EXEC_FLAGS[family]
-    skip_value = False
-    for token in args:
-        if skip_value:
-            skip_value = False
-            continue
+    with_arg = _INTERPRETER_WITH_ARG[family]
+    index = 0
+    while index < len(args):
+        token = args[index]
         if token == "--":
             break
         if family != "powershell" and not token.startswith("-"):
             break
-        option, attached = _split_option(token)
-        comparable = option.lower() if family == "powershell" else option
-        if comparable in flags:
-            return comparable
-        with_arg = _INTERPRETER_WITH_ARG[family]
-        # `-Wonce` and `ruby -rjson` attach an option value; they are not
-        # short-option bundles containing an execution flag. PowerShell's
-        # normal long options also use one dash, so bundle parsing never
-        # applies to that family.
-        has_attached_option_value = any(
-            option.startswith(short) and len(option) > len(short)
-            for short in with_arg
-            if short.startswith("-") and not short.startswith("--")
-        )
-        if (
-            family != "powershell"
-            and not option.startswith("--")
-            and len(option) > 2
-            and not has_attached_option_value
-        ):
-            for char in option[1:]:
-                short = f"-{char}"
-                if short in flags:
-                    return short
-        if comparable in with_arg and attached is None:
-            skip_value = True
+
+        if family == "powershell" or token.startswith("--"):
+            option, attached = _split_option(token)
+            comparable = option.lower() if family == "powershell" else option
+            if comparable in flags:
+                offset = len(option) + 1 if attached is not None else None
+                return comparable, index, offset
+            index += 2 if comparable in with_arg and attached is None else 1
+            continue
+
+        # Short options may be bundled. The first option that owns a value
+        # owns the rest of the token (or the next token), so -Wc/-Xc and
+        # -iWc do not manufacture a later -c execution option.
+        consumed_next = False
+        for char_index, char in enumerate(token[1:], start=1):
+            short = f"-{char}"
+            remainder_offset = char_index + 1
+            has_remainder = remainder_offset < len(token)
+            if short in with_arg:
+                consumed_next = not has_remainder
+                break
+            if short in flags:
+                return short, index, remainder_offset if has_remainder else None
+        index += 2 if consumed_next else 1
+    return None
+
+
+def _interpreter_exec_flag(family: str, args: list[str]) -> str | None:
+    """Return an execution-bearing interpreter option, if present."""
+    owned = _interpreter_exec_option(family, args)
+    if owned is not None:
+        return owned[0]
     return None
 
 
@@ -3774,20 +5524,51 @@ def _iter_explicit_shell_payloads(command: str):
     yield from _iter_explicit_command_argv_payloads(command)
 
 
-def _iter_detection_payloads(shell_source: str, variant: str):
-    """Yield payloads lazily, with a finite per-variant findings budget."""
+def _iter_detection_payload_records(shell_source: str, variant: str):
+    """Yield bounded payloads with their expansion/child-shell provenance."""
     findings = 0
-    for _, payload in _execution_flag_findings(variant):
+    for description, payload in _execution_flag_findings(variant):
         findings += 1
         if findings > _MAX_PAYLOAD_FINDINGS_PER_VARIANT:
             raise _CommandDetectionBudgetExceeded from None
         if payload:
-            yield payload
-    for payload in _iter_explicit_shell_payloads(shell_source):
-        findings += 1
-        if findings > _MAX_PAYLOAD_FINDINGS_PER_VARIANT:
-            raise _CommandDetectionBudgetExceeded from None
-        yield payload
+            kind = (
+                _ShellPayloadKind.FRESH_SHELL
+                if description == "shell command via -c/-lc flag"
+                else _ShellPayloadKind.FRESH_PROCESS
+            )
+            yield _ShellPayload(payload, kind)
+
+    payload_groups = (
+        (
+            _iter_executable_substitution_payloads(shell_source),
+            _ShellPayloadKind.SAME_SHELL,
+        ),
+        (
+            _iter_explicit_command_argv_payloads(
+                shell_source, executables=frozenset({"eval"})
+            ),
+            _ShellPayloadKind.SAME_SHELL,
+        ),
+        (
+            _iter_explicit_command_argv_payloads(
+                shell_source, executables=frozenset({"xargs", "find"})
+            ),
+            _ShellPayloadKind.FRESH_PROCESS,
+        ),
+    )
+    for payloads, kind in payload_groups:
+        for payload in payloads:
+            findings += 1
+            if findings > _MAX_PAYLOAD_FINDINGS_PER_VARIANT:
+                raise _CommandDetectionBudgetExceeded from None
+            yield _ShellPayload(payload, kind)
+
+
+def _iter_detection_payloads(shell_source: str, variant: str):
+    """Yield legacy string variants from the provenance-bearing payload seam."""
+    for payload in _iter_detection_payload_records(shell_source, variant):
+        yield payload.source
 
 
 def _command_detection_variants(command: str):
@@ -5654,7 +7435,11 @@ def check_all_command_guards(command: str, env_type: str,
     # Hardline, user-deny, and mandatory-human rules are global floors. They
     # protect external/public side effects as well as the local filesystem, so
     # isolated containers must not bypass them.
-    is_hardline, hardline_desc = detect_hardline_command(command)
+    mandatory_analysis = _analyze_mandatory_approval_command(command)
+    is_hardline, hardline_desc = detect_hardline_command(
+        command,
+        _mandatory_analysis=mandatory_analysis,
+    )
     if is_hardline:
         logger.warning("command_hardline_blocked")
         return _hardline_block_result(hardline_desc, command)
@@ -5664,7 +7449,7 @@ def check_all_command_guards(command: str, env_type: str,
         logger.warning("command_user_deny_blocked")
         return _user_deny_block_result(deny_pattern)
 
-    mandatory_approval, mandatory_desc = detect_mandatory_approval_command(command)
+    mandatory_approval, mandatory_desc = mandatory_analysis.public_result()
     if mandatory_approval:
         is_cli = _is_interactive_cli()
         is_gateway = _is_gateway_approval_context()

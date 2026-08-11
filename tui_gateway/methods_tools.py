@@ -1903,12 +1903,31 @@ def _(rid, params: dict) -> dict:
     if not cmd:
         return _err(rid, 4004, "empty command")
     try:
-        from tools.approval import detect_dangerous_command, detect_hardline_command
+        from tools.approval import (
+            _match_user_deny_rule,
+            detect_dangerous_command,
+            detect_hardline_command,
+            detect_mandatory_approval_command,
+        )
 
         is_hardline, hardline_desc = detect_hardline_command(cmd)
         if is_hardline:
             return _err(
                 rid, 4005, f"blocked (hardline): {hardline_desc}. Use the agent for dangerous commands."
+            )
+        if _match_user_deny_rule(cmd) is not None:
+            return _err(
+                rid,
+                4005,
+                "blocked by configured deny rule. Use the agent for dangerous commands.",
+            )
+        is_mandatory, mandatory_desc = detect_mandatory_approval_command(cmd)
+        if is_mandatory:
+            return _err(
+                rid,
+                4005,
+                f"blocked (mandatory): {mandatory_desc or 'mandatory action'}. "
+                "Use the agent for dangerous commands.",
             )
         is_dangerous, _, desc = detect_dangerous_command(cmd)
         if is_dangerous:

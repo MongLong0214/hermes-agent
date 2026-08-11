@@ -38,6 +38,112 @@ def _neuter_agent_prewarm_timer(request, monkeypatch):
     yield
 
 
+def _shell_exec_request(command: str, *, rid: str = "shell-exec") -> dict:
+    response = server.handle_request(
+        {"id": rid, "method": "shell.exec", "params": {"command": command}}
+    )
+    assert response is not None
+    return response
+
+
+@pytest.mark.parametrize(
+    ("command", "description"),
+    [
+        (
+            "B=buzz; $B messages send --channel public --message x",
+            "send an external Buzz message",
+        ),
+        ("E=sendmail; $E user@example.invalid", "send external email"),
+    ],
+    ids=["variable-buzz", "variable-email"],
+)
+def test_shell_exec_blocks_variable_backed_mandatory_commands_before_subprocess(
+    monkeypatch, command, description
+):
+    mock_run = Mock(side_effect=AssertionError("shell.exec must not spawn"))
+    monkeypatch.setattr(server.subprocess, "run", mock_run)
+
+    response = _shell_exec_request(command)
+
+    assert response["error"] == {
+        "code": 4005,
+        "message": (
+            f"blocked (mandatory): {description}. "
+            "Use the agent for dangerous commands."
+        ),
+    }
+    mock_run.assert_not_called()
+
+
+def test_shell_exec_blocks_configured_user_deny_before_subprocess(monkeypatch):
+    from tools import approval
+
+    private_rule = "echo configured-deny-private-*"
+    monkeypatch.setattr(
+        approval, "_get_approval_config", lambda: {"deny": [private_rule]}
+    )
+    mock_run = Mock(side_effect=AssertionError("shell.exec must not spawn"))
+    monkeypatch.setattr(server.subprocess, "run", mock_run)
+
+    response = _shell_exec_request("echo configured-deny-private-value")
+
+    assert response["error"] == {
+        "code": 4005,
+        "message": (
+            "blocked by configured deny rule. "
+            "Use the agent for dangerous commands."
+        ),
+    }
+    assert private_rule not in response["error"]["message"]
+    mock_run.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("command", "message_fragment"),
+    [
+        ("git push origin main", "blocked (hardline)"),
+        ("rm -rf build/", "blocked:"),
+    ],
+    ids=["hardline", "dangerous"],
+)
+def test_shell_exec_keeps_existing_protected_commands_blocked(
+    monkeypatch, command, message_fragment
+):
+    from tools import approval
+
+    monkeypatch.setattr(approval, "_get_approval_config", lambda: {})
+    mock_run = Mock(side_effect=AssertionError("shell.exec must not spawn"))
+    monkeypatch.setattr(server.subprocess, "run", mock_run)
+
+    response = _shell_exec_request(command)
+
+    assert response["error"]["code"] == 4005
+    assert message_fragment in response["error"]["message"]
+    mock_run.assert_not_called()
+
+
+def test_shell_exec_keeps_benign_return_shape(monkeypatch):
+    from tools import approval
+
+    monkeypatch.setattr(approval, "_get_approval_config", lambda: {})
+    completed = subprocess.CompletedProcess(
+        args="echo harmless", returncode=0, stdout="harmless\n", stderr=""
+    )
+    mock_run = Mock(return_value=completed)
+    monkeypatch.setattr(server.subprocess, "run", mock_run)
+
+    response = _shell_exec_request("echo harmless", rid="benign-shell-exec")
+
+    assert response == {
+        "jsonrpc": "2.0",
+        "id": "benign-shell-exec",
+        "result": {"stdout": "harmless\n", "stderr": "", "code": 0},
+    }
+    assert mock_run.call_count == 1
+    assert mock_run.call_args.args == ("echo harmless",)
+    assert mock_run.call_args.kwargs["shell"] is True
+
+
 def test_session_slot_is_claimed_on_first_turn_not_on_create(monkeypatch, tmp_path):
     home = tmp_path / ".hermes"
     home.mkdir()

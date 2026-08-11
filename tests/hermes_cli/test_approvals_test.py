@@ -50,6 +50,46 @@ def isolated_approvals(monkeypatch):
     A._permanent_approved.update(saved)
 
 
+@pytest.fixture
+def copied_approval_collections(isolated_approvals, monkeypatch):
+    """Keep mandatory-human state mutations off the module's real objects."""
+    names = (
+        "_pending",
+        "_session_approved",
+        "_session_yolo",
+        "_permanent_approved",
+        "_gateway_queues",
+        "_gateway_notify_cbs",
+        "_denial_tally",
+        "_human_wait_states",
+    )
+
+    def copy_members(name, value):
+        if name == "_session_approved":
+            return {key: set(patterns) for key, patterns in value.items()}
+        if name == "_gateway_queues":
+            return {key: list(entries) for key, entries in value.items()}
+        if isinstance(value, set):
+            return set(value)
+        return dict(value)
+
+    originals = {name: getattr(A, name) for name in names}
+    original_members = {
+        name: copy_members(name, value) for name, value in originals.items()
+    }
+    for name, value in originals.items():
+        monkeypatch.setattr(A, name, copy_members(name, value))
+
+    try:
+        yield A
+    finally:
+        for name, original in originals.items():
+            assert copy_members(name, original) == original_members[name]
+            setattr(A, name, original)
+            assert getattr(A, name) is original
+            assert copy_members(name, original) == original_members[name]
+
+
 class TestVerdicts:
     @pytest.mark.parametrize("command", [
         "git -C /tmp/repo push origin main",
@@ -131,15 +171,33 @@ class TestVerdicts:
         # The user deny glob must NOT be claimed as the verdict's rule.
         assert payload["rule"] != "git push *"
 
-    def test_container_env_type_skips_guards_like_runtime(self, isolated_approvals,
-                                                          capsys):
-        # Mirrors check_all_command_guards: isolated docker skips BEFORE the
-        # hardline floor, so even a catastrophic command reports allow.
-        rc = at.approvals_test_command(_args(["rm", "-rf", "/"], env_type="docker"))
-        out = capsys.readouterr().out
-        assert rc == 0
-        assert "allow" in out
-        assert "container" in out or "isolated" in out
+    def test_container_skips_only_ordinary_dangerous_guard(
+        self, isolated_approvals, monkeypatch
+    ):
+        monkeypatch.setattr(
+            A,
+            "_get_approval_config",
+            lambda: {"mode": "manual", "deny": ["git push origin feature/*"]},
+        )
+
+        protected = at.evaluate_command("git push origin main", env_type="docker")
+        assert protected["verdict"] == "hardline-deny"
+
+        mandatory = at.evaluate_command(
+            "sh -c 'buzz messages send --channel public --message x'",
+            env_type="docker",
+        )
+        assert mandatory["verdict"] == "ask-approval"
+
+        configured_deny = at.evaluate_command(
+            "git push origin feature/container",
+            env_type="docker",
+        )
+        assert configured_deny["verdict"] == "user-deny"
+
+        ordinary = at.evaluate_command("rm -rf ~/build", env_type="docker")
+        assert ordinary["verdict"] == "allow"
+        assert "container" in ordinary["detail"] or "isolated" in ordinary["detail"]
 
     def test_mode_off_bypasses_dangerous_but_not_hardline(self, isolated_approvals,
                                                           capsys, monkeypatch):
@@ -408,6 +466,620 @@ class TestCommandParserBudgets:
         )
 
 
+class TestMandatoryShellVariables:
+    """Mandatory effects are structural, quote-aware, and non-bypassable."""
+
+    @staticmethod
+    def _assert_policy(command, expected, description=None):
+        assert A.detect_mandatory_approval_command(command) == (
+            expected,
+            description if expected else None,
+        )
+        guard = A.check_all_command_guards(command, "local")
+        assert guard["approved"] is not expected
+        assert guard.get("mandatory_approval", False) is expected
+        verdict = at.evaluate_command(command)
+        assert verdict["verdict"] == ("ask-approval" if expected else "allow")
+        assert verdict["exit_code"] == (2 if expected else 0)
+        assert verdict["rule"] == (description if expected else None)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "buzz messages send --channel public --message x",
+            "buzz-real messages send --channel public --message x",
+            "B=buzz; $B messages send --channel public --message x",
+            'B=buzz; "$B" messages send --channel public --message x',
+            "$B messages send --channel public --message x",
+            "B=printf; echo poison; $B messages send --channel public --message x",
+        ],
+    )
+    def test_buzz_send_requires_live_approval(
+        self, isolated_approvals, monkeypatch, command
+    ):
+        monkeypatch.setattr(A, "_get_approval_config", lambda: {"mode": "off"})
+        self._assert_policy(command, True, "send an external Buzz message")
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "B=printf; $B messages send --channel public --message x",
+            "$B messages list",
+            "B=buzz; '$B' messages send --channel public --message x",
+            r"B=buzz; \$B messages send --channel public --message x",
+            "printf '%s' 'buzz messages send --channel public --message x'",
+            "echo buzz messages send --channel public --message x",
+        ],
+    )
+    def test_buzz_non_send_or_prose_remains_safe(
+        self, isolated_approvals, monkeypatch, command
+    ):
+        monkeypatch.setattr(A, "_get_approval_config", lambda: {"mode": "off"})
+        self._assert_policy(command, False)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "echo x > ~/.hermes/config.yaml",
+            "echo x >> $HERMES_HOME/config.yaml",
+            "echo x > ${HERMES_HOME}/config.yaml",
+            "echo x > /synthetic/.hermes/config.yaml",
+            'P=/synthetic/.hermes/config.yaml; echo x > "$P"',
+            'echo x > "$P/.hermes/config.yaml"',
+            "echo x | tee ~/.hermes/config.yaml",
+            'P=/synthetic/.hermes/config.yaml; tee "$P"',
+        ],
+    )
+    def test_hermes_config_write_requires_live_approval(
+        self, isolated_approvals, monkeypatch, command
+    ):
+        monkeypatch.setattr(A, "_get_approval_config", lambda: {"mode": "off"})
+        self._assert_policy(command, True, "write Hermes security configuration")
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'P=/tmp/file; echo x > "$P"',
+            "P=/synthetic/.hermes/config.yaml; echo x > '$P'",
+            r"P=/synthetic/.hermes/config.yaml; echo x > \$P",
+            "echo 'write ~/.hermes/config.yaml'",
+            "printf '%s' 'tee ~/.hermes/config.yaml'",
+            "cat ~/.hermes/config.yaml",
+            "echo x > /tmp/config.yaml",
+        ],
+    )
+    def test_non_config_targets_and_config_prose_remain_safe(
+        self, isolated_approvals, monkeypatch, command
+    ):
+        monkeypatch.setattr(A, "_get_approval_config", lambda: {"mode": "off"})
+        self._assert_policy(command, False)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "echo x # > ~/.hermes/config.yaml",
+            "printf ok;\n# echo x > ~/.hermes/config.yaml",
+            "echo x # buzz messages send --channel public --message x",
+            (
+                "cat <<'EOF'\n"
+                "> ~/.hermes/config.yaml\n"
+                "buzz messages send --channel public --message x\n"
+                "sendmail user@example.invalid\n"
+                "python -c \"import smtplib\"\n"
+                "EOF"
+            ),
+            (
+                "cat <<END\n"
+                "echo x > ~/.hermes/config.yaml\n"
+                "buzz messages send --channel public --message x\n"
+                "END"
+            ),
+        ],
+    )
+    def test_shell_comments_and_heredoc_bodies_remain_non_mandatory(
+        self, isolated_approvals, monkeypatch, command
+    ):
+        monkeypatch.setattr(A, "_get_approval_config", lambda: {"mode": "off"})
+        self._assert_policy(command, False)
+
+    @pytest.mark.parametrize(
+        ("command", "description"),
+        [
+            (
+                "echo x > ~/.hermes/config.yaml # explanatory prose",
+                "write Hermes security configuration",
+            ),
+            (
+                "printf x | tee ~/.hermes/config.yaml # explanatory prose",
+                "write Hermes security configuration",
+            ),
+            (
+                "echo x # comment ends here\n"
+                "buzz messages send --channel public --message x",
+                "send an external Buzz message",
+            ),
+            (
+                "echo '#' > ~/.hermes/config.yaml",
+                "write Hermes security configuration",
+            ),
+            (
+                r"echo \# > ~/.hermes/config.yaml",
+                "write Hermes security configuration",
+            ),
+        ],
+    )
+    def test_executable_effects_outside_comments_and_heredocs_remain_mandatory(
+        self, isolated_approvals, monkeypatch, command, description
+    ):
+        monkeypatch.setattr(A, "_get_approval_config", lambda: {"mode": "off"})
+        self._assert_policy(command, True, description)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'python -c "import smtplib; smtplib.SMTP(\"mail.example\").sendmail(\"a\", \"b\", \"x\")"',
+            "python3 -c 'import smtplib; smtplib.SMTP().sendmail(\"a\", \"b\", \"x\")'",
+            'pypy3 -c "import smtplib; smtplib.SMTP().sendmail(\"a\", \"b\", \"x\")"',
+            'M=smtplib; python -c "import $M; $M.SMTP().sendmail(\"a\", \"b\", \"x\")"',
+            'M=json; echo poison; python -c "import $M; print($M)"',
+            'python2 -c "import $M; print($M)"',
+        ],
+    )
+    def test_interpreter_smtp_requires_live_approval(
+        self, isolated_approvals, monkeypatch, command
+    ):
+        monkeypatch.setattr(A, "_get_approval_config", lambda: {"mode": "off"})
+        self._assert_policy(command, True, "send email through an interpreter/SMTP")
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'M=json; python -c "import $M; print($M)"',
+            "M=smtplib; python -c 'import $M; print($M)'",
+            r'M=smtplib; python -c "import \$M; print(\$M)"',
+            "echo 'python -c \"import smtplib\"'",
+            'python -c "print(\"smtplib prose\")"',
+            "python -m smtplib",
+            'node -e "import smtplib"',
+        ],
+    )
+    def test_non_smtp_interpreter_code_and_prose_remain_safe(
+        self, isolated_approvals, monkeypatch, command
+    ):
+        monkeypatch.setattr(A, "_get_approval_config", lambda: {"mode": "off"})
+        self._assert_policy(command, False)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'python3.12 -c "import smtplib; smtplib.SMTP().sendmail(1, 2, 3)"',
+            'pypy3.10 -c "from smtplib import SMTP; SMTP().sendmail(1, 2, 3)"',
+            "python -c'import smtplib; smtplib.SMTP().sendmail(1, 2, 3)'",
+        ],
+    )
+    def test_versioned_and_attached_python_smtp_requires_live_approval(
+        self, isolated_approvals, monkeypatch, command
+    ):
+        monkeypatch.setattr(A, "_get_approval_config", lambda: {"mode": "off"})
+        self._assert_policy(command, True, "send email through an interpreter/SMTP")
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "python3.12 -c 'print(1)'",
+            "pypy3.10 -c 'print(1)'",
+            "python -c'print(1)'",
+            "python-helper -c 'import smtplib'",
+            "printf '%s' 'python3.12 -c import smtplib'",
+        ],
+    )
+    def test_versioned_and_attached_interpreter_safe_controls_remain_non_mandatory(
+        self, isolated_approvals, monkeypatch, command
+    ):
+        monkeypatch.setattr(A, "_get_approval_config", lambda: {"mode": "off"})
+        self._assert_policy(command, False)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "python -ic 'import smtplib'",
+            "python3.12 -ic 'from smtplib import SMTP'",
+            "pypy3.10 -ic 'import smtplib'",
+            "python -ic'import smtplib'",
+        ],
+    )
+    def test_bundled_python_c_option_owns_smtp_code(
+        self, isolated_approvals, monkeypatch, command
+    ):
+        monkeypatch.setattr(A, "_get_approval_config", lambda: {"mode": "off"})
+        self._assert_policy(command, True, "send email through an interpreter/SMTP")
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "python -W c 'import smtplib'",
+            "python -Wc 'import smtplib'",
+            "python -X c 'import smtplib'",
+            "python -Xc 'import smtplib'",
+            "node -ic 'import smtplib'",
+            "python -ic 'print(\"smtplib prose\")'",
+        ],
+    )
+    def test_python_option_values_and_non_python_bundles_do_not_own_smtp_code(
+        self, isolated_approvals, monkeypatch, command
+    ):
+        monkeypatch.setattr(A, "_get_approval_config", lambda: {"mode": "off"})
+        self._assert_policy(command, False)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'python -c "print(\'import smtplib\')"',
+            'python -c "# import smtplib\nprint(\'ok\')"',
+            'python -c "print(\'sendmail(1, 2, 3)\')"',
+            'python -c "# SMTP().sendmail(1, 2, 3)\nprint(\'ok\')"',
+        ],
+    )
+    def test_python_smtp_string_and_comment_prose_remains_non_mandatory(
+        self, isolated_approvals, monkeypatch, command
+    ):
+        monkeypatch.setattr(A, "_get_approval_config", lambda: {"mode": "off"})
+        self._assert_policy(command, False)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'python -c "import smtplib"',
+            'python -c "from smtplib import SMTP"',
+            'python -c "class Mailer:\n def sendmail(self, *args): pass\nMailer().sendmail(1, 2, 3)"',
+        ],
+    )
+    def test_python_ast_smtp_effects_remain_mandatory(
+        self, isolated_approvals, monkeypatch, command
+    ):
+        monkeypatch.setattr(A, "_get_approval_config", lambda: {"mode": "off"})
+        self._assert_policy(command, True, "send email through an interpreter/SMTP")
+
+    def test_python_ast_overflow_is_a_hardline_floor_at_every_boundary(
+        self, isolated_approvals, monkeypatch
+    ):
+        monkeypatch.setattr(A, "_MAX_PYTHON_SMTP_AST_NODES", 8)
+        monkeypatch.setattr(A, "_get_approval_config", lambda: {"mode": "off"})
+        over_limit = 'python -c "import smtplib; x = 1; y = 2"'
+
+        assert A.detect_hardline_command(over_limit) == (
+            True,
+            "command parser limit exceeded",
+        )
+        guard = A.check_all_command_guards(over_limit, "local")
+        assert guard["approved"] is False
+        assert guard["hardline"] is True
+        assert guard.get("mandatory_approval") is not True
+        verdict = at.evaluate_command(over_limit)
+        assert verdict["verdict"] == "hardline-deny"
+        assert verdict["rule"] == "command parser limit exceeded"
+
+        self._assert_policy(
+            'python -c "import smtplib"',
+            True,
+            "send email through an interpreter/SMTP",
+        )
+        self._assert_policy('python -c "print(\'import smtplib\')"', False)
+        self._assert_policy('python -c "# import smtplib"', False)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "sendmail user@example.invalid",
+            "/usr/sbin/sendmail user@example.invalid",
+            "msmtp user@example.invalid",
+            "mailx -s subject user@example.invalid",
+            "mutt user@example.invalid",
+            "swaks --to user@example.invalid",
+            "E=sendmail; $E user@example.invalid",
+            "E=ms; ${E}mtp user@example.invalid",
+            'E=sendmail; "$E" user@example.invalid',
+        ],
+    )
+    def test_external_email_cli_requires_live_approval(
+        self, isolated_approvals, monkeypatch, command
+    ):
+        monkeypatch.setattr(A, "_get_approval_config", lambda: {"mode": "off"})
+        self._assert_policy(command, True, "send external email")
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "E=printf; $E user@example.invalid",
+            "E=sendmail; '$E' user@example.invalid",
+            r"E=sendmail; \$E user@example.invalid",
+            "$E user@example.invalid",
+            "echo sendmail user@example.invalid",
+            "printf '%s' 'msmtp user@example.invalid'",
+            "sendmail-helper user@example.invalid",
+        ],
+    )
+    def test_non_email_executable_and_email_prose_remain_safe(
+        self, isolated_approvals, monkeypatch, command
+    ):
+        monkeypatch.setattr(A, "_get_approval_config", lambda: {"mode": "off"})
+        self._assert_policy(command, False)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "E=sendmail sh -c '$E user@example.invalid'",
+            "env E=sendmail sh -c '$E user@example.invalid'",
+        ],
+    )
+    def test_fresh_shell_receives_only_explicit_environment_bindings(
+        self, isolated_approvals, monkeypatch, command
+    ):
+        monkeypatch.setattr(A, "_get_approval_config", lambda: {"mode": "off"})
+        self._assert_policy(command, True, "send external email")
+
+    def test_prior_unexported_shell_binding_does_not_enter_fresh_shell(
+        self, isolated_approvals, monkeypatch
+    ):
+        monkeypatch.setattr(A, "_get_approval_config", lambda: {"mode": "off"})
+        self._assert_policy(
+            "E=sendmail; sh -c '$E user@example.invalid'",
+            False,
+        )
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "E=sendmail; printf '%s' \"$($E user@example.invalid)\"",
+            "E=sendmail; eval '$E user@example.invalid'",
+        ],
+    )
+    def test_same_shell_payloads_receive_parent_expansion_bindings(
+        self, isolated_approvals, monkeypatch, command
+    ):
+        monkeypatch.setattr(A, "_get_approval_config", lambda: {"mode": "off"})
+        self._assert_policy(command, True, "send external email")
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "E=printf; eval '$E user@example.invalid'",
+            "E=printf; printf '%s' \"$($E user@example.invalid)\"",
+            "E=sendmail; printf '%s' 'eval $E user@example.invalid'",
+        ],
+    )
+    def test_same_shell_known_safe_and_prose_controls_remain_non_mandatory(
+        self, isolated_approvals, monkeypatch, command
+    ):
+        monkeypatch.setattr(A, "_get_approval_config", lambda: {"mode": "off"})
+        self._assert_policy(command, False)
+
+    @pytest.mark.parametrize(
+        ("command", "description"),
+        [
+            (
+                "env buzz messages send --channel public --message x",
+                "send an external Buzz message",
+            ),
+            (
+                "sh -c 'buzz messages send --channel public --message x'",
+                "send an external Buzz message",
+            ),
+            (
+                "env sendmail user@example.invalid",
+                "send external email",
+            ),
+            (
+                "env sh -c 'echo x > ~/.hermes/config.yaml'",
+                "write Hermes security configuration",
+            ),
+            (
+                "sh -c 'python -c \"import smtplib; smtplib.SMTP().sendmail(1, 2, 3)\"'",
+                "send email through an interpreter/SMTP",
+            ),
+            (
+                "eval 'buzz messages send --channel public --message x'",
+                "send an external Buzz message",
+            ),
+            (
+                "printf x | xargs sendmail user@example.invalid",
+                "send external email",
+            ),
+            (
+                "find . -exec sh -c 'echo x > ~/.hermes/config.yaml' _ {} \\;",
+                "write Hermes security configuration",
+            ),
+            (
+                "eval 'python -c \"import smtplib; smtplib.SMTP().sendmail(1, 2, 3)\"'",
+                "send email through an interpreter/SMTP",
+            ),
+            (
+                "find . -exec sendmail user@example.invalid {} \\;",
+                "send external email",
+            ),
+        ],
+    )
+    def test_wrapped_and_late_payload_effects_require_live_approval(
+        self, isolated_approvals, monkeypatch, command, description
+    ):
+        monkeypatch.setattr(A, "_get_approval_config", lambda: {"mode": "off"})
+        self._assert_policy(command, True, description)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "env printf '%s' ok",
+            "env buzz messages list",
+            "sh -c 'echo buzz messages send --channel public --message x'",
+            "env sh -c 'echo x > /tmp/config.yaml'",
+            "sh -c 'python -c \"print(1)\"'",
+            "eval 'echo sendmail user@example.invalid'",
+            "printf x | xargs printf '%s\\n'",
+            "find . -exec printf '%s\\n' {} \\;",
+        ],
+    )
+    def test_wrapped_and_late_payload_safe_controls_remain_non_mandatory(
+        self, isolated_approvals, monkeypatch, command
+    ):
+        monkeypatch.setattr(A, "_get_approval_config", lambda: {"mode": "off"})
+        self._assert_policy(command, False)
+
+    def test_hardline_protected_push_beats_mandatory_buzz(
+        self, isolated_approvals
+    ):
+        command = (
+            "B=buzz; $B messages send --channel public --message x; "
+            "git push origin main"
+        )
+        assert A.detect_mandatory_approval_command(command) == (
+            True,
+            "send an external Buzz message",
+        )
+        guard = A.check_all_command_guards(command, "local")
+        assert guard["approved"] is False
+        assert guard["hardline"] is True
+        assert guard.get("mandatory_approval") is not True
+        verdict = at.evaluate_command(command)
+        assert verdict["verdict"] == "hardline-deny"
+        assert verdict["rule"] == "push to protected default branch (main/master)"
+
+    def test_user_deny_beats_mandatory_buzz(
+        self, isolated_approvals, monkeypatch
+    ):
+        command = "B=buzz; $B messages send --channel public --message x"
+        deny_rule = "*messages send*"
+        monkeypatch.setattr(
+            A,
+            "_get_approval_config",
+            lambda: {"mode": "off", "deny": [deny_rule]},
+        )
+        assert A.detect_mandatory_approval_command(command)[0] is True
+        guard = A.check_all_command_guards(command, "local")
+        assert guard["approved"] is False
+        assert guard["user_deny"] is True
+        assert guard.get("mandatory_approval") is not True
+        verdict = at.evaluate_command(command)
+        assert verdict["verdict"] == "user-deny"
+        assert verdict["rule"] == deny_rule
+
+    @pytest.mark.parametrize("bypass", ["mode-off", "process-yolo", "session-yolo"])
+    def test_mandatory_buzz_beats_every_approval_bypass(
+        self, isolated_approvals, monkeypatch, bypass
+    ):
+        command = "B=buzz; $B messages send --channel public --message x"
+        if bypass == "mode-off":
+            monkeypatch.setattr(A, "_get_approval_config", lambda: {"mode": "off"})
+        elif bypass == "process-yolo":
+            monkeypatch.setattr(A, "_YOLO_MODE_FROZEN", True)
+        else:
+            monkeypatch.setattr(A, "is_current_session_yolo_enabled", lambda: True)
+
+        guard = A.check_all_command_guards(command, "local")
+        assert guard["approved"] is False
+        assert guard["mandatory_approval"] is True
+        verdict = at.evaluate_command(command)
+        assert verdict["verdict"] == "ask-approval"
+        assert verdict["exit_code"] == 2
+
+    def test_wrapped_mandatory_effect_keeps_hardline_precedence(
+        self, isolated_approvals
+    ):
+        command = (
+            "git push origin main; "
+            "sh -c 'buzz messages send --channel public --message x'"
+        )
+        assert A.detect_mandatory_approval_command(command) == (
+            True,
+            "send an external Buzz message",
+        )
+        guard = A.check_all_command_guards(command, "local")
+        assert guard["approved"] is False
+        assert guard["hardline"] is True
+        assert guard.get("mandatory_approval") is not True
+        verdict = at.evaluate_command(command)
+        assert verdict["verdict"] == "hardline-deny"
+        assert verdict["rule"] == "push to protected default branch (main/master)"
+
+    def test_exact_user_deny_keeps_wrapped_mandatory_precedence(
+        self, isolated_approvals, monkeypatch
+    ):
+        command = "sh -c 'buzz messages send --channel public --message x'"
+        monkeypatch.setattr(
+            A,
+            "_get_approval_config",
+            lambda: {"mode": "off", "deny": [command]},
+        )
+        assert A.detect_mandatory_approval_command(command) == (
+            True,
+            "send an external Buzz message",
+        )
+        guard = A.check_all_command_guards(command, "local")
+        assert guard["approved"] is False
+        assert guard["user_deny"] is True
+        assert guard.get("mandatory_approval") is not True
+        verdict = at.evaluate_command(command)
+        assert verdict["verdict"] == "user-deny"
+        assert verdict["rule"] == command
+
+    @pytest.mark.parametrize("bypass", ["mode-off", "process-yolo", "session-yolo"])
+    def test_wrapped_mandatory_effect_beats_every_approval_bypass(
+        self, isolated_approvals, monkeypatch, bypass
+    ):
+        # Bind these controls to A's historical wrapper/late-payload RED:
+        # before that correction this command was allowed and not mandatory.
+        command = "sh -c 'buzz messages send --channel public --message x'"
+        if bypass == "mode-off":
+            monkeypatch.setattr(A, "_get_approval_config", lambda: {"mode": "off"})
+        elif bypass == "process-yolo":
+            monkeypatch.setattr(A, "_YOLO_MODE_FROZEN", True)
+        else:
+            monkeypatch.setattr(A, "is_current_session_yolo_enabled", lambda: True)
+
+        verdict = at.evaluate_command(command)
+        assert verdict["verdict"] == "ask-approval"
+        assert verdict["exit_code"] == 2
+        assert verdict["rule"] == "send an external Buzz message"
+        guard = A.check_all_command_guards(command, "local")
+        assert guard["approved"] is False
+        assert guard["mandatory_approval"] is True
+
+    def test_shell_variable_resolution_has_no_ambient_lookup(
+        self, isolated_approvals, monkeypatch
+    ):
+        class NoAmbientEnvironment(dict):
+            def _deny(self, *_args, **_kwargs):
+                raise AssertionError("shell variable resolution touched ambient state")
+
+            __contains__ = _deny
+            __getitem__ = _deny
+            __iter__ = _deny
+            get = _deny
+            items = _deny
+            keys = _deny
+            values = _deny
+
+        def deny_lookup(*_args, **_kwargs):
+            raise AssertionError("shell variable resolution performed ambient lookup")
+
+        command = "B=buzz; $B messages send --channel public --message x"
+        with monkeypatch.context() as lookup_guard:
+            lookup_guard.setattr(A.os, "environ", NoAmbientEnvironment())
+            lookup_guard.setattr(A.os, "getenv", deny_lookup)
+            lookup_guard.setattr(A.os, "system", deny_lookup)
+            lookup_guard.setattr(A.os, "popen", deny_lookup)
+            lookup_guard.setattr(A.os.path, "exists", deny_lookup)
+            lookup_guard.setattr(A.os.path, "isfile", deny_lookup)
+            lookup_guard.setattr(A.os.path, "isdir", deny_lookup)
+            lookup_guard.setattr(A, "_get_approval_config", deny_lookup)
+
+            program = A._resolve_shell_program(command)
+            assert program.status == A._ShellVariableStatus.RESOLVED
+            assert A.detect_mandatory_approval_command(command) == (
+                True,
+                "send an external Buzz message",
+            )
+
+
 class TestMandatoryHumanApproval:
     """Mandatory side effects always use one-operation human approval."""
 
@@ -564,6 +1236,160 @@ class TestMandatoryHumanApproval:
 
             assert result["approved"] is True
             assert len(approval_payloads) == 1
+            assert approval_payloads[0]["allow_permanent"] is False
+            assert approval_payloads[0]["allow_session"] is False
+            assert not A.is_approved(session_key, self.pattern_key)
+            assert self.pattern_key not in A._permanent_approved
+        finally:
+            A.unregister_gateway_notify(session_key)
+            A.clear_session(session_key)
+            A.reset_current_session_key(token)
+            A._permanent_approved.discard(self.pattern_key)
+
+
+class TestMandatoryWrappedHumanApproval:
+    """Wrapped effects cannot inherit or create reusable approval scope."""
+
+    command = "sh -c 'buzz messages send --channel public --message x'"
+    pattern_key = TestMandatoryHumanApproval.pattern_key
+
+    @staticmethod
+    def _configure_cli(monkeypatch, *, mode="manual"):
+        TestMandatoryHumanApproval._configure_cli(monkeypatch, mode=mode)
+
+    @pytest.mark.parametrize("scope", ["session", "permanent"])
+    def test_cached_pattern_cannot_bypass_wrapped_live_human(
+        self, copied_approval_collections, monkeypatch, scope
+    ):
+        self._configure_cli(monkeypatch)
+        session_key = f"mandatory-wrapped-preapproved-{scope}"
+        token = A.set_current_session_key(session_key)
+        prompts = []
+        try:
+            if scope == "session":
+                A.approve_session(session_key, self.pattern_key)
+            else:
+                A.approve_permanent(self.pattern_key)
+            assert A.is_approved(session_key, self.pattern_key) is True
+
+            result = A.check_all_command_guards(
+                self.command,
+                "local",
+                approval_callback=lambda command, description, **kwargs: (
+                    prompts.append((command, description, kwargs)) or "once"
+                ),
+            )
+
+            assert result["approved"] is True
+            assert result["mandatory_approval"] is True
+            assert result["description"] == "send an external Buzz message"
+            assert prompts == [
+                (
+                    self.command,
+                    "send an external Buzz message",
+                    {"allow_permanent": False, "smart_denied": True},
+                )
+            ]
+        finally:
+            A.clear_session(session_key)
+            A.reset_current_session_key(token)
+            A._permanent_approved.discard(self.pattern_key)
+
+    def test_smart_autoapproval_cannot_replace_wrapped_live_human(
+        self, copied_approval_collections, monkeypatch
+    ):
+        self._configure_cli(monkeypatch, mode="smart")
+        session_key = "mandatory-wrapped-smart"
+        token = A.set_current_session_key(session_key)
+        smart_calls = []
+        prompts = []
+        monkeypatch.setattr(
+            A,
+            "_smart_approve",
+            lambda command, description: smart_calls.append((command, description))
+            or "approve",
+        )
+        try:
+            result = A.check_all_command_guards(
+                self.command,
+                "local",
+                approval_callback=lambda *args, **kwargs: prompts.append(
+                    (args, kwargs)
+                )
+                or "once",
+            )
+
+            assert result["approved"] is True
+            assert result["mandatory_approval"] is True
+            assert result["description"] == "send an external Buzz message"
+            assert smart_calls == []
+            assert len(prompts) == 1
+            assert prompts[0][0][0] == self.command
+            assert prompts[0][1] == {
+                "allow_permanent": False,
+                "smart_denied": True,
+            }
+        finally:
+            A.clear_session(session_key)
+            A.reset_current_session_key(token)
+
+    @pytest.mark.parametrize("choice", ["session", "always"])
+    def test_cli_reusable_choice_stays_one_operation_for_wrapped_effect(
+        self, copied_approval_collections, monkeypatch, choice
+    ):
+        self._configure_cli(monkeypatch)
+        session_key = f"mandatory-wrapped-cli-{choice}"
+        token = A.set_current_session_key(session_key)
+        callback_kwargs = []
+        try:
+            result = A.check_all_command_guards(
+                self.command,
+                "local",
+                approval_callback=lambda _command, _description, **kwargs: (
+                    callback_kwargs.append(kwargs) or choice
+                ),
+            )
+
+            assert result["approved"] is True
+            assert result["mandatory_approval"] is True
+            assert callback_kwargs == [
+                {"allow_permanent": False, "smart_denied": True}
+            ]
+            assert not A.is_approved(session_key, self.pattern_key)
+            assert self.pattern_key not in A._permanent_approved
+        finally:
+            A.clear_session(session_key)
+            A.reset_current_session_key(token)
+            A._permanent_approved.discard(self.pattern_key)
+
+    @pytest.mark.parametrize("choice", ["session", "always"])
+    def test_gateway_reusable_choice_stays_one_operation_for_wrapped_effect(
+        self, copied_approval_collections, monkeypatch, choice
+    ):
+        monkeypatch.setattr(A, "_get_approval_config", lambda: {"mode": "manual"})
+        monkeypatch.setattr(A, "_is_interactive_cli", lambda: False)
+        monkeypatch.setattr(A, "_is_gateway_approval_context", lambda: True)
+        approval_payloads = []
+        monkeypatch.setattr(
+            A,
+            "_await_gateway_decision",
+            lambda _session, _notify, data, **_kwargs: (
+                approval_payloads.append(data)
+                or {"resolved": True, "choice": choice, "reason": None}
+            ),
+        )
+        session_key = f"mandatory-wrapped-gateway-{choice}"
+        token = A.set_current_session_key(session_key)
+        A.register_gateway_notify(session_key, lambda _data: None)
+        try:
+            result = A.check_all_command_guards(self.command, "local")
+
+            assert result["approved"] is True
+            assert result["mandatory_approval"] is True
+            assert result["description"] == "send an external Buzz message"
+            assert len(approval_payloads) == 1
+            assert approval_payloads[0]["command"] == self.command
+            assert approval_payloads[0]["mandatory_approval"] is True
             assert approval_payloads[0]["allow_permanent"] is False
             assert approval_payloads[0]["allow_session"] is False
             assert not A.is_approved(session_key, self.pattern_key)
@@ -793,8 +1619,14 @@ class TestNormalizationParity:
                 return real(c)
             return wrapper
 
-        monkeypatch.setattr(A, "detect_hardline_command",
-                            _spy("hardline", A.detect_hardline_command))
+        real_hardline = A.detect_hardline_command
+
+        def hardline_spy(c, *, _mandatory_analysis=None):
+            calls["hardline"] = c
+            calls["hardline_mandatory_analysis"] = _mandatory_analysis
+            return real_hardline(c, _mandatory_analysis=_mandatory_analysis)
+
+        monkeypatch.setattr(A, "detect_hardline_command", hardline_spy)
         monkeypatch.setattr(A, "detect_dangerous_command",
                             _spy("dangerous", A.detect_dangerous_command))
         monkeypatch.setattr(A, "_match_user_deny_rule",
@@ -805,6 +1637,7 @@ class TestNormalizationParity:
         at.approvals_test_command(_args(cmd.split()))
         capsys.readouterr()
         assert calls.get("hardline") == cmd
+        assert calls.get("hardline_mandatory_analysis") is not None
         assert calls.get("dangerous") == cmd
         assert calls.get("deny") == cmd
         assert calls.get("variants") == cmd

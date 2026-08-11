@@ -1850,6 +1850,745 @@ class TestProtectedPushGitAliases:
         assert detect_hardline_command(command) == (False, None)
 
 
+class TestTopLevelProtectedPushShellVariables:
+    protected_rule = "push to protected default branch (main/master)"
+
+    @staticmethod
+    def _assert_boundaries(command, *, blocked, clean_session, monkeypatch):
+        import tools.approval as approval_mod
+        from hermes_cli import approvals_test as approvals_test_mod
+
+        monkeypatch.setattr(
+            approval_mod, "_get_approval_config", lambda: {"mode": "off"}
+        )
+        monkeypatch.setattr(approval_mod, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setattr(
+            approval_mod, "is_current_session_yolo_enabled", lambda: False
+        )
+        monkeypatch.setattr(approval_mod, "load_permanent_allowlist", lambda: set())
+
+        detector = detect_hardline_command(command)
+        guard = check_all_command_guards(command, "local")
+        verdict = approvals_test_mod.evaluate_command(command)
+        if blocked:
+            assert detector == (
+                True,
+                TestTopLevelProtectedPushShellVariables.protected_rule,
+            )
+            assert guard["approved"] is False
+            assert guard["hardline"] is True
+            assert verdict["verdict"] == "hardline-deny"
+            assert verdict["exit_code"] == 3
+        else:
+            assert detector == (False, None)
+            assert guard["approved"] is True
+            assert guard.get("hardline") is not True
+            assert verdict["verdict"] == "allow"
+            assert verdict["exit_code"] == 0
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "G=git; $G push origin main",
+            "G='git'; ${G} push origin master",
+            'G=git; "$G" push origin main',
+            'G=git; "${G}" push origin master',
+            "G=git; $G'' push origin main",
+            "G=git; /usr/bin/$G push origin main",
+            "G=g; ${G}it push origin master",
+            "A=x G=/usr/local/bin/git; $G push origin main",
+            "A=x; G=git; ${G} push origin master",
+        ],
+    )
+    def test_b1_raw_executable_composition_blocks_protected_pushes(
+        self, command, clean_session, monkeypatch
+    ):
+        self._assert_boundaries(
+            command, blocked=True, clean_session=clean_session, monkeypatch=monkeypatch
+        )
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "G=printf; $G push origin main",
+            "G=git; '$G' push origin main",
+            r"G=git; \$G push origin main",
+            "G=git; echo '$G push origin main'",
+            r'G=git; printf "%s" "\$G push origin main"',
+            "G=git; $G status",
+            "G=git; $G push origin feature/topic",
+            "G=git; ${G} push origin HEAD:refs/heads/feature/topic",
+        ],
+    )
+    def test_b1_quote_provenance_and_nonprotected_controls_remain_safe(
+        self, command, clean_session, monkeypatch
+    ):
+        self._assert_boundaries(
+            command, blocked=False, clean_session=clean_session, monkeypatch=monkeypatch
+        )
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "G=git; env $G push origin main",
+            "G=git; env -u UNUSED $G push origin master",
+            "G=git; nice -n 5 $G push origin main",
+        ],
+    )
+    def test_core_wrapper_argv_blocks_variable_backed_protected_pushes(
+        self, command, clean_session, monkeypatch
+    ):
+        self._assert_boundaries(
+            command, blocked=True, clean_session=clean_session, monkeypatch=monkeypatch
+        )
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "G=printf; env $G push origin main",
+            "G=git; env $G status",
+            "G=git; env -u UNUSED $G push origin feature/topic",
+            "G=git; nice -n 5 $G status",
+            'G=git; printf "%s" "env $G push origin main"',
+        ],
+    )
+    def test_core_wrapper_argv_preserves_status_feature_and_prose_controls(
+        self, command, clean_session, monkeypatch
+    ):
+        self._assert_boundaries(
+            command, blocked=False, clean_session=clean_session, monkeypatch=monkeypatch
+        )
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "env -S 'git push origin main'",
+            "env --split-string='git push origin master'",
+            "env -S 'git push origin main",
+            'env -S "git \'push origin master"',
+            r"env -S 'git push origin main \q'",
+        ],
+    )
+    def test_core_env_split_string_payload_blocks_protected_pushes(
+        self, command, clean_session, monkeypatch
+    ):
+        self._assert_boundaries(
+            command, blocked=True, clean_session=clean_session, monkeypatch=monkeypatch
+        )
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "env -S 'git status --short'",
+            "env --split-string='git push origin feature/topic'",
+            "env -S 'printf \"%s\" \"git push origin main\"'",
+            "env -S 'git status",
+            'env -S "printf \'%s\' \'git push origin main"',
+            r"env -S 'git status\q'",
+            "printf '%s' \"env -S 'git push origin main'\"",
+        ],
+    )
+    def test_core_env_split_string_preserves_status_feature_and_prose_controls(
+        self, command, clean_session, monkeypatch
+    ):
+        self._assert_boundaries(
+            command, blocked=False, clean_session=clean_session, monkeypatch=monkeypatch
+        )
+
+    def test_core_alias_definition_does_not_hide_sibling_protected_substitution(
+        self, clean_session, monkeypatch
+    ):
+        command = 'git -c alias.s=status "$(G=git; $G push origin main)"'
+        self._assert_boundaries(
+            command, blocked=True, clean_session=clean_session, monkeypatch=monkeypatch
+        )
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'git -c "alias.s=status$(G=git; $G push origin main)" status',
+            "git -calias.s=status$(G=git; $G push origin master) status",
+        ],
+    )
+    def test_core_alias_same_word_outer_substitution_blocks_protected_pushes(
+        self, command, clean_session, monkeypatch
+    ):
+        self._assert_boundaries(
+            command, blocked=True, clean_session=clean_session, monkeypatch=monkeypatch
+        )
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'git -c "alias.s=status$(G=git; $G status --short)" status',
+            (
+                'git -c "alias.s=status$(G=git; '
+                '$G push origin feature/topic)" status'
+            ),
+            "git -c 'alias.s=status$(G=git; $G push origin main)' status",
+            "git -calias.s=status'$(G=git; $G push origin main)' status",
+            (
+                'git -c "alias.s=status$(printf \'%s\' '
+                "'git push origin main')\" status"
+            ),
+        ],
+    )
+    def test_core_alias_same_word_substitution_controls_remain_safe(
+        self, command, clean_session, monkeypatch
+    ):
+        self._assert_boundaries(
+            command, blocked=False, clean_session=clean_session, monkeypatch=monkeypatch
+        )
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "git -c alias.s=status",
+            "git -c alias.s=status s --short",
+            'git -c alias.s=status "$(G=git; $G status)"',
+            'git -c alias.s=status "$(G=git; $G push origin feature/topic)"',
+            "git -c alias.s=status '$(G=git; $G push origin main)'",
+            (
+                "git -c alias.s=status "
+                '"$(printf \'%s\' \'G=git; $G push origin main\')"'
+            ),
+        ],
+    )
+    def test_core_alias_definition_preserves_status_feature_and_prose_controls(
+        self, command, clean_session, monkeypatch
+    ):
+        self._assert_boundaries(
+            command, blocked=False, clean_session=clean_session, monkeypatch=monkeypatch
+        )
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "cat <<'EOF'\nG=git; $G push origin main\nEOF",
+            "cat <<'EOF'\n$(G=git; $G push origin main)\nEOF",
+            "cat <<EOF\ngit push origin master\nEOF",
+            "cat <<-'EOF'\n\tG=git; $G push origin main\n\tEOF",
+            (
+                "cat <<A <<B\n"
+                "G=git; $G push origin main\nA\n"
+                "rm -rf /\nB"
+            ),
+            "printf ok # git push origin main",
+            "printf ok # rm -rf /",
+            "printf '%s' '# git push origin main'",
+            r"printf '%s' \# git push origin main",
+            "printf ok; " + "\\" + "\n# rm -rf /\nprintf done",
+        ],
+    )
+    def test_core_hardline_semantic_text_ownership_preserves_safe_data(
+        self, command, clean_session, monkeypatch
+    ):
+        self._assert_boundaries(
+            command, blocked=False, clean_session=clean_session, monkeypatch=monkeypatch
+        )
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            (
+                "cat <<'EOF'\n"
+                "G=git; $G status --short\nEOF\n"
+                "G=git; $G push origin main"
+            ),
+            "printf ok # comment ends here\ngit push origin master",
+            "printf '%s' '#' ; G=git; $G push origin main",
+            r"printf '%s' \#; git push origin master",
+            "cat <<EOF\n$(G=git; $G push origin main)\nEOF",
+        ],
+    )
+    def test_core_hardline_semantic_text_ownership_preserves_real_commands(
+        self, command, clean_session, monkeypatch
+    ):
+        self._assert_boundaries(
+            command, blocked=True, clean_session=clean_session, monkeypatch=monkeypatch
+        )
+
+    @pytest.mark.parametrize(
+        "case",
+        ["delimiter", "too-many", "premature-eof", "malformed-delimiter"],
+    )
+    def test_core_hardline_semantic_parser_limits_fail_closed_at_boundaries(
+        self, case, clean_session, monkeypatch
+    ):
+        import tools.approval as approval_mod
+        from hermes_cli import approvals_test as approvals_test_mod
+
+        monkeypatch.setattr(
+            approval_mod, "_get_approval_config", lambda: {"mode": "off"}
+        )
+        monkeypatch.setattr(approval_mod, "_save_blocked_payload", lambda _cmd: None)
+        if case == "delimiter":
+            delimiter = "D" * (approval_mod._MAX_HEREDOC_DELIMITER_CHARS + 1)
+            command = f"cat <<{delimiter}\ngit push origin main\n{delimiter}"
+        elif case == "too-many":
+            monkeypatch.setattr(
+                approval_mod, "_MAX_PENDING_HEREDOCS", 1, raising=False
+            )
+            command = "cat <<A <<B\nprintf ok\nA\ngit push origin main\nB"
+        elif case == "premature-eof":
+            command = "cat <<EOF\nG=git; $G push origin main"
+        else:
+            command = "cat <<'EOF\nG=git; $G push origin main\nEOF"
+
+        assert detect_hardline_command(command) == (
+            True,
+            approval_mod._PARSER_LIMIT_DESCRIPTION,
+        )
+        guard = check_all_command_guards(command, "local")
+        assert guard["approved"] is False
+        assert guard["hardline"] is True
+        assert approval_mod._PARSER_LIMIT_DESCRIPTION in guard["message"]
+        verdict = approvals_test_mod.evaluate_command(command)
+        assert verdict["verdict"] == "hardline-deny"
+        assert verdict["exit_code"] == 3
+        assert verdict["rule"] == approval_mod._PARSER_LIMIT_DESCRIPTION
+
+    _LINE_CONTINUATION = "\\" + "\n"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "G=g; ${G}" + _LINE_CONTINUATION + "it push origin main",
+            'G=g; "${G}' + _LINE_CONTINUATION + 'it" push origin master',
+        ],
+    )
+    def test_core_line_continuation_composes_protected_git_executable(
+        self, command, clean_session, monkeypatch
+    ):
+        self._assert_boundaries(
+            command, blocked=True, clean_session=clean_session, monkeypatch=monkeypatch
+        )
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            r'G="g\it"; $G push origin main',
+            r'G="g\qt"; $G push origin master',
+            r"G='g\it'; $G push origin main",
+            r"G=git; \$G push origin main",
+            "G=g; ${G}" + _LINE_CONTINUATION + "it status",
+            (
+                'G=g; "${G}'
+                + _LINE_CONTINUATION
+                + 'it" push origin feature/topic'
+            ),
+            "G=g; '${G}" + _LINE_CONTINUATION + "it' push origin main",
+        ],
+    )
+    def test_core_backslash_quote_feature_and_status_controls_remain_safe(
+        self, command, clean_session, monkeypatch
+    ):
+        self._assert_boundaries(
+            command, blocked=False, clean_session=clean_session, monkeypatch=monkeypatch
+        )
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "G=git; G=printf $G push origin main",
+            "G=git; $G push origin main; G=printf",
+        ],
+    )
+    def test_b2_same_command_and_source_order_use_prior_state(
+        self, command, clean_session, monkeypatch
+    ):
+        self._assert_boundaries(
+            command, blocked=True, clean_session=clean_session, monkeypatch=monkeypatch
+        )
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "G=printf; G=git $G push origin main",
+            "G=printf; $G push origin main; G=git",
+        ],
+    )
+    def test_b2_prefix_and_later_assignments_never_rewrite_the_command(
+        self, command, clean_session, monkeypatch
+    ):
+        self._assert_boundaries(
+            command, blocked=False, clean_session=clean_session, monkeypatch=monkeypatch
+        )
+
+    _B3_POISONS = [
+        "echo ready",
+        "printf '%s' ready",
+        "true",
+        "false",
+        "printf -v G git",
+        "X=$OTHER",
+        "X=$(printf git)",
+        "unset G",
+        "export G=git",
+        "readonly G=git",
+        "declare G=git",
+        "read G",
+        "eval 'G=git'",
+        "source /synthetic/script",
+        ". /synthetic/script",
+        "alias G=git",
+        "f(){ G=git; }; f",
+        "trap 'G=git' DEBUG",
+        "if true; then G=git; fi",
+    ]
+
+    @pytest.mark.parametrize("poison", _B3_POISONS)
+    def test_b3_every_executable_dynamic_or_control_event_sticky_poisons_state(
+        self, poison, clean_session, monkeypatch
+    ):
+        command = f"G=printf; {poison}; $G push origin main"
+        self._assert_boundaries(
+            command, blocked=True, clean_session=clean_session, monkeypatch=monkeypatch
+        )
+
+    @pytest.mark.parametrize("poison", _B3_POISONS)
+    @pytest.mark.parametrize(
+        "suffix",
+        [
+            "$G status",
+            "$G push origin feature/topic",
+            "echo '$G push origin main'",
+            r"echo \$G push origin main",
+        ],
+    )
+    def test_b3_poisoned_status_feature_and_prose_controls_remain_safe(
+        self, poison, suffix, clean_session, monkeypatch
+    ):
+        command = f"G=printf; {poison}; {suffix}"
+        self._assert_boundaries(
+            command, blocked=False, clean_session=clean_session, monkeypatch=monkeypatch
+        )
+
+    _B4_BARRIERS = [
+        "G=printf | G=printf;",
+        "G=printf && G=printf;",
+        "G=printf || G=printf;",
+        "G=printf & G=printf;",
+        "(G=printf);",
+        "{ G=printf; };",
+        "( { G=printf; }; );",
+        "f(){ G=printf; }; f;",
+        "case x in x) G=printf ;; esac;",
+        "for x in one; do G=printf; done;",
+        "while false; do G=printf; done;",
+    ]
+
+    @pytest.mark.parametrize("prefix", _B4_BARRIERS)
+    def test_b4_connectors_groups_and_control_constructs_are_barriers(
+        self, prefix, clean_session, monkeypatch
+    ):
+        self._assert_boundaries(
+            f"{prefix} $G push origin main",
+            blocked=True,
+            clean_session=clean_session,
+            monkeypatch=monkeypatch,
+        )
+
+    @pytest.mark.parametrize("prefix", _B4_BARRIERS)
+    @pytest.mark.parametrize(
+        "suffix",
+        [
+            "$G status",
+            "$G push origin feature/topic",
+            "echo '$G push origin main'",
+            r"echo \$G push origin main",
+        ],
+    )
+    def test_b4_barrier_status_feature_and_prose_controls_remain_safe(
+        self, prefix, suffix, clean_session, monkeypatch
+    ):
+        self._assert_boundaries(
+            f"{prefix} {suffix}",
+            blocked=False,
+            clean_session=clean_session,
+            monkeypatch=monkeypatch,
+        )
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "git -c 'alias.s=!G=git; $G push origin main; G=printf' s",
+            "sh -c 'G=git; $G push origin main; G=printf'",
+            "echo \"$(G=git; $G push origin main; G=printf)\"",
+        ],
+    )
+    def test_b5_alias_and_raw_payload_source_order_blocks_protected_pushes(
+        self, command, clean_session, monkeypatch
+    ):
+        self._assert_boundaries(
+            command,
+            blocked=True,
+            clean_session=clean_session,
+            monkeypatch=monkeypatch,
+        )
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "git -c 'alias.s=!G=printf; $G push origin main; G=git' s",
+            "sh -c 'printf \"%s\" \"G=git; $G push origin main\"'",
+            "echo \"$(printf '%s' 'G=git; $G push origin main')\"",
+        ],
+    )
+    def test_b5_later_bindings_and_quoted_payload_prose_remain_safe(
+        self, command, clean_session, monkeypatch
+    ):
+        self._assert_boundaries(
+            command,
+            blocked=False,
+            clean_session=clean_session,
+            monkeypatch=monkeypatch,
+        )
+
+    def test_b7_program_resolution_records_assignment_and_command_events(self):
+        import tools.approval as approval_mod
+
+        program = approval_mod._resolve_shell_program(
+            "G=git; G=printf $G push origin main"
+        )
+
+        assert program.status == approval_mod._ShellVariableStatus.RESOLVED
+        assert [event.kind for event in program.events] == [
+            "assignment",
+            "executable",
+        ]
+        assignment, command = program.events
+        assert assignment.prefix_assignments == (("G", "git"),)
+        assert command.prefix_assignments == (("G", "printf"),)
+        assert command.executable is not None
+        assert command.executable.value == "git"
+        assert command.resolved_basename == "git"
+        assert command.trusted_bindings == (("G", "git"),)
+
+    def test_b7_word_resolution_accounts_fragments_replacements_and_bytes(self):
+        import tools.approval as approval_mod
+
+        budget = approval_mod._ShellVariableBudget()
+        resolution = approval_mod._resolve_shell_word(
+            "pre${G}post", {"G": "git"}, budget
+        )
+
+        assert resolution.status == approval_mod._ShellVariableStatus.RESOLVED
+        assert resolution.value == "pregitpost"
+        assert [fragment.kind for fragment in resolution.fragments] == [
+            "literal",
+            "parameter",
+            "literal",
+        ]
+        assert budget.fragments == 3
+        assert budget.replacements == 1
+        assert budget.emitted_bytes == len("pregitpost".encode())
+
+    @pytest.mark.parametrize(
+        ("constant", "resolver_kind", "source"),
+        [
+            ("_MAX_GIT_LEADING_ASSIGNMENTS", "program", "G=git"),
+            ("_MAX_DETECTION_WORK_ITEMS", "program", "true"),
+            ("_MAX_SHELL_VARIABLE_FRAGMENTS", "word", "literal"),
+            ("_MAX_SHELL_VARIABLE_REPLACEMENTS", "word", "$G"),
+        ],
+    )
+    def test_b7_direct_budget_caps_return_overflow(
+        self, constant, resolver_kind, source, monkeypatch
+    ):
+        import tools.approval as approval_mod
+
+        monkeypatch.setattr(approval_mod, constant, 0)
+        budget = approval_mod._ShellVariableBudget()
+        if resolver_kind == "program":
+            resolution = approval_mod._resolve_shell_program(source, budget=budget)
+        else:
+            resolution = approval_mod._resolve_shell_word(source, {}, budget)
+
+        assert resolution.status == approval_mod._ShellVariableStatus.OVERFLOW
+        assert budget.overflowed is True
+
+    @pytest.mark.parametrize(
+        ("constant", "command"),
+        [
+            (
+                "_MAX_GIT_LEADING_ASSIGNMENTS",
+                "G=git; $G push origin main",
+            ),
+            (
+                "_MAX_DETECTION_WORK_ITEMS",
+                "G=git; $G push origin main",
+            ),
+            (
+                "_MAX_SHELL_VARIABLE_FRAGMENTS",
+                "G=git; $G push origin main",
+            ),
+            (
+                "_MAX_SHELL_VARIABLE_REPLACEMENTS",
+                "$G push origin main",
+            ),
+        ],
+    )
+    def test_core_caller_budget_caps_fail_closed_without_materializing_overflow(
+        self, constant, command, clean_session, monkeypatch
+    ):
+        import tools.approval as approval_mod
+        from hermes_cli import approvals_test as approvals_test_mod
+
+        materialized = []
+
+        def record_materialization(parts):
+            materialized.append(tuple(parts))
+            return "".join(parts)
+
+        monkeypatch.setattr(approval_mod, constant, 0)
+        monkeypatch.setattr(
+            approval_mod, "_materialize_shell_word", record_materialization
+        )
+        monkeypatch.setattr(approval_mod, "_save_blocked_payload", lambda _cmd: None)
+        monkeypatch.setattr(
+            approval_mod, "_get_approval_config", lambda: {"mode": "off"}
+        )
+        monkeypatch.setattr(approval_mod, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setattr(
+            approval_mod, "is_current_session_yolo_enabled", lambda: False
+        )
+        monkeypatch.setattr(approval_mod, "load_permanent_allowlist", lambda: set())
+
+        assert detect_hardline_command(command) == (
+            True,
+            approval_mod._PARSER_LIMIT_DESCRIPTION,
+        )
+        assert materialized == []
+
+        materialized.clear()
+        guard = check_all_command_guards(command, "local")
+        assert guard["approved"] is False
+        assert guard["hardline"] is True
+        assert approval_mod._PARSER_LIMIT_DESCRIPTION in guard["message"]
+        assert materialized == []
+
+        materialized.clear()
+        verdict = approvals_test_mod.evaluate_command(command)
+        assert verdict["verdict"] == "hardline-deny"
+        assert verdict["exit_code"] == 3
+        assert materialized == []
+
+    def test_b7_unsupported_parameter_syntax_is_unresolved_not_overflow(self):
+        import tools.approval as approval_mod
+
+        budget = approval_mod._ShellVariableBudget()
+        resolution = approval_mod._resolve_shell_word("${G:-git}", {}, budget)
+
+        assert resolution.status == approval_mod._ShellVariableStatus.UNRESOLVED
+        assert resolution.value is None
+        assert budget.overflowed is False
+
+    def test_b7_emitted_byte_overflow_never_materializes_output(
+        self, monkeypatch
+    ):
+        import tools.approval as approval_mod
+
+        materialized = []
+        monkeypatch.setattr(approval_mod, "_MAX_SHELL_VARIABLE_EMITTED_BYTES", 3)
+        monkeypatch.setattr(
+            approval_mod,
+            "_materialize_shell_word",
+            lambda parts: materialized.append(parts) or "unexpected",
+        )
+        budget = approval_mod._ShellVariableBudget()
+
+        resolution = approval_mod._resolve_shell_word("abcd", {}, budget)
+
+        assert resolution.status == approval_mod._ShellVariableStatus.OVERFLOW
+        assert resolution.value is None
+        assert budget.overflowed is True
+        assert materialized == []
+
+    def test_b7_recursive_payload_uses_containing_source_order_state(self):
+        import tools.approval as approval_mod
+
+        budget = approval_mod._ShellVariableBudget()
+        protected, status = approval_mod._shell_variable_default_branch_push(
+            'G=git; echo "$($G push origin main)"', budget=budget
+        )
+
+        assert protected is True
+        assert status == approval_mod._ShellVariableStatus.RESOLVED
+        assert budget.payload_work == 1
+        assert budget.depth == 1
+
+    @pytest.mark.parametrize(
+        ("constant", "limit", "initial_payload_work"),
+        [
+            ("_MAX_DETECTION_WORK_ITEMS", 2, 2),
+            ("_MAX_GIT_SHELL_RECURSION", 0, 0),
+        ],
+    )
+    def test_b7_recursive_payload_caps_return_overflow(
+        self, constant, limit, initial_payload_work, monkeypatch
+    ):
+        import tools.approval as approval_mod
+
+        monkeypatch.setattr(approval_mod, constant, limit)
+        budget = approval_mod._ShellVariableBudget(
+            payload_work=initial_payload_work
+        )
+        protected, status = approval_mod._shell_variable_default_branch_push(
+            'echo "$(printf ready)"', budget=budget
+        )
+
+        assert protected is False
+        assert status == approval_mod._ShellVariableStatus.OVERFLOW
+        assert budget.overflowed is True
+
+    def test_b7_payload_findings_overflow_surfaces_parser_limit_at_boundaries(
+        self, clean_session, monkeypatch
+    ):
+        import tools.approval as approval_mod
+        from hermes_cli import approvals_test as approvals_test_mod
+
+        monkeypatch.setattr(approval_mod, "_MAX_PAYLOAD_FINDINGS_PER_VARIANT", 1)
+        monkeypatch.setattr(
+            approval_mod, "_get_approval_config", lambda: {"mode": "off"}
+        )
+        command = 'sh -c "printf ready" "$(printf one)"'
+
+        protected, status = approval_mod._shell_variable_default_branch_push(command)
+        assert protected is False
+        assert status == approval_mod._ShellVariableStatus.OVERFLOW
+        assert detect_hardline_command(command) == (
+            True,
+            approval_mod._PARSER_LIMIT_DESCRIPTION,
+        )
+        guard = check_all_command_guards(command, "local")
+        assert guard["approved"] is False
+        assert guard["hardline"] is True
+        verdict = approvals_test_mod.evaluate_command(command)
+        assert verdict["verdict"] == "hardline-deny"
+        assert verdict["exit_code"] == 3
+
+    def test_b7_synthesized_git_event_disables_variable_recursion(
+        self, monkeypatch
+    ):
+        import tools.approval as approval_mod
+
+        program = approval_mod._resolve_shell_program(
+            "G=git; $G push origin main"
+        )
+        command_event = program.events[-1]
+
+        def unexpected_recursion(*_args, **_kwargs):
+            raise AssertionError("synthesized Git recursively resolved variables")
+
+        monkeypatch.setattr(
+            approval_mod,
+            "_shell_variable_default_branch_push",
+            unexpected_recursion,
+        )
+        assert approval_mod._shell_event_default_branch_push(command_event, 0) is True
+
+
 class TestHardlinePublicDiagnostics:
     @pytest.mark.parametrize(
         "caller_name", ["check_dangerous_command", "check_all_command_guards"]
