@@ -54,6 +54,78 @@ def test_arbitrary_hermes_home_file_not_blocked(fake_home):
     assert get_read_block_error(str(safe)) is None
 
 
+def test_bridge_private_key_is_blocked(fake_home):
+    from agent.file_safety import get_read_block_error
+
+    private_key = _create(fake_home, Path("bridge") / "keys" / "signing-key.priv")
+    error = get_read_block_error(str(private_key))
+    assert error is not None
+    assert "private key" in error.lower() or "credential" in error.lower()
+
+
+def test_bridge_private_key_symlink_file_cannot_escape_guard(fake_home, tmp_path):
+    from agent.file_safety import get_read_block_error
+
+    outside = tmp_path / "public-material.txt"
+    outside.write_text("dummy", encoding="utf-8")
+    key_alias = fake_home / "bridge" / "keys" / "signing-key.priv"
+    key_alias.parent.mkdir(parents=True)
+    key_alias.symlink_to(outside)
+    assert key_alias.resolve() == outside.resolve()
+
+    error = get_read_block_error(str(key_alias))
+    assert error is not None
+    assert "private key" in error.lower() or "credential" in error.lower()
+
+
+def test_bridge_private_key_symlink_directory_cannot_escape_guard(
+    fake_home, tmp_path
+):
+    from agent.file_safety import get_read_block_error
+
+    outside = tmp_path / "external-material"
+    outside.mkdir()
+    (outside / "rotation-key.priv").write_text("dummy", encoding="utf-8")
+    linked_dir = fake_home / "bridge" / "keys" / "linked"
+    linked_dir.parent.mkdir(parents=True)
+    linked_dir.symlink_to(outside, target_is_directory=True)
+    requested = linked_dir / "rotation-key.priv"
+    assert requested.resolve().parent == outside.resolve()
+
+    error = get_read_block_error(str(requested))
+    assert error is not None
+    assert "private key" in error.lower() or "credential" in error.lower()
+
+
+def test_symlinked_hermes_home_blocks_escaping_bridge_private_key_only(
+    tmp_path, monkeypatch
+):
+    import agent.file_safety as fs
+
+    real_home = tmp_path / "real-hermes-home"
+    real_home.mkdir()
+    symlinked_home = tmp_path / "symlinked-hermes-home"
+    symlinked_home.symlink_to(real_home, target_is_directory=True)
+    monkeypatch.setattr(fs, "_hermes_home_path", lambda: symlinked_home)
+    monkeypatch.setattr(fs, "_hermes_root_path", lambda: symlinked_home)
+
+    outside = tmp_path / "external-material"
+    outside.mkdir()
+    (outside / "rotation-key.priv").write_text("dummy", encoding="utf-8")
+    linked_dir = real_home / "bridge" / "keys" / "linked"
+    linked_dir.parent.mkdir(parents=True)
+    linked_dir.symlink_to(outside, target_is_directory=True)
+
+    requested = symlinked_home / "bridge" / "keys" / "linked" / "rotation-key.priv"
+    assert requested.resolve().parent == outside.resolve()
+    error = fs.get_read_block_error(str(requested))
+    assert error is not None
+    assert "private key" in error.lower() or "credential" in error.lower()
+
+    safe = _create(symlinked_home, "session_log.txt")
+    assert fs.get_read_block_error(str(safe)) is None
+
+
 def test_subdirectory_named_auth_json_not_blocked(fake_home):
     """Only the top-level auth.json is the credential store; a file with the
     same name in a subdirectory (e.g., a skill mock) must remain readable."""

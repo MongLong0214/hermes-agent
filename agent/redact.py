@@ -360,6 +360,10 @@ _PRIVATE_KEY_RE = re.compile(
     r"-----BEGIN[A-Z ]*PRIVATE KEY-----[\s\S]*?-----END[A-Z ]*PRIVATE KEY-----"
 )
 
+# Raw Ed25519/secp256k1 private keys are commonly serialized as one 32-byte
+# hex token and have no vendor prefix. Mask the whole token (no head/tail).
+_RAW_64_HEX_SECRET_RE = re.compile(r"(?<![A-Fa-f0-9])[A-Fa-f0-9]{64}(?![A-Fa-f0-9])")
+
 # Database connection strings: protocol://user:PASSWORD@host
 # Catches postgres, mysql, mongodb, redis, amqp URLs and redacts the password.
 # The userinfo and password groups forbid whitespace ([^:\s]+ / [^@\s]+) so the
@@ -943,6 +947,10 @@ def redact_sensitive_text(
     if "BEGIN" in text and "-----" in text:
         text = _PRIVATE_KEY_RE.sub("[REDACTED PRIVATE KEY]", text)
 
+    # A standalone SHA-256 digest is indistinguishable from a raw 32-byte key;
+    # at a secret-output boundary the conservative false positive is safer.
+    text = _RAW_64_HEX_SECRET_RE.sub("[REDACTED 64-HEX SECRET]", text)
+
     # Database connection string passwords. With code_file=True, a password
     # group that is a pure ``{...}`` brace expression is an f-string template
     # reference (e.g. f"postgresql://{user}:{pass}@{host}"), not a literal
@@ -1098,6 +1106,148 @@ def is_env_dump_command(command: str | None) -> bool:
     return False
 
 
+def _iter_top_level_shell_segments(command: str):
+    """Yield quote-aware command segments across shell sequencing operators."""
+    start = 0
+    quote: str | None = None
+    escaped = False
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if escaped:
+            escaped = False
+        elif char == "\\" and quote != "'":
+            escaped = True
+        elif quote:
+            if char == quote:
+                quote = None
+        elif char in {"'", '"'}:
+            quote = char
+        elif char in ";&|\n":
+            if start < index:
+                yield command[start:index]
+            if char in "&|" and index + 1 < len(command) and command[index + 1] == char:
+                index += 1
+            start = index + 1
+        index += 1
+    if start < len(command):
+        yield command[start:]
+
+
+def _parse_shell_segment_argv(segment: str) -> list[str] | None:
+    """Tokenize a segment and unwrap command-substitution/group delimiters."""
+    try:
+        lexer = shlex.shlex(
+            segment.strip(),
+            posix=True,
+            punctuation_chars="`(){}",
+        )
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        argv = list(lexer)
+    except ValueError:
+        return None
+
+    while argv and argv[0] in {"`", "(", "{"}:
+        argv.pop(0)
+    while argv and argv[-1] in {"`", ")", "}"}:
+        argv.pop()
+    return argv
+
+
+def _command_runs_docker_inspect(command: str | None) -> bool:
+    """Recognize Docker inspect, forcing redaction on parser uncertainty."""
+    if not command or not isinstance(command, str):
+        return False
+
+    # Import at runtime to avoid an import-order cycle: tools.approval uses the
+    # redactor at approval boundaries, while this path only needs its bounded,
+    # non-executing stream of command-position and interpreter payload forms.
+    from tools.approval import (
+        _command_detection_variants,
+        _command_parser_limit_exceeded,
+        _PARSER_LIMIT_VARIANT,
+    )
+
+    # Oversized or carrier-heavy commands are opaque at this output boundary.
+    # Force generic KEY=value masking before any recursive/token/variant work;
+    # the redactor must never leak merely because the detector declined to parse.
+    if _command_parser_limit_exceeded(command):
+        return True
+
+    docker_value_options = {
+        "--config", "-c", "--context", "-H", "--host", "-l", "--log-level",
+        "--tlscacert", "--tlscert", "--tlskey",
+    }
+    wrapper_value_options = {
+        "sudo": {
+            "-C", "--chdir", "-g", "--group", "-h", "--host", "-p", "--prompt",
+            "-R", "--chroot", "-r", "--role", "-T", "--command-timeout", "-t",
+            "--type", "-u", "--user",
+        },
+        "env": {"-C", "--chdir", "-S", "--split-string", "-u", "--unset"},
+        "exec": {"-a"},
+        "time": {"-f", "--format", "-o", "--output"},
+        "nice": {"-n", "--adjustment"},
+    }
+    wrappers = {
+        "sudo", "env", "exec", "nohup", "setsid", "time", "command", "nice",
+    }
+
+    for variant in _command_detection_variants(command):
+        if variant == _PARSER_LIMIT_VARIANT:
+            return True
+        for segment in _iter_top_level_shell_segments(variant):
+            argv = _parse_shell_segment_argv(segment)
+            if argv is None:
+                continue
+            while argv:
+                while argv and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", argv[0]):
+                    argv.pop(0)
+                if not argv:
+                    break
+                wrapper = os.path.basename(argv[0]).lower()
+                if wrapper not in wrappers:
+                    break
+                argv.pop(0)
+                value_options = wrapper_value_options.get(wrapper, set())
+                i = 0
+                while i < len(argv) and argv[i].startswith("-") and argv[i] != "-":
+                    token = argv[i]
+                    if token == "--":
+                        i += 1
+                        break
+                    option = token.split("=", 1)[0]
+                    i += 1
+                    if "=" not in token and option in value_options and i < len(argv):
+                        i += 1
+                argv = argv[i:]
+                if wrapper == "env":
+                    while argv and re.fullmatch(
+                        r"[A-Za-z_][A-Za-z0-9_]*=.*", argv[0]
+                    ):
+                        argv.pop(0)
+
+            if not argv or os.path.basename(argv[0]).lower() != "docker":
+                continue
+            i = 1
+            while i < len(argv) and argv[i].startswith("-") and argv[i] != "-":
+                token = argv[i]
+                if token == "--":
+                    i += 1
+                    break
+                option = token.split("=", 1)[0]
+                i += 1
+                if "=" not in token and option in docker_value_options and i < len(argv):
+                    i += 1
+            command_words = [word.lower() for word in argv[i:i + 2]]
+            if command_words[:1] == ["inspect"]:
+                return True
+            if command_words == ["container", "inspect"]:
+                return True
+    return False
+
+
 def redact_terminal_output(
     output: str, command: str | None = None, *, force: bool = False
 ) -> str:
@@ -1115,17 +1265,34 @@ def redact_terminal_output(
       Per AGENTS.md, ``.env`` files contain only secrets, so the generic
       ENV pass is the right one (keys whose names carry no secret keyword
       can still slip through it — same limit as the env-dump path).
+    - Docker inspect (direct or ``docker container inspect``, including Docker
+      global options) → ``code_file=False`` and forced redaction because
+      ``Config.Env`` can contain opaque credential values.
+    - a command that exceeds the bounded parser/carrier/variant budgets → the
+      same forced opaque-env redaction, because its behavior cannot be safely
+      classified without exceeding the parser's work limits.
     - anything else (or unknown command) → ``code_file=True`` to avoid
       false positives on source/config dumps.
 
     ``force=True`` bypasses the global ``security.redact_secrets`` preference
-    for safety boundaries that must never emit raw credentials.
+    for safety boundaries that must never emit raw credentials. Docker inspect
+    and parser-budget exhaustion are always such boundaries regardless of the
+    caller's flag.
     """
     if not output:
         return output
     cmd = command or ""
-    code_file = not (is_env_dump_command(cmd) or _command_reads_env_file(cmd))
-    return redact_sensitive_text(output, force=force, code_file=code_file)
+    force_opaque_env_redaction = _command_runs_docker_inspect(cmd)
+    code_file = not (
+        is_env_dump_command(cmd)
+        or _command_reads_env_file(cmd)
+        or force_opaque_env_redaction
+    )
+    return redact_sensitive_text(
+        output,
+        force=force or force_opaque_env_redaction,
+        code_file=code_file,
+    )
 
 
 # Substrings used to gate ``_PREFIX_RE`` execution. If none of these appear in
