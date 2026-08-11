@@ -62,7 +62,7 @@ class TestDenyBeatsYolo:
         deny_config(["git push --force*"])
         monkeypatch.setattr(mod, "_YOLO_MODE_FROZEN", True)
 
-        result = mod.check_dangerous_command("git push --force origin main", "local")
+        result = mod.check_dangerous_command("git push --force origin feature/topic", "local")
         assert result["approved"] is False
         assert result.get("user_deny") is True
         assert "approvals.deny" in result["message"]
@@ -90,7 +90,7 @@ class TestDenyBeatsYolo:
         deny_config([])
         monkeypatch.setattr(mod, "_YOLO_MODE_FROZEN", True)
 
-        result = mod.check_dangerous_command("git push --force origin main", "local")
+        result = mod.check_dangerous_command("git push --force origin feature/topic", "local")
         assert result["approved"] is True
 
 
@@ -109,7 +109,7 @@ class TestDenyOrdering:
         monkeypatch.setattr(
             mod, "_command_matches_permanent_allowlist", lambda c: True)
 
-        result = mod.check_dangerous_command("git push --force origin main", "local")
+        result = mod.check_dangerous_command("git push --force origin feature/topic", "local")
         assert result["approved"] is False
         assert result.get("user_deny") is True
 
@@ -127,7 +127,7 @@ class TestDenyOrdering:
 
     def test_block_message_tells_agent_not_to_retry(self, deny_config, clean_env):
         deny_config(["git push --force*"])
-        result = mod.check_dangerous_command("git push --force origin main", "local")
+        result = mod.check_dangerous_command("git push --force origin feature/topic", "local")
         msg = result["message"]
         assert "BLOCKED" in msg
         assert "git push --force*" in msg

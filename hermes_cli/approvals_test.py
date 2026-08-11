@@ -112,7 +112,15 @@ def evaluate_command(command: str, env_type: str = "local") -> dict:
                    "config.yaml (blocked even under --yolo / mode=off)",
         )
 
-    # 5. Yolo / approvals.mode=off bypass.
+    # 5. Mandatory human-approval side effects are not bypassed by yolo/off.
+    mandatory, mandatory_desc = approval.detect_mandatory_approval_command(command)
+    if mandatory:
+        return result(
+            "ask-approval", rule=mandatory_desc,
+            detail="mandatory human approval (not bypassable by --yolo or approvals.mode=off)",
+        )
+
+    # 6. Yolo / approvals.mode=off bypass.
     if (approval._YOLO_MODE_FROZEN
             or approval.is_current_session_yolo_enabled()
             or approval._get_approval_mode() == "off"):
