@@ -31,6 +31,28 @@ _install_lock = threading.Lock()
 # never double-wrap and so we can recover the original stream.
 _installed: dict[str, "_ThreadRoutingStream"] = {}
 
+# One devnull handle for the process, not one per install.
+#
+# The install below is idempotent only while ``sys.<attr>`` is still the proxy we
+# put there. Anything that rebinds it — a ``redirect_stdout`` elsewhere in the
+# process, another library's capture — makes the next call re-install, and the
+# handle opened for the previous proxy was never closed by anyone. A long-lived
+# gateway accumulated 654 write handles on ``/dev/null`` over three days that way
+# and started failing with EMFILE on unrelated file reads.
+#
+# The sink is ``/dev/null``: there is nothing per-proxy about it, so sharing one
+# handle removes the leak at its source rather than adding a close path that
+# would have to race threads still writing through the old proxy.
+_shared_sink: TextIO | None = None
+
+
+def _devnull_sink() -> TextIO:
+    """The process-wide sink every routing proxy writes silenced threads to."""
+    global _shared_sink
+    if _shared_sink is None or _shared_sink.closed:
+        _shared_sink = open(os.devnull, "w", encoding="utf-8")
+    return _shared_sink
+
 
 class _ThreadRoutingStream:
     """A ``sys.stdout``/``sys.stderr`` stand-in that routes writes per-thread.
@@ -115,8 +137,13 @@ def _ensure_installed(attr: str, passthrough: TextIO) -> "_ThreadRoutingStream":
         # global redirect_stdout is active, route non-silenced threads to that
         # stream to preserve the old behavior.
         passthrough = current if current is not None else passthrough
-        sink = open(os.devnull, "w", encoding="utf-8")
-        proxy = _ThreadRoutingStream(passthrough, sink)
+        # Never chain onto a proxy of our own. Routing through the previous one
+        # would keep it — and every proxy before it — reachable forever, so the
+        # chain grew a link on each re-install and nothing was ever collected.
+        # An external redirect is still honoured; only our own layer is unwrapped.
+        while isinstance(passthrough, _ThreadRoutingStream):
+            passthrough = passthrough._passthrough
+        proxy = _ThreadRoutingStream(passthrough, _devnull_sink())
         setattr(sys, attr, proxy)
         _installed[attr] = proxy
         return proxy
