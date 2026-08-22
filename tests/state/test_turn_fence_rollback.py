@@ -49,10 +49,14 @@ import pytest
 
 import hermes_state_common
 from hermes_state import SessionDB
-from tests.state.test_turn_lease_generation_trigger import (  # noqa: F401
-    BASE_COMMIT,
-    base_binary_tree,
-)
+from tests.state import test_turn_lease_generation_trigger as _base_binary
+
+#: Reused rather than re-derived: one place decides which commit "the exact old
+#: binary" means, and one fixture knows how to extract it. Bound by assignment
+#: so the fixture name is also a plain module attribute, which keeps the test
+#: parameters below from reading as redefinitions of an import.
+BASE_COMMIT = _base_binary.BASE_COMMIT
+base_binary_tree = _base_binary.base_binary_tree
 
 
 def _rollback_module():
