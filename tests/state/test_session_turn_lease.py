@@ -301,17 +301,32 @@ def test_turn_lease_refresh_and_release_are_owner_fenced(tmp_path):
 
 
 def test_an_expired_lease_is_NOT_reclaimed_on_the_deadline_alone(tmp_path):
-    """Was ``test_expired_turn_lease_is_reclaimed``; the contract inverted.
+    """Was ``test_expired_turn_lease_is_reclaimed``. THE CONTRACT CHANGED.
 
-    A passed deadline says the refresher did not run — a starved thread, a
-    stopped-world GC, a laptop that slept. It does not say the owner is gone,
-    and this test used to assert that it did. Reclaiming on it hands a live
-    turn's conversation to a contender, which is the whole defect slice 5
-    closes.
+    Read the original before reading this one. It took a lease under the holder
+    ``"legacy-holder"`` — not parseable as a pid — waited past a 50ms TTL, and
+    asserted that a different holder could then take it. That is not a defect
+    assertion and calling it one would be wrong: it encodes a real and
+    defensible rule, *an expired lease from an unidentifiable holder is
+    reclaimable*, whose point is that a wedged conversation heals itself after
+    one TTL with nobody watching.
 
-    The two paths out of a held lease are unchanged in spirit and both are
-    evidence-based: the holder releases, or an operator forces it. Neither
-    involves waiting.
+    What replaced it is the opposite rule — a lease is freed only by positive
+    evidence — and the difference is a design decision with an operational
+    price, not a bug being fixed. The price: automatic recovery is gone. A
+    crashed owner this host cannot probe (no psutil, a recycled PID, a
+    carried-over row with no recorded identity) wedges its conversation
+    permanently, and only ``force_release_session_turn_lease`` gets it back.
+    ``SessionDB._turn_lease_row_is_free`` carries the full argument for taking
+    that trade and the list of hosts that pay it.
+
+    Note what this test does and does not exercise. The lease below is taken in
+    THIS process, so the branch that refuses it is "ours, held" — the process
+    holds a live grant — not the unparseable-holder branch. The holder string
+    is kept verbatim from upstream so the two tests can be diffed, but it is
+    not what decides the outcome here;
+    ``tests/state/test_turn_lease_liveness.py`` is where the foreign and
+    unidentifiable holders are exercised.
     """
     db = SessionDB(tmp_path / "state.db")
     db.create_session("shared", source="test")

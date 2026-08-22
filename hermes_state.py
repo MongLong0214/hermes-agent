@@ -7380,6 +7380,56 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         decides admission; :meth:`force_release_session_turn_lease` is the
         recovery that replaces it.
 
+        THIS IS A CONTRACT CHANGE, NOT A BUG FIX, AND IT HAS A PRICE
+            The rule this replaced was "expired ⇒ reclaimable", and it was
+            deliberate: it meant every wedged conversation healed itself after
+            one TTL with nobody watching. What is written here is the opposite —
+            a lease is freed only by *positive evidence*, so "cannot prove the
+            owner is gone" now means "stays held", forever, until a person runs
+            :meth:`force_release_session_turn_lease`. Automatic recovery is gone.
+            That is the cost, and it is paid on real hosts:
+
+            * **psutil missing.** ``_turn_lease_owner_is_dead`` answers False for
+              every foreign PID when ``psutil is None``, so on such an install
+              NOTHING is ever provably dead and every crashed turn wedges its
+              conversation permanently. Under the old rule those recovered in
+              one TTL. This is the largest of the three and it is not rare —
+              psutil is an optional dependency (see the Windows/scaffold
+              fallback in ``_compression_lock_holder_process_is_dead``).
+            * **A recycled PID that landed on something long-lived.** The owner
+              is gone, its number was reissued, liveness reads "alive". Held.
+            * **A carried-over row** from a store written before ``owner_pid``
+              existed (the v27 rebuild). With no recorded identity the fallback
+              is the holder string, and a holder that is not parseable as
+              ``pid=<n>`` is liveness-UNKNOWN, which is not liveness-dead, so
+              the row is never free.
+
+            The reason to take that trade anyway: the failure the old rule
+            allowed is silent and unbounded (two writers in one conversation,
+            transcript interleaved or truncated, no error anywhere), and the
+            failure this one allows is loud, local and reversible (one
+            conversation refuses writes and says so). A wedged conversation is
+            recoverable; an interleaved transcript is not.
+
+        WHICH PRODUCTION PATH PRODUCES AN UNPARSEABLE HOLDER
+            None, today, and that was checked rather than assumed: every
+            acquirer in the tree composes its holder through
+            :func:`make_turn_lease_holder` or the identical literal in
+            ``run_agent``'s turn prologue, and both start ``pid=<os.getpid()>``.
+            The same was true at the base commit, so no shipped binary has
+            written one. An unparseable holder therefore means a row edited by
+            hand, or a third-party writer against the same store — which is
+            exactly the case where refusing is right. The paths above that DO
+            occur in production are the first two; the third is listed because
+            it is the one the rule is often described by, and describing the
+            rule by its rarest trigger is how the cost gets underestimated.
+
+        WHAT THE OPERATOR ACTUALLY HAS
+            :meth:`force_release_session_turn_lease` is a Python method with no
+            CLI verb in front of it yet. The refusal messages therefore name it
+            (see :meth:`_check_turn_lease_guard`), because an exit nobody can
+            find is not an exit.
+
         Every branch below is positive evidence:
 
         released          holder is empty. The row survives release so the
@@ -10387,7 +10437,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 raise SessionTurnLeaseLostError(
                     f"Session turn lease held by {lease['holder']!r} "
                     f"(epoch {lease['epoch']}); refusing unfenced write for "
-                    f"{session_id!r}"
+                    f"{session_id!r}. A lease is now freed only by evidence — "
+                    f"the holder releasing, or the owner being provably gone — "
+                    f"so a crashed owner this host cannot probe stays held "
+                    f"until SessionDB.force_release_session_turn_lease("
+                    f"{session_id!r}) is run."
                 )
         else:
             authorized = self._authorize_turn_lease_token(
