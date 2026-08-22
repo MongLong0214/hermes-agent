@@ -477,15 +477,22 @@ def test_mapper_rebuilds_sessiondb_from_synthetic_lost_and_found(
     expected = _make_synthetic_lost_and_found(lf_path, schema_ref)
 
     output = tmp_path / "mapped.db"
-    SessionDB(db_path=output).close()
+    dest_db = SessionDB(db_path=output)
 
     lf_conn = sqlite3.connect(str(lf_path), isolation_level=None)
-    dest = sqlite3.connect(str(output), isolation_level=None)
+    # The salvage lane writes THROUGH the destination store now. It used to
+    # reopen the file with a second bare connection and write that, which the
+    # store's own turn-fence triggers refuse — a handle that registered nothing
+    # is what an old binary is. offline_rebuild also supplies the relaxed
+    # foreign keys this used to set by hand, and refuses while any conversation
+    # in the destination is owned by a live turn.
+    rebuild = dest_db.offline_rebuild(reason="lost_and_found mapper test")
     try:
-        dest.execute("PRAGMA foreign_keys=OFF")
-        mapping = map_lost_and_found_rows(lf_conn, dest)
-        stubbing = stub_missing_parent_sessions(dest)
-        fts = rebuild_fts_indexes(dest)
+        dest_store = rebuild.__enter__()
+        mapping = map_lost_and_found_rows(lf_conn, dest_store)
+        stubbing = stub_missing_parent_sessions(dest_store)
+        fts = rebuild_fts_indexes(dest_store)
+        dest = sqlite3.connect(str(output), isolation_level=None)
 
         assert mapping["mapped"]["sessions"] == expected["sessions"]
         assert mapping["mapped"]["messages"] == expected["messages"]
@@ -531,9 +538,11 @@ def test_mapper_rebuilds_sessiondb_from_synthetic_lost_and_found(
 
         assert dest.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
         assert dest.execute("PRAGMA foreign_key_check").fetchall() == []
-    finally:
-        lf_conn.close()
         dest.close()
+    finally:
+        rebuild.__exit__(None, None, None)
+        lf_conn.close()
+        dest_db.close()
 
     # And the mapped output opens through the normal SessionDB path.
     db = SessionDB(db_path=output)

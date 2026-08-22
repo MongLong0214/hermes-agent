@@ -94,8 +94,14 @@ def _open_rebuild(db: SessionDB, *, reason: str):
     return gate(reason=reason)
 
 
-def _live_owned_store(path: pathlib.Path) -> str:
-    """A store with one live-owned session whose title is ``before``."""
+def _live_owned_store(path: pathlib.Path):
+    """A store with one live-owned session whose title is ``before``.
+
+    Returns the GRANT, not a holder string rebuilt from the same parts: the
+    grant carries the epoch, and releasing with an unversioned holder is
+    refused — which would have made the authorized half of this file pass for
+    the wrong reason.
+    """
     db = SessionDB(db_path=path)
     try:
         db.create_session("live", "test")
@@ -110,7 +116,7 @@ def _live_owned_store(path: pathlib.Path) -> str:
         )
     finally:
         db.close()
-    return _holder("live")
+    return grant
 
 
 def _title(path: pathlib.Path) -> str | None:
@@ -267,8 +273,12 @@ def test_the_lost_and_found_mapper_writes_through_the_destination_store(tmp_path
     dest = SessionDB(db_path=output)
     lf_conn = sqlite3.connect(str(salvaged), isolation_level=None)
     try:
-        mapping = map_lost_and_found_rows(lf_conn, dest)
-        stubbing = stub_missing_parent_sessions(dest)
+        # Through the gate, because salvage inserts children before it can
+        # prove their parents exist — that ordering IS reconstruction, and the
+        # store enforces foreign keys everywhere else.
+        with _open_rebuild(dest, reason="lost_and_found salvage") as store:
+            mapping = map_lost_and_found_rows(lf_conn, store)
+            stubbing = stub_missing_parent_sessions(store)
     finally:
         lf_conn.close()
         dest.close()

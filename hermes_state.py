@@ -7982,6 +7982,93 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         finally:
             self.release_session_turn_lease(session_id, token)
 
+    @contextlib.contextmanager
+    def offline_rebuild(self, *, reason: str):
+        """Rebuild THIS store wholesale, offline, on the canonical transaction.
+
+        The one entry point for a writer whose job is to reconstruct a store
+        rather than to take a turn in a conversation — session recovery and the
+        page-level lost_and_found salvage lane. It exists because those two had
+        a real tension and resolved it the wrong way: they opened the
+        destination a SECOND time with a bare ``sqlite3.connect`` and wrote it
+        from there, which the store refuses, because a handle that registered
+        nothing is exactly what an old binary is.
+
+        WHY NOT ``register_turn_fence_function`` ON THE RAW HANDLE
+            Because that is the defect, performed on purpose. The marker proves
+            "current generation" and nothing else — not the canonical root, not
+            the holder, not the monotonic epoch — so minting it on a production
+            writer opens a second admitted door around the token validator. The
+            barrier's question was never "is this connection marked" but "who
+            may mint the marker". A rebuild answers it by not needing a second
+            connection at all.
+
+        WHAT THIS GATE PROMISES
+            * Every write inside the block runs through :meth:`_execute_write`,
+              on the connection the token validator sits on. There is no second
+              door to admit.
+            * It is FAIL-CLOSED on ownership: if any conversation in this store
+              is owned by a live turn, the block is never entered and nothing is
+              written. A rebuild rewrites rows wholesale — session identity,
+              parent lineage, titles, the transcript — so running one against a
+              conversation somebody is mid-turn on is a silent interleave that
+              no per-row token could make safe. There is no "skip the busy ones"
+              variant on offer: :meth:`_skip_leased_conversations` is for a
+              sweep that never promised to touch anything in particular, and a
+              rebuild promised to reproduce the whole store.
+            * Foreign keys are relaxed for the duration and restored after.
+              Salvage inserts children before it can prove their parents exist
+              — that ordering is the entire point of reconstruction — and the
+              caller must not have to reach past this API to get it.
+
+        The refusal names the owned conversations, because the operator's next
+        move is to end those turns or run
+        :meth:`force_release_session_turn_lease`, and a refusal that does not
+        say which ones sends them hunting.
+        """
+        def _owned_conversations(conn) -> List[str]:
+            """Every conversation in this store a live turn owns.
+
+            The predicate is :meth:`_turn_lease_row_is_free`, the same one that
+            decides whether an acquirer may take the lease and the same one
+            :meth:`_skip_leased_conversations` runs per row — so a rebuild can
+            never proceed over a conversation an acquirer would have been
+            refused. Read directly off the lease table rather than off
+            ``sessions`` because a live row whose session is exactly what the
+            rebuild is about to recreate must still stop it.
+            """
+            owned: List[str] = []
+            for row in conn.execute(
+                "SELECT conversation_id FROM session_turn_leases "
+                "WHERE holder IS NOT NULL AND holder != ''"
+            ).fetchall():
+                root = row["conversation_id"]
+                lease = conn.execute(
+                    f"SELECT {self._TURN_LEASE_COLUMNS} FROM "
+                    f"session_turn_leases WHERE conversation_id = ?",
+                    (root,),
+                ).fetchone()
+                if not self._turn_lease_row_is_free(root, lease):
+                    owned.append(root)
+            return owned
+
+        owned = self._execute_write(_owned_conversations)
+        if owned:
+            raise SessionTurnLeaseLostError(
+                f"refusing an offline rebuild ({reason}) of {self.db_path}: "
+                f"conversation(s) a live turn owns ({', '.join(sorted(owned))})"
+            )
+        with self._lock:
+            self._conn.execute("PRAGMA foreign_keys=OFF")
+        try:
+            yield self
+        finally:
+            with self._lock:
+                try:
+                    self._conn.execute("PRAGMA foreign_keys=ON")
+                except Exception:  # pragma: no cover - closed mid-rebuild
+                    pass
+
     def get_compression_lock_holder(self, session_id: str) -> Optional[str]:
         """Return the current (non-expired) holder for ``session_id``, or None.
 

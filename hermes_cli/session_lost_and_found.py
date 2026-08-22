@@ -29,7 +29,10 @@ import sqlite3
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from hermes_state import SessionDB
 
 # Hermes session ids are timestamps: 20260812_135332_ab12cd. This is the
 # strongest sentinel available for classifying schema-less rows.
@@ -360,25 +363,33 @@ def _copy_direct_tables(
 
 def map_lost_and_found_rows(
     lf_conn: sqlite3.Connection,
-    dest: sqlite3.Connection,
+    dest_db: "SessionDB",
 ) -> dict[str, Any]:
     """Best-effort mapping of a .recover output DB into a fresh SessionDB.
 
     Handles both rows .recover attributed to real tables and unattributed
     ``lost_and_found`` rows classified by field count + sentinel columns.
+
+    Takes the destination STORE, not a connection to it. The output is created
+    by ``SessionDB`` and therefore carries this generation's turn-fence
+    triggers; a second bare ``sqlite3.connect`` onto the same file is, to those
+    triggers, indistinguishable from an old binary, and was refused —
+    measurably, at line 352 of this module. The whole mapping runs in one
+    ``_execute_write`` transaction on the store's own connection, which is
+    where the token validator sits. Registering the fence function on a private
+    handle would also have made the error go away, and is exactly the second
+    admitted door this barrier exists to refuse.
     """
 
-    report: dict[str, Any] = {
-        "direct_table_rows": {},
-        "mapped": {"sessions": 0, "messages": 0, "session_model_usage": 0},
-        "legacy_minimal_sessions": 0,
-        "unmapped_rows": 0,
-        "insert_conflicts": 0,
-        "lost_and_found_tables": [],
-    }
-
-    dest.execute("BEGIN IMMEDIATE")
-    try:
+    def _map_rows(dest: sqlite3.Connection) -> dict[str, Any]:
+        report: dict[str, Any] = {
+            "direct_table_rows": {},
+            "mapped": {"sessions": 0, "messages": 0, "session_model_usage": 0},
+            "legacy_minimal_sessions": 0,
+            "unmapped_rows": 0,
+            "insert_conflicts": 0,
+            "lost_and_found_tables": [],
+        }
         report["direct_table_rows"] = _copy_direct_tables(lf_conn, dest)
 
         sessions_columns = _table_columns(dest, "sessions")
@@ -474,28 +485,32 @@ def map_lost_and_found_rows(
                     ] += 1
                 else:
                     report["insert_conflicts"] += 1
-        dest.execute("COMMIT")
-    except BaseException:
-        dest.execute("ROLLBACK")
-        raise
-    return report
+        return report
+
+    return dest_db._execute_write(_map_rows)
 
 
-def stub_missing_parent_sessions(dest: sqlite3.Connection) -> dict[str, Any]:
+def stub_missing_parent_sessions(dest_db: "SessionDB") -> dict[str, Any]:
     """Fabricate placeholder parents for salvaged child rows.
 
     Salvaged children (messages, model-usage rows) are NEVER deleted for
     foreign-key cleanup — a fabricated parent is cheaper than losing the only
     surviving copy of the user's data. Stubs are clearly marked.
+
+    Takes the destination STORE for the same reason
+    :func:`map_lost_and_found_rows` does: the stub INSERT ran on a private
+    connection and the store refused it (line 535 of this module, measured).
+    One ``_execute_write`` transaction keeps the all-or-nothing the manual
+    BEGIN/COMMIT here used to provide, on the connection the token validator
+    sits on.
     """
 
-    result: dict[str, Any] = {
-        "sessions_stubbed": 0,
-        "messages_retained": 0,
-        "usage_rows_retained": 0,
-    }
-    dest.execute("BEGIN IMMEDIATE")
-    try:
+    def _stub_parents(dest: sqlite3.Connection) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "sessions_stubbed": 0,
+            "messages_retained": 0,
+            "usage_rows_retained": 0,
+        }
         orphan_ids: dict[str, dict[str, Any]] = {}
         for session_id, first_ts, count in dest.execute(
             "SELECT m.session_id, MIN(m.timestamp), COUNT(*) FROM messages AS m "
@@ -561,22 +576,32 @@ def stub_missing_parent_sessions(dest: sqlite3.Connection) -> dict[str, Any]:
             "(SELECT 1 FROM system_prompts "
             "WHERE system_prompts.hash = sessions.system_prompt_hash)"
         )
-        dest.execute("COMMIT")
-    except BaseException:
-        dest.execute("ROLLBACK")
-        raise
-    return result
+        return result
+
+    return dest_db._execute_write(_stub_parents)
 
 
-def rebuild_fts_indexes(dest: sqlite3.Connection) -> dict[str, str]:
-    """Rebuild derived FTS indexes from the salvaged canonical rows."""
+def rebuild_fts_indexes(dest_db: "SessionDB") -> dict[str, str]:
+    """Rebuild derived FTS indexes from the salvaged canonical rows.
+
+    One transaction per index rather than one for all of them: a rebuild that
+    fails is reported and the others still run, and under a single
+    ``_execute_write`` the first failure would roll the successful ones back
+    with it. The per-table ``try`` here already had that shape; it only worked
+    because the old raw connection was in autocommit.
+    """
 
     results: dict[str, str] = {}
     for table in ("messages_fts", "messages_fts_trigram", "messages_fts_cjk"):
-        if not _table_columns(dest, table):
-            continue
-        try:
+        with dest_db._read_ctx() as probe:
+            if not _table_columns(probe, table):
+                continue
+
+        def _rebuild_index(dest: sqlite3.Connection, table: str = table) -> None:
             dest.execute(f'INSERT INTO "{table}" ("{table}") VALUES (\'rebuild\')')
+
+        try:
+            dest_db._execute_write(_rebuild_index)
             results[table] = "rebuilt"
         except sqlite3.DatabaseError as exc:
             results[table] = f"rebuild failed: {exc}"

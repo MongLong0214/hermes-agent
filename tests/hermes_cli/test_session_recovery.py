@@ -13,6 +13,10 @@ import pytest
 
 import hermes_state
 from hermes_state import FTS_STORAGE_VERSION, SCHEMA_VERSION, SessionDB
+from hermes_state_common import (
+    TURN_FENCE_FUNCTION_NAME,
+    TURN_FENCE_GENERATION,
+)
 from hermes_cli import session_recovery
 from hermes_cli.session_recovery import (
     SessionRecoverySafetyError,
@@ -424,7 +428,15 @@ def test_partial_recovery_keeps_messages_when_sessions_are_unsalvageable(
         db.close()
 
     # sessions unrecoverable, messages intact — the reported shape.
+    # The marker is minted HERE, in the fixture, because the damage this test
+    # needs is not reachable through any SessionDB method: every one of them
+    # cascades the transcript away with its owner, which is the opposite of
+    # the reported failure. A test may mint it; a production writer may not,
+    # and that difference is what the writer census exists to hold.
     conn = sqlite3.connect(str(source), isolation_level=None)
+    conn.create_function(
+        TURN_FENCE_FUNCTION_NAME, 0, lambda: TURN_FENCE_GENERATION
+    )
     try:
         conn.execute("DELETE FROM sessions")
     finally:
