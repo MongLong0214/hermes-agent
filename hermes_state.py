@@ -7398,6 +7398,41 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 last_notice_at = now
             time.sleep(min(max(0.01, float(poll_interval_seconds)), remaining))
 
+    def _authorize_turn_lease_token(self, conn, session_id: str, token):
+        """Resolve the target's canonical root and check the grant against it.
+
+        Returns ``(conversation_id, epoch)`` for a grant that is genuinely the
+        current owner of the target conversation, or ``None`` when it is not.
+
+        The root comparison is the point. Holder and epoch order acquisitions
+        WITHIN one conversation and say nothing across conversations — and a
+        first grant is epoch 1 in every conversation, so on the common path the
+        epoch discriminates nothing at all. Both sides of the comparison are
+        canonical roots resolved in THIS transaction: the caller's session id is
+        mutable input and is never authority on its own, and the grant's root is
+        immutable because it was stamped when the lease was issued.
+        """
+        conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
+        epoch = self._turn_lease_epoch_of(token)
+        granted_root = getattr(token, "conversation_id", None)
+        if epoch is None or granted_root is None:
+            return None
+        if granted_root != conversation_id:
+            return None
+        row = conn.execute(
+            f"SELECT {self._TURN_LEASE_COLUMNS} FROM session_turn_leases "
+            f"WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchone()
+        if (
+            row is None
+            or row["holder"] != str(token)
+            or int(row["epoch"] or 0) != epoch
+            or epoch == LEGACY_TURN_LEASE_EPOCH
+        ):
+            return None
+        return conversation_id, epoch
+
     @staticmethod
     def _turn_lease_epoch_of(holder) -> Optional[int]:
         """Generation carried by a presented holder; None for a bare string."""
@@ -7429,11 +7464,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         expires_at = time.time() + max(0.1, float(ttl_seconds))
 
         def _do(conn):
-            conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
+            authorized = self._authorize_turn_lease_token(conn, session_id, holder)
+            if authorized is None:
+                return False
+            conversation_id, granted_epoch = authorized
             cursor = conn.execute(
                 "UPDATE session_turn_leases SET expires_at = ? "
                 "WHERE conversation_id = ? AND holder = ? AND epoch = ?",
-                (expires_at, conversation_id, str(holder), epoch),
+                (expires_at, conversation_id, str(holder), granted_epoch),
             )
             return cursor.rowcount > 0
 
@@ -7457,11 +7495,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return
 
         def _do(conn):
-            conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
+            # Release is a destructive authority transfer: it makes the
+            # conversation acquirable by anyone. Deriving it from the mutable
+            # session id the caller passed lets a grant for one conversation
+            # free a different one.
+            authorized = self._authorize_turn_lease_token(conn, session_id, holder)
+            if authorized is None:
+                logger.debug(
+                    "release_session_turn_lease refused: grant does not own "
+                    "the conversation %s resolves to", session_id,
+                )
+                return
+            conversation_id, granted_epoch = authorized
             conn.execute(
                 "UPDATE session_turn_leases SET holder = '', expires_at = 0 "
                 "WHERE conversation_id = ? AND holder = ? AND epoch = ?",
-                (conversation_id, str(holder), epoch),
+                (conversation_id, str(holder), granted_epoch),
             )
 
         self._execute_write(_do)
@@ -9955,17 +10004,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # slow provider summary held the lease (#74568, #77386), including
         # stale locks from dead PIDs blocking writes for the full TTL.
         if turn_lease_holder:
-            conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
-            lease = conn.execute(
-                "SELECT holder, expires_at FROM session_turn_leases "
-                "WHERE conversation_id = ?",
-                (conversation_id,),
-            ).fetchone()
-            if lease is None or lease["holder"] != turn_lease_holder:
+            authorized = self._authorize_turn_lease_token(
+                conn, session_id, turn_lease_holder
+            )
+            if authorized is None:
                 raise SessionTurnLeaseLostError(
                     f"Session turn lease lost; refusing transcript write "
                     f"for {session_id!r}"
                 )
+            conversation_id, _granted_epoch = authorized
+            lease = conn.execute(
+                f"SELECT {self._TURN_LEASE_COLUMNS} FROM session_turn_leases "
+                f"WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
             now = time.time()
             if float(lease["expires_at"]) <= now:
                 # Expiry makes the row reclaimable; it does not prove that a
@@ -9974,11 +10026,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # a starved refresher without weakening the foreign-holder fence.
                 conn.execute(
                     "UPDATE session_turn_leases SET expires_at = ? "
-                    "WHERE conversation_id = ? AND holder = ?",
+                    "WHERE conversation_id = ? AND holder = ? AND epoch = ?",
                     (
                         now + max(0.1, float(turn_lease_ttl_seconds)),
                         conversation_id,
-                        turn_lease_holder,
+                        str(turn_lease_holder),
+                        _granted_epoch,
                     ),
                 )
         session = conn.execute(
