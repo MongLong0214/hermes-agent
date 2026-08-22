@@ -3145,6 +3145,81 @@ class SessionTurnLeaseLostError(RuntimeError):
     """
 
 
+class SessionTurnLeaseToken(str):
+    """A holder string bound to the generation it was granted at.
+
+    ``str`` subclass deliberately: every existing ``turn_lease_holder=`` call
+    site, log line and comparison keeps working, while the epoch rides along so
+    a validator can tell "the holder that owns this lease right now" from "a
+    holder string that owned it one generation ago". A bare ``str`` carries no
+    epoch and is therefore indistinguishable from a replay.
+    """
+
+    __slots__ = ("epoch", "conversation_id")
+
+    def __new__(
+        cls, holder: str, epoch: int, conversation_id: Optional[str] = None
+    ) -> "SessionTurnLeaseToken":
+        obj = super().__new__(cls, holder)
+        obj.epoch = int(epoch)
+        obj.conversation_id = conversation_id
+        return obj
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
+        return (
+            f"SessionTurnLeaseToken({str(self)!r}, epoch={self.epoch}, "
+            f"conversation_id={self.conversation_id!r})"
+        )
+
+
+#: A row carried over from a pre-generation store. No grant can match it, so a
+#: writer presenting a token against one fails closed; it recovers by takeover.
+LEGACY_TURN_LEASE_EPOCH = 0
+
+
+def _process_start_time(pid: int) -> Optional[float]:
+    """Process creation time for *pid*, or None when it cannot be established.
+
+    ``(pid, start_time)`` is what turns a PID into an identity. On its own a PID
+    is a recyclable integer: once the owner exits the kernel may hand its number
+    to anything, and a bare ``pid_exists`` would then report a dead owner alive.
+    """
+    if psutil is None or pid <= 0:
+        return None
+    try:
+        return float(psutil.Process(pid).create_time())
+    except Exception:
+        return None
+
+
+def _turn_lease_owner_is_dead(
+    holder: str, owner_pid: Optional[int], owner_pid_start: Optional[float]
+) -> bool:
+    """True only when the recorded owner is PROVABLY gone — PID reuse included.
+
+    Asymmetric with "alive" on purpose: "cannot prove alive" is not "dead".
+    """
+    if owner_pid:
+        pid = int(owner_pid)
+        if pid <= 0 or pid == os.getpid() or psutil is None:
+            return False
+        try:
+            if not psutil.pid_exists(pid):
+                return True
+        except Exception:
+            return False
+        if owner_pid_start is None:
+            return False
+        started = _process_start_time(pid)
+        if started is None:
+            return False
+        # Same number, different process: the owner is gone and its PID was
+        # recycled. Without this a reused PID keeps a dead lease alive forever.
+        return abs(started - float(owner_pid_start)) >= 1.0
+    # No recorded identity (a carried-over row): fall back to the holder string.
+    return _compression_lock_holder_process_is_dead(holder or "")
+
+
 def _connect_tracked_db(path, tracking_path=None, **kwargs):
     """``sqlite3.connect`` that registers the open fd for lock-safety.
 
@@ -7163,6 +7238,37 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         with self._read_ctx() as conn:
             return self._session_turn_lease_key_on_conn(conn, session_id)
 
+    _TURN_LEASE_COLUMNS = (
+        "holder, expires_at, epoch, owner_pid, owner_pid_start"
+    )
+
+    def _read_turn_lease_on_conn(self, conn, session_id: str):
+        """Resolve the conversation key and read its lease row on *conn*.
+
+        One reader for every caller so the admission decision cannot drift
+        between the path that refuses a write and the path that grants a lease.
+        Returns ``(conversation_id, row_or_None)``.
+        """
+        conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
+        return conversation_id, conn.execute(
+            f"SELECT {self._TURN_LEASE_COLUMNS} FROM session_turn_leases "
+            f"WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchone()
+
+    def _turn_lease_row_is_free(self, row, now: float) -> bool:
+        """True when *row* no longer represents an owned conversation."""
+        if row is None:
+            return True
+        holder = row["holder"] or ""
+        if not holder:
+            return True  # released; the row survives to keep epoch monotonic
+        if _turn_lease_owner_is_dead(
+            holder, row["owner_pid"], row["owner_pid_start"]
+        ):
+            return True
+        return float(row["expires_at"]) <= now
+
     def try_acquire_session_turn_lease(
         self,
         session_id: str,
@@ -7170,51 +7276,50 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         *,
         ttl_seconds: float = 300.0,
         patience_s: Optional[float] = None,
-    ) -> bool:
+    ) -> Optional[SessionTurnLeaseToken]:
         """Atomically acquire the cross-process turn lease for a conversation.
 
-        Compression rotates a session into child segments, so the durable key
-        is the lineage root rather than the current segment id. The walk and
-        INSERT share one write transaction. Expired leases and leases whose
-        structured local holder PID is known dead are reclaimed in that same
-        transaction.
+        Returns a :class:`SessionTurnLeaseToken` — a truthy ``str`` carrying the
+        granted epoch — or ``None`` when the conversation is already owned.
+
+        Compression rotates a session into child segments, so the durable key is
+        the lineage root rather than the current segment id. The walk and the
+        write share one transaction.
+
+        Every grant BUMPS the epoch, and the row is upserted rather than
+        deleted-and-reinserted, so the counter survives release: re-acquiring
+        under the SAME holder string yields a different generation, which is
+        what makes the earlier grant unusable.
         """
         if not session_id or not holder:
-            return False
+            return None
         now = time.time()
         expires_at = now + max(0.1, float(ttl_seconds))
+        my_pid = os.getpid()
+        my_start = _process_start_time(my_pid)
 
         def _do(conn):
-            conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
-            row = conn.execute(
-                "SELECT holder, expires_at FROM session_turn_leases "
-                "WHERE conversation_id = ?",
-                (conversation_id,),
-            ).fetchone()
-            if row is not None:
-                current_holder = row["holder"]
-                if (
-                    float(row["expires_at"]) <= now
-                    or _compression_lock_holder_process_is_dead(current_holder)
-                ):
-                    conn.execute(
-                        "DELETE FROM session_turn_leases "
-                        "WHERE conversation_id = ? AND holder = ?",
-                        (conversation_id, current_holder),
-                    )
+            conversation_id, row = self._read_turn_lease_on_conn(conn, session_id)
+            if row is None:
+                conn.execute(
+                    "INSERT INTO session_turn_leases "
+                    "(conversation_id, holder, acquired_at, expires_at, epoch, "
+                    "owner_pid, owner_pid_start) VALUES (?, ?, ?, ?, 1, ?, ?)",
+                    (conversation_id, holder, now, expires_at, my_pid, my_start),
+                )
+                return SessionTurnLeaseToken(holder, 1, conversation_id)
+            if not self._turn_lease_row_is_free(row, now):
+                return None
+            epoch = int(row["epoch"] or 0) + 1
             conn.execute(
-                "INSERT OR IGNORE INTO session_turn_leases "
-                "(conversation_id, holder, acquired_at, expires_at) "
-                "VALUES (?, ?, ?, ?)",
-                (conversation_id, holder, now, expires_at),
+                "UPDATE session_turn_leases SET holder = ?, acquired_at = ?, "
+                "expires_at = ?, epoch = ?, owner_pid = ?, owner_pid_start = ? "
+                "WHERE conversation_id = ?",
+                (holder, now, expires_at, epoch, my_pid, my_start, conversation_id),
             )
-            owner = conn.execute(
-                "SELECT holder FROM session_turn_leases WHERE conversation_id = ?",
-                (conversation_id,),
-            ).fetchone()
-            return owner is not None and owner["holder"] == holder
+            return SessionTurnLeaseToken(holder, epoch, conversation_id)
 
-        return bool(self._execute_write(_do, patience_s=patience_s))
+        return self._execute_write(_do, patience_s=patience_s)
 
     def acquire_session_turn_lease(
         self,
@@ -7228,8 +7333,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         wait_notice_interval_seconds: float = 15.0,
         should_abort=None,
         acquire_patience_s: float = 0.5,
-    ) -> bool:
+    ) -> Optional[SessionTurnLeaseToken]:
         """Wait for a cross-process turn lease without holding a SQLite lock.
+
+        Returns the granted :class:`SessionTurnLeaseToken`, or ``None`` when the
+        wait times out or ``should_abort()`` fires.
 
         ``on_wait(elapsed_seconds)`` is best-effort: invoked when the first
         attempt fails (elapsed ~0) and again about every
@@ -7248,20 +7356,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if should_abort is not None:
                 try:
                     if should_abort():
-                        return False
+                        return None
                 except Exception:
                     logger.debug(
                         "session turn lease should_abort callback failed",
                         exc_info=True,
                     )
             try:
-                if self.try_acquire_session_turn_lease(
+                token = self.try_acquire_session_turn_lease(
                     session_id,
                     holder,
                     ttl_seconds=ttl_seconds,
                     patience_s=acquire_patience_s,
-                ):
-                    return True
+                )
+                if token is not None:
+                    return token
             except sqlite3.Error as exc:
                 # Long holder transactions (compression publish, large
                 # flushes) can exhaust a single write-patience budget.
@@ -7271,7 +7380,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             now = time.monotonic()
             remaining = deadline - now
             if remaining <= 0:
-                return False
+                return None
             if wait_started is None:
                 wait_started = now
             if on_wait is not None and (
@@ -7289,15 +7398,33 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 last_notice_at = now
             time.sleep(min(max(0.01, float(poll_interval_seconds)), remaining))
 
+    @staticmethod
+    def _turn_lease_epoch_of(holder) -> Optional[int]:
+        """Generation carried by a presented holder; None for a bare string."""
+        epoch = getattr(holder, "epoch", None)
+        return int(epoch) if isinstance(epoch, int) else None
+
     def refresh_session_turn_lease(
         self,
         session_id: str,
-        holder: str,
+        holder,
         *,
         ttl_seconds: float = 300.0,
     ) -> bool:
-        """Extend a turn lease only while ``holder`` still owns it."""
+        """Extend a lease only while *holder* still owns it AT ITS GENERATION.
+
+        A superseded grant — same holder string, older epoch — must not be able
+        to extend the current owner's deadline.
+        """
         if not session_id or not holder:
+            return False
+        epoch = self._turn_lease_epoch_of(holder)
+        if epoch is None:
+            logger.warning(
+                "refresh_session_turn_lease got an unversioned holder for %s; "
+                "refusing (a bare string cannot be told apart from a replay)",
+                session_id,
+            )
             return False
         expires_at = time.time() + max(0.1, float(ttl_seconds))
 
@@ -7305,27 +7432,57 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
             cursor = conn.execute(
                 "UPDATE session_turn_leases SET expires_at = ? "
-                "WHERE conversation_id = ? AND holder = ?",
-                (expires_at, conversation_id, holder),
+                "WHERE conversation_id = ? AND holder = ? AND epoch = ?",
+                (expires_at, conversation_id, str(holder), epoch),
             )
             return cursor.rowcount > 0
 
         return bool(self._execute_write(_do))
 
-    def release_session_turn_lease(self, session_id: str, holder: str) -> None:
-        """Release a turn lease iff ``holder`` still owns it; idempotent."""
+    def release_session_turn_lease(self, session_id: str, holder) -> None:
+        """Release a lease iff *holder* still owns it at its generation.
+
+        The row is KEPT (``holder = ''``) rather than deleted, so the epoch
+        stays monotonic. Deleting it would let the counter restart at 1 and make
+        an already-released grant valid again.
+        """
         if not session_id or not holder:
+            return
+        epoch = self._turn_lease_epoch_of(holder)
+        if epoch is None:
+            logger.warning(
+                "release_session_turn_lease got an unversioned holder for %s; "
+                "refusing", session_id,
+            )
             return
 
         def _do(conn):
             conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
             conn.execute(
-                "DELETE FROM session_turn_leases "
-                "WHERE conversation_id = ? AND holder = ?",
-                (conversation_id, holder),
+                "UPDATE session_turn_leases SET holder = '', expires_at = 0 "
+                "WHERE conversation_id = ? AND holder = ? AND epoch = ?",
+                (conversation_id, str(holder), epoch),
             )
 
         self._execute_write(_do)
+
+    def get_session_turn_lease(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Current lease row for the conversation *session_id* belongs to.
+
+        Diagnostic helper. ``None`` when nothing ever leased the conversation;
+        a dict with ``holder = ''`` once it has been released.
+        """
+        if not session_id:
+            return None
+        with self._read_ctx() as conn:
+            conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
+            row = conn.execute(
+                "SELECT conversation_id, acquired_at, "
+                f"{self._TURN_LEASE_COLUMNS} FROM session_turn_leases "
+                "WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
 
     def get_compression_lock_holder(self, session_id: str) -> Optional[str]:
         """Return the current (non-expired) holder for ``session_id``, or None.

@@ -10,6 +10,7 @@ module-level constants live in hermes_state_common.
 
 import logging
 import json
+import re
 import sqlite3
 from typing import Dict, Optional
 
@@ -80,6 +81,11 @@ def schema_read_probe_statements() -> tuple:
             for table, cols in sorted(tables.items())
         )
     return _READ_PROBE_STATEMENTS
+
+
+#: Holder strings minted by the agent embed the owning pid; the migration
+#: recovers it so a carried-over row still has an identity to decide on.
+_LEGACY_HOLDER_PID_RE = re.compile(r"(?:^|:)pid=(\d+)(?::|$)")
 
 
 class SessionSchemaMixin:
@@ -626,6 +632,69 @@ class SessionSchemaMixin:
                             "SCHEMA_SQL: %s", table_name, col_name, exc,
                         )
 
+    def _heal_session_turn_lease_epoch(self, cursor: sqlite3.Cursor) -> None:
+        """Rebuild ``session_turn_leases`` when it predates the turn epoch.
+
+        A table rebuild rather than an ADD COLUMN, for the same reason
+        :meth:`_heal_gateway_routing_pk` is one: the shape SQLite cannot ALTER
+        into place is the shape that carries the guarantee.
+
+        Rows are CARRIED OVER, not dropped, at ``epoch = 0``. Dropping them
+        would be the easy migration and the wrong one — at upgrade time a live
+        owner's conversation would become instantly acquirable by a bystander.
+        Epoch 0 is a generation no grant can match, so a writer against a
+        carried-over row fails closed. ``owner_pid`` is recovered from the
+        holder string when it carries one, so the row keeps an identity that
+        liveness can be decided from.
+        """
+        try:
+            rows = cursor.execute(
+                'PRAGMA table_info("session_turn_leases")'
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return  # table not created yet; executescript above makes it
+        if not rows:
+            return
+        live_cols = {
+            (row[1] if isinstance(row, (tuple, list)) else row["name"])
+            for row in rows
+        }
+        if "epoch" in live_cols:
+            return
+
+        carried = cursor.execute(
+            "SELECT conversation_id, holder, acquired_at, expires_at "
+            "FROM session_turn_leases"
+        ).fetchall()
+        cursor.execute("DROP TABLE session_turn_leases")
+        cursor.execute(
+            """CREATE TABLE session_turn_leases (
+                conversation_id TEXT PRIMARY KEY,
+                holder TEXT NOT NULL,
+                acquired_at REAL NOT NULL,
+                expires_at REAL NOT NULL,
+                epoch INTEGER NOT NULL,
+                owner_pid INTEGER,
+                owner_pid_start REAL
+            )"""
+        )
+        for row in carried:
+            conversation_id, holder, acquired_at, expires_at = (
+                row[0], row[1], row[2], row[3],
+            )
+            match = _LEGACY_HOLDER_PID_RE.search(holder or "")
+            owner_pid = int(match.group(1)) if match else None
+            cursor.execute(
+                "INSERT INTO session_turn_leases "
+                "(conversation_id, holder, acquired_at, expires_at, epoch, "
+                "owner_pid, owner_pid_start) VALUES (?, ?, ?, ?, 0, ?, NULL)",
+                (conversation_id, holder, acquired_at, expires_at, owner_pid),
+            )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_session_turn_leases_expires "
+            "ON session_turn_leases(expires_at)"
+        )
+
     def _heal_gateway_routing_pk(self, cursor: sqlite3.Cursor) -> None:
         """Rebuild ``gateway_routing`` when its PRIMARY KEY predates scoping.
 
@@ -835,6 +904,12 @@ class SessionSchemaMixin:
         cursor = self._conn.cursor()
 
         cursor.executescript(SCHEMA_SQL)
+
+        # Rebuild session_turn_leases when it predates the generation column.
+        # Must precede _reconcile_columns: `epoch` is NOT NULL with no DEFAULT
+        # (that is the cutover fence, see SCHEMA_SQL) and SQLite cannot ADD
+        # COLUMN a NOT NULL column without one.
+        self._heal_session_turn_lease_epoch(cursor)
 
         # ── Declarative column reconciliation ──────────────────────────
         # Diff live tables against SCHEMA_SQL and ADD any missing columns.

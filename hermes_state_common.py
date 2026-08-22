@@ -302,7 +302,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
     )
 
 
-SCHEMA_VERSION = 26
+SCHEMA_VERSION = 27
 
 
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
@@ -476,11 +476,25 @@ CREATE TABLE IF NOT EXISTS compression_locks (
     expires_at REAL NOT NULL
 );
 
+-- The row OUTLIVES release: releasing sets ``holder = ''`` and KEEPS ``epoch``.
+-- That is what makes the generation monotonic across release/re-acquire, which
+-- is what stops a holder string from being replayed — the same string can own
+-- generation N and be stale at N+1.
+--
+-- ``epoch`` is NOT NULL with NO DEFAULT on purpose: a build that predates the
+-- generation writes four columns, and that INSERT must fail rather than land a
+-- row no current writer can validate.
+--
+-- ``owner_pid`` / ``owner_pid_start`` record WHICH process holds it, so who is
+-- alive is a question about the OS rather than about the clock.
 CREATE TABLE IF NOT EXISTS session_turn_leases (
     conversation_id TEXT PRIMARY KEY,
     holder TEXT NOT NULL,
     acquired_at REAL NOT NULL,
-    expires_at REAL NOT NULL
+    expires_at REAL NOT NULL,
+    epoch INTEGER NOT NULL,
+    owner_pid INTEGER,
+    owner_pid_start REAL
 );
 
 CREATE TABLE IF NOT EXISTS async_delegations (
