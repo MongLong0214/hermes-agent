@@ -20,8 +20,37 @@ So the denominator is written down here, in the check, rather than implied by
 what the scan happens to reach.
 
 THE DENOMINATOR
-    Every call, in non-test Python under the repository root, to one of
-    :data:`CONTEXT_BEARING_MUTATORS` on any receiver.
+    Every call, in non-test Python under the repository root, to one of the
+    mutators :func:`derive_context_bearing_mutators` reads out of the
+    ``SessionDB`` implementation, on any receiver.
+
+MEMBERSHIP IS READ OFF THE CODE, NOT TYPED HERE
+    The first version of this file made membership a ``frozenset`` literal, and
+    every stage filtered on it before doing anything else. A mutator nobody had
+    typed into the literal was therefore outside the denominator, outside the
+    derived sweep set, and its production call sites were not counted — so
+    "every production transcript writer goes through the fence" meant "every
+    transcript writer someone remembered". Review demonstrated it on a copy of
+    that tree with a method that discards the admission helper's answer and then
+    ``DELETE``\\s the transcript: the file reported 5 passed.
+
+    So membership is now a property of ``hermes_state.py`` and its mixins:
+    a method is a context-bearing mutator when its own WRITE TRANSACTION
+    contains message-table SQL. "Its own write transaction" is the whole of the
+    rule and it is what keeps the set from collapsing into "every method":
+
+    * the method's body (its nested ``_do(conn)`` closure included) contains a
+      string that writes ``messages`` or ``message_reactions``; or
+    * it hands the transaction's connection to a helper that is already in the
+      set — ``self._insert_message_rows(conn, …)``. Passing ``conn`` is what
+      makes the helper's SQL part of THIS transaction, and it is the difference
+      between a real extension of the write and the plain ``self._execute_write``
+      / ``self._init_schema`` calls that every method makes. Following those
+      instead puts ``__init__`` in the set, and then everything.
+
+    :mod:`tests.state.test_turn_lease_census_derivation` is the test for this:
+    it splices review's method into the real ``hermes_state.py`` source and
+    requires the derivation to find it and the scan to reach its caller.
 
 WHY "ON ANY RECEIVER" NEEDED A DISCRIMINATOR
     Matching the attribute name on any receiver is what closes the aliasing
@@ -49,18 +78,29 @@ WHY "ON ANY RECEIVER" NEEDED A DISCRIMINATOR
 WHY THAT IS THE WHOLE SET
     Model context lives in exactly one place: the ``messages`` rows of a
     session, plus the ``sessions`` rows that own them. Those rows are reachable
-    only through ``SessionDB``'s public mutators — the class owns the sole
-    connection and no production module opens its own handle to write them
-    (asserted by :func:`test_no_production_module_writes_messages_outside_sessiondb`).
+    only through ``SessionDB``'s mutators — the class owns the sole connection
+    and no production module opens its own handle to write them (asserted by
+    :func:`test_no_production_module_writes_messages_outside_sessiondb`).
     So a call to one of those names is necessary and sufficient to change what
     a later turn replays, and enumerating the calls enumerates the risk.
 
 WHAT COUNTS AS GOING THROUGH THE FENCE
-    The call passes ``turn_lease_holder=``, or it is lexically inside a
-    ``with ... session_turn_lease(...)`` / ``turn_lease_scope(...)`` block that
-    binds the grant it presents, or the mutator it calls is a SWEEP that does
-    its own per-row admission inside its write transaction. Anything else is an
-    unfenced production writer, and this test names it.
+    Four forms, and every one of them is read off the code:
+
+    grant   the call passes ``turn_lease_holder=``.
+    scope   the call is lexically inside a ``with ... session_turn_lease(...)``
+            / ``turn_lease_scope(...)`` block that binds the grant it presents.
+    sweep   the mutator does its own per-row admission inside its write
+            transaction (see below).
+    inner   the call is inside a ``SessionDB`` implementation module, lexically
+            within another derived mutator. It is not a separate production
+            entry point: the enclosing method extends its transaction into the
+            callee, so the risk belongs to the enclosing method — which the
+            derivation guarantees is itself in the denominator, with its own
+            call sites counted here. ``self._insert_message_rows(conn, …)``
+            inside ``append_messages_batch`` is the shape.
+
+    Anything else is an unfenced production writer, and this test names it.
 
 THE ONE PREDICATE CHANGE, AND WHY IT IS NOT AN EXEMPTION
     The third form was added when the sweeps were reached, and it is the place
@@ -76,67 +116,207 @@ THE ONE PREDICATE CHANGE, AND WHY IT IS NOT AN EXEMPTION
 
     What keeps it from being an exemption in disguise:
 
-    * the set is DERIVED from ``hermes_state.py`` (:func:`_self_fencing_sweeps`)
+    * the set is DERIVED from the implementation (:func:`_self_fencing_sweeps`)
       rather than listed here, so it cannot be grown by editing this file;
     * the marker it derives from is the call to the real admission helper, and
       :func:`test_every_self_fencing_sweep_actually_skips_an_owned_conversation`
       proves BEHAVIOURALLY that each derived member leaves an owned
       conversation alone — a decorative call to the helper fails that test;
-    * membership is still restricted to :data:`CONTEXT_BEARING_MUTATORS`.
+    * membership is still restricted to the derived mutator set.
 
     A single-target mutator can never qualify: it has one conversation, so it
     has a call site that can hold a grant, and every one of them does.
 
-MEMBERSHIP IS ARGUED, NOT ASSUMED
-    :data:`NOT_CONTEXT_BEARING` is deliberately empty. Every candidate for it
-    has to answer one question — *can this write change what the provider will
-    see on the next turn, remove it, or consume it?* — and the two entries that
-    were previously exempted both answer yes. An entry may only be added with
-    that question answered in its comment.
+EXEMPTIONS ARE ARGUED, NOT ASSUMED
+    :data:`NOT_CONTEXT_BEARING` holds the residue the derivation finds and the
+    fence forms do not cover. Every entry has to answer one question — *can this
+    write change what the provider will see on the next turn, remove it, or
+    consume it?* — in its comment, AND have a test that proves the answer.
+    ``_init_schema`` is the only one, and
+    :func:`test_the_only_exemption_cannot_touch_a_row_this_generation_wrote`
+    is its evidence.
 """
 
 from __future__ import annotations
 
 import ast
 import os
+import re
 import time
 import pathlib
 
 import pytest
 
-#: Mutators that reach model context. Session deletion is included: removing the
-#: rows is the most complete way to change what the next turn replays.
-CONTEXT_BEARING_MUTATORS = frozenset({
-    "append_message",
-    "append_messages_batch",
-    "replace_messages",
-    "archive_and_compact",
-    "publish_compression_child",
-    "rewind_to_message",
-    "restore_rewound",
-    "clear_messages",
-    "set_latest_user_api_content",
-    # Reactions are NOT presentation: take_unseen_reactions consumes the
-    # announcement that is injected into model context on the next turn, and
-    # set_message_reaction produces it. Consume-once state, not a decoration.
-    "set_message_reaction",
-    "take_unseen_reactions",
-    # display_kind is read back by the context pipeline (a "hidden" row is
-    # treated differently) and by the compressor's real-ask classification, so
-    # stamping it changes what the provider sees.
-    "set_latest_matching_message_display_kind",
-    # Clears `content` in place across sessions.
-    "purge_stale_tool_call_markers",
-    # Destructive lifecycle: these remove the context entirely.
-    "delete_session",
-    "delete_sessions",
-    "delete_empty_sessions",
-    "prune_sessions",
-})
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
-#: Empty on purpose — see the module docstring. Adding an entry requires
-#: answering "can this change, remove or consume what the provider sees next?"
-NOT_CONTEXT_BEARING: dict = {}
+#: The modules that implement ``SessionDB``: the class itself plus the mixins it
+#: inherits. Located by parsing ``class SessionDB(...)`` rather than listed, and
+#: :func:`test_the_derivation_reads_every_module_sessiondb_is_made_of` asserts
+#: that every base named there was actually found in one of them.
+SESSIONDB_IMPLEMENTATION_MODULES = (
+    "hermes_state.py",
+    "hermes_state_schema.py",
+    "hermes_state_search.py",
+    "hermes_state_portability.py",
+)
+
+#: A statement that writes model context. ``\b`` after the table name is what
+#: keeps ``messages_fts`` — the search shadow table, rebuilt constantly and
+#: carrying no context of its own — out of the set.
+MESSAGE_TABLE_WRITE = re.compile(
+    r"\b(?:insert(?:\s+or\s+\w+)?\s+into|update|delete\s+from)\s+"
+    r"(?:messages|message_reactions)\b",
+    re.IGNORECASE,
+)
+
+#: The residue: derived mutators whose call sites no fence form covers, with the
+#: question answered per entry. See EXEMPTIONS ARE ARGUED, NOT ASSUMED.
+NOT_CONTEXT_BEARING: dict = {
+    # `UPDATE messages SET active = 1 WHERE active IS NULL`, run on every open.
+    #
+    # Can it change what the provider sees next?  Only by making rows visible
+    # that a *previous generation* of the writer hid by accident (#51646: an
+    # older reconciler added `active` without its NOT NULL DEFAULT 1, so INSERTs
+    # that omitted the column wrote NULL and every `WHERE active = 1` transcript
+    # loader dropped the row). It cannot remove or consume anything — the
+    # predicate is `active IS NULL` and the direction is NULL → 1.
+    #
+    # Can it reach a row this generation wrote?  No: every INSERT now sets
+    # active explicitly, so `active IS NULL` matches nothing this binary
+    # produced. That is the part that is asserted rather than argued —
+    # test_the_only_exemption_cannot_touch_a_row_this_generation_wrote.
+    #
+    # And its two call sites are `__init__` and `_reconnect_after_notadb`,
+    # i.e. connection setup: there is no caller holding a handle yet, so there
+    # is no call site at which a grant could be presented.
+    "_init_schema": (
+        "schema repair; heals `active IS NULL` rows left by a previous "
+        "generation and cannot reach a row this one wrote"
+    ),
+}
+
+
+def _sessiondb_implementation(root: pathlib.Path):
+    """Return ``(methods, missing_bases)`` for the ``SessionDB`` under *root*.
+
+    ``methods`` maps a method name to ``(module_relative_name, ast node)`` for
+    ``class SessionDB`` and every base class named in its declaration that can
+    be found in :data:`SESSIONDB_IMPLEMENTATION_MODULES`. ``missing_bases`` is
+    the bases that could not be found — reported rather than raised, so the
+    derivation still runs on a partial tree (the fixture in
+    ``test_turn_lease_census_derivation`` is one), and asserted empty against
+    the real tree by
+    :func:`test_the_derivation_reads_every_module_sessiondb_is_made_of`.
+    """
+    trees = {}
+    for name in SESSIONDB_IMPLEMENTATION_MODULES:
+        path = root / name
+        if not path.is_file():
+            continue
+        try:
+            trees[name] = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+        except SyntaxError:  # pragma: no cover - a broken tree is not our finding
+            continue
+
+    def _classes(want):
+        for module, tree in trees.items():
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ClassDef) and node.name == want:
+                    yield module, node
+
+    owner = list(_classes("SessionDB"))
+    assert owner, f"no `class SessionDB` under {root}"
+    wanted = ["SessionDB"]
+    for _module, node in owner:
+        for base in node.bases:
+            name = base.attr if isinstance(base, ast.Attribute) else getattr(base, "id", "")
+            if name:
+                wanted.append(name)
+
+    methods, missing = {}, []
+    for want in wanted:
+        found = list(_classes(want))
+        if not found:
+            missing.append(want)
+            continue
+        for module, node in found:
+            for member in node.body:
+                if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    methods.setdefault(member.name, (module, member))
+    return methods, missing
+
+
+def _writes_message_rows(node: ast.AST) -> bool:
+    """True when a string literal anywhere under *node* writes model context."""
+    for inner in ast.walk(node):
+        if isinstance(inner, ast.Constant) and isinstance(inner.value, str):
+            if MESSAGE_TABLE_WRITE.search(inner.value):
+                return True
+    return False
+
+
+def _names_bound_in(method: ast.AST) -> set:
+    """Every parameter name in scope anywhere inside *method*.
+
+    The transaction connection is a parameter — of ``_do(conn)``, or of the
+    method itself for the ``(self, conn, …)`` helpers. Collecting all of them
+    over-approximates in the safe direction: a call that passes a parameter as
+    its first positional argument might not be passing the connection, and
+    counting it anyway can only make the denominator larger.
+    """
+    names = set()
+    for inner in ast.walk(method):
+        if isinstance(inner, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            args = inner.args
+            for group in (args.posonlyargs, args.args, args.kwonlyargs):
+                names.update(a.arg for a in group)
+            for extra in (args.vararg, args.kwarg):
+                if extra is not None:
+                    names.add(extra.arg)
+    return names
+
+
+def derive_context_bearing_mutators(root: pathlib.Path = REPO_ROOT) -> frozenset:
+    """Methods whose own write transaction writes model context, read off *root*.
+
+    See MEMBERSHIP IS READ OFF THE CODE in the module docstring. Two rules,
+    applied to a fixpoint:
+
+    1. the method's body contains message-table write SQL; or
+    2. it calls ``self.<already in the set>(<a parameter>, …)`` — handing the
+       transaction's connection to a helper, which is what puts that helper's
+       SQL in this method's transaction.
+
+    Rule 2 is deliberately NOT "calls something that can eventually write":
+    ``self._execute_write`` reaches ``_init_schema`` through the reconnect path,
+    so following plain calls puts every writer, ``__init__`` and ``close`` in
+    the set, and a denominator containing everything measures nothing.
+    """
+    methods, _missing = _sessiondb_implementation(root)
+    derived = {name for name, (_m, node) in methods.items()
+               if _writes_message_rows(node)}
+    changed = True
+    while changed:
+        changed = False
+        for name, (_module, node) in methods.items():
+            if name in derived:
+                continue
+            bound = _names_bound_in(node)
+            for inner in ast.walk(node):
+                if not isinstance(inner, ast.Call):
+                    continue
+                fn = inner.func
+                if not (isinstance(fn, ast.Attribute)
+                        and isinstance(fn.value, ast.Name)
+                        and fn.value.id == "self"
+                        and fn.attr in derived):
+                    continue
+                first = inner.args[0] if inner.args else None
+                if isinstance(first, ast.Name) and first.id in bound:
+                    derived.add(name)
+                    changed = True
+                    break
+    return frozenset(derived)
 
 #: Trees that are not shipped production Python.
 EXCLUDED_DIRS = frozenset({
@@ -144,14 +324,12 @@ EXCLUDED_DIRS = frozenset({
     "docs", "native", "ui-tui", "contributors", "locales", "assets",
 })
 
-REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
-
 FENCE_HELPERS = ("session_turn_lease", "turn_lease_scope")
 
 
-def _production_files():
-    for path in sorted(REPO_ROOT.rglob("*.py")):
-        rel = path.relative_to(REPO_ROOT)
+def _production_files(root: pathlib.Path = REPO_ROOT):
+    for path in sorted(root.rglob("*.py")):
+        rel = path.relative_to(root)
         if set(rel.parts) & EXCLUDED_DIRS:
             continue
         if rel.name.startswith("test_") or rel.name == "conftest.py":
@@ -182,40 +360,67 @@ def _fenced_line_ranges(tree: ast.AST) -> list[tuple[int, int]]:
 SWEEP_ADMISSION_HELPER = "_skip_leased_conversations"
 
 
-def _self_fencing_sweeps() -> frozenset:
-    """Mutators in ``hermes_state.py`` that admit per row inside their own txn.
+def _self_fencing_sweeps(root: pathlib.Path = REPO_ROOT) -> frozenset:
+    """Derived mutators that admit per row inside their own write transaction.
 
-    Derived, never listed. A method qualifies by calling
-    :data:`SWEEP_ADMISSION_HELPER` somewhere in its body (including the nested
-    ``_do(conn)`` closure that runs in the write transaction), and by being a
-    context-bearing mutator in the first place.
+    Derived twice over, and never listed. A method qualifies by being a
+    context-bearing mutator at all (:func:`derive_context_bearing_mutators` —
+    which no longer consults a name anybody typed) and by calling
+    :data:`SWEEP_ADMISSION_HELPER` somewhere in its body, including the nested
+    ``_do(conn)`` closure that runs in the write transaction.
     """
-    tree = ast.parse((REPO_ROOT / "hermes_state.py").read_text(encoding="utf-8"))
+    methods, _missing = _sessiondb_implementation(root)
+    mutators = derive_context_bearing_mutators(root)
     found = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+    for name in mutators:
+        entry = methods.get(name)
+        if entry is None:
             continue
-        if node.name not in CONTEXT_BEARING_MUTATORS:
-            continue
-        for inner in ast.walk(node):
+        for inner in ast.walk(entry[1]):
             if (
                 isinstance(inner, ast.Call)
                 and isinstance(inner.func, ast.Attribute)
                 and inner.func.attr == SWEEP_ADMISSION_HELPER
             ):
-                found.add(node.name)
+                found.add(name)
                 break
     return frozenset(found)
 
 
-def _mutator_parameters() -> dict:
-    """Parameter names of each mutator, read off ``SessionDB`` itself."""
+def _mutator_call_sites_inside_the_implementation(root: pathlib.Path = REPO_ROOT):
+    """``{(module, lineno)}`` for mutator calls nested in another mutator.
+
+    The ``inner`` fence form. See WHAT COUNTS AS GOING THROUGH THE FENCE: such
+    a call is the enclosing mutator's own transaction reaching further, not a
+    new production entry point, and the enclosing mutator is in the denominator
+    by construction — rule 2 of the derivation is what put it there.
+    """
+    methods, _missing = _sessiondb_implementation(root)
+    mutators = derive_context_bearing_mutators(root)
+    inner_sites = set()
+    for name in mutators:
+        entry = methods.get(name)
+        if entry is None:
+            continue
+        module, node = entry
+        for call in ast.walk(node):
+            if (
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr in mutators
+            ):
+                inner_sites.add((module, call.lineno))
+    return inner_sites
+
+
+def _mutator_parameters(root: pathlib.Path = REPO_ROOT) -> dict:
+    """Parameter names of each derived mutator, read off ``SessionDB`` itself."""
     import inspect
 
     from hermes_state import SessionDB
 
     params = {}
-    for name in CONTEXT_BEARING_MUTATORS:
+    for name in derive_context_bearing_mutators(root):
         fn = getattr(SessionDB, name, None)
         if fn is None:
             continue
@@ -245,12 +450,14 @@ def _provably_not_sessiondb(node: ast.Call, mutator: str, source: str, params) -
     return f"passes {sorted(impossible)}, which SessionDB.{mutator} has no parameter for"
 
 
-def census() -> list[dict]:
+def census(root: pathlib.Path = REPO_ROOT) -> list[dict]:
     """Every production call site in the denominator, with its fence status."""
-    sweeps = _self_fencing_sweeps()
-    params = _mutator_parameters()
+    mutators = derive_context_bearing_mutators(root)
+    sweeps = _self_fencing_sweeps(root)
+    inner_sites = _mutator_call_sites_inside_the_implementation(root)
+    params = _mutator_parameters(root)
     sites = []
-    for rel, path in _production_files():
+    for rel, path in _production_files(root):
         source = path.read_text(encoding="utf-8", errors="replace")
         try:
             tree = ast.parse(source)
@@ -265,22 +472,27 @@ def census() -> list[dict]:
             # the in-memory list helper in agent/, not a durable write.
             if not isinstance(fn, ast.Attribute):
                 continue
-            if fn.attr not in CONTEXT_BEARING_MUTATORS:
+            if fn.attr not in mutators:
                 continue
             excluded = _provably_not_sessiondb(node, fn.attr, source, params)
             carries = any(k.arg == "turn_lease_holder" for k in node.keywords)
             inside = any(lo <= node.lineno <= hi for lo, hi in fenced_spans)
             sweep = fn.attr in sweeps
+            # Keyed on the module's path relative to the root, so a same-named
+            # file in a package cannot inherit an implementation module's
+            # `inner` classification.
+            inner = (str(rel), node.lineno) in inner_sites
             sites.append({
                 "location": f"{rel}:{node.lineno}",
                 "package": rel.parts[0] if len(rel.parts) > 1 else "(root)",
                 "mutator": fn.attr,
                 "excluded": excluded,
-                "fenced": carries or inside or sweep,
+                "fenced": carries or inside or sweep or inner,
                 "how": (
                     "grant" if carries
                     else "scope" if inside
                     else "sweep" if sweep
+                    else "inner" if inner
                     else ""
                 ),
             })
@@ -311,6 +523,29 @@ def _seed_owned_and_free(db, tmp_path):
     return grant
 
 
+def _seed_ghost_owner_and_free(db):
+    """A live lease on a conversation with no ``sessions`` row, and nothing else.
+
+    ``import_sessions`` skips every id that already exists, inside the same
+    write transaction that would have inserted it, so an existing transcript is
+    already out of its reach. What is left is the id it CAN create: one whose
+    row is absent while the lease on that conversation is live — a turn that
+    took the lease before its session row landed, or whose row was removed
+    under it. Seeding it any other way would test the `exists` check instead of
+    the fence.
+    """
+    grant = db.try_acquire_session_turn_lease(
+        "owned", f"pid={os.getpid()}:turn=census-proof:platform=test",
+        ttl_seconds=600,
+    )
+    assert grant, "could not take the lease the proof depends on"
+    with db._read_ctx() as conn:
+        assert not conn.execute(
+            "SELECT 1 FROM sessions WHERE id = 'owned'"
+        ).fetchone(), "the ghost owner must not have a sessions row"
+    return grant
+
+
 def test_every_self_fencing_sweep_actually_skips_an_owned_conversation(tmp_path):
     """The derived sweep set is proven, not asserted.
 
@@ -322,11 +557,11 @@ def test_every_self_fencing_sweep_actually_skips_an_owned_conversation(tmp_path)
 
     derived = _self_fencing_sweeps()
     assert derived, (
-        "no mutator in hermes_state.py performs sweep admission, so the third "
-        "fence form is vacuous — either the helper was renamed or the sweeps "
-        "lost their guard"
+        "no derived mutator performs sweep admission, so the third fence form "
+        "is vacuous — either the helper was renamed or the sweeps lost their "
+        "guard"
     )
-    unknown = derived - CONTEXT_BEARING_MUTATORS
+    unknown = derived - derive_context_bearing_mutators()
     assert not unknown, f"sweep set escaped the denominator: {sorted(unknown)}"
 
     # Every derived member, exercised through its real public entry point.
@@ -337,6 +572,16 @@ def test_every_self_fencing_sweep_actually_skips_an_owned_conversation(tmp_path)
         "purge_stale_tool_call_markers": lambda db: db.purge_stale_tool_call_markers(
             backup=False
         ),
+        # import_sessions never touches a session that already exists, so the
+        # conversation it CAN reach while a turn owns it is one whose row is
+        # gone (or not written yet) while the lease on its id is live. That is
+        # what this seeds; see _seed_ghost_owner_and_free.
+        "import_sessions": lambda db: db.import_sessions([
+            {"id": "owned", "source": "test", "started_at": 1.0,
+             "messages": [{"role": "user", "content": "imported"}]},
+            {"id": "free", "source": "test", "started_at": 1.0,
+             "messages": [{"role": "user", "content": "imported"}]},
+        ]),
     }
     missing = derived - set(exercises)
     assert not missing, (
@@ -346,6 +591,26 @@ def test_every_self_fencing_sweep_actually_skips_an_owned_conversation(tmp_path)
 
     for name in sorted(derived):
         db = SessionDB(tmp_path / f"{name}.db")
+        if name == "import_sessions":
+            _seed_ghost_owner_and_free(db)
+            result = exercises[name](db)
+            with db._read_ctx() as conn:
+                imported = {
+                    r["session_id"] for r in conn.execute(
+                        "SELECT DISTINCT session_id FROM messages"
+                    ).fetchall()
+                }
+            assert "free" in imported, (
+                "import_sessions imported nothing at all, so this proves "
+                f"nothing about what it skipped: {result}"
+            )
+            assert "owned" not in imported, (
+                "import_sessions wrote a transcript onto a conversation a live "
+                "turn owns; its call sites are counted as fenced BY it, so "
+                "this makes the census a lie"
+            )
+            db.close()
+            continue
         grant = _seed_owned_and_free(db, tmp_path)
         if name == "purge_stale_tool_call_markers":
             for sid in ("owned", "free"):
@@ -373,6 +638,69 @@ def test_every_self_fencing_sweep_actually_skips_an_owned_conversation(tmp_path)
                 f"are counted as fenced BY it, so this makes the census a lie"
             )
         db.close()
+
+
+def test_the_derivation_reads_every_module_sessiondb_is_made_of():
+    """The derivation's own premise, asserted rather than assumed.
+
+    ``SessionDB`` is a class plus three mixins in three other files. If a base
+    moves to a module the derivation does not parse, its methods silently leave
+    the denominator and the census keeps reporting full coverage over a smaller
+    set — the exact failure mode the hand-written literal had.
+    """
+    _methods, missing = _sessiondb_implementation(REPO_ROOT)
+    assert not missing, (
+        f"SessionDB inherits {sorted(missing)}, and none of "
+        f"{list(SESSIONDB_IMPLEMENTATION_MODULES)} defines them. Every method "
+        f"of those bases is outside the derived denominator until this list is "
+        f"updated deliberately."
+    )
+
+
+def test_the_only_exemption_cannot_touch_a_row_this_generation_wrote(tmp_path):
+    """Evidence for the one entry in NOT_CONTEXT_BEARING.
+
+    ``_init_schema`` runs ``UPDATE messages SET active = 1 WHERE active IS
+    NULL`` on every open. The argument for exempting it is that the predicate
+    cannot match a row this binary produced. That is checkable, so it is
+    checked, on the real write paths rather than on a hand-built row.
+    """
+    from hermes_state import SessionDB
+
+    assert set(NOT_CONTEXT_BEARING) == {"_init_schema"}, (
+        f"the exemption list changed; every entry needs the question answered "
+        f"and a test that proves the answer: {sorted(NOT_CONTEXT_BEARING)}"
+    )
+    db = SessionDB(tmp_path / "exemption.db")
+    db.create_session("s", source="test")
+    db.append_message(session_id="s", role="user", content="one")
+    db.append_messages_batch("s", [{"role": "assistant", "content": "two"}])
+    with db._read_ctx() as conn:
+        nulls = conn.execute(
+            "SELECT COUNT(*) AS n FROM messages WHERE active IS NULL"
+        ).fetchone()["n"]
+    assert nulls == 0, (
+        "a write path in this generation left `active` NULL, so the schema "
+        "repair CAN reach a row this binary wrote and the exemption argument "
+        "for _init_schema no longer holds"
+    )
+    db.close()
+
+    # And re-opening (which is what runs the repair) leaves the transcript
+    # exactly as it was, including while the conversation is owned.
+    reopened = SessionDB(tmp_path / "exemption.db")
+    grant = reopened.try_acquire_session_turn_lease(
+        "s", f"pid={os.getpid()}:turn=exemption:platform=test", ttl_seconds=600
+    )
+    assert grant, "could not take the lease this check depends on"
+    again = SessionDB(tmp_path / "exemption.db")
+    with again._read_ctx() as conn:
+        rows = [r["content"] for r in conn.execute(
+            "SELECT content FROM messages WHERE session_id = 's' ORDER BY id"
+        ).fetchall()]
+    assert rows == ["one", "two"], f"the schema repair changed the transcript: {rows}"
+    again.close()
+    reopened.close()
 
 
 def test_the_denominator_spans_every_production_package(tmp_path):
