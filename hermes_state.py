@@ -7368,18 +7368,91 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             (conversation_id,),
         ).fetchone()
 
-    def _turn_lease_row_is_free(self, row, now: float) -> bool:
-        """True when *row* no longer represents an owned conversation."""
+    def _turn_lease_row_is_free(self, conversation_id: str, row) -> bool:
+        """True when *row* no longer represents an owned conversation.
+
+        There is no clock in here, deliberately. ``expires_at`` says the
+        refresher did not run — a starved thread, a stopped-world GC, a laptop
+        that slept — and reclaiming on it hands a live turn's conversation to a
+        contender. It is kept as a diagnostic column and read by nothing that
+        decides admission; :meth:`force_release_session_turn_lease` is the
+        recovery that replaces it.
+
+        Every branch below is positive evidence:
+
+        released          holder is empty. The row survives release so the
+                          epoch stays monotonic.
+        provably dead     the recorded (pid, start_time) pair no longer exists,
+                          PID reuse included.
+        ours, unheld      the row names THIS process and nothing in this
+                          process holds the grant. That is a turn that died
+                          without releasing, and it is knowable here and now:
+                          no deadline, no guess. Without this branch the first
+                          rule would wedge such a conversation forever.
+        ours, held        something here holds it. A contender sharing our PID
+                          is still a contender — never free, whatever the
+                          deadline says. This is the case a subprocess cannot
+                          exercise.
+        foreign           alive, or alive-as-far-as-we-can-tell. Never free.
+                          "Cannot prove alive" is not "dead".
+        """
         if row is None:
             return True
         holder = row["holder"] or ""
         if not holder:
-            return True  # released; the row survives to keep epoch monotonic
+            return True
+        owner_pid = row["owner_pid"]
         if _turn_lease_owner_is_dead(
-            holder, row["owner_pid"], row["owner_pid_start"]
+            holder, owner_pid, row["owner_pid_start"]
         ):
             return True
-        return float(row["expires_at"]) <= now
+        if owner_pid and int(owner_pid) == os.getpid():
+            return live_turn_grant(self.db_path, conversation_id) is None
+        return False
+
+    def force_release_session_turn_lease(self, session_id: str) -> bool:
+        """Free a conversation without consulting a clock or the holder.
+
+        The deliberate recovery that replaces expiry. Needed because a lease is
+        now only freed by evidence, and there are rows no evidence can reach: a
+        pre-``owner_pid`` row carried over by the v27 rebuild, or a foreign PID
+        that was recycled into something long-lived so liveness reads as "still
+        there". Without this an operator's only option is editing the database
+        by hand.
+
+        The epoch is KEPT, so the grant this evicts can never be replayed —
+        the next acquisition is a strictly later generation. Returns True when
+        a row was actually freed.
+        """
+        if not session_id:
+            return False
+        freed_root = {}
+
+        def _do(conn):
+            conversation_id, row = self._read_turn_lease_on_conn(conn, session_id)
+            if row is None:
+                return False
+            freed_root["id"] = conversation_id
+            logger.warning(
+                "force-releasing the turn lease on conversation %s "
+                "(holder %r, epoch %s) — this evicts whatever holds it",
+                conversation_id, row["holder"], row["epoch"],
+            )
+            conn.execute(
+                "UPDATE session_turn_leases SET holder = '', expires_at = 0 "
+                "WHERE conversation_id = ?",
+                (conversation_id,),
+            )
+            return True
+
+        freed = bool(self._execute_write(_do))
+        root = freed_root.get("id")
+        if freed and root:
+            # Drop any local registration too, or current_turn_grant would keep
+            # handing out a grant the row no longer honours.
+            with _LIVE_TURN_GRANTS_LOCK:
+                _LIVE_TURN_GRANTS.pop(_live_grant_key(self.db_path, root), None)
+        return freed
 
     def _skip_leased_conversations(self, conn, session_ids, now=None):
         """Split *session_ids* into (may_touch, owned) inside a write txn.
@@ -7422,7 +7495,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 f"WHERE conversation_id = ?",
                 (root,),
             ).fetchone()
-            if not self._turn_lease_row_is_free(lease, when):
+            if not self._turn_lease_row_is_free(root, lease):
                 owned_roots.add(root)
         if not owned_roots:
             return list(ids), []
@@ -7477,10 +7550,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     "owner_pid, owner_pid_start) VALUES (?, ?, ?, ?, 1, ?, ?)",
                     (conversation_id, holder, now, expires_at, my_pid, my_start),
                 )
-                token = SessionTurnLeaseToken(holder, 1, conversation_id)
-                _register_live_turn_grant(self.db_path, token)
-                return token
-            if not self._turn_lease_row_is_free(row, now):
+                return SessionTurnLeaseToken(holder, 1, conversation_id)
+            if not self._turn_lease_row_is_free(conversation_id, row):
                 return None
             epoch = int(row["epoch"] or 0) + 1
             conn.execute(
@@ -7489,11 +7560,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "WHERE conversation_id = ?",
                 (holder, now, expires_at, epoch, my_pid, my_start, conversation_id),
             )
-            token = SessionTurnLeaseToken(holder, epoch, conversation_id)
-            _register_live_turn_grant(self.db_path, token)
-            return token
+            return SessionTurnLeaseToken(holder, epoch, conversation_id)
 
-        return self._execute_write(_do, patience_s=patience_s)
+        token = self._execute_write(_do, patience_s=patience_s)
+        if token is not None:
+            # AFTER the write commits, never inside _do: _execute_write can
+            # retry the callback, and a registration left behind by an attempt
+            # that never landed would make this process look like the owner of
+            # a row it does not hold.
+            _register_live_turn_grant(self.db_path, token)
+        return token
 
     def acquire_session_turn_lease(
         self,
@@ -10283,7 +10359,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # moment a live owner exists.
             conversation_id, lease = self._read_turn_lease_on_conn(conn, session_id)
             if lease is not None and not self._turn_lease_row_is_free(
-                lease, time.time()
+                conversation_id, lease
             ):
                 raise SessionTurnLeaseLostError(
                     f"Session turn lease held by {lease['holder']!r} "

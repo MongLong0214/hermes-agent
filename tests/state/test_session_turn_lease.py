@@ -300,17 +300,40 @@ def test_turn_lease_refresh_and_release_are_owner_fenced(tmp_path):
     )
 
 
-def test_expired_turn_lease_is_reclaimed(tmp_path):
+def test_an_expired_lease_is_NOT_reclaimed_on_the_deadline_alone(tmp_path):
+    """Was ``test_expired_turn_lease_is_reclaimed``; the contract inverted.
+
+    A passed deadline says the refresher did not run — a starved thread, a
+    stopped-world GC, a laptop that slept. It does not say the owner is gone,
+    and this test used to assert that it did. Reclaiming on it hands a live
+    turn's conversation to a contender, which is the whole defect slice 5
+    closes.
+
+    The two paths out of a held lease are unchanged in spirit and both are
+    evidence-based: the holder releases, or an operator forces it. Neither
+    involves waiting.
+    """
     db = SessionDB(tmp_path / "state.db")
     db.create_session("shared", source="test")
-    assert db.try_acquire_session_turn_lease(
+    held = db.try_acquire_session_turn_lease(
         "shared", "legacy-holder", ttl_seconds=0.05
     )
+    assert held is not None
 
-    time.sleep(0.15)
+    time.sleep(0.15)  # the deadline is now comfortably in the past
 
     assert db.try_acquire_session_turn_lease(
         "shared", "pid=202:turn=reclaimer", ttl_seconds=5
+    ) is None, "the deadline alone reclaimed a lease this process still holds"
+
+    assert db.force_release_session_turn_lease("shared") is True
+    taken = db.try_acquire_session_turn_lease(
+        "shared", "pid=202:turn=reclaimer", ttl_seconds=5
+    )
+    assert taken is not None
+    assert taken.epoch == held.epoch + 1, (
+        "a forced takeover must advance the generation, or the evicted grant "
+        "comes back the moment its holder tries to write"
     )
 
 
