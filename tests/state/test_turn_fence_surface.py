@@ -1,0 +1,367 @@
+"""The DB-level fence surface is DERIVED from source and mutation-tested.
+
+WHY THIS FILE EXISTS
+    The first version of the generation fence put triggers on ``messages`` only,
+    and the probe against the base binary only called ``append_message``. Both
+    halves of that were too narrow, and the narrowness was invisible because the
+    tests that existed all passed:
+
+        end_session, update_session_model, update_system_prompt,
+        set_session_title, patch_session_model_config
+
+    all WROTE, from the exact binary at the base commit, against a conversation
+    this generation held the lease on. Not one of them touches ``messages``.
+    They rewrite the model, the system prompt and the end state that the next
+    turn replays under — provider-visible state, changed by a process that has
+    never heard of the lease.
+
+    (The counterexample that was predicted — an EMPTY session, no ``messages``
+    row, therefore no message trigger fires — does NOT reproduce. SQLite
+    resolves a trigger program when it PREPARES the statement, so
+    ``DELETE FROM messages WHERE session_id = ?`` is refused whether or not it
+    would have matched a row. It is kept as a row of the base-binary table in
+    ``test_turn_lease_generation_trigger`` anyway, because "no row, no trigger"
+    is the intuitive answer and it is wrong, and because an implementation that
+    moved to AFTER triggers or to ``ON DELETE CASCADE`` would make it right.)
+
+HOW THE SURFACE IS DECIDED
+    Not by a list in production that somebody keeps in step. Production
+    DECLARES :data:`hermes_state_common.TURN_FENCE_SURFACE`; this file DERIVES
+    the same set from the source of ``SessionDB`` and its mixins, and fails when
+    they differ. A new mutator that writes a new table therefore fails here
+    until the declaration follows it.
+
+    The derivation is: every ``(table, operation)`` written inside the write
+    transaction of a method that either
+
+    * writes model context (:func:`derive_context_bearing_mutators`, the same
+      derivation the writer census uses), or
+    * writes the turn-lease table itself — a process that can free the fence
+      can defeat it, so the fence's own table is part of the surface.
+
+    minus the one argued exemption (``_init_schema``, which installs the
+    triggers and cannot be fenced by them), and intersected with the tables that
+    actually exist in the schema so that prose in a docstring cannot invent a
+    table name.
+
+WHY EACH TRIGGER IS MUTATION-TESTED
+    A trigger that is never the reason a write fails contributes nothing and
+    still reads as coverage. So for every derived ``(table, operation)`` the
+    table below drops THAT ONE trigger from a real store and shows the foreign
+    write then succeeds — and with it in place, fails. A trigger whose removal
+    changes nothing fails this test.
+"""
+
+from __future__ import annotations
+
+import ast
+import os
+import pathlib
+import re
+import sqlite3
+
+import pytest
+
+import hermes_state_common
+from hermes_state_common import TURN_FENCE_FUNCTION_NAME
+from tests.state import test_turn_lease_writer_census as census_mod
+
+
+def turn_fence_trigger_name(table: str, operation: str) -> str:
+    """The trigger production names for one surface entry.
+
+    Read from production when it exposes the helper. The fallback reproduces
+    the name production already uses, so a tree that has not grown the helper
+    yet is measured against its real triggers rather than failing to import —
+    a collection error is not a result.
+    """
+    helper = getattr(hermes_state_common, "turn_fence_trigger_name", None)
+    if helper is not None:
+        return helper(table, operation)
+    return f"hermes_turn_fence_{table}_{operation.lower()}"
+
+
+def declared_fence_surface() -> tuple:
+    """What production says the fence covers, as ``(table, operation)`` pairs.
+
+    ``TURN_FENCE_SURFACE`` when production declares one; otherwise recovered
+    from the trigger NAMES it does declare, which is the same claim in a less
+    convenient form. Either way this returns production's real answer, so a
+    difference from the derivation is a finding rather than an artefact.
+    """
+    declared = getattr(hermes_state_common, "TURN_FENCE_SURFACE", None)
+    if declared is not None:
+        return tuple(declared)
+    recovered = []
+    for name in getattr(hermes_state_common, "TURN_FENCE_TRIGGERS", ()):
+        stem = name.removeprefix("hermes_turn_fence_")
+        table, _, verb = stem.rpartition("_")
+        if table and verb:
+            recovered.append((table, verb.upper()))
+    return tuple(recovered)
+
+
+TURN_FENCE_SURFACE = declared_fence_surface()
+
+#: Any statement that writes a table, and which table. The verb is captured so
+#: the surface is per (table, operation) rather than per table: a fence that
+#: covers INSERT and not DELETE is exactly the shape being ruled out.
+WRITE_STATEMENT = re.compile(
+    r"\b(insert(?:\s+or\s+\w+)?\s+into|update|delete\s+from)\s+"
+    r"([A-Za-z_][A-Za-z_0-9]*)",
+    re.IGNORECASE,
+)
+
+TURN_LEASE_TABLE = "session_turn_leases"
+
+VERB_TO_OPERATION = {"insert": "INSERT", "update": "UPDATE", "delete": "DELETE"}
+
+
+def _real_tables(tmp_path) -> frozenset:
+    """Table names in a store this generation creates.
+
+    The derivation reads string literals, and a docstring that says "update is
+    …" parses as ``UPDATE is``. Intersecting with the live schema is what stops
+    prose from inventing a table, and it is derived rather than filtered by a
+    list of words to ignore.
+    """
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / "schema-probe.db")
+    with db._read_ctx() as conn:
+        names = {
+            row["name"] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+    db.close()
+    return frozenset(names)
+
+
+def derive_turn_fence_surface(tmp_path) -> frozenset:
+    """``{(table, operation)}`` the fence has to cover, read off the source."""
+    methods, _missing = census_mod._sessiondb_implementation(census_mod.REPO_ROOT)
+    context_bearing = set(census_mod.derive_context_bearing_mutators())
+
+    lease_writers = set()
+    for name, (_module, node) in methods.items():
+        for inner in ast.walk(node):
+            if not (isinstance(inner, ast.Constant)
+                    and isinstance(inner.value, str)):
+                continue
+            for match in WRITE_STATEMENT.finditer(inner.value):
+                if match.group(2).lower() == TURN_LEASE_TABLE:
+                    lease_writers.add(name)
+
+    exempt = set(census_mod.NOT_CONTEXT_BEARING)
+    tables = {name.lower() for name in _real_tables(tmp_path)}
+    surface = set()
+    for name in (context_bearing | lease_writers) - exempt:
+        entry = methods.get(name)
+        if entry is None:
+            continue
+        for inner in ast.walk(entry[1]):
+            if not (isinstance(inner, ast.Constant)
+                    and isinstance(inner.value, str)):
+                continue
+            for match in WRITE_STATEMENT.finditer(inner.value):
+                table = match.group(2).lower()
+                if table not in tables:
+                    continue
+                verb = match.group(1).split()[0].lower()
+                surface.add((table, VERB_TO_OPERATION[verb]))
+    return frozenset(surface)
+
+
+def test_the_declared_fence_surface_is_the_one_the_source_needs(tmp_path):
+    """Production's declaration must equal the derivation, both ways.
+
+    Missing entries are the hole this file was written for. EXTRA entries
+    matter too: a declared trigger with nothing behind it is a claim the source
+    does not support, and it makes the next reader believe a table is written
+    where it is not.
+    """
+    derived = derive_turn_fence_surface(tmp_path)
+    declared = frozenset(
+        (table.lower(), op.upper()) for table, op in TURN_FENCE_SURFACE
+    )
+    assert derived, "the derivation found nothing; the scan itself is broken"
+    missing = derived - declared
+    extra = declared - derived
+    assert not missing, (
+        f"these (table, operation) pairs are written inside the write "
+        f"transaction of a context-bearing or lease-table mutator and no "
+        f"generation trigger covers them, so an old binary performs them "
+        f"unrefused: {sorted(missing)}"
+    )
+    assert not extra, (
+        f"these triggers are declared but no derived mutator writes them: "
+        f"{sorted(extra)}"
+    )
+
+
+def test_every_declared_trigger_exists_in_a_real_store(tmp_path):
+    """The declaration has to reach the file, not just the constant."""
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / "state.db")
+    with db._read_ctx() as conn:
+        installed = {
+            row["name"] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+            ).fetchall()
+        }
+    db.close()
+    for table, op in TURN_FENCE_SURFACE:
+        name = turn_fence_trigger_name(table, op)
+        assert name in installed, (
+            f"{name} is declared but was not created on a store this "
+            f"generation opened; installed triggers: {sorted(installed)}"
+        )
+
+
+#: One foreign statement per surface entry, and the seed it needs. The statement
+#: has to be one the schema would otherwise accept, or "it failed" proves
+#: nothing about the trigger.
+FOREIGN_STATEMENTS = {
+    ("messages", "INSERT"):
+        "INSERT INTO messages (session_id, role, content, timestamp, active) "
+        "VALUES ('s', 'assistant', 'foreign', 1.0, 1)",
+    ("messages", "UPDATE"):
+        "UPDATE messages SET content = 'clobbered' WHERE session_id = 's'",
+    ("messages", "DELETE"):
+        "DELETE FROM messages WHERE session_id = 's'",
+    ("sessions", "INSERT"):
+        "INSERT INTO sessions (id, source, started_at) "
+        "VALUES ('smuggled', 'foreign', 1.0)",
+    ("sessions", "UPDATE"):
+        "UPDATE sessions SET model = 'evil-model' WHERE id = 's'",
+    ("sessions", "DELETE"):
+        "DELETE FROM sessions WHERE id = 's'",
+    (TURN_LEASE_TABLE, "INSERT"):
+        "INSERT INTO session_turn_leases (conversation_id, holder, "
+        "acquired_at, expires_at, epoch) VALUES ('smuggled', 'x', 0, 0, 1)",
+    (TURN_LEASE_TABLE, "UPDATE"):
+        "UPDATE session_turn_leases SET holder = '' WHERE conversation_id = 's'",
+    (TURN_LEASE_TABLE, "DELETE"):
+        "DELETE FROM session_turn_leases WHERE conversation_id = 's'",
+}
+
+
+def _store_with_a_live_lease(tmp_path, name="state.db"):
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / name)
+    db.create_session("s", source="test")
+    grant = db.try_acquire_session_turn_lease(
+        "s", f"pid={os.getpid()}:turn=live:platform=test", ttl_seconds=600
+    )
+    assert grant
+    db.append_message(
+        session_id="s", role="user", content="current", turn_lease_holder=grant
+    )
+    db.close()
+    return tmp_path / name
+
+
+def test_every_declared_trigger_is_the_reason_its_write_fails(tmp_path):
+    """The mutation table. Drop one trigger; that one write gets through.
+
+    A trigger something else already guarantees the property for is redundant
+    and reports coverage it does not have. This is the check that can tell the
+    difference: with the trigger installed the foreign write must be refused,
+    and with THAT trigger and no other removed it must succeed.
+    """
+    missing_statements = {
+        (t.lower(), o.upper()) for t, o in TURN_FENCE_SURFACE
+    } - set(FOREIGN_STATEMENTS)
+    assert not missing_statements, (
+        f"these surface entries have no foreign statement to exercise them, "
+        f"so their triggers are unproven: {sorted(missing_statements)}"
+    )
+
+    for index, (table, op) in enumerate(TURN_FENCE_SURFACE):
+        key = (table.lower(), op.upper())
+        sql = FOREIGN_STATEMENTS[key]
+        trigger = turn_fence_trigger_name(table, op)
+
+        store = _store_with_a_live_lease(tmp_path, f"intact-{index}.db")
+        intact = sqlite3.connect(str(store))
+        try:
+            with pytest.raises(sqlite3.OperationalError) as caught:
+                intact.execute(sql)
+            assert TURN_FENCE_FUNCTION_NAME in str(caught.value), (
+                f"{key} was refused, but not by {trigger}: {caught.value!r}"
+            )
+        finally:
+            intact.rollback()
+            intact.close()
+
+        # Same store, same statement, that one trigger removed.
+        store = _store_with_a_live_lease(tmp_path, f"mutated-{index}.db")
+        surgeon = sqlite3.connect(str(store))
+        surgeon.create_function(TURN_FENCE_FUNCTION_NAME, 0, lambda: 1)
+        surgeon.execute(f"DROP TRIGGER {trigger}")
+        surgeon.commit()
+        surgeon.close()
+
+        mutated = sqlite3.connect(str(store))
+        try:
+            mutated.execute("PRAGMA foreign_keys=OFF")
+            mutated.execute(sql)
+        except sqlite3.OperationalError as exc:
+            pytest.fail(
+                f"{trigger} was removed and {key} was STILL refused "
+                f"({exc}). Something else already guarantees this write "
+                f"cannot happen, so the trigger is reporting coverage it does "
+                f"not have — or the drop did not take."
+            )
+        finally:
+            mutated.rollback()
+            mutated.close()
+
+
+def test_this_generation_writes_every_surface_table_normally(tmp_path):
+    """The fence must not be a fence on us, on any of its tables."""
+    from hermes_state import SessionDB
+
+    store = tmp_path / "state.db"
+    db = SessionDB(store)
+    db.create_session("s", source="test")
+    grant = db.try_acquire_session_turn_lease(
+        "s", f"pid={os.getpid()}:turn=live:platform=test", ttl_seconds=600
+    )
+    assert grant
+    db.append_message(
+        session_id="s", role="user", content="one", turn_lease_holder=grant
+    )
+    db.update_session_model("s", "a-model")
+    db.set_session_title("s", "a title")
+    db.end_session("s", "completed")
+    assert db.refresh_session_turn_lease("s", grant, ttl_seconds=600) is True
+    db.release_session_turn_lease("s", grant)
+    regrant = db.try_acquire_session_turn_lease(
+        "s", f"pid={os.getpid()}:turn=again:platform=test", ttl_seconds=600
+    )
+    assert regrant is not None and regrant.epoch > grant.epoch
+    db.delete_session("s", turn_lease_holder=regrant)
+    db.close()
+
+
+def test_the_surface_covers_sessions_not_only_messages(tmp_path):
+    """A named regression for the narrowness this file was opened for.
+
+    Stated separately from the derivation check so that a derivation which
+    silently stops finding `sessions` writers fails with the reason rather than
+    with a set difference.
+    """
+    declared = {(t.lower(), o.upper()) for t, o in TURN_FENCE_SURFACE}
+    for op in ("INSERT", "UPDATE", "DELETE"):
+        assert ("sessions", op) in declared, (
+            f"sessions {op} is unfenced. The model, the system prompt, the "
+            f"title and the end state all live in `sessions` and none of them "
+            f"touch `messages`, so a transcript-only fence lets a mixed-version "
+            f"writer rewrite what the next turn replays under."
+        )
+    for op in ("INSERT", "UPDATE", "DELETE"):
+        assert ("messages", op) in declared

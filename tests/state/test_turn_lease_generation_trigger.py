@@ -123,6 +123,10 @@ def _new_generation_store(path: pathlib.Path):
 
     db = SessionDB(path)
     db.create_session("s", source="test")
+    # An EMPTY session with a cascading child, for the "no messages row, so no
+    # message trigger can fire" case.
+    db.create_session("empty", source="test")
+    db.create_session("empty-kid", source="test", parent_session_id="empty")
     grant = db.try_acquire_session_turn_lease(
         "s", f"pid={os.getpid()}:turn=live:platform=test", ttl_seconds=600
     )
@@ -130,6 +134,11 @@ def _new_generation_store(path: pathlib.Path):
     db.append_message(
         session_id="s", role="user", content="current", turn_lease_holder=grant
     )
+    empty_grant = db.try_acquire_session_turn_lease(
+        "empty", f"pid={os.getpid()}:turn=live-empty:platform=test",
+        ttl_seconds=600,
+    )
+    assert empty_grant, "could not take the empty session's lease"
     db.close()
     return grant
 
@@ -219,6 +228,39 @@ BASE_BINARY_WRITE_ATTEMPTS = (
      'db.set_message_reaction("s", 1, "old-binary")'),
     ("delete_session",
      'db.delete_session("s")'),
+    # An EMPTY session has no `messages` row. Review's counterexample was that
+    # a message trigger therefore cannot fire and the delete goes through with
+    # the delegates cascaded behind it. It does not reproduce -- SQLite
+    # resolves a trigger program when it PREPARES the statement, so
+    # `DELETE FROM messages WHERE session_id = ?` is refused whether or not it
+    # would have matched a row -- and it is kept as a row of this table
+    # precisely because "no row, no trigger" is the intuitive answer and it is
+    # wrong. If the implementation ever moves to AFTER triggers, or drops the
+    # messages delete in favour of an ON DELETE CASCADE, this row is what
+    # notices.
+    ("delete_empty_session",
+     'db.delete_session("empty")'),
+    ("delete_sessions_bulk",
+     'db.delete_sessions(["s"])'),
+    # Provider-visible state that lives entirely in `sessions`. None of these
+    # touch `messages`, so a fence built on the transcript alone lets every one
+    # of them through: the model, the system prompt and the title the next turn
+    # replays under are all rewritable by a binary that has never heard of the
+    # lease.
+    ("end_session",
+     'db.end_session("s", "completed")'),
+    ("update_session_model",
+     'db.update_session_model("s", "evil-model")'),
+    ("update_system_prompt",
+     'db.update_system_prompt("s", "EVIL PROMPT")'),
+    ("set_session_title",
+     'db.set_session_title("s", "clobbered")'),
+    ("patch_session_model_config",
+     'db.patch_session_model_config("s", {"temperature": 9})'),
+    ("promote_to_session_reset",
+     'db.promote_to_session_reset("s")'),
+    ("create_session",
+     'db.create_session("smuggled", source="old-binary")'),
 )
 
 
