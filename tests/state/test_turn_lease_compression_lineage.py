@@ -179,6 +179,15 @@ def check_a_foreign_root_grant_cannot_publish(tmpdir) -> None:
     Holder and epoch order acquisitions within one conversation and say
     nothing across conversations — a first grant is epoch 1 everywhere, so
     without the root comparison the epoch discriminates nothing at all.
+
+    BOTH GRANTS USE THE SAME HOLDER STRING, AND THAT IS THE WHOLE TEST. The
+    first version of this check gave them different holders, and it survived
+    its own mutation: with the root comparison deleted the write was still
+    refused, by the ``row["holder"] != str(token)`` comparison one line below.
+    It passed while asserting nothing about the property it names. One process
+    holding the lease on two conversations under one identity is the case that
+    isolates the root, and it is not exotic — a compressor working two sessions
+    composes the same holder for both.
     """
     from hermes_state import SessionTurnLeaseLostError
 
@@ -186,18 +195,25 @@ def check_a_foreign_root_grant_cannot_publish(tmpdir) -> None:
     try:
         db.create_session("mine", "test")
         db.create_session("theirs", "test")
+        one_identity = _holder("compressor")
         foreign = db.try_acquire_session_turn_lease(
-            "theirs", _holder("foreign"), ttl_seconds=600
+            "theirs", one_identity, ttl_seconds=600
         )
         assert foreign, "could not take the foreign lease"
         mine = db.try_acquire_session_turn_lease(
-            "mine", _holder("mine"), ttl_seconds=600
+            "mine", one_identity, ttl_seconds=600
         )
         assert mine, "could not take my own lease"
+        assert str(foreign) == str(mine), (
+            "the two grants must be the same holder string, or the holder "
+            "comparison refuses this write and the ROOT comparison is never "
+            "exercised"
+        )
         assert foreign.epoch == mine.epoch, (
             "both first grants should be the same epoch; if they are not, this "
             "check no longer isolates the ROOT comparison"
         )
+        assert foreign.conversation_id != mine.conversation_id
 
         before = _session_snapshot(db, "mine")
         try:
