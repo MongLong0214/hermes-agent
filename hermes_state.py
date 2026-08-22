@@ -9978,32 +9978,39 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         )
         return None
 
-    def _check_transcript_write_guards(
+    def _check_turn_lease_guard(
         self,
         conn,
         session_id: str,
-        compression_lock_holder: Optional[str],
-        turn_lease_holder: Optional[str] = None,
+        turn_lease_holder,
+        *,
         turn_lease_ttl_seconds: float = 300.0,
     ) -> None:
-        """Transcript-append admission checks, run INSIDE the write txn.
+        """Admission for one context-bearing mutation, INSIDE the write txn.
 
-        Shared by :meth:`append_message` and :meth:`append_messages_batch` so
-        the two writers can never diverge on these correctness invariants
-        (this guard has already needed targeted fixes — see the #74478
-        patience note below).
+        Separated from the transcript-append guard so that every mutator can
+        reach the same decision — appends are not the only writes that change
+        what the next turn replays, and a rule only the append path can call
+        is a rule the other writers do not have.
         """
-        # NOTE (#75316 redesign): appends do NOT check compression_locks.
-        # The lock's job is to stop two COMPRESSIONS colliding, not to fence
-        # ordinary transcript writes. Concurrent appends during a compression
-        # are safe by construction: archive_and_compact() commits against a
-        # watermark captured at compression start and clones every row that
-        # arrived after it back into the live transcript, in the same write
-        # transaction. Blocking appends here was the root cause of a whole
-        # symptom family — turns dying as session_persistence_failed while a
-        # slow provider summary held the lease (#74568, #77386), including
-        # stale locks from dead PIDs blocking writes for the full TTL.
-        if turn_lease_holder:
+        if not turn_lease_holder:
+            # Admission when NOTHING is presented. This branch did not exist:
+            # the check was `if turn_lease_holder:`, so a writer that presented
+            # nothing was admitted unconditionally — including while another
+            # process demonstrably owned the conversation. Holderless writes
+            # stay legal on an unowned conversation (fresh sessions, imports,
+            # branch copies, single-writer installs); they are refused the
+            # moment a live owner exists.
+            conversation_id, lease = self._read_turn_lease_on_conn(conn, session_id)
+            if lease is not None and not self._turn_lease_row_is_free(
+                lease, time.time()
+            ):
+                raise SessionTurnLeaseLostError(
+                    f"Session turn lease held by {lease['holder']!r} "
+                    f"(epoch {lease['epoch']}); refusing unfenced write for "
+                    f"{session_id!r}"
+                )
+        else:
             authorized = self._authorize_turn_lease_token(
                 conn, session_id, turn_lease_holder
             )
@@ -10034,6 +10041,38 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         _granted_epoch,
                     ),
                 )
+
+    def _check_transcript_write_guards(
+        self,
+        conn,
+        session_id: str,
+        compression_lock_holder: Optional[str],
+        turn_lease_holder: Optional[str] = None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> None:
+        """Transcript-append admission checks, run INSIDE the write txn.
+
+        Shared by :meth:`append_message` and :meth:`append_messages_batch` so
+        the two writers can never diverge on these correctness invariants
+        (this guard has already needed targeted fixes — see the #74478
+        patience note below).
+        """
+        # NOTE (#75316 redesign): appends do NOT check compression_locks.
+        # The lock's job is to stop two COMPRESSIONS colliding, not to fence
+        # ordinary transcript writes. Concurrent appends during a compression
+        # are safe by construction: archive_and_compact() commits against a
+        # watermark captured at compression start and clones every row that
+        # arrived after it back into the live transcript, in the same write
+        # transaction. Blocking appends here was the root cause of a whole
+        # symptom family — turns dying as session_persistence_failed while a
+        # slow provider summary held the lease (#74568, #77386), including
+        # stale locks from dead PIDs blocking writes for the full TTL.
+        self._check_turn_lease_guard(
+            conn,
+            session_id,
+            turn_lease_holder,
+            turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+        )
         session = conn.execute(
             "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
             (session_id,),
@@ -10775,6 +10814,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         model_config_patch: Optional[Dict[str, Any]] = None,
         watermark: Optional[int] = None,
         lock_holder: Optional[str] = None,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> int:
         """Non-destructive in-place compaction for a single durable session id.
 
@@ -10821,6 +10862,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
 
         def _do(conn):
+            # The compression lock stops two COMPRESSIONS colliding; it says
+            # nothing about who owns the TURN. A compaction rewrites the whole
+            # live history, so it takes the turn fence as well.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             if lock_holder is not None:
                 lock_row = conn.execute(
                     "SELECT holder, expires_at FROM compression_locks "
