@@ -415,6 +415,11 @@ def _run_pin(tree: pathlib.Path, pin: str, scratch: pathlib.Path):
             "pins_under_mutation", {str(tree / _SELF)!r}
         )
         module = importlib.util.module_from_spec(spec)
+        # Registered BEFORE exec: @dataclass resolves annotations through
+        # sys.modules[cls.__module__], and an unregistered module makes that
+        # None. The failure looks like the pin not holding on a clean extract,
+        # which would have read as "this row measures nothing" forever.
+        sys.modules[spec.name] = module
         spec.loader.exec_module(module)
         import hermes_state
         loaded = pathlib.Path(hermes_state.__file__).resolve()
