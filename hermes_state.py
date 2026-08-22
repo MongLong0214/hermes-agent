@@ -72,6 +72,11 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     FTS_TRIGRAM_SQL,
     LEGACY_FTS_SQL,
     LEGACY_FTS_TRIGRAM_SQL,
+    TURN_FENCE_FUNCTION_NAME,
+    TURN_FENCE_GENERATION,
+    TURN_FENCE_TRIGGERS,
+    TURN_FENCE_TRIGGER_SQL,
+    register_turn_fence_function,
     MAX_FTS5_QUERY_CHARS,
     SCHEMA_SQL,
     SCHEMA_VERSION,
@@ -2498,6 +2503,11 @@ def _connect_repair_durable(db_path: Path) -> sqlite3.Connection:
     schema parses again, which is the point at which the pragmas can stick.
     """
     conn = sqlite3.connect(str(db_path), isolation_level=None)
+    # Repair rewrites `messages` on some strategies, and the generation
+    # triggers refuse a connection that has not registered the marker. Without
+    # this, installing the fence would make the repair path unable to fix the
+    # file it exists to fix.
+    register_turn_fence_function(conn)
     _reapply_durability_barriers(conn)
     return conn
 
@@ -3323,17 +3333,27 @@ def _connect_tracked_db(path, tracking_path=None, **kwargs):
             "(byte-probe guard inactive in this install)",
             path,
         )
-        return sqlite3.connect(str(path), **kwargs)
+        conn = sqlite3.connect(str(path), **kwargs)
+        register_turn_fence_function(conn)
+        return conn
 
     # Open through THIS module's sqlite3.connect so callers (and tests) that
     # patch hermes_state.sqlite3.connect keep control of connection creation;
     # the helper still owns tracking.
-    return connect_tracked(
+    conn = connect_tracked(
         path,
         tracking_path=tracking_path,
         connect_fn=sqlite3.connect,
         **kwargs,
     )
+    # THE choke point for the generation barrier: every connection this package
+    # opens comes through here, and the marker has to be registered before the
+    # first statement — `_init_schema` writes `messages` itself, so a
+    # connection that gets it later cannot finish opening the store. Read-only
+    # connections get it too: the cost is one dictionary entry, and a read pool
+    # that silently could not write would be a worse surprise than one that can.
+    register_turn_fence_function(conn)
+    return conn
 
 
 def is_zeroed_state_db(

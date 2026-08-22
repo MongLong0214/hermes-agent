@@ -43,6 +43,7 @@ import pathlib
 import sqlite3
 import subprocess
 import sys
+import textwrap
 
 import pytest
 
@@ -200,13 +201,52 @@ def test_this_generation_still_writes_normally(tmp_path):
     reopened.close()
 
 
+#: Every class of write the old binary has to be stopped on. Append-only is a
+#: fail: `replace_messages` rewrites the history wholesale, `rewind_to_message`
+#: truncates it, `set_message_reaction` produces the announcement the next turn
+#: consumes, and `delete_session` removes the conversation outright. All four go
+#: through `messages` -- reactions are columns on the row, not a side table --
+#: so one trigger set covers them, but the coverage has to be demonstrated
+#: rather than inferred from the schema.
+BASE_BINARY_WRITE_ATTEMPTS = (
+    ("append",
+     'db.append_message(session_id="s", role="assistant", content="OLD")'),
+    ("replace",
+     'db.replace_messages("s", [{"role": "user", "content": "OLD"}])'),
+    ("rewind",
+     'db.rewind_to_message("s", 1)'),
+    ("reaction",
+     'db.set_message_reaction("s", 1, "old-binary")'),
+    ("delete_session",
+     'db.delete_session("s")'),
+)
+
+
 def test_the_base_binary_cannot_write_a_store_this_generation_created(
     tmp_path, base_binary_tree
 ):
-    """The claim, against the exact module tree at the base commit."""
+    """The claim, against the exact module tree at the base commit.
+
+    Every write class, not just append. A fence that stops the transcript
+    append and lets the same binary run ``delete_session`` has not fenced
+    anything — removing the rows is the most complete way to change what the
+    next turn replays.
+    """
     store = tmp_path / "state.db"
     _new_generation_store(store)
 
+    attempts = textwrap.indent(
+        "\n".join(
+            f'try:\n'
+            f'    {code}\n'
+            f'except Exception as exc:\n'
+            f'    print("REFUSED {label}:", type(exc).__name__, exc)\n'
+            f'else:\n'
+            f'    print("WROTE {label}")\n'
+            for label, code in BASE_BINARY_WRITE_ATTEMPTS
+        ),
+        "    ",
+    )
     probe = f'''
 import pathlib, sys, traceback
 import hermes_state
@@ -218,14 +258,11 @@ assert loaded.is_relative_to(here), (
     "the candidate leaked in and the result would be meaningless"
     % (loaded, here)
 )
+print("LOADED", loaded)
 
 db = hermes_state.SessionDB(pathlib.Path({str(store)!r}))
 try:
-    db.append_message(session_id="s", role="assistant", content="OLD BINARY WROTE")
-except Exception as exc:
-    print("REFUSED:", type(exc).__name__, exc)
-else:
-    print("WROTE")
+{attempts}
 finally:
     try:
         db.close()
@@ -249,11 +286,17 @@ finally:
         f"the base-binary probe did not run to completion, so it proves "
         f"nothing:\nstdout: {result.stdout}\nstderr: {result.stderr}"
     )
-    assert "REFUSED:" in result.stdout, (
-        f"the binary at {BASE_COMMIT[:10]} appended to a conversation this "
-        f"generation holds the lease on, and nothing stopped it. epoch NOT NULL "
-        f"fences the lease table; it says nothing about a holderless transcript "
-        f"write.\nprobe stdout: {result.stdout!r}\nstderr: {result.stderr!r}"
+    assert "LOADED" in result.stdout, "the probe never confirmed which module it ran"
+    got_through = [
+        label for label, _code in BASE_BINARY_WRITE_ATTEMPTS
+        if f"WROTE {label}" in result.stdout
+    ]
+    assert not got_through, (
+        f"the binary at {BASE_COMMIT[:10]} performed {got_through} against a "
+        f"conversation this generation holds the lease on, and nothing stopped "
+        f"it. epoch NOT NULL fences the lease table; it says nothing about a "
+        f"holderless transcript write.\nprobe stdout:\n{result.stdout}\n"
+        f"stderr:\n{result.stderr}"
     )
 
     from hermes_state import SessionDB
@@ -261,5 +304,8 @@ finally:
     db = SessionDB(store)
     assert [m["content"] for m in db.get_messages("s")] == ["current"], (
         "the base binary's write landed even though it reported a refusal"
+    )
+    assert db.get_session("s") is not None, (
+        "the base binary deleted the session even though it reported a refusal"
     )
     db.close()

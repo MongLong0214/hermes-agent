@@ -26,6 +26,7 @@ from hermes_state_common import (
     LEGACY_FTS_TRIGRAM_SQL,
     SCHEMA_SQL,
     SCHEMA_VERSION,
+    TURN_FENCE_TRIGGER_SQL,
     _FTS_CJK_TRIGGERS,
     _FTS_TRIGGERS,
     _ephemeral_child_sql,
@@ -1371,6 +1372,13 @@ class SessionSchemaMixin:
             # AFTER UPDATE OF variants. IF NOT EXISTS cannot rewrite them.
             if getattr(self, "_fts_enabled", False):
                 self._migrate_broad_fts_update_triggers(cursor)
+
+        # Generation barrier. Last, so it is installed only once every other
+        # piece of DDL this open needed has succeeded — a half-migrated store
+        # that then refuses its own writer is worse than one that is merely
+        # behind. See TURN_FENCE_TRIGGER_SQL in hermes_state_common for what it
+        # stops, what it does not, and what it costs to roll back.
+        cursor.executescript(TURN_FENCE_TRIGGER_SQL)
 
         self._conn.commit()
 

@@ -788,3 +788,90 @@ AFTER UPDATE OF content, tool_name, tool_calls ON messages BEGIN
     );
 END;
 """
+
+
+# ---------------------------------------------------------------------------
+# Turn-fence generation barrier
+# ---------------------------------------------------------------------------
+#
+# Blocker (b). Every other part of the turn fence lives in Python: a process
+# running an older build of this package does not execute any of it, and the
+# schema has nothing to say about a holderless `INSERT INTO messages`. The base
+# binary at 261a4efb can open a store this generation created, append to a
+# conversation this generation holds the lease on, and be told nothing.
+#
+# The one thing both binaries share is the database file. A trigger on
+# `messages` whose body calls an application-defined function makes "did this
+# connection register the function" a precondition of the STATEMENT: SQLite
+# resolves the trigger program when it prepares the write, so a connection that
+# did not register it fails with `no such function` before a row is touched.
+# Registration happens in this package's connect path, so "this generation" is
+# exactly the set of processes allowed to write the transcript.
+#
+# THE CEILING, STATED SO NOBODY MISTAKES IT FOR A SECURITY BOUNDARY
+#   It stops an OLD BINARY. It does not stop an adversary, and it is not meant
+#   to: anything with a write handle to the file can `DROP TRIGGER
+#   hermes_turn_fence_messages_insert`, or register a function of the same name
+#   and be admitted. Both are one statement. What the trigger buys is that
+#   neither happens BY ACCIDENT — an old build does not drop triggers it has
+#   never heard of, and does not register a function that did not exist when it
+#   was written. It converts silent transcript interleaving into a loud
+#   OperationalError at the writer.
+#
+# THE ROLLBACK COST
+#   Downgrading is no longer partial. Once a store has these triggers, a binary
+#   from before this change cannot write `messages` AT ALL — not the transcript,
+#   and not `_init_schema`'s `UPDATE messages SET active = 1 WHERE active IS
+#   NULL`, so it cannot even complete a writable open. Recovering an old binary
+#   on a v27 store means dropping the three triggers by hand. That is the price
+#   of the guarantee and it should be weighed before shipping, not after: the
+#   alternative on offer was a fence that an old build walks straight past.
+TURN_FENCE_FUNCTION_NAME = "hermes_turn_fence_generation"
+
+#: Bumped only when an older build must be locked out again. The value is
+#: returned to the trigger and otherwise unused — presence of the function, not
+#: its result, is what admits the write.
+TURN_FENCE_GENERATION = 1
+
+TURN_FENCE_TRIGGERS = (
+    "hermes_turn_fence_messages_insert",
+    "hermes_turn_fence_messages_update",
+    "hermes_turn_fence_messages_delete",
+)
+
+TURN_FENCE_TRIGGER_SQL = f"""
+CREATE TRIGGER IF NOT EXISTS {TURN_FENCE_TRIGGERS[0]}
+BEFORE INSERT ON messages BEGIN
+    SELECT {TURN_FENCE_FUNCTION_NAME}();
+END;
+
+CREATE TRIGGER IF NOT EXISTS {TURN_FENCE_TRIGGERS[1]}
+BEFORE UPDATE ON messages BEGIN
+    SELECT {TURN_FENCE_FUNCTION_NAME}();
+END;
+
+CREATE TRIGGER IF NOT EXISTS {TURN_FENCE_TRIGGERS[2]}
+BEFORE DELETE ON messages BEGIN
+    SELECT {TURN_FENCE_FUNCTION_NAME}();
+END;
+"""
+
+
+def register_turn_fence_function(conn) -> None:
+    """Register the generation marker on *conn*; never raises.
+
+    Called on EVERY connection this package opens, read-only ones included, and
+    before any schema work — ``_init_schema`` itself writes ``messages``, so a
+    connection that gets the function later cannot finish opening the store.
+
+    Failure is swallowed on purpose. ``create_function`` is missing only on a
+    Python whose sqlite3 module is stripped, and on such a host the triggers
+    cannot have been created either (the same connection would have failed to
+    write them), so nothing is being weakened that was ever in place.
+    """
+    try:
+        conn.create_function(
+            TURN_FENCE_FUNCTION_NAME, 0, lambda: TURN_FENCE_GENERATION
+        )
+    except Exception:  # pragma: no cover - stripped sqlite3 build
+        pass
