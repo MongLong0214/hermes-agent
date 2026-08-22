@@ -277,14 +277,21 @@ def test_the_base_binary_cannot_write_a_store_this_generation_created(
     store = tmp_path / "state.db"
     _new_generation_store(store)
 
+    # The verdict is a STATE COMPARISON, not the absence of an exception. Two
+    # of these return a falsey no-op on this fixture rather than raising, and a
+    # no-op is not a write — reading "it did not raise" as "it wrote" reports a
+    # hole that is not there, exactly as reading it as "it was refused" would
+    # hide one that is. The snapshot is every row of `sessions` and `messages`.
     attempts = textwrap.indent(
         "\n".join(
+            f'before = snapshot()\n'
             f'try:\n'
             f'    {code}\n'
             f'except Exception as exc:\n'
             f'    print("REFUSED {label}:", type(exc).__name__, exc)\n'
             f'else:\n'
-            f'    print("WROTE {label}")\n'
+            f'    print(("CHANGED {label}" if snapshot() != before\n'
+            f'           else "NOCHANGE {label}"))\n'
             for label, code in BASE_BINARY_WRITE_ATTEMPTS
         ),
         "    ",
@@ -303,6 +310,24 @@ assert loaded.is_relative_to(here), (
 print("LOADED", loaded)
 
 db = hermes_state.SessionDB(pathlib.Path({str(store)!r}))
+
+
+def snapshot():
+    """Every provider-visible row, read on a connection of this old binary."""
+    with db._read_ctx() as conn:
+        return (
+            [tuple(r) for r in conn.execute(
+                "SELECT id, model, model_config, system_prompt_hash, title, "
+                "end_reason, ended_at, parent_session_id FROM sessions "
+                "ORDER BY id"
+            ).fetchall()],
+            [tuple(r) for r in conn.execute(
+                "SELECT id, session_id, role, content, active FROM messages "
+                "ORDER BY id"
+            ).fetchall()],
+        )
+
+
 try:
 {attempts}
 finally:
@@ -331,8 +356,20 @@ finally:
     assert "LOADED" in result.stdout, "the probe never confirmed which module it ran"
     got_through = [
         label for label, _code in BASE_BINARY_WRITE_ATTEMPTS
-        if f"WROTE {label}" in result.stdout
+        if f"CHANGED {label}" in result.stdout
     ]
+    # Every attempt has to have produced a verdict. A label that appears in
+    # none of the three lines ran into something this test did not model, and
+    # silence would read as a pass.
+    unaccounted = [
+        label for label, _code in BASE_BINARY_WRITE_ATTEMPTS
+        if not any(f"{verdict} {label}" in result.stdout
+                   for verdict in ("REFUSED", "CHANGED", "NOCHANGE"))
+    ]
+    assert not unaccounted, (
+        f"these attempts produced no verdict at all: {unaccounted}\n"
+        f"probe stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
     assert not got_through, (
         f"the binary at {BASE_COMMIT[:10]} performed {got_through} against a "
         f"conversation this generation holds the lease on, and nothing stopped "

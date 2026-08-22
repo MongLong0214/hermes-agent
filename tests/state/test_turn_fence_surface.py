@@ -15,14 +15,23 @@ WHY THIS FILE EXISTS
     turn replays under — provider-visible state, changed by a process that has
     never heard of the lease.
 
-    (The counterexample that was predicted — an EMPTY session, no ``messages``
-    row, therefore no message trigger fires — does NOT reproduce. SQLite
-    resolves a trigger program when it PREPARES the statement, so
-    ``DELETE FROM messages WHERE session_id = ?`` is refused whether or not it
-    would have matched a row. It is kept as a row of the base-binary table in
-    ``test_turn_lease_generation_trigger`` anyway, because "no row, no trigger"
-    is the intuitive answer and it is wrong, and because an implementation that
-    moved to AFTER triggers or to ``ON DELETE CASCADE`` would make it right.)
+    THE EMPTY-SESSION DELETE, AND A CORRECTION I OWE THE RECORD
+    I first reported that the predicted empty-session counterexample "does not
+    reproduce", and that was wrong because I tested the wrong thing. Driving it
+    through the old binary's ``delete_session`` IS refused — that method issues
+    ``DELETE FROM messages WHERE session_id = ?`` and SQLite resolves a trigger
+    program when it PREPARES a statement, so the refusal happens whether or not
+    a row would have matched. But a foreign writer does not have to go through
+    that method. A plain
+
+        DELETE FROM sessions WHERE id = 'empty'
+
+    never names ``messages`` at all, so nothing prepares a message trigger and
+    the row is gone. Measured at cb61320a: ``empty_survives: false``,
+    ``raw_empty_session_delete: accepted``. The prediction was right and my
+    check was aimed one layer too high.
+    :func:`test_the_measured_counterexample_at_cb61320a` is that measurement,
+    kept verbatim as a test rather than as a paragraph.
 
 HOW THE SURFACE IS DECIDED
     Not by a list in production that somebody keeps in step. Production
@@ -155,7 +164,7 @@ def derive_turn_fence_surface(tmp_path) -> frozenset:
 
     exempt = set(census_mod.NOT_CONTEXT_BEARING)
     tables = {name.lower() for name in _real_tables(tmp_path)}
-    surface = set()
+    fenced_tables = set()
     for name in (context_bearing | lease_writers) - exempt:
         entry = methods.get(name)
         if entry is None:
@@ -166,11 +175,115 @@ def derive_turn_fence_surface(tmp_path) -> frozenset:
                 continue
             for match in WRITE_STATEMENT.finditer(inner.value):
                 table = match.group(2).lower()
-                if table not in tables:
-                    continue
-                verb = match.group(1).split()[0].lower()
-                surface.add((table, VERB_TO_OPERATION[verb]))
-    return frozenset(surface)
+                if table in tables:
+                    fenced_tables.add(table)
+    # ALL THREE operations on every table the derivation reaches, not only the
+    # ones this generation happens to perform. The surface is about what a
+    # FOREIGN writer can do, and "no code path of ours deletes a lease row" is
+    # not "a lease row cannot be deleted" — a fence keyed per operation is a
+    # fence with the other doors open. Deriving tables and then covering the
+    # operations also removes the only place a judgement call could live.
+    return frozenset(
+        (table, operation)
+        for table in fenced_tables
+        for operation in ("INSERT", "UPDATE", "DELETE")
+    )
+
+
+def test_the_measured_counterexample_at_cb61320a(tmp_path):
+    """The exact review measurement, kept as a test rather than as prose.
+
+    Two LIVE-OWNED sessions created by this generation — ``meta`` carrying a
+    ``model_config``, and ``empty`` with no ``messages`` row at all — then one
+    plain ``sqlite3.connect`` with no generation function registered, running
+    two statements that never name ``messages``::
+
+        UPDATE sessions SET model_config = '{"model": "FOREIGN"}' WHERE id = 'meta'
+        DELETE FROM sessions WHERE id = 'empty'
+
+    Measured at cb61320a5510cc7fb4cc8e3da3ebf9ac8aab6c2b::
+
+        {"empty_survives": false,
+         "meta_model_config_after": "{\\"model\\": \\"FOREIGN\\"}",
+         "raw_empty_session_delete": "accepted",
+         "raw_model_config_update": "accepted"}
+
+    A live-owned provider-visible config mutation and a live-owned destructive
+    lifecycle mutation, both accepted. The empty session is the load-bearing
+    half: with no ``messages`` row there is nothing for a cascade or a message
+    trigger to act on, so it removes the last defence a transcript-only fence
+    has.
+
+    Asserted on the four keys, and on the row VALUES rather than on an
+    exception — "it raised" and "the row is unchanged" are different claims and
+    only the second is the property.
+    """
+    import json
+
+    from hermes_state import SessionDB
+
+    store = tmp_path / "state.db"
+    db = SessionDB(store)
+    db.create_session("meta", source="test",
+                      model_config={"model": "current"})
+    db.create_session("empty", source="test")
+    for sid in ("meta", "empty"):
+        grant = db.try_acquire_session_turn_lease(
+            sid, f"pid={os.getpid()}:turn=live-{sid}:platform=test",
+            ttl_seconds=600,
+        )
+        assert grant, f"could not take the lease on {sid}"
+    db.close()
+
+    foreign = sqlite3.connect(str(store))
+    outcome = {}
+    for key, sql in (
+        ("raw_model_config_update",
+         "UPDATE sessions SET model_config = '{\"model\": \"FOREIGN\"}' "
+         "WHERE id = 'meta'"),
+        ("raw_empty_session_delete",
+         "DELETE FROM sessions WHERE id = 'empty'"),
+    ):
+        try:
+            foreign.execute(sql)
+        except sqlite3.OperationalError as exc:
+            outcome[key] = f"refused: {exc}"
+        else:
+            outcome[key] = "accepted"
+    foreign.commit()
+    foreign.close()
+
+    reopened = SessionDB(store)
+    with reopened._read_ctx() as conn:
+        row = conn.execute(
+            "SELECT model_config FROM sessions WHERE id = 'meta'"
+        ).fetchone()
+        outcome["meta_model_config_after"] = row["model_config"] if row else None
+        outcome["empty_survives"] = conn.execute(
+            "SELECT 1 FROM sessions WHERE id = 'empty'"
+        ).fetchone() is not None
+    reopened.close()
+
+    assert outcome["empty_survives"] is True, (
+        f"a foreign connection deleted a LIVE-OWNED empty session. It has no "
+        f"`messages` row, so no message trigger and no cascade can act on it — "
+        f"a transcript-only fence has nothing left to stop this.\n"
+        f"{json.dumps(outcome, sort_keys=True)}"
+    )
+    assert json.loads(outcome["meta_model_config_after"] or "{}").get(
+        "model"
+    ) == "current", (
+        f"a foreign connection rewrote the model_config of a LIVE-OWNED "
+        f"session. `model_config` is what the next turn is dispatched under "
+        f"and it never touches `messages`.\n"
+        f"{json.dumps(outcome, sort_keys=True)}"
+    )
+    assert outcome["raw_model_config_update"].startswith("refused"), (
+        f"the UPDATE was accepted: {json.dumps(outcome, sort_keys=True)}"
+    )
+    assert outcome["raw_empty_session_delete"].startswith("refused"), (
+        f"the DELETE was accepted: {json.dumps(outcome, sort_keys=True)}"
+    )
 
 
 def test_the_declared_fence_surface_is_the_one_the_source_needs(tmp_path):
