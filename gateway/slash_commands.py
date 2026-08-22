@@ -5110,32 +5110,59 @@ class GatewaySlashCommandsMixin:
         # write-amplification pattern, and a history can be hundreds of rows.
         # Best-effort like the old loop — a failed copy still yields a
         # usable (partial) branch.
+        from hermes_state import SessionTurnLeaseLostError, make_turn_lease_holder
+
+        branch_rows = [
+            {
+                "role": msg.get("role", "user"),
+                "content": msg.get("content"),
+                "tool_name": msg.get("tool_name") or msg.get("name"),
+                "tool_calls": msg.get("tool_calls"),
+                "tool_call_id": msg.get("tool_call_id"),
+                "finish_reason": msg.get("finish_reason"),
+                "reasoning": msg.get("reasoning"),
+                "reasoning_content": msg.get("reasoning_content"),
+                "reasoning_details": msg.get("reasoning_details"),
+                "codex_reasoning_items": msg.get("codex_reasoning_items"),
+                "codex_message_items": msg.get("codex_message_items"),
+                # Keep the api_content sidecar so the branch's first turn
+                # replays the parent's exact wire bytes (warm provider
+                # prompt cache) instead of a full cold prefill.
+                "api_content": extract_api_content_sidecar(msg),
+                "timestamp": msg.get("timestamp"),
+            }
+            for msg in history
+        ]
+        # The lease is taken on the PARENT, not on the destination. A branch
+        # child is an explicit fork, so it is its own lease root — a brand-new
+        # id no other writer can name yet, which makes a grant on it fence
+        # nothing. What can move under this copy is the parent, whose transcript
+        # we just snapshotted, so the parent is the serialization domain worth
+        # holding. The child write stays holderless (legal exactly because the
+        # child is unowned): a parent-rooted grant presented against the child's
+        # root is refused by the token's root check.
+        sync_db = getattr(self._session_db, "_db", self._session_db)
+
+        def _seed_branch_history() -> None:
+            with sync_db.session_turn_lease(
+                parent_session_id,
+                make_turn_lease_holder("gateway-branch-seed"),
+                ttl_seconds=30.0,
+                reload_messages=False,
+            ):
+                sync_db.append_messages_batch(
+                    new_session_id,
+                    branch_rows,
+                    chunk_rows=500,
+                )
+
         try:
-            await self._session_db.append_messages_batch(
-                new_session_id,
-                [
-                    {
-                        "role": msg.get("role", "user"),
-                        "content": msg.get("content"),
-                        "tool_name": msg.get("tool_name") or msg.get("name"),
-                        "tool_calls": msg.get("tool_calls"),
-                        "tool_call_id": msg.get("tool_call_id"),
-                        "finish_reason": msg.get("finish_reason"),
-                        "reasoning": msg.get("reasoning"),
-                        "reasoning_content": msg.get("reasoning_content"),
-                        "reasoning_details": msg.get("reasoning_details"),
-                        "codex_reasoning_items": msg.get("codex_reasoning_items"),
-                        "codex_message_items": msg.get("codex_message_items"),
-                        # Keep the api_content sidecar so the branch's first turn
-                        # replays the parent's exact wire bytes (warm provider
-                        # prompt cache) instead of a full cold prefill.
-                        "api_content": extract_api_content_sidecar(msg),
-                        "timestamp": msg.get("timestamp"),
-                    }
-                    for msg in history
-                ],
-                chunk_rows=500,
-            )
+            # Off the event loop, matching the AsyncSessionDB contract this
+            # call used to go through — acquisition can wait on another writer.
+            await asyncio.to_thread(_seed_branch_history)
+        except SessionTurnLeaseLostError as e:
+            logger.error("Branch history copy refused by the turn lease: %s", e)
+            return t("gateway.branch.create_failed", error=e)
         except Exception:
             pass  # Best-effort copy
 

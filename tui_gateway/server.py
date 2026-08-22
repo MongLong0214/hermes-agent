@@ -3081,43 +3081,67 @@ def _persist_branch_seed(session: dict) -> None:
         seed = [dict(msg) for msg in (session.get("history") or [])]
     if not seed:
         return
+    from hermes_state import SessionTurnLeaseLostError, make_turn_lease_holder
+
     with _session_db(session) as db:
         if db is None:
             return
         try:
+            # The seed copies the PARENT's turns into this branch. It is the
+            # branch's own conversation that is written, so that is the lease
+            # taken: a first turn can be dispatched on this key concurrently
+            # (the branch is live from the moment it is created), and a seed
+            # interleaved into it lands the parent's history in the middle of
+            # the new exchange. `_branch_seed_persisted` is only set on the
+            # path that actually wrote, so a refused seed is retried on the
+            # next turn rather than silently skipped forever.
             # Bounded-chunk transactions (see #23254): a branch seed can be
             # hundreds of rows; chunking keeps each BEGIN IMMEDIATE short so
             # concurrent writers aren't starved. Recovery semantics match the
             # old per-row loop (mid-copy failure leaves a partial seed with
             # _branch_seed_persisted unset).
-            db.append_messages_batch(
+            with db.session_turn_lease(
                 key,
-                [
-                    {
-                        "role": msg.get("role", "user"),
-                        "content": msg.get("content"),
-                        "reasoning": msg.get("reasoning"),
-                        "reasoning_content": msg.get("reasoning_content"),
-                        "reasoning_details": msg.get("reasoning_details"),
-                        "codex_reasoning_items": msg.get("codex_reasoning_items"),
-                        "codex_message_items": msg.get("codex_message_items"),
-                        # Timeline markers (model_switch, personality_switch,
-                        # auto_continue, …) ride as role=user; dropping the tag
-                        # here re-planted them as bare user turns after a
-                        # restart, corrupting the truncate ordinal address
-                        # space the same way #82756 did.
-                        "display_kind": msg.get("display_kind"),
-                        "display_metadata": msg.get("display_metadata"),
-                        # Preserve the parent's original message timestamps —
-                        # append_message would otherwise stamp time.time() and the
-                        # branch's copied history would all appear authored "now".
-                        "timestamp": msg.get("timestamp"),
-                    }
-                    for msg in seed
-                ],
-                chunk_rows=500,
-            )
+                make_turn_lease_holder("tui-branch-seed-persist"),
+                ttl_seconds=60.0,
+                reload_messages=False,
+            ) as _seed_lease:
+                db.append_messages_batch(
+                    _seed_lease.session_id,
+                    [
+                        {
+                            "role": msg.get("role", "user"),
+                            "content": msg.get("content"),
+                            "reasoning": msg.get("reasoning"),
+                            "reasoning_content": msg.get("reasoning_content"),
+                            "reasoning_details": msg.get("reasoning_details"),
+                            "codex_reasoning_items": msg.get("codex_reasoning_items"),
+                            "codex_message_items": msg.get("codex_message_items"),
+                            # Timeline markers (model_switch, personality_switch,
+                            # auto_continue, …) ride as role=user; dropping the tag
+                            # here re-planted them as bare user turns after a
+                            # restart, corrupting the truncate ordinal address
+                            # space the same way #82756 did.
+                            "display_kind": msg.get("display_kind"),
+                            "display_metadata": msg.get("display_metadata"),
+                            # Preserve the parent's original message timestamps —
+                            # append_message would otherwise stamp time.time() and the
+                            # branch's copied history would all appear authored "now".
+                            "timestamp": msg.get("timestamp"),
+                        }
+                        for msg in seed
+                    ],
+                    chunk_rows=500,
+                    turn_lease_holder=_seed_lease.token,
+                )
             session["_branch_seed_persisted"] = True
+        except SessionTurnLeaseLostError:
+            # Leave _branch_seed_persisted unset: the seed is retried on the
+            # next turn rather than the branch resuming without its context.
+            logger.info(
+                "branch seed for %s deferred: another process owns the "
+                "conversation", key,
+            )
         except Exception as exc:
             from hermes_state import is_disk_full_error
 
@@ -4447,34 +4471,61 @@ def _append_model_switch_marker(session: dict | None, *, model: str, provider: s
         history.append(entry)
         session["history_version"] = int(session.get("history_version", 0)) + 1
 
-    lock = session.get("history_lock")
-    if lock is not None:
-        with lock:
+    def _commit_to_memory() -> None:
+        lock = session.get("history_lock")
+        if lock is not None:
+            with lock:
+                _replace_markers()
+        else:
             _replace_markers()
-    else:
-        _replace_markers()
 
+    from hermes_state import SessionTurnLeaseLostError, make_turn_lease_holder
+
+    def _persist(db) -> None:
+        """Append the marker under the conversation's turn lease."""
+        with db.session_turn_lease(
+            session_key,
+            make_turn_lease_holder("tui-model-switch"),
+            ttl_seconds=30.0,
+            reload_messages=False,
+        ) as lease:
+            db.append_message(
+                session_id=lease.session_id,
+                role="user",
+                content=marker,
+                display_kind="model_switch",
+                turn_lease_holder=lease.token,
+            )
+
+    # Durable FIRST, memory second. The old order mutated session["history"]
+    # and then swallowed the append failure, so a refused or failed write left
+    # the live conversation carrying a marker the transcript has never seen —
+    # and the marker is model context: the next turn replays it and the resume
+    # after it does not. Memory now only moves when the row landed.
     try:
         agent = session.get("agent")
         db = getattr(agent, "_session_db", None) if agent is not None else None
         if db is not None:
-            db.append_message(
-                session_id=session_key,
-                role="user",
-                content=marker,
-                display_kind="model_switch",
-            )
+            _persist(db)
+            _commit_to_memory()
             return
 
         _ensure_session_db_row(session)
         with _session_db(session) as scoped_db:
-            if scoped_db is not None:
-                scoped_db.append_message(
-                    session_id=session_key,
-                    role="user",
-                    content=marker,
-                    display_kind="model_switch",
-                )
+            if scoped_db is None:
+                # No durable store at all — there is no divergence to create,
+                # so the in-memory marker is the whole truth here.
+                _commit_to_memory()
+                return
+            _persist(scoped_db)
+        _commit_to_memory()
+    except SessionTurnLeaseLostError:
+        logger.info(
+            "model switch marker not recorded for %s: another process is "
+            "running a turn on this conversation; leaving history unchanged "
+            "rather than diverging from the transcript",
+            session_key,
+        )
     except Exception:
         logger.debug("failed to persist model switch marker", exc_info=True)
 
@@ -11090,13 +11141,36 @@ def _run_prompt_submit(
                 db = getattr(agent, "_session_db", None)
                 current_session_id = getattr(agent, "session_id", None) or session.get("session_key")
                 if db is not None:
+                    from hermes_state import (
+                        SessionTurnLeaseLostError,
+                        make_turn_lease_holder,
+                    )
+
                     try:
-                        db.set_latest_matching_message_display_kind(
+                        # display_kind is read back by the context pipeline and
+                        # by the compressor's real-ask classification, so this
+                        # stamp changes what the provider sees next. The turn
+                        # that produced `text` has just released the lease, so
+                        # this normally acquires immediately; when it does not,
+                        # somebody else owns the conversation and the stamp
+                        # would land on their transcript.
+                        with db.session_turn_lease(
                             current_session_id,
-                            role="user",
-                            content=text,
-                            display_kind=display_kind,
-                            display_metadata=display_metadata,
+                            make_turn_lease_holder("tui-display-kind"),
+                            ttl_seconds=30.0,
+                            reload_messages=False,
+                        ) as _dk_lease:
+                            db.set_latest_matching_message_display_kind(
+                                _dk_lease.session_id,
+                                role="user",
+                                content=text,
+                                display_kind=display_kind,
+                                display_metadata=display_metadata,
+                            )
+                    except SessionTurnLeaseLostError:
+                        logger.info(
+                            "display kind not stamped for %s: another process "
+                            "owns the conversation", current_session_id,
                         )
                     except Exception:
                         logger.debug("failed to stamp synthetic display kind", exc_info=True)

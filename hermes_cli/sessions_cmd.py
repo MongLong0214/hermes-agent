@@ -810,11 +810,36 @@ def cmd_sessions(args, sessions_parser=None):
                         db.close()
                         return
                 sessions_dir = get_hermes_home() / "sessions"
-                if db.delete_session(
-                    resolved_session_id,
-                    sessions_dir=sessions_dir,
-                    expected_delete_ids=delete_target_ids,
-                ):
+                from hermes_state import (
+                    SessionTurnLeaseLostError,
+                    make_turn_lease_holder,
+                )
+
+                # The export is already on disk; the delete is the destructive
+                # half and must not land while another process is appending to
+                # this conversation. The named id is the one to delete, so the
+                # lease is exclusion only.
+                try:
+                    with db.session_turn_lease(
+                        resolved_session_id,
+                        make_turn_lease_holder("sessions-export-delete"),
+                        ttl_seconds=30.0,
+                        reload_messages=False,
+                    ):
+                        deleted = db.delete_session(
+                            resolved_session_id,
+                            sessions_dir=sessions_dir,
+                            expected_delete_ids=delete_target_ids,
+                        )
+                except SessionTurnLeaseLostError:
+                    print(
+                        f"Exported, but session '{resolved_session_id}' was "
+                        "not deleted: another process is running a turn on "
+                        "this conversation."
+                    )
+                    db.close()
+                    return 1
+                if deleted:
                     delegate_count = len(delete_target_ids) - 1
                     delegate_suffix = (
                         ""
@@ -888,7 +913,28 @@ def cmd_sessions(args, sessions_parser=None):
         elif _pinned_note:
             print(f"Warning: deleting a pinned session '{resolved_session_id}'.")
         sessions_dir = get_hermes_home() / "sessions"
-        if db.delete_session(resolved_session_id, sessions_dir=sessions_dir):
+        from hermes_state import SessionTurnLeaseLostError, make_turn_lease_holder
+
+        # The operator named this row; a live turn may still be writing it, and
+        # deleting under the writer loses the transcript it is building. Keep
+        # the named id — resolving forward would delete a different session.
+        try:
+            with db.session_turn_lease(
+                resolved_session_id,
+                make_turn_lease_holder("sessions-delete"),
+                ttl_seconds=30.0,
+                reload_messages=False,
+            ):
+                deleted = db.delete_session(
+                    resolved_session_id, sessions_dir=sessions_dir
+                )
+        except SessionTurnLeaseLostError:
+            print(
+                f"Session '{resolved_session_id}' was not deleted: another "
+                "process is running a turn on this conversation."
+            )
+            return 1
+        if deleted:
             print(f"Deleted session '{resolved_session_id}'.")
         else:
             print(f"Session '{args.session_id}' not found.")

@@ -372,8 +372,36 @@ def import_foreign_session(source: str, path, db=None) -> str:
             cwd=parsed.get("cwd"),
             origin_json=json.dumps(origin),
         )
-        for turn in turns:
-            db.append_message(session_id, turn["role"], turn["content"])
+        from hermes_state import (
+            SessionTurnLeaseLostError,
+            make_turn_lease_holder,
+        )
+
+        try:
+            # The importer is an alternate writer: the caller may hand in a db
+            # whose conversation another process is mid-turn on, and splicing a
+            # foreign transcript into a live turn interleaves two histories.
+            # Write against the post-acquisition id for the same reason.
+            with db.session_turn_lease(
+                session_id,
+                make_turn_lease_holder("foreign-session-import"),
+                ttl_seconds=30.0,
+                reload_messages=False,
+            ) as lease:
+                for turn in turns:
+                    db.append_message(
+                        lease.session_id,
+                        turn["role"],
+                        turn["content"],
+                        turn_lease_holder=lease.token,
+                    )
+        except SessionTurnLeaseLostError as exc:
+            # ValueError is this function's documented failure channel, and both
+            # callers print it and exit non-zero.
+            raise ValueError(
+                "Another process is running a turn on this conversation; "
+                "nothing was imported"
+            ) from exc
         try:
             db.set_session_title(session_id, title)
         except Exception:

@@ -3811,9 +3811,32 @@ class SessionStore:
             )
 
     def _append_transcript_message(self, session_id: str, message: Dict[str, Any]) -> None:
-        """Write one transcript row. Caller handles retry queuing."""
+        """Write one transcript row. Caller handles retry queuing.
+
+        Takes the conversation's turn lease first. The gateway is an ALTERNATE
+        writer: when an agent process owns the turn, appending holderless
+        interleaves a row into the transcript it is building. Raising here is
+        correct — the caller already queues and retries transcript appends, so
+        a contended write is deferred rather than lost.
+        """
+        from hermes_state import make_turn_lease_holder
+
+        with self._db.session_turn_lease(
+            session_id,
+            make_turn_lease_holder("gateway-transcript"),
+            ttl_seconds=30.0,
+            reload_messages=False,
+        ) as lease:
+            self._append_transcript_message_fenced(
+                lease.session_id, message, lease.token
+            )
+
+    def _append_transcript_message_fenced(
+        self, session_id: str, message: Dict[str, Any], turn_lease_holder
+    ) -> None:
         self._db.append_message(
             session_id=session_id,
+            turn_lease_holder=turn_lease_holder,
             role=message.get("role", "unknown"),
             content=message.get("content"),
             tool_name=message.get("tool_name"),
@@ -3959,9 +3982,27 @@ class SessionStore:
         """
         if not self._db:
             return True
+        from hermes_state import make_turn_lease_holder
+
         self._clear_dirty_transcript(session_id)
         try:
-            self._db.replace_messages(session_id, messages, active_only=active_only)
+            # /retry and /compress REPLACE the transcript. Doing that while an
+            # agent process owns the turn destroys rows it is still building
+            # on, so this acquires rather than writing holderless, and writes
+            # against the post-acquisition session id (the owner may have
+            # rotated the conversation while we waited).
+            with self._db.session_turn_lease(
+                session_id,
+                make_turn_lease_holder("gateway-rewrite"),
+                ttl_seconds=60.0,
+                reload_messages=False,
+            ) as lease:
+                self._db.replace_messages(
+                    lease.session_id,
+                    messages,
+                    active_only=active_only,
+                    turn_lease_holder=lease.token,
+                )
             return True
         except Exception as e:
             logger.debug("Failed to rewrite transcript in DB: %s", e)
@@ -4044,7 +4085,21 @@ class SessionStore:
         target_idx = min(n - 1, len(recents) - 1)
         target_id = recents[target_idx]["id"]
         try:
-            result = self._db.rewind_to_message(session_id, target_id)
+            from hermes_state import make_turn_lease_holder
+
+            # /undo truncates the live transcript — same hazard as the rewrite
+            # path above, so it takes the same lease.
+            with self._db.session_turn_lease(
+                session_id,
+                make_turn_lease_holder("gateway-rewind"),
+                ttl_seconds=60.0,
+                reload_messages=False,
+            ) as lease:
+                result = self._db.rewind_to_message(
+                    lease.session_id,
+                    target_id,
+                    turn_lease_holder=lease.token,
+                )
         except ValueError as e:
             logger.debug("rewind_session: %s", e)
             return None

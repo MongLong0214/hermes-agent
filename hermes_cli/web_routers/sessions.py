@@ -674,7 +674,32 @@ async def delete_session_endpoint(session_id: str, profile: Optional[str] = None
             sid = db.resolve_session_id(session_id)
             if not sid:
                 return {"ok": True, "already_absent": True}
-            db.delete_session(sid)
+            from hermes_state import (
+                SessionTurnLeaseLostError,
+                make_turn_lease_holder,
+            )
+
+            # DELETE must not land while another process is running a turn on
+            # this conversation — the rows would go out from under the writer.
+            # 409 (not 404) so the desktop restores its optimistic row instead
+            # of treating the session as gone. The resolved id is the one the
+            # caller named; the lease is exclusion only.
+            try:
+                with db.session_turn_lease(
+                    sid,
+                    make_turn_lease_holder("web-session-delete"),
+                    ttl_seconds=30.0,
+                    reload_messages=False,
+                ):
+                    db.delete_session(sid)
+            except SessionTurnLeaseLostError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Another process is running a turn on this "
+                        "conversation; try again"
+                    ),
+                ) from exc
             return {"ok": True}
         finally:
             db.close()

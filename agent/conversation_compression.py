@@ -3512,6 +3512,14 @@ def compress_context(
                         },
                         watermark=_commit_watermark,
                         lock_holder=_lock_holder,
+                        # The compression lock and the turn lease are different
+                        # locks with different jobs: the first stops two
+                        # compressions colliding, the second says who owns the
+                        # conversation. Compaction is a whole-history rewrite,
+                        # so it carries the turn owner's token too.
+                        turn_lease_holder=getattr(
+                            agent, "_active_session_turn_lease_holder", None
+                        ),
                     )
                     split_status = "in_place_committed"
                     # Reset the flush identity set so the next turn's appends are
@@ -3655,6 +3663,9 @@ def compress_context(
                             else None
                         ),
                         watermark_ceiling=_foreign_tail_ceiling,
+                        turn_lease_holder=getattr(
+                            agent, "_active_session_turn_lease_holder", None
+                        ),
                     )
                     agent.session_id = new_session_id
                     try:

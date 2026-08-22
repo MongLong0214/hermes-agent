@@ -60,9 +60,48 @@ def _react_to_message_with_db(
         row = db.get_message_role(session_key, int(row_id))
         target_role = row or "user"
 
+    from hermes_state import SessionTurnLeaseLostError, make_turn_lease_holder
+
     try:
-        reactions = db.set_message_reaction(
-            session_key, int(row_id), emoji or None, author="agent"
+        # Reactions are consume-once model context (`take_unseen_reactions`
+        # announces them on the next turn), so the write is fenced like any
+        # other transcript mutation. The mutator gets the ORIGINAL session id:
+        # `row_id` is scoped to this session's rows, and the lease's
+        # forward-resolved id would point the lookup at a different session.
+        #
+        # This tool runs INSIDE the turn that called it, and that turn already
+        # holds the conversation's lease. So it presents the turn's own grant.
+        # Acquiring instead would wait out the whole budget and then refuse —
+        # on every real invocation — because the thing it is waiting for is
+        # itself. The acquire path below is for the case where nothing in this
+        # process owns the conversation (a tool driven outside a leased turn).
+        grant = db.current_turn_grant(session_key)
+        if grant is not None:
+            reactions = db.set_message_reaction(
+                session_key,
+                int(row_id),
+                emoji or None,
+                author="agent",
+                turn_lease_holder=grant,
+            )
+        else:
+            with db.session_turn_lease(
+                session_key,
+                make_turn_lease_holder("agent-reaction"),
+                ttl_seconds=30.0,
+                reload_messages=False,
+            ) as lease:
+                reactions = db.set_message_reaction(
+                    session_key,
+                    int(row_id),
+                    emoji or None,
+                    author="agent",
+                    turn_lease_holder=lease.token,
+                )
+    except SessionTurnLeaseLostError:
+        return tool_error(
+            "Could not record the reaction: another process is running a turn "
+            "on this conversation. Try again once it finishes."
         )
     except Exception as exc:
         return tool_error(f"Failed to set the reaction: {exc}")

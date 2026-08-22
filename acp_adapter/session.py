@@ -377,11 +377,34 @@ class SessionManager:
         db = self._get_db()
         if db is not None:
             try:
+                from hermes_state import (
+                    SessionTurnLeaseLostError,
+                    make_turn_lease_holder,
+                )
+
+                holder = make_turn_lease_holder("acp-cleanup")
                 rows = db.search_sessions(source="acp", limit=10000)
                 for row in rows:
                     sid = row["id"]
                     _clear_task_cwd(sid)
-                    db.delete_session(sid)
+                    # Teardown sweep: an ACP row whose conversation a live turn
+                    # is writing must outlive cleanup. A leftover row is
+                    # recoverable on the next run; a transcript deleted out from
+                    # under its writer is not. Per id so one busy conversation
+                    # does not abandon the rest of the sweep.
+                    try:
+                        with db.session_turn_lease(
+                            sid,
+                            holder,
+                            ttl_seconds=30.0,
+                            reload_messages=False,
+                        ):
+                            db.delete_session(sid)
+                    except SessionTurnLeaseLostError:
+                        logger.info(
+                            "Leaving ACP session %s in the DB: another process "
+                            "is running a turn on this conversation", sid,
+                        )
             except Exception:
                 logger.debug("Failed to cleanup ACP sessions from DB", exc_info=True)
 
@@ -500,9 +523,27 @@ class SessionManager:
                 # replace on any DB error and can race a concurrent
                 # archive_and_compact — the same probe failure mode #80216's
                 # /retry fix (gateway/slash_commands.py) deliberately avoids.
-                db.replace_messages(
-                    state.session_id, state.history, active_only=True
-                )
+                # The ACP adapter is an ALTERNATE writer: an agent process
+                # can own this conversation's turn. A full replace under a
+                # live owner rewrites the transcript it is building, so
+                # acquire first and write against the post-acquisition id
+                # (the owner may have compressed and rotated it while we
+                # waited). A lease we cannot get raises and is logged below —
+                # persistence is retried on the next state change.
+                from hermes_state import make_turn_lease_holder
+
+                with db.session_turn_lease(
+                    state.session_id,
+                    make_turn_lease_holder("acp-persist"),
+                    ttl_seconds=60.0,
+                    reload_messages=False,
+                ) as lease:
+                    db.replace_messages(
+                        lease.session_id,
+                        state.history,
+                        active_only=True,
+                        turn_lease_holder=lease.token,
+                    )
         except Exception:
             logger.warning("Failed to persist ACP session %s", state.session_id, exc_info=True)
 
@@ -591,8 +632,26 @@ class SessionManager:
         db = self._get_db()
         if db is None:
             return False
+        from hermes_state import SessionTurnLeaseLostError, make_turn_lease_holder
+
         try:
-            return db.delete_session(session_id)
+            # Teardown path: the editor dropped this session, but an agent
+            # process may still be persisting a turn into the same
+            # conversation. Keep the original id — the caller named this row,
+            # and resolving forward would delete the compression tip instead.
+            with db.session_turn_lease(
+                session_id,
+                make_turn_lease_holder("acp-session-delete"),
+                ttl_seconds=30.0,
+                reload_messages=False,
+            ):
+                return db.delete_session(session_id)
+        except SessionTurnLeaseLostError:
+            logger.info(
+                "Leaving ACP session %s in the DB: another process is running "
+                "a turn on this conversation", session_id,
+            )
+            return False
         except Exception:
             logger.debug("Failed to delete ACP session %s from DB", session_id, exc_info=True)
             return False

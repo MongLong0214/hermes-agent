@@ -1143,8 +1143,31 @@ def _(rid, params: dict) -> dict:
             sessions_dir = Path(profile_home) / "sessions"
         else:
             sessions_dir = get_hermes_home() / "sessions"
+        from hermes_state import (
+            SessionTurnLeaseLostError,
+            make_turn_lease_holder,
+        )
+
         try:
-            deleted = db.delete_session(target, sessions_dir=sessions_dir)
+            # The in-process active-session check above only sees THIS
+            # gateway. A CLI or a second gateway can be mid-turn on the same
+            # conversation, and deleting it removes the transcript that turn
+            # is appending to. The lease is the cross-process form of the same
+            # refusal. `target` (not lease.session_id) is what gets deleted:
+            # the operator named a specific row, and resolving forward through
+            # the compression chain would delete a different one.
+            with db.session_turn_lease(
+                target,
+                make_turn_lease_holder("tui-session-delete"),
+                ttl_seconds=30.0,
+                reload_messages=False,
+            ):
+                deleted = db.delete_session(target, sessions_dir=sessions_dir)
+        except SessionTurnLeaseLostError:
+            return _err(
+                rid, 4023,
+                "cannot delete a session another process is running a turn on",
+            )
         except Exception as e:
             return _err(rid, 5036, f"delete failed: {e}")
         if not deleted:
@@ -1322,15 +1345,44 @@ def _(rid, params: dict) -> dict:
     with _session_db(session) as db:
         if db is None:
             return _db_unavailable_error(rid, code=5007)
+        from hermes_state import (
+            SessionTurnLeaseLostError,
+            make_turn_lease_holder,
+        )
+
         try:
-            if row_id is None:
-                row_id = db.latest_message_row_id(
-                    session["session_key"], role=newest_role
-                )
+            # A reaction is consume-once model context: _pending_reaction_notes
+            # takes the unseen set and injects it into exactly one turn. Both
+            # the newest-row lookup and the write happen under the lease, so a
+            # reaction cannot be stamped onto a row that a concurrent turn is
+            # about to replace, and `newest_role` cannot resolve against a
+            # transcript that moves before the write lands.
+            # session_key, not lease.session_id: row_id addresses a row in THIS
+            # session, and resolving forward would look for it in another one.
+            with db.session_turn_lease(
+                session["session_key"],
+                make_turn_lease_holder("tui-react"),
+                ttl_seconds=30.0,
+                reload_messages=False,
+            ) as _rx_lease:
                 if row_id is None:
-                    return _err(rid, 4040, "no message to react to yet")
-            reactions = db.set_message_reaction(
-                session["session_key"], int(row_id), emoji, author=author
+                    row_id = db.latest_message_row_id(
+                        session["session_key"], role=newest_role
+                    )
+                    if row_id is None:
+                        return _err(rid, 4040, "no message to react to yet")
+                reactions = db.set_message_reaction(
+                    session["session_key"],
+                    int(row_id),
+                    emoji,
+                    author=author,
+                    turn_lease_holder=_rx_lease.token,
+                )
+        except SessionTurnLeaseLostError:
+            return _err(
+                rid, 4009,
+                "another process is running a turn on this conversation; "
+                "retry the reaction once it finishes",
             )
         except Exception as e:
             return _err(rid, 5007, str(e))
@@ -2971,117 +3023,147 @@ def _(rid, params: dict) -> dict:
         if db is None:
             return _db_unavailable_error(rid, code=5008)
         old_key = session["session_key"]
-        with session["history_lock"]:
-            in_memory_history = [
-                dict(msg)
-                for msg in list(session.get("display_history_prefix") or []) + list(session.get("history", []))
-                if isinstance(msg, dict)
-            ]
+        from hermes_state import (
+            SessionTurnLeaseLostError,
+            make_turn_lease_holder,
+        )
 
-        def _visible_branch_history(messages):
-            visible = []
-            for message in messages or []:
-                if not isinstance(message, dict) or message.get("role") not in {"user", "assistant"}:
-                    continue
-                if not _coerce_message_text(message.get("content")).strip():
-                    continue
-                # Keep the FULL row — the copy loop below preserves reasoning
-                # fields and timeline-marker tags (display_kind/display_metadata,
-                # #82756); a minimal role/content copy would silently drop them.
-                visible.append(dict(message))
-            return visible
-
-        # The live session history is the model projection. After compaction it
-        # may contain only a summary and the protected tail, while the persisted
-        # display projection still contains the complete visible transcript. A
-        # branch must snapshot the latter; otherwise the child permanently loses
-        # every turn archived before the fork.
-        history = None
-        get_resume_conversations = getattr(db, "get_resume_conversations", None)
-        if callable(get_resume_conversations):
-            try:
-                _, display_history = get_resume_conversations(old_key)
-                display_history = _reconcile_display_with_live(display_history, in_memory_history)
-                history = _visible_branch_history(display_history)
-            except Exception:
-                logger.debug("branch display projection read failed", exc_info=True)
-        if not history:
-            history = _visible_branch_history(in_memory_history)
-        if not history:
-            return _err(rid, 4008, "nothing to branch — send a message first")
-        count = params.get("count")
-        if isinstance(count, int) and count > 0:
-            history = history[:count]
-        new_key = _new_session_key()
-        new_sid = uuid.uuid4().hex[:8]
-        source = _session_source(session)
-        lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
-        branch_name = params.get("name", "")
+        # Seeding a child from the parent's history reads the PARENT's
+        # serialization domain, so the parent's turn lease is what has to be
+        # held — a unique destination does not stabilize the source. Without
+        # it the display projection, the live-history reconcile and the copy
+        # each see a different parent transcript when a turn lands between
+        # them, and the branch is seeded from a history that never existed.
+        # The lease covers the read AND the copy for that reason.
+        #
+        # The child write presents no grant: `new_key` is a fresh conversation
+        # of its own (the parent did not end in compression, so the lease-key
+        # walk stops at the child), and this grant is the parent's. Holderless
+        # is correct there and legal — nobody owns the child.
         try:
-            if branch_name:
-                title = branch_name
-            else:
-                current = db.get_session_title(old_key) or "branch"
-                title = (
-                    db.get_next_title_in_lineage(current)
-                    if hasattr(db, "get_next_title_in_lineage")
-                    else f"{current} (branch)"
-                )
-            db.create_session(
-                new_key,
-                source=source,
-                model=_resolve_model(),
-                # Stable _branched_from marker so list_sessions_rich() keeps the
-                # branch visible in /resume and /sessions. The TUI branch leaves
-                # the parent live (no end_reason='branched'), so the legacy
-                # end_reason heuristic never matches it — the marker is the only
-                # thing that surfaces TUI branches. See issue #20856.
-                model_config={"_branched_from": old_key},
-                parent_session_id=old_key,
-                cwd=_session_cwd(session),
-                # The branch stays on its parent's profile. Explicit stamp (not
-                # just the parent-backfill) so it holds even when the parent row
-                # predates the profile_name column.
-                profile_name=(
-                    Path(session["profile_home"]).name
-                    if session.get("profile_home")
-                    else None
-                ),
+            with db.session_turn_lease(
+                old_key,
+                make_turn_lease_holder("tui-branch-seed"),
+                ttl_seconds=60.0,
+                reload_messages=False,
+            ):
+                with session["history_lock"]:
+                    in_memory_history = [
+                        dict(msg)
+                        for msg in list(session.get("display_history_prefix") or []) + list(session.get("history", []))
+                        if isinstance(msg, dict)
+                    ]
+
+                def _visible_branch_history(messages):
+                    visible = []
+                    for message in messages or []:
+                        if not isinstance(message, dict) or message.get("role") not in {"user", "assistant"}:
+                            continue
+                        if not _coerce_message_text(message.get("content")).strip():
+                            continue
+                        # Keep the FULL row — the copy loop below preserves reasoning
+                        # fields and timeline-marker tags (display_kind/display_metadata,
+                        # #82756); a minimal role/content copy would silently drop them.
+                        visible.append(dict(message))
+                    return visible
+
+                # The live session history is the model projection. After compaction it
+                # may contain only a summary and the protected tail, while the persisted
+                # display projection still contains the complete visible transcript. A
+                # branch must snapshot the latter; otherwise the child permanently loses
+                # every turn archived before the fork.
+                history = None
+                get_resume_conversations = getattr(db, "get_resume_conversations", None)
+                if callable(get_resume_conversations):
+                    try:
+                        _, display_history = get_resume_conversations(old_key)
+                        display_history = _reconcile_display_with_live(display_history, in_memory_history)
+                        history = _visible_branch_history(display_history)
+                    except Exception:
+                        logger.debug("branch display projection read failed", exc_info=True)
+                if not history:
+                    history = _visible_branch_history(in_memory_history)
+                if not history:
+                    return _err(rid, 4008, "nothing to branch — send a message first")
+                count = params.get("count")
+                if isinstance(count, int) and count > 0:
+                    history = history[:count]
+                new_key = _new_session_key()
+                new_sid = uuid.uuid4().hex[:8]
+                source = _session_source(session)
+                lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
+                branch_name = params.get("name", "")
+                try:
+                    if branch_name:
+                        title = branch_name
+                    else:
+                        current = db.get_session_title(old_key) or "branch"
+                        title = (
+                            db.get_next_title_in_lineage(current)
+                            if hasattr(db, "get_next_title_in_lineage")
+                            else f"{current} (branch)"
+                        )
+                    db.create_session(
+                        new_key,
+                        source=source,
+                        model=_resolve_model(),
+                        # Stable _branched_from marker so list_sessions_rich() keeps the
+                        # branch visible in /resume and /sessions. The TUI branch leaves
+                        # the parent live (no end_reason='branched'), so the legacy
+                        # end_reason heuristic never matches it — the marker is the only
+                        # thing that surfaces TUI branches. See issue #20856.
+                        model_config={"_branched_from": old_key},
+                        parent_session_id=old_key,
+                        cwd=_session_cwd(session),
+                        # The branch stays on its parent's profile. Explicit stamp (not
+                        # just the parent-backfill) so it holds even when the parent row
+                        # predates the profile_name column.
+                        profile_name=(
+                            Path(session["profile_home"]).name
+                            if session.get("profile_home")
+                            else None
+                        ),
+                    )
+                    # Copy the whole parent history in bounded-chunk transactions —
+                    # a branch seed can be hundreds of rows, and per-row transactions
+                    # were the write-amplification pattern removed in #23254.
+                    db.append_messages_batch(
+                        new_key,
+                        [
+                            {
+                                "role": msg.get("role", "user"),
+                                "content": msg.get("content"),
+                                "reasoning": msg.get("reasoning"),
+                                "reasoning_content": msg.get("reasoning_content"),
+                                "reasoning_details": msg.get("reasoning_details"),
+                                "codex_reasoning_items": msg.get("codex_reasoning_items"),
+                                "codex_message_items": msg.get("codex_message_items"),
+                                # Timeline markers (model_switch, personality_switch,
+                                # auto_continue, …) ride as role=user; dropping the tag
+                                # here re-planted them as bare user turns after a
+                                # restart, corrupting the truncate ordinal address
+                                # space the same way #82756 did.
+                                "display_kind": msg.get("display_kind"),
+                                "display_metadata": msg.get("display_metadata"),
+                                # Preserve the parent's original message timestamps —
+                                # branch copies are history, not new activity (9d73006ad).
+                                "timestamp": msg.get("timestamp"),
+                            }
+                            for msg in history
+                        ],
+                        chunk_rows=500,
+                    )
+                    db.set_session_title(new_key, title)
+                except Exception as e:
+                    if lease is not None:
+                        lease.release()
+                    return _err(rid, 5008, f"branch failed: {e}")
+        except SessionTurnLeaseLostError:
+            return _err(
+                rid, 4009,
+                "another process is running a turn on this conversation; "
+                "retry the branch once it finishes",
             )
-            # Copy the whole parent history in bounded-chunk transactions —
-            # a branch seed can be hundreds of rows, and per-row transactions
-            # were the write-amplification pattern removed in #23254.
-            db.append_messages_batch(
-                new_key,
-                [
-                    {
-                        "role": msg.get("role", "user"),
-                        "content": msg.get("content"),
-                        "reasoning": msg.get("reasoning"),
-                        "reasoning_content": msg.get("reasoning_content"),
-                        "reasoning_details": msg.get("reasoning_details"),
-                        "codex_reasoning_items": msg.get("codex_reasoning_items"),
-                        "codex_message_items": msg.get("codex_message_items"),
-                        # Timeline markers (model_switch, personality_switch,
-                        # auto_continue, …) ride as role=user; dropping the tag
-                        # here re-planted them as bare user turns after a
-                        # restart, corrupting the truncate ordinal address
-                        # space the same way #82756 did.
-                        "display_kind": msg.get("display_kind"),
-                        "display_metadata": msg.get("display_metadata"),
-                        # Preserve the parent's original message timestamps —
-                        # branch copies are history, not new activity (9d73006ad).
-                        "timestamp": msg.get("timestamp"),
-                    }
-                    for msg in history
-                ],
-                chunk_rows=500,
-            )
-            db.set_session_title(new_key, title)
-        except Exception as e:
-            if lease is not None:
-                lease.release()
-            return _err(rid, 5008, f"branch failed: {e}")
     # Bound before the try so the ownership finally below can never see them
     # unbound, whatever raises inside.
     branch_db = None

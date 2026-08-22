@@ -10238,11 +10238,24 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     self.session_id, limit=max(turns_undone, 10)
                 )
                 if recents:
+                    from hermes_state import make_turn_lease_holder
+
                     target_idx = min(turns_undone - 1, len(recents) - 1)
                     target_id = recents[target_idx]["id"]
-                    result = self._session_db.rewind_to_message(
-                        self.session_id, target_id
-                    )
+                    # /undo truncates the durable transcript. When a gateway
+                    # or another CLI owns this conversation's turn, take the
+                    # lease rather than soft-deleting rows out from under it.
+                    with self._session_db.session_turn_lease(
+                        self.session_id,
+                        make_turn_lease_holder("cli-undo"),
+                        ttl_seconds=60.0,
+                        reload_messages=False,
+                    ) as lease:
+                        result = self._session_db.rewind_to_message(
+                            lease.session_id,
+                            target_id,
+                            turn_lease_holder=lease.token,
+                        )
                     rewound_rows = result.get("rewound_count", 0)
                     # Prefer the DB's decoded target text for the prefill —
                     # it's the canonical persisted copy.
@@ -20695,12 +20708,37 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 if getattr(self, '_delete_session_on_exit', False):
                     try:
                         from hermes_constants import get_hermes_home as _ghh
+                        from hermes_state import (
+                            SessionTurnLeaseLostError as _LeaseLostError,
+                            make_turn_lease_holder as _make_lease_holder,
+                        )
                         _sessions_dir = _ghh() / "sessions"
                         _sid = self.agent.session_id
-                        if self._session_db.delete_session(_sid, sessions_dir=_sessions_dir):
-                            _cprint(f"  {_DIM}✓ Session {_escape(_sid)} deleted{_RST}")
+                        try:
+                            # A gateway/ACP writer can still be persisting a turn
+                            # into this conversation; deleting under it destroys a
+                            # transcript mid-write. The lease fences the delete —
+                            # the id stays the one the operator asked to drop.
+                            with self._session_db.session_turn_lease(
+                                _sid,
+                                _make_lease_holder("cli-exit-delete"),
+                                ttl_seconds=30.0,
+                                reload_messages=False,
+                            ):
+                                _deleted = self._session_db.delete_session(
+                                    _sid, sessions_dir=_sessions_dir
+                                )
+                        except _LeaseLostError:
+                            _cprint(
+                                f"  {_DIM}✗ Session {_escape(_sid)} not deleted — "
+                                f"another process is running a turn on this "
+                                f"conversation{_RST}"
+                            )
                         else:
-                            _cprint(f"  {_DIM}✗ Session {_escape(_sid)} not found for deletion{_RST}")
+                            if _deleted:
+                                _cprint(f"  {_DIM}✓ Session {_escape(_sid)} deleted{_RST}")
+                            else:
+                                _cprint(f"  {_DIM}✗ Session {_escape(_sid)} not found for deletion{_RST}")
                     except (Exception, KeyboardInterrupt) as e:
                         logger.debug("Could not delete session on exit: %s", e)
             # Plugin hook: on_session_end — safety net for interrupted exits.

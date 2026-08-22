@@ -1238,17 +1238,37 @@ def _session_browse_picker(sessions: list, session_db=None) -> Optional[str]:
 
     _annotate_session_statuses(sessions, session_db)
 
+    # Carries the REASON a delete was refused up to the curses footer: "someone
+    # else owns this conversation right now" is a different thing to tell the
+    # operator than "the delete failed".
+    delete_refusal: list = []
+
     def _delete_session(session_id: str) -> bool:
         if session_db is None:
             return False
+        delete_refusal.clear()
         try:
             sessions_dir = get_hermes_home() / "sessions"
         except Exception:
             sessions_dir = None
+        from hermes_state import SessionTurnLeaseLostError, make_turn_lease_holder
+
         try:
-            return bool(
-                session_db.delete_session(session_id, sessions_dir=sessions_dir)
-            )
+            # The picker deletes the row the operator highlighted, which a live
+            # turn may still be appending to. Keep the highlighted id — the
+            # lease is here for exclusion, not to redirect the delete.
+            with session_db.session_turn_lease(
+                session_id,
+                make_turn_lease_holder("session-picker-delete"),
+                ttl_seconds=30.0,
+                reload_messages=False,
+            ):
+                return bool(
+                    session_db.delete_session(session_id, sessions_dir=sessions_dir)
+                )
+        except SessionTurnLeaseLostError:
+            delete_refusal.append("Another process is running a turn on it.")
+            return False
         except Exception:
             return False
 
@@ -1477,7 +1497,10 @@ def _session_browse_picker(sessions: list, session_db=None) -> Optional[str]:
                             if not sessions:
                                 return
                         else:
-                            flash = "Delete failed."
+                            flash = (
+                                delete_refusal[0] if delete_refusal
+                                else "Delete failed."
+                            )
                     continue
 
                 if key in {curses.KEY_UP,}:
