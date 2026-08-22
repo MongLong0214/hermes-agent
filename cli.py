@@ -23,6 +23,7 @@ except ModuleNotFoundError:
     # means UTF-8 stdio setup is skipped on Windows; POSIX is unaffected.
     pass
 
+import contextlib
 import logging
 import copy
 import os
@@ -13285,7 +13286,75 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return
 
         original_count = len(self.conversation_history)
-        with self._busy_command("Compressing context...", blocks_input=False):
+
+        # PRE-DISPATCH FENCE (blocker (g)).
+        #
+        # The turn fence is enforced at ROTATION -- publish_compression_child --
+        # which runs after `_compress_context` has already called the provider.
+        # So on a conversation another process owns, the sequence was:
+        # summarise (real tokens, real latency) -> publish -> refused. The work
+        # is spent to produce a value that cannot be stored, and the failure
+        # arrives at the end, which is where a caller is most likely to write
+        # something else instead.
+        #
+        # Reuse before acquire, in that order. A /compress issued INSIDE a turn
+        # this process is running must present the turn's own grant: acquiring
+        # there waits for itself and then refuses, on every in-turn call. That
+        # is `current_turn_grant`, the same shape tools/react_to_message_tool.py
+        # uses.
+        _fence = contextlib.ExitStack()
+        _db = getattr(self, "_session_db", None)
+        if _db is not None and self.session_id:
+            from hermes_state import (
+                SessionTurnLeaseLostError as _CompressLeaseLost,
+                make_turn_lease_holder as _compress_lease_holder,
+            )
+            if _db.current_turn_grant(self.session_id) is None:
+                try:
+                    _scope = _fence.enter_context(_db.session_turn_lease(
+                        self.session_id,
+                        _compress_lease_holder("cli-manual-compress"),
+                        ttl_seconds=300.0,
+                        # NOT the class-wide ALTERNATE_WRITER_LEASE_WAIT_S of
+                        # 10s. This call site has a human waiting at a prompt
+                        # with no output, and /compress is idempotent and
+                        # retryable, so ten seconds of silence reads as a hang
+                        # and buys nothing a retry does not. Long enough to ride
+                        # out a gateway mirror's write, short enough to answer.
+                        wait_seconds=2.0,
+                        reload_messages=False,
+                    ))
+                except _CompressLeaseLost:
+                    print(
+                        "(._.) Another process is running a turn on this "
+                        "conversation, so /compress would summarise it and "
+                        "then be refused when it tried to store the result. "
+                        "Nothing was sent to the model. Try again once that "
+                        "turn finishes, or free the conversation with "
+                        "SessionDB.force_release_session_turn_lease() if you "
+                        "know the owner is gone."
+                    )
+                    return
+                # What is true AFTER acquisition. Compressing the in-memory
+                # history against a conversation that rotated while we waited
+                # would summarise a transcript that is no longer the live one
+                # and publish the child onto the wrong segment. There is no
+                # recovery here that is better than not doing it: the caller
+                # still has its input.
+                if _scope.session_id != self.session_id:
+                    _fence.close()
+                    print(
+                        "(._.) This conversation rotated onto "
+                        f"{_scope.session_id} while /compress waited for the "
+                        "lease, so the history in this session is no longer "
+                        "the live one. Nothing was sent to the model; "
+                        "run /compress again."
+                    )
+                    return
+
+        with _fence, self._busy_command(
+            "Compressing context...", blocks_input=False
+        ):
             try:
                 from agent.model_metadata import estimate_request_tokens_rough
                 from agent.manual_compression_feedback import summarize_manual_compression
