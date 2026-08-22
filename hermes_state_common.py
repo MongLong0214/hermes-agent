@@ -833,28 +833,57 @@ TURN_FENCE_FUNCTION_NAME = "hermes_turn_fence_generation"
 #: its result, is what admits the write.
 TURN_FENCE_GENERATION = 1
 
-TURN_FENCE_TRIGGERS = (
-    "hermes_turn_fence_messages_insert",
-    "hermes_turn_fence_messages_update",
-    "hermes_turn_fence_messages_delete",
+#: Every ``(table, operation)`` the barrier covers.
+#:
+#: `messages` alone was not enough and the gap was not theoretical: the exact
+#: binary at the base commit ran end_session, update_session_model,
+#: update_system_prompt, set_session_title, patch_session_model_config,
+#: promote_to_session_reset and create_session against a conversation this
+#: generation held the lease on, unrefused, because not one of them touches the
+#: transcript. The model, the system prompt, the title and the end state all
+#: live in `sessions`, and the next turn replays under all four.
+#:
+#: `session_turn_leases` is here because a writer that can free the fence can
+#: defeat it. It is fenced for DELETE as well as INSERT/UPDATE even though no
+#: code path deletes a lease row: the surface is about what a FOREIGN writer
+#: can do, and "we never do it" is not "it cannot be done".
+#:
+#: This is a DECLARATION, not the decision. tests/state/test_turn_fence_surface
+#: derives the same set from the source of SessionDB and its mixins and fails
+#: when the two differ in either direction, so a mutator that starts writing a
+#: new table fails there until this follows it. The list is checked; it is not
+#: maintained by hand and trusted.
+TURN_FENCE_SURFACE = (
+    ("messages", "INSERT"),
+    ("messages", "UPDATE"),
+    ("messages", "DELETE"),
+    ("sessions", "INSERT"),
+    ("sessions", "UPDATE"),
+    ("sessions", "DELETE"),
+    ("session_turn_leases", "INSERT"),
+    ("session_turn_leases", "UPDATE"),
+    ("session_turn_leases", "DELETE"),
 )
 
-TURN_FENCE_TRIGGER_SQL = f"""
-CREATE TRIGGER IF NOT EXISTS {TURN_FENCE_TRIGGERS[0]}
-BEFORE INSERT ON messages BEGIN
-    SELECT {TURN_FENCE_FUNCTION_NAME}();
-END;
 
-CREATE TRIGGER IF NOT EXISTS {TURN_FENCE_TRIGGERS[1]}
-BEFORE UPDATE ON messages BEGIN
-    SELECT {TURN_FENCE_FUNCTION_NAME}();
-END;
+def turn_fence_trigger_name(table: str, operation: str) -> str:
+    """The trigger that fences one ``(table, operation)`` pair."""
+    return f"hermes_turn_fence_{table}_{operation.lower()}"
 
-CREATE TRIGGER IF NOT EXISTS {TURN_FENCE_TRIGGERS[2]}
-BEFORE DELETE ON messages BEGIN
-    SELECT {TURN_FENCE_FUNCTION_NAME}();
-END;
-"""
+
+TURN_FENCE_TRIGGERS = tuple(
+    turn_fence_trigger_name(table, operation)
+    for table, operation in TURN_FENCE_SURFACE
+)
+
+TURN_FENCE_TRIGGER_SQL = "\n".join(
+    f"CREATE TRIGGER IF NOT EXISTS "
+    f"{turn_fence_trigger_name(table, operation)}\n"
+    f"BEFORE {operation} ON {table} BEGIN\n"
+    f"    SELECT {TURN_FENCE_FUNCTION_NAME}();\n"
+    f"END;\n"
+    for table, operation in TURN_FENCE_SURFACE
+)
 
 
 def register_turn_fence_function(conn) -> None:

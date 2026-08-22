@@ -20,6 +20,7 @@ import sqlite3
 import pytest
 
 from hermes_state import SessionDB
+from hermes_state_common import register_turn_fence_function
 
 
 def _make_legacy_db(tmp_path, n_rows=5):
@@ -29,6 +30,11 @@ def _make_legacy_db(tmp_path, n_rows=5):
     db.close()
 
     conn = sqlite3.connect(db_path)
+    # Stands in for a CURRENT-generation writer, so it registers the
+    # generation marker the same way hermes_state's connect path does. A
+    # raw connection without it IS an old binary as far as the fence is
+    # concerned, and refusing it is the fence working.
+    register_turn_fence_function(conn)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     for i in range(n_rows):
@@ -75,6 +81,7 @@ def test_mid_loop_lock_error_returns_instead_of_raising(tmp_path):
     db = SessionDB(db_path=db_path)
     try:
         conn = sqlite3.connect(db_path)
+        register_turn_fence_function(conn)  # a current-generation writer
         conn.row_factory = sqlite3.Row
         raw = conn.cursor()
         proxy = _FailAfterN(raw, fail_after=2)
@@ -103,6 +110,7 @@ def test_later_run_completes_the_remainder(tmp_path):
     db = SessionDB(db_path=db_path)
     try:
         conn = sqlite3.connect(db_path)
+        register_turn_fence_function(conn)  # a current-generation writer
         conn.row_factory = sqlite3.Row
         raw = conn.cursor()
         db._dedupe_legacy_system_prompts(_FailAfterN(raw, fail_after=2))

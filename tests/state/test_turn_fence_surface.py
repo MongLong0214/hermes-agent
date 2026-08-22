@@ -434,6 +434,126 @@ def test_every_declared_trigger_is_the_reason_its_write_fails(tmp_path):
             mutated.close()
 
 
+def test_no_production_module_writes_a_fenced_table_outside_sessiondb():
+    """No SECOND MINTER: one place registers the marker, and it is SessionDB.
+
+    The marker proves "current generation" and nothing else. It does not prove
+    the conversation root, the holder, or the epoch, so it is not authority to
+    mutate a live-owned conversation — and the barrier's real question was never
+    "is this connection marked" but "who is allowed to mint the marker". A
+    connection-local scalar is not a database boundary.
+
+    So the fix for a module that this test names is NOT to call
+    ``register_turn_fence_function`` on its connection. That mints a second
+    admitted door around the token validator: it is the original defect
+    (a foreign handle registers the same name and walks past the trigger)
+    performed deliberately, by us, in production. The fix for the blind spot
+    would carry the blind spot.
+
+    There are exactly two closures for a module named here:
+
+    * route the write through ``SessionDB``, so it runs on the canonical
+      transaction that the token validator sits in
+      (``plugins/platforms/a2a/adapter.py`` was closed this way); or
+    * refuse deterministically while a live lease exists.
+
+    "It registers the fence function" is not one of them.
+
+    The writer census asserts SessionDB ownership for ``messages``. The barrier
+    needs it for every table on the surface, so it is asserted for every table
+    on the surface — derived from the same declaration the triggers come from,
+    never from a list of modules someone keeps in step.
+    """
+    tables = {table.lower() for table, _op in TURN_FENCE_SURFACE}
+    statement = re.compile(
+        r"\b(?:insert(?:\s+or\s+\w+)?\s+into|update|delete\s+from)\s+"
+        r"(" + "|".join(sorted(re.escape(t) for t in tables)) + r")\b",
+        re.IGNORECASE,
+    )
+    owners = set(census_mod.SESSIONDB_IMPLEMENTATION_MODULES)
+    offenders = []
+    for rel, path in census_mod._production_files():
+        if str(rel) in owners:
+            continue
+        source = path.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            continue
+        docstrings = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef,
+                                 ast.AsyncFunctionDef)):
+                doc = ast.get_docstring(node, clean=False)
+                if doc is not None:
+                    docstrings.add(doc)
+        # Deliberately NO escape hatch for "the module registers the marker".
+        # Registering is the trap this check exists to keep out of the tree, so
+        # a module cannot answer this test by minting the marker — only by
+        # routing through SessionDB or by refusing while a lease is live.
+        # Does the module open its own connections at all? A module that only
+        # ever writes on a connection handed to it (SessionDB's
+        # `_execute_write(lambda conn: ...)` shape) has nothing to register:
+        # registration belongs where the connection is opened.
+        opens_its_own = any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "connect"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "sqlite3"
+            for node in ast.walk(tree)
+        )
+        if not opens_its_own:
+            continue
+        # A write that runs inside a callback the module hands to
+        # SessionDB._execute_write is on SESSIONDB's connection, whatever else
+        # the module opens elsewhere. gateway/platforms/api_server.py is this
+        # shape: it opens response_store.db on one path, and writes `sessions`
+        # from an `_atomic(conn)` closure passed to `db._execute_write`.
+        # Recovery is NOT this shape — it opens the destination itself and
+        # passes that handle down — which is why the carve-out is keyed on the
+        # callback reaching _execute_write rather than on "the receiver is a
+        # parameter".
+        canonical = set()
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "_execute_write"):
+                for arg in node.args:
+                    if isinstance(arg, ast.Name):
+                        canonical.add(arg.id)
+        canonical_spans = [
+            (n.lineno, n.end_lineno)
+            for n in ast.walk(tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and n.name in canonical
+        ]
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+                continue
+            if node.value in docstrings:
+                continue
+            found = statement.search(node.value)
+            if not found:
+                continue
+            if any(lo <= node.lineno <= hi for lo, hi in canonical_spans):
+                continue
+            offenders.append(
+                f"{rel}:{node.lineno}: writes {found.group(1)} on a connection "
+                f"this module opened, outside any SessionDB transaction"
+            )
+    assert not offenders, (
+        "these production modules open their own SQLite connections and write a "
+        "fenced table outside any SessionDB transaction. Each one needs ONE of "
+        "the two closures — route the write through SessionDB, or refuse "
+        "deterministically while a live lease exists. Calling "
+        "register_turn_fence_function on the connection is NOT a closure: it "
+        "mints a second admitted door around the token validator, which is the "
+        "defect this barrier exists to stop, performed on purpose.\n  "
+        + "\n  ".join(sorted(set(offenders)))
+    )
+
+
 def test_this_generation_writes_every_surface_table_normally(tmp_path):
     """The fence must not be a fence on us, on any of its tables."""
     from hermes_state import SessionDB

@@ -1535,6 +1535,10 @@ class TestSessionTitleIndexRepair:
         session_db.close()
 
         with sqlite3.connect(db_path) as conn:
+            # The legacy shape is seeded by a CURRENT-generation writer, so it
+            # registers the generation marker like hermes_state's connect path.
+            from hermes_state_common import register_turn_fence_function
+            register_turn_fence_function(conn)
             conn.execute("DROP INDEX idx_sessions_title_unique")
             if duplicate_titles:
                 conn.execute(
