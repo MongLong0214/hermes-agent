@@ -50,32 +50,19 @@ from __future__ import annotations
 
 import os
 import pathlib
-import subprocess
-import sys
-import textwrap
-from dataclasses import dataclass
 
 import pytest
 
-from tests.state.test_turn_lease_generation_trigger import (
-    BASE_TREE_PATHSPEC,
-    _git_dir,
+from tests.state.lease_mutation_harness import (
+    Mutation,
+    assert_every_pin_has_a_killer,
+    assert_mutation_kills_the_pin,
 )
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 #: This file, so a mutated extract can run the same checks it defines.
 _SELF = pathlib.Path(__file__).resolve().relative_to(REPO_ROOT)
-
-#: Everything an extract needs: enough of the package to open a store, plus
-#: this file and the two test paths it imports at module scope. Derived from
-#: the pathspec the base-binary fixture already maintains rather than a second
-#: copy of it, so a module that fixture starts needing arrives here too.
-EXTRACT_PATHSPEC = tuple(BASE_TREE_PATHSPEC) + (
-    "tests/__init__.py",
-    "tests/state/test_turn_lease_generation_trigger.py",
-    str(_SELF),
-)
 
 
 def _holder(tag: str) -> str:
@@ -346,15 +333,6 @@ def test_blocker_d_property(name, tmp_path):
 # The mutation table: for each pin, the source edit that must kill it.
 # ---------------------------------------------------------------------------
 
-@dataclass(frozen=True)
-class Mutation:
-    pin: str
-    module: str
-    find: str
-    replace: str
-    why: str
-
-
 SOURCE_MUTATIONS = (
     Mutation(
         pin="check_a_superseded_grant_cannot_publish",
@@ -393,124 +371,14 @@ SOURCE_MUTATIONS = (
 )
 
 
-def _extract(tmp_path: pathlib.Path) -> pathlib.Path:
-    """A private, byte-fresh copy of the tree under test.
-
-    Per row, never shared. Two rows in one directory means the second one
-    imports whatever the first one left compiled, and a harness that measures
-    stale bytecode reports a removed guard as covered.
-    """
-    git_dir = _git_dir()
-    if git_dir is None:
-        pytest.skip(
-            "no git repository to extract a tree from; the PINS themselves "
-            "still run without it"
-        )
-    out = tmp_path / "tree"
-    out.mkdir()
-    archive = subprocess.run(
-        ["git", "-C", git_dir, "archive", "HEAD", "--", *EXTRACT_PATHSPEC],
-        capture_output=True,
-    )
-    assert archive.returncode == 0, archive.stderr.decode(errors="replace")
-    extract = subprocess.run(
-        ["tar", "-x", "-C", str(out)], input=archive.stdout, capture_output=True
-    )
-    assert extract.returncode == 0, extract.stderr.decode(errors="replace")
-    return out
-
-
-def _run_pin(tree: pathlib.Path, pin: str, scratch: pathlib.Path):
-    """Run one check inside *tree*, importing it BY PATH from that tree."""
-    scratch.mkdir(parents=True, exist_ok=True)
-    probe = textwrap.dedent(
-        f"""
-        import importlib.util, pathlib, sys
-        sys.path.insert(0, {str(tree)!r})
-        spec = importlib.util.spec_from_file_location(
-            "pins_under_mutation", {str(tree / _SELF)!r}
-        )
-        module = importlib.util.module_from_spec(spec)
-        # Registered BEFORE exec: @dataclass resolves annotations through
-        # sys.modules[cls.__module__], and an unregistered module makes that
-        # None. The failure looks like the pin not holding on a clean extract,
-        # which would have read as "this row measures nothing" forever.
-        sys.modules[spec.name] = module
-        spec.loader.exec_module(module)
-        import hermes_state
-        loaded = pathlib.Path(hermes_state.__file__).resolve()
-        assert loaded.is_relative_to(pathlib.Path({str(tree)!r}).resolve()), (
-            "the probe imported %s, not the extracted tree" % loaded
-        )
-        module.PINS[{pin!r}](pathlib.Path({str(scratch)!r}))
-        print("PIN-HELD")
-        """
-    )
-    return subprocess.run(
-        [sys.executable, "-c", probe],
-        cwd=str(tree),
-        env={
-            "PATH": "/usr/bin:/bin",
-            "HOME": str(scratch),
-            "PYTHONPATH": str(tree),
-            "PYTHONDONTWRITEBYTECODE": "1",
-        },
-        capture_output=True, text=True, timeout=300,
-    )
-
-
 @pytest.mark.parametrize(
     "mutation", SOURCE_MUTATIONS, ids=[m.pin for m in SOURCE_MUTATIONS]
 )
 def test_each_pin_dies_when_its_own_guard_is_removed(mutation, tmp_path):
     """Clean, mutated, restored. A pin that survives its mutation is not a pin."""
-    tree = _extract(tmp_path)
-    target = tree / mutation.module
-    original = target.read_text(encoding="utf-8")
-
-    occurrences = original.count(mutation.find)
-    assert occurrences == 1, (
-        f"the mutation for {mutation.pin} matches {occurrences} places in "
-        f"{mutation.module}, so it no longer names one guard. Keyed by content "
-        f"on purpose — a line number would have gone stale silently. Re-derive "
-        f"the anchor:\n{mutation.find!r}"
-    )
-
-    clean = _run_pin(tree, mutation.pin, tmp_path / "clean")
-    assert clean.returncode == 0, (
-        f"{mutation.pin} does not hold on the UNMUTATED extract, so this row "
-        f"measures nothing:\n{clean.stdout}\n{clean.stderr}"
-    )
-    assert "PIN-HELD" in clean.stdout
-
-    target.write_text(original.replace(mutation.find, mutation.replace, 1))
-    killed = _run_pin(tree, mutation.pin, tmp_path / "mutated")
-    assert killed.returncode != 0, (
-        f"{mutation.pin} still passed with its guard removed ({mutation.why}). "
-        f"It is asserting something the code cannot do anyway, and it will "
-        f"keep passing after that guard is deleted:\n{killed.stdout}\n"
-        f"{killed.stderr}"
-    )
-
-    target.write_text(original)
-    restored = _run_pin(tree, mutation.pin, tmp_path / "restored")
-    assert restored.returncode == 0, (
-        f"{mutation.pin} did not recover when the guard was put back, so the "
-        f"failure above was not caused by the mutation:\n{restored.stdout}\n"
-        f"{restored.stderr}"
-    )
+    assert_mutation_kills_the_pin(mutation, str(_SELF), tmp_path)
 
 
 def test_every_pin_has_a_mutation_that_kills_it():
-    """No pin without a killer, and no killer without a pin.
-
-    The failure this rules out is a property added to :data:`PINS` with no row
-    in the table — which reads as coverage and is not, because nothing has ever
-    shown it can fail.
-    """
-    pinned = set(PINS)
-    mutated = {mutation.pin for mutation in SOURCE_MUTATIONS}
-    assert pinned == mutated, (
-        f"pins without a mutation row: {sorted(pinned - mutated)}; "
-        f"mutation rows naming no pin: {sorted(mutated - pinned)}"
-    )
+    """No pin without a killer, and no killer without a pin."""
+    assert_every_pin_has_a_killer(PINS, SOURCE_MUTATIONS)
