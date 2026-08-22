@@ -1262,9 +1262,13 @@ def _session_browse_picker(sessions: list, session_db=None) -> Optional[str]:
                 make_turn_lease_holder("session-picker-delete"),
                 ttl_seconds=30.0,
                 reload_messages=False,
-            ):
+            ) as lease:
                 return bool(
-                    session_db.delete_session(session_id, sessions_dir=sessions_dir)
+                    session_db.delete_session(
+                        session_id,
+                        sessions_dir=sessions_dir,
+                        turn_lease_holder=lease.token,
+                    )
                 )
         except SessionTurnLeaseLostError:
             delete_refusal.append("Another process is running a turn on it.")

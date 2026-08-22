@@ -1161,8 +1161,12 @@ def _(rid, params: dict) -> dict:
                 make_turn_lease_holder("tui-session-delete"),
                 ttl_seconds=30.0,
                 reload_messages=False,
-            ):
-                deleted = db.delete_session(target, sessions_dir=sessions_dir)
+            ) as lease:
+                deleted = db.delete_session(
+                    target,
+                    sessions_dir=sessions_dir,
+                    turn_lease_holder=lease.token,
+                )
         except SessionTurnLeaseLostError:
             return _err(
                 rid, 4023,

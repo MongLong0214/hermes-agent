@@ -398,8 +398,10 @@ class SessionManager:
                             holder,
                             ttl_seconds=30.0,
                             reload_messages=False,
-                        ):
-                            db.delete_session(sid)
+                        ) as lease:
+                            db.delete_session(
+                                sid, turn_lease_holder=lease.token
+                            )
                     except SessionTurnLeaseLostError:
                         logger.info(
                             "Leaving ACP session %s in the DB: another process "
@@ -644,8 +646,10 @@ class SessionManager:
                 make_turn_lease_holder("acp-session-delete"),
                 ttl_seconds=30.0,
                 reload_messages=False,
-            ):
-                return db.delete_session(session_id)
+            ) as lease:
+                return db.delete_session(
+                    session_id, turn_lease_holder=lease.token
+                )
         except SessionTurnLeaseLostError:
             logger.info(
                 "Leaving ACP session %s in the DB: another process is running "

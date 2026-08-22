@@ -20724,9 +20724,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                                 _make_lease_holder("cli-exit-delete"),
                                 ttl_seconds=30.0,
                                 reload_messages=False,
-                            ):
+                            ) as _lease:
                                 _deleted = self._session_db.delete_session(
-                                    _sid, sessions_dir=_sessions_dir
+                                    _sid,
+                                    sessions_dir=_sessions_dir,
+                                    turn_lease_holder=_lease.token,
                                 )
                         except _LeaseLostError:
                             _cprint(

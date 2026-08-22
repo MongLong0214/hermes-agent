@@ -825,11 +825,12 @@ def cmd_sessions(args, sessions_parser=None):
                         make_turn_lease_holder("sessions-export-delete"),
                         ttl_seconds=30.0,
                         reload_messages=False,
-                    ):
+                    ) as lease:
                         deleted = db.delete_session(
                             resolved_session_id,
                             sessions_dir=sessions_dir,
                             expected_delete_ids=delete_target_ids,
+                            turn_lease_holder=lease.token,
                         )
                 except SessionTurnLeaseLostError:
                     print(
@@ -924,9 +925,11 @@ def cmd_sessions(args, sessions_parser=None):
                 make_turn_lease_holder("sessions-delete"),
                 ttl_seconds=30.0,
                 reload_messages=False,
-            ):
+            ) as lease:
                 deleted = db.delete_session(
-                    resolved_session_id, sessions_dir=sessions_dir
+                    resolved_session_id,
+                    sessions_dir=sessions_dir,
+                    turn_lease_holder=lease.token,
                 )
         except SessionTurnLeaseLostError:
             print(

@@ -5836,7 +5836,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     reload_messages=False,
                 ) as lease:
                     if self.delete_session(
-                        lease.session_id, sessions_dir=sessions_dir
+                        lease.session_id,
+                        sessions_dir=sessions_dir,
+                        turn_lease_holder=lease.token,
                     ):
                         deleted += 1
             except SessionTurnLeaseLostError:
@@ -7511,6 +7513,27 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 ", ".join(sorted(skipped)[:10]),
             )
         return allowed, skipped
+
+    def _refuse_if_any_conversation_is_owned(self, conn, session_ids, because: str):
+        """Raise unless every id in *session_ids* is on a free conversation.
+
+        The counterpart of :meth:`_skip_leased_conversations`, for an operation
+        that named ONE thing. A sweep may skip what it cannot touch because it
+        never promised to touch anything in particular; a delete promised to
+        remove exactly this session and everything it takes with it, and doing
+        half of that is worse than doing none of it.
+
+        Deliberately a separate entry point rather than a flag on the sweep
+        helper: the census derives its "self-fencing sweep" set from calls to
+        that helper, and a refusing caller reading as a sweep would count every
+        one of its call sites as fenced by it.
+        """
+        _allowed, owned = self._skip_leased_conversations(conn, session_ids)
+        if owned:
+            raise SessionTurnLeaseLostError(
+                f"{because}: conversation(s) a live turn owns "
+                f"({', '.join(sorted(owned))})"
+            )
 
     def try_acquire_session_turn_lease(
         self,
@@ -12712,6 +12735,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         session_id: str,
         sessions_dir: Optional[Path] = None,
         expected_delete_ids: Optional[List[str]] = None,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> bool:
         """Delete a session and all its messages.
 
@@ -12735,11 +12760,37 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         )
 
         def _do(conn):
+            # Deletion is the most complete way to change what a later turn
+            # replays, so it takes the same admission as every other
+            # context-bearing mutation — in this transaction, not at whichever
+            # call sites happened to remember.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             cursor = conn.execute(
                 "SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (session_id,)
             )
             if cursor.fetchone() is None:
                 return False
+            # The delegate children go with the parent, and they are SEPARATE
+            # conversations with separate leases — a grant on the parent
+            # authorizes nothing about them. Guarding only session_id fences
+            # the row the operator named and none of the rows it takes with it.
+            #
+            # Refuse rather than skip, unlike a sweep: the operator named one
+            # session, and a delete that removes the parent while leaving a
+            # live delegate behind is a partially applied destructive change.
+            # A sweep has no such contract to keep, which is why it may skip.
+            cascade = sorted(_collect_delegate_child_ids(conn, [session_id]))
+            if cascade:
+                self._refuse_if_any_conversation_is_owned(
+                    conn, cascade,
+                    f"refusing to delete {session_id!r}: its delegate cascade "
+                    f"includes",
+                )
             if expected_ids is not None:
                 actual_ids = {
                     session_id,

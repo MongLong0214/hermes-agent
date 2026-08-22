@@ -690,8 +690,8 @@ async def delete_session_endpoint(session_id: str, profile: Optional[str] = None
                     make_turn_lease_holder("web-session-delete"),
                     ttl_seconds=30.0,
                     reload_messages=False,
-                ):
-                    db.delete_session(sid)
+                ) as lease:
+                    db.delete_session(sid, turn_lease_holder=lease.token)
             except SessionTurnLeaseLostError as exc:
                 raise HTTPException(
                     status_code=409,
