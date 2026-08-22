@@ -68,9 +68,14 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 _SELF = pathlib.Path(__file__).resolve().relative_to(REPO_ROOT)
 
 #: Everything an extract needs: enough of the package to open a store, plus
-#: this file. Derived from the pathspec the base-binary fixture already
-#: maintains rather than a second copy of it.
-EXTRACT_PATHSPEC = tuple(BASE_TREE_PATHSPEC) + (str(_SELF),)
+#: this file and the two test paths it imports at module scope. Derived from
+#: the pathspec the base-binary fixture already maintains rather than a second
+#: copy of it, so a module that fixture starts needing arrives here too.
+EXTRACT_PATHSPEC = tuple(BASE_TREE_PATHSPEC) + (
+    "tests/__init__.py",
+    "tests/state/test_turn_lease_generation_trigger.py",
+    str(_SELF),
+)
 
 
 def _holder(tag: str) -> str:
