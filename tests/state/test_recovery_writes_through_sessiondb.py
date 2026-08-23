@@ -109,7 +109,10 @@ def _live_owned_store(path: pathlib.Path):
             "live", _holder("live"), ttl_seconds=600
         )
         assert grant, "could not take the lease this proof depends on"
-        db.set_session_title("live", "before")
+        # The title pair is fenced now (archived is read by prune as a
+        # do-not-collect marker, so the flag family goes through the
+        # same admission); the fixture holds the grant, so it presents it.
+        db.set_session_title("live", "before", turn_lease_holder=grant)
         db.append_message(
             session_id="live", role="user", content="mine",
             turn_lease_holder=grant,

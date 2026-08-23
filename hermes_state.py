@@ -305,6 +305,26 @@ def _workspace_key_clause(key: str) -> Tuple[str, List[str]]:
     )
 
 
+def _routing_entry_session_id(raw) -> Optional[str]:
+    """The session a ``gateway_routing`` entry points at, or None.
+
+    The index is keyed by ``session_key``; the conversation it routes to is
+    named inside the JSON payload. That is why the routing writers' own
+    parameters carry no session id to fence against, and why the fence has
+    to read the payload.
+    """
+    if not raw:
+        return None
+    try:
+        entry = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(entry, dict):
+        return None
+    session_id = entry.get("session_id")
+    return str(session_id) if session_id else None
+
+
 def _collect_delegate_child_ids(conn, parent_ids: List[str]) -> List[str]:
     """Delegate-subagent ids to cascade-delete with *parent_ids*.
 
@@ -5619,6 +5639,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         display_name: str = None,
         origin_json: str = None,
         include_compression_ancestors: bool = False,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> None:
         """Persist the gateway routing peer for an existing session row.
 
@@ -5646,6 +5668,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return
 
         def _do(conn):
+            # This rewrites where the conversation's replies are delivered.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             lineage_cte = ""
             target_clause = "WHERE id = ?"
             query_params = []
@@ -5773,7 +5802,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     # ── Gateway routing index (replaces sessions.json, #9006 follow-up) ────
 
     def save_gateway_routing_entry(
-        self, session_key: str, entry_json: str, *, scope: str = ""
+        self, session_key: str, entry_json: str, *, scope: str = "",
+        turn_lease_holder=None, turn_lease_ttl_seconds: float = 300.0,
     ) -> None:
         """Upsert one gateway routing entry (session_key -> SessionEntry JSON).
 
@@ -5789,6 +5819,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return
 
         def _do(conn):
+            self._admit_routing_write(
+                conn, [(scope, session_key)], entry_json,
+                turn_lease_holder, turn_lease_ttl_seconds,
+            )
             conn.execute(
                 """INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at)
                    VALUES (?, ?, ?, ?)
@@ -5813,12 +5847,28 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         now = time.time()
 
         def _do(conn):
-            conn.execute("DELETE FROM gateway_routing WHERE scope = ?", (scope,))
+            # A wholesale rewrite of the scope. The entries whose
+            # conversation a live turn owns are KEPT, not replaced.
+            keep = self._owned_routing_keys(conn, scope)
+            if keep:
+                placeholders = ",".join("?" * len(keep))
+                conn.execute(
+                    f"DELETE FROM gateway_routing WHERE scope = ? "
+                    f"AND session_key NOT IN ({placeholders})",
+                    (scope, *sorted(keep)),
+                )
+            else:
+                conn.execute(
+                    "DELETE FROM gateway_routing WHERE scope = ?", (scope,)
+                )
             if entries:
                 conn.executemany(
                     "INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at) "
                     "VALUES (?, ?, ?, ?)",
-                    [(scope, k, v, now) for k, v in entries.items() if k and v],
+                    [
+                        (scope, k, v, now) for k, v in entries.items()
+                        if k and v and k not in keep
+                    ],
                 )
 
         self._execute_write(_do)
@@ -5840,9 +5890,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return
 
         def _do(conn):
+            # A sweep over keys the caller listed: the ones whose
+            # conversation a live turn owns are left in place.
+            keep = self._owned_routing_keys(conn, scope)
             conn.executemany(
                 "DELETE FROM gateway_routing WHERE scope = ? AND session_key = ?",
-                [(scope, k) for k in session_keys],
+                [(scope, k) for k in session_keys if k not in keep],
             )
 
         self._execute_write(_do)
@@ -5924,9 +5977,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return 0
 
         def _do(conn):
+            # Same sweep rule as the sibling above.
+            live = {
+                (scope, key)
+                for scope in {row_scope for row_scope, _ in doomed}
+                for key in self._owned_routing_keys(conn, scope)
+            }
             conn.executemany(
                 "DELETE FROM gateway_routing WHERE scope = ? AND session_key = ?",
-                doomed,
+                [pair for pair in doomed if pair not in live],
             )
 
         self._execute_write(_do)
@@ -6926,6 +6985,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         git_branch: Optional[str] = None,
         git_repo_root: Optional[str] = None,
         replace_git_meta: bool = False,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> Optional[int]:
         """Persist the authoritative cwd and claim a Git metadata generation.
 
@@ -6960,6 +7021,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         repo_root = (git_repo_root or "").strip()
 
         def _do(conn):
+            # cwd and the git pair ride in the assembled prompt.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             current = conn.execute(
                 "SELECT cwd FROM sessions WHERE id = ?", (session_id,)
             ).fetchone()
@@ -7003,6 +7071,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         generation: int,
         git_branch: Optional[str] = None,
         git_repo_root: Optional[str] = None,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> bool:
         """Publish async Git enrichment only while its cwd claim is current."""
         if (
@@ -7030,6 +7100,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         params.extend((session_id, cwd, generation))
 
         def _do(conn):
+            # A generation fence is not a lease: it orders writers, it does not admit them.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             cursor = conn.execute(
                 f"UPDATE sessions SET {', '.join(sets)} "
                 "WHERE id = ? AND cwd = ? "
@@ -7053,10 +7130,24 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         def _do(conn):
             for root, cwd in pairs:
+                # A cwd-keyed repair is a SWEEP — nobody could hold a grant
+                # naming the rows a directory happens to match — so it
+                # resolves its victims first and skips the owned ones.
+                targets = [
+                    row["id"] for row in conn.execute(
+                        "SELECT id FROM sessions "
+                        "WHERE cwd = ? AND COALESCE(git_repo_root, '') = ''",
+                        (cwd,),
+                    ).fetchall()
+                ]
+                targets = self._skip_leased_conversations(conn, targets)[0]
+                if not targets:
+                    continue
+                placeholders = ",".join("?" * len(targets))
                 conn.execute(
-                    "UPDATE sessions SET git_repo_root = ? "
-                    "WHERE cwd = ? AND COALESCE(git_repo_root, '') = ''",
-                    (root, cwd),
+                    f"UPDATE sessions SET git_repo_root = ? "
+                    f"WHERE id IN ({placeholders})",
+                    (root, *targets),
                 )
 
         self._execute_write(_do)
@@ -7066,12 +7157,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         session_id: str,
         cooldown_until: float,
         error: Optional[str] = None,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> None:
         """Persist the active compression-failure cooldown for a session."""
         if not session_id:
             return
 
         def _do(conn):
+            # The cooldown decides whether the owner's next turn may compress.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             conn.execute(
                 "UPDATE sessions SET compression_failure_cooldown_until = ?, "
                 "compression_failure_error = ? WHERE id = ?",
@@ -7166,6 +7266,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self,
         session_id: str,
         snapshot: Dict[str, Any],
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> None:
         """Restore and verify an exact cooldown-row snapshot.
 
@@ -7186,6 +7288,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         error = snapshot.get("error")
 
         def _do(conn):
+            # A rollback writes the same two columns the cooldown does.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             cursor = conn.execute(
                 "UPDATE sessions SET compression_failure_cooldown_until = ?, "
                 "compression_failure_error = ? WHERE id = ?",
@@ -7209,12 +7318,24 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 f"expected={expected!r}, actual={actual!r}"
             )
 
-    def clear_compression_failure_cooldown(self, session_id: str) -> None:
+    def clear_compression_failure_cooldown(
+        self,
+        session_id: str,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> None:
         """Clear any persisted compression-failure cooldown for a session."""
         if not session_id:
             return
 
         def _do(conn):
+            # Clearing the cooldown re-arms compression for somebody else's turn.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             conn.execute(
                 "UPDATE sessions SET compression_failure_cooldown_until = NULL, "
                 "compression_failure_error = NULL WHERE id = ?",
@@ -7253,13 +7374,26 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         except (TypeError, ValueError):
             return 0
 
-    def set_compression_fallback_streak(self, session_id: str, streak: int) -> None:
+    def set_compression_fallback_streak(
+        self,
+        session_id: str,
+        streak: int,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> None:
         """Persist the deterministic-fallback streak for one session."""
         if not session_id:
             return
         normalized = max(0, int(streak))
 
         def _do(conn):
+            # The fallback streak steers the next compression's strategy.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             conn.execute(
                 "UPDATE sessions SET compression_fallback_streak = ? WHERE id = ?",
                 (normalized, session_id),
@@ -7334,13 +7468,26 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         except (TypeError, ValueError):
             return 0
 
-    def set_compression_ineffective_count(self, session_id: str, count: int) -> None:
+    def set_compression_ineffective_count(
+        self,
+        session_id: str,
+        count: int,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> None:
         """Persist the ineffective-compaction strike count for one session."""
         if not session_id:
             return
         normalized = max(0, int(count))
 
         def _do(conn):
+            # The anti-thrash counter decides whether compression runs at all.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             conn.execute(
                 "UPDATE sessions SET compression_ineffective_count = ? WHERE id = ?",
                 (normalized, session_id),
@@ -7888,6 +8035,84 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if foreign:
             self._refuse_if_any_conversation_is_owned(conn, foreign, because)
 
+    def _routing_affected_session_ids(self, conn, keys, entry_json) -> List[str]:
+        """Every conversation a routing write touches, in both directions.
+
+        The entry being OVERWRITTEN names the conversation whose replies
+        stop arriving; the new entry names the one they start arriving for.
+        A fence that read only the second would let a bystander orphan a
+        live conversation by pointing its key somewhere else.
+        """
+        ids = set()
+        for scope, key in keys:
+            row = conn.execute(
+                "SELECT entry_json FROM gateway_routing "
+                "WHERE scope = ? AND session_key = ?",
+                (scope, key),
+            ).fetchone()
+            existing = _routing_entry_session_id(row["entry_json"] if row else None)
+            if existing:
+                ids.add(existing)
+        incoming = _routing_entry_session_id(entry_json)
+        if incoming:
+            ids.add(incoming)
+        return sorted(ids)
+
+    def _admit_routing_write(
+        self, conn, keys, entry_json, turn_lease_holder, turn_lease_ttl_seconds
+    ) -> None:
+        """Root + holder + epoch for the conversation the grant names; free for the rest.
+
+        Same rule as every other multi-target writer. It is stated here in
+        terms of the payload rather than a parameter because the routing
+        index has no session-id parameter to state it in.
+        """
+        affected = self._routing_affected_session_ids(conn, keys, entry_json)
+        if not affected:
+            return
+        granted_root = getattr(turn_lease_holder, "conversation_id", None)
+        named = next(
+            (sid for sid in affected
+             if self._session_turn_lease_key_on_conn(conn, sid) == granted_root),
+            None,
+        )
+        if named is not None:
+            self._check_turn_lease_guard(
+                conn, named, turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
+        rest = [sid for sid in affected if sid != named]
+        if rest:
+            self._refuse_if_any_conversation_is_owned(
+                conn, rest,
+                f"refusing to write the gateway routing index for "
+                f"{sorted(keys)!r}: it names",
+            )
+
+    def _owned_routing_keys(self, conn, scope: str) -> set:
+        """The ``session_key``s in *scope* whose conversation a live turn owns.
+
+        A wholesale index rewrite is a SWEEP — the gateway rebuilds the
+        whole scope on startup and nobody could have held a grant naming
+        those keys — so the owned entries are KEPT rather than the pass
+        being refused.
+        """
+        rows = conn.execute(
+            "SELECT session_key, entry_json FROM gateway_routing WHERE scope = ?",
+            (scope,),
+        ).fetchall()
+        by_session: Dict[str, List[str]] = {}
+        for row in rows:
+            sid = _routing_entry_session_id(row["entry_json"])
+            if sid:
+                by_session.setdefault(sid, []).append(row["session_key"])
+        if not by_session:
+            return set()
+        _allowed, owned = self._skip_leased_conversations(
+            conn, sorted(by_session)
+        )
+        return {key for sid in owned for key in by_session[sid]}
+
     def try_acquire_session_turn_lease(
         self,
         session_id: str,
@@ -8376,6 +8601,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         *,
         description: Optional[str] = None,
         provenance: Optional[ActivityProvenance] = None,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> None:
         """Stamp durable mid-turn session activity (observation-only).
 
@@ -8400,6 +8627,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         prov = normalize_activity_provenance(provenance).value
 
         def _do(conn):
+            # The activity label is what the session list and resume banner read.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             conn.execute(
                 "UPDATE sessions SET "
                 "last_activity_at = ?, "
@@ -8416,7 +8650,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # (the next due window retries naturally).
         self._execute_write(_do, patience_s=self._ACTIVITY_WRITE_PATIENCE_S)
 
-    def clear_session_activity_labels(self, session_id: str) -> None:
+    def clear_session_activity_labels(
+        self,
+        session_id: str,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> None:
         """Clear mid-turn activity labels after a turn ends.
 
         Keeps ``last_activity_at`` intact so idle / watchdog clocks stay
@@ -8454,6 +8693,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 return
 
         def _do(conn):
+            # Clearing the label is a write into the same column the heartbeat owns.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             conn.execute(
                 "UPDATE sessions SET "
                 "last_activity_description = ?, "
@@ -9686,6 +9932,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                   )
             """, (cutoff,)).fetchall()
             ids = [r[0] if isinstance(r, (tuple, list)) else r["id"] for r in rows]
+            # A ghost is still a row inside somebody's conversation.
+            ids = self._skip_leased_conversations(conn, ids)[0]
             if ids:
                 placeholders = ",".join("?" * len(ids))
                 conn.execute(
@@ -9952,6 +10200,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         title: str,
         *,
         source: str,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> bool:
         """Write a title, enforcing provenance precedence.
 
@@ -9972,6 +10222,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         new_rank = self._title_rank(source) if not is_user else None
 
         def _do(conn):
+            self._check_session_flag_write(
+                conn, session_id, turn_lease_holder, turn_lease_ttl_seconds
+            )
             current = conn.execute(
                 "SELECT title, title_source FROM sessions WHERE id = ?",
                 (session_id,),
@@ -10032,7 +10285,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         rowcount = self._execute_write(_do)
         return rowcount > 0
 
-    def set_session_title(self, session_id: str, title: str) -> bool:
+    def set_session_title(
+        self,
+        session_id: str,
+        title: str,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> bool:
         """Set or update a session's title on the user's behalf.
 
         Returns True if session was found and title was set.
@@ -10044,7 +10303,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         the result. Automatic callers must use :meth:`set_auto_title`.
         """
         return self._set_session_title(
-            session_id, title, source=self.TITLE_SOURCE_USER
+            session_id, title, source=self.TITLE_SOURCE_USER,
+            turn_lease_holder=turn_lease_holder,
+            turn_lease_ttl_seconds=turn_lease_ttl_seconds,
         )
 
     def set_auto_title(self, session_id: str, title: str, *, source: str) -> bool:
@@ -10089,7 +10350,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return None
         return row["title_source"]
 
-    def set_session_title_source(self, session_id: str, source: str) -> bool:
+    def set_session_title_source(
+        self,
+        session_id: str,
+        source: str,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> bool:
         """Overwrite a title's provenance without touching the title text.
 
         Used when a title is carried across a session boundary (compression
@@ -10100,6 +10367,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             raise ValueError(f"invalid title source: {source!r}")
 
         def _do(conn):
+            self._check_session_flag_write(
+                conn, session_id, turn_lease_holder, turn_lease_ttl_seconds
+            )
             cursor = conn.execute(
                 "UPDATE sessions SET title_source = ? "
                 "WHERE id = ? AND title IS NOT NULL",
@@ -10109,7 +10379,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return self._execute_write(_do) > 0
 
-    def set_session_archived(self, session_id: str, archived: bool) -> bool:
+    def set_session_archived(
+        self,
+        session_id: str,
+        archived: bool,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> bool:
         """Archive or unarchive a session.
 
         Archived sessions are hidden from the default session list but keep all
@@ -10120,6 +10396,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         Returns True when at least one row was updated.
         """
         def _do(conn):
+            self._check_session_flag_write(
+                conn, session_id, turn_lease_holder, turn_lease_ttl_seconds
+            )
             cursor = conn.execute(
                 """
                 WITH RECURSIVE
@@ -10159,7 +10438,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         rowcount = self._execute_write(_do)
         return rowcount > 0
 
-    def set_session_pinned(self, session_id: str, pinned: bool) -> bool:
+    def set_session_pinned(
+        self,
+        session_id: str,
+        pinned: bool,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> bool:
         """Pin or unpin a session (and its whole compression lineage).
 
         ``pinned`` is a durable "keep" flag: pinned sessions are exempt from
@@ -10172,6 +10457,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         least one row changed.
         """
         def _do(conn):
+            self._check_session_flag_write(
+                conn, session_id, turn_lease_holder, turn_lease_ttl_seconds
+            )
             cursor = conn.execute(
                 """
                 WITH RECURSIVE
@@ -10211,7 +10499,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         rowcount = self._execute_write(_do)
         return rowcount > 0
 
-    def set_session_hidden(self, session_id: str, hidden: bool) -> bool:
+    def set_session_hidden(
+        self,
+        session_id: str,
+        hidden: bool,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> bool:
         """Hide or unhide a session (and its whole compression lineage).
 
         ``hidden`` is a generic "don't show in the global Sessions sidebar"
@@ -10226,6 +10520,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         changed.
         """
         def _do(conn):
+            self._check_session_flag_write(
+                conn, session_id, turn_lease_holder, turn_lease_ttl_seconds
+            )
             cursor = conn.execute(
                 """
                 WITH RECURSIVE
@@ -10265,7 +10562,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         rowcount = self._execute_write(_do)
         return rowcount > 0
 
-    def set_session_read(self, session_id: str, read: bool = True) -> bool:
+    def set_session_read(
+        self,
+        session_id: str,
+        read: bool = True,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> bool:
         """Mark a session read or unread (and its whole compression lineage).
 
         Read state is a watermark, not a flag: ``last_read_at`` records when
@@ -10286,6 +10589,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         holds. Returns True when at least one row changed.
         """
         def _do(conn):
+            self._check_session_flag_write(
+                conn, session_id, turn_lease_holder, turn_lease_ttl_seconds
+            )
             cursor = conn.execute(
                 """
                 WITH RECURSIVE
@@ -11168,6 +11474,29 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         _granted_epoch,
                     ),
                 )
+
+    def _check_session_flag_write(
+        self, conn, session_id, turn_lease_holder, turn_lease_ttl_seconds
+    ) -> None:
+        """Admission for the list-facing flags and the title pair.
+
+        These do not move a replay column, and it would be easy to call
+        them exempt on that ground. They are not, for one reason that is
+        checkable: ``archived`` is read by ``prune_sessions`` and
+        ``count_empty_sessions`` as a DO-NOT-COLLECT marker, so clearing it
+        on a live conversation hands that conversation to the next sweep.
+        A write that decides what a later delete may remove is a write
+        about the transcript, one step removed.
+
+        One helper rather than six copies so the six cannot drift, and so
+        there is a single seam a mutation row can name.
+        """
+        self._check_turn_lease_guard(
+            conn,
+            session_id,
+            turn_lease_holder,
+            turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+        )
 
     def _check_transcript_write_guards(
         self,
@@ -14418,14 +14747,27 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return 0
 
         def _do(conn):
-            cursor = conn.execute(
-                "UPDATE sessions SET source = 'kanban' "
-                "WHERE source = 'cli' AND (cwd = ? OR cwd LIKE ? ESCAPE '\\')",
-                (prefix, _escape_like(prefix) + "/%"),
-            )
-            # Read rowcount before set_meta reuses this cursor for its INSERT,
-            # which would otherwise overwrite it with the meta write's count.
-            retagged = cursor.rowcount or 0
+            # A cwd-prefix retag is a SWEEP, same rule as backfill_repo_roots.
+            targets = [
+                row["id"] for row in conn.execute(
+                    "SELECT id FROM sessions "
+                    "WHERE source = 'cli' AND (cwd = ? OR cwd LIKE ? ESCAPE '\\')",
+                    (prefix, _escape_like(prefix) + "/%"),
+                ).fetchall()
+            ]
+            targets = self._skip_leased_conversations(conn, targets)[0]
+            cursor = conn.cursor()
+            retagged = 0
+            if targets:
+                placeholders = ",".join("?" * len(targets))
+                cursor.execute(
+                    f"UPDATE sessions SET source = 'kanban' "
+                    f"WHERE id IN ({placeholders})",
+                    targets,
+                )
+                # Read rowcount before set_meta reuses this cursor for its INSERT,
+                # which would otherwise overwrite it with the meta write's count.
+                retagged = cursor.rowcount or 0
             self.set_meta(gate, "1", cursor=cursor)
             return retagged
 
@@ -15200,13 +15542,26 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     # The CLI writes "pending" then poll-waits for terminal state. The gateway
     # watcher transitions pending→running→{completed,failed}.
 
-    def request_handoff(self, session_id: str, platform: str) -> bool:
+    def request_handoff(
+        self,
+        session_id: str,
+        platform: str,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> bool:
         """Mark a session as pending handoff to the given platform.
 
         Returns True if the row was found and not already in flight; False if
         the session is already in a non-terminal handoff state.
         """
         def _do(conn):
+            # Handoff state decides which platform drives this conversation next.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             cur = conn.execute(
                 "UPDATE sessions "
                 "SET handoff_state = 'pending', "
@@ -15260,9 +15615,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         except Exception:
             return []
 
-    def claim_handoff(self, session_id: str) -> bool:
+    def claim_handoff(
+        self,
+        session_id: str,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> bool:
         """Atomically transition pending → running. Returns True if claimed."""
         def _do(conn):
+            # Claiming a handoff takes the conversation onto another platform.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             cur = conn.execute(
                 "UPDATE sessions SET handoff_state = 'running' "
                 "WHERE id = ? AND handoff_state = 'pending'",
@@ -15271,9 +15638,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return cur.rowcount > 0
         return self._execute_write(_do)
 
-    def complete_handoff(self, session_id: str) -> None:
+    def complete_handoff(
+        self,
+        session_id: str,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> None:
         """Mark a handoff as completed."""
         def _do(conn):
+            # Completing a handoff releases the conversation to its new driver.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             conn.execute(
                 "UPDATE sessions SET handoff_state = 'completed', "
                 "handoff_error = NULL WHERE id = ?",
@@ -15281,9 +15660,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
         self._execute_write(_do)
 
-    def fail_handoff(self, session_id: str, error: str) -> None:
+    def fail_handoff(
+        self,
+        session_id: str,
+        error: str,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> None:
         """Mark a handoff as failed and record the reason."""
         def _do(conn):
+            # Failing a handoff writes the error the other platform reads.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             conn.execute(
                 "UPDATE sessions SET handoff_state = 'failed', "
                 "handoff_error = ? WHERE id = ?",

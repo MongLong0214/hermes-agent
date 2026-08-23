@@ -582,11 +582,11 @@ def test_this_generation_writes_every_surface_table_normally(tmp_path):
     # unfenced writer of it closes the transcript against the holder of a
     # still-valid grant. See tests/state/test_turn_lease_session_lifecycle.
     #
-    # set_session_title stays holderless: it is still outside the lease guard
-    # (the trigger fences it against an older BINARY, which is what this test
-    # is about), and that gap is named rather than papered over.
+    # set_session_title presents it too: the title pair shares the list-flag
+    # admission helper, and `archived` in that family is what prune reads as
+    # a do-not-collect marker. See tests/state/test_turn_lease_broad_writer_closure.
     db.update_session_model("s", "a-model", turn_lease_holder=grant)
-    db.set_session_title("s", "a title")
+    db.set_session_title("s", "a title", turn_lease_holder=grant)
     db.end_session("s", "completed", turn_lease_holder=grant)
     assert db.refresh_session_turn_lease("s", grant, ttl_seconds=600) is True
     db.release_session_turn_lease("s", grant)

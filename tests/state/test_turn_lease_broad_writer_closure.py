@@ -331,20 +331,23 @@ def check_a_ghost_prune_skips_the_owned_conversation(tmpdir) -> None:
     """Deleting a ghost row is still deleting a row someone may own."""
     db = _store(tmpdir)
     try:
-        db.create_session("owned", "test")
-        db.create_session("free", "test")
+        # The collector's own predicate: source='tui', ended, no title, no
+        # messages, older than 24h. Built exactly, so a pin that stops
+        # collecting says something about the fence rather than the filter.
+        for sid in ("owned", "free"):
+            db.create_session(sid, "tui")
+            db.end_session(sid, "done")
         grant = db.try_acquire_session_turn_lease(
             "owned", _holder("owner"), ttl_seconds=600
         )
         assert grant
         db._conn.execute(
-            "UPDATE sessions SET started_at = ?, last_activity_at = ? "
-            "WHERE id IN ('owned', 'free')",
-            (time.time() - 1_000_000, time.time() - 1_000_000),
+            "UPDATE sessions SET started_at = ? WHERE id IN ('owned', 'free')",
+            (time.time() - 1_000_000,),
         )
         db._conn.commit()
 
-        db.prune_empty_ghost_sessions()
+        collected = db.prune_empty_ghost_sessions()
 
         assert db.get_session("owned") is not None, (
             "the ghost prune deleted a conversation a live turn owns"
@@ -353,6 +356,7 @@ def check_a_ghost_prune_skips_the_owned_conversation(tmpdir) -> None:
             "the ghost prune skipped the UNOWNED ghost too, so it collects "
             "nothing"
         )
+        assert collected == 1, f"expected exactly one ghost, got {collected}"
     finally:
         db.close()
 
@@ -556,9 +560,9 @@ SOURCE_MUTATIONS = (
         pin="check_a_repo_root_backfill_skips_the_owned_conversation",
         module="hermes_state.py",
         find=(
-            "            targets = self._skip_leased_conversations(conn, targets)[0]\n"
-            "            if not targets:\n"
-            "                return\n"
+            "                targets = self._skip_leased_conversations(conn, targets)[0]\n"
+                "                if not targets:\n"
+                "                    continue\n"
         ),
         replace="",
         why="without the per-row sweep admission the cwd-keyed UPDATE writes "
@@ -576,9 +580,9 @@ SOURCE_MUTATIONS = (
         pin="check_a_bystander_cannot_repoint_the_owners_routing_entry",
         module="hermes_state.py",
         find=(
-            "            self._refuse_if_routing_entries_are_owned(\n"
+            "            self._admit_routing_write(\n"
             "                conn, [(scope, session_key)], entry_json,\n"
-            "                session_id, turn_lease_holder, turn_lease_ttl_seconds,\n"
+            "                turn_lease_holder, turn_lease_ttl_seconds,\n"
             "            )\n"
         ),
         replace="",
@@ -589,9 +593,13 @@ SOURCE_MUTATIONS = (
         pin="check_a_routing_replace_keeps_the_owned_conversations_entry",
         module="hermes_state.py",
         find=(
+            "            # conversation a live turn owns are KEPT, not replaced.\n"
             "            keep = self._owned_routing_keys(conn, scope)\n"
         ),
-        replace="            keep = set()\n",
+        replace=(
+            "            # conversation a live turn owns are KEPT, not replaced.\n"
+            "            keep = set()\n"
+        ),
         why="a wholesale index rewrite that keeps nothing drops the owned "
             "conversation's route, which is how a live turn's replies stop "
             "being delivered",
