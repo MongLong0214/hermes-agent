@@ -51,15 +51,29 @@ def _point_ledger(monkeypatch, tmp_path):
 
 
 def _track_connections(monkeypatch):
+    """Count the connections THE LEDGER opens, by wrapping its own opener.
+
+    Patching ``sqlite3.connect`` was the original shape and it measured the
+    wrong set. ``ad.sqlite3`` IS the sqlite3 module, so that patch is
+    process-wide: it also intercepted the admission store the ledger now builds
+    to ask whether a record's conversation is owned by a live turn, and
+    ``SessionDB`` refuses a connection factory it cannot retrofit — so the test
+    failed on a subsystem it was never about.
+
+    The property is "the ledger closes every connection the ledger opens", and
+    ``ad._connect`` is exactly that set. The admission store is a per-process
+    singleton that deliberately keeps its connection open, and counting it here
+    would assert the opposite of what it is for.
+    """
     opened, closed = [], []
-    real_connect = sqlite3.connect
+    real_connect = ad._connect
 
     def tracking_connect(*args, **kwargs):
         conn = real_connect(*args, **kwargs)
         opened.append(id(conn))
         return _TrackingConnection(conn, closed)
 
-    monkeypatch.setattr(ad.sqlite3, "connect", tracking_connect)
+    monkeypatch.setattr(ad, "_connect", tracking_connect)
     return opened, closed
 
 

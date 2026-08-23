@@ -8036,6 +8036,104 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if foreign:
             self._refuse_if_any_conversation_is_owned(conn, foreign, because)
 
+    def admit_on_connection(
+        self,
+        conn,
+        session_ids,
+        *,
+        because: str,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> None:
+        """Admission for a writer that holds its OWN transaction on this store.
+
+        WHY THIS EXISTS AND WHY IT IS NOT A SECOND DOOR
+            ``tools/async_delegation`` writes ``async_delegations`` — rows in
+            THIS database, every one of them naming a conversation — through a
+            connection it opened itself. There are two ways to bring such a
+            module inside the fence, and only one of them survives review:
+
+            re-implement    resolve the canonical root and read the lease over
+                            there. That is a SECOND implementation of the
+                            admission rule, and two implementations drift. It
+                            is the shape this method exists to make
+                            unnecessary.
+            borrow          run the canonical helpers against the connection
+                            the caller hands in. Every one of them —
+                            :meth:`_session_turn_lease_key_on_conn`,
+                            :meth:`_read_turn_lease_on_conn`,
+                            :meth:`_authorize_turn_lease_token`,
+                            :meth:`_check_turn_lease_guard` — already takes its
+                            connection as a parameter and touches no other
+                            state than ``self.db_path``. So there is exactly
+                            one rule, and it runs in the caller's transaction.
+
+        THE CALLER'S OBLIGATION, AND IT IS THE WHOLE CONTRACT
+            *conn* must already be inside ``BEGIN IMMEDIATE`` and must be the
+            connection the DML then runs on. Called on a connection outside a
+            transaction, or on a different one, this is a snapshot rather than
+            a decision — the same failure as reading the lease before the write
+            instead of inside it.
+
+        Refuses unless every id in *session_ids* is admitted: the caller's
+        grant for the conversation it names, freeness for every other.
+        """
+        ids = [sid for sid in session_ids if sid]
+        if not ids:
+            return
+        with self._row_factory_on(conn):
+            self._admit_on_connection(
+                conn, ids, because, turn_lease_holder, turn_lease_ttl_seconds
+            )
+
+    @staticmethod
+    @contextmanager
+    def _row_factory_on(conn):
+        """Read this store's rows by NAME on a foreign connection, then restore.
+
+        The helpers index their rows as ``row["holder"]``; a module that opened
+        its own connection has the default tuple factory and every one of them
+        raises ``TypeError: tuple indices must be integers``. Setting it here
+        rather than asking the caller to keeps the borrowed rule self-contained,
+        and restoring it means the caller's own row shape is untouched — that
+        module unpacks tuples positionally two lines later.
+        """
+        previous = conn.row_factory
+        conn.row_factory = sqlite3.Row
+        try:
+            yield
+        finally:
+            conn.row_factory = previous
+
+    def _admit_on_connection(
+        self, conn, ids, because, turn_lease_holder, turn_lease_ttl_seconds
+    ) -> None:
+        granted_root = getattr(turn_lease_holder, "conversation_id", None)
+        named = next(
+            (sid for sid in ids
+             if self._session_turn_lease_key_on_conn(conn, sid) == granted_root),
+            None,
+        )
+        if named is not None:
+            self._check_turn_lease_guard(
+                conn, named, turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
+        rest = [sid for sid in ids if sid != named]
+        if rest:
+            self._refuse_if_any_conversation_is_owned(conn, rest, because)
+
+    def skip_leased_on_connection(self, conn, session_ids) -> List[str]:
+        """The SWEEP counterpart of :meth:`admit_on_connection`.
+
+        Returns the subset of *session_ids* whose conversations are free. Same
+        connection obligation, same predicate an acquirer faces, so a sweep
+        driven from a foreign module can never touch a conversation an acquirer
+        would have been refused.
+        """
+        with self._row_factory_on(conn):
+            return self._skip_leased_conversations(conn, list(session_ids))[0]
+
     def _routing_affected_session_ids(self, conn, keys, entry_json) -> List[str]:
         """Every conversation a routing write touches, in both directions.
 

@@ -27,24 +27,40 @@ THE CLOSURE, AND THE ONE IT REFUSES
     the whole requirement.
 
 WHICH STATEMENTS TAKE ADMISSION, AND WHICH DO NOT
-    The rule is what the statement does to the parent's future turn:
+    Fifteen DML statements, and the rule is what each one does to the parent's
+    future turn. Five take admission and ten are argued; the argument is
+    per-group and every group has a checkable ground.
 
-    removes / un-pends   DELETE, and every ``delivery_state`` move away from
-                         ``pending``. These take admission. A refusal here is a
-                         refusal, and the sweeps (retention prune, the stale
-                         replay drop) SKIP rather than refuse, for the same
-                         reason every other sweep does.
-    contention book-keeping
-                         the claim / release / attempt-counter writes. They are
-                         the mutual exclusion BETWEEN consumers, and the
-                         claimer is by construction not the turn owner —
-                         fencing them on the turn lease would deadlock the
-                         delivery protocol against itself. They leave the
-                         payload and the ``pending`` state exactly where they
-                         were, which is the property that makes this an argued
-                         exemption rather than an unexamined one, and
-                         :func:`test_the_claim_protocol_leaves_the_payload_pending`
-                         asserts it.
+    unclaimed removal    ``_delete_durable_delegation`` (DELETE) and
+                         ``mark_completion_delivered`` — the one delivery
+                         transition whose WHERE clause is ``delegation_id = ?``
+                         ALONE, so anybody can run it, and running it is how a
+                         completion stops ever reaching the parent. Both take
+                         the admission and REFUSE.
+    the two sweeps       the retention prune (3 statements) and the staleness
+                         cap in ``restore_undelivered_completions``. Victims
+                         come from a retention filter, so they SKIP rather than
+                         refuse — the same rule every other sweep in this
+                         family follows.
+    claim-scoped         ``claim`` / ``release`` / ``drop`` /
+                         ``complete_completion_delivery``. Every one of them
+                         carries ``AND delivery_claim = ?``, so they already
+                         have a mutual-exclusion primitive and it is the right
+                         one: the actor is the consumer INJECTING the
+                         completion into the parent's turn, not a bystander.
+                         ``complete_completion_delivery`` in particular runs
+                         immediately after the injection, i.e. while the owner
+                         demonstrably holds the lease — fencing it on that
+                         lease would leave the row ``pending`` forever and
+                         replay the completion on every restart.
+    toward pending       ``_persist_dispatch``, ``_persist_completion``,
+                         ``recover_abandoned_delegations`` and the attempt
+                         counter. They create a record or move it TOWARD
+                         ``pending``; none of them can remove a turn from the
+                         parent's future.
+
+    :func:`test_the_claim_protocol_leaves_the_payload_pending` is the evidence
+    for the third group, and it is asserted rather than argued.
 """
 
 from __future__ import annotations
@@ -248,7 +264,50 @@ def check_a_stale_replay_drop_skips_the_owned_parent(tmpdir) -> None:
         db.close()
 
 
+def check_an_unclaimed_delivery_ack_is_refused_for_an_owned_parent(
+    tmpdir,
+) -> None:
+    """``mark_completion_delivered`` is the ack anybody can run.
+
+    Unlike its claim-scoped sibling its WHERE clause names only the delegation,
+    and marking a completion delivered is how that completion stops reaching
+    the parent's turn. No production caller passes through here today — that is
+    a mitigation, not a proof.
+    """
+    import tools.async_delegation as ad
+    from hermes_state import SessionTurnLeaseLostError
+
+    db = _store(tmpdir)
+    home = pathlib.Path(db.db_path).parent
+    try:
+        grant = _owned(db, "parent")
+        _delegation(home, "d1", "parent", state="completed", delivery="pending")
+
+        try:
+            ad.mark_completion_delivered("d1")
+        except SessionTurnLeaseLostError:
+            pass
+        else:
+            raise AssertionError(
+                "a bystander acknowledged delivery of a completion belonging "
+                "to a conversation a live turn owns"
+            )
+        assert _records(home)["d1"] == "pending", (
+            f"the refused ack moved the delivery state anyway: "
+            f"{_records(home)['d1']!r}"
+        )
+
+        assert ad.mark_completion_delivered(
+            "d1", turn_lease_holder=grant
+        ) is True, "the owner's own delivery ack was refused"
+        assert _records(home)["d1"] == "delivered"
+    finally:
+        db.close()
+
+
 PINS = {
+    "check_an_unclaimed_delivery_ack_is_refused_for_an_owned_parent":
+        check_an_unclaimed_delivery_ack_is_refused_for_an_owned_parent,
     "check_a_durable_delete_is_refused_for_an_owned_parent":
         check_a_durable_delete_is_refused_for_an_owned_parent,
     "check_a_retention_prune_keeps_the_owned_parents_record":
@@ -303,7 +362,7 @@ SOURCE_MUTATIONS = (
         module="tools/async_delegation.py",
         find=(
             "        _admit_delegations(\n"
-            "            conn, [delegation_id], turn_lease_holder,\n"
+            "            store, conn, [delegation_id], turn_lease_holder,\n"
             "            f\"refusing to delete the durable record for \"\n"
             "            f\"{delegation_id!r}: it belongs to\",\n"
             "        )\n"
@@ -313,9 +372,23 @@ SOURCE_MUTATIONS = (
             "deleting it from an unfenced connection removes that turn",
     ),
     Mutation(
+        pin="check_an_unclaimed_delivery_ack_is_refused_for_an_owned_parent",
+        module="tools/async_delegation.py",
+        find=(
+            "        _admit_delegations(\n"
+            "            store, conn, [delegation_id], turn_lease_holder,\n"
+            "            f\"refusing to acknowledge delivery of {delegation_id!r}: \"\n"
+            "            f\"it belongs to\",\n"
+            "        )\n"
+        ),
+        replace="",
+        why="this ack is not claim-scoped, so without the admission any "
+            "process can stop a completion reaching the parent's turn",
+    ),
+    Mutation(
         pin="check_a_retention_prune_keeps_the_owned_parents_record",
         module="tools/async_delegation.py",
-        find="        keep = _leased_delegation_ids(conn)\n",
+        find="        keep = _leased_delegation_ids(store, conn)\n",
         replace="        keep = set()\n",
         why="without the per-row sweep admission the retention DELETEs reach "
             "records belonging to conversations a live turn owns",
@@ -323,7 +396,7 @@ SOURCE_MUTATIONS = (
     Mutation(
         pin="check_a_stale_replay_drop_skips_the_owned_parent",
         module="tools/async_delegation.py",
-        find="        leased = _leased_delegation_ids(conn)\n",
+        find="        leased = _leased_delegation_ids(store, conn)\n",
         replace="        leased = set()\n",
         why="the staleness cap moves delivery_state out of pending, which is "
             "what stops the parent's completion ever being replayed",

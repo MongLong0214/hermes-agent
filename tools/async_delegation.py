@@ -196,10 +196,133 @@ def _transaction() -> Iterator[sqlite3.Connection]:
     """
     conn = _connect()
     try:
-        with conn:
+        # BEGIN IMMEDIATE, not sqlite3's implicit deferred transaction.
+        # The admission reads below happen BEFORE the first DML, and a
+        # deferred transaction does not take the write lock until that DML
+        # runs — so the lease could move between the answer and the write,
+        # which is a snapshot rather than a decision.
+        conn.isolation_level = None
+        conn.execute("BEGIN IMMEDIATE")
+        try:
             yield conn
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        conn.execute("COMMIT")
     finally:
         conn.close()
+
+
+def _not_in_clause(column: str, excluded) -> tuple:
+    """``(sql_fragment, params)`` excluding *excluded* from a DELETE.
+
+    An empty exclusion set yields an empty fragment rather than
+    ``NOT IN ()``, which SQLite rejects — and which would otherwise turn
+    'nothing is owned' into 'the sweep cannot run at all'.
+    """
+    values = sorted(excluded)
+    if not values:
+        return "", ()
+    placeholders = ",".join("?" * len(values))
+    return f" AND {column} NOT IN ({placeholders})", tuple(values)
+
+
+def _delegation_conversation_ids(conn, delegation_ids) -> List[str]:
+    """The conversations the given durable records belong to.
+
+    A record names its parent through ``parent_session_id`` and the two
+    origin ids the completion is routed back through. All of them are
+    conversations, and the lease key walk resolves each to its own root.
+    """
+    ids = [d for d in delegation_ids if d]
+    if not ids:
+        return []
+    placeholders = ",".join("?" * len(ids))
+    rows = conn.execute(
+        f"SELECT parent_session_id, origin_ui_session_id, origin_session_id "
+        f"FROM async_delegations WHERE delegation_id IN ({placeholders})",
+        ids,
+    ).fetchall()
+    out = set()
+    for row in rows:
+        for value in row:
+            if value:
+                out.add(str(value))
+    return sorted(out)
+
+
+_STORE_LOCK = threading.Lock()
+_STORE: Dict[str, Any] = {}
+
+
+def _session_store():
+    """A cached SessionDB on the same file, for its admission helpers ONLY.
+
+    Never for its connection: the writes here run on THIS module's connection,
+    inside the BEGIN IMMEDIATE that ``_transaction`` opens, and the helpers are
+    handed that connection. Borrowing the rule is the point; borrowing the
+    handle would be a different transaction and would prove nothing.
+
+    CACHED, AND THE CACHE IS LOAD-BEARING RATHER THAN AN OPTIMIZATION
+        ``SessionDB.__init__`` runs the schema reconciler, which takes the
+        write lock. Constructing one INSIDE our own BEGIN IMMEDIATE therefore
+        deadlocks the transaction against itself — measured, as "database is
+        locked" on every admitted path. ``_transaction`` primes this before it
+        begins, so the construction always happens outside a transaction and
+        the helpers inside it only ever read.
+    """
+    path = str(_db_path())
+    with _STORE_LOCK:
+        store = _STORE.get(path)
+        if store is None:
+            from hermes_state import SessionDB
+
+            store = SessionDB(db_path=_db_path())
+            _STORE[path] = store
+        return store
+
+
+def _admit_delegations(store, conn, delegation_ids, turn_lease_holder, because) -> None:
+    """Refuse unless every conversation these records belong to admits us.
+
+    *store* is resolved by the CALLER, before the transaction opens.
+    ``SessionDB.__init__`` runs the schema reconciler and takes the write lock,
+    so building one inside our own BEGIN IMMEDIATE deadlocks the transaction
+    against itself — measured, as "database is locked" on every admitted path.
+    """
+    sessions = _delegation_conversation_ids(conn, delegation_ids)
+    if not sessions:
+        return
+    store.admit_on_connection(
+        conn, sessions, because=because,
+        turn_lease_holder=turn_lease_holder,
+    )
+
+
+def _leased_delegation_ids(store, conn) -> set:
+    """Delegation ids whose conversation a live turn owns — for the sweeps.
+
+    A sweep skips rather than refuses, for the same reason every other
+    sweep does: its victims come from a retention filter, so nobody could
+    have held a grant naming them, and refusing the pass because one
+    conversation is busy makes retention unrunnable on a busy host.
+    """
+    rows = conn.execute(
+        "SELECT delegation_id, parent_session_id, origin_ui_session_id, "
+        "origin_session_id FROM async_delegations"
+    ).fetchall()
+    by_session: Dict[str, List[str]] = {}
+    for delegation_id, *owners in rows:
+        for value in owners:
+            if value:
+                by_session.setdefault(str(value), []).append(delegation_id)
+    if not by_session:
+        return set()
+    free = set(store.skip_leased_on_connection(conn, sorted(by_session)))
+    return {
+        d for session, ids in by_session.items() if session not in free
+        for d in ids
+    }
 
 
 def _capture_routing_origin() -> Dict[str, Any]:
@@ -268,8 +391,14 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
     _prune_durable_records()
 
 
-def _delete_durable_delegation(delegation_id: str) -> None:
+def _delete_durable_delegation(delegation_id: str, turn_lease_holder=None) -> None:
+    store = _session_store()
     with _DB_LOCK, _transaction() as conn:
+        _admit_delegations(
+            store, conn, [delegation_id], turn_lease_holder,
+            f"refusing to delete the durable record for "
+            f"{delegation_id!r}: it belongs to",
+        )
         conn.execute("DELETE FROM async_delegations WHERE delegation_id=?", (delegation_id,))
 
 
@@ -277,10 +406,16 @@ def _prune_durable_records() -> None:
     """Bound terminal history, preferring delivered records for deletion."""
     now = time.time()
     cutoff = now - _DURABLE_RETENTION_SECONDS
+    store = _session_store()
     with _DB_LOCK, _transaction() as conn:
+        # Records whose conversation a live turn owns are left alone; the
+        # rest of the pass runs exactly as before.
+        keep = _leased_delegation_ids(store, conn)
+        keep_clause, keep_params = _not_in_clause("delegation_id", keep)
         conn.execute(
-            "DELETE FROM async_delegations WHERE delivery_state='delivered' AND updated_at < ?",
-            (cutoff,),
+            "DELETE FROM async_delegations WHERE delivery_state='delivered' "
+            f"AND updated_at < ?{keep_clause}",
+            (cutoff, *keep_params),
         )
         terminal_count = conn.execute(
             "SELECT COUNT(*) FROM async_delegations WHERE state NOT IN ('running','finalizing')"
@@ -288,13 +423,14 @@ def _prune_durable_records() -> None:
         excess = max(0, terminal_count - _MAX_RETAINED_COMPLETED)
         if excess:
             conn.execute(
-                """DELETE FROM async_delegations WHERE delegation_id IN (
-                     SELECT delegation_id FROM async_delegations
-                     WHERE state NOT IN ('running','finalizing')
-                     ORDER BY CASE delivery_state WHEN 'delivered' THEN 0 ELSE 1 END,
-                              updated_at ASC LIMIT ?
-                   )""",
-                (excess,),
+                "DELETE FROM async_delegations WHERE delegation_id IN ("
+                "  SELECT delegation_id FROM async_delegations"
+                "  WHERE state NOT IN ('running','finalizing')"
+                f" {keep_clause}"
+                "  ORDER BY CASE delivery_state WHEN 'delivered' THEN 0 ELSE 1 END,"
+                "           updated_at ASC LIMIT ?"
+                ")",
+                (*keep_params, excess),
             )
         pending_count = conn.execute(
             """SELECT COUNT(*) FROM async_delegations
@@ -303,12 +439,14 @@ def _prune_durable_records() -> None:
         overflow = max(0, pending_count - _MAX_DURABLE_PENDING)
         if overflow:
             conn.execute(
-                """DELETE FROM async_delegations WHERE delegation_id IN (
-                     SELECT delegation_id FROM async_delegations
-                     WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'
-                     ORDER BY updated_at ASC LIMIT ?
-                   )""",
-                (overflow,),
+                "DELETE FROM async_delegations WHERE delegation_id IN ("
+                "  SELECT delegation_id FROM async_delegations"
+                "  WHERE state NOT IN ('running','finalizing')"
+                "    AND delivery_state='pending'"
+                f" {keep_clause}"
+                "  ORDER BY updated_at ASC LIMIT ?"
+                ")",
+                (*keep_params, overflow),
             )
 
 
@@ -411,7 +549,12 @@ def restore_undelivered_completions(target_queue) -> int:
     recover_abandoned_delegations()
     now = time.time()
     restored = 0
+    store = _session_store()
     with _DB_LOCK, _transaction() as conn:
+        # The staleness cap moves delivery_state out of 'pending', which is
+        # what stops the parent's completion ever being replayed. Same
+        # sweep rule: leave the owned conversations' rows pending.
+        leased = _leased_delegation_ids(store, conn)
         rows = conn.execute(
             """SELECT delegation_id, event_json, completed_at, dispatched_at
                FROM async_delegations
@@ -420,7 +563,11 @@ def restore_undelivered_completions(target_queue) -> int:
         ).fetchall()
         for delegation_id, payload, completed_at, dispatched_at in rows:
             age_basis = completed_at or dispatched_at
-            if age_basis and (now - age_basis) > _MAX_COMPLETION_REPLAY_AGE_S:
+            if (
+                age_basis
+                and (now - age_basis) > _MAX_COMPLETION_REPLAY_AGE_S
+                and delegation_id not in leased
+            ):
                 conn.execute(
                     """UPDATE async_delegations SET delivery_state='dropped',
                               delivery_claim=NULL, delivery_claimed_at=NULL,
@@ -444,10 +591,24 @@ def restore_undelivered_completions(target_queue) -> int:
     return restored
 
 
-def mark_completion_delivered(delegation_id: str) -> bool:
-    """Atomically acknowledge successful injection of a durable completion."""
+def mark_completion_delivered(delegation_id: str, turn_lease_holder=None) -> bool:
+    """Atomically acknowledge successful injection of a durable completion.
+
+    The one delivery transition that is NOT claim-scoped: its WHERE clause is
+    ``delegation_id = ?`` alone, so unlike ``complete_completion_delivery`` it
+    can be run by anybody, and marking a completion delivered is how that
+    completion stops ever reaching the parent's turn. No production caller
+    passes through here today — the claim-scoped sibling superseded it — and
+    that is a mitigation, not a proof, so it takes the admission.
+    """
     now = time.time()
+    store = _session_store()
     with _DB_LOCK, _transaction() as conn:
+        _admit_delegations(
+            store, conn, [delegation_id], turn_lease_holder,
+            f"refusing to acknowledge delivery of {delegation_id!r}: "
+            f"it belongs to",
+        )
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_state='delivered', delivered_at=?, updated_at=?
                WHERE delegation_id=? AND delivery_state!='delivered'""",
