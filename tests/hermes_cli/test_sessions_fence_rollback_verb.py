@@ -1284,9 +1284,13 @@ def check_a_dry_run_that_cannot_clean_up_does_not_report_success(
         f"the report claims success with the working copy still on disk: "
         f"{payload!r}"
     )
-    assert payload["refused"]["reason"] == "rehearsal-residue", (
-        "residue was not reported as its own outcome, so the operator cannot "
-        f"tell it apart from a pre-flight refusal: {payload['refused']!r}"
+    records = payload.get("residue") or []
+    assert records, (
+        "a working copy of the store could not be removed and the report says "
+        f"nothing was left behind: {payload!r}"
+    )
+    assert payload.get("ok") is False, (
+        f"a run that left an unfenced duplicate on disk reported success: {payload!r}"
     )
 
     printed = run.stdout + run.stderr
@@ -2679,20 +2683,12 @@ def check_a_late_failure_does_not_retract_what_already_happened(
 
     from hermes_cli import session_fence_rollback as library
 
-    real_sweep = library.sweep_work_dir
-
-    def _the_final_cleanup_fails(work_dir, *args, **kwargs):
-        result = real_sweep(work_dir, *args, **kwargs)
-        if pathlib.Path(work_dir).name.startswith("hermes-fence-rehearsal-"):
-            return {"work_dir": str(work_dir), "files": 3, "error": ""}
-        return result
-
     def _run_with_cleanup_failing(store, backup):
-        library.sweep_work_dir = _the_final_cleanup_fails
+        real_shutil = _suppress_directory_removal(library)
         try:
             return _run_verb(store, backup, dry_run=True)
         finally:
-            library.sweep_work_dir = real_sweep
+            library.shutil = real_shutil
 
     # (1) THE REHEARSAL COMPLETED, then cleanup failed.
     done_dir = tmpdir / "completed"
@@ -2721,9 +2717,10 @@ def check_a_late_failure_does_not_retract_what_already_happened(
         "the completed surface was flattened to empty by the cleanup failure: "
         f"{done.get('would_drop')!r}"
     )
-    assert done["refused"]["reason"] == "rehearsal-completed-with-residue", (
-        f"a completed rehearsal with residue is not distinguishable: "
-        f"{done['refused']!r}"
+    done_records = done.get("residue") or []
+    assert len(done_records) == 1 and done_records[0]["fence_state"] == "unfenced", (
+        "the rollback committed against this copy and the residue record does "
+        f"not say the fence is off it: {done_records!r}"
     )
     assert "Nothing was changed." not in completed.stderr, (
         "the operator is told nothing happened while an UNFENCED duplicate of "
@@ -2756,10 +2753,16 @@ def check_a_late_failure_does_not_retract_what_already_happened(
     assert stopped["dropped_triggers"] == []
     assert not live_backup.exists(), "a pre-rehearsal refusal wrote a backup"
     assert _installed_triggers(live_store) == live_triggers
-    assert stopped["refused"]["reason"] != done["refused"]["reason"], (
-        "a run whose rehearsal completed and a run that never started report "
-        f"the SAME outcome ({stopped['refused']['reason']}). Two different "
-        "situations that print the same thing is the defect"
+    stopped_records = stopped.get("residue") or []
+    assert len(stopped_records) == 1, f"expected one incident: {stopped_records!r}"
+    assert stopped_records[0]["fence_state"] != done_records[0]["fence_state"], (
+        "a directory holding an UNFENCED duplicate and one holding a copy that "
+        f"still carries the fence describe themselves identically "
+        f"({stopped_records[0]['fence_state']}). Same words, opposite urgency"
+    )
+    assert stopped_records[0]["fence_state"] == "as-found", (
+        "the run refused before the rollback ran, so its copy is in the state "
+        f"it was made in: {stopped_records[0]!r}"
     )
 
 
@@ -2838,6 +2841,550 @@ def check_the_completed_rehearsal_reports_the_surface_it_removed(
     assert not backup.exists(), "the dry run wrote to the operator's backup path"
 
 
+def _suppress_directory_removal(library):
+    """Make the REHEARSAL working directory un-removable, and nothing else.
+
+    Suppressing every ``rmtree`` also breaks the backup's own staging cleanup,
+    which correctly refuses the run before it can commit — so the injection
+    would prevent the completion some of these legs are about, and the pin
+    would be measuring a different failure than the one it names.
+    """
+
+    class _TheRehearsalDirectorySurvives:
+        def __init__(self, real):
+            self._real = real
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+        def rmtree(self, path, *args, **kwargs):
+            if pathlib.Path(path).name.startswith("hermes-fence-rehearsal-"):
+                return None
+            return self._real.rmtree(path, *args, **kwargs)
+
+    real = library.shutil
+    library.shutil = _TheRehearsalDirectorySurvives(real)
+    return real
+
+
+def check_one_suppressed_sweep_leaves_exactly_one_residue_record(
+    tmpdir: pathlib.Path,
+) -> None:
+    """ONE physical incident, ONE record. Counting is a fact too.
+
+    Making residue append-only removed the erasure — a work-dir answer assigned
+    over the top of a backup-withdrawal record — and introduced its mirror
+    image. Every path appends, and two paths observed the same sweep: the
+    command notes it into the outcome, then reads the outcome back and appends
+    the same record a second time. One suppressed cleanup came out as two
+    byte-identical records for one directory.
+
+    Erasure and duplication are the two ways a multi-writer fact goes wrong,
+    and fixing one exposes the other unless the invariant is stated as
+    CARDINALITY rather than as a write discipline. "Append-only" is a rule about
+    how records are added; it says nothing about how many there should be.
+
+    An operator reading two records counts two directories to go and clean, and
+    goes looking for a second one that never existed. A residue report exists
+    to be acted on, so its arithmetic is load-bearing.
+
+    The refusal is forced BEFORE any backup exists — a half-installed surface,
+    caught on the private copy — so the run has exactly one thing it could fail
+    to remove. Anything other than one record is this defect or its opposite.
+    """
+    _sandbox_home(tmpdir)
+    module, why = _import_verb()
+    assert module is not None, f"there is no fence-rollback verb: {why}"
+
+    from hermes_cli import session_fence_rollback as library
+
+    store = tmpdir / "state.db"
+    _fenced_store(store, leave_lease_live=False)
+    victim = hermes_state_common.turn_fence_trigger_name("messages", "INSERT")
+    conn = sqlite3.connect(str(store), isolation_level=None)
+    try:
+        conn.execute(f"DROP TRIGGER {victim}")
+    finally:
+        conn.close()
+
+    real_shutil = _suppress_directory_removal(library)
+    try:
+        run = _run_verb(store, tmpdir / "backup.db", dry_run=True)
+    finally:
+        library.shutil = real_shutil
+
+    assert not run.crash, f"the verb crashed: {run.crash}"
+    payload = _payload(run)
+    assert payload is not None, f"no machine-readable report: {run.stdout!r}"
+    assert payload["refused"]["reason"] == "surface-mismatch", (
+        "residue relabelled the run. The reason belongs to whatever decided "
+        "its fate — here a half-installed surface — and residue rides "
+        f"alongside it: {payload['refused']!r}"
+    )
+
+    records = payload.get("residue") or []
+    directories = {record.get("work_dir") for record in records}
+    assert len(records) == 1, (
+        f"one suppressed sweep of one directory produced {len(records)} residue "
+        f"records for {len(directories)} distinct directory(ies). An operator "
+        f"reads that as more than one place to go and clean: {records!r}"
+    )
+    assert (payload.get("rehearsal") or {}).get("residue_present") is True, (
+        f"the residue was recorded and not reported as present: {payload!r}"
+    )
+
+
+def check_two_notices_of_one_incident_are_one_record(
+    tmpdir: pathlib.Path,
+) -> None:
+    """The ledger merges by WHICH INCIDENT, so a second look is not a second event.
+
+    More than one code path can observe the same failure — the sweep that
+    performed it, and a reporter that re-reads the ledger afterwards. Neither is
+    wrong to look, and neither should be able to make one stuck directory
+    become two by looking.
+    """
+    _sandbox_home(tmpdir)
+    module, why = _import_verb()
+    assert module is not None, f"there is no fence-rollback verb: {why}"
+
+    from hermes_cli import session_fence_rollback as library
+
+    outcome = library.RollbackOutcome()
+    where = str(tmpdir / "stuck")
+    outcome.note_residue(
+        {"work_dir": where, "files": 3, "error": ""}, incident=f"work-dir:{where}"
+    )
+    outcome.note_residue(
+        {"work_dir": where, "files": 3, "error": ""}, incident=f"work-dir:{where}"
+    )
+
+    records = outcome.facts()["residue"]
+    assert len(records) == 1, (
+        "one incident observed twice became two records. The second observer "
+        f"is not a second stuck directory: {records!r}"
+    )
+    assert outcome.facts()["residue_present"] is True
+
+
+def check_two_incidents_with_identical_values_stay_two_records(
+    tmpdir: pathlib.Path,
+) -> None:
+    """Identical VALUES are not evidence of one incident. Never dedupe by value.
+
+    The obvious repair for a double-count is to drop records that look the
+    same, and it is the wrong one. Two genuinely distinct failures can produce
+    byte-identical payloads — the same file count under the same reported error
+    is a plausible coincidence, not proof they are one event — and collapsing
+    them loses a fact the operator needs. That trade is strictly worse than the
+    double-count it fixes: a spurious extra record wastes a look, a missing one
+    leaves an unfenced duplicate on disk that nobody is told about.
+
+    So identity comes from WHICH obligation over WHICH object, supplied by the
+    caller that knows, and the payloads are never compared.
+    """
+    _sandbox_home(tmpdir)
+    module, why = _import_verb()
+    assert module is not None, f"there is no fence-rollback verb: {why}"
+
+    from hermes_cli import session_fence_rollback as library
+
+    outcome = library.RollbackOutcome()
+    same_payload = {"work_dir": str(tmpdir / "somewhere"), "files": 3, "error": ""}
+    outcome.note_residue(dict(same_payload), incident="work-dir:/a")
+    outcome.note_residue(dict(same_payload), incident="backup:/a")
+
+    records = outcome.facts()["residue"]
+    assert len(records) == 2, (
+        "two distinct incidents that happened to produce identical payloads "
+        "were collapsed into one. A run can fail to remove its working copy "
+        "AND a backup it tried to withdraw, and those are two places to go: "
+        f"{records!r}"
+    )
+    incidents = sorted(str(record.get("incident")) for record in records)
+    assert incidents == ["backup:/a", "work-dir:/a"], (
+        f"the records do not say which incident each one is: {records!r}"
+    )
+
+
+def check_a_residue_claim_names_the_fence_state_that_was_established(
+    tmpdir: pathlib.Path,
+) -> None:
+    """What state is this claim about, and what DETERMINED that state?
+
+    The residue message was written where cleanup fails, so it inherited that
+    site's subject and asserted a property nothing there had established: every
+    left-behind copy was announced as "an UNFENCED duplicate of every
+    conversation". Fence state is not determined by whether cleanup failed. It
+    is determined by whether the rollback DDL COMMITTED — and on a refusal
+    before the DDL the copy sits exactly as it was made, still carrying the
+    fence.
+
+    The two readings call for different urgency, which is the whole reason to
+    get it right: an unfenced duplicate is a live exposure, a fenced one is
+    litter. Telling an operator the first when it is the second is the same
+    failure as reporting a backup that does not exist.
+
+    Both directions are asserted, because a claim that is always "unfenced" and
+    a claim that is always "as-found" are both wrong and only one of them looks
+    wrong.
+    """
+    _sandbox_home(tmpdir)
+    module, why = _import_verb()
+    assert module is not None, f"there is no fence-rollback verb: {why}"
+
+    from hermes_cli import session_fence_rollback as library
+
+    # (1) REFUSED BEFORE THE DDL — the copy still carries its fence.
+    early_dir = tmpdir / "early"
+    early_dir.mkdir()
+    early_store = early_dir / "state.db"
+    _fenced_store(early_store, leave_lease_live=False)
+    victim = hermes_state_common.turn_fence_trigger_name("messages", "INSERT")
+    conn = sqlite3.connect(str(early_store), isolation_level=None)
+    try:
+        conn.execute(f"DROP TRIGGER {victim}")
+    finally:
+        conn.close()
+
+    real_shutil = _suppress_directory_removal(library)
+    try:
+        early = _run_verb(early_store, early_dir / "backup.db", dry_run=True)
+    finally:
+        library.shutil = real_shutil
+
+    assert not early.crash, f"the verb crashed: {early.crash}"
+    early_payload = _payload(early)
+    assert early_payload is not None, f"no report: {early.stdout!r}"
+    early_records = early_payload.get("residue") or []
+    assert len(early_records) == 1, f"expected one incident: {early_records!r}"
+    assert early_records[0]["fence_state"] == "as-found", (
+        "the copy was left in the state it was made in — the run refused "
+        "before the rollback ran — and the record says the fence came off it: "
+        f"{early_records[0]!r}"
+    )
+    assert "UNFENCED" not in early.stdout + early.stderr, (
+        "an unfenced duplicate is a live exposure and this one is not "
+        f"unfenced:\n{early.stderr}"
+    )
+
+    # (2) THE ROLLBACK COMMITTED against the copy — now it IS unfenced.
+    done_dir = tmpdir / "committed"
+    done_dir.mkdir()
+    done_store = done_dir / "state.db"
+    _fenced_store(done_store, leave_lease_live=False)
+
+    real_shutil = _suppress_directory_removal(library)
+    try:
+        done = _run_verb(done_store, done_dir / "backup.db", dry_run=True)
+    finally:
+        library.shutil = real_shutil
+
+    assert not done.crash, f"the verb crashed: {done.crash}"
+    done_payload = _payload(done)
+    assert done_payload is not None, f"no report: {done.stdout!r}"
+    assert (done_payload.get("rehearsal") or {}).get("outcome") == "committed", (
+        "the fixture did not commit the rollback against the copy, so the "
+        f"unfenced leg is not exercised: {done_payload.get('rehearsal')!r}"
+    )
+    done_records = done_payload.get("residue") or []
+    assert len(done_records) == 1, f"expected one incident: {done_records!r}"
+    assert done_records[0]["fence_state"] == "unfenced", (
+        "the rollback committed against this copy and the record does not say "
+        f"the fence is off it: {done_records[0]!r}"
+    )
+    assert "UNFENCED" in done.stderr, (
+        f"the operator is not told this one is a live exposure:\n{done.stderr}"
+    )
+
+
+def check_a_run_that_creates_nothing_reports_no_residue(
+    tmpdir: pathlib.Path,
+) -> None:
+    """A directory existing is not an incident. Something unresolved is.
+
+    The real path refuses at the authority BEFORE it observes the source, so it
+    makes no copy and needs no working directory. One was being created up
+    front anyway, and the cleanup then reported an incident about it — "a
+    duplicate of every conversation in the store" asserted for a directory with
+    zero files in it, and that manufactured reason overwrote the authority
+    refusal that had actually decided the run.
+
+    Two failures in one line: a claim with no evidence behind it, and a late
+    fact erasing an earlier one. Both are visible from outside, so both are
+    asserted here.
+    """
+    _sandbox_home(tmpdir)
+    module, why = _import_verb()
+    assert module is not None, f"there is no fence-rollback verb: {why}"
+
+    from hermes_cli import session_fence_rollback as library
+
+    store = tmpdir / "state.db"
+    _fenced_store(store, leave_lease_live=False)
+    digest_before = _store_digest(store)
+    listing_before = sorted(entry.name for entry in tmpdir.iterdir())
+
+    real_shutil = _suppress_directory_removal(library)
+    try:
+        run = _run_verb(store, tmpdir / "backup.db")
+    finally:
+        library.shutil = real_shutil
+
+    assert not run.crash, f"the verb crashed: {run.crash}"
+    payload = _payload(run)
+    assert payload is not None, f"no report: {run.stdout!r}"
+
+    assert payload["refused"]["reason"] == "offline-authority-unknown", (
+        "a cleanup failure relabelled the run. The authority decided this "
+        f"one's fate and residue may not take the reason from it: "
+        f"{payload['refused']!r}"
+    )
+    assert not (payload.get("residue") or []), (
+        "the run reports something left behind, and it created nothing — it "
+        f"refused before it observed the source: {payload.get('residue')!r}"
+    )
+    assert "duplicate" not in run.stdout + run.stderr, (
+        f"a duplicate of the store is claimed and none was ever made:\n{run.stderr}"
+    )
+    assert _store_digest(store) == digest_before
+    assert sorted(entry.name for entry in tmpdir.iterdir()) == listing_before, (
+        f"the refusal changed the store's directory: "
+        f"{sorted(entry.name for entry in tmpdir.iterdir())}"
+    )
+
+
+def _drive_the_boundary_with_unlink_failing(library, store, work_dir, sabotage):
+    """Enter the boundary with ``os.unlink`` sabotaged for chosen pathnames.
+
+    *sabotage* is called with each pathname before the real unlink and may
+    raise, or may replace what is there. The backup destination sits OUTSIDE
+    the private working directory so a sidecar left behind is a real artifact
+    in the operator's chosen location, not something the sweep tidies away.
+    """
+    prepared = library.prepare_the_private_copy(store, work_dir=work_dir)
+    backup = work_dir.parent / "backup.db"
+    outcome = library.RollbackOutcome()
+
+    class _SabotagedOs:
+        def __getattr__(self, name):
+            return getattr(os, name)
+
+        def lstat(self, path, *args, **kwargs):
+            sabotage(pathlib.Path(path), "lstat")
+            return os.lstat(path, *args, **kwargs)
+
+        def unlink(self, path, *args, **kwargs):
+            sabotage(pathlib.Path(path), "unlink")
+            return os.unlink(path, *args, **kwargs)
+
+    had_os = hasattr(library, "os")
+    previous = getattr(library, "os", None)
+    library.os = _SabotagedOs()
+    result = {"returned": None, "reason": "", "detail": "", "crash": ""}
+    try:
+        result["returned"] = library._commit_the_rollback(
+            prepared, backup, sorted(hermes_state_common.TURN_FENCE_TRIGGERS),
+            report_as=store, outcome=outcome,
+        )
+    except library.TurnFenceRollbackRefused as exc:
+        result["reason"] = getattr(exc, "reason", "refused")
+        result["detail"] = str(exc)
+    except BaseException as exc:  # noqa: BLE001 - carried, not swallowed
+        result["crash"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        if had_os:
+            library.os = previous
+        else:
+            del library.os
+    return {"backup": backup, "outcome": outcome, "result": result,
+            "copy": pathlib.Path(prepared.path)}
+
+
+def check_a_sidecar_that_cannot_be_released_is_not_a_successful_backup(
+    tmpdir: pathlib.Path,
+) -> None:
+    """Ownership is held until the release RESULT is known, not until it starts.
+
+    The destination family is reserved with exclusive creates, and the sidecar
+    reservations are handed back at the end so the backup is one file. Handing
+    back is an operation that can fail — a pinned file, a permission change, a
+    filesystem that says no — and the release path dropped the handle and the
+    recorded identity BEFORE attempting it, then swallowed every error. By the
+    time the unlink failed there was nothing left to report with and nothing to
+    retry from, so the run returned a verified, durable backup while an
+    unreleased reservation sat beside it on disk, unmentioned.
+
+    THIS IS THE SHAPE ALREADY FIXED ONCE, ONE SEAM OVER. Presence was
+    snapshotted before the sweep and re-emitted as current; here ownership is
+    discarded before the release and the outcome is emitted as if it had
+    succeeded. Both are *state that governs an operation released before that
+    operation's result is known*, and the repair is the same: keep the thing
+    that decides until the decision is in.
+
+    An unreleased ``-wal`` beside a database is not litter. The next reader
+    picks it up as that database's write-ahead log, which is the exact hazard
+    the family reservation exists to prevent — so this cannot be a success.
+
+    The durability claims are re-checked THROUGH THIS PATH, not merely where
+    they were written: a release that failed halfway leaves the parent
+    directory in a state the earlier fsync no longer describes.
+    """
+    _sandbox_home(tmpdir)
+    module, why = _import_verb()
+    assert module is not None, f"there is no fence-rollback verb: {why}"
+
+    from hermes_cli import session_fence_rollback as library
+
+    store = tmpdir / "state.db"
+    _fenced_store(store, leave_lease_live=False)
+    triggers_before = _installed_triggers(store)
+    work_dir = tmpdir / "work"
+    work_dir.mkdir()
+
+    def _pin_the_wal_sidecar(path, op):
+        if op == "unlink" and path.name.endswith("backup.db-wal"):
+            raise PermissionError("pinned sidecar")
+
+    run = _drive_the_boundary_with_unlink_failing(
+        library, store, work_dir, _pin_the_wal_sidecar
+    )
+    facts = run["outcome"].facts()
+    orphan = run["backup"].with_name(run["backup"].name + "-wal")
+
+    assert not run["result"]["crash"], f"the boundary crashed: {run['result']['crash']}"
+    assert orphan.exists(), (
+        "the fixture did not actually leave a sidecar behind, so this pin "
+        f"measures nothing: {sorted(_family_beside(run['backup']))}"
+    )
+    assert run["result"]["returned"] is None, (
+        "a reservation could not be released and the boundary returned a "
+        f"backup report anyway: {run['result']['returned']!r}. There is a "
+        "stale -wal beside that database and the next reader will use it"
+    )
+    assert facts["backup_durable"] is False, (
+        f"a durable backup is claimed for a destination family that was never "
+        f"cleanly established: {facts!r}"
+    )
+    assert facts["backup_verified"] is False, (
+        f"a verified backup is claimed: {facts!r}"
+    )
+    assert facts["outcome"] not in ("committed", "commit-unknown"), (
+        f"the rollback committed on a run whose backup never completed: {facts!r}"
+    )
+    assert facts["changed"] is False, (
+        f"the run reports it changed the store: {facts!r}"
+    )
+    assert facts["residue_present"] is True, (
+        f"the unreleased reservation is on disk and unreported: {facts!r}"
+    )
+    assert any(
+        str(orphan) == record.get("path") for record in facts["residue"]
+    ), (
+        f"the residue does not name the file that was left: {facts['residue']!r}"
+    )
+    assert _installed_triggers(run["copy"]) == triggers_before, (
+        "triggers were dropped on a run whose backup did not complete"
+    )
+    assert _installed_triggers(store) == triggers_before
+
+
+def check_a_foreign_file_at_a_reserved_sidecar_is_never_deleted(
+    tmpdir: pathlib.Path,
+) -> None:
+    """A reserved name that now resolves elsewhere is not ours to remove.
+
+    Between reserving a sidecar and handing it back, the pathname can come to
+    mean a different file. Releasing by NAME then deletes something this run
+    never created — the same rule the published backup already follows, and it
+    binds harder here because nothing about the sidecar's contents would ever
+    look wrong afterwards.
+
+    So identity decides, the foreign file survives, and the run says it could
+    not finish rather than tidying the question away.
+    """
+    _sandbox_home(tmpdir)
+    module, why = _import_verb()
+    assert module is not None, f"there is no fence-rollback verb: {why}"
+
+    from hermes_cli import session_fence_rollback as library
+
+    store = tmpdir / "state.db"
+    _fenced_store(store, leave_lease_live=False)
+    work_dir = tmpdir / "work"
+    work_dir.mkdir()
+    stranger = b"a different file that arrived at the reserved sidecar"
+
+    def _swap_the_sidecar_for_a_strangers_file(path, op):
+        # BEFORE the identity check, which is the window that matters: the
+        # reservation is handed back by NAME, and the name can come to mean a
+        # different file between reserving it and releasing it.
+        if op == "lstat" and path.name.endswith("backup.db-wal") and path.exists():
+            path.unlink()
+            path.write_bytes(stranger)
+
+    run = _drive_the_boundary_with_unlink_failing(
+        library, store, work_dir, _swap_the_sidecar_for_a_strangers_file
+    )
+    facts = run["outcome"].facts()
+    orphan = run["backup"].with_name(run["backup"].name + "-wal")
+
+    assert not run["result"]["crash"], f"the boundary crashed: {run['result']['crash']}"
+    assert orphan.exists() and orphan.read_bytes() == stranger, (
+        "the run deleted a file it did not create at a name it had merely "
+        f"reserved: {orphan.exists()!r}"
+    )
+    assert run["result"]["returned"] is None, (
+        f"the run reported a completed backup: {run['result']['returned']!r}"
+    )
+    assert "ownership-lost" in _residue_errors(facts), (
+        f"the report does not say the name stopped being ours: {facts['residue']!r}"
+    )
+
+
+def check_a_sidecar_that_vanished_is_not_claimed_as_our_removal(
+    tmpdir: pathlib.Path,
+) -> None:
+    """Absence answers "is it there". It does not answer "did we remove it".
+
+    Same rule as the withdrawal edge, at the other end of the same object: a
+    reservation that is already gone when the release looks was removed by
+    somebody, and this run has no basis for saying it was the one. The
+    obligation is satisfied — nothing is at that name — so there is no residue
+    to report, and equally no agency to claim.
+    """
+    _sandbox_home(tmpdir)
+    module, why = _import_verb()
+    assert module is not None, f"there is no fence-rollback verb: {why}"
+
+    from hermes_cli import session_fence_rollback as library
+
+    store = tmpdir / "state.db"
+    _fenced_store(store, leave_lease_live=False)
+    work_dir = tmpdir / "work"
+    work_dir.mkdir()
+
+    def _somebody_else_removed_it_first(path, op):
+        if op == "lstat" and path.name.endswith("backup.db-wal") and path.exists():
+            os.unlink(path)
+
+    run = _drive_the_boundary_with_unlink_failing(
+        library, store, work_dir, _somebody_else_removed_it_first
+    )
+    facts = run["outcome"].facts()
+    orphan = run["backup"].with_name(run["backup"].name + "-wal")
+
+    assert not run["result"]["crash"], f"the boundary crashed: {run['result']['crash']}"
+    assert not orphan.exists(), "the fixture left the sidecar in place"
+    assert run["result"]["returned"] is not None, (
+        "the reservation is gone, which is the state the release wanted, and "
+        f"the run refused anyway: {run['result']!r}"
+    )
+    assert facts["residue_present"] is False, (
+        f"nothing is at that name and residue is reported: {facts['residue']!r}"
+    )
+
+
 PINS = {
     "check_the_verb_is_registered_under_sessions_and_names_its_target":
         check_the_verb_is_registered_under_sessions_and_names_its_target,
@@ -2863,6 +3410,22 @@ PINS = {
         check_an_orphan_backup_sidecar_is_not_overwritten,
     "check_a_dry_run_that_cannot_clean_up_does_not_report_success":
         check_a_dry_run_that_cannot_clean_up_does_not_report_success,
+    "check_one_suppressed_sweep_leaves_exactly_one_residue_record":
+        check_one_suppressed_sweep_leaves_exactly_one_residue_record,
+    "check_two_notices_of_one_incident_are_one_record":
+        check_two_notices_of_one_incident_are_one_record,
+    "check_two_incidents_with_identical_values_stay_two_records":
+        check_two_incidents_with_identical_values_stay_two_records,
+    "check_a_residue_claim_names_the_fence_state_that_was_established":
+        check_a_residue_claim_names_the_fence_state_that_was_established,
+    "check_a_run_that_creates_nothing_reports_no_residue":
+        check_a_run_that_creates_nothing_reports_no_residue,
+    "check_a_sidecar_that_cannot_be_released_is_not_a_successful_backup":
+        check_a_sidecar_that_cannot_be_released_is_not_a_successful_backup,
+    "check_a_foreign_file_at_a_reserved_sidecar_is_never_deleted":
+        check_a_foreign_file_at_a_reserved_sidecar_is_never_deleted,
+    "check_a_sidecar_that_vanished_is_not_claimed_as_our_removal":
+        check_a_sidecar_that_vanished_is_not_claimed_as_our_removal,
     "check_a_late_failure_does_not_retract_what_already_happened":
         check_a_late_failure_does_not_retract_what_already_happened,
     "check_the_completed_rehearsal_reports_the_surface_it_removed":
@@ -3025,6 +3588,115 @@ SOURCE_MUTATIONS = (
             "holding an UNFENCED duplicate indistinguishable from one holding "
             "a copy that still carries the fence. Same words, opposite "
             "urgency, and the operator has no way to tell which they have",
+    ),
+    Mutation(
+        pin="check_one_suppressed_sweep_leaves_exactly_one_residue_record",
+        module="hermes_cli/session_fence_rollback_cmd.py",
+        find='    residue_records = list(outcome.facts()["residue"])\n'
+             '    rehearsal_facts["residue"] = residue_records\n',
+        replace='    residue_records = list(outcome.facts()["residue"]) + [\n'
+                '        rollback.describe_residue(\n'
+                '            residue, obligation="the rehearsal working directory",\n'
+                '            outcome=outcome,\n'
+                '        )\n'
+                '    ] if residue is not None else list(outcome.facts()["residue"])\n'
+                '    rehearsal_facts["residue"] = residue_records\n',
+        why="a second writer for one sweep is what turned a single stuck "
+            "directory into two byte-identical records. The ledger already "
+            "holds it; appending here again makes an operator count two places "
+            "to go and look for a second one that never existed",
+    ),
+    Mutation(
+        pin="check_two_notices_of_one_incident_are_one_record",
+        module="hermes_cli/session_fence_rollback.py",
+        find="        for position, existing in enumerate(self.residue):\n"
+             '            if existing.get("incident") == incident:\n'
+             "                self.residue[position] = entry\n"
+             "                return\n",
+        replace="",
+        why="append-only without an identity is the mirror image of the "
+            "erasure it replaced: every observer of one incident adds a "
+            "record, so looking at a stuck directory twice makes two of them",
+    ),
+    Mutation(
+        pin="check_two_incidents_with_identical_values_stay_two_records",
+        module="hermes_cli/session_fence_rollback.py",
+        find='            if existing.get("incident") == incident:\n',
+        replace="            if {k: v for k, v in existing.items() if k != 'incident'} == record:\n",
+        why="deduplicating by VALUE is the obvious repair for a double count "
+            "and the wrong one. Two distinct failures can produce identical "
+            "payloads, and collapsing them loses a place the operator has to "
+            "go — a spurious record costs a look, a missing one leaves an "
+            "unfenced duplicate nobody is told about",
+    ),
+    Mutation(
+        pin="check_a_residue_claim_names_the_fence_state_that_was_established",
+        module="hermes_cli/session_fence_rollback.py",
+        find='    elif state == "committed":\n        fence_state = "unfenced"\n',
+        replace='    elif True:\n        fence_state = "unfenced"\n',
+        why="the message was generated where cleanup fails and inherited that "
+            "site's subject, announcing every left-behind copy as UNFENCED. "
+            "Fence state is determined by whether the DDL committed, and a "
+            "copy left by a refusal still carries its fence — an unfenced "
+            "duplicate is a live exposure and a fenced one is litter",
+    ),
+    Mutation(
+        pin="check_a_run_that_creates_nothing_reports_no_residue",
+        module="hermes_cli/session_fence_rollback_cmd.py",
+        find="    outcome = rollback.RollbackOutcome()\n    report = None\n",
+        replace="    import tempfile\n\n"
+                "    work_dir = Path(tempfile.mkdtemp(prefix=\"hermes-fence-preflight-\"))\n"
+                "    outcome = rollback.RollbackOutcome()\n"
+                "    outcome.note_residue(\n"
+                "        rollback.describe_residue(\n"
+                '            {"work_dir": str(work_dir), "files": 0, "error": ""},\n'
+                '            obligation="the pre-flight working directory",\n'
+                "            outcome=outcome,\n"
+                "        ),\n"
+                '        incident=f"work-dir:{work_dir}",\n'
+                "    )\n    report = None\n",
+        why="creating a working directory for a run that refuses before it "
+            "observes the source manufactures an incident out of nothing, and "
+            "the residue reason then overwrote the authority refusal that "
+            "actually decided the run — a claim with no evidence behind it and "
+            "a late fact erasing an earlier one, in one line",
+    ),
+    Mutation(
+        pin="check_a_sidecar_that_cannot_be_released_is_not_a_successful_backup",
+        module="hermes_cli/session_fence_rollback.py",
+        find="        except OSError as exc:\n"
+             '            return {"path": str(member), "error": f"{type(exc).__name__}: {exc}"}\n'
+             "        self.identities.pop(suffix, None)\n"
+             "        return None",
+        replace="        except OSError:\n            pass\n"
+                "        self.identities.pop(suffix, None)\n"
+                "        return None",
+        why="swallowing the unlink failure is the defect: the reservation is "
+            "still on disk and the run reports a verified, durable backup with "
+            "a stale -wal beside it, which the next reader takes for that "
+            "database's write-ahead log",
+    ),
+    Mutation(
+        pin="check_a_foreign_file_at_a_reserved_sidecar_is_never_deleted",
+        module="hermes_cli/session_fence_rollback.py",
+        find="        if identity is not None and (info.st_dev, info.st_ino) != identity:\n"
+             '            return {"path": str(member), "error": "ownership-lost"}\n',
+        replace="",
+        why="releasing a reserved name without checking what it resolves to "
+            "now deletes a file this run never created. Nothing about the "
+            "result would look wrong afterwards, and deletion has no way back",
+    ),
+    Mutation(
+        pin="check_a_sidecar_that_vanished_is_not_claimed_as_our_removal",
+        module="hermes_cli/session_fence_rollback.py",
+        find="        except FileNotFoundError:\n"
+             "            self.identities.pop(suffix, None)\n"
+             "            return None\n",
+        replace="        except FileNotFoundError:\n"
+                '            return {"path": str(member), "error": "vanished"}\n',
+        why="a reservation that is already gone is the state the release "
+            "wanted. Reporting it as an unresolved incident sends the operator "
+            "to a directory to remove a file that is not there",
     ),
     Mutation(
         pin="check_the_completed_rehearsal_reports_the_surface_it_removed",

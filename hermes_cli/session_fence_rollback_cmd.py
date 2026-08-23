@@ -197,12 +197,22 @@ def _report_rehearsal(store: Path, backup: Path, work_parent: Path = None) -> in
         except (sqlite3.DatabaseError, OSError) as exc:
             refusal = _unexpected(exc)
     finally:
+        # ONE ENTRY POINT. The record goes into the outcome and is read back
+        # from there; nothing downstream appends. Two writers observing one
+        # sweep is what turned a single stuck directory into two identical
+        # records, and a second entry point is how that returns.
         residue = rollback.sweep_work_dir(work_dir)
-        # note_residue, never assignment. `residue_present` is derived from an
-        # append-only list precisely so this line cannot erase a backup-cleanup
-        # or staging record established earlier by a path that already returned.
         if residue is not None:
-            outcome.note_residue(dict(residue, error=residue.get("error") or "work-dir"))
+            copies = sorted(work_dir.glob("private-*/preflight.db"))
+            outcome.note_residue(
+                rollback.describe_residue(
+                    residue,
+                    obligation="the rehearsal working directory",
+                    outcome=outcome,
+                    copy_path=str(copies[0]) if copies else None,
+                ),
+                incident=f"work-dir:{work_dir}",
+            )
 
     # WHAT THE REHEARSAL ESTABLISHED, decided by the steps that established it.
     # Read from the outcome the run wrote into rather than from a report it may
@@ -214,56 +224,29 @@ def _report_rehearsal(store: Path, backup: Path, work_parent: Path = None) -> in
         established.get("rehearsal"), dict
     ):
         rehearsal_facts = dict(established["rehearsal"])
-    # OR, not overwrite. There are two independent things this run may have
-    # failed to remove — its working copy, and a backup it tried to withdraw —
-    # and assigning the work-dir answer over the top erased the other one. A
-    # fact nobody reads is not a fact; a fact something else overwrites is
-    # worse, because the report looks complete.
-    rehearsal_facts["residue_present"] = bool(
-        rehearsal_facts.get("residue_present")
-    ) or residue is not None
-    if residue is not None:
-        rehearsal_facts["work_dir_residue"] = residue
-        rehearsal_facts["residue"] = list(rehearsal_facts.get("residue") or []) + [
-            dict(residue, error=residue.get("error") or "work-dir")
-        ]
+    # The ledger is the single source for residue. The snapshot above was taken
+    # when the operation ended and the sweep happens after it, so this is a
+    # re-read, never an append.
+    residue_records = list(outcome.facts()["residue"])
+    rehearsal_facts["residue"] = residue_records
+    rehearsal_facts["residue_present"] = bool(residue_records)
     _settle_the_transient_artifacts(rehearsal_facts, swept=residue is None)
 
-    # RESIDUE OUTRANKS EVERY OTHER OUTCOME OF A DRY RUN. What is left in there
-    # is a rolled-back — that is, UNFENCED — duplicate of every conversation in
-    # the store, in a directory the operator was never told about. Reporting
-    # "nothing changed" and exiting 0 over the top of that is false twice.
-    if residue is not None:
-        return _emit_refusal(
-            rollback.TurnFenceRollbackRefused(
-                f"the dry run could not remove its working copy of {store}: "
-                f"{residue['files']} file(s) remain under "
-                f"{residue['work_dir']}{residue['error']}. That copy is an "
-                "UNFENCED duplicate of every conversation in the store — "
-                "remove that directory",
-                # TWO SITUATIONS, TWO REASONS. A dry run whose rehearsal ran to
-                # a commit leaves a rolled-back — UNFENCED — duplicate behind; a
-                # dry run refused in the pre-flight leaves a copy that still
-                # carries the fence. Same directory, different contents, and an
-                # operator triaging the first needs to know the fence is off in
-                # there. Collapsing them into one reason is the same flattening
-                # this pin's other half exists to stop.
-                reason=(
-                    "rehearsal-completed-with-residue"
-                    if (rehearsal_facts.get("outcome") == "committed")
-                    else "rehearsal-residue"
-                ),
-            ),
-            store=store, backup=backup, dry_run=True,
-            preflight=(established or {}).get("preflight"),
-            rehearsal=rehearsal_facts,
-            would_drop=(established or {}).get("would_drop"),
-            installed_triggers=(established or {}).get("installed_triggers"),
+    if refusal is None and residue_records:
+        # Nothing else decided this run's fate, so residue names it. When
+        # something did, the reason below stays ITS reason and the residue
+        # rides alongside — a late failure sets the exit status, it does not
+        # get to relabel what the run was refused for.
+        refusal = rollback.TurnFenceRollbackRefused(
+            f"the dry run left {len(residue_records)} thing(s) behind that it "
+            "created and could not remove",
+            reason="residue-not-removed",
         )
     if refusal is not None:
         return _emit_refusal(
             refusal, store=store, backup=backup, dry_run=True,
             rehearsal=rehearsal_facts,
+            residue=residue_records,
             would_drop=(established or {}).get("would_drop"),
             installed_triggers=(established or {}).get("installed_triggers"),
         )
@@ -340,40 +323,31 @@ def _settle_the_transient_artifacts(facts: dict, *, swept: bool) -> None:
 
 
 def _report_rollback(store: Path, backup: Path) -> int:
-    """The real run. It refuses, and the report says which refusal it is."""
-    import tempfile
+    """The real run. It refuses, and the report says which refusal it is.
 
+    NO WORKING DIRECTORY IS CREATED HERE. This used to mkdtemp one before the
+    call, and the call refuses at the authority before it observes the source —
+    so the directory was made for a run that cannot proceed, stayed empty, and
+    the cleanup then reported "a duplicate of every conversation" about zero
+    files. The library owns the directory and only creates one if it gets far
+    enough to need it, which under this contract is never.
+    """
     from hermes_cli import session_fence_rollback as rollback
-
-    try:
-        work_dir = Path(tempfile.mkdtemp(prefix="hermes-fence-preflight-"))
-    except OSError as exc:
-        return _emit_refusal(
-            _unexpected(exc), store=store, backup=backup, dry_run=False
-        )
 
     outcome = rollback.RollbackOutcome()
     report = None
     refusal = None
     try:
-        try:
-            report = rollback.rollback_turn_fence(
-                store, backup_path=backup, work_dir=work_dir, outcome=outcome
-            )
-        except rollback.TurnFenceRollbackRefused as exc:
-            refusal = exc
-        except (sqlite3.DatabaseError, OSError) as exc:
-            # A classified refusal names a next move; this does not, and saying
-            # so is the point. The store is untouched either way — every raise
-            # inside the boundary rolls its transaction back.
-            refusal = _unexpected(exc)
-    finally:
-        residue = rollback.sweep_work_dir(work_dir)
-        # note_residue, never assignment. `residue_present` is derived from an
-        # append-only list precisely so this line cannot erase a backup-cleanup
-        # or staging record established earlier by a path that already returned.
-        if residue is not None:
-            outcome.note_residue(dict(residue, error=residue.get("error") or "work-dir"))
+        report = rollback.rollback_turn_fence(
+            store, backup_path=backup, outcome=outcome
+        )
+    except rollback.TurnFenceRollbackRefused as exc:
+        refusal = exc
+    except (sqlite3.DatabaseError, OSError) as exc:
+        # A classified refusal names a next move; this does not, and saying so
+        # is the point. The store is untouched either way — every raise inside
+        # the boundary rolls its transaction back.
+        refusal = _unexpected(exc)
 
     # THE FACTS THE RUN ESTABLISHED, read from the object the run wrote into
     # and not from a report it may never have returned. Whatever goes wrong
@@ -391,12 +365,13 @@ def _report_rollback(store: Path, backup: Path) -> int:
         "backup_withdrawn": outcome.backup_withdrawn,
         "residue_present": outcome.residue_present,
     }
-    if outcome.residue is not None:
+    residue_records = list(outcome.facts()["residue"])
+    if residue_records:
         # A fact nobody reads is not a fact. The library records what it could
         # not remove or could not prove it removed; if that stops here the
         # operator is told about a directory that is clean and a backup that
         # exists, and neither may be true.
-        established["residue"] = outcome.residue
+        established["residue"] = residue_records
     if outcome.backup is not None:
         established["backup"] = outcome.backup
     if report is not None:
@@ -408,30 +383,20 @@ def _report_rollback(store: Path, backup: Path) -> int:
         # knows what to look for and one who is told there is nothing to find.
         established["dropped_triggers"] = sorted(rollback.rollback_trigger_names())
 
-    if residue is not None:
-        # Same rule as the dry run, and it applies even when the rollback
-        # SUCCEEDED: a copy of the store from before the fence came off is
-        # still a copy of every conversation.
-        return _emit_refusal(
-            rollback.TurnFenceRollbackRefused(
-                f"the pre-flight copy of {store} could not be removed: "
-                f"{residue['files']} file(s) remain under "
-                f"{residue['work_dir']}{residue['error']}. That copy is a "
-                "duplicate of every conversation in the store — remove that "
-                "directory",
-                reason=(
-                    "completed-with-residue" if report is not None
-                    else "preflight-residue"
-                ),
-            ),
-            store=store, backup=backup, dry_run=False,
-            preflight=(report or {}).get("preflight"),
-            established=established,
+    if refusal is None and residue_records:
+        # Only when nothing else decided the run's fate. Residue is additive to
+        # the report and never relabels a refusal that already named one.
+        refusal = rollback.TurnFenceRollbackRefused(
+            f"the run left {len(residue_records)} thing(s) behind that it "
+            "created and could not remove",
+            reason="residue-not-removed",
         )
     if refusal is not None:
         return _emit_refusal(
             refusal, store=store, backup=backup, dry_run=False,
+            preflight=(report or {}).get("preflight"),
             established=established,
+            residue=residue_records,
         )
 
     _emit(
@@ -470,6 +435,7 @@ def _emit_refusal(
     preflight: dict | None = None,
     established: dict | None = None,
     rehearsal: dict | None = None,
+    residue: list | None = None,
     would_drop: list | None = None,
     installed_triggers: list | None = None,
 ) -> int:
@@ -522,8 +488,9 @@ def _emit_refusal(
             "detail": str(exc),
         },
     }
-    if facts.get("residue") is not None:
-        payload["residue"] = facts["residue"]
+    records = residue if residue is not None else facts.get("residue")
+    if records:
+        payload["residue"] = records
     if rehearsal is not None:
         payload["rehearsal"] = rehearsal
     if would_drop is not None:
@@ -540,6 +507,8 @@ def _emit(payload: dict[str, Any]) -> None:
 
 
 def _human_lines(payload: dict[str, Any]) -> list:
+    from hermes_cli import session_fence_rollback as rollback
+
     if not payload.get("ok"):
         refused = payload.get("refused", {})
         lines = [f"✗ {refused.get('reason')}: {refused.get('detail')}"]
@@ -569,12 +538,7 @@ def _human_lines(payload: dict[str, Any]) -> list:
                         f"  The backup at {backup['path']} was written and then "
                         "withdrawn by this run. It is NOT there."
                     )
-            residue = payload.get("residue")
-            if isinstance(residue, dict):
-                lines.append(
-                    f"  Left behind: {residue.get('path')} "
-                    f"({residue.get('error')})"
-                )
+
         elif payload.get("changed") is None:
             lines.append(
                 "  WHETHER THE ROLLBACK LANDED IS UNKNOWN. The COMMIT was "
@@ -596,6 +560,10 @@ def _human_lines(payload: dict[str, Any]) -> list:
             )
         else:
             lines.append("  Nothing was changed.")
+        for record in payload.get("residue") or []:
+            # Rendered from the record's own derived fields, so the sentence
+            # and the structured output cannot disagree about one incident.
+            lines.append(rollback.residue_sentence(record))
         backup = payload.get("backup")
         if (
             isinstance(backup, dict)

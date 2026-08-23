@@ -813,10 +813,31 @@ class RollbackOutcome:
         """Derived, so it cannot disagree with what was actually recorded."""
         return bool(self.residue)
 
-    def note_residue(self, record: dict) -> None:
-        """Add something this run could not remove. Never replaces a record."""
-        if record is not None:
-            self.residue.append(dict(record))
+    def note_residue(self, record: dict, *, incident: str) -> None:
+        """Record ONE unresolved incident. Idempotent per incident.
+
+        *incident* identifies WHICH obligation over WHICH object — not the
+        record's contents. More than one code path can legitimately observe the
+        same failure (the sweep that performed it, a reporter that re-reads the
+        ledger afterwards), and neither should be able to turn one stuck
+        directory into two by looking at it.
+
+        MERGED BY IDENTITY, NEVER BY VALUE. Two genuinely distinct incidents
+        can produce byte-identical payloads — the same file count under the
+        same error is a coincidence, not proof they are one event — and
+        collapsing those loses a place the operator has to go. A spurious extra
+        record costs a look; a missing one leaves an unfenced duplicate on disk
+        that nobody is told about. The trade is not symmetric, so the payloads
+        are never compared.
+        """
+        if record is None:
+            return
+        entry = dict(record, incident=incident)
+        for position, existing in enumerate(self.residue):
+            if existing.get("incident") == incident:
+                self.residue[position] = entry
+                return
+        self.residue.append(entry)
 
     def facts(self) -> dict[str, Any]:
         return {
@@ -1129,20 +1150,44 @@ class _AcquiredDestinations:
             writer.flush()
         os.fsync(handle)
 
-    def release_the_sidecars(self) -> None:
+    def release_the_sidecars(self, *, outcome=None) -> None:
         """Give back the sidecar names, so the backup is one file.
 
-        They were taken to prove nothing was already there. Leaving them would
-        put an empty ``-shm`` next to a database that has no connection.
+        They were taken to prove nothing was already there. Leaving one puts an
+        empty ``-wal`` next to a database with no connection, and the next
+        reader takes it for that database's write-ahead log — the exact hazard
+        the reservation exists to prevent. So a name that cannot be handed back
+        is not a tidy-up failure to log and move past; it is a destination
+        family that was never cleanly established, and the run says so.
         """
-        for suffix in list(self.handles):
-            if not suffix:
-                continue
-            self._release(suffix)
+        left = []
+        for suffix in [s for s in self.identities if s]:
+            problem = self._release(suffix)
+            if problem is not None:
+                left.append(problem)
+        if not left:
+            return
+        for problem in left:
+            if outcome is not None:
+                outcome.note_residue(
+                    describe_residue(
+                        problem,
+                        obligation="a reserved backup sidecar",
+                        outcome=outcome,
+                    ),
+                    incident=f"sidecar:{problem['path']}",
+                )
+        raise TurnFenceRollbackRefused(
+            "the backup destination family could not be handed back ("
+            + ", ".join(f"{p['path']}: {p['error']}" for p in left)
+            + "). A reserved sidecar left beside the backup is read by the "
+            "next reader as that database's write-ahead log",
+            reason="backup-destination-residue",
+        )
 
     def confirm_the_final_member(self, snapshot: Path) -> None:
         now = os.stat(self.backup_path)
-        if (now.st_dev, now.st_ino) != self.identities[""]:
+        if (now.st_dev, now.st_ino) != self.identities_at_acquisition[""]:
             raise TurnFenceRollbackRefused(
                 f"{self.backup_path} is not the file this run created when it "
                 "acquired the destination, so the backup that was written is "
@@ -1156,25 +1201,55 @@ class _AcquiredDestinations:
                 reason="backup-unreadable",
             )
 
-    def _release(self, suffix: str) -> None:
+    def _release(self, suffix: str):
+        """Hand back one reserved NAME. Returns the problem, or ``None``.
+
+        OWNERSHIP IS DROPPED ONLY WHEN THE RELEASE HAS SUCCEEDED. It used to be
+        discarded first — the handle and the recorded identity popped, then the
+        ``lstat``, the identity comparison and the ``unlink`` each swallowed on
+        failure. By the time anything went wrong there was nothing left to
+        report with and nothing to retry from, so a pinned sidecar produced a
+        silent success with the file still on disk.
+
+        That is the same error as snapshotting presence before the sweep and
+        re-emitting it: state that governs an operation released before the
+        operation's result is known. The descriptor is a different resource
+        from the name and is closed straight away; the NAME's ownership is what
+        must survive until the outcome is in.
+
+        Three outcomes, each classified from what was observed:
+
+        ABSENT     the obligation is met — nothing is at that name. No agency
+                   is claimed: somebody removed it and this run cannot say it
+                   was the one, the same rule the withdrawal edge follows.
+        FOREIGN    the name now resolves to a file this run did not create. It
+                   is not ours to delete, and deletion has no way back.
+        REFUSED    the unlink failed. The reservation is still there and still
+                   ours, and the caller has to be told.
+        """
+        member = self._member(suffix)
+        identity = self.identities.get(suffix)
         handle = self.handles.pop(suffix, None)
         if handle is not None:
             try:
                 os.close(handle)
             except OSError:  # pragma: no cover - already closed
                 pass
-        identity = self.identities.pop(suffix, None)
-        member = self._member(suffix)
         try:
             info = os.lstat(member)
-        except OSError:
-            return
+        except FileNotFoundError:
+            self.identities.pop(suffix, None)
+            return None
+        except OSError as exc:
+            return {"path": str(member), "error": f"{type(exc).__name__}: {exc}"}
         if identity is not None and (info.st_dev, info.st_ino) != identity:
-            return
+            return {"path": str(member), "error": "ownership-lost"}
         try:
             os.unlink(member)
-        except OSError:  # pragma: no cover - defensive
-            pass
+        except OSError as exc:
+            return {"path": str(member), "error": f"{type(exc).__name__}: {exc}"}
+        self.identities.pop(suffix, None)
+        return None
 
     def close(self) -> None:
         for suffix in list(self.handles):
@@ -1185,9 +1260,114 @@ class _AcquiredDestinations:
                 except OSError:  # pragma: no cover - already closed
                     pass
 
-    def remove_only_what_we_created(self) -> None:
-        for suffix in list(self.handles):
-            self._release(suffix)
+    def remove_only_what_we_created(self) -> list:
+        """Best effort over every name still owned. Returns what would not go.
+
+        Keyed on ``identities`` rather than on ``handles``: the descriptor is
+        closed as soon as a release is attempted, and it is the NAME's
+        ownership that says whether this run may still remove something.
+        """
+        left = []
+        for suffix in list(self.identities):
+            problem = self._release(suffix)
+            if problem is not None:
+                left.append(problem)
+        return left
+
+
+#: What a residue record may say about what it is holding, and what has to be
+#: TRUE for each. The wording is chosen from evidence at the moment the record
+#: is made, never from the code path that happens to be printing.
+def describe_residue(
+    observed: dict, *, obligation: str, outcome=None, copy_path=None
+) -> dict:
+    """Compose a residue record from what was OBSERVED, not from where we are.
+
+    A residue record is ONE physical incident this run is responsible for and
+    did not resolve. Not "a directory exists"; not "a sweep returned something".
+
+    EVERY CLAIM IS BOUND TO THE THING THAT DETERMINES IT
+        Two claims kept being asserted by whichever branch was printing, and
+        both were wrong in the field:
+
+        WHAT IT HOLDS is determined by whether a copy of the store is in there,
+        so it is measured — ``files`` from the sweep, and the copy's own path
+        checked for existence. An empty directory earns "an empty transient
+        directory remains" and nothing more. "A duplicate of every
+        conversation" was being asserted for a directory with zero files in it.
+
+        WHETHER THAT COPY IS FENCED is determined by whether the rollback DDL
+        COMMITTED — not by whether cleanup failed, which is what the printing
+        site knew. A refusal before the DDL leaves the copy exactly as it was
+        found, still carrying its fence, and telling an operator it is unfenced
+        when it is not is the same failure as reporting a backup that does not
+        exist. ``unfenced`` is admissible only from a committed outcome;
+        ``commit-unknown`` earns ``unknown`` and nothing firmer.
+
+    The record carries the derived fields so the sentence and the structured
+    output are rendered from ONE decision rather than written twice.
+    """
+    files = observed.get("files", -1)
+    copy_present = bool(copy_path) and os.path.lexists(str(copy_path))
+    if files == 0:
+        holds = "empty"
+    elif copy_present:
+        holds = "store-copy"
+    else:
+        holds = "files"
+
+    state = getattr(outcome, "outcome", None)
+    if holds != "store-copy":
+        fence_state = "not-applicable"
+    elif state == "committed":
+        fence_state = "unfenced"
+    elif state == "commit-unknown":
+        fence_state = "unknown"
+    else:
+        fence_state = "as-found"
+
+    return {
+        "path": str(observed.get("work_dir") or observed.get("path") or ""),
+        "files": files,
+        "error": observed.get("error") or "",
+        "obligation": obligation,
+        "holds": holds,
+        "fence_state": fence_state,
+    }
+
+
+def residue_sentence(record: dict) -> str:
+    """The operator's line, rendered from the record's own derived fields.
+
+    Written once, from the same decision the structured output uses, so the two
+    renderings cannot drift into disagreeing about the same incident.
+    """
+    where = record.get("path")
+    count = record.get("files")
+    holds = record.get("holds")
+    if holds == "empty":
+        what = "an empty directory this run created and could not remove"
+    elif holds == "store-copy":
+        fence = {
+            "unfenced": (
+                "an UNFENCED duplicate of every conversation in the store — "
+                "the rollback committed against it"
+            ),
+            "unknown": (
+                "a duplicate of every conversation in the store, and whether "
+                "the rollback committed against it is UNKNOWN"
+            ),
+            "as-found": (
+                "a duplicate of every conversation in the store, still "
+                "carrying the fence it was copied with — the run refused "
+                "before the rollback ran"
+            ),
+        }.get(record.get("fence_state"), "a duplicate of every conversation")
+        what = fence
+    else:
+        what = f"{count} file(s) this run created"
+    detail = f" ({record['error']})" if record.get("error") else ""
+    return f"  Left behind: {where} — {what}{detail}"
 
 
 def _fsync_the_directory(directory: Path) -> None:
@@ -1364,7 +1544,7 @@ def _make_verified_backup(
         reservation = _AcquiredDestinations(backup_path)
         reservation.acquire()
         reservation.write_the_main_member_from(snapshot)
-        reservation.release_the_sidecars()
+        reservation.release_the_sidecars(outcome=outcome)
         _fsync_the_directory(backup_path.parent)
         reservation.confirm_the_final_member(snapshot)
         reservation.close()
@@ -1399,7 +1579,14 @@ def _make_verified_backup(
             residue = sweep_work_dir(staging)
             if residue is not None:
                 if outcome is not None:
-                    outcome.note_residue(residue)
+                    outcome.note_residue(
+                        describe_residue(
+                            residue,
+                            obligation="the backup staging directory",
+                            outcome=outcome,
+                        ),
+                        incident=f"staging:{staging}",
+                    )
                 # The durable backup is NOT removed. It exists, it restores,
                 # and telling the operator otherwise to keep the failure tidy
                 # is the same lie as reporting success over residue.
@@ -1717,7 +1904,10 @@ def _mark_the_backup_absent_but_not_by_us(outcome, backup_path: Path) -> dict:
         outcome.backup_absence_durable = None
         outcome.backup_present = None
         outcome.backup_withdrawn = False
-        outcome.note_residue(left)
+        outcome.note_residue(
+            describe_residue(left, obligation="the backup", outcome=outcome),
+            incident=f"backup:{backup_path}",
+        )
         if isinstance(outcome.backup, dict):
             outcome.backup = dict(outcome.backup, present=None, residue=left)
     return left
@@ -1736,7 +1926,10 @@ def _leave_the_backup_and_report_it(outcome, left: dict, *, unlinked=False) -> d
     whether to expect the entry back after a crash.
     """
     if outcome is not None:
-        outcome.note_residue(left)
+        outcome.note_residue(
+            describe_residue(left, obligation="the backup", outcome=outcome),
+            incident=f"backup:{left.get('path')}",
+        )
         outcome.backup_present = None
         outcome.backup_withdrawn = False
         outcome.backup_unlinked_by_this_run = bool(unlinked)
@@ -1980,7 +2173,14 @@ def rollback_turn_fence(
         if owned_work_dir:
             residue = sweep_work_dir(work_dir)
             if residue is not None:
-                outcome.note_residue(residue)
+                outcome.note_residue(
+                    describe_residue(
+                        residue,
+                        obligation="the pre-flight working directory",
+                        outcome=outcome,
+                    ),
+                    incident=f"work-dir:{work_dir}",
+                )
 
     report = {
         "store": str(store_path),
