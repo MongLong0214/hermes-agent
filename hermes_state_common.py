@@ -515,7 +515,19 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     owner_started_at INTEGER,
     task_json TEXT,
     delivery_claim TEXT,
-    delivery_claimed_at REAL
+    delivery_claimed_at REAL,
+    -- Raw api_server session id (X-Hermes-Session-Id) of the ORIGINATING
+    -- request — the wake self-post target. Without it, completions recovered
+    -- after a process restart are unroutable on api_server (the in-memory
+    -- record that carried it is gone).
+    --
+    -- Declared HERE rather than ALTERed in by tools/async_delegation, which is
+    -- where it used to live. That module no longer opens a connection of its
+    -- own — its writes run on SessionDB's transaction so the generation
+    -- barrier can cover `async_delegations` — and a module with no connection
+    -- has no place to run DDL. SCHEMA_SQL is the single source of truth for
+    -- the shape, and _reconcile_columns ADDs this to a store that predates it.
+    origin_session_id TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
@@ -848,21 +860,63 @@ TURN_FENCE_GENERATION = 1
 #: code path deletes a lease row: the surface is about what a FOREIGN writer
 #: can do, and "we never do it" is not "it cannot be done".
 #:
+#: THE FIVE ADJUNCT TABLES, AND WHY `messages` + `sessions` WAS STILL TOO NARROW
+#: A foreign `sqlite3.connect` with no generation function, against a store this
+#: generation created while a conversation was LIVE-OWNED, wrote every one of
+#: them unrefused. The one that is not bookkeeping:
+#:
+#:     owner prompt BEFORE : "THE PROMPT THE TURN IS REPLAYING"  hash 4e9cbc79…
+#:     owner prompt AFTER  : None                                hash 4e9cbc79…
+#:
+#: `DELETE FROM system_prompts` names neither `sessions` nor `messages`, so no
+#: trigger prepared against it. It removes the BYTES and leaves
+#: `sessions.system_prompt_hash` pointing at them — this schema DECLARES that
+#: reference, and a raw connection has `PRAGMA foreign_keys` off — so the next
+#: turn resolves its prompt through the LEFT JOIN, gets NULL, and resumes with
+#: no system prompt. Nothing raises anywhere. That is a provider-visible context
+#: integrity defect, not a residual.
+#:
+#: `session_model_usage` carries the accounting the turn is billed and routed
+#: on; `gateway_routing` decides which conversation a platform reply lands in;
+#: `compression_locks` is the publication authority for a compression segment;
+#: `async_delegations.delivery_state` / `delivery_claim` decide who may deliver
+#: a subagent's result back into a turn. Each one is written INSIDE a
+#: transaction that consults the turn-lease admission, which is the property the
+#: derivation is keyed on — see below.
+#:
+#: `async_delegations` is on this list ONLY because `tools/async_delegation`
+#: stopped opening its own connection. While it held one, adding the table here
+#: broke that module's own writes with `no such function:
+#: hermes_turn_fence_generation` — the trigger correctly reporting a writer
+#: outside the generation it claimed. The fix was to move the connection onto
+#: SessionDB.write_transaction, NOT to register the marker on the raw handle:
+#: the marker proves "current generation" and nothing else — not root, not
+#: holder, not epoch — so minting it in a production writer opens a second
+#: admitted door around the token validator.
+#:
 #: This is a DECLARATION, not the decision. tests/state/test_turn_fence_surface
-#: derives the same set from the source of SessionDB and its mixins and fails
-#: when the two differ in either direction, so a mutator that starts writing a
-#: new table fails there until this follows it. The list is checked; it is not
+#: derives the same set from source — every table production writes inside a
+#: transaction that consults the canonical turn-lease admission, seeded on the
+#: refusal `SessionTurnLeaseLostError` rather than on any table name — and fails
+#: when the two differ in either direction. The list is checked; it is not
 #: maintained by hand and trusted.
-TURN_FENCE_SURFACE = (
-    ("messages", "INSERT"),
-    ("messages", "UPDATE"),
-    ("messages", "DELETE"),
-    ("sessions", "INSERT"),
-    ("sessions", "UPDATE"),
-    ("sessions", "DELETE"),
-    ("session_turn_leases", "INSERT"),
-    ("session_turn_leases", "UPDATE"),
-    ("session_turn_leases", "DELETE"),
+TURN_FENCE_SURFACE = tuple(
+    (table, operation)
+    for table in (
+        "messages",
+        "sessions",
+        "session_turn_leases",
+        "system_prompts",
+        "session_model_usage",
+        "gateway_routing",
+        "compression_locks",
+        "async_delegations",
+    )
+    # ALL THREE, on every table, always. The surface is about what a FOREIGN
+    # writer can do, and "no code path of ours deletes a lease row" is not "a
+    # lease row cannot be deleted": a fence keyed per operation is a fence with
+    # the other doors open.
+    for operation in ("INSERT", "UPDATE", "DELETE")
 )
 
 

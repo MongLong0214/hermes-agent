@@ -9,11 +9,15 @@ WHAT THIS IS NOT
 
 WHY IT EXISTS ANYWAY
     Because the alternative that was actually on offer — an operator typing
-    ``DROP TRIGGER`` nine times into whatever database they think is the right
-    one — is not a rollback story. It has no backup, no check that the store is
-    idle, no check that it is removing the surface it believes it is removing,
-    and no atomicity: eight of nine dropped leaves a store fenced against some
-    writes and not others, which is worse than either end state.
+    ``DROP TRIGGER`` once per surface entry into whatever database they think
+    is the right one — is not a rollback story. It has no backup, no check that
+    the store is idle, no check that it is removing the surface it believes it
+    is removing, and no atomicity: all-but-one dropped leaves a store fenced
+    against some writes and not others, which is worse than either end state.
+
+    How many that is has already changed once — the surface went from three
+    tables to eight when the adjunct tables were closed — which is the whole
+    reason nothing here counts them.
 
     So this is the same operation with the four things that were missing:
 
@@ -29,9 +33,11 @@ WHY IT EXISTS ANYWAY
        preservation.
     3. A GENERATED TRIGGER SET. :func:`rollback_trigger_names` derives from
        ``TURN_FENCE_SURFACE``, the same declaration the triggers are created
-       from. There is no list of names in this file. A surface that grows and a
-       rollback that does not is how a store ends up half-fenced, and a
-       hand-copied list is right exactly once.
+       from. There is no list of names in this file and no count of them. A
+       surface that grows and a rollback that does not is how a store ends up
+       half-fenced, and a hand-copied list is right exactly once — the surface
+       has since grown from nine entries to twenty-four, and this file needed
+       no edit for it.
     4. VERIFY, THEN MUTATE, ALL OR NOTHING. The installed surface is compared
        against the expected one INSIDE the exclusive transaction, before the
        first ``DROP``; anything unexpected refuses the whole operation, and the
@@ -83,8 +89,9 @@ def rollback_trigger_names() -> tuple[str, ...]:
     Read through the module rather than bound at import so that moving
     ``TURN_FENCE_SURFACE`` moves this with it. That is not a testing
     convenience: it is the property being claimed. A rollback carrying its own
-    nine names is correct on the day it is written and silently incomplete on
-    the day the surface grows, and nothing would notice until a store was left
+    copy of the names is correct on the day it is written and silently
+    incomplete on the day the surface grows — which has now happened, from nine
+    entries to twenty-four — and nothing would notice until a store was left
     fenced against some writes and not others.
     """
     declared = getattr(hermes_state_common, "TURN_FENCE_TRIGGERS", None)

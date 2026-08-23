@@ -47,6 +47,8 @@ import textwrap
 
 import pytest
 
+from hermes_state_common import TURN_FENCE_FUNCTION_NAME
+
 #: The base commit this branch is measured against. The exact binary, not "an
 #: older one" — the whole point is that this is checkable.
 BASE_COMMIT = "261a4efb90d7dbe4e71786861858f721b4ab730c"
@@ -261,43 +263,84 @@ BASE_BINARY_WRITE_ATTEMPTS = (
      'db.promote_to_session_reset("s")'),
     ("create_session",
      'db.create_session("smuggled", source="old-binary")'),
+    # The ADJUNCT tables. None of these name `sessions` or `messages` in the
+    # statement that matters, so a fence on those two lets all three through —
+    # measured, at this branch's own head, before the surface was widened:
+    # system_prompts / session_model_usage / gateway_routing / async_delegations
+    # were all ACCEPTED from a connection with no generation marker. The worst
+    # of them is the system prompt: deleting the BYTES leaves
+    # `sessions.system_prompt_hash` pointing at them, so the next turn resumes
+    # with no system prompt and nothing raises.
+    ("save_gateway_routing_entry",
+     'db.save_gateway_routing_entry("key-1", \'{"session_id": "s"}\', '
+     'scope="probe")'),
+    ("record_auxiliary_usage",
+     'db.record_auxiliary_usage("s", "vision", model="old-model", '
+     'input_tokens=5)'),
+    ("try_acquire_compression_lock",
+     'db.try_acquire_compression_lock("s", "old-binary")'),
 )
 
 
-def test_the_base_binary_cannot_write_a_store_this_generation_created(
-    tmp_path, base_binary_tree
-):
-    """The claim, against the exact module tree at the base commit.
+#: Every table on the fence surface, read narrowly enough that the base commit's
+#: schema has every column named. A snapshot that dies of a schema difference
+#: turns a verdict into an ERROR, and an ERROR reads as neither pass nor fail.
+SNAPSHOT_QUERIES = (
+    "SELECT id, model, model_config, system_prompt_hash, title, end_reason, "
+    "ended_at, parent_session_id FROM sessions ORDER BY id",
+    # `display_metadata` carries the reaction list. Without it the `reaction`
+    # row scored NOCHANGE on the CONTROL arm — the write landed and the
+    # snapshot could not see it — so a row claiming to prove the fence covers
+    # reactions was proving nothing at all. The control arm is what found it.
+    "SELECT id, session_id, role, content, active, display_metadata "
+    "FROM messages ORDER BY id",
+    "SELECT hash, prompt FROM system_prompts ORDER BY hash",
+    "SELECT session_id, model, input_tokens, output_tokens "
+    "FROM session_model_usage ORDER BY session_id, model",
+    "SELECT scope, session_key, entry_json FROM gateway_routing "
+    "ORDER BY scope, session_key",
+    "SELECT session_id, holder FROM compression_locks ORDER BY session_id",
+    "SELECT delegation_id, delivery_state FROM async_delegations "
+    "ORDER BY delegation_id",
+)
 
-    Every write class, not just append. A fence that stops the transcript
-    append and lets the same binary run ``delete_session`` has not fenced
-    anything — removing the rows is the most complete way to change what the
-    next turn replays.
+
+def _drop_every_fence_trigger(store: pathlib.Path) -> None:
+    """The CONTROL arm: the same store with the barrier and nothing else removed.
+
+    Named off the declaration, so the control cannot silently stop covering a
+    trigger the surface grew.
     """
-    store = tmp_path / "state.db"
-    _new_generation_store(store)
+    import hermes_state_common
 
-    # The verdict is a STATE COMPARISON, not the absence of an exception. Two
-    # of these return a falsey no-op on this fixture rather than raising, and a
-    # no-op is not a write — reading "it did not raise" as "it wrote" reports a
-    # hole that is not there, exactly as reading it as "it was refused" would
-    # hide one that is. The snapshot is every row of `sessions` and `messages`.
-    attempts = textwrap.indent(
-        "\n".join(
-            f'before = snapshot()\n'
-            f'try:\n'
-            f'    {code}\n'
-            f'except Exception as exc:\n'
-            f'    print("REFUSED {label}:", type(exc).__name__, exc)\n'
-            f'else:\n'
-            f'    print(("CHANGED {label}" if snapshot() != before\n'
-            f'           else "NOCHANGE {label}"))\n'
-            for label, code in BASE_BINARY_WRITE_ATTEMPTS
-        ),
-        "    ",
+    conn = sqlite3.connect(str(store), isolation_level=None)
+    try:
+        hermes_state_common.register_turn_fence_function(conn)
+        for name in hermes_state_common.TURN_FENCE_TRIGGERS:
+            conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+    finally:
+        conn.close()
+
+
+def _run_base_binary_attempts(base_binary_tree, pristine, work, home):
+    """Run every attempt in ``BASE_BINARY_WRITE_ATTEMPTS`` on its OWN copy.
+
+    One copy per attempt, restored from *pristine* each time, because the
+    attempts interfere: ``delete_session`` removes the row every later attempt
+    needs, so a single sequential run scores "nothing changed" for reasons that
+    have nothing to do with the fence. That does not matter while every attempt
+    is refused and it matters completely on the control arm, where they are not.
+    """
+    functions = "\n".join(
+        f"def _attempt_{index}(db):\n    {code}\n"
+        for index, (_label, code) in enumerate(BASE_BINARY_WRITE_ATTEMPTS)
+    )
+    table = ",\n    ".join(
+        f"({label!r}, _attempt_{index})"
+        for index, (label, _code) in enumerate(BASE_BINARY_WRITE_ATTEMPTS)
     )
     probe = f'''
-import pathlib, sys, traceback
+import pathlib, shutil, sys, traceback
 import hermes_state
 
 here = pathlib.Path({str(base_binary_tree)!r}).resolve()
@@ -309,36 +352,46 @@ assert loaded.is_relative_to(here), (
 )
 print("LOADED", loaded)
 
-db = hermes_state.SessionDB(pathlib.Path({str(store)!r}))
+PRISTINE = pathlib.Path({str(pristine)!r})
+WORK = pathlib.Path({str(work)!r})
+QUERIES = {SNAPSHOT_QUERIES!r}
 
 
-def snapshot():
-    """Every provider-visible row, read on a connection of this old binary."""
+def snapshot(db):
     with db._read_ctx() as conn:
-        return (
-            [tuple(r) for r in conn.execute(
-                "SELECT id, model, model_config, system_prompt_hash, title, "
-                "end_reason, ended_at, parent_session_id FROM sessions "
-                "ORDER BY id"
-            ).fetchall()],
-            [tuple(r) for r in conn.execute(
-                "SELECT id, session_id, role, content, active FROM messages "
-                "ORDER BY id"
-            ).fetchall()],
+        return tuple(
+            [tuple(r) for r in conn.execute(q).fetchall()] for q in QUERIES
         )
 
 
-try:
-{attempts}
-finally:
+{functions}
+
+ATTEMPTS = [
+    {table},
+]
+
+for label, attempt in ATTEMPTS:
+    target = WORK / (label + ".db")
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        source = PRISTINE.with_name(PRISTINE.name + suffix)
+        if source.is_file():
+            shutil.copyfile(source, target.with_name(target.name + suffix))
+    db = hermes_state.SessionDB(target)
     try:
-        db.close()
-    except Exception:
-        traceback.print_exc()
+        before = snapshot(db)
+        try:
+            attempt(db)
+        except Exception as exc:
+            print("REFUSED", label + ":", type(exc).__name__, exc)
+        else:
+            print(("CHANGED " if snapshot(db) != before else "NOCHANGE ") + label)
+    finally:
+        try:
+            db.close()
+        except Exception:
+            traceback.print_exc()
 '''
-    home = tmp_path / "home"
-    home.mkdir()
-    result = subprocess.run(
+    return subprocess.run(
         [sys.executable, "-c", probe],
         cwd=str(base_binary_tree),
         env={
@@ -347,17 +400,73 @@ finally:
             "PYTHONPATH": str(base_binary_tree),
             "PYTHONDONTWRITEBYTECODE": "1",
         },
-        capture_output=True, text=True, timeout=180,
+        capture_output=True, text=True, timeout=300,
     )
-    assert result.returncode == 0, (
-        f"the base-binary probe did not run to completion, so it proves "
-        f"nothing:\nstdout: {result.stdout}\nstderr: {result.stderr}"
-    )
-    assert "LOADED" in result.stdout, "the probe never confirmed which module it ran"
-    got_through = [
+
+
+def _verdicts(result, kind):
+    return [
         label for label, _code in BASE_BINARY_WRITE_ATTEMPTS
-        if f"CHANGED {label}" in result.stdout
+        if f"{kind} {label}" in result.stdout
     ]
+
+
+def test_the_base_binary_cannot_write_a_store_this_generation_created(
+    tmp_path, base_binary_tree
+):
+    """The claim, against the exact module tree at the base commit.
+
+    Every write class, not just append. A fence that stops the transcript
+    append and lets the same binary run ``delete_session`` has not fenced
+    anything — removing the rows is the most complete way to change what the
+    next turn replays.
+
+    TWO ARMS, BECAUSE ONE ARM CANNOT TELL A FENCE FROM A NO-OP
+        The verdict is a STATE COMPARISON, not the absence of an exception —
+        but a state comparison alone scores a call that never had anything to
+        do as "did not write". Two of these attempts are exactly that shape:
+        ``promote_to_session_reset`` and ``try_acquire_compression_lock`` catch
+        their own exception and return False, so a real refusal and a silent
+        no-op are the same observation.
+
+        So the same attempts run a second time against the SAME store with the
+        fence triggers — and nothing else — removed. Every attempt must change
+        something there. That is the mutation arm for this whole file: it
+        proves each row has a target and that the barrier is what stopped it,
+        and it fails if a row is ever written that could not have written
+        anyway.
+    """
+    fenced = tmp_path / "fenced" / "state.db"
+    fenced.parent.mkdir()
+    _new_generation_store(fenced)
+
+    control = tmp_path / "control" / "state.db"
+    control.parent.mkdir()
+    _new_generation_store(control)
+    _drop_every_fence_trigger(control)
+
+    home = tmp_path / "home"
+    home.mkdir()
+    for name in ("fenced-work", "control-work"):
+        (tmp_path / name).mkdir()
+
+    result = _run_base_binary_attempts(
+        base_binary_tree, fenced, tmp_path / "fenced-work", home
+    )
+    control_result = _run_base_binary_attempts(
+        base_binary_tree, control, tmp_path / "control-work", home
+    )
+
+    for name, outcome in (("fenced", result), ("control", control_result)):
+        assert outcome.returncode == 0, (
+            f"the {name} base-binary probe did not run to completion, so it "
+            f"proves nothing:\nstdout: {outcome.stdout}\n"
+            f"stderr: {outcome.stderr}"
+        )
+        assert "LOADED" in outcome.stdout, (
+            f"the {name} probe never confirmed which module it ran"
+        )
+
     # Every attempt has to have produced a verdict. A label that appears in
     # none of the three lines ran into something this test did not model, and
     # silence would read as a pass.
@@ -370,6 +479,23 @@ finally:
         f"these attempts produced no verdict at all: {unaccounted}\n"
         f"probe stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )
+
+    # THE CONTROL ARM FIRST: a row that cannot write even unfenced is a row
+    # that proves nothing about the fence, and reading the fenced arm before
+    # this one is how such a row gets counted as coverage.
+    no_target = [
+        label for label, _code in BASE_BINARY_WRITE_ATTEMPTS
+        if label not in _verdicts(control_result, "CHANGED")
+    ]
+    assert not no_target, (
+        f"with the fence triggers removed and NOTHING else changed, these "
+        f"attempts still changed no row: {no_target}. Each one is scored as "
+        f"'the barrier stopped it' in the fenced arm while the barrier may "
+        f"have had nothing to do with it.\ncontrol stdout:\n"
+        f"{control_result.stdout}\nstderr:\n{control_result.stderr}"
+    )
+
+    got_through = _verdicts(result, "CHANGED")
     assert not got_through, (
         f"the binary at {BASE_COMMIT[:10]} performed {got_through} against a "
         f"conversation this generation holds the lease on, and nothing stopped "
@@ -377,10 +503,26 @@ finally:
         f"holderless transcript write.\nprobe stdout:\n{result.stdout}\n"
         f"stderr:\n{result.stderr}"
     )
+    # A refusal that RAISES has to be THIS refusal. "It raised" is satisfied by
+    # a TypeError from a signature that moved, and a row refused for the wrong
+    # reason reports coverage the fence does not have. The two attempts that
+    # swallow their own exception report NOCHANGE instead and are covered by
+    # the control arm above.
+    wrong_reason = [
+        line for line in result.stdout.splitlines()
+        if line.startswith("REFUSED ")
+        and TURN_FENCE_FUNCTION_NAME not in line
+    ]
+    assert not wrong_reason, (
+        f"these attempts were refused by something OTHER than the generation "
+        f"barrier, so they prove nothing about it:\n  "
+        + "\n  ".join(wrong_reason)
+        + f"\nprobe stdout:\n{result.stdout}"
+    )
 
     from hermes_state import SessionDB
 
-    db = SessionDB(store)
+    db = SessionDB(fenced)
     assert [m["content"] for m in db.get_messages("s")] == ["current"], (
         "the base binary's write landed even though it reported a refusal"
     )

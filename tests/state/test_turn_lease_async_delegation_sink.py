@@ -118,22 +118,35 @@ def _store(tmpdir):
 
 
 def _delegation(home, delegation_id, parent, *, state, delivery, age=0.0):
-    """One durable record, written straight in — this is the fixture, not the sink."""
+    """One durable record — the fixture, not the sink.
+
+    Written on the STORE'S OWN transaction rather than on a private
+    ``sqlite3.connect``. It used to be the latter, and that stopped working the
+    moment ``async_delegations`` joined ``TURN_FENCE_SURFACE``: a connection
+    that has not registered the generation marker is refused with ``no such
+    function: hermes_turn_fence_generation`` before a row is touched. Which is
+    the fence doing its job — a test fixture writing straight into a fenced
+    table IS the foreign writer the barrier exists to stop, and the honest fix
+    is for the fixture to be part of this generation, not for the fence to
+    stand down.
+    """
+    from hermes_state import SessionDB
+
     now = time.time() - age
-    conn = sqlite3.connect(home / "state.db", timeout=10)
+    db = SessionDB(db_path=home / "state.db")
     try:
-        conn.execute(
-            """INSERT OR REPLACE INTO async_delegations
-               (delegation_id, origin_session, origin_ui_session_id,
-                parent_session_id, state, dispatched_at, updated_at,
-                delivery_state, delivery_attempts, event_json)
-               VALUES (?, '', '', ?, ?, ?, ?, ?, 0, ?)""",
-            (delegation_id, parent, state, now, now, delivery,
-             json.dumps({"delegation_id": delegation_id, "status": state})),
-        )
-        conn.commit()
+        with db.write_transaction() as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO async_delegations
+                   (delegation_id, origin_session, origin_ui_session_id,
+                    parent_session_id, state, dispatched_at, updated_at,
+                    delivery_state, delivery_attempts, event_json)
+                   VALUES (?, '', '', ?, ?, ?, ?, ?, 0, ?)""",
+                (delegation_id, parent, state, now, now, delivery,
+                 json.dumps({"delegation_id": delegation_id, "status": state})),
+            )
     finally:
-        conn.close()
+        db.close()
 
 
 def _records(home):

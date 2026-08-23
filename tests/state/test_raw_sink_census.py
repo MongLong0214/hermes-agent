@@ -7,13 +7,23 @@ WHY A SEPARATE CENSUS EXISTS AT ALL
     an excluded module cannot obtain a ``SessionDB``. Both of those are only
     meaningful for code that goes THROUGH ``SessionDB``.
 
-    ``tools/async_delegation.py`` opens its own ``sqlite3.connect`` on the live
-    ``state.db``. It never obtains a ``SessionDB``, so that census cannot see
-    it **by construction** — not by oversight. Its fifteen statements were
-    therefore disposed of by a module docstring and one pin, and a sixteenth
-    added tomorrow would fail nothing. The symptom was already visible: three
-    different places in this branch stated three different counts for one set,
-    which is what prose does and derivation does not.
+    ``tools/async_delegation.py`` writes ``async_delegations`` in the live
+    ``state.db`` through module-level functions, not through ``SessionDB``
+    methods, so that census cannot see it **by construction** — not by
+    oversight. Its fifteen statements were therefore disposed of by a module
+    docstring and one pin, and a sixteenth added tomorrow would fail nothing.
+    The symptom was already visible: three different places in this branch
+    stated three different counts for one set, which is what prose does and
+    derivation does not.
+
+    THE HANDLE IS GONE; THE STATEMENTS ARE NOT.
+    That module used to hold its own ``sqlite3.connect`` on the store. It no
+    longer does — ``async_delegations`` joined ``TURN_FENCE_SURFACE`` and an
+    unmarked connection cannot write a fenced table, so the writes moved onto
+    ``SessionDB.write_transaction``. What did NOT change is why this census
+    exists: the statements still live outside any ``SessionDB`` method, so the
+    call-site census still cannot reach them and they still need a derived
+    disposition of their own.
 
     So the set is derived here, at test time, and the counts are PRINTED rather
     than written down anywhere.
@@ -46,13 +56,20 @@ THE RULE, AND WHY EACH ARM IS CHECKABLE
     guard: a new DELETE, or a new ``delivery_state='dropped'`` without either
     the admission or the claim scope, has nowhere to land.
 
-WHAT THIS DOES NOT CLAIM
-    It does not claim the SessionDB surface is derived by a test. It is not:
-    the residual-zero number for the 71 canonical writers in this branch comes
-    from a derivation script run by hand, and the only ratchet in the
-    repository over that surface is the replay-column one in
-    ``test_turn_lease_replay_column_writers``. That gap is stated rather than
-    papered over, and it is the obvious next file.
+THE OTHER HALF, WHICH USED TO BE MISSING
+    This file used to end by saying that the SessionDB surface was NOT derived
+    by any test — that its residual-zero number came from a derivation script
+    run by hand, and that the only ratchet in the repository over that surface
+    was the replay-column one in ``test_turn_lease_replay_column_writers``.
+    That gap is now closed by ``test_canonical_writer_residual``, which derives
+    the canonical writers of every fenced table, classifies each one, prints its
+    counts and fails on anything it cannot ground.
+
+    The two files split the surface between them: statements that are
+    ``SessionDB`` methods there, statements that are not here.
+    ``test_every_fenced_table_has_a_census_that_counts_its_writers`` asserts the
+    split leaves no fenced table uncounted, so neither file can quietly stop
+    covering something by assuming the other does.
 """
 
 from __future__ import annotations
@@ -294,7 +311,13 @@ def test_only_one_module_holds_a_raw_handle_on_the_live_store():
             "hermes_state_search.py", "hermes_state_portability.py"}
     offenders = []
     for rel, path in census._production_files(REPO_ROOT):
-        if rel.name in impl or str(rel) == RAW_SINK:
+        # RAW_SINK used to be exempt here, because it WAS the raw handle this
+        # check counted to one. It is not any more: its writes run on
+        # SessionDB's transaction. Leaving the carve-out would have made this
+        # the one place a reopened private handle in that exact module could
+        # hide, so the count is now to ZERO and the module is scanned like
+        # every other.
+        if rel.name in impl:
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
         if '"state.db"' not in text and "'state.db'" not in text:

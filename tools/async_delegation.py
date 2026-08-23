@@ -125,92 +125,49 @@ def _db_path():
     return get_hermes_home() / "state.db"
 
 
-def _connect() -> sqlite3.Connection:
-    path = _db_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, timeout=10)
-    try:
-        _initialize_schema(conn)
-    except Exception:
-        # A PRAGMA/DDL failure after a successful connect() must not leak the
-        # just-opened connection back to the caller.
-        conn.close()
-        raise
-    return conn
-
-
-def _initialize_schema(conn: sqlite3.Connection) -> None:
-    from hermes_state import apply_wal_with_fallback
-
-    apply_wal_with_fallback(conn, db_label="state.db (async_delegation)")
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS async_delegations (
-            delegation_id TEXT PRIMARY KEY,
-            origin_session TEXT NOT NULL,
-            origin_ui_session_id TEXT NOT NULL DEFAULT '',
-            parent_session_id TEXT,
-            state TEXT NOT NULL,
-            dispatched_at REAL NOT NULL,
-            completed_at REAL,
-            updated_at REAL NOT NULL,
-            event_json TEXT,
-            result_json TEXT,
-            delivery_state TEXT NOT NULL DEFAULT 'pending',
-            delivery_attempts INTEGER NOT NULL DEFAULT 0,
-            delivered_at REAL,
-            owner_pid INTEGER,
-            owner_started_at INTEGER,
-            task_json TEXT,
-            delivery_claim TEXT,
-            delivery_claimed_at REAL,
-            origin_session_id TEXT NOT NULL DEFAULT ''
-        )"""
-    )
-    columns = {row[1] for row in conn.execute("PRAGMA table_info(async_delegations)")}
-    for name, sql_type in (
-        ("owner_pid", "INTEGER"),
-        ("owner_started_at", "INTEGER"),
-        ("task_json", "TEXT"),
-        ("delivery_claim", "TEXT"),
-        ("delivery_claimed_at", "REAL"),
-        # Raw api_server session id (X-Hermes-Session-Id) of the ORIGINATING
-        # request — the wake self-post target. Without persisting it,
-        # completions recovered after a process restart are unroutable on
-        # api_server (the in-memory record that carried it is gone).
-        ("origin_session_id", "TEXT"),
-    ):
-        if name not in columns:
-            conn.execute(f"ALTER TABLE async_delegations ADD COLUMN {name} {sql_type}")
-
-
 @contextmanager
 def _transaction() -> Iterator[sqlite3.Connection]:
-    """Open a connection, commit/rollback on exit, and ALWAYS close it.
+    """The store's OWN write transaction — this module no longer has one.
 
-    ``sqlite3.Connection.__enter__``/``__exit__`` only commit or roll back the
-    transaction; they do not close the connection. Using ``with _connect()``
-    alone therefore leaks a connection — and its WAL/SHM file descriptors — on
-    every durable dispatch, completion, and delivery-claim, deferring the close
-    to the garbage collector. On a long-running gateway that exhausts
-    ``RLIMIT_NOFILE`` (the cron-ledger sibling of this bug was #69567 / PR #69594).
+    WHAT MOVED, AND WHY IT HAD TO BE THE CONNECTION
+        ``async_delegations`` lives in the same ``state.db`` as ``sessions``,
+        and every row in it names a conversation. It carries the publication
+        authority for a delegation's completion: ``delivery_state`` /
+        ``delivery_claim`` decide who is allowed to deliver the result back
+        into a turn. A writer that can move those can deliver into — or steal
+        the delivery from — a conversation a live turn owns.
+
+        This module already borrowed the canonical admission
+        (:meth:`SessionDB.admit_on_connection`), but it borrowed it onto a
+        ``sqlite3.connect`` of its own. That handle is a SECOND WRITER on the
+        store, and it is invisible to the generation barrier: measured, adding
+        ``async_delegations`` to ``TURN_FENCE_SURFACE`` while this module held
+        its own connection broke the module's own writes with ``no such
+        function: hermes_turn_fence_generation``. Which is the point — the
+        trigger was correctly reporting that this writer was not part of the
+        generation it claimed to belong to.
+
+        THE CLOSURE NOT TAKEN. Calling ``register_turn_fence_function`` on that
+        raw connection would have made the error go away and made the defect
+        permanent: the marker proves "current generation" and nothing else —
+        not root, not holder, not epoch — so a production writer that mints it
+        is a second admitted door around the token validator. So the connection
+        moves. The transaction shape every call site here is written around is
+        unchanged; the handle underneath it is now the store's.
+
+    :meth:`SessionDB.write_transaction` is ``BEGIN IMMEDIATE`` on the store's
+    own connection under the store's own lock — the same transaction
+    ``_execute_write`` runs, so the admission reads below happen inside the
+    write lock rather than as a snapshot taken before it.
+
+    The store is resolved BEFORE the transaction opens, and that is
+    load-bearing rather than tidy: ``SessionDB.__init__`` runs the schema
+    reconciler, which takes the write lock, so constructing one inside the
+    transaction deadlocks it against itself.
     """
-    conn = _connect()
-    try:
-        # BEGIN IMMEDIATE, not sqlite3's implicit deferred transaction.
-        # The admission reads below happen BEFORE the first DML, and a
-        # deferred transaction does not take the write lock until that DML
-        # runs — so the lease could move between the answer and the write,
-        # which is a snapshot rather than a decision.
-        conn.isolation_level = None
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            yield conn
-        except BaseException:
-            conn.execute("ROLLBACK")
-            raise
-        conn.execute("COMMIT")
-    finally:
-        conn.close()
+    store = _session_store()
+    with store.write_transaction() as conn:
+        yield conn
 
 
 def _not_in_clause(column: str, excluded) -> tuple:

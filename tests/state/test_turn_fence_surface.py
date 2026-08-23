@@ -786,3 +786,160 @@ def test_the_surface_covers_sessions_not_only_messages(tmp_path):
         )
     for op in ("INSERT", "UPDATE", "DELETE"):
         assert ("messages", op) in declared
+
+
+#: The pre-scope shape of ``gateway_routing`` (#59203) and the pre-``task``
+#: shape of ``session_model_usage`` (#73823). Both are rebuilt on open by a
+#: heal that SQLite cannot express as an ALTER, and both tables are now on the
+#: fence surface — so the migration has to run inside the barrier and the
+#: rebuilt table has to come out carrying it.
+LEGACY_GATEWAY_ROUTING_SQL = """
+CREATE TABLE gateway_routing (
+    session_key TEXT PRIMARY KEY,
+    entry_json TEXT NOT NULL,
+    updated_at REAL NOT NULL
+)
+"""
+
+LEGACY_SESSION_MODEL_USAGE_SQL = """
+CREATE TABLE session_model_usage (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    model TEXT NOT NULL,
+    billing_provider TEXT NOT NULL DEFAULT '',
+    billing_base_url TEXT NOT NULL DEFAULT '',
+    billing_mode TEXT NOT NULL DEFAULT '',
+    api_call_count INTEGER NOT NULL DEFAULT 0,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+    estimated_cost_usd REAL NOT NULL DEFAULT 0,
+    actual_cost_usd REAL NOT NULL DEFAULT 0,
+    cost_status TEXT,
+    cost_source TEXT,
+    first_seen REAL,
+    last_seen REAL,
+    PRIMARY KEY (session_id, model, billing_provider, billing_base_url,
+                 billing_mode)
+)
+"""
+
+
+def _regress_to_a_legacy_store(store):
+    """Put a fenced store back into the shapes the open-time heals repair.
+
+    The fence triggers are dropped FIRST and by name from the declaration.
+    Dropping them is what makes this a legacy store rather than a current one
+    with old tables, and doing it without registering the generation marker is
+    deliberate: a test that mints the marker to build its fixture is a test
+    that has quietly proved the marker is mintable.
+    """
+    conn = sqlite3.connect(str(store), isolation_level=None)
+    try:
+        for name in hermes_state_common.TURN_FENCE_TRIGGERS:
+            conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+        conn.execute("DROP TABLE gateway_routing")
+        conn.executescript(LEGACY_GATEWAY_ROUTING_SQL)
+        conn.execute(
+            "INSERT INTO gateway_routing (session_key, entry_json, updated_at) "
+            "VALUES ('legacy-key', '{\"session_id\": \"s\"}', 1.0)"
+        )
+        conn.execute("DROP TABLE session_model_usage")
+        conn.executescript(LEGACY_SESSION_MODEL_USAGE_SQL)
+        conn.execute(
+            "INSERT INTO session_model_usage "
+            "(session_id, model, input_tokens, output_tokens) "
+            "VALUES ('s', 'legacy-model', 41, 1)"
+        )
+        conn.execute(
+            "INSERT INTO async_delegations "
+            "(delegation_id, origin_session, origin_ui_session_id, "
+            " parent_session_id, state, dispatched_at, updated_at, "
+            " delivery_state, delivery_attempts) "
+            "VALUES ('legacy-d', 's', 's', 's', 'running', 1.0, 1.0, "
+            "'pending', 0)"
+        )
+    finally:
+        conn.close()
+
+
+def test_a_legacy_store_migrates_under_the_fence_and_comes_out_fenced(tmp_path):
+    """The other direction of the downgrade contract, and it is not symmetric.
+
+    The rollback side proves an old binary is REFUSED. This side proves the
+    current binary is not — that widening the surface to the tables the
+    open-time heals rebuild did not turn a migration into a store that cannot
+    open. That is a live risk rather than a formality: ``_heal_gateway_routing_pk``
+    and ``_heal_session_model_usage_pk`` rebuild a table by RENAME + CREATE +
+    INSERT ... SELECT, so every one of those statements now runs against a
+    fenced table, and the CREATE produces a table with no trigger on it.
+
+    Two things are therefore asserted, and the second is the one that would
+    catch a reordering:
+
+    * the rows survive the migration — the heal's own ``INSERT ... SELECT``
+      is admitted, so the store is not silently emptied by the barrier;
+    * every declared trigger is installed on the migrated store. The fence DDL
+      runs LAST in ``_init_schema`` precisely so a rebuilt table is covered in
+      the same open. Move it earlier and the store comes out of its migration
+      with ``gateway_routing`` and ``session_model_usage`` unfenced until some
+      later reopen, which is a hole nothing else here would notice.
+    """
+    from hermes_state import SessionDB
+
+    store = _store_with_a_live_lease(tmp_path)
+    _regress_to_a_legacy_store(store)
+
+    migrated = SessionDB(store)
+    try:
+        with migrated._read_ctx() as conn:
+            routing = conn.execute(
+                "SELECT scope, session_key, entry_json FROM gateway_routing "
+                "ORDER BY session_key"
+            ).fetchall()
+            usage = conn.execute(
+                "SELECT session_id, model, input_tokens, task "
+                "FROM session_model_usage ORDER BY model"
+            ).fetchall()
+            delegation = conn.execute(
+                "SELECT delegation_id, origin_session_id FROM async_delegations "
+                "WHERE delegation_id = 'legacy-d'"
+            ).fetchone()
+            installed = {
+                row["name"] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+                ).fetchall()
+            }
+    finally:
+        migrated.close()
+
+    assert [(r["scope"], r["session_key"]) for r in routing] == [
+        ("", "legacy-key")
+    ], (
+        f"the gateway_routing rebuild lost its rows under the fence: "
+        f"{[tuple(r) for r in routing]}"
+    )
+    assert [(r["model"], r["input_tokens"], r["task"]) for r in usage] == [
+        ("legacy-model", 41, "")
+    ], (
+        f"the session_model_usage rebuild lost its rows under the fence: "
+        f"{[tuple(r) for r in usage]}"
+    )
+    assert delegation is not None and delegation["origin_session_id"] == "", (
+        "the reconciler did not add async_delegations.origin_session_id, which "
+        "moved into SCHEMA_SQL when tools/async_delegation stopped opening a "
+        "connection it could run DDL on"
+    )
+
+    missing = [
+        turn_fence_trigger_name(table, op)
+        for table, op in TURN_FENCE_SURFACE
+        if turn_fence_trigger_name(table, op) not in installed
+    ]
+    assert not missing, (
+        f"these triggers are not on the MIGRATED store: {missing}. A table an "
+        f"open-time heal rebuilt comes out of the rebuild with no trigger on "
+        f"it, so the fence DDL has to run after every heal — and this is the "
+        f"only place that would notice it moving."
+    )

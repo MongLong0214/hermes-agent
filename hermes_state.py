@@ -4721,6 +4721,78 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 self._warn_fts5_unavailable(exc)
             return False
 
+    @contextmanager
+    def write_transaction(self, patience_s: Optional[float] = None):
+        """This store's CANONICAL write transaction, as a context manager.
+
+        WHO THIS IS FOR, AND WHY IT IS NOT A SECOND DOOR
+            A module that has to interleave reads and writes across a block it
+            controls cannot express itself as ``_execute_write(fn)`` without
+            being rewritten around a callback. ``tools/async_delegation`` is
+            that module: twenty-odd call sites, each ``with _transaction() as
+            conn:``. It used to satisfy that shape by opening its OWN
+            ``sqlite3.connect`` on the same file — which is a second writer on
+            the store, invisible to the generation barrier, and the reason
+            ``async_delegations`` could not be added to
+            ``TURN_FENCE_SURFACE``: the module's own writes would have failed
+            with ``no such function: hermes_turn_fence_generation``.
+
+            The closure that was NOT taken is calling
+            :func:`register_turn_fence_function` on that raw connection. The
+            marker proves "current generation" and nothing else — not the
+            conversation root, not the holder, not the epoch — so registering
+            it on a production writer mints a second admitted door around the
+            token validator. That is the original defect performed on purpose.
+            The connection MOVES instead; the module keeps its transaction
+            shape and loses its private handle.
+
+        SAME TRANSACTION, SAME LOCK, SAME CONNECTION as :meth:`_execute_write`:
+        ``BEGIN IMMEDIATE`` under ``self._lock`` on ``self._conn``, committed on
+        a clean exit and rolled back on any exception. The caller must not
+        commit or roll back.
+
+        THE ONE DIFFERENCE, STATED SO IT IS NOT MISTAKEN FOR AN OVERSIGHT
+            ``_execute_write`` retries a locked write by RE-RUNNING ``fn``. A
+            context manager cannot re-run its caller's block, so the retry here
+            covers ``BEGIN IMMEDIATE`` only. That is where lock contention
+            surfaces — BEGIN IMMEDIATE takes the write lock at statement time,
+            not at commit — so a busy store still waits out its patience budget
+            before anything in the block has run. Errors raised inside the
+            block propagate untouched, which is what a caller holding its own
+            admission decision needs.
+        """
+        if patience_s is None:
+            patience_s = self._WRITE_PATIENCE_S
+        deadline = time.monotonic() + patience_s
+        while True:
+            self._lock.acquire()
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError as exc:
+                self._lock.release()
+                err = str(exc).lower()
+                if ("locked" in err or "busy" in err) and (
+                    self._sleep_before_write_retry(deadline, patience_s)
+                ):
+                    continue
+                raise
+            except BaseException:
+                self._lock.release()
+                raise
+            break
+        try:
+            try:
+                yield self._conn
+            except BaseException:
+                try:
+                    self._conn.rollback()
+                except Exception:
+                    pass
+                raise
+            self._conn.commit()
+        finally:
+            self._lock.release()
+
     def _execute_write(
         self,
         fn: Callable[[sqlite3.Connection], T],

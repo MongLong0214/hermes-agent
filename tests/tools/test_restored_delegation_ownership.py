@@ -87,7 +87,10 @@ def test_restore_stamps_restored_flag(tmp_path, monkeypatch):
     assert got["session_key"] == "OLD_SESSION_A"
 
     # The stamp is in-memory only — the durable payload is unchanged.
-    with ad._connect() as conn:
+    # Read on the store's own transaction: the module no longer has a private
+    # connection to lend, because `async_delegations` is on the turn-fence
+    # surface and an unmarked handle cannot write it.
+    with ad._transaction() as conn:
         row = conn.execute(
             "SELECT event_json FROM async_delegations WHERE delegation_id='d-old'"
         ).fetchone()

@@ -276,7 +276,15 @@ def test_rollback_verifies_the_installed_surface_before_changing_anything(
         conn.close()
 
     remaining = _installed_triggers(store)
-    assert victim not in remaining and len(remaining) == 8
+    # Counted off the DECLARATION, not typed. A literal here was right while the
+    # surface had nine entries and silently wrong the moment it grew: the assert
+    # would have failed on a store that was in exactly the intended state.
+    expected_after_drop = len(rollback.rollback_trigger_names()) - 1
+    assert victim not in remaining and len(remaining) == expected_after_drop, (
+        f"dropping {victim} out of band should leave every other declared "
+        f"trigger in place: expected {expected_after_drop}, found "
+        f"{len(remaining)} — {sorted(remaining)}"
+    )
 
     with pytest.raises(rollback.TurnFenceRollbackRefused) as caught:
         rollback.rollback_turn_fence(store, backup_path=tmp_path / "backup.db")

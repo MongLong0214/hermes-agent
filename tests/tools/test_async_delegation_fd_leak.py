@@ -1,12 +1,38 @@
-"""Regression: the async-delegation ledger must close every SQLite connection.
+"""Regression: the async-delegation ledger must not leak a SQLite connection.
 
 Sibling of the cron execution-ledger leak (#69567 / PR #69594). The durable
 delegation ledger used ``with _connect() as conn:`` where the connection
 context manager commits/rolls back but never closes, leaking the db/-wal/-shm
-file descriptors on every dispatch, completion, and delivery-claim. These tests
-fail if the deterministic ``close()`` is ever removed again.
+file descriptors on every dispatch, completion, and delivery-claim.
+
+WHY THIS FILE CHANGED SHAPE
+    The leak was fixed by closing every connection the module opened. The
+    module now opens NONE: ``async_delegations`` joined ``TURN_FENCE_SURFACE``,
+    and a private ``sqlite3.connect`` on the store cannot write a fenced table —
+    it has not registered the generation marker, so the write is refused before
+    a row is touched. The closure taken was to move the connection onto
+    :meth:`SessionDB.write_transaction`; the closure NOT taken was to register
+    the marker on the private handle, which would have minted a second admitted
+    door around the token validator.
+
+    So "closes every connection it opens" is now vacuously true, and a test
+    that only asserted that would pass while proving nothing. The property that
+    still has teeth is the one the leak actually violated — REPEATED LEDGER
+    OPERATIONS MUST NOT ACCUMULATE HANDLES — and it is restated here against the
+    new design, in two directions that can each fail on their own:
+
+    1. the module opens no connection of its own (structural, read off the AST);
+    2. running the public ledger operations opens no NEW connection at all once
+       the store exists, so a ``SessionDB`` per call — which is the shape that
+       would leak now — fails here.
+
+    And one the old file could not have: a failure inside the transaction must
+    release the store's write lock. A leaked lock is this design's version of a
+    leaked descriptor, and it is worse: it wedges every writer in the process.
 """
 
+import ast
+import pathlib
 import queue
 import sqlite3
 
@@ -14,107 +40,139 @@ import pytest
 
 from tools import async_delegation as ad
 
-
-class _TrackingConnection:
-    """Delegates to a real sqlite3.Connection while recording close() calls.
-
-    sqlite3.Connection is a static C type: it has no per-instance __dict__ and
-    its methods can't be monkeypatched, so open/close tracking is done via a
-    delegating wrapper returned in place of the real connection.
-    """
-
-    def __init__(self, real, closed_ids):
-        object.__setattr__(self, "_real", real)
-        object.__setattr__(self, "_closed_ids", closed_ids)
-
-    def close(self):
-        self._closed_ids.append(id(self._real))
-        self._real.close()
-
-    def __enter__(self):
-        self._real.__enter__()
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        return self._real.__exit__(exc_type, exc, tb)
-
-    def __getattr__(self, name):
-        return getattr(self._real, name)
-
-    def __setattr__(self, name, value):
-        setattr(self._real, name, value)
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 
 def _point_ledger(monkeypatch, tmp_path):
     monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    ad._STORE.clear()
+    monkeypatch.setattr(ad, "_STORE", dict(ad._STORE), raising=False)
     return ad
 
 
-def _track_connections(monkeypatch):
-    """Count the connections THE LEDGER opens, by wrapping its own opener.
-
-    Patching ``sqlite3.connect`` was the original shape and it measured the
-    wrong set. ``ad.sqlite3`` IS the sqlite3 module, so that patch is
-    process-wide: it also intercepted the admission store the ledger now builds
-    to ask whether a record's conversation is owned by a live turn, and
-    ``SessionDB`` refuses a connection factory it cannot retrofit — so the test
-    failed on a subsystem it was never about.
-
-    The property is "the ledger closes every connection the ledger opens", and
-    ``ad._connect`` is exactly that set. The admission store is a per-process
-    singleton that deliberately keeps its connection open, and counting it here
-    would assert the opposite of what it is for.
-    """
-    opened, closed = [], []
-    real_connect = ad._connect
-
-    def tracking_connect(*args, **kwargs):
-        conn = real_connect(*args, **kwargs)
-        opened.append(id(conn))
-        return _TrackingConnection(conn, closed)
-
-    monkeypatch.setattr(ad, "_connect", tracking_connect)
-    return opened, closed
-
-
-def test_ledger_operations_close_every_connection(monkeypatch, tmp_path):
-    """Public durable-ledger reads/writes must close every connection opened."""
-    _point_ledger(monkeypatch, tmp_path)
-    opened, closed = _track_connections(monkeypatch)
-
+def _drive_the_public_ledger():
+    """Every public entry point that used to open (and leak) a connection."""
     ad.get_durable_delegation("nope")
     ad.recover_abandoned_delegations()
     ad.restore_undelivered_completions(queue.Queue())
     ad.mark_completion_delivered("nope")
     ad.claim_completion_delivery("nope", "claim-1")
 
-    assert opened, "expected at least one connection to be opened"
-    assert len(opened) == len(closed)
-    assert set(opened) == set(closed)
+
+def test_the_ledger_opens_no_sqlite_connection_of_its_own():
+    """Structural half: there is no ``sqlite3.connect`` left in the module.
+
+    Read off the AST rather than the text, so a mention in a docstring — this
+    module has several, explaining why the handle went away — cannot satisfy or
+    break it. A private handle reappearing here is not only an fd-leak risk: it
+    is a second writer on a fenced store, which is the defect the barrier
+    exists to stop.
+    """
+    source = (REPO_ROOT / "tools" / "async_delegation.py").read_text(
+        encoding="utf-8"
+    )
+    opens = [
+        node.lineno
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "connect"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "sqlite3"
+    ]
+    assert not opens, (
+        f"tools/async_delegation.py opens its own SQLite connection at "
+        f"line(s) {opens}. Its writes must run on SessionDB's transaction: a "
+        f"private handle both re-opens the descriptor leak this file was "
+        f"written for and puts a second, unmarked writer on a fenced store."
+    )
 
 
-def test_schema_init_failure_still_closes_connection(monkeypatch, tmp_path):
-    """A PRAGMA/DDL failure after connect() must still close the connection."""
+def test_repeated_ledger_operations_open_no_new_connection(
+    monkeypatch, tmp_path
+):
+    """Runtime half: after the store exists, the ledger opens nothing.
+
+    This is the assertion the original leak would have failed, restated for a
+    module that borrows a connection instead of owning one. A ``SessionDB``
+    built per call — today's version of "connect and forget to close" — opens a
+    connection per call and fails here.
+    """
     _point_ledger(monkeypatch, tmp_path)
-    opened, closed = [], []
+    # Build the store OUTSIDE the measurement: its construction legitimately
+    # connects, and counting that would assert the opposite of what this is for.
+    store = ad._session_store()
+
+    opened = []
     real_connect = sqlite3.connect
 
-    class _FailingSchemaConnection(_TrackingConnection):
-        def execute(self, sql, *args, **kwargs):
-            if "CREATE TABLE" in sql:
-                raise sqlite3.OperationalError("simulated schema init failure")
-            return self._real.execute(sql, *args, **kwargs)
+    def counting_connect(*args, **kwargs):
+        opened.append(args[0] if args else kwargs.get("database"))
+        return real_connect(*args, **kwargs)
 
-    def tracking_connect(*args, **kwargs):
-        conn = real_connect(*args, **kwargs)
-        opened.append(id(conn))
-        return _FailingSchemaConnection(conn, closed)
+    monkeypatch.setattr(sqlite3, "connect", counting_connect)
+    for _ in range(3):
+        _drive_the_public_ledger()
+    monkeypatch.setattr(sqlite3, "connect", real_connect)
 
-    monkeypatch.setattr(ad.sqlite3, "connect", tracking_connect)
+    assert opened == [], (
+        f"the ledger opened {len(opened)} connection(s) while running its "
+        f"public operations three times: {opened}. Every write runs on the "
+        f"store's own transaction, so the only way to open one is to rebuild "
+        f"the store per call — which leaks exactly what this file was written "
+        f"about."
+    )
+    assert ad._session_store() is store, (
+        "the admission store was rebuilt; it is a per-process singleton and "
+        "rebuilding it per operation is the leak in its new form"
+    )
 
-    with pytest.raises(sqlite3.OperationalError):
-        with ad._transaction():
-            pass
 
-    assert len(opened) == 1
-    assert len(closed) == 1
+def test_a_failure_inside_the_transaction_releases_the_stores_write_lock(
+    monkeypatch, tmp_path
+):
+    """A raise inside the block must roll back AND hand the lock back.
+
+    The connection is no longer this module's to leak; the STORE'S WRITE LOCK
+    is. Holding it after an exception wedges every writer in the process — a
+    strictly worse outcome than the descriptor leak this file started as — and
+    it would not show up as an error anywhere, only as a hang.
+    """
+    _point_ledger(monkeypatch, tmp_path)
+    store = ad._session_store()
+
+    with pytest.raises(RuntimeError):
+        with ad._transaction() as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO async_delegations
+                   (delegation_id, origin_session, origin_ui_session_id,
+                    parent_session_id, state, dispatched_at, updated_at,
+                    delivery_state, delivery_attempts)
+                   VALUES ('rolled-back', '', '', NULL, 'running', 1.0, 1.0,
+                           'pending', 0)"""
+            )
+            raise RuntimeError("simulated failure inside the transaction")
+
+    acquired = store._lock.acquire(blocking=False)
+    if acquired:
+        store._lock.release()
+    assert acquired, (
+        "the store's write lock was still held after the transaction raised; "
+        "every subsequent write in this process would block forever"
+    )
+    assert ad.get_durable_delegation("rolled-back") is None, (
+        "the row written before the exception was committed; the transaction "
+        "did not roll back"
+    )
+    # And the store is still usable, which is the observable consequence of
+    # both of the above being true.
+    with ad._transaction() as conn:
+        conn.execute(
+            """INSERT OR REPLACE INTO async_delegations
+               (delegation_id, origin_session, origin_ui_session_id,
+                parent_session_id, state, dispatched_at, updated_at,
+                delivery_state, delivery_attempts)
+               VALUES ('after', '', '', NULL, 'running', 1.0, 1.0,
+                       'pending', 0)"""
+        )
+    assert ad.get_durable_delegation("after") is not None
