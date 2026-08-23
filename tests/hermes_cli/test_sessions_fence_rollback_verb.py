@@ -422,7 +422,7 @@ def check_a_target_that_is_not_this_fence_is_refused_by_a_named_reason(
     reasons = {}
 
     missing = tmpdir / "there-is-no-store-here.db"
-    run = _run_verb(missing, tmpdir / "backup-missing.db")
+    run = _run_verb(missing, tmpdir / "backup-missing.db", dry_run=True)
     assert not run.crash, f"the verb crashed on a missing target: {run.crash}"
     assert run.rc not in (0, None), (
         f"a missing target exited {run.rc!r}; a script cannot branch on that"
@@ -449,7 +449,7 @@ def check_a_target_that_is_not_this_fence_is_refused_by_a_named_reason(
     foreign_before = _store_digest(foreign)
     foreign_backup = tmpdir / "backup-foreign.db"
 
-    run = _run_verb(foreign, foreign_backup)
+    run = _run_verb(foreign, foreign_backup, dry_run=True)
     assert not run.crash, f"the verb crashed on a foreign database: {run.crash}"
     assert run.rc not in (0, None), (
         f"the verb accepted a database that is not a Hermes store: rc={run.rc!r} "
@@ -482,7 +482,7 @@ def check_a_target_that_is_not_this_fence_is_refused_by_a_named_reason(
     junk = tmpdir / "not-a-database-at-all.db"
     junk.write_bytes(b"this is a text file an operator renamed by mistake\n")
     junk_before = _store_digest(junk)
-    run = _run_verb(junk, tmpdir / "backup-junk.db")
+    run = _run_verb(junk, tmpdir / "backup-junk.db", dry_run=True)
     assert not run.crash, f"the verb crashed on a non-database file: {run.crash}"
     assert run.rc not in (0, None), f"a non-database target exited {run.rc!r}"
     payload = _payload(run)
@@ -536,7 +536,7 @@ def check_a_partial_surface_is_refused_whole_and_writes_no_backup(
     rows_before = _canonical_rows(store)
     backup = tmpdir / "backup.db"
 
-    run = _run_verb(store, backup)
+    run = _run_verb(store, backup, dry_run=True)
     assert not run.crash, f"the verb crashed on a partial surface: {run.crash}"
     assert run.rc not in (0, None), (
         f"the verb accepted a half-fenced store: rc={run.rc!r} "
@@ -780,7 +780,7 @@ def check_every_preflight_refusal_leaves_the_artifact_byte_identical(
         _canonical_rows(live_store),
         _installed_triggers(live_store),
         sorted(entry.name for entry in live_dir.iterdir()),
-        _run_verb(live_store, live_dir / "backup.db"),
+        _run_verb(live_store, live_dir / "backup.db", dry_run=True),
     )
 
     # (2) backup-exists — idle store, surface fine, destination occupied.
@@ -796,7 +796,7 @@ def check_every_preflight_refusal_leaves_the_artifact_byte_identical(
         _canonical_rows(taken_store),
         _installed_triggers(taken_store),
         sorted(entry.name for entry in taken_dir.iterdir()),
-        _run_verb(taken_store, occupied),
+        _run_verb(taken_store, occupied, dry_run=True),
     )
 
     for reason, (store, digest, rows, triggers, listing, run) in outcomes.items():
@@ -1097,30 +1097,41 @@ def check_a_destination_appearing_after_the_check_is_never_clobbered(
     backup = tmpdir / "backup.db"
     sentinel = b"DO NOT CLOBBER - a concurrent writer got here first"
 
-    injected = {"fired": False}
+    injected = {"fired": False, "path": None}
     real_check = library._refuse_unusable_backup_path
 
     def _competing_writer_after_the_check(path, *args, **kwargs):
         """A racer that re-appears in EVERY window, not just the first.
 
-        The destination check runs more than once — pre-flight, then again
-        inside the boundary — and a one-shot injection is caught by the second
+        The destination check runs more than once — pre-flight, then again at
+        the acquisition — and a one-shot injection is caught by the second
         check, which proves nothing: a check saving the run is exactly what is
         not allowed to be the guarantee. So the sentinel is cleared before each
         check and re-created immediately after it, which is what a competing
         writer looks like. Only an acquisition the filesystem arbitrates can
         survive that.
+
+        AIMED AT THE DESTINATION THAT IS ACTUALLY ACQUIRED. Under a contract
+        where no target the operator can name has offline authority, the run
+        that reaches a backup is the rehearsal, and the destination it acquires
+        is its own — so the sentinel goes where the bytes are about to be
+        written, which is the only place a clobber could happen. Keyed by the
+        name the check is called with rather than by a path this pin computes,
+        because the working directory is the command's and not this pin's.
         """
-        if pathlib.Path(path) == backup and backup.exists():
-            backup.unlink()
+        target = pathlib.Path(path)
+        if target.name != "rehearsal-backup.db":
+            return real_check(path, *args, **kwargs)
+        if target.exists():
+            target.unlink()
         real_check(path, *args, **kwargs)
-        if pathlib.Path(path) == backup:
-            injected["fired"] = True
-            backup.write_bytes(sentinel)
+        injected["fired"] = True
+        injected["path"] = target
+        target.write_bytes(sentinel)
 
     library._refuse_unusable_backup_path = _competing_writer_after_the_check
     try:
-        run = _run_verb(store, backup)
+        run = _run_verb(store, backup, dry_run=True)
     finally:
         library._refuse_unusable_backup_path = real_check
 
@@ -1132,7 +1143,8 @@ def check_a_destination_appearing_after_the_check_is_never_clobbered(
 
     payload = _payload(run)
     assert payload is not None, f"no machine-readable report: {run.stdout!r}"
-    assert backup.read_bytes() == sentinel, (
+    landed = injected["path"]
+    assert landed.read_bytes() == sentinel, (
         "the backup step overwrote a file that appeared after its own "
         "existence check. Whatever was at the destination is gone, and no "
         "check placed anywhere can fix that — the create has to be the check"
@@ -1182,7 +1194,7 @@ def check_an_orphan_backup_sidecar_is_not_overwritten(
     orphan.write_bytes(orphan_bytes)
     assert not backup.exists(), "the fixture wants the MAIN path absent"
 
-    run = _run_verb(store, backup)
+    run = _run_verb(store, backup, dry_run=True)
 
     assert not run.crash, f"the verb crashed on the orphan sidecar: {run.crash}"
     payload = _payload(run)
@@ -1628,7 +1640,13 @@ def check_no_in_place_run_succeeds_and_each_wrong_target_names_its_own_reason(
     os.link(shared, shared_dir / "also-state.db")
     cases["target-untrusted-namespace"] = (shared, None)
 
-    # (2) CANONICAL — the store this build would open with no argument at all.
+    # (2) CANONICAL — ``state.db`` in the profile home this process is
+    #     running under. Deliberately NOT pinned through DEFAULT_DB_PATH: this
+    #     suite already re-points that, so the two candidates disagree here
+    #     exactly as a profile override makes them disagree in production, and
+    #     a classifier that consults only one of them calls the operator's real
+    #     store unrecognised. Making the fixture agree with the classifier
+    #     would have hidden that.
     canonical = home / "state.db"
     _fenced_store(canonical, leave_lease_live=False)
     cases["canonical-store-target"] = (canonical, None)

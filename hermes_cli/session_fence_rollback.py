@@ -512,14 +512,51 @@ def prepare_the_private_copy(
     )
 
 
-def _canonical_store_path():
-    """Where this build would find ``state.db`` with no argument at all."""
+def _canonical_store_paths() -> list:
+    """EVERY path this build might mean by "the store", not the first one.
+
+    Canonicalness is a SET, and reducing it to one candidate is how a real
+    ``state.db`` gets classified as something nobody recognises. There are at
+    least two independent answers and they disagree by design:
+
+    * ``hermes_state._default_db_path()`` — which honours a re-pointed
+      ``DEFAULT_DB_PATH`` above everything else;
+    * ``get_hermes_home() / "state.db"`` — the profile's home as it stands right
+      now.
+
+    A profile override, a re-pointed default, or a test fixture makes those two
+    different paths, and the store the operator is actually running on is
+    whichever the process would open. If the artifact is ANY of them it is the
+    live one.
+
+    Both are asked of the modules that own them rather than reconstructed here,
+    for the same reason the trigger names are generated: a second copy of
+    somebody else's rule is right until they change it.
+
+    The failure direction matters. Missing a candidate makes this say "I do not
+    know what this is" about the operator's real store — which is safe only for
+    as long as every path refuses anyway, and is precisely the judgement a
+    future authority-bearing caller would trust to tell a canonical store from
+    a detached artifact.
+    """
+    candidates = []
     try:
         from hermes_state import _default_db_path
 
-        return Path(_default_db_path())
+        candidates.append(Path(_default_db_path()))
     except Exception:  # pragma: no cover - defensive
-        return None
+        pass
+    try:
+        from hermes_constants import get_hermes_home
+
+        candidates.append(Path(get_hermes_home()) / "state.db")
+    except Exception:  # pragma: no cover - defensive
+        pass
+    seen = []
+    for candidate in candidates:
+        if candidate not in seen:
+            seen.append(candidate)
+    return seen
 
 
 def _same_file(left: Path, right: Path) -> bool:
@@ -564,15 +601,18 @@ def disqualify_the_target(artifact: Path) -> None:
             "bounded. Nothing was changed",
             reason="target-untrusted-namespace",
         )
-    canonical = _canonical_store_path()
-    if canonical is not None and _same_file(artifact, canonical):
-        raise TurnFenceRollbackRefused(
-            f"{artifact} IS the canonical store this binary opens by default "
-            f"({canonical}). The canonical store is the live one whatever it "
-            "looks like at this instant, and a detached artifact is what this "
-            "verb acts on. Nothing was changed",
-            reason="canonical-store-target",
-        )
+    # BY IDENTITY, against every candidate. A string comparison is what a
+    # symlink or an override defeats, which is the same lesson the A/B store
+    # swap taught one layer down.
+    for canonical in _canonical_store_paths():
+        if _same_file(artifact, canonical):
+            raise TurnFenceRollbackRefused(
+                f"{artifact} IS a canonical store this binary opens on its own "
+                f"({canonical}). The canonical store is the live one whatever "
+                "it looks like at this instant, and a detached artifact is "
+                "what this verb acts on. Nothing was changed",
+                reason="canonical-store-target",
+            )
     present = [
         str(artifact.with_name(artifact.name + suffix))
         for suffix in _SIDECAR_SUFFIXES
