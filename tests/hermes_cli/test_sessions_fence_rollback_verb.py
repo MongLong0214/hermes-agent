@@ -912,7 +912,10 @@ SOURCE_MUTATIONS = (
     Mutation(
         pin="check_the_dry_run_refuses_what_the_real_run_would_refuse",
         module="hermes_cli/session_fence_rollback.py",
-        find="        _refuse_if_this_process_owns_a_turn(store_path)\n",
+        find=(
+            "        _refuse_if_this_process_owns_a_turn"
+            "(copy, identity_path=store_path)\n"
+        ),
         replace="        pass\n",
         why="without it the rehearsal asks the liveness question of a copy, "
             "and the one branch of the predicate that is keyed by the store's "
