@@ -465,12 +465,6 @@ def rehearse_turn_fence_rollback(
 
         _refuse_if_this_process_owns_a_turn(store_path)
 
-        # The path the REAL run would write, checked against the real
-        # filesystem — a rehearsal that does not notice the operator's backup
-        # path is already taken has not rehearsed the run they will type next.
-        _refuse_unusable_backup_path(backup_path)
-        progress["backup_path_available"] = True
-
         try:
             work_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -493,6 +487,16 @@ def rehearse_turn_fence_rollback(
                 reason=exc.reason,
             ) from exc
         progress["offline_verified"] = True
+
+        # LAST, so the sequence matches the real run's. The path the REAL run
+        # would write, checked against the real filesystem — a rehearsal that
+        # does not notice the operator's backup path is already taken has not
+        # rehearsed the run they will type next. Checking it EARLIER would be
+        # cheaper and would make a store that is both live-owned and pointed at
+        # an occupied backup path report a different reason here than it does
+        # there, which is the whole failure this rehearsal exists to avoid.
+        _refuse_unusable_backup_path(backup_path)
+        progress["backup_path_available"] = True
     except TurnFenceRollbackRefused as exc:
         exc.preflight = dict(progress)
         raise

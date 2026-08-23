@@ -122,10 +122,12 @@ def _report_rehearsal(store: Path, backup: Path) -> int:
     """``--dry-run``: rehearse on a copy, report the plan, touch nothing."""
     from hermes_cli import session_fence_rollback as rollback
 
-    # Beside the backup the operator named, because that is the location they
-    # have already chosen for a copy of their conversations — its permissions
-    # and its free space are the ones they thought about.
-    work_dir = backup.parent / f".{backup.name}.fence-rehearsal-{os.getpid()}"
+    # Beside the STORE, not beside the backup. The store's directory is one the
+    # real run must already be able to write (SQLite puts its journal there),
+    # and using it means the rehearsal needs no early opinion about the backup
+    # path — which is what lets the dry run check things in the same order the
+    # real run does. Hidden, PID-suffixed, and removed in the `finally` below.
+    work_dir = store.parent / f".{store.name}.fence-rehearsal-{os.getpid()}"
     try:
         try:
             plan = rollback.rehearse_turn_fence_rollback(
