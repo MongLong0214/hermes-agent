@@ -3467,63 +3467,106 @@ def check_a_target_swapped_and_restored_around_any_open_cannot_be_reached(
 def check_the_boundary_decides_liveness_again_keyed_by_the_operators_store(
     tmpdir: pathlib.Path,
 ) -> None:
-    """The pre-flight's answer is a snapshot. The boundary's is the decision.
+    """Two conjuncts: it decides AGAIN, and it decides about the OPERATOR's store.
 
-    ``SessionDB._turn_lease_row_is_free`` frees a row whose ``owner_pid`` is
-    this process when this process holds no grant FOR THAT ``db_path`` — a turn
-    that died without releasing. The pre-flight asks about the private copy, so
-    a conversation this very process is genuinely mid-turn on reads FREE there.
-    The boundary asks again, keyed by the store the operator NAMED, and that is
-    the answer the drops are bound to.
+    KEYED BY THE OPERATOR'S STORE. ``SessionDB._turn_lease_row_is_free`` frees a
+    row whose ``owner_pid`` is this process when this process holds no grant FOR
+    THAT ``db_path`` — a turn that died without releasing. The pre-flight asks
+    about the private copy, so a conversation this very process is genuinely
+    mid-turn on reads FREE there. Measured: the first version of this rehearsal
+    reported "this would proceed" on exactly the store the real run refused.
 
-    Measured, not reasoned about: the first version of this rehearsal reported
-    "this would proceed" on exactly the store the real run then refused.
+    AND IT DECIDES AGAIN. The lock has to be released for the backup —
+    ``VACUUM INTO`` cannot run inside a transaction and the online backup API
+    deadlocks against a source holding ``BEGIN EXCLUSIVE``, both measured — so
+    everything decided before it is a snapshot by the time the drops run. The
+    boundary therefore decides a second time, under the lock that performs
+    them.
 
-    MERGED FROM TWO PINS, DELIBERATELY. There was a second pin here for "a turn
-    acquired between the backup and the drops". With the mutable object
-    deserialized into memory, no other process can reach it — that interleave
-    is unreachable by construction rather than merely unobserved — and the two
-    pins had collapsed onto one observable that a single mutation killed twice.
-    A redundant check reports coverage it does not have, so it is one pin with
-    one killer, and the reason is recorded rather than the pin quietly dropped.
+    THE FIXTURE HAS TO SEPARATE THE TWO, OR ONE ROW COVERS BOTH BY ACCIDENT.
+    An earlier version made the turn live from the start; the FIRST decision
+    then refused, and deleting the second changed nothing, so the row for
+    "decides again" scored a kill it had not earned. The lease row here is left
+    owned by this process with no grant — free to both decisions — and a grant
+    for the operator's store is taken in the backup window, which is the only
+    interval that separates them. Free before, live after.
     """
     _sandbox_home(tmpdir)
     module, why = _import_verb()
     assert module is not None, f"there is no fence-rollback verb: {why}"
 
-    store = tmpdir / "state.db"
-    # The grant stays held BY THIS PROCESS, which is what puts the decision on
-    # the path-keyed branch. A foreign holder would be caught by the row read
-    # in the pre-flight and would never exercise the identity this pin names.
-    _fenced_store(store, leave_lease_live=True)
-    before = _store_digest(store)
-    listing_before = sorted(entry.name for entry in tmpdir.iterdir())
+    from hermes_cli import session_fence_rollback as library
+    from hermes_state import SessionDB
 
-    run = _run_verb(store, tmpdir / "backup-dry.db", dry_run=True)
-    assert not run.crash, f"the dry run crashed on a live store: {run.crash}"
+    store = tmpdir / "state.db"
+    _fenced_store(store, leave_lease_live=False)
+    # A holder owned by THIS process with no grant: the path-keyed branch reads
+    # it free, which is what makes the two decisions differ later.
+    stale = SessionDB(db_path=store)
+    try:
+        stale._execute_write(
+            lambda conn: conn.execute(
+                "UPDATE session_turn_leases SET holder = ?, owner_pid = ?, "
+                "owner_pid_start = NULL WHERE conversation_id = ?",
+                (_holder("stale"), os.getpid(), "keep"),
+            )
+        )
+    finally:
+        stale.close()
+    triggers_before = _installed_triggers(store)
+
+    barrier = {"granted": None, "db": None}
+    real_backup = library._make_verified_backup
+
+    def _a_turn_starts_in_the_backup_window(*args, **kwargs):
+        report = real_backup(*args, **kwargs)
+        if barrier["granted"] is None:
+            # Acquired through the ordinary API, on the store the operator
+            # named. The in-memory row was captured before this; what changes
+            # is whether this process holds a grant for that db_path, which is
+            # exactly what the path-keyed branch consults.
+            db = SessionDB(db_path=store)
+            barrier["db"] = db
+            barrier["granted"] = db.try_acquire_session_turn_lease(
+                "keep", _holder("late"), ttl_seconds=600
+            )
+        return report
+
+    library._make_verified_backup = _a_turn_starts_in_the_backup_window
+    try:
+        run = _run_verb(store, tmpdir / "backup-dry.db", dry_run=True)
+    finally:
+        library._make_verified_backup = real_backup
+        if barrier["db"] is not None:
+            barrier["db"].close()
+
+    assert barrier["granted"], (
+        "the barrier never took the turn, so the two decisions were never "
+        f"separated and this pin measures nothing: {barrier['granted']!r}"
+    )
+    assert not run.crash, f"the dry run crashed: {run.crash}"
     payload = _payload(run)
     assert payload is not None, f"no machine-readable report: {run.stdout!r}"
 
     assert payload.get("ok") is False
     assert payload["preflight"]["offline_verified"] is True, (
-        "the PRE-FLIGHT refused this, so the boundary's own decision was never "
-        f"the one that mattered and this pin measures nothing: {payload['preflight']!r}"
+        "the PRE-FLIGHT refused this, so neither of the boundary's decisions "
+        f"was the one that mattered: {payload['preflight']!r}"
+    )
+    assert (payload.get("rehearsal") or {}).get("backup_created") is True, (
+        "the run never reached the backup, so the turn was never taken in the "
+        f"window between the two decisions: {payload.get('rehearsal')!r}"
     )
     assert payload["refused"]["reason"] == "live-turn", (
-        "a conversation this process is mid-turn on read FREE, because the "
-        "liveness question was answered about the COPY rather than about the "
-        f"store the operator named: {payload['refused']!r}"
+        "a turn taken between the backup and the drops was not refused. Either "
+        "the boundary trusted its earlier snapshot, or it asked about the COPY "
+        f"rather than the store the operator named: {payload['refused']!r}"
     )
     assert "keep" in payload["refused"]["detail"], (
         f"the refusal does not name the conversation: {payload['refused']!r}"
     )
-    assert _store_digest(store) == before, (
-        f"the dry run changed the store while refusing it: {before} -> "
-        f"{_store_digest(store)}"
-    )
-    assert sorted(entry.name for entry in tmpdir.iterdir()) == listing_before, (
-        f"a refused dry run left files behind: "
-        f"{sorted(entry.name for entry in tmpdir.iterdir())}"
+    assert _installed_triggers(store) == triggers_before, (
+        "the rollback dropped triggers on the operator's store"
     )
 
 
