@@ -34,6 +34,24 @@ WHY THE MUTATION IS THE PARENT WALK
     at once. The lineage file mutates the same line for its resolution pin —
     the same guard provides both properties, and the properties are different
     claims about it, which is why they are pinned separately.
+
+WHY THIS PIN DIES ON ADMISSION AND NOT ON A CRASH
+    It did not, and that was the defect in the row rather than in the code.
+    The resolution snapshot ran BEFORE the two admission halves and rendered
+    its failure message with ``dict(before_row)``. Remove the walk and
+    ``get_session_turn_lease("child")`` returns ``None``, so composing the
+    message raised ``TypeError: 'NoneType' object is not iterable`` and the
+    harness recorded a non-zero exit — a dead row, not a refuted claim. The
+    guard whose removal the row exists to detect is precisely the one that
+    makes that value ``None``, so the single input the message had to survive
+    was the only one it would ever see.
+
+    Two changes, and both are the same point: the failure text goes through
+    :func:`_row_repr` so ``None`` renders, and the resolution assertions moved
+    BELOW the two admission halves. The mutation now kills this pin at half
+    one — "a holderless write landed on the rotated tip of a conversation
+    another writer owns" — which is the claim the file is named for, and the
+    resolution claim is still asserted, after the attack rather than before it.
 """
 
 from __future__ import annotations
@@ -63,6 +81,18 @@ def _store(tmpdir, name="state.db"):
     from hermes_state import SessionDB
 
     return SessionDB(db_path=pathlib.Path(tmpdir) / name)
+
+
+def _row_repr(row):
+    """A lease row rendered so that ``None`` is a value, not an exception.
+
+    Every failure message in this file goes through here. ``dict(row)`` is the
+    obvious spelling and it is the reason the mutation below used to kill this
+    pin with ``TypeError: 'NoneType' object is not iterable`` — the walk is
+    exactly the guard whose removal makes the row ``None``, so the one input
+    the message had to survive was the one it could not render.
+    """
+    return "None" if row is None else repr(dict(row))
 
 
 def _lease_keys(db):
@@ -117,9 +147,6 @@ def check_the_fence_follows_the_conversation_onto_the_rotated_tip(
         before_keys = _lease_keys(db)
         assert before_keys == ["root"], before_keys
         before_row = db.get_session_turn_lease("child")
-        assert before_row is not None and before_row["holder"] == str(turn), (
-            f"the tip does not resolve to the owned conversation: {dict(before_row)!r}"
-        )
 
         # Half one: a holderless writer aiming at the TIP.
         try:
@@ -148,7 +175,25 @@ def check_the_fence_follows_the_conversation_onto_the_rotated_tip(
             f"a second lease row appeared for the same conversation: "
             f"{_lease_keys(db)!r}"
         )
-        assert dict(db.get_session_turn_lease("child")) == dict(before_row)
+
+        # ...and the row the tip resolves to is still the owner's, unchanged.
+        # Asserted here rather than before the two halves, and rendered through
+        # `_row_repr`, for the reason in WHY THIS PIN DIES ON ADMISSION: an
+        # f-string that calls `dict(None)` raises TypeError while composing the
+        # failure message, so the pin dies by a crash instead of by the claim
+        # it was written to make.
+        after_row = db.get_session_turn_lease("child")
+        assert before_row is not None, (
+            f"the tip resolves to no lease row at all: {_row_repr(before_row)}"
+        )
+        assert before_row["holder"] == str(turn), (
+            f"the tip does not resolve to the owned conversation: "
+            f"{_row_repr(before_row)}"
+        )
+        assert _row_repr(after_row) == _row_repr(before_row), (
+            f"the refused attempts changed the tip's lease row: "
+            f"{_row_repr(before_row)} -> {_row_repr(after_row)}"
+        )
 
         # The owner is unaffected and still writes to the tip.
         assert db.append_message(
