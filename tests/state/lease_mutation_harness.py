@@ -98,11 +98,18 @@ def assert_the_owner_was_not_refused(outcome, what: str) -> None:
     )
 
 
-def extract_tree(tmp_path: pathlib.Path, *extra: str) -> pathlib.Path:
-    """A private, byte-fresh copy of HEAD's tree under *tmp_path*.
+def extract_tree(tmp_path: pathlib.Path, *extra: str, ref: str = "HEAD") -> pathlib.Path:
+    """A private, byte-fresh copy of *ref*'s tree under *tmp_path*.
 
-    HEAD, not the working tree: an immutable object, so a row cannot be
-    measuring uncommitted state it did not describe.
+    HEAD by default, not the working tree: an immutable object, so a row cannot
+    be measuring uncommitted state it did not describe.
+
+    *ref* exists for one caller and one reason. A row written but not yet
+    committed cannot be measured against HEAD — the guard it names is not there
+    yet, so it reports "0 matches" and looks stale rather than unproven. A
+    pre-commit check hands in the commit object ``git stash create`` makes from
+    the working tree, which is precisely what is about to become HEAD. Every
+    other caller leaves this alone and keeps measuring an immutable object.
     """
     git_dir = _git_dir()
     if git_dir is None:
@@ -114,7 +121,7 @@ def extract_tree(tmp_path: pathlib.Path, *extra: str) -> pathlib.Path:
     out.mkdir()
     archive = subprocess.run(
         [
-            "git", "-C", git_dir, "archive", "HEAD", "--",
+            "git", "-C", git_dir, "archive", ref, "--",
             *BASE_EXTRACT_PATHSPEC, *extra,
         ],
         capture_output=True,
@@ -187,6 +194,7 @@ def assert_mutation_kills_the_pin(
     pin_module: str,
     tmp_path: pathlib.Path,
     *extra_paths: str,
+    ref: str = "HEAD",
 ) -> None:
     """Clean, mutated, restored. Anything else is a row that measures nothing.
 
@@ -196,7 +204,7 @@ def assert_mutation_kills_the_pin(
     the package, which it asks for as ``"."`` rather than by naming the modules
     it happens to import today.
     """
-    tree = extract_tree(tmp_path, pin_module, *extra_paths)
+    tree = extract_tree(tmp_path, pin_module, *extra_paths, ref=ref)
     target = tree / mutation.module
     original = target.read_text(encoding="utf-8")
 

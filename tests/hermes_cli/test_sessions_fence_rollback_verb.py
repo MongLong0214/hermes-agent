@@ -53,6 +53,7 @@ WHAT IT DOES NOT SOFTEN
 from __future__ import annotations
 
 import argparse
+import ast
 import contextlib
 import hashlib
 import io
@@ -4256,6 +4257,112 @@ SOURCE_MUTATIONS = (
 )
 def test_each_pin_dies_when_its_own_guard_is_removed(mutation, tmp_path):
     assert_mutation_kills_the_pin(mutation, str(_SELF), tmp_path, *_EXTRA_EXTRACT)
+
+
+def _mutation_rows_as_written(source: str) -> dict:
+    """Every ``Mutation(...)`` in *source*, keyed by pin, valued by its guts.
+
+    Parsed rather than diffed line by line. A unified diff shows changed LINES,
+    so a row whose ``find`` moved by one character reports a hunk that may not
+    contain the ``pin=`` line at all, and the row would be attributed to
+    whatever block the hunk happened to touch. The tuple is the unit of
+    meaning, so the tuple is what gets compared.
+    """
+    rows = {}
+    for node in ast.walk(ast.parse(source)):
+        if not (isinstance(node, ast.Call) and getattr(node.func, "id", "") == "Mutation"):
+            continue
+        fields = {}
+        for keyword in node.keywords:
+            try:
+                fields[keyword.arg] = ast.literal_eval(keyword.value)
+            except (ValueError, SyntaxError):  # pragma: no cover - non-literal
+                fields[keyword.arg] = "<unevaluated>"
+        pin = fields.get("pin")
+        if pin is not None:
+            rows.setdefault(pin, []).append(
+                (fields.get("module"), fields.get("find"), fields.get("replace"))
+            )
+    return rows
+
+
+def _rows_this_working_tree_added_or_changed():
+    """Pins whose rows differ from HEAD's. ``None`` when git cannot say.
+
+    Derived from the artifact, never from a name typed by hand. A pin name
+    passed in by a person is one more thing to get wrong, and its failure mode
+    is silent — you verify the wrong row and it passes.
+    """
+    from tests.state.test_turn_lease_generation_trigger import _git_dir
+
+    git_dir = _git_dir()
+    if git_dir is None:
+        return None, None
+    committed = subprocess.run(
+        ["git", "-C", git_dir, "show", f"HEAD:{_SELF}"],
+        capture_output=True, text=True,
+    )
+    if committed.returncode != 0:
+        return None, None
+    before = _mutation_rows_as_written(committed.stdout)
+    after = _mutation_rows_as_written((REPO_ROOT / _SELF).read_text(encoding="utf-8"))
+    changed = {
+        pin for pin, rows in after.items()
+        if sorted(rows) != sorted(before.get(pin, []))
+    }
+    if not changed:
+        # THE COMPARISON IS CHEAP AND THE REF IS NOT. Building a commit object
+        # from a working tree this size costs over a minute, and paying it on
+        # every clean run is how a check that must run before every commit stops
+        # being run before every commit. Nothing changed, nothing to prove.
+        return changed, None
+
+    working = subprocess.run(
+        ["git", "-C", git_dir, "stash", "create"], capture_output=True, text=True
+    )
+    # `stash create` builds a commit object from the working tree and prints
+    # its sha. It pushes nothing onto the stash stack and moves no ref, so it
+    # cannot disturb anyone else's work.
+    return changed, (working.stdout or "").strip() or "HEAD"
+
+
+def test_every_mutation_row_this_tree_adds_or_changes_actually_kills(tmp_path):
+    """A row you just wrote is EARNED before it is committed. Not coverage.
+
+    It proves nothing about the verb, and it does not say the property matters
+    or that the pin observes the right thing — a row can kill for a reason that
+    is not its own, and only walking what assertion fired in the mutated tree
+    catches that.
+
+    WHY IT EXISTS: my own verification of a NEW row was twice "the suite is
+    green" rather than "this specific row kills", and twice a row that killed
+    nothing survived into a head I reported. Running one row is a single tree
+    extraction — seconds — so cost was never the obstacle. REMEMBERING was,
+    which is the shape that should always have been a check instead.
+
+    So nothing is asked of the author: the diff against HEAD decides which rows
+    run. A clean tree runs none, which is correct — there is nothing new to
+    earn. It measures against the WORKING TREE, because a row whose guard is
+    also uncommitted cannot be measured against HEAD; it would report a stale
+    anchor rather than an unproven row, which is a different complaint and a
+    misleading one.
+    """
+    changed, ref = _rows_this_working_tree_added_or_changed()
+    if changed is None:
+        pytest.skip("no git repository to compare the mutation table against")
+    if not changed:
+        return
+
+    by_pin = {mutation.pin: mutation for mutation in SOURCE_MUTATIONS}
+    for position, pin in enumerate(sorted(changed)):
+        mutation = by_pin.get(pin)
+        assert mutation is not None, (
+            f"the working tree changes a row for {pin}, and no such pin exists"
+        )
+        assert_mutation_kills_the_pin(
+            mutation, str(_SELF), tmp_path / f"new{position}", *_EXTRA_EXTRACT,
+            ref=ref,
+        )
 
 
 def test_every_mutation_anchor_still_names_one_place():
