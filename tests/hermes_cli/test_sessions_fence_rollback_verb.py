@@ -3029,8 +3029,12 @@ SOURCE_MUTATIONS = (
     Mutation(
         pin="check_the_completed_rehearsal_reports_the_surface_it_removed",
         module="hermes_cli/session_fence_rollback.py",
-        find='            "would_drop": plan["would_drop"],\n',
-        replace='            "would_drop": [],\n',
+        find='        "installed_triggers": plan["installed_triggers"],\n'
+             '        "would_drop": plan["would_drop"],\n'
+             '        "rehearsal": dict(outcome.facts(), copy=str(copy)),\n',
+        replace='        "installed_triggers": plan["installed_triggers"],\n'
+                '        "would_drop": [],\n'
+                '        "rehearsal": dict(outcome.facts(), copy=str(copy)),\n',
         why="a completion report that does not name the surface it removed "
             "leaves nothing in the output to distinguish a full rollback from "
             "a partial one, and the operator is back to checking by hand — "
@@ -3085,8 +3089,9 @@ SOURCE_MUTATIONS = (
     Mutation(
         pin="check_a_partial_destination_collision_keeps_only_what_the_run_created",
         module="hermes_cli/session_fence_rollback.py",
-        find="            except FileExistsError as exc:\n                self.remove_only_what_we_created()\n",
-        replace="            except FileExistsError as exc:\n",
+        find="        if reservation is not None:\n"
+             "            reservation.remove_only_what_we_created()\n",
+        replace="        if reservation is not None:\n            pass\n",
         why="the run still refuses, and still refuses for the right reason — "
             "what it stops doing is removing the half-built destination it "
             "created before hitting the occupied sibling. The operator who "

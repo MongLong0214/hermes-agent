@@ -1079,6 +1079,13 @@ class _AcquiredDestinations:
         return self.backup_path.with_name(self.backup_path.name + suffix)
 
     def acquire(self) -> None:
+        """Take every name, or take none of them and leave what was there.
+
+        Cleanup on failure belongs to the CALLER, in the ``except BaseException``
+        that already wraps the whole backup. Doing it here as well was a second
+        guard for one obligation, and a mutation removing either scored no kill
+        because the other still ran — coverage reported and not held. One site.
+        """
         flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
         flags |= getattr(os, "O_NOFOLLOW", 0)
         flags |= getattr(os, "O_BINARY", 0)
@@ -1087,7 +1094,6 @@ class _AcquiredDestinations:
             try:
                 handle = os.open(member, flags, 0o600)
             except FileExistsError as exc:
-                self.remove_only_what_we_created()
                 raise TurnFenceRollbackRefused(
                     f"the backup destination {member} already exists; refusing "
                     "to overwrite it. Name a path whose whole family — the "
@@ -1096,7 +1102,6 @@ class _AcquiredDestinations:
                     reason="backup-exists",
                 ) from exc
             except OSError as exc:
-                self.remove_only_what_we_created()
                 raise TurnFenceRollbackRefused(
                     f"the backup destination {member} could not be created: "
                     f"{exc}",
