@@ -7639,6 +7639,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         session_id: str,
         holder: str,
         ttl_seconds: float = 300.0,
+        *,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> bool:
         """Try to atomically acquire the compression lock for ``session_id``.
 
@@ -7656,6 +7659,37 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         Implementation: single-transaction DELETE-expired + INSERT-or-IGNORE,
         followed by a SELECT to confirm we got the row. SQLite serialises
         writes, so the whole sequence is atomic against other writers.
+
+        FENCED, AND THE OTHER TWO LOCK METHODS ARE NOT
+            Taking this lock is a decision about somebody else's conversation:
+            ``INSERT OR IGNORE`` is first-writer-wins, so a process holding no
+            grant that gets here first denies the OWNER its compression for the
+            whole lock TTL. Measured before this guard existed, on a live-owned
+            conversation from a second ``SessionDB`` of this same generation::
+
+                {"bystander_acquire": true,
+                 "owner_acquire_after": false,
+                 "lock_holder_final": "BYSTANDER"}
+
+            The generation trigger on ``compression_locks`` does not reach this:
+            it admits every connection this build opens. So the admission is the
+            same one every other writer on the surface takes — root, holder and
+            epoch for the conversation, resolved inside the same transaction as
+            the INSERT.
+
+            :meth:`refresh_compression_lock` and
+            :meth:`release_compression_lock` deliberately stay token-scoped.
+            Their statements carry ``WHERE session_id = ? AND holder = ?``, so
+            the token the caller was handed IS the authority, and requiring a
+            turn grant there would refuse a compressor whose grant rotated
+            mid-compression — a fence on the owner, which is a different
+            failure. See tests/state/test_turn_lease_compression_lock_admission.
+
+            The refusal PROPAGATES rather than becoming ``False``. ``False``
+            means "somebody else holds it", and reporting a lease refusal that
+            way would tell the caller a specific untruth about who is
+            compressing. The compression caller already fails closed on any
+            exception from this method.
         """
         if not session_id:
             return False
@@ -7663,6 +7697,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         expires_at = now + ttl_seconds
 
         def _do(conn):
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             reclaimed_holder = None
             row = conn.execute(
                 "SELECT holder, expires_at FROM compression_locks "

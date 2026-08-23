@@ -51,6 +51,8 @@ from tests.state.lease_mutation_harness import (
     Mutation,
     assert_every_pin_has_a_killer,
     assert_mutation_kills_the_pin,
+    assert_the_owner_was_not_refused,
+    owner_call,
 )
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -159,7 +161,12 @@ def check_the_owner_can_close_its_own_session_as_compression(tmpdir) -> None:
     db = _store(tmpdir)
     try:
         grant = _owned(db)
-        db.end_session("s", "compression", turn_lease_holder=grant)
+        assert_the_owner_was_not_refused(
+            owner_call(lambda: db.end_session(
+                "s", "compression", turn_lease_holder=grant
+            )),
+            "end_session('compression')",
+        )
         ended_at, end_reason = _lifecycle(db, "s")
         assert end_reason == "compression", (
             f"the owner's own close was refused: end_reason={end_reason!r}"

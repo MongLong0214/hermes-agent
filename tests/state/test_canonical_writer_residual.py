@@ -41,14 +41,28 @@ FOUR CLASSES, AND EVERY ONE OF THEM IS A PREDICATE OVER THE SOURCE
                     presented. ``_init_schema`` itself is the census's one
                     argued exemption, and ``test_turn_lease_writer_census``
                     already asserts it cannot reach a row this generation wrote.
-    token-scoped    every statement the method aims at a fenced table either
-                    constrains ``holder`` — a token the caller had to be given —
-                    or is an ``INSERT OR IGNORE`` that cannot overwrite a row
-                    that exists. The three compression-lock writers are this:
-                    a caller with no token can neither take a lock somebody
-                    holds nor free it. Same shape as the ``claim-scoped`` ground
-                    in ``test_raw_sink_census``, and checked the same way — by
-                    reading the SQL, not by being on a list.
+    token-scoped    every statement the method aims at a fenced table
+                    constrains ``holder`` — a token the caller had to be given
+                    — so it can neither extend nor free a lease it does not
+                    hold. ``refresh_compression_lock`` and
+                    ``release_compression_lock`` are this. Same shape as the
+                    ``claim-scoped`` ground in ``test_raw_sink_census``, and
+                    checked the same way: by reading the SQL, not by being on
+                    a list.
+
+                    ``INSERT OR IGNORE`` USED TO COUNT HERE AND NO LONGER DOES.
+                    The ground was originally written to cover
+                    ``try_acquire_compression_lock`` too, on the reasoning that
+                    an insert which cannot overwrite a row cannot steal a lock.
+                    Review refused it and the counterexample is measured in
+                    ``test_turn_lease_compression_lock_admission``: INSERT OR
+                    IGNORE is FIRST-WRITER-WINS, so a grantless process takes
+                    the lock on a conversation nobody holds it for and the
+                    OWNER then cannot compress. "Cannot steal a held lock" was
+                    never the question. That method now admits, and the insert
+                    arm is gone from this predicate — a ground nothing claims is
+                    a ground that cannot be checked, and one that would let the
+                    same mistake back in.
 
     Anything else is RESIDUAL and fails. There is no list of names anywhere in
     this file: a method is classified by what its source does, so a new writer
@@ -170,21 +184,24 @@ def schema_repair_closure(methods: dict) -> frozenset:
 
 
 def _statement_is_token_scoped(verb: str, rest: str) -> bool:
-    """One statement that cannot take or free what the caller was not given.
+    """One statement that cannot move what the caller was not given.
 
-    Two shapes, both read off the SQL:
+    The statement must constrain ``holder`` — the token the caller had to be
+    handed by whoever granted it.
 
-    * ``INSERT OR IGNORE`` — creates a row only where none exists, so it can
-      never overwrite a holder;
-    * anything else must constrain ``holder``, the token the caller had to be
-      handed by whoever granted it.
-
-    A bare ``INSERT`` is NOT token-scoped, and neither is ``INSERT OR REPLACE``:
-    both can put a row where another holder's row was.
+    NO INSERT IS TOKEN-SCOPED, and that is a correction rather than a
+    simplification. This predicate first admitted ``INSERT OR IGNORE`` on the
+    reasoning that an insert which cannot overwrite a row cannot steal a lock.
+    Review refused it and the measurement is in
+    ``test_turn_lease_compression_lock_admission``: INSERT OR IGNORE is
+    first-writer-wins, so a caller with no token takes a lock nobody holds on a
+    conversation somebody OWNS, and the owner is then locked out for the whole
+    TTL. Creating a row where none exists is a decision about the conversation,
+    not merely an absence of theft.
     """
     verb = " ".join(verb.lower().split())
     if verb.startswith("insert"):
-        return verb == "insert or ignore into"
+        return False
     return bool(re.search(r"\bholder\s*=", rest, re.IGNORECASE))
 
 
@@ -326,21 +343,23 @@ def test_every_ground_is_a_predicate_that_can_reject(capsys):
         "ground would then absolve a writer that frees anybody's lock"
     )
 
-    # INSERT OR IGNORE cannot overwrite; INSERT OR REPLACE can, and must not
-    # be mistaken for it.
-    assert is_token_scoped(ast.parse(
-        "def m(self):\n"
-        "    conn.execute('INSERT OR IGNORE INTO compression_locks "
-        "(session_id, holder) VALUES (?, ?)')\n"
-    ).body[0], tables)
-    assert not is_token_scoped(ast.parse(
-        "def m(self):\n"
-        "    conn.execute('INSERT OR REPLACE INTO compression_locks "
-        "(session_id, holder) VALUES (?, ?)')\n"
-    ).body[0], tables), (
-        "INSERT OR REPLACE was accepted as token-scoped; it puts a row where "
-        "another holder's row was, which is the theft the ground denies"
-    )
+    # NO insert is token-scoped. INSERT OR IGNORE was accepted here until
+    # review produced the counterexample: first-writer-wins means a grantless
+    # caller takes a lock nobody holds on a conversation somebody owns, and
+    # the owner is locked out. Both arms are pinned so the ground cannot be
+    # widened back.
+    for insert in ("INSERT OR IGNORE INTO", "INSERT OR REPLACE INTO",
+                   "INSERT INTO"):
+        assert not is_token_scoped(ast.parse(
+            "def m(self):\n"
+            f"    conn.execute('{insert} compression_locks "
+            "(session_id, holder) VALUES (?, ?)')\n"
+        ).body[0], tables), (
+            f"`{insert}` was accepted as token-scoped. Creating a row where "
+            f"none exists is a decision about the conversation, not an "
+            f"absence of theft — measured as bystander_acquire=true, "
+            f"owner_acquire_after=false"
+        )
 
     # One unscoped statement is enough to lose the ground, even beside a
     # scoped one — a method is only as scoped as its loosest statement.

@@ -551,12 +551,15 @@ def _store_with_a_live_lease(tmp_path, name="state.db"):
     store, grant = adjunct._live_owned_store(tmp_path, name)
     db = SessionDB(store)
     try:
-        assert db.try_acquire_compression_lock("s", "holder-1", ttl_seconds=600), (
-            "the compression lock this fixture needs was not taken"
-        )
+        # The grant is presented because taking the compression lock is
+        # admitted: the fixture's compressor is the turn's compressor, and a
+        # holderless acquire on a live-owned conversation is precisely what
+        # tests/state/test_turn_lease_compression_lock_admission refuses.
+        assert db.try_acquire_compression_lock(
+            "s", "holder-1", ttl_seconds=600, turn_lease_holder=grant
+        ), "the compression lock this fixture needs was not taken"
     finally:
         db.close()
-    del grant
     return store
 
 

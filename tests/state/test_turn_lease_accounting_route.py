@@ -69,6 +69,8 @@ from tests.state.lease_mutation_harness import (
     Mutation,
     assert_every_pin_has_a_killer,
     assert_mutation_kills_the_pin,
+    assert_the_owner_was_not_refused,
+    owner_call,
 )
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -225,8 +227,11 @@ def check_the_owner_can_fill_its_own_null_route(tmpdir) -> None:
         grant = _owned(db)
         assert _row(db)["model"] is None
 
-        db.create_session(
-            "s", "test", model="openai/gpt-owner", turn_lease_holder=grant
+        assert_the_owner_was_not_refused(
+            owner_call(lambda: db.create_session(
+                "s", "test", model="openai/gpt-owner", turn_lease_holder=grant
+            )),
+            "create_session route backfill",
         )
 
         assert _row(db)["model"] == "openai/gpt-owner", (

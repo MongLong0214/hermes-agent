@@ -57,6 +57,8 @@ from tests.state.lease_mutation_harness import (
     Mutation,
     assert_every_pin_has_a_killer,
     assert_mutation_kills_the_pin,
+    assert_the_owner_was_not_refused,
+    owner_call,
 )
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -84,7 +86,22 @@ def _publish(db, parent, child, grant, *, lock="compressor"):
     these checks fail for a reason that has nothing to do with the turn lease.
     """
     if db.get_compression_lock_holder(parent) != lock:
-        assert db.try_acquire_compression_lock(parent, lock, ttl_seconds=60), (
+        # The ACQUIRE is admitted now too, so it presents the conversation's
+        # CURRENT grant — `current_turn_grant` is the registry the production
+        # compressor reads — and NOT the grant under test.
+        #
+        # This is load-bearing rather than tidy. Handing the grant under test
+        # to the acquire makes a refused ACQUIRE raise the same exception a
+        # refused PUBLISH does, one call earlier, and every check below would
+        # go on passing while never reaching the publish guard it names. That
+        # is a pin that has quietly stopped measuring anything — the failure
+        # mode this whole family exists to rule out, arriving through a fence
+        # added in front of the write rather than through a second guard
+        # beside it.
+        assert db.try_acquire_compression_lock(
+            parent, lock, ttl_seconds=60,
+            turn_lease_holder=db.current_turn_grant(parent),
+        ), (
             f"could not take the compression lock on {parent!r}; held by "
             f"{db.get_compression_lock_holder(parent)!r}"
         )
@@ -280,9 +297,20 @@ def check_the_lease_key_walks_to_the_root_three_deep(tmpdir) -> None:
 
         chain = ["root", "c1", "c2", "c3"]
         for index in range(3):
-            _publish(
-                db, chain[index], chain[index + 1], grant,
-                lock=f"compressor-{index}",
+            # Each hop is the ROOT's grant publishing the next segment, and
+            # each one is a place the property can fail: with the lease-key
+            # walk gone, `c1` no longer resolves to `root` and the second hop
+            # is refused. Stated as an assertion rather than left to raise —
+            # a pin that dies building its fixture cannot be told apart from
+            # a pin whose fixture is broken.
+            assert_the_owner_was_not_refused(
+                owner_call(lambda i=index: _publish(
+                    db, chain[i], chain[i + 1], grant,
+                    lock=f"compressor-{i}",
+                )),
+                f"publishing segment {chain[index + 1]!r} under the root's "
+                f"own grant — the lease key for {chain[index]!r} must still "
+                f"walk to 'root'",
             )
 
         # Three hops from the tail back to the root, resolved by production.
@@ -304,7 +332,10 @@ def check_the_lease_key_walks_to_the_root_three_deep(tmpdir) -> None:
         )
 
         # And the same root grant still publishes from three deep.
-        _publish(db, "c3", "c4", grant)
+        assert_the_owner_was_not_refused(
+            owner_call(lambda: _publish(db, "c3", "c4", grant)),
+            "publish from three segments deep under the root's own grant",
+        )
         assert db.get_session("c4") is not None
     finally:
         db.close()

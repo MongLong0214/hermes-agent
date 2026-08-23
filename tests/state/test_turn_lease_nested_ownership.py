@@ -129,7 +129,12 @@ def check_a_nested_writer_gets_the_turns_exact_grant_across_rotation(
         )
 
         # The turn compresses. The conversation is now addressed by 'child'.
-        assert db.try_acquire_compression_lock("root", "compressor", ttl_seconds=60)
+        # The turn is what compresses, so it presents its own grant:
+        # taking the compression lock is admitted now, and a compressor
+        # with no grant would be denying the owner its own compression.
+        assert db.try_acquire_compression_lock(
+            "root", "compressor", ttl_seconds=60, turn_lease_holder=turn
+        )
         db.publish_compression_child(
             parent_session_id="root",
             child_session_id="child",

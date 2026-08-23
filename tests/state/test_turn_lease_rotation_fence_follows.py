@@ -134,7 +134,12 @@ def check_the_fence_follows_the_conversation_onto_the_rotated_tip(
         )
         assert turn, "could not take the turn's lease"
 
-        assert db.try_acquire_compression_lock("root", "compressor", ttl_seconds=60)
+        # The turn is what compresses, so it presents its own grant:
+        # taking the compression lock is admitted now, and a compressor
+        # with no grant would be denying the owner its own compression.
+        assert db.try_acquire_compression_lock(
+            "root", "compressor", ttl_seconds=60, turn_lease_holder=turn
+        )
         db.publish_compression_child(
             parent_session_id="root",
             child_session_id="child",

@@ -62,6 +62,42 @@ class Mutation:
     why: str
 
 
+class OwnerRefused(str):
+    """A refusal of the OWNER's own call, carried as a value rather than raised.
+
+    For the "and the owner can still do X" leg every refusal pin needs. Left
+    bare, such a leg dies under its mutation by an escaping
+    ``SessionTurnLeaseLostError``: the property IS violated, but the pin never
+    states what it expected, so the failure reads as a broken fixture rather
+    than as "the fence refused the conversation's own holder".
+
+    That distinction is the whole of :func:`assert_mutation_kills_the_pin`'s
+    discrimination check. A row whose pin dies without its own assertion firing
+    proves the mutation runs; it does not prove the pin can see what the guard
+    protects, and those are the rows that go on passing after the guard is
+    deleted.
+    """
+
+
+def owner_call(fn):
+    """Run *fn*, returning its result or the refusal as :class:`OwnerRefused`."""
+    from hermes_state import SessionTurnLeaseLostError
+
+    try:
+        return fn()
+    except SessionTurnLeaseLostError as exc:
+        return OwnerRefused(f"REFUSED THE OWNER: {exc}")
+
+
+def assert_the_owner_was_not_refused(outcome, what: str) -> None:
+    """The assertion half of :func:`owner_call`, so the message is uniform."""
+    assert not isinstance(outcome, OwnerRefused), (
+        f"the fence refused the conversation's OWN holder on {what}. A fence "
+        f"that refuses the owner is a different failure from the one the "
+        f"refusal legs check, not a fix for it.\n  {outcome}"
+    )
+
+
 def extract_tree(tmp_path: pathlib.Path, *extra: str) -> pathlib.Path:
     """A private, byte-fresh copy of HEAD's tree under *tmp_path*.
 
@@ -185,6 +221,35 @@ def assert_mutation_kills_the_pin(
         f"{mutation.pin} still passed with its guard removed ({mutation.why}). "
         f"It is asserting something the code cannot do anyway, and it will keep "
         f"passing after that guard is deleted:\n{killed.stdout}\n{killed.stderr}"
+    )
+    # AND IT HAS TO HAVE DIED BY OBSERVING, NOT BY FALLING OVER.
+    #
+    # A non-zero exit is not a kill. A mutation that breaks an import, moves a
+    # signature, or trips a TypeError on the way in makes the probe exit
+    # non-zero without the pin ever reading the state the guard protects — so
+    # the row scores as discrimination while discriminating nothing. That is
+    # the same blind spot review found in the base-binary attempt table, where
+    # an attempt scored "did not change the state" because the snapshot did not
+    # read the column the write lands in.
+    #
+    # So the mutated run must end in the PIN'S OWN AssertionError. A pin that
+    # dies any other way is either measuring a crash or has a mutation aimed at
+    # the wrong seam, and both are rows that would keep passing after the guard
+    # they name is deleted.
+    trace = f"{killed.stdout}\n{killed.stderr}"
+    assert "AssertionError" in trace, (
+        f"{mutation.pin} failed under its mutation, but NOT by its own "
+        f"assertion — nothing in the failure names an AssertionError, so the "
+        f"pin never reached the observation it exists to make. A row that "
+        f"kills its pin by crashing proves the mutation runs, not that the pin "
+        f"can see what the guard protects.\n"
+        f"mutation: {mutation.module} :: {mutation.find!r} -> "
+        f"{mutation.replace!r}\n{trace}"
+    )
+    assert "PIN-HELD" not in killed.stdout, (
+        f"{mutation.pin} printed PIN-HELD under its mutation and then exited "
+        f"non-zero anyway, so the non-zero exit came from something after the "
+        f"pin passed:\n{trace}"
     )
 
     target.write_text(original)

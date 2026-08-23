@@ -980,8 +980,14 @@ def test_post_compress_exception_stops_lock_refresher(tmp_path: Path, monkeypatc
     """A warning-path exception after compress() returns must still release the lock."""
     real_try_acquire = SessionDB.try_acquire_compression_lock
 
-    def _short_ttl(self, session_id: str, holder: str, ttl_seconds: float = 300.0) -> bool:
-        return real_try_acquire(self, session_id, holder, ttl_seconds=0.15)
+    def _short_ttl(
+        self, session_id: str, holder: str, ttl_seconds: float = 300.0, **kwargs
+    ) -> bool:
+        # ``**kwargs`` forwards the turn-lease admission the caller now
+        # presents. Swallowing it here instead would make this double admit a
+        # write the real method would refuse, which is the shape of test that
+        # passes against the defect it was written for.
+        return real_try_acquire(self, session_id, holder, ttl_seconds=0.15, **kwargs)
 
     monkeypatch.setattr(SessionDB, "try_acquire_compression_lock", _short_ttl)
 

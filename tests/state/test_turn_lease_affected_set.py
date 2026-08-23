@@ -73,6 +73,8 @@ from tests.state.lease_mutation_harness import (
     Mutation,
     assert_every_pin_has_a_killer,
     assert_mutation_kills_the_pin,
+    assert_the_owner_was_not_refused,
+    owner_call,
 )
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -314,9 +316,14 @@ def check_the_owner_can_delete_its_own_compression_lineage(tmpdir) -> None:
         )
         assert grant
 
-        assert db.delete_session("p", turn_lease_holder=grant) is True, (
+        deleted = owner_call(
+            lambda: db.delete_session("p", turn_lease_holder=grant)
+        )
+        assert_the_owner_was_not_refused(deleted, "delete_session of its lineage")
+        assert deleted is True, (
             "the owner's own delete of its own lineage was refused; the "
-            "affected-set rule must exempt the root its grant authorizes"
+            f"affected-set rule must exempt the root its grant authorizes "
+            f"({deleted!r})"
         )
         assert not _exists(db, "p")
         assert _parent_of(db, "c") is None
