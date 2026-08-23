@@ -3568,10 +3568,25 @@ def check_an_artifact_whose_image_is_incomplete_is_refused(
     payload = _payload(run)
     assert payload is not None, f"no machine-readable report: {run.stdout!r}"
 
-    assert payload["refused"]["reason"] == "target-not-quiesced", (
+    assert (payload.get("refused") or {}).get("reason") == "target-not-quiesced", (
         "an artifact whose committed state lives outside its main file was "
         f"accepted, and every later claim is about a different database: "
-        f"{payload['refused']!r}"
+        f"{payload.get('refused')!r}"
+    )
+    # THE REASON ALONE IS NOT THIS PIN'S PROPERTY. The authority gate refuses
+    # the same artifact for the same reason at the END of the run, so asserting
+    # only the reason passes whether or not the image was ever checked — a
+    # redundant guarantee reporting coverage it does not have. What this pin
+    # owns is that the refusal happens BEFORE anything is derived from a short
+    # image: nothing may be prepared, rehearsed or backed up from it.
+    rehearsal = payload.get("rehearsal") or {}
+    assert rehearsal.get("outcome") == "not-started", (
+        "the run built a working object out of an image that is missing "
+        "committed rows and rehearsed the rollback against it before refusing: "
+        f"{rehearsal!r}"
+    )
+    assert rehearsal.get("backup_created") in (False, None), (
+        f"a backup was taken from an incomplete image: {rehearsal!r}"
     )
     assert payload["changed"] is False
     assert not backup.exists(), "a refused run wrote a backup"
@@ -3750,6 +3765,53 @@ def test_sessions_fence_rollback_verb_property(name, tmp_path):
 
 
 SOURCE_MUTATIONS = (
+    Mutation(
+        pin="check_the_verb_is_registered_under_sessions_and_names_its_target",
+        module="hermes_cli/session_fence_rollback_cmd.py",
+        find='        "fence-rollback",\n        help=(\n',
+        replace='        "fence-rollback-disabled",\n        help=(\n',
+        why="SECOND CONJUNCT: registered UNDER SESSIONS. The other row attacks "
+            "the target being named; nothing attacked the verb existing at the "
+            "name an operator types, so a rename to anything at all would have "
+            "left the table green",
+    ),
+    Mutation(
+        pin="check_no_in_place_run_succeeds_and_each_wrong_target_names_its_own_reason",
+        module="hermes_cli/session_fence_rollback.py",
+        find='        "database — so nothing available proves which store an artifact is or "\n'
+             '        "that it is detached. Nothing was changed",\n'
+             '        reason=DISQUALIFICATION_REASONS["unknown"],\n',
+        replace='        "database", reason=DISQUALIFICATION_REASONS["unknown"],\n'
+                "    ) if False else None\n    return None\n    raise TurnFenceRollbackRefused(\n"
+                '        "unreachable",\n        reason=DISQUALIFICATION_REASONS["unknown"],\n',
+        why="SECOND CONJUNCT: NO in-place run succeeds. The other row collapses "
+            "the four reasons into one, which leaves every target still "
+            "refused; this one lets an ordinary idle store through, which is "
+            "the fail-closed half and the whole contract",
+    ),
+    Mutation(
+        pin="check_the_boundary_decides_liveness_again_keyed_by_the_operators_store",
+        module="hermes_cli/session_fence_rollback.py",
+        find="        private_copy.verify()\n"
+             "        _decide_under_the_lock(conn, reported, expected, bound=None)\n",
+        replace="        private_copy.verify()\n",
+        why="SECOND CONJUNCT: decides AGAIN. The other row attacks the keying "
+            "and leaves the re-decision standing; this one deletes the "
+            "re-decision and leaves the keying intact, so the boundary trusts "
+            "the pre-flight's snapshot. That is the TOCTOU half, and it is the "
+            "property the merged-away pin used to own",
+    ),
+    Mutation(
+        pin="check_the_dry_run_reports_the_plan_and_changes_no_byte",
+        module="hermes_cli/session_fence_rollback.py",
+        find="        owned = _live_holders_inside_the_transaction(prepared.connection, copy)\n",
+        replace="        owned = _live_holders_inside_the_transaction(prepared.connection, copy)\n"
+                "        SessionDB(db_path=store_path).close()\n",
+        why="SECOND CONJUNCT: changes NO BYTE. The other row makes the dry run "
+            "fall through and stop reporting a plan, while still touching "
+            "nothing; this one opens the operator's store during the dry run, "
+            "and SessionDB's schema init writes",
+    ),
     Mutation(
         pin="check_the_verb_is_registered_under_sessions_and_names_its_target",
         module="hermes_cli/session_fence_rollback_cmd.py",
