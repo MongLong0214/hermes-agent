@@ -302,6 +302,15 @@ def cmd_sessions(args, sessions_parser=None):
         print("  Do not install it. Review the JSON report for partial data or errors.")
         return 1
 
+    if action == "fence-rollback":
+        # Also before SessionDB(): the target is the store the operator NAMED.
+        # Opening this process's own default store to service a rollback of a
+        # different file is a write nobody asked for — and on a store whose
+        # schema is mid-downgrade it is the write that damages it.
+        from hermes_cli.session_fence_rollback_cmd import run_fence_rollback
+
+        return run_fence_rollback(args)
+
     if action == "import":
         from hermes_cli.foreign_sessions import run_sessions_import
 
