@@ -43,6 +43,15 @@ WHY IT EXISTS ANYWAY
        first ``DROP``; anything unexpected refuses the whole operation, and the
        drops commit together or not at all.
 
+WHO CALLS IT
+    ``hermes sessions fence-rollback`` — :mod:`hermes_cli.session_fence_rollback_cmd`
+    — and nothing else in the tree. A library function is not an operator
+    surface: it has no exit code, no way to name which precondition stopped it,
+    and no rehearsal, so the runbook entry for it is a Python one-liner. The
+    verb supplies those three and re-derives none of this: it hands
+    :func:`preflight_turn_fence_rollback` and :func:`rollback_turn_fence` a
+    store and a backup path the operator typed, and reports what they return.
+
 THE RETURN LEG
     Rollback is not a one-way door. ``_init_schema`` creates the triggers with
     ``CREATE TRIGGER IF NOT EXISTS`` on every open, so a current binary
