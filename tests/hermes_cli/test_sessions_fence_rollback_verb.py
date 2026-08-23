@@ -1614,6 +1614,10 @@ def check_no_in_place_run_succeeds_and_each_wrong_target_names_its_own_reason(
 
     home = pathlib.Path(os.environ["HERMES_HOME"])
 
+    # Each case is a target and, where the case IS a sidecar, the sidecar to
+    # plant. It is planted AFTER the rows are read, because reading a store
+    # with a hot journal beside it makes SQLite roll the journal back and
+    # remove it — the fixture would have deleted the condition it is for.
     cases = {}
 
     # (1) UNTRUSTED NAMESPACE — a second hard link on the artifact.
@@ -1622,12 +1626,12 @@ def check_no_in_place_run_succeeds_and_each_wrong_target_names_its_own_reason(
     shared = shared_dir / "state.db"
     _fenced_store(shared, leave_lease_live=False)
     os.link(shared, shared_dir / "also-state.db")
-    cases["target-untrusted-namespace"] = shared
+    cases["target-untrusted-namespace"] = (shared, None)
 
     # (2) CANONICAL — the store this build would open with no argument at all.
     canonical = home / "state.db"
     _fenced_store(canonical, leave_lease_live=False)
-    cases["canonical-store-target"] = canonical
+    cases["canonical-store-target"] = (canonical, None)
 
     # (3) NOT QUIESCED — a sidecar beside it. Written rather than produced by
     #     an open connection so the leg means the same thing on the DELETE-mode
@@ -1637,8 +1641,9 @@ def check_no_in_place_run_succeeds_and_each_wrong_target_names_its_own_reason(
     attached_dir.mkdir()
     attached = attached_dir / "state.db"
     _fenced_store(attached, leave_lease_live=False)
-    attached.with_name(attached.name + "-journal").write_bytes(b"a hot journal")
-    cases["target-not-quiesced"] = attached
+    cases["target-not-quiesced"] = (
+        attached, attached.with_name(attached.name + "-journal")
+    )
 
     # (4) EVERYTHING ELSE — a perfectly ordinary, idle, fully fenced store,
     #     which is the case the retired design called a success.
@@ -1646,17 +1651,18 @@ def check_no_in_place_run_succeeds_and_each_wrong_target_names_its_own_reason(
     plain_dir.mkdir()
     plain = plain_dir / "state.db"
     _fenced_store(plain, leave_lease_live=False)
-    cases["offline-authority-unknown"] = plain
+    cases["offline-authority-unknown"] = (plain, None)
 
     observed = {}
-    for reason, store in sorted(cases.items()):
+    for reason, (store, sidecar) in sorted(cases.items()):
         backup = store.parent / "backup.db"
-        before = (
-            _store_digest(store),
-            sorted(entry.name for entry in store.parent.iterdir()),
-            _canonical_rows(store),
-            _installed_triggers(store),
-        )
+        rows_before = _canonical_rows(store)
+        triggers_before = _installed_triggers(store)
+        if sidecar is not None:
+            sidecar.write_bytes(b"a journal from a write that was interrupted")
+        digest_before = _store_digest(store)
+        listing_before = sorted(entry.name for entry in store.parent.iterdir())
+
         run = _run_verb(store, backup)
         assert not run.crash, f"the verb crashed on the {reason} case: {run.crash}"
         payload = _payload(run)
@@ -1679,20 +1685,24 @@ def check_no_in_place_run_succeeds_and_each_wrong_target_names_its_own_reason(
             "wrong targets that print the same reason leave the operator with "
             "one next move for four different situations"
         )
-        assert _store_digest(store) == before[0], (
-            f"the {reason} refusal rewrote the artifact: {before[0]} -> "
+        assert _store_digest(store) == digest_before, (
+            f"the {reason} refusal rewrote the artifact: {digest_before} -> "
             f"{_store_digest(store)}"
         )
-        assert sorted(entry.name for entry in store.parent.iterdir()) == before[1], (
+        assert sorted(entry.name for entry in store.parent.iterdir()) == listing_before, (
             f"the {reason} refusal changed the artifact's directory: "
             f"{sorted(entry.name for entry in store.parent.iterdir())}"
         )
-        assert _canonical_rows(store) == before[2], f"{reason} moved rows"
-        assert _installed_triggers(store) == before[3], (
-            f"the {reason} refusal dropped fence triggers"
-        )
         assert not backup.exists(), (
             f"the {reason} refusal wrote a backup for a rollback that never ran"
+        )
+        if sidecar is not None:
+            # Removed only now, so the rows can be read without SQLite
+            # rolling the journal back mid-assertion.
+            sidecar.unlink()
+        assert _canonical_rows(store) == rows_before, f"{reason} moved rows"
+        assert _installed_triggers(store) == triggers_before, (
+            f"the {reason} refusal dropped fence triggers"
         )
 
     assert len(set(observed.values())) == len(observed), (
@@ -1833,24 +1843,29 @@ def check_a_partial_destination_collision_keeps_only_what_the_run_created(
     second is the one that gets dropped: refuse, and then remove ONLY what this
     run created.
 
-    ENTERED AT THE BOUNDARY, WITH THE TARGET PREPARED. Driving this through the
-    rehearsal does not reach the seam: the pre-flight opens its working copy as
-    a store, and on a build that falls back to ``journal_mode=DELETE`` the copy
-    has no sidecars by the time the backup runs, so the sidecar collision never
-    happens and the run refuses earlier for an unrelated reason. A RED that reds
-    somewhere else goes green the moment that somewhere else is fixed. So the
-    target is a disposable copy this pin prepares, in WAL with real frames on
-    both builds, and the production boundary is entered directly — the same
-    connection, backup helper, DDL and cleanup the rehearsal drives.
+    ENTERED WITH THE PRODUCTION PREPARER'S OWN TARGET. The boundary takes a
+    private copy that :func:`prepare_the_private_copy` returns, and nothing
+    else can produce one — so this pin cannot mint its way in either, which is
+    the point of the seal. Driving it through the rehearsal instead does not
+    reach this seam on a build that falls back to ``journal_mode=DELETE``, and
+    a RED that reds somewhere else goes green when that somewhere else is
+    fixed.
 
     THE PHASE EVENT IS THE ACQUISITION ITSELF. Every exclusive create the run
     makes is recorded, so "it reached the collision after acquiring the main
     destination" is observed rather than inferred from the outcome. A run whose
     acquisitions cannot be seen does not pass this — for a check, silence is
     not evidence.
-    """
-    import inspect
 
+    NOTHING IS CLAIMED ABOUT A BACKUP THAT DOES NOT EXIST. The snapshot in the
+    private staging directory is created and verified before the destination is
+    touched, and it is not the operator's backup: reporting ``backup_created``
+    when IT appears leaves the ledger saying a backup was made and verified
+    while the collision path has just removed every file. So the public facts
+    are asserted false here, and the directory is asserted to hold nothing this
+    run put in it — including the staging directory, which lives beside the
+    BACKUP and not in the work dir the residue pin watches.
+    """
     _sandbox_home(tmpdir)
     module, why = _import_verb()
     assert module is not None, f"there is no fence-rollback verb: {why}"
@@ -1862,17 +1877,11 @@ def check_a_partial_destination_collision_keeps_only_what_the_run_created(
 
     work_dir = tmpdir / "work"
     work_dir.mkdir()
-    target = work_dir / "target.db"
-    shutil.copyfile(store, target)
-    # Real WAL frames, on both builds, so the destination family the backup
-    # step has to acquire actually includes the sidecar being squatted on.
-    _commit_a_marker_that_lives_only_in_the_wal(target, "collision-fixture")
-    assert {target.name + "-wal", target.name + "-shm"} <= _family_beside(target), (
-        f"the fixture target has no sidecars: {sorted(_family_beside(target))}"
-    )
+    prepared = library.prepare_the_private_copy(store, work_dir=work_dir)
+    target = pathlib.Path(prepared.path)
     target_triggers = _installed_triggers(target)
     assert target_triggers == sorted(hermes_state_common.TURN_FENCE_TRIGGERS), (
-        f"the disposable target is not a fenced store: {target_triggers}"
+        f"the prepared copy is not a fenced store: {target_triggers}"
     )
 
     backup = work_dir / "backup.db"
@@ -1910,15 +1919,10 @@ def check_a_partial_destination_collision_keeps_only_what_the_run_created(
             planted["fired"] = True
             squatter.write_bytes(squatter_bytes)
 
-    kwargs = {"report_as": store}
-    # The authority the boundary requires, if it requires one. This pin is
-    # about destination acquisition; which targets may be rolled back at all is
-    # the subject of the in-place pin, and is not re-litigated here.
-    parameters = inspect.signature(library._commit_the_rollback).parameters
-    if "authority" in parameters:
-        kwargs["authority"] = library.authority_over_a_copy_this_run_made(
-            target, work_dir
-        )
+    outcome = library.RollbackOutcome()
+    # What is in the destination's directory before the run: the private copy
+    # the preparer made, and nothing else. The squatter arrives during it.
+    listing_before = sorted(entry.name for entry in work_dir.iterdir())
 
     library._refuse_unusable_backup_path = _a_sidecar_appears_after_the_check
     had_os = hasattr(library, "os")
@@ -1927,8 +1931,8 @@ def check_a_partial_destination_collision_keeps_only_what_the_run_created(
     refusal = {"reason": "", "detail": "", "returned": None, "crash": ""}
     try:
         refusal["returned"] = library._commit_the_rollback(
-            target, backup, sorted(hermes_state_common.TURN_FENCE_TRIGGERS),
-            **kwargs,
+            prepared, backup, sorted(hermes_state_common.TURN_FENCE_TRIGGERS),
+            report_as=store, outcome=outcome,
         )
     except library.TurnFenceRollbackRefused as exc:
         refusal["reason"] = getattr(exc, "reason", "refused")
@@ -1966,6 +1970,25 @@ def check_a_partial_destination_collision_keeps_only_what_the_run_created(
         "the refused run left its own half-built destination behind: "
         f"{sorted(_family_beside(backup))}. An operator who retries now hits a "
         "collision this run manufactured"
+    )
+    assert sorted(entry.name for entry in work_dir.iterdir()) == sorted(
+        listing_before + [squatter.name]
+    ), (
+        "the refused run left something in the destination's directory that "
+        "was not there before and is not the squatter — the staging directory "
+        "lives HERE, beside the backup, not in the work dir the residue pin "
+        f"watches: {sorted(entry.name for entry in work_dir.iterdir())}"
+    )
+    facts = outcome.facts()
+    assert facts["backup_created"] is False, (
+        "the ledger says a backup was created and there is no backup: the "
+        f"private staging snapshot is not the operator's backup: {facts!r}"
+    )
+    assert facts["backup_verified"] is False, (
+        f"the ledger verifies a backup that does not exist: {facts!r}"
+    )
+    assert facts["backup"] is None, (
+        f"the ledger carries a backup record for no backup: {facts!r}"
     )
     assert _installed_triggers(target) == target_triggers, (
         "the run dropped triggers on a rollback whose backup never landed"

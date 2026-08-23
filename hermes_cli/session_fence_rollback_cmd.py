@@ -129,7 +129,7 @@ def run_fence_rollback(args) -> int:
 
 
 def _report_rehearsal(store: Path, backup: Path, work_parent: Path = None) -> int:
-    """``--dry-run``: rehearse on a copy, report the plan, touch nothing.
+    """``--dry-run``: rehearse on a copy, report the plan AND the verdict.
 
     THE COPY DOES NOT GO IN THE OPERATOR'S DIRECTORY. An earlier version put it
     beside the store, reasoning that a hidden subdirectory removed in a
@@ -138,6 +138,12 @@ def _report_rehearsal(store: Path, backup: Path, work_parent: Path = None) -> in
     is sitting next to the original with nothing to draw attention to it.
     ``mkdtemp`` is 0700 and lives where the platform already expects disposable
     copies; ``--work-dir`` moves it for a store too large for that volume.
+
+    THE REHEARSAL COMPLETING IS NOT THE REAL RUN PROCEEDING. The rollback is
+    permitted only on an artifact whose offline authority was established
+    elsewhere, and the copy this rehearsal makes is the only artifact that
+    qualifies. So a dry run reports both: what the operation did on the copy,
+    and the refusal the operator will get if they type the real command.
     """
     import tempfile
 
@@ -161,12 +167,13 @@ def _report_rehearsal(store: Path, backup: Path, work_parent: Path = None) -> in
         return _emit_refusal(
             _unexpected(exc), store=store, backup=backup, dry_run=True
         )
+    outcome = rollback.RollbackOutcome()
     plan = None
     refusal = None
     try:
         try:
             plan = rollback.rehearse_turn_fence_rollback(
-                store, backup_path=backup, work_dir=work_dir
+                store, backup_path=backup, work_dir=work_dir, outcome=outcome
             )
         except rollback.TurnFenceRollbackRefused as exc:
             refusal = exc
@@ -174,6 +181,19 @@ def _report_rehearsal(store: Path, backup: Path, work_parent: Path = None) -> in
             refusal = _unexpected(exc)
     finally:
         residue = rollback.sweep_work_dir(work_dir)
+        outcome.residue_present = residue is not None
+
+    # WHAT THE REHEARSAL ESTABLISHED, decided by the steps that established it.
+    # Read from the outcome the run wrote into rather than from a report it may
+    # never have returned: a fault after the rehearsal's COMMIT raises, and a
+    # caller that reads only the return value concludes nothing happened.
+    established = getattr(refusal, "established", None)
+    rehearsal_facts = dict(outcome.facts())
+    if isinstance(established, dict) and isinstance(
+        established.get("rehearsal"), dict
+    ):
+        rehearsal_facts = dict(established["rehearsal"])
+    rehearsal_facts["residue_present"] = residue is not None
 
     # RESIDUE OUTRANKS EVERY OTHER OUTCOME OF A DRY RUN. What is left in there
     # is a rolled-back — that is, UNFENCED — duplicate of every conversation in
@@ -190,10 +210,21 @@ def _report_rehearsal(store: Path, backup: Path, work_parent: Path = None) -> in
                 reason="rehearsal-residue",
             ),
             store=store, backup=backup, dry_run=True,
+            preflight=(established or {}).get("preflight"),
+            rehearsal=rehearsal_facts,
+            would_drop=(established or {}).get("would_drop"),
+            installed_triggers=(established or {}).get("installed_triggers"),
         )
     if refusal is not None:
-        return _emit_refusal(refusal, store=store, backup=backup, dry_run=True)
+        return _emit_refusal(
+            refusal, store=store, backup=backup, dry_run=True,
+            rehearsal=rehearsal_facts,
+            would_drop=(established or {}).get("would_drop"),
+            installed_triggers=(established or {}).get("installed_triggers"),
+        )
 
+    # Unreachable while nothing can establish offline authority over the
+    # operator's artifact; kept honest rather than asserted away.
     _emit(
         {
             "verb": _VERB,
@@ -207,18 +238,14 @@ def _report_rehearsal(store: Path, backup: Path, work_parent: Path = None) -> in
             "would_drop": plan["would_drop"],
             "dropped_triggers": [],
             "preflight": plan["preflight"],
-            # The private directory the rehearsal worked in, so a pin — or an
-            # operator — can check that it is gone rather than checking a
-            # location this code might move next. Naming it here is what stops
-            # the observation going blind when the work relocates.
-            "rehearsal_work_dir": plan["rehearsal"]["work_dir"],
+            "rehearsal": rehearsal_facts,
         }
     )
     return 0
 
 
 def _report_rollback(store: Path, backup: Path) -> int:
-    """The real run. Pre-flight first, and its result is part of the report."""
+    """The real run. It refuses, and the report says which refusal it is."""
     import tempfile
 
     from hermes_cli import session_fence_rollback as rollback
@@ -230,16 +257,13 @@ def _report_rollback(store: Path, backup: Path) -> int:
             _unexpected(exc), store=store, backup=backup, dry_run=False
         )
 
+    outcome = rollback.RollbackOutcome()
     report = None
     refusal = None
     try:
         try:
-            # ONE call. `rollback_turn_fence` runs the pre-flight itself and
-            # returns its result — driving the pre-flight separately here ran
-            # it twice against the same working directory, which the exclusive
-            # create correctly refused as a collision with our own first copy.
             report = rollback.rollback_turn_fence(
-                store, backup_path=backup, work_dir=work_dir
+                store, backup_path=backup, work_dir=work_dir, outcome=outcome
             )
         except rollback.TurnFenceRollbackRefused as exc:
             refusal = exc
@@ -250,22 +274,32 @@ def _report_rollback(store: Path, backup: Path) -> int:
             refusal = _unexpected(exc)
     finally:
         residue = rollback.sweep_work_dir(work_dir)
+        outcome.residue_present = residue is not None
 
-    # THE FACTS THE RUN ESTABLISHED, decided by the step that established
-    # them. Whatever goes wrong after this point reports on top of these — it
-    # does not get to rewrite them. A run whose fence came off and whose backup
-    # landed says so even when cleanup then fails, because an operator told
-    # "nothing was changed" stops looking for a store they now have to restore.
-    established = (
-        {
-            "changed": True,
-            "backup": report["backup"],
-            "installed_triggers": report["installed_triggers"],
-            "dropped_triggers": report["dropped_triggers"],
-        }
-        if report is not None
-        else {"changed": False}
-    )
+    # THE FACTS THE RUN ESTABLISHED, read from the object the run wrote into
+    # and not from a report it may never have returned. Whatever goes wrong
+    # after a step does not get to rewrite what that step established: a run
+    # whose fence came off and whose backup landed says so even when cleanup
+    # then fails, because an operator told "nothing was changed" stops looking
+    # for a store they now have to restore.
+    established = {
+        "changed": outcome.changed,
+        "outcome": outcome.outcome,
+        "backup_created": outcome.backup_created,
+        "backup_verified": outcome.backup_verified,
+        "backup_durable": outcome.backup_durable,
+        "residue_present": outcome.residue_present,
+    }
+    if outcome.backup is not None:
+        established["backup"] = outcome.backup
+    if report is not None:
+        established["installed_triggers"] = report["installed_triggers"]
+        established["dropped_triggers"] = report["dropped_triggers"]
+    elif outcome.outcome in ("committing", "committed", "commit-unknown"):
+        # The drops were issued. Naming them from the plan rather than from a
+        # report that never came back is the difference between an operator who
+        # knows what to look for and one who is told there is nothing to find.
+        established["dropped_triggers"] = sorted(rollback.rollback_trigger_names())
 
     if residue is not None:
         # Same rule as the dry run, and it applies even when the rollback
@@ -305,6 +339,7 @@ def _report_rollback(store: Path, backup: Path) -> int:
             "installed_triggers": report["installed_triggers"],
             "dropped_triggers": report["dropped_triggers"],
             "preflight": report["preflight"],
+            "outcome": outcome.outcome,
         }
     )
     return 0
@@ -327,6 +362,9 @@ def _emit_refusal(
     dry_run: bool,
     preflight: dict | None = None,
     established: dict | None = None,
+    rehearsal: dict | None = None,
+    would_drop: list | None = None,
+    installed_triggers: list | None = None,
 ) -> int:
     """Report a failure WITHOUT retracting what already happened.
 
@@ -334,8 +372,8 @@ def _emit_refusal(
     cleanup blocker was residue on disk while claiming success; flattening
     `changed`, `dropped_triggers` and the backup into their empty values on
     every error path is the same defect pointed the other way, and worse — an
-    operator told "Nothing was changed." after twenty-four triggers came off
-    stops looking, because they have been told there is nothing to find.
+    operator told "Nothing was changed." after the fence came off stops
+    looking, because they have been told there is nothing to find.
 
     So failure precedence decides the exit status and the primary reason.
     *established* decides the outcome fields, and it is whatever the run
@@ -346,28 +384,34 @@ def _emit_refusal(
     import hermes_state_common
 
     facts = dict(established or {})
-    _emit(
-        {
-            "verb": _VERB,
-            "ok": False,
-            "dry_run": dry_run,
-            "changed": bool(facts.get("changed", False)),
-            "store": str(store),
-            "backup": facts.get("backup", str(backup)),
-            "generation": hermes_state_common.TURN_FENCE_GENERATION,
-            "installed_triggers": facts.get("installed_triggers", []),
-            "dropped_triggers": facts.get("dropped_triggers", []),
-            "preflight": (
-                preflight
-                or getattr(exc, "preflight", None)
-                or rollback._blank_preflight()
-            ),
-            "refused": {
-                "reason": getattr(exc, "reason", "refused"),
-                "detail": str(exc),
-            },
-        }
-    )
+    payload = {
+        "verb": _VERB,
+        "ok": False,
+        "dry_run": dry_run,
+        "changed": facts.get("changed", False),
+        "outcome": facts.get("outcome", "not-started"),
+        "store": str(store),
+        "backup": facts.get("backup", str(backup)),
+        "generation": hermes_state_common.TURN_FENCE_GENERATION,
+        "installed_triggers": facts.get(
+            "installed_triggers", installed_triggers or []
+        ),
+        "dropped_triggers": facts.get("dropped_triggers", []),
+        "preflight": (
+            preflight
+            or getattr(exc, "preflight", None)
+            or rollback._blank_preflight()
+        ),
+        "refused": {
+            "reason": getattr(exc, "reason", "refused"),
+            "detail": str(exc),
+        },
+    }
+    if rehearsal is not None:
+        payload["rehearsal"] = rehearsal
+    if would_drop is not None:
+        payload["would_drop"] = would_drop
+    _emit(payload)
     return 1
 
 
@@ -382,7 +426,8 @@ def _human_lines(payload: dict[str, Any]) -> list:
     if not payload.get("ok"):
         refused = payload.get("refused", {})
         lines = [f"✗ {refused.get('reason')}: {refused.get('detail')}"]
-        if payload.get("changed"):
+        rehearsal = payload.get("rehearsal") or {}
+        if payload.get("changed") is True:
             # The run got further than the failure suggests. Saying "nothing
             # was changed" here would send the operator away from a store whose
             # fence is already off and a backup they need to keep.
@@ -395,6 +440,25 @@ def _human_lines(payload: dict[str, Any]) -> list:
             backup = payload.get("backup")
             if isinstance(backup, dict) and backup.get("path"):
                 lines.append(f"  Verified backup: {backup['path']}")
+        elif payload.get("changed") is None:
+            lines.append(
+                "  WHETHER THE ROLLBACK LANDED IS UNKNOWN. The COMMIT was "
+                "issued and did not report back, so the fence may or may not "
+                "still be installed — check the store before doing anything "
+                "else, and keep the backup."
+            )
+        elif rehearsal.get("changed") is None:
+            lines.append(
+                "  The store was not modified. The rehearsal's own commit on a "
+                "disposable copy did not report back, which is a fault in this "
+                "run and not in your store."
+            )
+        elif rehearsal.get("changed") is True:
+            lines.append(
+                "  The store was not modified. The rehearsal performed the "
+                "rollback on a disposable copy, so the refusal above is the "
+                "verdict on the real run, not a failure to run one."
+            )
         else:
             lines.append("  Nothing was changed.")
         return lines
