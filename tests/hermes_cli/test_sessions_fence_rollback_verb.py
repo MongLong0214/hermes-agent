@@ -3582,8 +3582,8 @@ SOURCE_MUTATIONS = (
     Mutation(
         pin="check_a_late_failure_does_not_retract_what_already_happened",
         module="hermes_cli/session_fence_rollback_cmd.py",
-        find='                    "rehearsal-completed-with-residue"\n',
-        replace='                    "rehearsal-residue"\n',
+        find="    rehearsal_facts = dict(outcome.facts())\n",
+        replace="    rehearsal_facts = {}\n",
         why="collapsing the two situations into one reason makes a directory "
             "holding an UNFENCED duplicate indistinguishable from one holding "
             "a copy that still carries the fence. Same words, opposite "
@@ -3781,8 +3781,9 @@ SOURCE_MUTATIONS = (
     Mutation(
         pin="check_the_backups_directory_entry_is_flushed_too",
         module="hermes_cli/session_fence_rollback.py",
-        find="        reservation.release_the_sidecars()\n        _fsync_the_directory(backup_path.parent)\n",
-        replace="        reservation.release_the_sidecars()\n",
+        find="        reservation.release_the_sidecars(outcome=outcome)\n"
+             "        _fsync_the_directory(backup_path.parent)\n",
+        replace="        reservation.release_the_sidecars(outcome=outcome)\n",
         why="the file's contents are durable and its NAME is not, so the "
             "crash leaves a backup nothing can find. The file fsync left in "
             "place does not cover it — they are different objects",
