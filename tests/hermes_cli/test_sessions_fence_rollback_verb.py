@@ -1492,29 +1492,48 @@ def check_the_completed_run_reports_the_surface_it_removed(
 # code. A helper whose greenness comes from never running is not covered.
 # ---------------------------------------------------------------------------
 
-def _give_the_store_free_pages(store: pathlib.Path) -> int:
-    """Leave real free pages in the artifact, and say how many.
+def _commit_a_marker_that_lives_only_in_the_wal(
+    store: pathlib.Path, marker: str
+) -> None:
+    """Commit *marker* into an UNCHECKPOINTED WAL frame, and leave it there.
 
-    A logical backup (``VACUUM INTO``) rebuilds the database and therefore has
-    NO freelist; a byte copy reproduces the freelist exactly. That difference is
-    the only build-independent way to tell the two apart from the outside — the
-    sidecar difference is not, because this program runs ``journal_mode=DELETE``
-    on a SQLite that carries the WAL-reset bug and ``wal`` on one that does not.
+    The child exits with ``os._exit`` on purpose. Closing a SQLite connection
+    normally checkpoints and removes the ``-wal``, so a marker committed and
+    then closed politely ends up in the MAIN FILE and proves nothing — measured
+    on both builds, and it is what the retired chimera fixture was actually
+    doing while its docstring claimed otherwise. A hard exit skips the close
+    path entirely, which is also exactly what an interrupted detach leaves
+    behind.
 
-    The scratch table is created and dropped through a RAW connection on
-    purpose: it is not a fenced table, so no turn-lease trigger applies, and the
-    rows the fence protects are left exactly as the fixture wrote them.
+    ``journal_mode=WAL`` is set here rather than inherited: this program opens
+    ``journal_mode=DELETE`` on a SQLite build carrying the WAL-reset bug, and
+    the property under test is about committed state living outside the main
+    file, not about that fallback. A scratch table, because a raw handle
+    writing a fenced table is refused by the generation trigger, correctly.
     """
-    conn = sqlite3.connect(str(store), isolation_level=None)
-    try:
-        conn.execute("CREATE TABLE _rollback_scratch(x TEXT)")
-        conn.executemany(
-            "INSERT INTO _rollback_scratch VALUES (?)", [("z" * 2000,)] * 500
-        )
-        conn.execute("DROP TABLE _rollback_scratch")
-        return int(conn.execute("PRAGMA freelist_count").fetchone()[0])
-    finally:
-        conn.close()
+    child = subprocess.run(
+        [
+            sys.executable, "-c",
+            textwrap.dedent(
+                """
+                import os, sqlite3, sys
+                conn = sqlite3.connect(sys.argv[1], isolation_level=None)
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA wal_autocheckpoint=0")
+                conn.execute("CREATE TABLE IF NOT EXISTS wal_marker (who TEXT)")
+                conn.execute(
+                    "INSERT INTO wal_marker (who) VALUES (?)", (sys.argv[2],)
+                )
+                os._exit(0)
+                """
+            ),
+            str(store), marker,
+        ],
+        capture_output=True, text=True, env=dict(os.environ), timeout=120,
+    )
+    assert child.returncode == 0, (
+        f"the WAL-marker child failed: {child.returncode} {child.stderr}"
+    )
 
 
 def _pragma(path: pathlib.Path, pragma: str):
@@ -1684,29 +1703,31 @@ def check_no_in_place_run_succeeds_and_each_wrong_target_names_its_own_reason(
 def check_the_backup_is_a_logical_copy_that_restores_the_pre_rollback_state(
     tmpdir: pathlib.Path,
 ) -> None:
-    """A backup is proven by RESTORING it, and it is taken by the engine.
+    """A backup is proven by RESTORING it, and it captures COMMITTED state.
 
-    Two separate claims, and the second is what makes the first checkable.
+    Two claims, and the second is what makes the first mean anything.
 
-    IT IS PRODUCED BY SQLITE, ON THE SOURCE CONNECTION. ``VACUUM INTO`` (this
-    repo already uses it, ``hermes_state.py:14858``) writes a database the
-    engine built from the source's own pages, so it is internally consistent by
-    construction. A byte copy is consistent only if nothing was writing, which
-    is the thing that cannot be established here. The two are told apart from
-    outside by the FREELIST: a rebuilt database has none, a byte copy
-    reproduces it exactly. That discriminator is build-independent, which the
-    sidecar one is not — this program runs ``journal_mode=DELETE`` on a SQLite
-    carrying the WAL-reset bug and ``wal`` on one that does not.
+    IT IS TAKEN BY SQLITE, FROM THE SOURCE CONNECTION. Whether that is
+    ``VACUUM INTO`` (this repo already uses it, ``hermes_state.py:14858``) or
+    the online backup API is not this pin's business — both produce a database
+    the engine assembled from the source's committed view, and the property is
+    what they have in common, not the artifact one of them happens to leave.
+    A copy of the main file has neither: it reproduces whatever bytes are on
+    disk, and committed state does not have to be there yet. So the artifact
+    carries a row that is COMMITTED and lives only in an uncheckpointed
+    ``-wal`` — asserted as bytes, in the main file and in the sidecar, before
+    anything is copied — and the restored backup has to contain it.
 
-    IT RESTORES. Not "it opens" — the earlier version proved the backup by
-    opening it, and a file that opens can still be missing every row the
-    operator would need. So the backup is copied to a fresh path, opened as a
-    STORE, and its rows are compared against the ones the artifact carried
-    BEFORE the rollback, with the fence surface it carried then still on it.
+    IT RESTORES. Not "it opens" — an earlier version proved the backup by
+    opening it, and a file that opens can be missing every row the operator
+    needs. So it is copied to a fresh path, read as a store, and compared
+    against what the artifact carried BEFORE the rollback: the rows, and the
+    fence surface that was still on it then.
 
-    The ``-shm`` assertion is not decoration. A backup that arrives with a
-    shared-memory file beside it hands the next reader a coordination file for a
-    connection that no longer exists.
+    The ``-shm`` leg is observed on the FILE SET before the backup is opened,
+    because opening a WAL-mode database is itself enough to create one. A
+    backup that arrives with a shared-memory file beside it hands its next
+    reader a coordination file for a connection that no longer exists.
     """
     _sandbox_home(tmpdir)
     module, why = _import_verb()
@@ -1716,13 +1737,21 @@ def check_the_backup_is_a_logical_copy_that_restores_the_pre_rollback_state(
 
     store = tmpdir / "state.db"
     _fenced_store(store, leave_lease_live=False)
-    free_before = _give_the_store_free_pages(store)
-    assert free_before > 0, (
-        "the fixture left no free pages, so a byte copy and a logical backup "
-        "would be indistinguishable and this pin would measure nothing"
-    )
     rows_before = _canonical_rows(store)
     triggers_before = _installed_triggers(store)
+
+    marker = "committed-but-not-checkpointed"
+    _commit_a_marker_that_lives_only_in_the_wal(store, marker)
+    wal = store.with_name(store.name + "-wal")
+    assert wal.is_file() and marker.encode() in wal.read_bytes(), (
+        "the fixture did not leave the row in an uncheckpointed -wal, so a "
+        "copy of the main file would carry it and this pin would measure "
+        f"nothing: {sorted(_family_beside(store))}"
+    )
+    assert marker.encode() not in store.read_bytes(), (
+        "the row reached the MAIN file, so it is not committed state living "
+        "outside it and the property under test is not exercised"
+    )
 
     work_dir = tmpdir / "work"
     work_dir.mkdir()
@@ -1735,27 +1764,42 @@ def check_the_backup_is_a_logical_copy_that_restores_the_pre_rollback_state(
         f"{backup}: {sorted(p.name for p in work_dir.iterdir())} "
         f"(refusal: {outcome['reason']} {outcome['detail']})"
     )
-    # The FILE SET, read before anything opens the backup — opening a WAL-mode
-    # database is itself enough to create the -shm this leg is about.
+    # THE FILE SET FIRST. Opening the backup can create the -shm this asserts
+    # the absence of, so the observation has to precede the open.
     assert _family_beside(backup) == {backup.name}, (
-        "the backup arrived as a FAMILY of files. A logical backup is one "
-        f"database and nothing else: {sorted(_family_beside(backup))}"
+        "the backup arrived as a FAMILY of files. What the engine hands back "
+        "is one database and nothing else: "
+        f"{sorted(_family_beside(backup))}"
     )
 
-    assert _pragma(backup, "freelist_count") == 0, (
-        f"the backup carries {_pragma(backup, 'freelist_count')} free page(s), "
-        f"and the source carried {free_before}. It was copied, not written by "
-        "the engine from the source connection — so nothing about it is "
-        "internally consistent that was not already consistent on disk"
-    )
     assert _pragma(backup, "integrity_check") == "ok", (
         f"the backup does not pass integrity_check: "
         f"{_pragma(backup, 'integrity_check')!r}"
     )
 
-    # RESTORE IT. A copy to a path nothing else knows, opened as a store.
+    # RESTORE IT — a copy to a path nothing else knows, read as a store.
     restored = tmpdir / "restored.db"
     shutil.copyfile(backup, restored)
+    conn = sqlite3.connect(str(restored))
+    try:
+        rows = conn.execute("SELECT who FROM wal_marker").fetchall()
+        held = sorted(str(row[0]) for row in rows)
+        content = sorted(
+            str(row[0]) for row in conn.execute("SELECT content FROM messages")
+        )
+    except sqlite3.DatabaseError as exc:
+        held = [f"<unreadable: {exc}>"]
+        content = []
+    finally:
+        conn.close()
+    assert held == [marker], (
+        "the restored backup is missing the row that was committed into the "
+        f"-wal: {held!r}. It reproduces the bytes that were in the main file, "
+        "which is not the state the source connection had committed"
+    )
+    assert "irreplaceable" in content, (
+        f"the restored store has lost the message rows: {content!r}"
+    )
     assert _canonical_rows(restored) == rows_before, (
         "the backup does not restore the rows the artifact carried before the "
         "rollback, so it is not a way back"
@@ -1763,16 +1807,6 @@ def check_the_backup_is_a_logical_copy_that_restores_the_pre_rollback_state(
     assert _installed_triggers(restored) == triggers_before, (
         "the backup was taken AFTER the drops — it restores a store with no "
         f"fence on it: {_installed_triggers(restored)}"
-    )
-    conn = sqlite3.connect(str(restored))
-    try:
-        content = sorted(
-            str(row[0]) for row in conn.execute("SELECT content FROM messages")
-        )
-    finally:
-        conn.close()
-    assert "irreplaceable" in content, (
-        f"the restored store has lost the message rows: {content!r}"
     )
 
     # And the artifact the operator named was never the subject.
@@ -1786,26 +1820,37 @@ def check_a_partial_destination_collision_keeps_only_what_the_run_created(
     """The acquisition is the check, and the cleanup owns only what it made.
 
     ``VACUUM INTO`` and the online backup API both take a FILENAME; neither can
-    inherit a descriptor. So the destination cannot be created by the same call
-    that writes it, and "must not already exist" has to be re-established at the
-    one place it can be: an ``O_CREAT | O_EXCL`` acquisition of the final path,
-    with the bytes then streamed through THAT descriptor. The snapshot itself is
-    built in a private staging directory where no other name resolves to it.
+    inherit a descriptor. So the destination cannot be created by the call that
+    writes it, and "must not already exist" has to be re-established where it
+    can be: an ``O_CREAT | O_EXCL`` acquisition of the final path, with the
+    bytes then going through THAT descriptor.
 
     A backup destination is a FAMILY, so the acquisition is over the family, and
     the interesting case is the PARTIAL one — the main name free, a sidecar
     occupied. That is what an operator whose previous attempt died leaves
-    behind, and it is the case where a run can both refuse AND leave its own
-    half-built destination lying next to the file it refused to touch.
+    behind, and it is where a run can both refuse AND leave its own half-built
+    destination next to the file it refused to touch. Two obligations, and the
+    second is the one that gets dropped: refuse, and then remove ONLY what this
+    run created.
 
-    Two obligations, and the second is the one that gets dropped: refuse, and
-    then remove ONLY what this run created. The pre-existing file is not this
-    run's to clean up, and the file this run created is not the operator's to
-    discover.
+    ENTERED AT THE BOUNDARY, WITH THE TARGET PREPARED. Driving this through the
+    rehearsal does not reach the seam: the pre-flight opens its working copy as
+    a store, and on a build that falls back to ``journal_mode=DELETE`` the copy
+    has no sidecars by the time the backup runs, so the sidecar collision never
+    happens and the run refuses earlier for an unrelated reason. A RED that reds
+    somewhere else goes green the moment that somewhere else is fixed. So the
+    target is a disposable copy this pin prepares, in WAL with real frames on
+    both builds, and the production boundary is entered directly — the same
+    connection, backup helper, DDL and cleanup the rehearsal drives.
 
-    The collision is introduced after the destination check RETURNS, because a
-    check that saves the run is exactly what is not allowed to be the guarantee.
+    THE PHASE EVENT IS THE ACQUISITION ITSELF. Every exclusive create the run
+    makes is recorded, so "it reached the collision after acquiring the main
+    destination" is observed rather than inferred from the outcome. A run whose
+    acquisitions cannot be seen does not pass this — for a check, silence is
+    not evidence.
     """
+    import inspect
+
     _sandbox_home(tmpdir)
     module, why = _import_verb()
     assert module is not None, f"there is no fence-rollback verb: {why}"
@@ -1814,54 +1859,115 @@ def check_a_partial_destination_collision_keeps_only_what_the_run_created(
 
     store = tmpdir / "state.db"
     _fenced_store(store, leave_lease_live=False)
-    rows_before = _canonical_rows(store)
-    triggers_before = _installed_triggers(store)
 
     work_dir = tmpdir / "work"
     work_dir.mkdir()
-    rehearsal_backup = work_dir / "rehearsal-backup.db"
-    squatter = work_dir / "rehearsal-backup.db-shm"
+    target = work_dir / "target.db"
+    shutil.copyfile(store, target)
+    # Real WAL frames, on both builds, so the destination family the backup
+    # step has to acquire actually includes the sidecar being squatted on.
+    _commit_a_marker_that_lives_only_in_the_wal(target, "collision-fixture")
+    assert {target.name + "-wal", target.name + "-shm"} <= _family_beside(target), (
+        f"the fixture target has no sidecars: {sorted(_family_beside(target))}"
+    )
+    target_triggers = _installed_triggers(target)
+    assert target_triggers == sorted(hermes_state_common.TURN_FENCE_TRIGGERS), (
+        f"the disposable target is not a fenced store: {target_triggers}"
+    )
+
+    backup = work_dir / "backup.db"
+    squatter = work_dir / "backup.db-shm"
     squatter_bytes = b"a shared-memory file from an attempt that died"
 
-    injected = {"fired": False}
+    exclusive_creates = []
+
+    class _RecordingOs:
+        """``os``, with every exclusive create recorded as a phase event."""
+
+        def __getattr__(self, name):
+            return getattr(os, name)
+
+        def open(self, path, flags, *args, **kwargs):
+            if flags & os.O_EXCL:
+                exclusive_creates.append(str(path))
+            return os.open(path, flags, *args, **kwargs)
+
+    planted = {"fired": False}
     real_check = library._refuse_unusable_backup_path
 
     def _a_sidecar_appears_after_the_check(path, *args, **kwargs):
-        target = pathlib.Path(path)
-        if target.name == rehearsal_backup.name and squatter.exists():
+        """The squatter arrives AFTER the check returns, in every window.
+
+        A collision the check catches proves the check; the obligation is that
+        the acquisition catches it, so the destination is cleared before each
+        check and re-occupied immediately after it.
+        """
+        target_path = pathlib.Path(path)
+        if target_path.name == backup.name and squatter.exists():
             squatter.unlink()
         real_check(path, *args, **kwargs)
-        if target.name == rehearsal_backup.name:
-            injected["fired"] = True
+        if target_path.name == backup.name:
+            planted["fired"] = True
             squatter.write_bytes(squatter_bytes)
 
+    kwargs = {"report_as": store}
+    # The authority the boundary requires, if it requires one. This pin is
+    # about destination acquisition; which targets may be rolled back at all is
+    # the subject of the in-place pin, and is not re-litigated here.
+    parameters = inspect.signature(library._commit_the_rollback).parameters
+    if "authority" in parameters:
+        kwargs["authority"] = library.authority_over_a_copy_this_run_made(
+            target, work_dir
+        )
+
     library._refuse_unusable_backup_path = _a_sidecar_appears_after_the_check
+    had_os = hasattr(library, "os")
+    previous_os = getattr(library, "os", None)
+    library.os = _RecordingOs()
+    refusal = {"reason": "", "detail": "", "returned": None, "crash": ""}
     try:
-        outcome = _rehearse(library, store, tmpdir / "backup.db", work_dir)
+        refusal["returned"] = library._commit_the_rollback(
+            target, backup, sorted(hermes_state_common.TURN_FENCE_TRIGGERS),
+            **kwargs,
+        )
+    except library.TurnFenceRollbackRefused as exc:
+        refusal["reason"] = getattr(exc, "reason", "refused")
+        refusal["detail"] = str(exc)
+    except BaseException as exc:  # noqa: BLE001 - carried, not swallowed
+        refusal["crash"] = f"{type(exc).__name__}: {exc}"
     finally:
         library._refuse_unusable_backup_path = real_check
+        if had_os:
+            library.os = previous_os
+        else:
+            del library.os
 
-    assert injected["fired"], (
-        "the collision was never introduced, so this pin measures nothing — the "
-        "rehearsal never reached its own backup destination"
+    assert planted["fired"], (
+        "the collision was never introduced, so this pin measures nothing — "
+        "the run never reached its own backup destination"
     )
-    assert not outcome["crash"], f"the rehearsal crashed: {outcome['crash']}"
-    assert outcome["reason"] == "backup-exists", (
+    assert not refusal["crash"], f"the boundary crashed: {refusal['crash']}"
+    assert refusal["reason"] == "backup-exists", (
         "a member of the backup destination family was already there and the "
-        f"run did not refuse for that reason: {outcome['reason']!r} "
-        f"{outcome['detail']!r}"
+        f"run did not refuse for that reason: {refusal['reason']!r} "
+        f"{refusal['detail']!r}"
     )
     assert squatter.read_bytes() == squatter_bytes, (
-        "the run cleaned up a file it did not create. The collision artifact is "
-        "the one thing at that destination that is not this run's to remove"
+        "the run removed a file it did not create. The collision artifact is "
+        "the one thing at that destination that is not this run's to touch"
     )
-    assert _family_beside(rehearsal_backup) == {squatter.name}, (
+    assert str(backup) in exclusive_creates, (
+        "the run never exclusively created the final destination, so it did "
+        "not reach the sidecar collision by way of acquiring the main name — "
+        "whatever refused it was something else, and the property this pin is "
+        f"named for was never exercised: {exclusive_creates!r}"
+    )
+    assert _family_beside(backup) == {squatter.name}, (
         "the refused run left its own half-built destination behind: "
-        f"{sorted(_family_beside(rehearsal_backup))}. An operator who retries "
-        "now hits a collision this run manufactured"
+        f"{sorted(_family_beside(backup))}. An operator who retries now hits a "
+        "collision this run manufactured"
     )
-    assert _canonical_rows(store) == rows_before
-    assert _installed_triggers(store) == triggers_before, (
+    assert _installed_triggers(target) == target_triggers, (
         "the run dropped triggers on a rollback whose backup never landed"
     )
 
