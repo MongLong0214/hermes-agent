@@ -33,25 +33,48 @@ WHY THIS FILE EXISTS
     :func:`test_the_measured_counterexample_at_cb61320a` is that measurement,
     kept verbatim as a test rather than as a paragraph.
 
-HOW THE SURFACE IS DECIDED
+HOW THE SURFACE IS DECIDED — AND THE SEED THAT WAS WRONG
     Not by a list in production that somebody keeps in step. Production
     DECLARES :data:`hermes_state_common.TURN_FENCE_SURFACE`; this file DERIVES
-    the same set from the source of ``SessionDB`` and its mixins, and fails when
-    they differ. A new mutator that writes a new table therefore fails here
-    until the declaration follows it.
+    the same set from the source, and fails when they differ. A new mutator that
+    writes a new table therefore fails here until the declaration follows it.
 
-    The derivation is: every ``(table, operation)`` written inside the write
-    transaction of a method that either
+    THE PREVIOUS DERIVATION SEEDED FROM THE WRONG SET, AND IT WAS MEASURABLE.
+    It seeded from ``derive_context_bearing_mutators()`` — the MESSAGE-TABLE
+    derivation — and then collected the tables those methods touch. So a writer
+    reachable only from the session row never entered the seed at all:
+    ``_store_system_prompt`` writes ``system_prompts`` and never names
+    ``messages``, and rule 2 of that derivation adds CALLERS of derived members,
+    not CALLEES. Four tables came out unfenced and a foreign connection wrote
+    every one of them — see ``tests/state/test_turn_fence_adjunct_surface``,
+    which keeps the measurement.
 
-    * writes model context (:func:`derive_context_bearing_mutators`, the same
-      derivation the writer census uses), or
-    * writes the turn-lease table itself — a process that can free the fence
-      can defeat it, so the fence's own table is part of the surface.
+    THE DENOMINATOR IS THE TRANSACTION, NOT THE TABLE.
+    A table belongs on the surface when production writes it inside a
+    transaction that consults the canonical turn-lease admission. That is the
+    property the barrier is for: whatever this generation decided it had to ask
+    permission before writing is exactly what an old binary must not write
+    without asking. Stated that way the derivation needs no list of tables, no
+    list of mutators, and no exemption:
 
-    minus the one argued exemption (``_init_schema``, which installs the
-    triggers and cannot be fenced by them), and intersected with the tables that
-    actually exist in the schema so that prose in a docstring cannot invent a
-    table name.
+    1. SEED — the methods that raise the production refusal itself,
+       ``hermes_state.SessionTurnLeaseLostError``. Anchored on the refusal
+       rather than on a table name so that renaming a table, adding one, or
+       moving a guard cannot quietly shrink the seed.
+    2. UPWARD — a method that hands its own transaction's connection to a
+       member is running that member's decision inside its transaction.
+    3. INNER — a method handed a member's connection runs its DML inside that
+       member's admitted transaction, so its tables are on the surface too.
+       This is the direction the old seed did not have.
+    4. BORROWED — a production module outside ``SessionDB`` that calls one of
+       the closure's ``(self, conn, …)`` entry points is running the canonical
+       decision on its own transaction, so every table IT writes is on the
+       surface. ``tools/async_delegation`` is that module and
+       ``async_delegations`` is that table.
+
+    Rules 1-3 run to a joint fixpoint, and the result is intersected with the
+    tables that actually exist in the schema, so that prose in a docstring
+    cannot invent a table name.
 
 WHY EACH TRIGGER IS MUTATION-TESTED
     A trigger that is never the reason a write fails contributes nothing and
@@ -73,6 +96,7 @@ import pytest
 
 import hermes_state_common
 from hermes_state_common import TURN_FENCE_FUNCTION_NAME
+from tests.state import test_turn_fence_adjunct_surface as adjunct
 from tests.state import test_turn_lease_writer_census as census_mod
 
 
@@ -147,36 +171,161 @@ def _real_tables(tmp_path) -> frozenset:
     return frozenset(names)
 
 
+#: The production refusal a turn-lease admission raises. The seed is anchored
+#: HERE and not on a table name: the question the surface answers is "what did
+#: this generation decide it must ask permission before writing", and the raise
+#: site IS that decision. A table can be renamed and a guard can move; the
+#: exception is the thing that cannot change without the refusal changing.
+TURN_LEASE_REFUSAL = "SessionTurnLeaseLostError"
+
+
+def _raises_the_turn_lease_refusal(node: ast.AST) -> bool:
+    for inner in ast.walk(node):
+        if not isinstance(inner, ast.Raise) or inner.exc is None:
+            continue
+        raised = inner.exc.func if isinstance(inner.exc, ast.Call) else inner.exc
+        name = getattr(raised, "id", None) or getattr(raised, "attr", None)
+        if name == TURN_LEASE_REFUSAL:
+            return True
+    return False
+
+
+def _self_calls_handing_over_the_connection(node: ast.AST):
+    """``self.<name>(<a name bound in this method>, …)`` — the transaction hop.
+
+    The same shape the writer census uses for its rule 2, and for the same
+    reason: the transaction's connection is a parameter, so a call that passes
+    a bound name as its first positional argument is the call that puts the
+    callee's statements inside this method's transaction.
+    """
+    bound = census_mod._names_bound_in(node)
+    for inner in ast.walk(node):
+        if not isinstance(inner, ast.Call):
+            continue
+        fn = inner.func
+        if not (isinstance(fn, ast.Attribute)
+                and isinstance(fn.value, ast.Name)
+                and fn.value.id == "self"):
+            continue
+        first = inner.args[0] if inner.args else None
+        if isinstance(first, ast.Name) and first.id in bound:
+            yield fn.attr
+
+
+def admitted_transaction_closure(methods: dict) -> frozenset:
+    """Methods whose transaction consults the canonical turn-lease admission.
+
+    Rules 1-3 of HOW THE SURFACE IS DECIDED, run to a JOINT fixpoint. Running
+    them to separate fixpoints is not the same answer: an entry point that
+    hands its connection to a helper which is only pulled in by the inner rule
+    (``skip_leased_on_connection`` -> ``_skip_leased_conversations``) is
+    reachable only when the upward pass gets to run again afterwards.
+    """
+    covered = {name for name, (_module, node) in methods.items()
+               if _raises_the_turn_lease_refusal(node)}
+    assert covered, (
+        f"no method raises {TURN_LEASE_REFUSAL}; the seed itself is broken and "
+        f"every answer below would be vacuous"
+    )
+    changed = True
+    while changed:
+        changed = False
+        for name, (_module, node) in methods.items():
+            if name in covered:
+                continue
+            if set(_self_calls_handing_over_the_connection(node)) & covered:
+                covered.add(name)
+                changed = True
+        grown = set()
+        for name in sorted(covered):
+            grown |= set(
+                _self_calls_handing_over_the_connection(methods[name][1])
+            )
+        inner = (grown & set(methods)) - covered
+        if inner:
+            covered |= inner
+            changed = True
+    return frozenset(covered)
+
+
+def _tables_written_in(node: ast.AST, real_tables: frozenset) -> set:
+    found = set()
+    for inner in ast.walk(node):
+        if not (isinstance(inner, ast.Constant) and isinstance(inner.value, str)):
+            continue
+        for match in WRITE_STATEMENT.finditer(inner.value):
+            table = match.group(2).lower()
+            if table in real_tables:
+                found.add(table)
+    return found
+
+
+def borrowed_admission_entry_points(methods: dict, closure) -> frozenset:
+    """Closure members a FOREIGN module can call on its own transaction.
+
+    A method whose first parameter after ``self`` is the connection is one that
+    decides on the caller's transaction rather than on this store's — which is
+    exactly what a module holding its own ``BEGIN IMMEDIATE`` has to call. The
+    set is read off the signatures, so a new borrowed entry point is picked up
+    without anybody adding it here.
+    """
+    entry_points = set()
+    for name in closure:
+        node = methods[name][1]
+        args = [a.arg for a in node.args.args]
+        if args and args[0] == "self":
+            args = args[1:]
+        if args and args[0] == "conn":
+            entry_points.add(name)
+    return frozenset(entry_points)
+
+
+def modules_borrowing_the_admission(entry_points) -> dict:
+    """``{relative path: {tables it writes}}`` for the borrowing modules.
+
+    A production module outside the ``SessionDB`` implementation that calls one
+    of *entry_points* is running the canonical decision inside its own
+    transaction. Its DML is therefore in an admitted transaction as surely as
+    ``SessionDB``'s is, and its tables belong on the surface.
+    """
+    owners = set(census_mod.SESSIONDB_IMPLEMENTATION_MODULES)
+    borrowing = {}
+    for rel, path in census_mod._production_files():
+        if str(rel) in owners:
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+        except SyntaxError:  # pragma: no cover - a broken tree is not our finding
+            continue
+        borrows = any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in entry_points
+            and not (isinstance(node.func.value, ast.Name)
+                     and node.func.value.id == "self")
+            for node in ast.walk(tree)
+        )
+        if borrows:
+            borrowing[str(rel)] = tree
+    return borrowing
+
+
 def derive_turn_fence_surface(tmp_path) -> frozenset:
     """``{(table, operation)}`` the fence has to cover, read off the source."""
     methods, _missing = census_mod._sessiondb_implementation(census_mod.REPO_ROOT)
-    context_bearing = set(census_mod.derive_context_bearing_mutators())
+    real_tables = frozenset(
+        name.lower() for name in _real_tables(tmp_path)
+    )
 
-    lease_writers = set()
-    for name, (_module, node) in methods.items():
-        for inner in ast.walk(node):
-            if not (isinstance(inner, ast.Constant)
-                    and isinstance(inner.value, str)):
-                continue
-            for match in WRITE_STATEMENT.finditer(inner.value):
-                if match.group(2).lower() == TURN_LEASE_TABLE:
-                    lease_writers.add(name)
-
-    exempt = set(census_mod.NOT_CONTEXT_BEARING)
-    tables = {name.lower() for name in _real_tables(tmp_path)}
+    closure = admitted_transaction_closure(methods)
     fenced_tables = set()
-    for name in (context_bearing | lease_writers) - exempt:
-        entry = methods.get(name)
-        if entry is None:
-            continue
-        for inner in ast.walk(entry[1]):
-            if not (isinstance(inner, ast.Constant)
-                    and isinstance(inner.value, str)):
-                continue
-            for match in WRITE_STATEMENT.finditer(inner.value):
-                table = match.group(2).lower()
-                if table in tables:
-                    fenced_tables.add(table)
+    for name in closure:
+        fenced_tables |= _tables_written_in(methods[name][1], real_tables)
+
+    entry_points = borrowed_admission_entry_points(methods, closure)
+    for _rel, tree in modules_borrowing_the_admission(entry_points).items():
+        fenced_tables |= _tables_written_in(tree, real_tables)
+
     # ALL THREE operations on every table the derivation reaches, not only the
     # ones this generation happens to perform. The surface is about what a
     # FOREIGN writer can do, and "no code path of ours deletes a lease row" is
@@ -302,10 +451,11 @@ def test_the_declared_fence_surface_is_the_one_the_source_needs(tmp_path):
     missing = derived - declared
     extra = declared - derived
     assert not missing, (
-        f"these (table, operation) pairs are written inside the write "
-        f"transaction of a context-bearing or lease-table mutator and no "
-        f"generation trigger covers them, so an old binary performs them "
-        f"unrefused: {sorted(missing)}"
+        f"these (table, operation) pairs are written inside a transaction that "
+        f"CONSULTS the canonical turn-lease admission — this generation decided "
+        f"it had to ask permission before writing them — and no generation "
+        f"trigger covers them, so an old binary performs them unrefused: "
+        f"{sorted(missing)}"
     )
     assert not extra, (
         f"these triggers are declared but no derived mutator writes them: "
@@ -358,23 +508,44 @@ FOREIGN_STATEMENTS = {
         "UPDATE session_turn_leases SET holder = '' WHERE conversation_id = 's'",
     (TURN_LEASE_TABLE, "DELETE"):
         "DELETE FROM session_turn_leases WHERE conversation_id = 's'",
+    ("compression_locks", "INSERT"):
+        "INSERT INTO compression_locks (session_id, holder, acquired_at, "
+        "expires_at) VALUES ('smuggled', 'foreign', 1.0, 4102444800.0)",
+    ("compression_locks", "UPDATE"):
+        "UPDATE compression_locks SET holder = 'foreign' WHERE session_id = 's'",
+    ("compression_locks", "DELETE"):
+        "DELETE FROM compression_locks WHERE session_id = 's'",
+    # The four adjunct tables, taken from the file that MEASURED them rather
+    # than restated here. Two copies of a foreign statement is two things to
+    # keep in step, and the copy that drifts is the one that stops proving
+    # anything.
+    **adjunct.ADJUNCT_STATEMENTS,
 }
 
 
 def _store_with_a_live_lease(tmp_path, name="state.db"):
+    """A live-owned store carrying a row in EVERY table on the surface.
+
+    Built by :func:`tests.state.test_turn_fence_adjunct_surface._live_owned_store`
+    so the mutation table below runs against the same fixture the counterexample
+    measurement runs against. An UPDATE or DELETE that matches no row is still
+    REFUSED by a trigger (SQLite resolves the trigger program when it PREPARES
+    the statement), so a fixture with empty tables would let a mutation row pass
+    while proving nothing about rows — the drop leg would 'succeed' by changing
+    nothing.
+    """
     from hermes_state import SessionDB
 
-    db = SessionDB(tmp_path / name)
-    db.create_session("s", source="test")
-    grant = db.try_acquire_session_turn_lease(
-        "s", f"pid={os.getpid()}:turn=live:platform=test", ttl_seconds=600
-    )
-    assert grant
-    db.append_message(
-        session_id="s", role="user", content="current", turn_lease_holder=grant
-    )
-    db.close()
-    return tmp_path / name
+    store, grant = adjunct._live_owned_store(tmp_path, name)
+    db = SessionDB(store)
+    try:
+        assert db.try_acquire_compression_lock("s", "holder-1", ttl_seconds=600), (
+            "the compression lock this fixture needs was not taken"
+        )
+    finally:
+        db.close()
+    del grant
+    return store
 
 
 def test_every_declared_trigger_is_the_reason_its_write_fails(tmp_path):
