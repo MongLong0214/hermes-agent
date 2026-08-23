@@ -59,6 +59,7 @@ import io
 import json
 import os
 import pathlib
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -1066,6 +1067,163 @@ def check_a_target_swapped_for_another_valid_store_is_refused(
     )
 
 
+def _give_the_store_a_committed_wal_marker(store: pathlib.Path, marker: str) -> None:
+    """Put *marker* in a real, committed, UNCHECKPOINTED WAL frame.
+
+    A raw connection and a scratch table on purpose. The marker has to live in
+    the ``-wal`` rather than in the main file — that is the whole point — and
+    it has to be in a table the fence does not cover, because a raw handle
+    writing a fenced table is refused by the generation trigger, correctly.
+    ``PRAGMA journal_mode=WAL`` is set here rather than inherited: on a SQLite
+    build with the WAL-reset bug the store is opened ``journal_mode=DELETE``,
+    and this property is about the file family, not about that fallback.
+    """
+    conn = sqlite3.connect(str(store), isolation_level=None)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("CREATE TABLE IF NOT EXISTS aba_marker (who TEXT)")
+        conn.execute("DELETE FROM aba_marker")
+        conn.execute("INSERT INTO aba_marker (who) VALUES (?)", (marker,))
+    finally:
+        conn.close()
+
+
+def _read_wal_marker(store: pathlib.Path) -> str:
+    conn = sqlite3.connect(f"file:{store}?mode=ro", uri=True)
+    try:
+        row = conn.execute("SELECT who FROM aba_marker").fetchone()
+        return row[0] if row else ""
+    except sqlite3.DatabaseError as exc:
+        return f"<unreadable: {exc}>"
+    finally:
+        conn.close()
+
+
+def _swap_family(source: pathlib.Path, destination: pathlib.Path) -> None:
+    """Rename a store and every sidecar beside it, as one move."""
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        member = source.with_name(source.name + suffix)
+        if member.exists():
+            os.rename(member, destination.with_name(destination.name + suffix))
+
+
+def check_the_backup_cannot_become_an_a_main_b_wal_chimera(
+    tmpdir: pathlib.Path,
+) -> None:
+    """Binding one member of a set resolved by name elsewhere binds nothing.
+
+    Two stores can share a BYTE-IDENTICAL checkpointed main file and carry
+    DIFFERENT committed WAL contents. Bind the main file by inode, resolve
+    ``-wal`` by pathname, and a swap that lands during the backup's source
+    reads — undone before the next identity check — produces a backup of
+    A's main and B's WAL. It reads back as B's rows. Both point checks see A
+    and report nothing, because a rename is not a modification of either file.
+
+    This is the ABA the one-way replacement pin cannot see: that pin watches a
+    target that is moved and left moved. Here the name comes back, so nothing
+    the outer identity check looks at is out of place. The only thing that can
+    tell the difference is whether the BYTES came from descriptors.
+
+    Either outcome is acceptable, and both are asserted: refuse, or succeed
+    with a backup that is exactly A. A backup carrying B's marker is the
+    failure, and so is a success report over a chimera.
+    """
+    _sandbox_home(tmpdir)
+    module, why = _import_verb()
+    assert module is not None, f"there is no fence-rollback verb: {why}"
+
+    from hermes_cli import session_fence_rollback as library
+
+    named = tmpdir / "state.db"
+    _fenced_store(named, leave_lease_live=False)
+    _give_the_store_a_committed_wal_marker(named, "A")
+
+    # B's main is a byte-for-byte copy of A's main, so nothing that compares
+    # main files can tell them apart. Only the WAL differs.
+    understudy_home = tmpdir / "understudy"
+    understudy_home.mkdir()
+    understudy = understudy_home / "state.db"
+    shutil.copyfile(named, understudy)
+    _give_the_store_a_committed_wal_marker(understudy, "B")
+    assert _read_wal_marker(named) == "A" and _read_wal_marker(understudy) == "B", (
+        "the fixture did not produce two stores with distinct WAL markers, so "
+        "this pin cannot tell a chimera from a faithful backup"
+    )
+    assert (named.with_name(named.name + "-wal")).exists(), (
+        "the fixture produced no -wal, so there is no sidecar to resolve and "
+        "this pin measures nothing"
+    )
+
+    a_rows = _canonical_rows(named)
+    a_triggers = _installed_triggers(named)
+    b_rows = _canonical_rows(understudy)
+    b_triggers = _installed_triggers(understudy)
+
+    backup = tmpdir / "backup.db"
+    parked = tmpdir / "parked.db"
+    swapped = {"count": 0}
+    real_copy = library._copy_family_onto_new_destinations
+
+    def _aba_during_the_source_reads(family, destination, **kwargs):
+        """Swap the pathname family to B for the copy, then put A back.
+
+        Placed at the backup's family copy — the seam where the source bytes
+        are actually read. The restore happens before the call returns, so the
+        next identity check sees A exactly as it expects to.
+        """
+        if pathlib.Path(destination) != backup:
+            return real_copy(family, destination, **kwargs)
+        swapped["count"] += 1
+        _swap_family(named, parked)
+        _swap_family(understudy, named)
+        try:
+            return real_copy(family, destination, **kwargs)
+        finally:
+            _swap_family(named, understudy)
+            _swap_family(parked, named)
+
+    library._copy_family_onto_new_destinations = _aba_during_the_source_reads
+    try:
+        run = _run_verb(named, backup)
+    finally:
+        library._copy_family_onto_new_destinations = real_copy
+
+    assert swapped["count"] == 1, (
+        f"the swap fired {swapped['count']} time(s); it must happen exactly "
+        "once, during the backup's source reads, or this pin is measuring "
+        "some other window"
+    )
+    assert not run.crash, f"the verb crashed under the ABA: {run.crash}"
+    payload = _payload(run)
+    assert payload is not None, f"no machine-readable report: {run.stdout!r}"
+
+    # Whatever it did, it must not have described B.
+    if backup.exists():
+        assert _read_wal_marker(backup) == "A", (
+            "the backup is an A-main/B-WAL CHIMERA: its rows come from the "
+            f"store that was swapped in ({_read_wal_marker(backup)!r}), not "
+            "from the one the transaction held. Binding the main file while "
+            "resolving -wal by pathname is what allows this, and both point "
+            "identity checks saw A because a rename modifies neither file"
+        )
+    if payload.get("ok"):
+        assert backup.is_file(), (
+            "the run reported a verified backup and there is no backup file"
+        )
+        assert payload["backup"]["verified"] is True
+
+    assert _canonical_rows(named) == a_rows, "the named store lost rows"
+    assert _installed_triggers(named) in (a_triggers, []), (
+        "the named store's fence surface is neither intact nor cleanly removed"
+    )
+    assert _canonical_rows(understudy) == b_rows, (
+        "the understudy store — which the operator never named — lost rows"
+    )
+    assert _installed_triggers(understudy) == b_triggers, (
+        "the rollback dropped the fence from the understudy store"
+    )
+
+
 def check_a_destination_appearing_after_the_check_is_never_clobbered(
     tmpdir: pathlib.Path,
 ) -> None:
@@ -1491,6 +1649,8 @@ PINS = {
         check_a_lease_taken_after_preflight_still_refuses_the_rollback,
     "check_a_target_swapped_for_another_valid_store_is_refused":
         check_a_target_swapped_for_another_valid_store_is_refused,
+    "check_the_backup_cannot_become_an_a_main_b_wal_chimera":
+        check_the_backup_cannot_become_an_a_main_b_wal_chimera,
     "check_a_destination_appearing_after_the_check_is_never_clobbered":
         check_a_destination_appearing_after_the_check_is_never_clobbered,
     "check_an_orphan_backup_sidecar_is_not_overwritten":
@@ -1615,6 +1775,30 @@ SOURCE_MUTATIONS = (
             "NAME again, and a different valid fenced store moved to that name "
             "passes every consistency check while the backup describes the "
             "store that left and the drops land on the one that arrived",
+    ),
+    Mutation(
+        pin="check_the_backup_cannot_become_an_a_main_b_wal_chimera",
+        module="hermes_cli/session_fence_rollback.py",
+        find=(
+            "            if bound is not None:\n"
+            "                with bound.bind_family() as family:\n"
+            "                    backup = _make_verified_backup(\n"
+            "                        target_path, backup_path, family=family\n"
+            "                    )\n"
+            "            else:\n"
+            "                backup = _make_verified_backup(target_path, backup_path)\n"
+        ),
+        replace=(
+            "            backup = _make_verified_backup(\n"
+            "                target_path, backup_path, bound=bound\n"
+            "            )\n"
+        ),
+        why="this blunts the WHOLE-FAMILY descriptor binding and nothing else: "
+            "every BoundTarget.verify stays, the main file is still read "
+            "through the bound descriptor, and only the sidecars go back to "
+            "being resolved by pathname. That is the exact regression a later "
+            "simplification would make, and it is invisible to both point "
+            "identity checks because a rename modifies neither file",
     ),
     Mutation(
         pin="check_a_destination_appearing_after_the_check_is_never_clobbered",
