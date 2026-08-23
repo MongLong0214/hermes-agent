@@ -376,29 +376,43 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-#: Handed to :class:`_PrivateCopy` by the one function allowed to make one.
-#: A module-private object cannot be named from outside this file, so the
-#: capability is not constructible by anything that did not go through the
-#: preparer — which is the difference between a docstring saying it may not be
-#: minted and the type saying it cannot be.
+#: Handed to :class:`_PrivateCopy` by the function that builds one. A leading
+#: underscore is a convention, not a barrier — ``from … import
+#: _ONLY_THE_PREPARER`` works, and a forged capability was constructed and
+#: passed ``verify()`` in five lines to check exactly that. So this catches
+#: accidental internal misuse and nothing else.
 _ONLY_THE_PREPARER = object()
 
 
 class _PrivateCopy:
-    """A store copy this run made, in a directory this run made. SEALED.
+    """A store copy this run made, in a directory this run made.
 
-    THE QUESTION IS NEVER "IS IT MARKED", IT IS WHO MAY MINT THE MARK
-        An earlier shape of this passed an ``OfflineAuthority`` object into the
-        boundary. The docstring said it could not be minted on request; the
-        constructor was public and took a path, so anything holding a
-        ``Path`` could produce one and walk past the offline contract. The
-        prose and the type said opposite things, and the type is what runs.
+    WHAT THIS IS: A GUARD AGAINST INTERNAL MISUSE. NOT A SECURITY BOUNDARY.
+        An earlier shape passed an ``OfflineAuthority`` built from a pathname,
+        and its docstring said it could not be minted on request while its
+        constructor was public — the prose and the type said opposite things.
+        This is the corrected version of the same idea, and the honest
+        statement of its limit is part of it: **a caller who can import
+        ``_ONLY_THE_PREPARER`` can construct one of these and it will pass
+        :meth:`verify`.** That was measured, not assumed.
 
-        So the capability is not a label attached to a path. It is only ever
-        returned by :func:`prepare_the_private_copy`, in the SAME call that
-        creates the directory, creates the file, and records what it created —
-        and it carries the identity of both so the boundary can re-establish
-        them rather than believe the object.
+        It does not matter, and saying why is the point: anything able to
+        import a private name from this module is already inside the process
+        and can open the store with ``sqlite3`` and issue the ``DROP TRIGGER``
+        statements directly, skipping this module altogether. There is no
+        attacker for whom this type is the obstacle. What it does buy is that a
+        future maintainer cannot casually hand a ``Path`` to the mutating
+        boundary and have it proceed.
+
+        THE ENFORCEABLE CLAIM IS THE WIRING, and it is checkable: the command
+        module references none of these names, and every real invocation fails
+        closed at :func:`establish_offline_authority` before the source is
+        opened. That is what the pins assert. "Unforgeable" is not.
+
+        The capability is built by :func:`prepare_the_private_copy`, in the
+        SAME call that creates the directory, creates the file, and records
+        what it created — and it carries the identity of both so the boundary
+        can re-establish them rather than believe the object.
 
     WHY THIS IS AUTHORITY AND A LEASE SWEEP IS NOT
         Not because the file looks idle. Because of how it came to exist: this
@@ -413,11 +427,11 @@ class _PrivateCopy:
     def __init__(self, sentinel, path: Path, work_dir: Path, identity) -> None:
         if sentinel is not _ONLY_THE_PREPARER:
             raise TypeError(
-                "a private copy is not constructible: it is returned by "
-                "prepare_the_private_copy, which is the call that creates the "
-                "directory and the file it describes. An object that can be "
-                "built from a pathname is a label, and a label is what the "
-                "offline contract exists to refuse"
+                "a private copy is built by prepare_the_private_copy, in "
+                "the call that creates the directory and the file it "
+                "describes. This refuses the accidental case — a Path handed "
+                "to the boundary by a later maintainer — and it is not a "
+                "barrier against a caller that imports the sentinel"
             )
         self.path = Path(path)
         self.work_dir = Path(work_dir)
@@ -734,6 +748,14 @@ class RollbackOutcome:
         # carry both, and an operator who reads "created" as "I have one" acts
         # more boldly than one who knows they do not.
         self.backup_present = False
+        # AGENCY DECOMPOSES. "We removed it" and "we made its absence
+        # survive a crash" are separate acts and either can happen without
+        # the other, so `backup_withdrawn` is the CONJUNCTION and these two
+        # are what it is built from. Without them the fsync-failure leg and
+        # the somebody-else-removed-it leg report identically, and they are
+        # different next moves.
+        self.backup_unlinked_by_this_run = False
+        self.backup_absence_durable = False
         self.backup_withdrawn = False
         self.residue_present = False
         self.residue = None
@@ -775,6 +797,8 @@ class RollbackOutcome:
             "backup_verified": self.backup_verified,
             "backup_durable": self.backup_durable,
             "backup_present": self.backup_present,
+            "backup_unlinked_by_this_run": self.backup_unlinked_by_this_run,
+            "backup_absence_durable": self.backup_absence_durable,
             "backup_withdrawn": self.backup_withdrawn,
             "residue_present": self.residue_present,
             "residue": self.residue,
@@ -1497,14 +1521,15 @@ def _commit_the_rollback(
 ) -> dict[str, Any]:
     """Decide, back up, then decide again and act. On a PRIVATE COPY, only.
 
-    THE TARGET IS THE AUTHORITY, AND IT IS NOT A PARAMETER ANYONE CAN SUPPLY
-        This takes a :class:`_PrivateCopy`, which only
-        :func:`prepare_the_private_copy` can produce and which records the
-        directory and the inode it created. A capability that can be passed can
-        be forged; the previous shape took an ``OfflineAuthority`` built from a
-        pathname, and a caller holding any path could walk past the offline
-        contract with it. There is now nothing to forge — a pathname is not a
-        private copy, and this refuses one.
+    THE TARGET IS THE AUTHORITY, AND THE ENFORCEMENT IS THE WIRING
+        This takes a :class:`_PrivateCopy`, which :func:`prepare_the_private_copy`
+        builds alongside the directory and the file it records. That refuses a
+        bare pathname, which is the mistake a later maintainer would actually
+        make. It is NOT unforgeable: importing the module's sentinel is enough
+        to construct one, measured. What keeps the operator's artifact away
+        from this function is not the type — it is that the command never
+        names this function, and a real invocation is refused at
+        :func:`establish_offline_authority` before the source is opened.
 
     WHY NOT ONE TRANSACTION AROUND ALL OF IT
         Because the backup cannot be inside one. ``VACUUM INTO`` refuses to run
@@ -1615,32 +1640,76 @@ def _commit_the_rollback(
     return backup
 
 
-def _mark_the_backup_gone(outcome, backup_path: Path) -> None:
-    """Record the withdrawal as PRESENCE, leaving the history alone.
+def _mark_the_backup_withdrawn(outcome, backup_path: Path) -> None:
+    """The ONLY route to ``present=False, withdrawn=True``. Both acts, both done.
 
-    ``backup_created`` stays true because it happened. ``backup_present``
-    becomes false because it is not there. And the backup record stops reading
-    like a file an operator can go and use.
+    Reached only when this run's identity-matched unlink returned AND the
+    parent directory flush after it returned. Three questions get conflated
+    here if they are allowed to:
+
+        I removed it              agency      — ENOENT is no evidence of this
+        it is gone                observation — true of a removal by anyone
+        its goneness is durable   requires the parent fsync THIS run performed
+
+    ``backup_created`` stays true because it happened. Only presence moves.
     """
     if outcome is None:
         return
+    outcome.backup_unlinked_by_this_run = True
+    outcome.backup_absence_durable = True
     outcome.backup_present = False
     outcome.backup_withdrawn = True
     if isinstance(outcome.backup, dict):
         outcome.backup = dict(outcome.backup, present=False, withdrawn=True)
 
 
-def _leave_the_backup_and_report_it(outcome, left: dict) -> dict:
-    """Something is at the backup path that this run may not remove.
+def _mark_the_backup_absent_but_not_by_us(outcome, backup_path: Path) -> dict:
+    """It was not there when cleanup looked, and this run did not remove it.
+
+    ENOENT answers the OBSERVATION question and neither of the others. This
+    run performed no unlink, so it has no agency to report; and it performed
+    no directory flush, so if a competitor removed the entry and has not yet
+    flushed, a crash can bring it back. Claiming the pair here would be
+    claiming an act this process never carried out.
+
+    Presence and durability are therefore both unknown, and the run fails
+    closed: it says it does not know rather than picking the tidy answer.
+    """
+    left = {
+        "path": str(backup_path),
+        "error": "absent-not-by-this-run",
+    }
+    if outcome is not None:
+        outcome.backup_unlinked_by_this_run = False
+        outcome.backup_absence_durable = None
+        outcome.backup_present = None
+        outcome.backup_withdrawn = False
+        outcome.residue_present = True
+        outcome.residue = left
+        if isinstance(outcome.backup, dict):
+            outcome.backup = dict(outcome.backup, present=None, residue=left)
+    return left
+
+
+def _leave_the_backup_and_report_it(outcome, left: dict, *, unlinked=False) -> dict:
+    """This run could not complete the withdrawal. Say which half it got.
 
     ``present`` becomes UNKNOWN rather than false: the run's own backup may
     still be there under a name something else now answers to, or may not, and
     a report that picks one of those is guessing on the operator's behalf.
+
+    *unlinked* is the half that did happen. An unlink that returned and a flush
+    that did not is a different situation from never having touched the file,
+    and folding them together loses the only fact that tells an operator
+    whether to expect the entry back after a crash.
     """
     if outcome is not None:
         outcome.residue_present = True
         outcome.residue = left
         outcome.backup_present = None
+        outcome.backup_withdrawn = False
+        outcome.backup_unlinked_by_this_run = bool(unlinked)
+        outcome.backup_absence_durable = False if unlinked else None
         if isinstance(outcome.backup, dict):
             outcome.backup = dict(outcome.backup, present=None, residue=left)
     return left
@@ -1668,8 +1737,7 @@ def _remove_a_backup_this_run_wrote(backup_path: Path, identity, outcome=None):
     try:
         here = os.lstat(backup_path)
     except FileNotFoundError:
-        _mark_the_backup_gone(outcome, backup_path)
-        return None
+        return _mark_the_backup_absent_but_not_by_us(outcome, backup_path)
     except OSError as exc:
         return _leave_the_backup_and_report_it(
             outcome,
@@ -1695,8 +1763,9 @@ def _remove_a_backup_this_run_wrote(backup_path: Path, identity, outcome=None):
                 "path": str(backup_path),
                 "error": f"unlinked but not flushed: {type(exc).__name__}: {exc}",
             },
+            unlinked=True,
         )
-    _mark_the_backup_gone(outcome, backup_path)
+    _mark_the_backup_withdrawn(outcome, backup_path)
     return None
 
 
@@ -1804,7 +1873,7 @@ def rollback_turn_fence(
         see its docstring for the measurement. So this function has no
         reachable success path today, and the mutating boundary is not even
         offered the operator's store: it takes a private copy this run made,
-        which is a thing no caller can manufacture.
+        and the operator's artifact never becomes one.
 
         That is the deliverable, not a gap in it. The alternative on offer was
         a success gated on an inference, and every inference available here has

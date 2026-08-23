@@ -87,8 +87,10 @@ def add_fence_rollback_parser(sessions_subparsers):
         type=Path,
         required=True,
         help=(
-            "The session database to roll back. Required and never defaulted — "
-            "name the file you mean"
+            "The session database to EVALUATE and rehearse against. Required "
+            "and never defaulted — name the file you mean. This build does not "
+            "roll back any store you can name: the run is refused and the file "
+            "is read as bytes, never opened as a database"
         ),
     )
     parser.add_argument(
@@ -96,8 +98,13 @@ def add_fence_rollback_parser(sessions_subparsers):
         type=Path,
         required=True,
         help=(
-            "Where to write the verified backup taken before any trigger is "
-            "dropped. Must not already exist"
+            "The destination RESERVED for the verified backup an "
+            "authority-bearing run would write before dropping any trigger. "
+            "NOT created by this build — nothing is written here. It is still "
+            "required and still validated, because an occupied destination is "
+            "a refusal you need to find out about now rather than at the "
+            "moment a real run would be about to overwrite something. Must not "
+            "already exist, including its -wal/-shm/-journal siblings"
         ),
     )
     parser.add_argument(
@@ -106,7 +113,9 @@ def add_fence_rollback_parser(sessions_subparsers):
         help=(
             "Perform the rollback on a disposable copy of the store and report "
             "what it removed, alongside the refusal the real run gives. The "
-            "store itself is read as bytes and never modified"
+            "copy and its backup live in a private directory and are removed "
+            "before this exits; the store itself is read as bytes and never "
+            "modified. This is the only form of the command that does anything"
         ),
     )
     parser.add_argument(
@@ -114,8 +123,9 @@ def add_fence_rollback_parser(sessions_subparsers):
         type=Path,
         default=None,
         help=(
-            "Existing directory for --dry-run's disposable copy of the store "
-            "(defaults to the system temporary directory). Point it at a "
+            "Existing directory to hold --dry-run's disposable copy of the "
+            "store and its transient backup (defaults to the system temporary "
+            "directory). Both are removed before this exits. Point it at a "
             "volume with room for a second copy of a large store"
         ),
     )
@@ -210,6 +220,7 @@ def _report_rehearsal(store: Path, backup: Path, work_parent: Path = None) -> in
     ) or residue is not None
     if residue is not None:
         rehearsal_facts["work_dir_residue"] = residue
+    _settle_the_transient_artifacts(rehearsal_facts, swept=residue is None)
 
     # RESIDUE OUTRANKS EVERY OTHER OUTCOME OF A DRY RUN. What is left in there
     # is a rolled-back — that is, UNFENCED — duplicate of every conversation in
@@ -258,6 +269,56 @@ def _report_rehearsal(store: Path, backup: Path, work_parent: Path = None) -> in
         }
     )
     return 0
+
+
+def _settle_the_transient_artifacts(facts: dict, *, swept: bool) -> None:
+    """Re-answer PRESENCE for everything that lived in the swept directory.
+
+    The rehearsal's facts are snapshotted when the operation ends, and the
+    sweep happens after. Every presence claim taken before an invalidating step
+    is stale by the time it is printed — the backup said ``present: true`` about
+    a file the sweep had already removed, and ``copy`` was a bare path string
+    making no claim at all, which is the same error one field over. Fixing them
+    where they are set does not help: they are set BEFORE the thing that
+    invalidates them. It has to happen here, once, after the only step that can.
+
+    History is untouched. ``backup_created``/``verified``/``durable`` stay true
+    because they happened, and under a contract where no real run proceeds that
+    record is the only evidence the operation works at all. What changes is the
+    claim about what an operator can go and find, and ``transient`` says why it
+    is gone: this command created it in a private directory and removed it on
+    purpose, which is a different thing from never having made one.
+
+    One site, driven by the sweep result, because N per-field patches would be
+    N places to get wrong and the next nested block would arrive silent again.
+    """
+    import os as _os
+
+    def _settle(record: dict) -> dict:
+        """Presence is MEASURED here, never inferred from the sweep's return.
+
+        Deriving it from ``swept`` would be asserting a fact instead of taking
+        one, and it gets a case wrong immediately: a withdrawal that ended in
+        ``ownership-lost`` left presence UNKNOWN, and stamping ``False`` over
+        that on the strength of "the sweep returned clean" is the same
+        overwrite this function exists to stop, one level down. Stat the path.
+        Then the claim cannot disagree with the filesystem, which is the rule
+        the report is held to, and it stays correct if a later change moves one
+        of these artifacts outside the swept directory.
+        """
+        record = dict(record)
+        record["transient"] = True
+        record["present"] = _os.path.lexists(record["path"])
+        record["removed"] = swept and not record["present"]
+        return record
+
+    if isinstance(facts.get("backup"), dict):
+        facts["backup"] = _settle(facts["backup"])
+        facts["backup_present"] = facts["backup"]["present"]
+    if facts.get("copy") is not None:
+        # Was a bare string. A path with no presence claim is unfalsifiable,
+        # so it becomes a record that states one like every other path does.
+        facts["copy"] = _settle({"path": str(facts["copy"])})
 
 
 def _report_rollback(store: Path, backup: Path) -> int:

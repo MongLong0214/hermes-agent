@@ -2461,7 +2461,44 @@ def check_a_withdrawn_backup_is_never_reported_as_one_the_operator_has(
         f"the residue does not say why it was left: {swapped_facts['residue']!r}"
     )
 
-    # (3) AND THE VERB SAYS SO, not only the library.
+    # (3) SOMEBODY ELSE REMOVED IT FIRST.
+    #     ENOENT answers only the OBSERVATION question. This run performed no
+    #     unlink, so it has no agency to report, and it performed no directory
+    #     flush, so if the competitor has not flushed either then a crash can
+    #     bring the entry back. Claiming withdrawal here would be claiming an
+    #     act this process never carried out.
+    def _somebody_else_removes_it(path):
+        path.unlink()
+
+    raced_dir = tmpdir / "raced"
+    raced_dir.mkdir()
+    three = _run_until_the_ddl_fails(raced_dir, meddle=_somebody_else_removes_it)
+    assert three["backed_up"], "the backup never landed in the third leg"
+    assert not three["result"]["crash"], f"the boundary crashed: {three['result']['crash']}"
+    raced = three["outcome"].facts()
+    assert raced["backup_created"] is True, (
+        f"the backup was written and the history denies it: {raced!r}"
+    )
+    assert raced["backup_unlinked_by_this_run"] is False, (
+        "this run claims it removed a file it never called unlink on. ENOENT "
+        f"is not evidence of agency: {raced!r}"
+    )
+    assert raced["backup_withdrawn"] is False, (
+        f"a withdrawal is claimed that this run did not perform: {raced!r}"
+    )
+    assert raced["backup_absence_durable"] is None, (
+        "the absence is reported as durable, and this run issued no directory "
+        f"flush — a crash can bring the entry back: {raced!r}"
+    )
+    assert raced["backup_present"] is None, (
+        "an observation somebody else made is reported as a certainty this "
+        f"run established: {raced!r}"
+    )
+    assert raced["residue"]["error"] == "absent-not-by-this-run", (
+        f"the report does not say why presence is unknown: {raced!r}"
+    )
+
+    # (4) AND THE VERB SAYS SO, not only the library.
     cli_dir = tmpdir / "surfaced"
     cli_dir.mkdir()
     cli_store = cli_dir / "state.db"
@@ -2503,8 +2540,20 @@ def check_a_withdrawn_backup_is_never_reported_as_one_the_operator_has(
         "the library recorded what it could not remove and the verb dropped "
         f"it. A fact nobody reads is not a fact: {payload!r}"
     )
-    assert rehearsal.get("backup_present") is None, (
-        f"the verb resolved an unknown into a certainty: {rehearsal!r}"
+    # Presence is measured at emit time, and by then the command has swept
+    # its own private directory — so `false` here is an OBSERVATION, not the
+    # unknown being resolved into a certainty. What must survive is the
+    # separate fact that this run could not complete its own withdrawal.
+    assert rehearsal.get("backup_present") is False, (
+        f"the report disagrees with the filesystem: {rehearsal!r}"
+    )
+    assert rehearsal.get("backup_withdrawn") is False, (
+        "the run failed to withdraw the backup and the report says it "
+        f"withdrew it: {rehearsal!r}"
+    )
+    assert rehearsal["residue"]["error"] == "ownership-lost", (
+        "the reason the withdrawal could not be completed was dropped once "
+        f"the sweep answered the presence question: {rehearsal!r}"
     )
 
 
