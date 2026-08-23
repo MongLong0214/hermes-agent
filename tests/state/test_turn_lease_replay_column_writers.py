@@ -510,30 +510,90 @@ def check_a_system_prompt_rewrite_is_refused_while_a_live_owner_holds_it(
     )
 
 
-def check_a_billing_route_write_is_refused_while_a_live_owner_holds_it(
+def check_a_billing_route_write_is_refused_when_the_lease_lands_mid_call(
     tmpdir,
 ) -> None:
-    """Nulling both prompt columns is a context write however it is named.
+    """The IN-TRANSACTION guard, isolated from the advisory one.
 
-    ``update_session_billing_route`` exists to update billing fields, and it
-    NULLs ``system_prompt`` / ``system_prompt_hash`` on the way past so a
-    cached ``Model:`` footer cannot lie. That second half is what puts it here:
-    the running turn's prompt is gone either way.
+    ``update_session_billing_route`` NULLs ``system_prompt`` /
+    ``system_prompt_hash`` on the way past, so it is a context write however it
+    is named — the running turn's prompt is gone either way. But it carries TWO
+    admission points: ``_refuse_before_side_effects`` before the token-queue
+    barrier, and ``_check_turn_lease_guard`` inside ``BEGIN IMMEDIATE``. A
+    plain "a bystander is refused" pin is satisfied by either, so no single
+    mutation can kill it and it measures neither.
+
+    So this pin opens the window the advisory check cannot see. The
+    conversation is FREE when the call starts, and the lease is taken DURING
+    ``flush_token_counts`` — the exact interval between the advisory read and
+    the write transaction. The advisory check has already said "no finding";
+    only the guard inside the transaction can refuse now, and that is the
+    property: the early refusal saves side effects, it is not the authority.
     """
-    _refused_then_owned_then_free(
-        tmpdir,
-        lambda db: db.update_session_billing_route(
-            "s", provider="smuggler", base_url="https://smuggled.example",
-        ),
-        lambda db, grant: db.update_session_billing_route(
+    from hermes_state import SessionTurnLeaseLostError
+
+    db = _store(tmpdir)
+    try:
+        db.create_session("s", "test")
+        db.append_message("s", "user", "s context")
+        db.update_session_model("s", "anthropic/claude-before")
+        db.update_system_prompt("s", "THE PROMPT THE TURN IS REPLAYING")
+
+        before = _replay_state(db, "s")
+        before_provider = _billing_provider(db)
+        assert db.get_session_turn_lease("s") is None, (
+            "the conversation must start FREE or the advisory check refuses "
+            "first and this pin measures the wrong guard"
+        )
+
+        taken = {}
+        original_flush = db.flush_token_counts
+
+        def _flush_and_take_the_lease(*args, **kwargs):
+            # Restored immediately so the owner's own call below flushes
+            # normally, and so the lease is taken exactly once.
+            db.flush_token_counts = original_flush
+            taken["grant"] = db.try_acquire_session_turn_lease(
+                "s", _holder("landed-mid-call"), ttl_seconds=600
+            )
+            return original_flush(*args, **kwargs)
+
+        db.flush_token_counts = _flush_and_take_the_lease
+
+        try:
+            db.update_session_billing_route(
+                "s", provider="smuggler", base_url="https://smuggled.example",
+            )
+        except SessionTurnLeaseLostError:
+            pass
+        else:
+            raise AssertionError(
+                "a write was admitted although the conversation was taken "
+                "between the advisory read and the write transaction. The "
+                "advisory check cannot see that, which is why it is not the "
+                "authority"
+            )
+        assert taken.get("grant"), (
+            "the lease was never taken, so the window was never opened and "
+            "this pin proves nothing"
+        )
+        assert _replay_state(db, "s") == before, (
+            f"the refused write changed the replay columns anyway: "
+            f"{_replay_state(db, 's')!r} != {before!r}"
+        )
+        assert _billing_provider(db) == before_provider, (
+            f"the refused write landed anyway: {_billing_provider(db)!r}"
+        )
+
+        db.update_session_billing_route(
             "s", provider="owner", base_url="https://owner.example",
-            turn_lease_holder=grant,
-        ),
-        lambda db: db.update_session_billing_route(
-            "s", provider="free", base_url="https://free.example",
-        ),
-        _billing_provider,
-    )
+            turn_lease_holder=taken["grant"],
+        )
+        assert _billing_provider(db) == "owner", (
+            f"the owner's own write was refused: {_billing_provider(db)!r}"
+        )
+    finally:
+        db.close()
 
 
 def check_a_yolo_toggle_is_refused_while_a_live_owner_holds_it(tmpdir) -> None:
@@ -560,8 +620,8 @@ PINS = {
         check_a_runtime_lock_write_is_refused_while_a_live_owner_holds_it,
     "check_a_system_prompt_rewrite_is_refused_while_a_live_owner_holds_it":
         check_a_system_prompt_rewrite_is_refused_while_a_live_owner_holds_it,
-    "check_a_billing_route_write_is_refused_while_a_live_owner_holds_it":
-        check_a_billing_route_write_is_refused_while_a_live_owner_holds_it,
+    "check_a_billing_route_write_is_refused_when_the_lease_lands_mid_call":
+        check_a_billing_route_write_is_refused_when_the_lease_lands_mid_call,
     "check_a_yolo_toggle_is_refused_while_a_live_owner_holds_it":
         check_a_yolo_toggle_is_refused_while_a_live_owner_holds_it,
 }
@@ -591,6 +651,14 @@ def _guard_block(comment: str) -> str:
     )
 
 
+#: This module derives through the census's parsing helpers, so a mutated
+#: extract has to contain them or the pin module cannot be imported at all —
+#: and a clean run that dies on ImportError reads as "the pin does not hold".
+#: An extract pathspec, which is what BASE_EXTRACT_PATHSPEC already is; not a
+#: list of methods or exemptions.
+_EXTRA_EXTRACT = ("tests/state/test_turn_lease_writer_census.py",)
+
+
 SOURCE_MUTATIONS = (
     Mutation(
         pin="check_a_runtime_lock_write_is_refused_while_a_live_owner_holds_it",
@@ -613,14 +681,15 @@ SOURCE_MUTATIONS = (
             "replaying under",
     ),
     Mutation(
-        pin="check_a_billing_route_write_is_refused_while_a_live_owner_holds_it",
+        pin="check_a_billing_route_write_is_refused_when_the_lease_lands_mid_call",
         module="hermes_state.py",
         find=_guard_block(
             "Nulling the prompt snapshot changes what the next turn replays."
         ),
         replace="",
-        why="the billing columns are bookkeeping; the two prompt columns it "
-            "nulls on the way past are not",
+        why="with the in-transaction guard gone the only admission left is "
+            "the advisory read, which ran while the conversation was still "
+            "free — a lease taken during the flush is invisible to it",
     ),
     Mutation(
         pin="check_a_yolo_toggle_is_refused_while_a_live_owner_holds_it",
@@ -640,7 +709,7 @@ SOURCE_MUTATIONS = (
 )
 def test_each_pin_dies_when_its_own_guard_is_removed(mutation, tmp_path):
     """Clean, mutated, restored. A pin that survives its mutation is not a pin."""
-    assert_mutation_kills_the_pin(mutation, str(_SELF), tmp_path)
+    assert_mutation_kills_the_pin(mutation, str(_SELF), tmp_path, *_EXTRA_EXTRACT)
 
 
 def test_every_pin_has_a_mutation_that_kills_it():
