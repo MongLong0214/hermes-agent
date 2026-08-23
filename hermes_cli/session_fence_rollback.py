@@ -392,16 +392,36 @@ class BoundTarget:
         the name is unlinked. ``(st_dev, st_ino)`` from that descriptor is the
         identity every later step is measured against.
 
-    WHAT THIS CAN AND CANNOT PROMISE
-        ``sqlite3`` opens by pathname; there is no descriptor-based open to
-        hand it, so this cannot make SQLite open the bound inode by
-        construction. It can prove the name still resolves to the bound inode
-        at each point the operation relies on it — before the connection,
-        immediately after ``BEGIN EXCLUSIVE``, and again before ``COMMIT`` —
-        and refuse otherwise. A swap that happens inside one of those gaps and
-        is then swapped back would go unseen; every other ordering ends in a
-        refusal, and the failure direction is always "refuse", never "write to
-        the wrong file".
+    A FAMILY, NOT A FILE — AND WHY POINT CHECKS ARE NOT ENOUGH
+        Binding the main file while resolving ``-wal``/``-shm`` by pathname
+        leaves the set unbound. Two stores can share a byte-identical
+        checkpointed main file and carry DIFFERENT committed WAL contents, so a
+        pathname swap that lands between two identity checks — and is undone
+        before the second — produces a backup of A's main and B's WAL that
+        reads back as B's rows, while the transaction commits against A. The
+        point checks see A both times and report nothing.
+
+        Two point observations with a window between them is the defect, not
+        the fix. So :meth:`bind_family` opens EVERY member and the bytes are
+        read from those descriptors; no name is resolved again during a copy.
+        A member whose name resolves to an inode this did not bind, or a member
+        that appears after binding, is a refusal.
+
+    WHAT IT STILL CANNOT PROMISE, STATED AS A REFUSAL AND NOT AS A CAVEAT
+        ``sqlite3`` opens by pathname and there is no descriptor-based open to
+        hand it, so nothing here can prove the CONNECTION is on the bound
+        inode. ``Connection.backup()`` would have derived the snapshot from the
+        transaction itself; measured, it blocks indefinitely and
+        uninterruptibly when the source connection holds ``BEGIN EXCLUSIVE``,
+        so that door is shut.
+
+        What is done instead: the connection is opened, the identity is
+        verified, the family is bound UNDER THE EXCLUSIVE LOCK, and the bound
+        family's main member is required to be the same inode this object
+        bound at invocation. A swap that reaches the connection must therefore
+        also survive that equality check, and the failure direction is always
+        "refuse", never "write to the wrong file" or "claim a backup of one
+        store while mutating another".
     """
 
     def __init__(self, path: Path) -> None:
@@ -449,6 +469,67 @@ class BoundTarget:
                 reason="target-replaced",
             )
 
+    def bind_family(self):
+        """Open EVERY member of the store's file family, atomically, by name once.
+
+        Called under the exclusive lock, where no other process can write the
+        store. What comes back reads exclusively through descriptors, so the
+        pathname cannot be re-resolved underneath a copy — which is the ABA the
+        main-file-only binding left open.
+
+        The main member is required to be the inode bound at invocation; that
+        is what ties the family to the target the operator named rather than to
+        whatever the name means now.
+        """
+        import os
+
+        members = {}
+        try:
+            for suffix in ("",) + _SIDECAR_SUFFIXES:
+                candidate = self.path.with_name(self.path.name + suffix)
+                flags = os.O_RDONLY
+                flags |= getattr(os, "O_NOFOLLOW", 0)
+                flags |= getattr(os, "O_BINARY", 0)
+                try:
+                    handle = os.open(candidate, flags)
+                except FileNotFoundError:
+                    if not suffix:
+                        raise TurnFenceRollbackRefused(
+                            f"{self.path} disappeared before its family could "
+                            "be bound. Nothing was changed",
+                            reason="target-replaced",
+                        ) from None
+                    continue
+                except OSError as exc:
+                    raise TurnFenceRollbackRefused(
+                        f"{candidate} could not be bound as a plain file: "
+                        f"{exc}. Nothing was changed",
+                        reason="target-replaced",
+                    ) from exc
+                members[suffix] = handle
+        except BaseException:
+            for handle in members.values():
+                try:
+                    os.close(handle)
+                except OSError:
+                    pass
+            raise
+
+        main = os.fstat(members[""])
+        if (main.st_dev, main.st_ino) != self.identity:
+            for handle in members.values():
+                try:
+                    os.close(handle)
+                except OSError:
+                    pass
+            raise TurnFenceRollbackRefused(
+                f"{self.path} resolved to a different file when its family was "
+                "bound than the one this rollback started on. The store was "
+                "replaced mid-operation. Nothing was changed",
+                reason="target-replaced",
+            )
+        return _BoundFamily(self.path, members)
+
     def open_for_reading(self):
         """A fresh read handle on the BOUND inode, never re-resolving the name.
 
@@ -478,6 +559,95 @@ class BoundTarget:
     def __exit__(self, *_exc):
         self.close()
         return False
+
+
+class _BoundFamily:
+    """The store's whole file family, held open. Reads never touch a pathname."""
+
+    def __init__(self, path: Path, members) -> None:
+        self.path = Path(path)
+        self.members = dict(members)
+
+    def suffixes(self):
+        return sorted(self.members, key=lambda suffix: (suffix != "", suffix))
+
+    def open_member(self, suffix: str):
+        import os
+
+        handle = os.fdopen(os.dup(self.members[suffix]), "rb", closefd=True)
+        handle.seek(0)
+        return handle
+
+    def digest(self, suffix: str) -> str:
+        digest = hashlib.sha256()
+        with self.open_member(suffix) as handle:
+            for block in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    def close(self) -> None:
+        import os
+
+        for handle in self.members.values():
+            try:
+                os.close(handle)
+            except OSError:  # pragma: no cover - already closed
+                pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()
+        return False
+
+
+def _copy_family_onto_new_destinations(
+    family: "_BoundFamily", destination: Path, *, what: str, collision_reason: str
+) -> dict[str, Any]:
+    """Copy every bound member to a destination this call creates exclusively.
+
+    Sources are descriptors, destinations are ``O_CREAT | O_EXCL`` creations,
+    and the verification compares the descriptor's bytes against the bytes that
+    landed. No pathname is resolved on either side after the family was bound,
+    so neither a swapped source nor a pre-existing destination can be involved
+    without a refusal.
+    """
+    copied: list[str] = []
+    try:
+        for suffix in family.suffixes():
+            target = destination.with_name(destination.name + suffix)
+            _copy_onto_a_destination_we_created(
+                None, target, source_handle=family.open_member(suffix)
+            )
+            copied.append(suffix or destination.name)
+    except FileExistsError as exc:
+        raise TurnFenceRollbackRefused(
+            f"the {what} destination {exc.filename} already exists; refusing "
+            "to overwrite it. The check is not the guarantee, the exclusive "
+            "create is",
+            reason=collision_reason,
+        ) from exc
+    except OSError as exc:
+        raise TurnFenceRollbackRefused(
+            f"the {what} of {family.path} could not be written to "
+            f"{destination}: {exc}",
+            reason="backup-unwritable",
+        ) from exc
+
+    drifted = [
+        suffix or "(main)"
+        for suffix in family.suffixes()
+        if family.digest(suffix)
+        != _sha256(destination.with_name(destination.name + suffix))
+    ]
+    if drifted:
+        raise TurnFenceRollbackRefused(
+            f"the {what} of {family.path} does not reproduce the bound store "
+            f"({', '.join(drifted)} differ). Nothing was changed",
+            reason="store-in-use",
+        )
+    return {"copy": str(destination), "files": copied}
 
 
 def _copy_onto_a_destination_we_created(
@@ -656,7 +826,11 @@ def _refuse_if_this_process_owns_a_turn(
 
 
 def _make_verified_backup(
-    store_path: Path, backup_path: Path, *, bound: "BoundTarget" = None
+    store_path: Path,
+    backup_path: Path,
+    *,
+    bound: "BoundTarget" = None,
+    family: "_BoundFamily" = None,
 ) -> dict[str, Any]:
     """Copy the store and READ THE COPY BACK before anything is changed.
 
@@ -683,14 +857,22 @@ def _make_verified_backup(
     """
     _refuse_unusable_backup_path(backup_path)
 
-    snapshot = _byte_copy_of_the_store(
-        store_path,
-        backup_path,
-        what="backup",
-        reason="backup-unwritable",
-        collision_reason="backup-exists",
-        bound=bound,
-    )
+    if family is not None:
+        # Sources are the descriptors bound under the exclusive lock, so the
+        # backup is of the artifact the transaction is holding and not of
+        # whatever the pathname family resolves to while the copy runs.
+        snapshot = _copy_family_onto_new_destinations(
+            family, backup_path, what="backup", collision_reason="backup-exists"
+        )
+    else:
+        snapshot = _byte_copy_of_the_store(
+            store_path,
+            backup_path,
+            what="backup",
+            reason="backup-unwritable",
+            collision_reason="backup-exists",
+            bound=bound,
+        )
 
     try:
         backup_conn = sqlite3.connect(f"file:{backup_path}?mode=ro", uri=True)
@@ -790,10 +972,20 @@ def preflight_turn_fence_rollback(
             ) from exc
 
         copy = work_dir / "preflight.db"
-        _byte_copy_of_the_store(
-            store_path, copy, what="pre-flight",
-            collision_reason="rehearsal-unwritable", bound=bound,
-        )
+        if bound is not None:
+            # The family, not just the main file. This was the last place a
+            # sidecar was still resolved by pathname after acquisition, which
+            # is how an A-main/B-wal chimera could be assembled.
+            with bound.bind_family() as family:
+                _copy_family_onto_new_destinations(
+                    family, copy, what="pre-flight",
+                    collision_reason="rehearsal-unwritable",
+                )
+        else:
+            _byte_copy_of_the_store(
+                store_path, copy, what="pre-flight",
+                collision_reason="rehearsal-unwritable",
+            )
 
         expected = sorted(rollback_trigger_names())
         installed = _installed_fence_triggers(copy, report_as=store_path)
@@ -894,10 +1086,18 @@ def _commit_the_rollback(
             )
             _refuse_unexpected_surface(reported, installed, expected)
 
-            # 3. The backup, of the state this transaction is holding, read
-            #    through the BOUND descriptor so the bytes preserved are the
-            #    bound target's and not the current name's.
-            backup = _make_verified_backup(target_path, backup_path, bound=bound)
+            # 3. The backup, of the state this transaction is holding. The
+            #    WHOLE file family is bound here, under the lock, and every
+            #    byte is read from those descriptors — binding only the main
+            #    file while resolving -wal by name is what let an A-main/B-wal
+            #    chimera through.
+            if bound is not None:
+                with bound.bind_family() as family:
+                    backup = _make_verified_backup(
+                        target_path, backup_path, family=family
+                    )
+            else:
+                backup = _make_verified_backup(target_path, backup_path)
 
             # 4. All of them, or none.
             for name in expected:

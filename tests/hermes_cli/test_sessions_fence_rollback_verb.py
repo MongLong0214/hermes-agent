@@ -1377,6 +1377,115 @@ def check_a_dry_run_that_cannot_clean_up_does_not_report_success(
     )
 
 
+def check_a_late_failure_does_not_retract_what_already_happened(
+    tmpdir: pathlib.Path,
+) -> None:
+    """Failure precedence sets the exit status. It does not rewrite the facts.
+
+    Two situations that must not print the same thing:
+
+    * the rollback COMPLETED and cleanup then failed — twenty-four triggers are
+      gone and a verified backup exists;
+    * the run was refused BEFORE it mutated anything, and cleanup then failed —
+      nothing was dropped and no backup was written.
+
+    Collapsing both into ``changed: false`` / ``dropped_triggers: []`` /
+    "Nothing was changed." is the original residue defect pointed the other
+    way, and worse: an operator who reads "nothing was changed" after the fence
+    came off stops looking. They will not go and find the unfenced store or the
+    backup they now depend on, because they have been told there is nothing to
+    find.
+    """
+    _sandbox_home(tmpdir)
+    module, why = _import_verb()
+    assert module is not None, f"there is no fence-rollback verb: {why}"
+
+    from hermes_cli import session_fence_rollback as library
+
+    class _CleanupDoesNothing:
+        def __init__(self, real):
+            self._real = real
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+        def rmtree(self, *args, **kwargs):
+            return None
+
+    def _run_with_cleanup_suppressed(store, backup):
+        real_shutil = library.shutil
+        library.shutil = _CleanupDoesNothing(real_shutil)
+        try:
+            return _run_verb(store, backup)
+        finally:
+            library.shutil = real_shutil
+
+    # (1) COMPLETED, then cleanup failed.
+    done_dir = tmpdir / "completed"
+    done_dir.mkdir()
+    done_store = done_dir / "state.db"
+    _fenced_store(done_store, leave_lease_live=False)
+    done_backup = done_dir / "backup.db"
+    completed = _run_with_cleanup_suppressed(done_store, done_backup)
+
+    assert not completed.crash, f"the verb crashed: {completed.crash}"
+    done = _payload(completed)
+    assert done is not None, f"no machine-readable report: {completed.stdout!r}"
+    assert _installed_triggers(done_store) == [], (
+        "the fixture did not actually complete a rollback, so this pin is "
+        "comparing nothing"
+    )
+    assert done_backup.is_file(), "the fixture did not produce a backup"
+    assert done["changed"] is True, (
+        "the fence came off and a verified backup was written, and the report "
+        f"says changed=false. A late failure retracted an earlier fact: {done!r}"
+    )
+    assert sorted(done["dropped_triggers"]) == sorted(
+        hermes_state_common.TURN_FENCE_TRIGGERS
+    ), (
+        "the completed surface was flattened to empty by the cleanup failure: "
+        f"{done.get('dropped_triggers')!r}"
+    )
+    assert isinstance(done.get("backup"), dict) and done["backup"].get("verified"), (
+        f"the verified backup was dropped from the report: {done.get('backup')!r}"
+    )
+    assert "Nothing was changed." not in completed.stderr, (
+        "the operator is told nothing changed after twenty-four triggers came "
+        f"off. They will stop looking:\n{completed.stderr}"
+    )
+    assert done["refused"]["reason"] == "completed-with-residue", (
+        "a completed run with residue is not distinguishable from a run that "
+        f"never mutated anything: {done['refused']!r}"
+    )
+    assert completed.rc not in (0, None), "residue still needs a nonzero exit"
+
+    # (2) REFUSED before mutating, then cleanup failed.
+    live_dir = tmpdir / "refused"
+    live_dir.mkdir()
+    live_store = live_dir / "state.db"
+    _fenced_store(live_store, leave_lease_live=True)
+    _hand_the_lease_to_a_foreign_live_owner(live_store)
+    live_triggers = _installed_triggers(live_store)
+    live_backup = live_dir / "backup.db"
+    refused = _run_with_cleanup_suppressed(live_store, live_backup)
+
+    assert not refused.crash, f"the verb crashed: {refused.crash}"
+    stopped = _payload(refused)
+    assert stopped is not None, f"no machine-readable report: {refused.stdout!r}"
+    assert stopped["changed"] is False, (
+        "a run that never mutated the store reports changed=true: "
+        f"{stopped!r}"
+    )
+    assert stopped["dropped_triggers"] == []
+    assert not live_backup.exists(), "a pre-mutation refusal wrote a backup"
+    assert _installed_triggers(live_store) == live_triggers
+    assert stopped["refused"]["reason"] != done["refused"]["reason"], (
+        "a run that completed and a run that never started report the SAME "
+        f"outcome ({stopped['refused']['reason']}). Two different situations "
+        "that print the same thing is the defect"
+    )
+
+
 def check_the_completed_run_reports_the_surface_it_removed(
     tmpdir: pathlib.Path,
 ) -> None:
@@ -1456,6 +1565,8 @@ PINS = {
         check_an_orphan_backup_sidecar_is_not_overwritten,
     "check_a_dry_run_that_cannot_clean_up_does_not_report_success":
         check_a_dry_run_that_cannot_clean_up_does_not_report_success,
+    "check_a_late_failure_does_not_retract_what_already_happened":
+        check_a_late_failure_does_not_retract_what_already_happened,
     "check_the_completed_run_reports_the_surface_it_removed":
         check_the_completed_run_reports_the_surface_it_removed,
 }
@@ -1636,6 +1747,17 @@ SOURCE_MUTATIONS = (
             "'failed and swallowed', so a rolled-back — unfenced — duplicate "
             "of every conversation stays on disk while the verb exits 0 and "
             "reports that nothing changed",
+    ),
+    Mutation(
+        pin="check_a_late_failure_does_not_retract_what_already_happened",
+        module="hermes_cli/session_fence_rollback_cmd.py",
+        find='            "changed": bool(facts.get("changed", False)),\n',
+        replace='            "changed": False,\n',
+        why="hardcoding the outcome fields on the failure path is how a run "
+            "that dropped twenty-four triggers and wrote a verified backup "
+            "announces that nothing changed. The operator stops looking, and "
+            "the store they now have to restore is the one they were told not "
+            "to worry about",
     ),
     Mutation(
         pin="check_the_completed_run_reports_the_surface_it_removed",

@@ -251,6 +251,22 @@ def _report_rollback(store: Path, backup: Path) -> int:
     finally:
         residue = rollback.sweep_work_dir(work_dir)
 
+    # THE FACTS THE RUN ESTABLISHED, decided by the step that established
+    # them. Whatever goes wrong after this point reports on top of these — it
+    # does not get to rewrite them. A run whose fence came off and whose backup
+    # landed says so even when cleanup then fails, because an operator told
+    # "nothing was changed" stops looking for a store they now have to restore.
+    established = (
+        {
+            "changed": True,
+            "backup": report["backup"],
+            "installed_triggers": report["installed_triggers"],
+            "dropped_triggers": report["dropped_triggers"],
+        }
+        if report is not None
+        else {"changed": False}
+    )
+
     if residue is not None:
         # Same rule as the dry run, and it applies even when the rollback
         # SUCCEEDED: a copy of the store from before the fence came off is
@@ -259,18 +275,22 @@ def _report_rollback(store: Path, backup: Path) -> int:
             rollback.TurnFenceRollbackRefused(
                 f"the pre-flight copy of {store} could not be removed: "
                 f"{residue['files']} file(s) remain under "
-                f"{residue['work_dir']}{residue['error']}. The rollback itself "
-                f"{'completed' if report is not None else 'did not complete'}. "
-                "That copy is a duplicate of every conversation in the store — "
-                "remove that directory",
-                reason="preflight-residue",
+                f"{residue['work_dir']}{residue['error']}. That copy is a "
+                "duplicate of every conversation in the store — remove that "
+                "directory",
+                reason=(
+                    "completed-with-residue" if report is not None
+                    else "preflight-residue"
+                ),
             ),
             store=store, backup=backup, dry_run=False,
             preflight=(report or {}).get("preflight"),
+            established=established,
         )
     if refusal is not None:
         return _emit_refusal(
             refusal, store=store, backup=backup, dry_run=False,
+            established=established,
         )
 
     _emit(
@@ -306,21 +326,37 @@ def _emit_refusal(
     backup: Path,
     dry_run: bool,
     preflight: dict | None = None,
+    established: dict | None = None,
 ) -> int:
+    """Report a failure WITHOUT retracting what already happened.
+
+    A late failure does not undo the facts established before it. The original
+    cleanup blocker was residue on disk while claiming success; flattening
+    `changed`, `dropped_triggers` and the backup into their empty values on
+    every error path is the same defect pointed the other way, and worse — an
+    operator told "Nothing was changed." after twenty-four triggers came off
+    stops looking, because they have been told there is nothing to find.
+
+    So failure precedence decides the exit status and the primary reason.
+    *established* decides the outcome fields, and it is whatever the run
+    actually accomplished before it went wrong.
+    """
     from hermes_cli import session_fence_rollback as rollback
 
     import hermes_state_common
 
+    facts = dict(established or {})
     _emit(
         {
             "verb": _VERB,
             "ok": False,
             "dry_run": dry_run,
-            "changed": False,
+            "changed": bool(facts.get("changed", False)),
             "store": str(store),
-            "backup": str(backup),
+            "backup": facts.get("backup", str(backup)),
             "generation": hermes_state_common.TURN_FENCE_GENERATION,
-            "dropped_triggers": [],
+            "installed_triggers": facts.get("installed_triggers", []),
+            "dropped_triggers": facts.get("dropped_triggers", []),
             "preflight": (
                 preflight
                 or getattr(exc, "preflight", None)
@@ -345,10 +381,23 @@ def _emit(payload: dict[str, Any]) -> None:
 def _human_lines(payload: dict[str, Any]) -> list:
     if not payload.get("ok"):
         refused = payload.get("refused", {})
-        return [
-            f"✗ refused ({refused.get('reason')}): {refused.get('detail')}",
-            "  Nothing was changed.",
-        ]
+        lines = [f"✗ {refused.get('reason')}: {refused.get('detail')}"]
+        if payload.get("changed"):
+            # The run got further than the failure suggests. Saying "nothing
+            # was changed" here would send the operator away from a store whose
+            # fence is already off and a backup they need to keep.
+            lines.append(
+                f"  THE ROLLBACK ITSELF COMPLETED: "
+                f"{len(payload.get('dropped_triggers') or [])} trigger(s) were "
+                "removed and the verified backup was written. The failure above "
+                "is what happened AFTER that, and it still needs action."
+            )
+            backup = payload.get("backup")
+            if isinstance(backup, dict) and backup.get("path"):
+                lines.append(f"  Verified backup: {backup['path']}")
+        else:
+            lines.append("  Nothing was changed.")
+        return lines
     if payload.get("dry_run"):
         return [
             f"✓ dry run on {payload['store']}: "
