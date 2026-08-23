@@ -28,6 +28,14 @@ WHY A VERB AND NOT A LIBRARY ENTRY POINT
       a single byte of the store — not the rows, not the triggers, not the
       file. It rehearses on a disposable copy precisely so that this can be
       asserted as bytes rather than as content;
+    * the dry run refuses exactly what the real run refuses. Rehearsing on a
+      copy buys the byte assertion and costs an identity: one branch of the
+      liveness predicate is keyed by the store's PATH, so without a guard a
+      conversation this very process is mid-turn on reads free on the copy and
+      held on the original. That was not a hypothesis — the first version of
+      the rehearsal reported "this would proceed" about a run that then
+      refused, which is worse than having no rehearsal, because the operator
+      types the real command on its say-so;
     * and the completed run reports, in machine-readable form, the surface it
       removed and the backup it verified.
 
@@ -588,6 +596,7 @@ def check_the_dry_run_reports_the_plan_and_changes_no_byte(
     store = tmpdir / "state.db"
     _fenced_store(store, leave_lease_live=False)
     before = _store_digest(store)
+    listing_before = sorted(entry.name for entry in tmpdir.iterdir())
     rows_before = _canonical_rows(store)
     backup = tmpdir / "backup.db"
 
@@ -631,6 +640,86 @@ def check_the_dry_run_reports_the_plan_and_changes_no_byte(
     assert _canonical_rows(store) == rows_before
     assert not backup.exists(), (
         "the dry run wrote the backup it was only supposed to plan"
+    )
+    assert sorted(entry.name for entry in tmpdir.iterdir()) == listing_before, (
+        "the dry run left its working copy behind. A rehearsal on a copy of a "
+        "session store leaves an unfenced duplicate of every conversation on "
+        "disk if it is not cleaned up: "
+        f"{sorted(entry.name for entry in tmpdir.iterdir())}"
+    )
+
+
+def check_the_dry_run_refuses_what_the_real_run_would_refuse(
+    tmpdir: pathlib.Path,
+) -> None:
+    """The rehearsal is only worth anything if it predicts the real run.
+
+    Rehearsing on a copy is what buys the byte assertion, and it costs an
+    identity. ``SessionDB._turn_lease_row_is_free`` frees a row whose
+    ``owner_pid`` is this process when this process holds no grant FOR THAT
+    ``db_path`` — a turn that died without releasing. The copy has a different
+    path, so a conversation this very process is genuinely mid-turn on reads
+    free on the copy and held on the original.
+
+    Measured, not reasoned about: the first version of this rehearsal reported
+    "this would proceed" on exactly the store the real run then refused. A
+    rehearsal that predicts the wrong outcome is worse than no rehearsal — the
+    operator types the real command on its say-so.
+
+    Both invocations are asserted here TOGETHER, so the claim is the agreement
+    rather than either verdict on its own.
+    """
+    _sandbox_home(tmpdir)
+    module, why = _import_verb()
+    assert module is not None, f"there is no fence-rollback verb: {why}"
+
+    store = tmpdir / "state.db"
+    _fenced_store(store, leave_lease_live=True)
+    before = _store_digest(store)
+    listing_before = sorted(entry.name for entry in tmpdir.iterdir())
+
+    rehearsal = _run_verb(store, tmpdir / "backup-dry.db", dry_run=True)
+    assert not rehearsal.crash, f"the dry run crashed on a live store: {rehearsal.crash}"
+    dry = _payload(rehearsal)
+    assert dry is not None, (
+        f"the dry run printed no machine-readable report: {rehearsal.stdout!r}"
+    )
+    # Read BEFORE the real run below. The real run's own liveness check opens
+    # the store as a store, and that writes — so a digest taken after it would
+    # attribute the real run's bytes to the rehearsal.
+    after_rehearsal = _store_digest(store)
+    listing_after_rehearsal = sorted(entry.name for entry in tmpdir.iterdir())
+
+    real = _run_verb(store, tmpdir / "backup-real.db")
+    assert not real.crash, f"the real run crashed on a live store: {real.crash}"
+    live = _payload(real)
+    assert live is not None, (
+        f"the real run printed no machine-readable report: {real.stdout!r}"
+    )
+    assert live.get("ok") is False and live["refused"]["reason"] == "live-turn", (
+        "the fixture did not produce a store the real run refuses, so this "
+        f"check is comparing nothing: {live!r}"
+    )
+
+    assert dry.get("ok") is False, (
+        "the dry run reported that the rollback WOULD PROCEED on a store the "
+        f"real run refuses ({live['refused']['reason']}). The rehearsal is "
+        "run on a copy, and the copy does not carry the store's path — so an "
+        "answer that depends on the path is an answer about the wrong file: "
+        f"{dry!r}"
+    )
+    assert dry["refused"]["reason"] == live["refused"]["reason"], (
+        "the dry run and the real run refused for DIFFERENT reasons "
+        f"({dry['refused']['reason']} vs {live['refused']['reason']}), so the "
+        "rehearsal is not a rehearsal of this run"
+    )
+
+    assert after_rehearsal == before, (
+        f"the dry run changed the store while refusing it: {before} -> "
+        f"{after_rehearsal}"
+    )
+    assert listing_after_rehearsal == listing_before, (
+        f"a refused dry run left files behind: {listing_after_rehearsal}"
     )
 
 
@@ -699,6 +788,8 @@ PINS = {
         check_a_partial_surface_is_refused_whole_and_writes_no_backup,
     "check_the_dry_run_reports_the_plan_and_changes_no_byte":
         check_the_dry_run_reports_the_plan_and_changes_no_byte,
+    "check_the_dry_run_refuses_what_the_real_run_would_refuse":
+        check_the_dry_run_refuses_what_the_real_run_would_refuse,
     "check_the_completed_run_reports_the_surface_it_removed":
         check_the_completed_run_reports_the_surface_it_removed,
 }
@@ -782,6 +873,17 @@ SOURCE_MUTATIONS = (
         why="a --dry-run that falls through to the real operation is worse "
             "than no dry run at all: the operator asked what would happen and "
             "it happened",
+    ),
+    Mutation(
+        pin="check_the_dry_run_refuses_what_the_real_run_would_refuse",
+        module="hermes_cli/session_fence_rollback.py",
+        find="        _refuse_if_this_process_owns_a_turn(store_path)\n",
+        replace="        pass\n",
+        why="without it the rehearsal asks the liveness question of a copy, "
+            "and the one branch of the predicate that is keyed by the store's "
+            "PATH answers about the wrong file — so a conversation this "
+            "process is mid-turn on reads free, and the dry run reports that "
+            "a run which is about to be refused would proceed",
     ),
     Mutation(
         pin="check_the_completed_run_reports_the_surface_it_removed",

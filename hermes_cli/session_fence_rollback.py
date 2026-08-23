@@ -246,6 +246,54 @@ def _refuse_unusable_backup_path(backup_path: Path) -> None:
         )
 
 
+def _refuse_if_this_process_owns_a_turn(store_path: Path) -> None:
+    """Close the ONE branch of the liveness predicate that is keyed by path.
+
+    :meth:`SessionDB._turn_lease_row_is_free` frees a row whose ``owner_pid``
+    is this process when this process holds no grant FOR THAT ``db_path`` — a
+    turn that died without releasing. Every other branch reads the row.
+
+    A rehearsal runs on a copy, and the copy has a different path. So a
+    conversation THIS process is genuinely mid-turn on reads free on the copy
+    and held on the original: the dry run would report "this would proceed"
+    about a run that is going to refuse. Measured, not reasoned about — the
+    first version of the rehearsal did exactly that.
+
+    Asked here for the REAL path, against the conversations the store itself
+    names, and only for the process-local registry. This is not a second
+    opinion about liveness: the row-reading branches stay where they are, on
+    :func:`_refuse_if_live`.
+    """
+    from hermes_state import live_turn_grant
+
+    conn = sqlite3.connect(f"file:{store_path}?mode=ro", uri=True)
+    try:
+        rows = conn.execute(
+            "SELECT conversation_id FROM session_turn_leases "
+            "WHERE holder IS NOT NULL AND holder != ''"
+        ).fetchall()
+    except sqlite3.DatabaseError as exc:
+        raise TurnFenceRollbackRefused(
+            f"could not read the turn leases of {store_path}: {exc}",
+            reason="store-unreadable",
+        ) from exc
+    finally:
+        conn.close()
+
+    held = sorted(
+        str(row[0])
+        for row in rows
+        if live_turn_grant(store_path, str(row[0])) is not None
+    )
+    if held:
+        raise TurnFenceRollbackRefused(
+            f"refusing to roll back the turn fence on {store_path}: this "
+            f"process holds a live turn on {held}, so the real run would "
+            "refuse. End those turns first",
+            reason="live-turn",
+        )
+
+
 def _make_verified_backup(store_path: Path, backup_path: Path) -> dict[str, Any]:
     """Copy the store and READ THE COPY BACK before anything is changed.
 
@@ -405,6 +453,8 @@ def rehearse_turn_fence_rollback(
         installed = _installed_fence_triggers(store_path)
         _refuse_unexpected_surface(store_path, installed, expected)
         progress["surface_verified"] = True
+
+        _refuse_if_this_process_owns_a_turn(store_path)
 
         # The path the REAL run would write, checked against the real
         # filesystem — a rehearsal that does not notice the operator's backup
