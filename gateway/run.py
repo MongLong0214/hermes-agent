@@ -8281,7 +8281,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ):
                 return
             config["gateway_runtime"] = runtime
-            db.update_session_meta(session_id, json.dumps(config), model=model)
+            # Fenced: model and model_config are what the next turn replays
+            # under, and everything above this line is a snapshot read outside
+            # the write transaction. Reuse before acquire — present the turn's
+            # own grant when this process is running one, and write holderless
+            # (grant is None) when nothing here owns the conversation, which
+            # the fence admits. A refusal means somebody else owns the turn and
+            # this stale merge would clobber it; the debug log below is the
+            # right outcome for a best-effort metadata sync.
+            grant = None
+            reuse = getattr(db, "current_turn_grant", None)
+            if callable(reuse):
+                grant = reuse(session_id)
+            db.update_session_meta(
+                session_id, json.dumps(config), model=model,
+                turn_lease_holder=grant,
+            )
         except Exception:
             logger.debug("Failed to sync gateway session model metadata", exc_info=True)
 

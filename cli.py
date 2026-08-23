@@ -8708,11 +8708,23 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "api_mode": result.api_mode or None,
         }
         try:
-            db.update_session_model(sid, result.new_model)
+            # Both writes are fenced: model / model_config / system_prompt are
+            # what the next turn replays under. Reuse before acquire — a switch
+            # issued INSIDE a turn this process is running must present the
+            # turn's own grant, and `current_turn_grant` is None when nothing
+            # here owns the conversation, which is the case the fence admits
+            # holderless.
+            _grant = None
+            _reuse = getattr(db, "current_turn_grant", None)
+            if callable(_reuse):
+                _grant = _reuse(sid)
+            db.update_session_model(
+                sid, result.new_model, turn_lease_holder=_grant
+            )
             db.patch_session_model_config(sid, {
                 "gateway_runtime": route,
                 **route,
-            })
+            }, turn_lease_holder=_grant)
         except Exception:
             logger.debug(
                 "Failed to persist model switch to session DB", exc_info=True

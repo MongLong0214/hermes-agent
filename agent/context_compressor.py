@@ -2467,7 +2467,20 @@ class ContextCompressor(ContextEngine):
         if not session_id or not callable(patcher):
             return
         try:
-            patcher(session_id, {PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None})
+            # model_config is fenced, and this runs INSIDE the turn that owns
+            # the conversation — so it presents the turn's own grant rather
+            # than writing holderless, which the store now refuses while a live
+            # owner exists. `current_turn_grant` is None when nothing in this
+            # process owns it, which is the unowned case the fence admits.
+            grant = None
+            reuse = getattr(session_db, "current_turn_grant", None)
+            if callable(reuse):
+                grant = reuse(session_id)
+            patcher(
+                session_id,
+                {PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None},
+                turn_lease_holder=grant,
+            )
         except Exception as exc:
             logger.debug("proactive prune runway clear failed: %s", exc)
 

@@ -4362,10 +4362,22 @@ def _persist_live_session_runtime(session: dict | None) -> None:
             # metadata persist.
             model_config["service_tier"] = create_service_tier_override or "normal"
         model = str(getattr(agent, "model", "") or "").strip()
+        # Both writes are fenced. Reuse before acquire: this runs on the live
+        # session, which may be mid-turn in this process, and an in-turn writer
+        # must present the turn's own grant. `current_turn_grant` is None when
+        # nothing here owns the conversation — the case the fence admits
+        # holderless — and this call is best-effort either way.
+        grant = None
+        reuse = getattr(db, "current_turn_grant", None)
+        if callable(reuse):
+            grant = reuse(session_key)
         if hasattr(db, "update_session_meta"):
-            db.update_session_meta(session_key, json.dumps(model_config), model or None)
+            db.update_session_meta(
+                session_key, json.dumps(model_config), model or None,
+                turn_lease_holder=grant,
+            )
         elif model and hasattr(db, "update_session_model"):
-            db.update_session_model(session_key, model)
+            db.update_session_model(session_key, model, turn_lease_holder=grant)
     except Exception:
         logger.debug("failed to persist live session runtime", exc_info=True)
 
@@ -11166,6 +11178,7 @@ def _run_prompt_submit(
                                 content=text,
                                 display_kind=display_kind,
                                 display_metadata=display_metadata,
+                                turn_lease_holder=_dk_lease.token,
                             )
                     except SessionTurnLeaseLostError:
                         logger.info(

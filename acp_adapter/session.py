@@ -482,7 +482,17 @@ class SessionManager:
             else:
                 # Update model_config (contains cwd) if changed.
                 try:
-                    db.update_session_meta(state.session_id, cwd_json, model_str)
+                    # Fenced (model / model_config are replayed by the next
+                    # turn). Reuse before acquire: present the turn's grant
+                    # when this process is running one, holderless otherwise.
+                    _grant = None
+                    _reuse = getattr(db, "current_turn_grant", None)
+                    if callable(_reuse):
+                        _grant = _reuse(state.session_id)
+                    db.update_session_meta(
+                        state.session_id, cwd_json, model_str,
+                        turn_lease_holder=_grant,
+                    )
                 except Exception:
                     logger.debug("Failed to update ACP session metadata", exc_info=True)
 
