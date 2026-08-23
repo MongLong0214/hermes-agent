@@ -27,18 +27,20 @@ THE CLOSURE, AND THE ONE IT REFUSES
     the whole requirement.
 
 WHICH STATEMENTS TAKE ADMISSION, AND WHICH DO NOT
-    Fifteen DML statements, and the rule is what each one does to the parent's
-    future turn. Five take admission and ten are argued; the argument is
-    per-group and every group has a checkable ground.
+    The rule is what each statement does to the parent's future turn. The
+    SET and its counts are NOT written here: three places in this branch
+    once stated three different totals for one set, which is what prose
+    does. :mod:`tests.state.test_raw_sink_census` derives the statements,
+    classifies each one, fails on any that is neither admitted nor
+    grounded, and prints the counts.
 
-    unclaimed removal    ``_delete_durable_delegation`` (DELETE) and
-                         ``mark_completion_delivered`` — the one delivery
-                         transition whose WHERE clause is ``delegation_id = ?``
-                         ALONE, so anybody can run it, and running it is how a
-                         completion stops ever reaching the parent. Both take
-                         the admission and REFUSE.
-    the two sweeps       the retention prune (3 statements) and the staleness
-                         cap in ``restore_undelivered_completions``. Victims
+    unclaimed removal    a DELETE, or a ``delivery_state`` move away from
+                         ``pending`` whose WHERE clause does not carry a
+                         claim — anybody can run one, and running it is how
+                         a completion stops ever reaching the parent. These
+                         take the admission and REFUSE.
+    the sweeps           the retention prune and the staleness cap in
+                         ``restore_undelivered_completions``. Victims
                          come from a retention filter, so they SKIP rather than
                          refuse — the same rule every other sweep in this
                          family follows.
@@ -59,8 +61,12 @@ WHICH STATEMENTS TAKE ADMISSION, AND WHICH DO NOT
                          ``pending``; none of them can remove a turn from the
                          parent's future.
 
-    :func:`test_the_claim_protocol_leaves_the_payload_pending` is the evidence
-    for the third group, and it is asserted rather than argued.
+    :func:`check_the_claim_protocol_leaves_the_payload_pending` is the ground
+    for the third group, asserted rather than argued — and it is a PIN with a
+    killer rather than plain evidence. It was first written as evidence on the
+    reasoning that no guard removal could falsify it; that reasoning was wrong,
+    and the mutation table names the removal that does (the
+    attempts-exhausted condition on the terminal drop).
 """
 
 from __future__ import annotations
@@ -305,25 +311,7 @@ def check_an_unclaimed_delivery_ack_is_refused_for_an_owned_parent(
         db.close()
 
 
-PINS = {
-    "check_an_unclaimed_delivery_ack_is_refused_for_an_owned_parent":
-        check_an_unclaimed_delivery_ack_is_refused_for_an_owned_parent,
-    "check_a_durable_delete_is_refused_for_an_owned_parent":
-        check_a_durable_delete_is_refused_for_an_owned_parent,
-    "check_a_retention_prune_keeps_the_owned_parents_record":
-        check_a_retention_prune_keeps_the_owned_parents_record,
-    "check_a_stale_replay_drop_skips_the_owned_parent":
-        check_a_stale_replay_drop_skips_the_owned_parent,
-}
-
-
-@pytest.mark.parametrize("name", sorted(PINS), ids=sorted(PINS))
-def test_async_delegation_sink_property(name, tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
-    PINS[name](tmp_path)
-
-
-def test_the_claim_protocol_leaves_the_payload_pending(tmp_path, monkeypatch):
+def check_the_claim_protocol_leaves_the_payload_pending(tmpdir) -> None:
     """Evidence for the one argued exemption in this module.
 
     The claim / release pair is mutual exclusion BETWEEN consumers, and the
@@ -332,10 +320,9 @@ def test_the_claim_protocol_leaves_the_payload_pending(tmp_path, monkeypatch):
     leave ``delivery_state`` at ``pending`` and the payload untouched, so
     nothing the parent's next turn would replay has moved.
     """
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
     import tools.async_delegation as ad
 
-    db = _store(tmp_path)
+    db = _store(tmpdir)
     home = pathlib.Path(db.db_path).parent
     try:
         _owned(db, "parent")
@@ -356,7 +343,37 @@ def test_the_claim_protocol_leaves_the_payload_pending(tmp_path, monkeypatch):
         db.close()
 
 
+PINS = {
+    "check_the_claim_protocol_leaves_the_payload_pending":
+        check_the_claim_protocol_leaves_the_payload_pending,
+    "check_an_unclaimed_delivery_ack_is_refused_for_an_owned_parent":
+        check_an_unclaimed_delivery_ack_is_refused_for_an_owned_parent,
+    "check_a_durable_delete_is_refused_for_an_owned_parent":
+        check_a_durable_delete_is_refused_for_an_owned_parent,
+    "check_a_retention_prune_keeps_the_owned_parents_record":
+        check_a_retention_prune_keeps_the_owned_parents_record,
+    "check_a_stale_replay_drop_skips_the_owned_parent":
+        check_a_stale_replay_drop_skips_the_owned_parent,
+}
+
+
+@pytest.mark.parametrize("name", sorted(PINS), ids=sorted(PINS))
+def test_async_delegation_sink_property(name, tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    PINS[name](tmp_path)
+
+
 SOURCE_MUTATIONS = (
+    Mutation(
+        pin="check_the_claim_protocol_leaves_the_payload_pending",
+        module="tools/async_delegation.py",
+        find="                 AND delivery_claim=? AND delivery_attempts>=?\"\"\",\n",
+        replace="                 AND delivery_claim=? AND ?>=0\"\"\",\n",
+        why="the attempts-exhausted condition is what confines the TERMINAL "
+            "drop to a row that has really burned its budget; without it an "
+            "ordinary release un-pends the payload, and the exemption this "
+            "check grounds stops being true",
+    ),
     Mutation(
         pin="check_a_durable_delete_is_refused_for_an_owned_parent",
         module="tools/async_delegation.py",
