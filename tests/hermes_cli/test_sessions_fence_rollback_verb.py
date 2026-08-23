@@ -4024,5 +4024,46 @@ def test_each_pin_dies_when_its_own_guard_is_removed(mutation, tmp_path):
     assert_mutation_kills_the_pin(mutation, str(_SELF), tmp_path, *_EXTRA_EXTRACT)
 
 
+def test_every_mutation_anchor_still_names_one_place():
+    """Every anchor matches exactly one place in the CURRENT source. Fast.
+
+    NOT COVERAGE — this proves nothing about the verb. It is a tooling guard,
+    and it exists because of a loop that cost three rounds: a commit moves a
+    production guard, the row naming that guard silently stops matching, and
+    nothing says so until the next full mutation matrix runs. By then two more
+    commits have moved more code, so the head is never green and complete at
+    the same instant.
+
+    The matrix already asserts this, once per row, behind three subprocess
+    tree-extractions each — minutes. Here it is a string count over two files,
+    which makes it runnable before every commit, and that is the whole point:
+    the delay was the defect, not the missing check.
+
+    A commit that moves a guard and leaves its row stale is incomplete by
+    construction. This is what says so at the time rather than a round later.
+    """
+    import collections
+
+    sources = {}
+    counts = collections.Counter()
+    stale = []
+    for mutation in SOURCE_MUTATIONS:
+        path = REPO_ROOT / mutation.module
+        text = sources.setdefault(mutation.module, path.read_text(encoding="utf-8"))
+        found = text.count(mutation.find)
+        counts[found] += 1
+        if found != 1:
+            stale.append((mutation.pin, mutation.module, found, mutation.find))
+    assert not stale, (
+        "mutation anchors that no longer name exactly one guard:\n"
+        + "\n".join(
+            f"  {pin} -> {module}: {found} match(es)\n    {find!r}"
+            for pin, module, found, find in stale
+        )
+        + "\n\nRe-derive each in the SAME commit that moved the guard. A row "
+        "pointing at replaced code scores no kill and still reports as a row."
+    )
+
+
 def test_every_pin_has_a_mutation_that_kills_it():
     assert_every_pin_has_a_killer(PINS, SOURCE_MUTATIONS)
