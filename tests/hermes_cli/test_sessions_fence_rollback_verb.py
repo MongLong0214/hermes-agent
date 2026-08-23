@@ -3385,6 +3385,87 @@ def check_a_sidecar_that_vanished_is_not_claimed_as_our_removal(
     )
 
 
+def check_every_surviving_destination_member_is_reported_exactly_once(
+    tmpdir: pathlib.Path,
+) -> None:
+    """A cleanup that RETURNS its failures, and a caller that reads them.
+
+    The release path was taught to hold ownership until the result was known,
+    and it does: it detects the member it could not remove and returns it. The
+    caller then called it for effect and threw the list away, so a surviving
+    ``backup.db`` sat on disk while the layer below had already worked out that
+    it was there. The defect did not survive where it was fixed — it reappeared
+    one level up, where the fix was invisible from outside.
+
+    That is the second time in this slice a defect has moved up a level after
+    being closed down one, so the rule is stated rather than filed: after
+    fixing something, check its CALLERS. Every level that consumes the fixed
+    thing's result. A return value describing a failure is a fact, and a fact
+    nobody reads is not a fact.
+
+    THE CARDINALITY RULE, ACROSS LAYERS THIS TIME. Both the sidecar release and
+    the cleanup pass can see the same physical file, so the incident key is the
+    MEMBER — not the layer that noticed it. One surviving destination is one
+    record however many passes observe it, and two surviving members are two.
+
+    And the refusal that decided the run stays primary: residue is additive.
+    """
+    _sandbox_home(tmpdir)
+    module, why = _import_verb()
+    assert module is not None, f"there is no fence-rollback verb: {why}"
+
+    from hermes_cli import session_fence_rollback as library
+
+    store = tmpdir / "state.db"
+    _fenced_store(store, leave_lease_live=False)
+    triggers_before = _installed_triggers(store)
+    work_dir = tmpdir / "work"
+    work_dir.mkdir()
+
+    def _pin_both_the_sidecar_and_the_backup(path, op):
+        if op == "unlink" and path.name in ("backup.db-wal", "backup.db"):
+            raise PermissionError("pinned")
+
+    run = _drive_the_boundary_with_unlink_failing(
+        library, store, work_dir, _pin_both_the_sidecar_and_the_backup
+    )
+    facts = run["outcome"].facts()
+    backup = run["backup"]
+    orphan = backup.with_name(backup.name + "-wal")
+
+    assert not run["result"]["crash"], f"the boundary crashed: {run['result']['crash']}"
+    assert backup.exists() and orphan.exists(), (
+        "the fixture did not leave both members behind, so this pin measures "
+        f"nothing: {sorted(_family_beside(backup))}"
+    )
+    assert run["result"]["returned"] is None, (
+        f"the run reported a backup: {run['result']['returned']!r}"
+    )
+    assert run["result"]["reason"] == "backup-destination-residue", (
+        "residue took the reason from whatever decided the run's fate: "
+        f"{run['result']!r}"
+    )
+
+    reported = sorted(record["path"] for record in facts["residue"])
+    assert reported == sorted([str(backup), str(orphan)]), (
+        "the surviving destination members are not each reported exactly "
+        f"once: {facts['residue']!r}. Two files remain on disk and the "
+        "operator is told about a different set"
+    )
+    assert len(facts["residue"]) == len(set(reported)), (
+        f"one physical member produced more than one record: {facts['residue']!r}"
+    )
+    assert facts["backup_created"] is False and facts["backup_verified"] is False, (
+        f"a valid backup is claimed for one that did not survive: {facts!r}"
+    )
+    assert facts["backup_durable"] is False, (
+        f"durability is claimed for a destination never cleanly established: {facts!r}"
+    )
+    assert facts["changed"] is False
+    assert _installed_triggers(run["copy"]) == triggers_before
+    assert _installed_triggers(store) == triggers_before
+
+
 PINS = {
     "check_the_verb_is_registered_under_sessions_and_names_its_target":
         check_the_verb_is_registered_under_sessions_and_names_its_target,
@@ -3426,6 +3507,8 @@ PINS = {
         check_a_foreign_file_at_a_reserved_sidecar_is_never_deleted,
     "check_a_sidecar_that_vanished_is_not_claimed_as_our_removal":
         check_a_sidecar_that_vanished_is_not_claimed_as_our_removal,
+    "check_every_surviving_destination_member_is_reported_exactly_once":
+        check_every_surviving_destination_member_is_reported_exactly_once,
     "check_a_late_failure_does_not_retract_what_already_happened":
         check_a_late_failure_does_not_retract_what_already_happened,
     "check_the_completed_rehearsal_reports_the_surface_it_removed":
@@ -3685,6 +3768,18 @@ SOURCE_MUTATIONS = (
         why="releasing a reserved name without checking what it resolves to "
             "now deletes a file this run never created. Nothing about the "
             "result would look wrong afterwards, and deletion has no way back",
+    ),
+    Mutation(
+        pin="check_every_surviving_destination_member_is_reported_exactly_once",
+        module="hermes_cli/session_fence_rollback.py",
+        find="            for problem in reservation.remove_only_what_we_created():\n",
+        replace="            reservation.remove_only_what_we_created()\n"
+                "            for problem in []:\n",
+        why="the cleanup pass correctly works out which destination it could "
+            "not remove and returns it; calling it for effect throws that away, "
+            "so a surviving backup.db sits on disk unreported while the layer "
+            "below has already established it is there. A return value "
+            "describing a failure is a fact, and a fact nobody reads is not one",
     ),
     Mutation(
         pin="check_a_sidecar_that_vanished_is_not_claimed_as_our_removal",

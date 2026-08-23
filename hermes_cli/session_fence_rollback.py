@@ -1172,10 +1172,14 @@ class _AcquiredDestinations:
                 outcome.note_residue(
                     describe_residue(
                         problem,
-                        obligation="a reserved backup sidecar",
+                        obligation="a reserved backup destination",
                         outcome=outcome,
                     ),
-                    incident=f"sidecar:{problem['path']}",
+                    # Keyed on the MEMBER, not on the layer that
+                    # noticed it. The cleanup pass above may report the same
+                    # physical file, and one surviving destination is one
+                    # incident however many layers see it.
+                    incident=f"destination:{problem['path']}",
                 )
         raise TurnFenceRollbackRefused(
             "the backup destination family could not be handed back ("
@@ -1241,13 +1245,15 @@ class _AcquiredDestinations:
             self.identities.pop(suffix, None)
             return None
         except OSError as exc:
-            return {"path": str(member), "error": f"{type(exc).__name__}: {exc}"}
+            return {"path": str(member), "files": 1,
+                    "error": f"{type(exc).__name__}: {exc}"}
         if identity is not None and (info.st_dev, info.st_ino) != identity:
-            return {"path": str(member), "error": "ownership-lost"}
+            return {"path": str(member), "files": 1, "error": "ownership-lost"}
         try:
             os.unlink(member)
         except OSError as exc:
-            return {"path": str(member), "error": f"{type(exc).__name__}: {exc}"}
+            return {"path": str(member), "files": 1,
+                    "error": f"{type(exc).__name__}: {exc}"}
         self.identities.pop(suffix, None)
         return None
 
@@ -1572,7 +1578,25 @@ def _make_verified_backup(
             outcome.backup = report
     except BaseException:
         if reservation is not None:
-            reservation.remove_only_what_we_created()
+            # CONSUMED, not called for effect. The cleanup pass correctly
+            # detects a destination it could not remove and RETURNS it; an
+            # earlier version discarded that list and re-raised, so a surviving
+            # backup.db sat on disk unreported while the layer below it had
+            # already worked out that it was there. A return value describing a
+            # failure is a fact, and a fact nobody reads is not a fact.
+            #
+            # Merged by the member's own identity, so a file both this pass and
+            # the sidecar release saw is one incident and not two.
+            for problem in reservation.remove_only_what_we_created():
+                if outcome is not None:
+                    outcome.note_residue(
+                        describe_residue(
+                            problem,
+                            obligation="a reserved backup destination",
+                            outcome=outcome,
+                        ),
+                        incident=f"destination:{problem['path']}",
+                    )
         raise
     finally:
         if staging is not None:
