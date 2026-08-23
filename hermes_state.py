@@ -5393,6 +5393,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         git_repo_root: str = None,
         origin_json: str = None,
         display_name: str = None,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> None:
         """Insert a session row, enriching NULL metadata on conflict.
 
@@ -5428,8 +5430,40 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         ``thread_id``/``display_name``/``origin_json``) are inherited too, so a
         crash before the gateway re-records the peer can't strand the child
         without a recoverable routing mapping (#59527).
+
+        ADMISSION IS PER STATEMENT-ARM, NOT PER METHOD
+            ``update_token_counts`` calls this on EVERY accounted API call to
+            make sure the row exists, and those calls are applied by a
+            background writer that holds no grant and logs its failures instead
+            of raising them. Fencing the whole method therefore does not merely
+            refuse the owner — it silently drops the owner's tokens.
+
+            So admission is required exactly when this call can MOVE a replay
+            column, which is when it carries one. The ``ON CONFLICT`` arms for
+            ``model_config`` and ``system_prompt`` are not COALESCE-only (the
+            first replaces a reset-only document, the second NULLs the prompt
+            when a new hash arrives), so carrying any of ``model`` /
+            ``model_config`` / ``system_prompt`` is the condition. With all
+            three absent every one of those arms degenerates to a no-op on the
+            replay columns and there is nothing to admit.
         """
+        carries_replay_value = any(
+            value is not None
+            for value in (model, model_config, system_prompt)
+        )
+
         def _do(conn):
+            # The ON CONFLICT arms for model_config and system_prompt are NOT
+            # COALESCE-only: they replace a reset-only config and NULL the
+            # prompt when a new hash arrives. Admission is required whenever
+            # this call carries one of them.
+            if carries_replay_value:
+                self._check_turn_lease_guard(
+                    conn,
+                    session_id,
+                    turn_lease_holder,
+                    turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+                )
             system_prompt_hash = self._store_system_prompt(conn, system_prompt)
             conn.execute(
                 """INSERT INTO sessions (
@@ -9250,6 +9284,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         billing_mode: Optional[str] = None,
         api_call_count: int = 0,
         absolute: bool = False,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> None:
         """Update token counters and backfill model if not already set.
 
@@ -9264,7 +9300,26 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # 0 rows.  Under concurrent load (cron + kanban + delegate_task) the
         # initial create_session() may have failed due to SQLite locking.
         # INSERT OR IGNORE is cheap and idempotent.
-        self._insert_session_row(session_id, "unknown", model=model)
+        #
+        # Carrying `model` makes this a replay-column write, so it is admitted
+        # (see _insert_session_row). A refusal is a decision about the ROUTE
+        # and must not cost the accounting: retry the ensure WITHOUT the route,
+        # which cannot move a replay column and therefore needs no admission.
+        # The alternative is losing the delta, and the background writer's
+        # contract turns a lost delta into a log line nobody reads.
+        try:
+            self._insert_session_row(
+                session_id, "unknown", model=model,
+                turn_lease_holder=turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
+        except SessionTurnLeaseLostError:
+            logger.debug(
+                "token accounting: not recording the route for %s — the "
+                "conversation is owned by another writer; the counters still "
+                "land", session_id,
+            )
+            self._insert_session_row(session_id, "unknown")
         if absolute:
             sql = """UPDATE sessions SET
                    input_tokens = ?,
@@ -9312,25 +9367,37 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             or cache_write_tokens or reasoning_tokens or api_call_count
             or estimated_cost_usd or actual_cost_usd
         )
-        params = (
-            input_tokens,
-            output_tokens,
-            cache_read_tokens,
-            cache_write_tokens,
-            reasoning_tokens,
-            estimated_cost_usd,
-            actual_cost_usd,
-            actual_cost_usd,
-            cost_status,
-            cost_source,
-            pricing_version,
-            billing_provider if has_accounted_usage else None,
-            billing_base_url if has_accounted_usage else None,
-            billing_mode if has_accounted_usage else None,
-            model if has_accounted_usage else None,
-            api_call_count,
-            session_id,
-        )
+        def _params(route_admitted: bool):
+            """The counter deltas, with the ROUTE bound only when admitted.
+
+            ``model = COALESCE(model, ?)`` is a NULL backfill, and a backfill
+            cannot move a route that is already set — but it CAN write one that
+            is not, and NULL -> a bystander's model is exactly the change this
+            fence exists to stop on a bare gateway row. Binding the parameter
+            to NULL when the route write was refused makes that assignment a
+            provable no-op while every accumulator in the same statement still
+            lands.
+            """
+            carry = has_accounted_usage and route_admitted
+            return (
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+                reasoning_tokens,
+                estimated_cost_usd,
+                actual_cost_usd,
+                actual_cost_usd,
+                cost_status,
+                cost_source,
+                pricing_version,
+                billing_provider if carry else None,
+                billing_base_url if carry else None,
+                billing_mode if carry else None,
+                model if carry else None,
+                api_call_count,
+                session_id,
+            )
         # Per-model usage attribution.  ``update_token_counts`` is the single
         # chokepoint every per-API-call delta flows through (CLI, gateway, cron,
         # delegated runs — see conversation_loop / codex_runtime), and each call
@@ -9370,7 +9437,31 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 and bool(billing_provider)
                 and (existing_model != model or existing_provider != billing_provider)
             )
-            if first_accounted_route:
+            # Every route-bearing assignment in this transaction — the bare
+            # overwrite below and the COALESCE backfill in `sql` — is decided
+            # once, here.
+            route_admitted = True
+            if has_accounted_usage and (model or billing_provider):
+                try:
+                    self._check_turn_lease_guard(
+                        conn,
+                        session_id,
+                        turn_lease_holder,
+                        turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+                    )
+                except SessionTurnLeaseLostError:
+                    # A refusal here is a decision about the ROUTE, not a failure of
+                    # the accounting. The counter arm still runs: a dropped delta
+                    # cannot be reconstructed, and this writer's callers log their
+                    # failures instead of raising them, so aborting the whole
+                    # transaction would make the loss silent.
+                    logger.debug(
+                        "token accounting: not recording the route for %s — "
+                        "the conversation is owned by another writer; the "
+                        "counters still land", session_id,
+                    )
+                    route_admitted = False
+            if first_accounted_route and route_admitted:
                 conn.execute(
                     """UPDATE sessions
                        SET model = ?, billing_provider = ?,
@@ -9378,7 +9469,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                        WHERE id = ?""",
                     (model, billing_provider, billing_base_url, billing_mode, session_id),
                 )
-            conn.execute(sql, params)
+            conn.execute(sql, _params(route_admitted))
             if record_model_usage:
                 self._record_model_usage(
                     conn,

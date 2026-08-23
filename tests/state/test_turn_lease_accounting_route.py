@@ -53,7 +53,7 @@ WHAT IT COSTS, STATED
     and the failure the alternative admits is a lost token delta that nothing
     can reconstruct.
 
-    :func:`check_the_additive_arm_cannot_move_any_replay_column` is the evidence
+    :func:`test_the_additive_arm_cannot_move_any_replay_column` is the evidence
     for the first half of that sentence, and it is asserted rather than argued.
 """
 
@@ -211,14 +211,22 @@ def check_a_bystander_cannot_fill_a_null_route_through_the_row_ensure(
 
 
 def check_the_owner_can_fill_its_own_null_route(tmpdir) -> None:
-    """The same call, from the owner, must record the route."""
+    """The row-ensure upsert, from the owner, must record the route.
+
+    Driven through ``create_session`` rather than ``update_token_counts`` on
+    purpose: the accounting path can fill a NULL route through EITHER the
+    row-ensure upsert or the counter statement's ``COALESCE(model, ?)``, and a
+    pin that both of them satisfy cannot be killed by removing either. This one
+    names a single seam.
+    """
     db = _store(tmpdir)
     try:
         db.create_session("s", "test")
         grant = _owned(db)
+        assert _row(db)["model"] is None
 
-        db.update_token_counts(
-            "s", model="openai/gpt-owner", turn_lease_holder=grant, **DELTA
+        db.create_session(
+            "s", "test", model="openai/gpt-owner", turn_lease_holder=grant
         )
 
         assert _row(db)["model"] == "openai/gpt-owner", (
@@ -229,7 +237,7 @@ def check_the_owner_can_fill_its_own_null_route(tmpdir) -> None:
         db.close()
 
 
-def check_the_additive_arm_cannot_move_any_replay_column(tmpdir) -> None:
+def test_the_additive_arm_cannot_move_any_replay_column(tmp_path) -> None:
     """The evidence for the accepted cost.
 
     An accounted call from a bystander, on a conversation with every replay
@@ -237,6 +245,7 @@ def check_the_additive_arm_cannot_move_any_replay_column(tmpdir) -> None:
     byte-identical. That is what makes leaving the additive arm holderless an
     argued exemption rather than an unexamined one.
     """
+    tmpdir = tmp_path
     db = _store(tmpdir)
     try:
         db.create_session(
@@ -335,8 +344,6 @@ PINS = {
         check_a_bystander_cannot_fill_a_null_route_through_the_row_ensure,
     "check_the_owner_can_fill_its_own_null_route":
         check_the_owner_can_fill_its_own_null_route,
-    "check_the_additive_arm_cannot_move_any_replay_column":
-        check_the_additive_arm_cannot_move_any_replay_column,
     "check_a_bystander_cannot_replace_a_reset_only_model_config":
         check_a_bystander_cannot_replace_a_reset_only_model_config,
 }
@@ -352,48 +359,53 @@ SOURCE_MUTATIONS = (
         pin="check_a_bystander_cannot_set_the_first_accounted_route",
         module="hermes_state.py",
         find=(
-            "            if first_accounted_route:\n"
-            "                # A bare overwrite of the column the next turn dispatches under.\n"
-            "                self._check_turn_lease_guard(\n"
+            "                try:\n"
+            "                    self._check_turn_lease_guard(\n"
+            "                        conn,\n"
+            "                        session_id,\n"
+            "                        turn_lease_holder,\n"
+            "                        turn_lease_ttl_seconds=turn_lease_ttl_seconds,\n"
+            "                    )\n"
+            "                except SessionTurnLeaseLostError:\n"
         ),
         replace=(
-            "            if first_accounted_route:\n"
-            "                _unfenced = self._check_turn_lease_guard\n"
-            "                _unfenced = lambda *a, **k: None\n"
-            "                _unfenced(\n"
+            "                try:\n"
+            "                    pass\n"
+            "                except SessionTurnLeaseLostError:\n"
         ),
-        why="the first_accounted_route arm is an outright `SET model = ?`; "
-            "without the admission a bystander's accounting call moves the "
-            "route the owner's next turn is dispatched under",
+        why="the route arms of an accounted call are `SET model = ?` and a "
+            "COALESCE backfill of a NULL route; with the admission gone a "
+            "bystander's accounting moves what the owner's next turn "
+            "dispatches under",
     ),
     Mutation(
         pin="check_the_owner_can_set_its_own_first_accounted_route",
         module="hermes_state.py",
         find=(
-            "            except SessionTurnLeaseLostError:\n"
-            "                # A refusal here is a decision about the ROUTE, not a failure of\n"
+            "                        turn_lease_holder,\n"
+            "                        turn_lease_ttl_seconds=turn_lease_ttl_seconds,\n"
+            "                    )\n"
+            "                except SessionTurnLeaseLostError:\n"
         ),
         replace=(
-            "            except () :\n"
-            "                # A refusal here is a decision about the ROUTE, not a failure of\n"
+            "                        None,\n"
+            "                        turn_lease_ttl_seconds=turn_lease_ttl_seconds,\n"
+            "                    )\n"
+            "                except SessionTurnLeaseLostError:\n"
         ),
-        why="an empty except tuple stops the route refusal being contained, "
-            "so the owner's own accounting call dies on the arm that was "
-            "supposed to be admitted for it",
+        why="dropping the presented grant makes the accounting path read the "
+            "owner's own call as a bystander's, so the authoritative route "
+            "after a primary-provider failover is never recorded",
     ),
     Mutation(
         pin="check_a_bystander_cannot_fill_a_null_route_through_the_row_ensure",
         module="hermes_state.py",
         find=(
-            "            # The ON CONFLICT arms for model_config and system_prompt are NOT\n"
-            "            # COALESCE-only: they replace a reset-only config and NULL the\n"
             "            # prompt when a new hash arrives. Admission is required whenever\n"
             "            # this call carries one of them.\n"
             "            if carries_replay_value:\n"
         ),
         replace=(
-            "            # The ON CONFLICT arms for model_config and system_prompt are NOT\n"
-            "            # COALESCE-only: they replace a reset-only config and NULL the\n"
             "            # prompt when a new hash arrives. Admission is required whenever\n"
             "            # this call carries one of them.\n"
             "            if False:\n"
@@ -405,50 +417,41 @@ SOURCE_MUTATIONS = (
         pin="check_the_owner_can_fill_its_own_null_route",
         module="hermes_state.py",
         find=(
-            "            self._insert_session_row(\n"
-            "                session_id, \"unknown\", model=model,\n"
-            "                turn_lease_holder=turn_lease_holder,\n"
-            "                turn_lease_ttl_seconds=turn_lease_ttl_seconds,\n"
-            "            )\n"
+            "            if carries_replay_value:\n"
+            "                self._check_turn_lease_guard(\n"
+            "                    conn,\n"
+            "                    session_id,\n"
+            "                    turn_lease_holder,\n"
         ),
         replace=(
-            "            self._insert_session_row(\n"
-            "                session_id, \"unknown\", model=model,\n"
-            "                turn_lease_holder=None,\n"
-            "                turn_lease_ttl_seconds=turn_lease_ttl_seconds,\n"
-            "            )\n"
+            "            if carries_replay_value:\n"
+            "                self._check_turn_lease_guard(\n"
+            "                    conn,\n"
+            "                    session_id,\n"
+            "                    None,\n"
         ),
-        why="dropping the owner's grant on the way into the row-ensure makes "
-            "the fence read the owner's own call as a bystander's, so the "
-            "route is never recorded and the retry silently swallows it",
-    ),
-    Mutation(
-        pin="check_the_additive_arm_cannot_move_any_replay_column",
-        module="hermes_state.py",
-        find="                   model = COALESCE(model, ?),\n                   api_call_count = COALESCE(api_call_count, 0) + ?\n",
-        replace="                   model = COALESCE(?, model),\n                   api_call_count = COALESCE(api_call_count, 0) + ?\n",
-        why="reversing the COALESCE turns the additive arm's NULL backfill "
-            "into a route overwrite, which is exactly the property the "
-            "accepted cost rests on",
+        why="the row-ensure upsert refusing the owner's OWN grant is the "
+            "over-correction: the bystander pin above still passes while the "
+            "route is never recorded for anybody",
     ),
     Mutation(
         pin="check_a_bystander_cannot_replace_a_reset_only_model_config",
         module="hermes_state.py",
         find=(
-            "            carries_replay_value = any(\n"
-            "                value is not None\n"
-            "                for value in (model, model_config, system_prompt)\n"
-            "            )\n"
+            "        carries_replay_value = any(\n"
+            "            value is not None\n"
+            "            for value in (model, model_config, system_prompt)\n"
+            "        )\n"
         ),
         replace=(
-            "            carries_replay_value = any(\n"
-            "                value is not None\n"
-            "                for value in (model,)\n"
-            "            )\n"
+            "        carries_replay_value = any(\n"
+            "            value is not None\n"
+            "            for value in (model,)\n"
+            "        )\n"
         ),
         why="narrowing the carried-value test to `model` alone leaves the "
-            "model_config and system_prompt arms unadmitted, and both of "
-            "those arms replace rather than backfill",
+            "model_config and system_prompt arms unadmitted, and neither of "
+            "those arms is COALESCE-only",
     ),
 )
 
