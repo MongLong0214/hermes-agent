@@ -1100,8 +1100,20 @@ def check_a_destination_appearing_after_the_check_is_never_clobbered(
     real_check = library._refuse_unusable_backup_path
 
     def _competing_writer_after_the_check(path, *args, **kwargs):
+        """A racer that re-appears in EVERY window, not just the first.
+
+        The destination check runs more than once — pre-flight, then again
+        inside the boundary — and a one-shot injection is caught by the second
+        check, which proves nothing: a check saving the run is exactly what is
+        not allowed to be the guarantee. So the sentinel is cleared before each
+        check and re-created immediately after it, which is what a competing
+        writer looks like. Only an acquisition the filesystem arbitrates can
+        survive that.
+        """
+        if pathlib.Path(path) == backup and backup.exists():
+            backup.unlink()
         real_check(path, *args, **kwargs)
-        if not injected["fired"] and pathlib.Path(path) == backup:
+        if pathlib.Path(path) == backup:
             injected["fired"] = True
             backup.write_bytes(sentinel)
 
