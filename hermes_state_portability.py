@@ -394,6 +394,21 @@ class SessionPortabilityMixin:
         would fabricate activity the watchdog and session listings act on.
         This asymmetry is intentional and covered by regression
         (tests/gateway/test_watchdog_review_76354.py::test_s4_export_includes_activity_import_resets_it).
+
+        Turn-lease contract: this is a SWEEP for fencing purposes — its targets
+        come from a payload, so no single grant a caller could hold authorizes
+        it, and the admission is per row inside the write transaction
+        (:meth:`_skip_leased_conversations`). Skipping rather than refusing
+        matches what the method already does with an id that exists.
+
+        What that fence is actually for is narrow, and worth stating so nobody
+        widens it by accident: an id that ALREADY EXISTS is skipped anyway, in
+        the same transaction, so an existing transcript was never reachable.
+        The case the fence closes is the id that does not exist while the lease
+        on that conversation is live — a turn that took the lease before its
+        session row landed, or whose row went away under it. Without the check,
+        an import names that id and the turn's next write lands in a
+        conversation that suddenly has someone else's history in it.
         """
         if not isinstance(sessions, list):
             raise ValueError("sessions must be a list")
@@ -555,6 +570,15 @@ class SessionPortabilityMixin:
             parent_updates: List[tuple[str, str]] = []
             detached = 0
 
+            # Per-row admission, on the transaction's own connection so the
+            # answer is a decision and not a snapshot. See the turn-lease
+            # paragraph in the docstring.
+            _allowed, owned_by_a_live_turn = self._skip_leased_conversations(
+                conn, [str(item["session"].get("id") or "").strip()
+                       for item in normalized],
+            )
+            owned_by_a_live_turn = set(owned_by_a_live_turn)
+
             for item in normalized:
                 raw = item["session"]
                 messages = item["messages"]
@@ -563,7 +587,7 @@ class SessionPortabilityMixin:
                     "SELECT 1 FROM sessions WHERE id = ? LIMIT 1",
                     (session_id,),
                 ).fetchone()
-                if exists:
+                if exists or session_id in owned_by_a_live_turn:
                     skipped_ids.append(session_id)
                     continue
 

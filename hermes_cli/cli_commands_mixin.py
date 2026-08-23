@@ -1435,29 +1435,47 @@ class CLICommandsMixin:
         # Copy conversation history to the new session in bounded-chunk
         # transactions (see #23254) instead of one txn per row. Best-effort
         # like the old loop — a failed copy still yields a usable branch.
+        from hermes_state import SessionTurnLeaseLostError, make_turn_lease_holder
+
         try:
-            self._session_db.append_messages_batch(
+            # This is an alternate writer against the branch conversation: if
+            # anything else claims it (a resumed id, a gateway mirror), the copy
+            # would interleave with that turn. Write against the post-acquisition
+            # id — the owner may have compressed and rotated it while we waited.
+            with self._session_db.session_turn_lease(
                 new_session_id,
-                [
-                    {
-                        "role": msg.get("role", "user"),
-                        "content": msg.get("content"),
-                        "tool_name": msg.get("tool_name") or msg.get("name"),
-                        "tool_calls": msg.get("tool_calls"),
-                        "tool_call_id": msg.get("tool_call_id"),
-                        "reasoning": msg.get("reasoning"),
-                        "reasoning_details": msg.get("reasoning_details"),
-                        "codex_reasoning_items": msg.get("codex_reasoning_items"),
-                        "codex_message_items": msg.get("codex_message_items"),
-                        # Keep the api_content sidecar so the branch's first turn
-                        # replays the parent's exact wire bytes (warm provider
-                        # prompt cache) instead of a full cold prefill.
-                        "api_content": extract_api_content_sidecar(msg),
-                        "timestamp": msg.get("timestamp"),
-                    }
-                    for msg in self.conversation_history
-                ],
-                chunk_rows=500,
+                make_turn_lease_holder("cli-branch-copy"),
+                ttl_seconds=30.0,
+                reload_messages=False,
+            ) as lease:
+                self._session_db.append_messages_batch(
+                    lease.session_id,
+                    [
+                        {
+                            "role": msg.get("role", "user"),
+                            "content": msg.get("content"),
+                            "tool_name": msg.get("tool_name") or msg.get("name"),
+                            "tool_calls": msg.get("tool_calls"),
+                            "tool_call_id": msg.get("tool_call_id"),
+                            "reasoning": msg.get("reasoning"),
+                            "reasoning_details": msg.get("reasoning_details"),
+                            "codex_reasoning_items": msg.get("codex_reasoning_items"),
+                            "codex_message_items": msg.get("codex_message_items"),
+                            # Keep the api_content sidecar so the branch's first
+                            # turn replays the parent's exact wire bytes (warm
+                            # provider prompt cache) instead of a full cold prefill.
+                            "api_content": extract_api_content_sidecar(msg),
+                            "timestamp": msg.get("timestamp"),
+                        }
+                        for msg in self.conversation_history
+                    ],
+                    chunk_rows=500,
+                    turn_lease_holder=lease.token,
+                )
+        except SessionTurnLeaseLostError:
+            _cprint(
+                "  Branch created, but its history was not copied: another "
+                "process is running a turn on this conversation."
             )
         except Exception:
             pass  # Best-effort copy

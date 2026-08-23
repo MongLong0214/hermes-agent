@@ -2763,6 +2763,21 @@ def init_agent(
             _bind_session_state(session_db=session_db, session_id=agent.session_id)
         except Exception:
             pass
+    # The compressor rewrites the transcript but does not own the turn. Give it
+    # a live read of the agent's turn-lease token so its commits carry the same
+    # fence as the agent's own flush.
+    _bind_lease = getattr(
+        agent.context_compressor, "bind_turn_lease_provider", None
+    )
+    if callable(_bind_lease):
+        try:
+            _bind_lease(
+                lambda: getattr(
+                    agent, "_active_session_turn_lease_holder", None
+                )
+            )
+        except Exception:
+            pass
     agent.compression_enabled = compression_enabled
     agent.compression_in_place = compression_in_place
     # Apply micro-compaction settings to the compressor (feature is opt-in)

@@ -923,8 +923,14 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
             # this is a continuation, not a new session.)
             if agent._session_db:
                 try:
+                    # Fenced write, inside this process's own turn: present the
+                    # turn's grant rather than acquiring, which would deadlock
+                    # the turn against itself. See hermes_state.turn_grant_kwargs.
+                    from hermes_state import turn_grant_kwargs
+
                     agent._session_db.update_system_prompt(
-                        agent.session_id, agent._cached_system_prompt
+                        agent.session_id, agent._cached_system_prompt,
+                        **turn_grant_kwargs(agent._session_db, agent.session_id),
                     )
                 except Exception as exc:
                     logger.warning(
@@ -1018,7 +1024,13 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # subsequent turn).
     if agent._session_db:
         try:
-            agent._session_db.update_system_prompt(agent.session_id, agent._cached_system_prompt)
+            # Fenced write, inside this process's own turn — present the grant.
+            from hermes_state import turn_grant_kwargs
+
+            agent._session_db.update_system_prompt(
+                agent.session_id, agent._cached_system_prompt,
+                **turn_grant_kwargs(agent._session_db, agent.session_id),
+            )
         except Exception as exc:
             logger.warning(
                 "Session DB update_system_prompt failed for session %s: "

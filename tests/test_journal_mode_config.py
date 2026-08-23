@@ -147,8 +147,19 @@ def test_real_db_openers_honor_configured_delete(monkeypatch, tmp_path):
 
     observed: dict[str, str] = {}
 
+    # async_delegation is deliberately NOT in this loop and is not an omission:
+    # it has no opener any more. `async_delegations` is on the turn-fence
+    # surface, so a connection that has not registered the generation marker
+    # cannot write it, and the module's writes moved onto
+    # SessionDB.write_transaction. Its journal mode is therefore the store's,
+    # measured below as `session_db`. Asserted rather than assumed, so that a
+    # private opener reappearing is a failure here too.
+    assert not hasattr(async_delegation, "_connect"), (
+        "tools/async_delegation grew a connection opener again; its writes "
+        "must run on SessionDB's transaction, whose journal mode is measured "
+        "as `session_db` below"
+    )
     for name, connect in (
-        ("async_delegation", async_delegation._connect),
         ("delivery_ledger", delivery_ledger._connect),
         ("verification_evidence", verification_evidence._connect),
     ):
@@ -215,7 +226,6 @@ def test_real_db_openers_honor_configured_delete(monkeypatch, tmp_path):
         response_store.close()
 
     assert observed == {
-        "async_delegation": "delete",
         "delivery_ledger": "delete",
         "verification_evidence": "delete",
         "cron_executions": "delete",

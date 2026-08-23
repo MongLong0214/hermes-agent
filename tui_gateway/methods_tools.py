@@ -908,34 +908,75 @@ def _(rid, params: dict) -> dict:
                     return _err(rid, 4004, f"undo: invalid count {arg_str!r} — use /undo or /undo N")
             if n < 1:
                 n = 1
+            from hermes_state import (
+                SessionTurnLeaseLostError,
+                make_turn_lease_holder,
+            )
+
+            # EVERYTHING below is derived after acquisition. The old order read
+            # the recents, picked a target row id, then rewound holderlessly —
+            # so a turn that landed while we were choosing was truncated by an
+            # index computed before it existed, and the reload that followed
+            # overwrote in-memory history with the result.
             try:
-                recents = db.list_recent_user_messages(session_key, limit=max(n, 10))
-            except Exception as e:
-                return _err(rid, 5008, f"undo: failed to load history: {e}")
-            if not recents:
-                return _err(rid, 4018, "no user messages to undo")
-            # recents[0] is the most-recent user turn; pick the Nth-from-last.
-            # If N exceeds the number of user turns, back up to the oldest.
-            target_idx = min(n - 1, len(recents) - 1)
-            target_id = recents[target_idx]["id"]
-            try:
-                result = db.rewind_to_message(session_key, target_id)
-            except ValueError as e:
-                return _err(rid, 4004, f"undo: {e}")
-            except Exception as e:
-                return _err(rid, 5008, f"undo: {e}")
-            # Reload the active-only transcript into the in-memory session
-            # history so subsequent turns see the truncated view.
-            # repair_alternation: this reload feeds LIVE REPLAY — session["history"]
-            # is the working conversation for subsequent turns, and a rewind that
-            # lands on a durable user;user pair would otherwise re-fire the
-            # pre-request repair on every request from here on.
-            try:
-                active = db.get_messages_as_conversation(
-                    session_key, repair_alternation=True, include_row_ids=True
+                with db.session_turn_lease(
+                    session_key,
+                    make_turn_lease_holder("tui-undo"),
+                    ttl_seconds=60.0,
+                    reload_messages=False,
+                ) as lease:
+                    live_id = lease.session_id
+                    try:
+                        recents = db.list_recent_user_messages(
+                            live_id, limit=max(n, 10)
+                        )
+                    except Exception as e:
+                        return _err(rid, 5008, f"undo: failed to load history: {e}")
+                    if not recents:
+                        return _err(rid, 4018, "no user messages to undo")
+                    # recents[0] is the most-recent user turn; pick the
+                    # Nth-from-last. If N exceeds the number of user turns,
+                    # back up to the oldest.
+                    target_idx = min(n - 1, len(recents) - 1)
+                    target_id = recents[target_idx]["id"]
+                    try:
+                        result = db.rewind_to_message(
+                            live_id, target_id, turn_lease_holder=lease.token
+                        )
+                    except ValueError as e:
+                        return _err(rid, 4004, f"undo: {e}")
+                    except Exception as e:
+                        return _err(rid, 5008, f"undo: {e}")
+                    # Reload the active-only transcript into the in-memory
+                    # session history so subsequent turns see the truncated
+                    # view. repair_alternation: this reload feeds LIVE REPLAY —
+                    # session["history"] is the working conversation for
+                    # subsequent turns, and a rewind that lands on a durable
+                    # user;user pair would otherwise re-fire the pre-request
+                    # repair on every request from here on.
+                    #
+                    # Fail CLOSED. This used to swallow into `active = []` and
+                    # then overwrite session["history"] with it, which presents
+                    # "I could not read the transcript" as "the conversation is
+                    # empty" — and the next turn replays that emptiness. The
+                    # rewind is already durable, so the caller retries /undo or
+                    # reloads rather than continuing on a fabricated view.
+                    try:
+                        active = db.get_messages_as_conversation(
+                            live_id, repair_alternation=True, include_row_ids=True
+                        )
+                    except Exception as e:
+                        return _err(
+                            rid, 5008,
+                            f"undo: rewind landed but the transcript could not "
+                            f"be reloaded ({e}); reload the session",
+                        )
+            except SessionTurnLeaseLostError:
+                return _err(
+                    rid, 4009,
+                    "undo: another process is running a turn on this "
+                    "conversation — retry once it finishes",
                 )
-            except Exception:
-                active = []
         with session["history_lock"]:
             session["history"] = list(active)
             session["history_version"] = int(session.get("history_version", 0)) + 1

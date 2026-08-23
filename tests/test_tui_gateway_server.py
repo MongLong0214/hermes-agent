@@ -1,3 +1,5 @@
+import contextlib
+from types import SimpleNamespace
 import json
 import os
 import subprocess
@@ -17,6 +19,24 @@ from hermes_cli.browser_connect import ChromeDebugLaunch
 from tools import async_delegation as ad
 from tui_gateway import server
 from tui_gateway.transport import bind_transport, reset_transport
+
+
+@contextlib.contextmanager
+def _stub_session_turn_lease(self, session_id, holder, **kwargs):
+    """The fence every TUI transcript writer now takes, for a db double.
+
+    Attached to the db doubles below rather than made optional in production:
+    a `getattr(db, "session_turn_lease", None)` fallback there would be a hole
+    the census cannot see, since the call site would still look fenced.
+
+    Yields the real scope shape. ``messages`` comes from whatever transcript
+    the double exposes, so a double that models the durable rows keeps
+    modelling them under the lease.
+    """
+    messages = getattr(self, "messages", None)
+    if not isinstance(messages, list):
+        messages = []
+    yield SimpleNamespace(token=holder, session_id=session_id, messages=list(messages))
 
 
 def _dispatch_sync(req: dict, transport=None) -> dict | None:
@@ -3722,6 +3742,7 @@ def test_session_resume_profile_uses_profile_db_cwd(monkeypatch, tmp_path):
     captured = {}
 
     class ProfileDB:
+        session_turn_lease = _stub_session_turn_lease
         def get_session(self, _target):
             return {"id": target, "cwd": str(profile_cwd)}
 
@@ -3819,6 +3840,7 @@ def test_session_cwd_set_profile_session_updates_profile_db(monkeypatch, tmp_pat
     captured = {}
 
     class ProfileDB:
+        session_turn_lease = _stub_session_turn_lease
         def update_session_cwd(self, session_id, cwd, git_branch=None, git_repo_root=None):
             captured["profile_update"] = (session_id, cwd)
 
@@ -4835,6 +4857,7 @@ def test_ws_orphan_reap_spares_detached_session_with_running_async_delegation(mo
             return None
 
     class _DB:
+        session_turn_lease = _stub_session_turn_lease
         def get_session(self, _session_id):
             return {"id": "sess_bg", "source": "desktop"}
 
@@ -4963,6 +4986,7 @@ def test_session_title_creates_row_and_sets_immediately_when_not_ready(monkeypat
     state = {"row": None, "title": None, "ensured": False}
 
     class _FakeDB:
+        session_turn_lease = _stub_session_turn_lease
         def get_session_title(self, _key):
             return state["title"]
 
@@ -5027,6 +5051,7 @@ def test_session_title_falls_back_to_queue_when_row_create_fails(monkeypatch):
     """
 
     class _FakeDB:
+        session_turn_lease = _stub_session_turn_lease
         def get_session_title(self, _key):
             return None
 
@@ -5118,6 +5143,7 @@ def test_notification_event_follows_compression_continuation(monkeypatch):
     monkeypatch.setattr(server, "_sessions", {"old-sid": old_parent, "tip-sid": live_tip})
 
     class _DB:
+        session_turn_lease = _stub_session_turn_lease
         def resolve_resume_session_id(self, session_id):
             return "new-tip" if session_id == "old-parent" else session_id
 
@@ -5147,6 +5173,7 @@ def test_finalized_origin_ui_session_falls_back_to_live_continuation(monkeypatch
     )
 
     class _DB:
+        session_turn_lease = _stub_session_turn_lease
         def resolve_resume_session_id(self, session_id):
             return "new-tip" if session_id == "old-parent" else session_id
 
@@ -5174,7 +5201,8 @@ def test_prompt_submit_rejects_negative_truncate_ordinal(monkeypatch):
     replaced = []
 
     class _FakeDB:
-        def replace_messages(self, key, messages, active_only=False, archive_dropped=False):
+        session_turn_lease = _stub_session_turn_lease
+        def replace_messages(self, key, messages, active_only=False, archive_dropped=False, **_lease_kw):
             replaced.append((key, list(messages)))
 
     history = [
@@ -5311,7 +5339,8 @@ def test_prompt_submit_refuses_unconfirmed_nonempty_truncation(monkeypatch):
     replaced = []
 
     class _FakeDB:
-        def replace_messages(self, key, messages, active_only=False, archive_dropped=False):
+        session_turn_lease = _stub_session_turn_lease
+        def replace_messages(self, key, messages, active_only=False, archive_dropped=False, **_lease_kw):
             replaced.append((key, list(messages)))
 
     history = [
@@ -5369,7 +5398,8 @@ def test_prompt_submit_truncates_by_message_id(monkeypatch):
     replaced = []
 
     class _FakeDB:
-        def replace_messages(self, key, messages, active_only=False, archive_dropped=False):
+        session_turn_lease = _stub_session_turn_lease
+        def replace_messages(self, key, messages, active_only=False, archive_dropped=False, **_lease_kw):
             replaced.append((key, list(messages)))
 
     history = [
@@ -5419,7 +5449,8 @@ def test_prompt_submit_truncation_falls_back_to_sid_when_session_key_null(monkey
     replaced = []
 
     class _FakeDB:
-        def replace_messages(self, key, messages, active_only=False, archive_dropped=False):
+        session_turn_lease = _stub_session_turn_lease
+        def replace_messages(self, key, messages, active_only=False, archive_dropped=False, **_lease_kw):
             replaced.append((key, list(messages)))
 
     history = [
@@ -5500,7 +5531,8 @@ def test_prompt_submit_refuses_ordinal_only_when_history_has_row_ids(monkeypatch
     replaced = []
 
     class _FakeDB:
-        def replace_messages(self, key, messages, active_only=False, archive_dropped=False):
+        session_turn_lease = _stub_session_turn_lease
+        def replace_messages(self, key, messages, active_only=False, archive_dropped=False, **_lease_kw):
             replaced.append((key, list(messages)))
 
     history = [
@@ -5552,12 +5584,13 @@ def test_prompt_submit_refuses_ordinal_only_when_durable_history_is_unstamped(mo
     ]
 
     class _FakeDB:
+        session_turn_lease = _stub_session_turn_lease
         def get_messages_as_conversation(self, key, **kwargs):
             assert key == "session-key"
             assert kwargs["include_row_ids"] is True
             return [dict(message, _row_id=100 + index) for index, message in enumerate(history)]
 
-        def replace_messages(self, key, messages, active_only=False, archive_dropped=False):
+        def replace_messages(self, key, messages, active_only=False, archive_dropped=False, **_lease_kw):
             replaced.append((key, list(messages)))
 
     server._sessions["unstamped-durable-sid"] = _session(history=list(history))
@@ -5596,7 +5629,8 @@ def test_prompt_submit_truncates_by_row_id(monkeypatch):
     replaced = []
 
     class _FakeDB:
-        def replace_messages(self, key, messages, active_only=False, archive_dropped=False):
+        session_turn_lease = _stub_session_turn_lease
+        def replace_messages(self, key, messages, active_only=False, archive_dropped=False, **_lease_kw):
             replaced.append((key, list(messages)))
 
     history = [
@@ -5641,7 +5675,8 @@ def test_prompt_submit_truncates_by_string_row_id(monkeypatch):
     replaced = []
 
     class _FakeDB:
-        def replace_messages(self, key, messages, active_only=False, archive_dropped=False):
+        session_turn_lease = _stub_session_turn_lease
+        def replace_messages(self, key, messages, active_only=False, archive_dropped=False, **_lease_kw):
             replaced.append((key, list(messages)))
 
     history = [
@@ -5795,7 +5830,8 @@ def test_prompt_submit_refuses_empty_truncation_without_confirm(monkeypatch):
     replaced = []
 
     class _FakeDB:
-        def replace_messages(self, key, messages, active_only=False, archive_dropped=False):
+        session_turn_lease = _stub_session_turn_lease
+        def replace_messages(self, key, messages, active_only=False, archive_dropped=False, **_lease_kw):
             replaced.append((key, list(messages)))
 
     history = [
@@ -5884,7 +5920,8 @@ def test_prompt_submit_empty_truncation_allowed_with_confirm(monkeypatch):
             self._target()
 
     class _FakeDB:
-        def replace_messages(self, key, messages, active_only=False, archive_dropped=False):
+        session_turn_lease = _stub_session_turn_lease
+        def replace_messages(self, key, messages, active_only=False, archive_dropped=False, **_lease_kw):
             replaced.append((key, list(messages)))
 
     history = [
@@ -6655,6 +6692,7 @@ def test_run_prompt_submit_prefers_origin_ui_session_id(monkeypatch, tmp_path):
     created = []
 
     class _FakeDB:
+        session_turn_lease = _stub_session_turn_lease
         def create_session(self, *args, **kwargs):
             created.append((args, kwargs))
 
@@ -6682,6 +6720,7 @@ def test_ensure_session_db_row_persists_explicit_cwd(monkeypatch, tmp_path):
     created = []
 
     class _FakeDB:
+        session_turn_lease = _stub_session_turn_lease
         def create_session(self, key, source=None, model=None, model_config=None, parent_session_id=None, cwd=None, profile_name=None):
             created.append(
                 {"key": key, "source": source, "model": model, "model_config": model_config, "cwd": cwd}
@@ -6703,6 +6742,7 @@ def test_ensure_session_db_row_persists_session_source(monkeypatch):
     created = []
 
     class _FakeDB:
+        session_turn_lease = _stub_session_turn_lease
         def create_session(self, key, source=None, model=None, model_config=None, parent_session_id=None, cwd=None, profile_name=None):
             created.append(
                 {"key": key, "source": source, "model": model, "model_config": model_config, "cwd": cwd}
@@ -6728,6 +6768,7 @@ def test_ensure_session_db_row_records_a_terminal_workspace(monkeypatch, tmp_pat
     created = []
 
     class _FakeDB:
+        session_turn_lease = _stub_session_turn_lease
         def create_session(self, key, source=None, model=None, model_config=None, parent_session_id=None, cwd=None, profile_name=None):
             created.append(
                 {"key": key, "source": source, "model": model, "model_config": model_config, "cwd": cwd}
@@ -6751,6 +6792,7 @@ def test_ensure_session_db_row_defaults_desktop_to_no_workspace(monkeypatch, tmp
     created = []
 
     class _FakeDB:
+        session_turn_lease = _stub_session_turn_lease
         def create_session(self, key, source=None, model=None, model_config=None, parent_session_id=None, cwd=None, profile_name=None):
             created.append(
                 {"key": key, "source": source, "model": model, "model_config": model_config, "cwd": cwd}
@@ -6778,6 +6820,7 @@ def test_ensure_session_db_row_persists_session_model_override(monkeypatch):
     created = []
 
     class _FakeDB:
+        session_turn_lease = _stub_session_turn_lease
         def create_session(self, key, source=None, model=None, model_config=None, parent_session_id=None, cwd=None, profile_name=None):
             created.append(
                 {"key": key, "model": model, "model_config": model_config, "cwd": cwd}
@@ -6810,6 +6853,7 @@ def test_ensure_session_db_row_no_override_uses_global(monkeypatch):
     created = []
 
     class _FakeDB:
+        session_turn_lease = _stub_session_turn_lease
         def create_session(self, key, source=None, model=None, model_config=None, parent_session_id=None, cwd=None, profile_name=None):
             created.append({"model": model, "model_config": model_config})
 
@@ -6853,6 +6897,7 @@ def test_ensure_session_db_row_stamps_profile_name(monkeypatch, tmp_path):
 
 def test_session_title_clears_pending_after_persist(monkeypatch):
     class _FakeDB:
+        session_turn_lease = _stub_session_turn_lease
         def __init__(self):
             self.title = "old"
 
@@ -6891,6 +6936,7 @@ def test_session_title_clears_pending_after_persist(monkeypatch):
 
 def test_session_title_does_not_queue_noop_when_row_exists(monkeypatch):
     class _FakeDB:
+        session_turn_lease = _stub_session_turn_lease
         def __init__(self):
             self.title = "same title"
 
@@ -6924,6 +6970,7 @@ def test_session_title_does_not_queue_noop_when_row_exists(monkeypatch):
 
 def test_session_title_get_falls_back_to_pending_when_db_read_throws(monkeypatch):
     class _FakeDB:
+        session_turn_lease = _stub_session_turn_lease
         def get_session_title(self, _key):
             raise RuntimeError("db temporarily locked")
 
@@ -6940,6 +6987,7 @@ def test_session_title_get_falls_back_to_pending_when_db_read_throws(monkeypatch
 
 def test_session_title_get_retries_persist_for_pending_title(monkeypatch):
     class _FakeDB:
+        session_turn_lease = _stub_session_turn_lease
         def __init__(self):
             self.title = ""
 
@@ -6968,6 +7016,7 @@ def test_session_title_get_retries_persist_for_pending_title(monkeypatch):
 
 def test_session_title_get_retries_pending_even_when_db_has_title(monkeypatch):
     class _FakeDB:
+        session_turn_lease = _stub_session_turn_lease
         def __init__(self):
             self.title = "auto title"
 
@@ -6996,6 +7045,7 @@ def test_session_title_get_retries_pending_even_when_db_has_title(monkeypatch):
 
 def test_session_title_rejects_empty_title_with_specific_error_code(monkeypatch):
     class _FakeDB:
+        session_turn_lease = _stub_session_turn_lease
         def get_session_title(self, _key):
             return ""
 
@@ -7017,6 +7067,7 @@ def test_session_title_rejects_empty_title_with_specific_error_code(monkeypatch)
 
 def test_session_title_set_maps_valueerror_to_user_error(monkeypatch):
     class _FakeDB:
+        session_turn_lease = _stub_session_turn_lease
         def get_session_title(self, _key):
             return ""
 
@@ -7045,6 +7096,7 @@ def test_session_title_set_maps_valueerror_to_user_error(monkeypatch):
 
 def test_session_title_set_errors_when_row_lookup_fails_after_noop(monkeypatch):
     class _FakeDB:
+        session_turn_lease = _stub_session_turn_lease
         def get_session_title(self, _key):
             return ""
 
@@ -7092,6 +7144,7 @@ def test_session_create_drops_pending_title_on_valueerror(monkeypatch):
             }
 
     class _FakeDB:
+        session_turn_lease = _stub_session_turn_lease
         def set_session_title(self, _key, _title):
             raise ValueError("Title already in use")
 
@@ -8689,6 +8742,11 @@ def test_config_set_model_switches_agent_without_touching_env(monkeypatch):
         def update_system_prompt(self, _session_id, system_prompt):
             self.system_prompt = system_prompt
 
+        # The model-switch marker is persisted BEFORE it is added to the live
+        # history, under the conversation's turn lease — so this double has to
+        # offer one or the marker never reaches either side.
+        session_turn_lease = _stub_session_turn_lease
+
         def append_message(self, session_id, role, content=None, **_kwargs):
             self.messages.append(
                 {"session_id": session_id, "role": role, "content": content}
@@ -9387,6 +9445,7 @@ def test_slash_exec_r7_read_commands_use_metadata_mirror_flag_on(monkeypatch):
     ]
 
     class _DB:
+        session_turn_lease = _stub_session_turn_lease
         def get_session(self, key):
             assert key == "session-key"
             return {
@@ -9955,6 +10014,7 @@ def test_session_status_reads_live_gateway_agent(monkeypatch):
     server._sessions["sid"] = _session(agent=agent, running=True)
 
     class _DB:
+        session_turn_lease = _stub_session_turn_lease
         def get_session(self, key):
             assert key == "session-key"
             return {
@@ -10626,6 +10686,7 @@ def test_session_info_includes_mcp_servers(monkeypatch):
 
 def test_session_info_includes_session_title(monkeypatch):
     class _FakeDB:
+        session_turn_lease = _stub_session_turn_lease
         def get_session_title(self, key):
             assert key == "session-key"
             return "Dashboard title"
@@ -11209,13 +11270,14 @@ def test_prompt_submit_can_truncate_before_user_ordinal(monkeypatch):
     server._sessions["sid"] = _session(agent=_Agent(), history=original_history)
 
     class _StubDb:
+        session_turn_lease = _stub_session_turn_lease
         def __init__(self):
             self.replaced = []
 
         def get_messages_as_conversation(self, *_args, **_kwargs):
             return []
 
-        def replace_messages(self, session_id, messages, active_only=False, archive_dropped=False):
+        def replace_messages(self, session_id, messages, active_only=False, archive_dropped=False, **_lease_kw):
             self.replaced.append((session_id, list(messages)))
 
     stub_db = _StubDb()
@@ -11364,13 +11426,14 @@ def test_prompt_submit_truncate_ordinal_skips_display_kind_rows(monkeypatch):
     server._sessions["sid"] = _session(agent=_Agent(), history=original_history)
 
     class _StubDb:
+        session_turn_lease = _stub_session_turn_lease
         def __init__(self):
             self.replaced = []
 
         def get_messages_as_conversation(self, *_args, **_kwargs):
             return []
 
-        def replace_messages(self, session_id, messages, active_only=False, archive_dropped=False):
+        def replace_messages(self, session_id, messages, active_only=False, archive_dropped=False, **_lease_kw):
             self.replaced.append((session_id, list(messages)))
 
     stub_db = _StubDb()
@@ -11465,6 +11528,7 @@ def test_prompt_submit_truncate_translates_display_prefix_ordinal(monkeypatch):
     )
 
     class _StubDb:
+        session_turn_lease = _stub_session_turn_lease
         def __init__(self):
             self.replaced = []
 
@@ -11473,7 +11537,7 @@ def test_prompt_submit_truncate_translates_display_prefix_ordinal(monkeypatch):
             # may take the ordinal-only path past the durability gate.
             return []
 
-        def replace_messages(self, session_id, messages, active_only=False, archive_dropped=False):
+        def replace_messages(self, session_id, messages, active_only=False, archive_dropped=False, **_lease_kw):
             self.replaced.append((session_id, list(messages)))
 
     stub_db = _StubDb()
@@ -11574,7 +11638,8 @@ def test_prompt_submit_row_id_accepts_full_lineage_ordinal(monkeypatch):
     replaced = []
 
     class _FakeDB:
-        def replace_messages(self, key, messages, active_only=False, archive_dropped=False):
+        session_turn_lease = _stub_session_turn_lease
+        def replace_messages(self, key, messages, active_only=False, archive_dropped=False, **_lease_kw):
             replaced.append((key, list(messages)))
 
     sess = _session(history=list(tip_history), display_history_prefix=display_prefix)
@@ -13145,6 +13210,7 @@ def test_session_delete_requires_session_id(monkeypatch):
     called: list[tuple] = []
 
     class _DB:
+        session_turn_lease = _stub_session_turn_lease
         def delete_session(self, *a, **kw):
             called.append((a, kw))
             return True
@@ -13175,7 +13241,8 @@ def test_session_delete_refuses_active_session(monkeypatch):
     called: list[str] = []
 
     class _DB:
-        def delete_session(self, sid, sessions_dir=None):
+        session_turn_lease = _stub_session_turn_lease
+        def delete_session(self, sid, sessions_dir=None, **_lease_kw):
             called.append(sid)
             return True
 
@@ -13205,6 +13272,7 @@ def test_session_delete_fails_closed_when_active_snapshot_raises(monkeypatch):
     delete (fail closed) rather than fall through and allow it."""
 
     class _DB:
+        session_turn_lease = _stub_session_turn_lease
         def delete_session(self, *a, **kw):
             raise AssertionError("delete must not run when active snapshot fails")
 
@@ -13226,7 +13294,8 @@ def test_session_delete_fails_closed_when_active_snapshot_raises(monkeypatch):
 
 def test_session_delete_returns_4007_when_missing(monkeypatch):
     class _DB:
-        def delete_session(self, sid, sessions_dir=None):
+        session_turn_lease = _stub_session_turn_lease
+        def delete_session(self, sid, sessions_dir=None, **_lease_kw):
             return False
 
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
@@ -13241,7 +13310,8 @@ def test_session_delete_returns_4007_when_missing(monkeypatch):
 
 def test_session_delete_propagates_db_exception(monkeypatch):
     class _DB:
-        def delete_session(self, sid, sessions_dir=None):
+        session_turn_lease = _stub_session_turn_lease
+        def delete_session(self, sid, sessions_dir=None, **_lease_kw):
             raise RuntimeError("disk full")
 
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
@@ -13262,7 +13332,8 @@ def test_session_delete_success_returns_deleted_id(monkeypatch):
     captured: dict = {}
 
     class _DB:
-        def delete_session(self, sid, sessions_dir=None):
+        session_turn_lease = _stub_session_turn_lease
+        def delete_session(self, sid, sessions_dir=None, **_lease_kw):
             captured["sid"] = sid
             captured["sessions_dir"] = sessions_dir
             return True
@@ -13304,6 +13375,7 @@ def test_session_list_honors_params_profile_opens_profile_db(monkeypatch, tmp_pa
             return [{"id": "launch-1", "source": "tui", "title": "L"}]
 
     class ProfileDB:
+        session_turn_lease = _stub_session_turn_lease
         def __init__(self, db_path=None):
             seen["db_path"] = db_path
 
@@ -13413,10 +13485,11 @@ def test_session_delete_honors_params_profile_sessions_dir(monkeypatch, tmp_path
     captured: dict = {}
 
     class ProfileDB:
+        session_turn_lease = _stub_session_turn_lease
         def __init__(self, db_path=None):
             captured["db_path"] = db_path
 
-        def delete_session(self, sid, sessions_dir=None):
+        def delete_session(self, sid, sessions_dir=None, **_lease_kw):
             captured["sid"] = sid
             captured["sessions_dir"] = sessions_dir
             return True
@@ -13461,6 +13534,7 @@ def test_session_title_uses_session_profile_db_not_launch(monkeypatch, tmp_path)
             return {"id": _key, "title": "from-launch"}
 
     class ProfileDB:
+        session_turn_lease = _stub_session_turn_lease
         def __init__(self, db_path=None):
             self.db_path = db_path
             seen["db_path"] = db_path
@@ -13529,6 +13603,7 @@ def test_session_history_uses_session_profile_db(monkeypatch, tmp_path):
             return [{"role": "user", "content": "launch"}]
 
     class ProfileDB:
+        session_turn_lease = _stub_session_turn_lease
         def __init__(self, db_path=None):
             seen["db_path"] = db_path
 
@@ -13574,6 +13649,7 @@ def test_session_history_ships_durable_row_ids(monkeypatch):
     seen: dict = {}
 
     class _Db:
+        session_turn_lease = _stub_session_turn_lease
         def get_messages_as_conversation(self, _key, include_ancestors=False, include_row_ids=False, **_kwargs):
             seen["include_row_ids"] = include_row_ids
 
@@ -13616,6 +13692,7 @@ def test_session_status_uses_session_profile_db(monkeypatch, tmp_path):
             return {"id": _key, "title": "launch-title", "started_at": 1}
 
     class ProfileDB:
+        session_turn_lease = _stub_session_turn_lease
         def __init__(self, db_path=None):
             seen["db_path"] = db_path
 
@@ -13665,6 +13742,7 @@ def test_teardown_ends_session_in_profile_db(monkeypatch, tmp_path):
             seen["launch_end"] = True
 
     class ProfileDB:
+        session_turn_lease = _stub_session_turn_lease
         def __init__(self, db_path=None):
             seen["db_path"] = db_path
 
@@ -13715,6 +13793,7 @@ def test_session_branch_writes_to_parent_profile_db(monkeypatch, tmp_path):
             return True
 
     class ProfileDB:
+        session_turn_lease = _stub_session_turn_lease
         def __init__(self, db_path=None):
             seen["db_path"] = db_path
             seen.setdefault("inits", 0)
@@ -13836,6 +13915,7 @@ def test_session_branch_installs_parent_profile_secret_scope(monkeypatch, tmp_pa
     seen: dict = {"msgs": []}
 
     class ProfileDB:
+        session_turn_lease = _stub_session_turn_lease
         def __init__(self, db_path=None):
             pass
 
@@ -13938,6 +14018,7 @@ def test_session_branch_uses_persisted_display_history_after_compaction(monkeypa
             return "launch"
 
     class ProfileDB:
+        session_turn_lease = _stub_session_turn_lease
         def __init__(self, db_path=None):
             seen.setdefault("inits", 0)
             seen["inits"] += 1
@@ -14054,6 +14135,7 @@ def test_pending_title_finalizer_uses_session_profile_db(monkeypatch, tmp_path):
             return True
 
     class ProfileDB:
+        session_turn_lease = _stub_session_turn_lease
         def __init__(self, db_path=None):
             seen["db_path"] = db_path
 
@@ -14520,6 +14602,7 @@ def test_prompt_submit_preserves_empty_response_without_error(monkeypatch):
 
 def test_session_active_list_reports_live_sessions(monkeypatch):
     class _DB:
+        session_turn_lease = _stub_session_turn_lease
         def get_session_title(self, key):
             return {"key-a": "Research", "key-b": "Implement"}.get(key, "")
 
@@ -14586,6 +14669,7 @@ def test_session_active_list_excludes_finalized_sessions(monkeypatch):
     standalone ``hermes --tui`` case) must still be reported.
     """
     class _DB:
+        session_turn_lease = _stub_session_turn_lease
         def get_session_title(self, key):
             return {"key-live": "Live", "key-dead": "Dead"}.get(key, "")
 
@@ -14828,6 +14912,7 @@ def test_session_most_recent_returns_first_non_denied(monkeypatch):
     """Drops `tool` rows like session.list does, returns the first hit."""
 
     class _DB:
+        session_turn_lease = _stub_session_turn_lease
         def list_sessions_rich(self, *, source=None, limit=200, order_by_last_active=False, compact_rows=False):
             return [
                 {"id": "tool-1", "source": "tool", "title": "noise", "started_at": 100},
@@ -14847,6 +14932,7 @@ def test_session_most_recent_returns_first_non_denied(monkeypatch):
 
 def test_session_most_recent_returns_null_when_only_tool_rows(monkeypatch):
     class _DB:
+        session_turn_lease = _stub_session_turn_lease
         def list_sessions_rich(self, *, source=None, limit=200, order_by_last_active=False, compact_rows=False):
             return [{"id": "tool-1", "source": "tool", "started_at": 1}]
 
@@ -18890,13 +18976,14 @@ def test_personality_marker_does_not_shift_truncate_ordinal(monkeypatch):
             self._target()
 
     class _StubDb:
+        session_turn_lease = _stub_session_turn_lease
         def __init__(self):
             self.replaced = []
 
         def get_messages_as_conversation(self, *_args, **_kwargs):
             return []
 
-        def replace_messages(self, session_id, messages, active_only=False, archive_dropped=False):
+        def replace_messages(self, session_id, messages, active_only=False, archive_dropped=False, **_lease_kw):
             self.replaced.append((session_id, list(messages)))
 
     session = _session(
@@ -19003,12 +19090,13 @@ def test_prompt_submit_truncation_archives_instead_of_deleting(monkeypatch):
             self._target()
 
     class _StubDb:
+        session_turn_lease = _stub_session_turn_lease
         def get_messages_as_conversation(self, *_args, **_kwargs):
             return []
 
         def replace_messages(
             self, session_id, messages, active_only=False, archive_dropped=False
-        ):
+, **_lease_kw):
             captured["active_only"] = active_only
             captured["archive_dropped"] = archive_dropped
 
@@ -19070,7 +19158,8 @@ def test_prompt_submit_unmatched_row_id_refuses_even_with_ordinal(monkeypatch):
     replaced = []
 
     class _FakeDB:
-        def replace_messages(self, key, messages, active_only=False, archive_dropped=False):
+        session_turn_lease = _stub_session_turn_lease
+        def replace_messages(self, key, messages, active_only=False, archive_dropped=False, **_lease_kw):
             replaced.append((key, list(messages)))
 
     history = [
@@ -19114,7 +19203,8 @@ def test_prompt_submit_unmatched_message_id_refuses_even_with_ordinal(monkeypatc
     replaced = []
 
     class _FakeDB:
-        def replace_messages(self, key, messages, active_only=False, archive_dropped=False):
+        session_turn_lease = _stub_session_turn_lease
+        def replace_messages(self, key, messages, active_only=False, archive_dropped=False, **_lease_kw):
             replaced.append((key, list(messages)))
 
     # Production-shaped history: no renderer "id" keys on user dicts.
@@ -19172,7 +19262,8 @@ def test_prompt_submit_row_id_resolves_via_db_when_memory_lacks_stamps(monkeypat
     ]
 
     class _FakeDB:
-        def replace_messages(self, key, messages, active_only=False, archive_dropped=False):
+        session_turn_lease = _stub_session_turn_lease
+        def replace_messages(self, key, messages, active_only=False, archive_dropped=False, **_lease_kw):
             replaced.append((key, list(messages)))
 
         def get_messages_as_conversation(self, key, repair_alternation=False, include_row_ids=False):
@@ -19498,7 +19589,8 @@ def test_prompt_submit_row_id_db_fallback_ordinal_mapping_verifies_content(
     ]
 
     class _FakeDB:
-        def replace_messages(self, key, messages, active_only=False, archive_dropped=False):
+        session_turn_lease = _stub_session_turn_lease
+        def replace_messages(self, key, messages, active_only=False, archive_dropped=False, **_lease_kw):
             replaced.append((key, list(messages)))
 
         def get_messages_as_conversation(self, key, repair_alternation=False, include_row_ids=False):

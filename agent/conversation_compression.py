@@ -2576,8 +2576,19 @@ def compress_context(
                     _complete_compaction_lifecycle()
                     return messages, _existing_sp
             try:
+                # Present the turn grant this compression is running under.
+                # Taking the compression lock is now admitted like every other
+                # write on a live-owned conversation: `INSERT OR IGNORE` is
+                # first-writer-wins, so a process with no grant that got here
+                # first denied the OWNER its compression for the whole lock TTL
+                # (measured: bystander_acquire=true, owner_acquire_after=false).
+                # This is the same holder the archive/publish writes below
+                # present — it is the turn we are compressing inside.
                 _lock_acquired = _try_acquire_lock(
-                    _lock_sid, _lock_holder, ttl_seconds=_lock_ttl
+                    _lock_sid, _lock_holder, ttl_seconds=_lock_ttl,
+                    turn_lease_holder=getattr(
+                        agent, "_active_session_turn_lease_holder", None
+                    ),
                 )
                 if _lock_acquired:
                     # Watermark (#75316): MAX(id) of active rows at compression
@@ -3540,6 +3551,14 @@ def compress_context(
                         },
                         watermark=_commit_watermark,
                         lock_holder=_lock_holder,
+                        # The compression lock and the turn lease are different
+                        # locks with different jobs: the first stops two
+                        # compressions colliding, the second says who owns the
+                        # conversation. Compaction is a whole-history rewrite,
+                        # so it carries the turn owner's token too.
+                        turn_lease_holder=getattr(
+                            agent, "_active_session_turn_lease_holder", None
+                        ),
                     )
                     split_status = "in_place_committed"
                     # Reset the flush identity set so the next turn's appends are
@@ -3683,6 +3702,9 @@ def compress_context(
                             else None
                         ),
                         watermark_ceiling=_foreign_tail_ceiling,
+                        turn_lease_holder=getattr(
+                            agent, "_active_session_turn_lease_holder", None
+                        ),
                     )
                     agent.session_id = new_session_id
                     try:
@@ -3772,8 +3794,15 @@ def compress_context(
                 # In-place mode still updates/replaces the current row here.
                 # Rotation already published prompt + compacted handoff atomically.
                 if in_place:
+                    # Fenced write, inside this process's own turn — present
+                    # the grant. See hermes_state.turn_grant_kwargs.
+                    from hermes_state import turn_grant_kwargs
+
                     agent._session_db.update_system_prompt(
-                        agent.session_id, new_system_prompt
+                        agent.session_id, new_system_prompt,
+                        **turn_grant_kwargs(
+                            agent._session_db, agent.session_id
+                        ),
                     )
                     agent._last_flushed_db_idx = 0
                 else:

@@ -2383,6 +2383,29 @@ class ContextCompressor(ContextEngine):
         self._compression_telemetry_seed = None
         self._proactive_prune_rearm_tokens = 0
 
+    def bind_turn_lease_provider(self, provider) -> None:
+        """Bind a zero-arg callable returning the owner's live turn-lease token.
+
+        The compressor writes to the transcript (``archive_and_compact``) but
+        does not own the turn — the AIAgent does, and the token is acquired per
+        turn, after ``bind_session_state``. A provider callable reads the live
+        value at write time instead of snapshotting a token that will be stale
+        by the next turn. Unbound (evals, direct construction) means "no token",
+        which the write guard treats as a holderless write: still legal on an
+        unowned conversation, refused under a live owner.
+        """
+        self._turn_lease_provider = provider
+
+    def _active_turn_lease(self):
+        provider = getattr(self, "_turn_lease_provider", None)
+        if provider is None:
+            return None
+        try:
+            return provider()
+        except Exception:
+            logger.debug("turn lease provider failed", exc_info=True)
+            return None
+
     def bind_session_state(self, session_db: Any = None, session_id: str = "") -> None:
         """Bind the current session row so durable cooldowns can round-trip."""
         self._session_db = session_db
@@ -2505,7 +2528,25 @@ class ContextCompressor(ContextEngine):
         if not session_id or not callable(patcher):
             return
         try:
-            patcher(session_id, {PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None})
+            # model_config is fenced, and this runs INSIDE the turn that owns
+            # the conversation — so it presents the turn's own grant rather
+            # than writing holderless, which the store now refuses while a live
+            # owner exists. `current_turn_grant` is None when nothing in this
+            # process owns it, which is the unowned case the fence admits.
+            # Passed only when there is one: `patcher` is a duck-typed
+            # attribute lookup, and with no live grant the call must stay
+            # byte-identical or an unexpected keyword becomes a silent
+            # no-clear in the `except Exception` below.
+            grant = None
+            reuse = getattr(session_db, "current_turn_grant", None)
+            if callable(reuse):
+                grant = reuse(session_id)
+            fence = {"turn_lease_holder": grant} if grant is not None else {}
+            patcher(
+                session_id,
+                {PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None},
+                **fence,
+            )
         except Exception as exc:
             logger.debug("proactive prune runway clear failed: %s", exc)
 
@@ -4026,6 +4067,7 @@ class ContextCompressor(ContextEngine):
                     model_config_patch={
                         PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: next_rearm_tokens,
                     },
+                    turn_lease_holder=self._active_turn_lease(),
                 )
             except Exception as exc:
                 logger.warning(
@@ -6959,7 +7001,11 @@ This compaction should PRIORITISE preserving all information related to the focu
         if not session_db or not session_id:
             return
         try:
-            session_db.archive_and_compact(session_id, compacted_messages)
+            session_db.archive_and_compact(
+                session_id,
+                compacted_messages,
+                turn_lease_holder=self._active_turn_lease(),
+            )
             for msg in compacted_messages:
                 if isinstance(msg, dict):
                     msg[_DB_PERSISTED_MARKER] = True
