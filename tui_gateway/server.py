@@ -838,7 +838,16 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
                     source = (row or {}).get("source", "")
                     _tui_owns_lifecycle = not _is_gateway_owned_source(source)
                     if _tui_owns_lifecycle:
-                        db.end_session(session_id, end_reason)
+                        # end_session is fenced; present this turn's own grant
+                        # when there is one rather than racing the turn against
+                        # itself. See hermes_state.turn_grant_kwargs.
+                        from hermes_state import turn_grant_kwargs
+
+                        db.end_session(
+                            session_id,
+                            end_reason,
+                            **turn_grant_kwargs(db, session_id),
+                        )
         except Exception:
             pass
 

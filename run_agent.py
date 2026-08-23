@@ -4671,7 +4671,16 @@ class AIAgent:
             if getattr(self, "_end_session_on_close", True):
                 session_id = getattr(self, "session_id", None)
                 if session_db and session_id:
-                    session_db.end_session(session_id, "agent_close")
+                    # end_session is fenced now. Reuse this turn's own grant
+                    # when there is one rather than racing the turn against
+                    # itself. See hermes_state.turn_grant_kwargs.
+                    from hermes_state import turn_grant_kwargs
+
+                    session_db.end_session(
+                        session_id,
+                        "agent_close",
+                        **turn_grant_kwargs(session_db, session_id),
+                    )
         except Exception:
             pass
 

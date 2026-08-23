@@ -84,20 +84,21 @@ def _owned(db, session_id="s", *, tag="owner"):
     return grant
 
 
-def _backdate(db_path: pathlib.Path, session_ids) -> None:
-    """Age *session_ids* past any sweep cutoff, through a foreign handle."""
-    import sqlite3
+def _backdate(db, session_ids) -> None:
+    """Age *session_ids* past a sweep cutoff.
 
-    conn = sqlite3.connect(db_path, timeout=10)
-    try:
-        placeholders = ",".join("?" * len(session_ids))
-        conn.execute(
-            f"UPDATE sessions SET started_at = ? WHERE id IN ({placeholders})",
-            (time.time() - 1_000_000, *session_ids),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    Straight down ``db._conn`` — the idiom every other prune fixture in this
+    repository uses — rather than through a foreign handle: the sessions table
+    carries a generation trigger that a connection outside this process's
+    ``SessionDB`` cannot satisfy, and rather than through a public writer,
+    which would put the fixture inside the fence it is setting up for.
+    """
+    placeholders = ",".join("?" * len(session_ids))
+    db._conn.execute(
+        f"UPDATE sessions SET started_at = ? WHERE id IN ({placeholders})",
+        (time.time() - 1_000_000, *session_ids),
+    )
+    db._conn.commit()
 
 
 def _refused(call):
@@ -145,7 +146,7 @@ def check_a_bystander_cannot_close_the_owners_session_as_compression(
                 f"a bystander closed the owner's conversation out from under a "
                 f"valid grant: {exc}"
             )
-        assert db.get_message_count("s") == 2, (
+        assert db.message_count("s") == 2, (
             "the owner's append did not land, so this pin cannot tell a fence "
             "from a broken transcript path"
         )
@@ -307,7 +308,7 @@ def check_the_orphan_finalize_sweep_skips_the_owned_conversation(
         # from OUTSIDE the store on purpose: a fixture that reached in through
         # SessionDB's own generic write path would be exercising the very sink
         # this family is closing.
-        _backdate(pathlib.Path(tmpdir) / "state.db", ("c1", "c2"))
+        _backdate(db, ("c1", "c2"))
 
         grant = db.try_acquire_session_turn_lease(
             "c1", _holder("owner"), ttl_seconds=600
@@ -387,22 +388,25 @@ SOURCE_MUTATIONS = (
         pin="check_the_owner_can_close_its_own_session_as_compression",
         module="hermes_state.py",
         find=(
-            "    def end_session(\n"
-            "        self,\n"
-            "        session_id: str,\n"
-            "        end_reason: str,\n"
-            "        turn_lease_holder=None,\n"
+            "                turn_lease_holder,\n"
+            "                turn_lease_ttl_seconds=turn_lease_ttl_seconds,\n"
+            "            )\n"
+            "            conn.execute(\n"
+            '                "UPDATE sessions SET ended_at = ?, end_reason = ? "\n'
+            '                "WHERE id = ? AND ended_at IS NULL",\n'
         ),
         replace=(
-            "    def end_session(\n"
-            "        self,\n"
-            "        session_id: str,\n"
-            "        end_reason: str,\n"
-            "        turn_lease_holder=object(),\n"
+            "                None,\n"
+            "                turn_lease_ttl_seconds=turn_lease_ttl_seconds,\n"
+            "            )\n"
+            "            conn.execute(\n"
+            '                "UPDATE sessions SET ended_at = ?, end_reason = ? "\n'
+            '                "WHERE id = ? AND ended_at IS NULL",\n'
         ),
-        why="a default that is not a grant makes every caller present a "
-            "not-a-grant, which _authorize_turn_lease_token refuses — the "
-            "fence would then refuse the owner's own rotation",
+        why="dropping the presented grant on the floor makes the guard read "
+            "every close as holderless, so the fence refuses the owner's own "
+            "rotation — a fence that refuses everybody passes the bystander "
+            "pin above perfectly",
     ),
     Mutation(
         pin="check_a_bystander_cannot_reopen_the_owners_ended_session",

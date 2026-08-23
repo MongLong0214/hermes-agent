@@ -5702,16 +5702,33 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         self._execute_write(_do)
 
-    def set_expiry_finalized(self, session_id: str, finalized: bool = True) -> None:
+    def set_expiry_finalized(
+        self,
+        session_id: str,
+        finalized: bool = True,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> None:
         """Mark a gateway session's expiry-finalization flag in state.db.
 
         Mirrors ``SessionEntry.expiry_finalized`` (sessions.json) so the flag
         survives even if the JSON index is pruned or lost (#9006).
+
+        The flag is what stops stale-route recovery resurrecting a session with
+        its full history, so a bystander that clears or sets it decides what a
+        later turn replays.
         """
         if not session_id:
             return
 
         def _do(conn):
+            # expiry_finalized is what stops recovery resurrecting this row.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             conn.execute(
                 "UPDATE sessions SET expiry_finalized = ? WHERE id = ?",
                 (1 if finalized else 0, session_id),
@@ -6307,7 +6324,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return records
 
     def adopt_orphaned_gateway_session(
-        self, orphan_id: str, donor_id: str
+        self,
+        orphan_id: str,
+        donor_id: str,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> bool:
         """Stamp *orphan_id* with *donor_id*'s routing identity, retire *donor_id*.
 
@@ -6320,6 +6341,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return False
 
         def _do(conn):
+            # The orphan is the row this caller named, and its routing identity
+            # is what the next turn is dispatched through.
+            self._check_turn_lease_guard(
+                conn,
+                orphan_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
+            # The donor is a SECOND conversation, and adoption RETIRES it. A
+            # grant on the orphan authorizes nothing about it, so the only
+            # admissible state for the donor's root is free.
+            self._refuse_if_any_conversation_is_owned(
+                conn, [donor_id],
+                f"refusing to adopt {orphan_id!r} from {donor_id!r}: "
+                f"the donor is",
+            )
             donor = conn.execute(
                 "SELECT session_key, chat_id, chat_type, thread_id, user_id, "
                 "origin_json, display_name, source FROM sessions WHERE id = ?",
@@ -6433,7 +6470,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ).fetchall()
         return self._session_row_dict(rows[0]) if len(rows) == 1 else None
 
-    def reopen_orphaned_compression_session(self, session_id: str) -> bool:
+    def reopen_orphaned_compression_session(
+        self,
+        session_id: str,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> bool:
         """Reopen a compression parent only when no continuation was published.
 
         Compression publication is atomic in current builds, but older builds
@@ -6446,6 +6488,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return False
 
         def _do(conn):
+            # Un-ending a segment changes what its conversation replays.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             parent = conn.execute(
                 "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
                 (session_id,),
@@ -6684,7 +6733,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         self._execute_write(_do)
 
-    def end_session(self, session_id: str, end_reason: str) -> None:
+    def end_session(
+        self,
+        session_id: str,
+        end_reason: str,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> None:
         """Mark a session as ended.
 
         No-ops when the session is already ended. The first end_reason wins:
@@ -6693,8 +6748,24 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         desynced CLI session_id after ``/resume`` or ``/branch``) targets them
         with a different reason. Use ``reopen_session()`` first if you
         intentionally need to re-end a closed session with a new reason.
+
+        FENCED, AND ``'compression'`` IS WHY
+            ``_check_transcript_write_guards`` refuses every append to a row
+            whose ``end_reason`` is ``'compression'``. That rule is enforced
+            against the APPENDER, so an unfenced writer of this column can end
+            a conversation another process is holding a valid grant on, and the
+            owner's next append dies as ``CompressionSessionClosedError``. No
+            shipped caller passes ``'compression'`` from a bystander today —
+            that is a mitigation, one edit wide, not a proof.
         """
         def _do(conn):
+            # end_reason='compression' closes the transcript against its own owner.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             conn.execute(
                 "UPDATE sessions SET ended_at = ?, end_reason = ? "
                 "WHERE id = ? AND ended_at IS NULL",
@@ -6702,13 +6773,33 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
         self._execute_write(_do)
 
-    def reopen_session(self, session_id: str) -> None:
+    def reopen_session(
+        self,
+        session_id: str,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> None:
         """Clear ended_at/end_reason so a session can be resumed.
 
         Before clearing a reset boundary, stabilize markerless legacy reset
         children that still depend on the parent's mutable end_reason.
+
+        Both statements are context-bearing: the second moves the lifecycle
+        pair, and the FIRST ``json_set``s ``_reset_from`` into the children's
+        ``model_config`` — a replay column, on rows this caller never named.
         """
         def _do(conn):
+            # Reopening clears the boundary and stamps the children's model_config.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
+            self._refuse_unless_reached_conversations_are_free(
+                conn, session_id,
+                f"refusing to reopen {session_id!r}: it stamps",
+            )
             placeholders = ",".join("?" for _ in _RESET_END_REASONS)
             # WHERE shape shared with _RESET_CHILD_SQL's fallback arm via
             # _legacy_reset_child_sql so the stamping and the listing
@@ -6730,7 +6821,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._execute_write(_do)
 
     def promote_to_session_reset(
-        self, session_id: str, reason: str = "session_reset"
+        self,
+        session_id: str,
+        reason: str = "session_reset",
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> bool:
         """Durably mark a session as ended by an intentional reset boundary.
 
@@ -6764,6 +6859,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         now = time.time()
 
         def _do(conn):
+            # A reset boundary ends a LIVE row, which is the owner's own row.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             cursor = conn.execute(
                 "UPDATE sessions SET ended_at = ?, end_reason = ? "
                 "WHERE id = ? AND (ended_at IS NULL "
@@ -6775,6 +6877,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         try:
             rows = self._execute_write(_do)
             return bool(rows)
+        except SessionTurnLeaseLostError:
+            # A refusal is a decision, not a failure to write. Swallowing it
+            # into `return False` would tell the caller "already had a
+            # boundary" — the one answer that reads as success.
+            raise
         except Exception:
             return False
 
@@ -9513,14 +9620,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         cutoff = time.time() - 604800  # 7 days
 
-        def _do(conn):
-            now = time.time()
-            result = conn.execute(
-                """
-                UPDATE sessions
-                SET ended_at = ?,
-                    end_reason = 'orphaned_compression'
-                WHERE api_call_count = 0
+        # The predicate, written once. It selects the victims and then, over
+        # exactly the ids the sweep is still allowed to touch, applies the
+        # close — rather than being a single set-based UPDATE that decides and
+        # writes in one statement with nowhere to put an admission.
+        _ORPHAN_PREDICATE = """
+                  api_call_count = 0
                   AND end_reason IS NULL
                   AND ended_at IS NULL
                   AND started_at < ?
@@ -9535,8 +9640,32 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                       SELECT 1 FROM messages m
                       WHERE m.session_id = sessions.id
                   )
+        """
+
+        def _do(conn):
+            now = time.time()
+            orphans = [
+                row["id"] for row in conn.execute(
+                    f"SELECT id FROM sessions WHERE {_ORPHAN_PREDICATE}",
+                    (cutoff,),
+                ).fetchall()
+            ]
+            # Repair is a SWEEP: its victims come from a predicate, so nobody
+            # could have held a grant naming them. Owned conversations are
+            # skipped in THIS transaction rather than failing the pass.
+            orphans = self._skip_leased_conversations(conn, orphans)[0]
+            if not orphans:
+                return 0
+            placeholders = ",".join("?" * len(orphans))
+            result = conn.execute(
+                f"""
+                UPDATE sessions
+                SET ended_at = ?,
+                    end_reason = 'orphaned_compression'
+                WHERE id IN ({placeholders})
+                  AND {_ORPHAN_PREDICATE}
                 """,
-                (now, cutoff),
+                (now, *orphans, cutoff),
             )
             return result.rowcount
 

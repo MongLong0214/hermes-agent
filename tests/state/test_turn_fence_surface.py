@@ -576,13 +576,18 @@ def test_this_generation_writes_every_surface_table_normally(tmp_path):
     # exempt from the fence this file exists to check, and it is the write the
     # surface docstring names first.
     #
-    # set_session_title and end_session stay holderless: they are still outside
-    # the lease guard (the trigger fences them against an older BINARY, which
-    # is what this test is about), and that gap is named rather than papered
-    # over — see tests/state/test_turn_lease_model_switch_fence.
+    # end_session presents the grant now too: it moves `ended_at` /
+    # `end_reason`, and `end_reason = 'compression'` is the value
+    # _check_transcript_write_guards enforces against the APPENDER — so an
+    # unfenced writer of it closes the transcript against the holder of a
+    # still-valid grant. See tests/state/test_turn_lease_session_lifecycle.
+    #
+    # set_session_title stays holderless: it is still outside the lease guard
+    # (the trigger fences it against an older BINARY, which is what this test
+    # is about), and that gap is named rather than papered over.
     db.update_session_model("s", "a-model", turn_lease_holder=grant)
     db.set_session_title("s", "a title")
-    db.end_session("s", "completed")
+    db.end_session("s", "completed", turn_lease_holder=grant)
     assert db.refresh_session_turn_lease("s", grant, ttl_seconds=600) is True
     db.release_session_turn_lease("s", grant)
     regrant = db.try_acquire_session_turn_lease(

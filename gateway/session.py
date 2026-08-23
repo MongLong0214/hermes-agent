@@ -97,6 +97,29 @@ from .whatsapp_identity import (
 from utils import atomic_replace
 from agent.turn_context import extract_api_content_sidecar
 
+
+def _turn_grant(db, session_id) -> Dict[str, Any]:
+    """This turn's own grant for *session_id*, or ``{}``.
+
+    The lifecycle writers (``end_session``, ``reopen_session``,
+    ``promote_to_session_reset``) are fenced: ``end_reason = 'compression'``
+    is the value ``_check_transcript_write_guards`` enforces against the next
+    appender, so an unfenced writer of it closes a transcript against the
+    holder of a still-valid grant. When the gateway hosts the agent, THIS
+    process is that holder, and racing the turn against itself is not the
+    point of the fence.
+
+    Imported lazily and via ``turn_grant_kwargs`` so the keyword is passed
+    ONLY when a real grant exists — several of these handles are duck-typed
+    and an unexpected keyword becomes a ``TypeError`` swallowed by the
+    surrounding ``except``, which reads exactly like a successful write.
+    """
+    if db is None or not session_id:
+        return {}
+    from hermes_state import turn_grant_kwargs
+
+    return turn_grant_kwargs(db, session_id)
+
 # Session keys/ids flow into filesystem paths downstream (e.g.
 # ``sessions_dir / f"{session_id}.json"`` in hermes_state, request-dump
 # filenames in agent_runtime_helpers). Any value that could escape the
@@ -2146,10 +2169,11 @@ class SessionStore:
         if reset_reason:
             try:
                 promote = getattr(self._db, "promote_to_session_reset", None)
+                grant = _turn_grant(self._db, entry.session_id)
                 if callable(promote):
-                    promote(entry.session_id, reset_reason)
+                    promote(entry.session_id, reset_reason, **grant)
                 else:
-                    self._db.end_session(entry.session_id, reset_reason)
+                    self._db.end_session(entry.session_id, reset_reason, **grant)
             except Exception as exc:
                 logger.debug(
                     "Gateway recovered-session reset promotion failed for %s: %s",
@@ -2158,7 +2182,9 @@ class SessionStore:
                 )
             return None
         try:
-            self._db.reopen_session(entry.session_id)
+            self._db.reopen_session(
+                entry.session_id, **_turn_grant(self._db, entry.session_id)
+            )
         except Exception as exc:
             logger.debug("Gateway session DB reopen failed for %s: %s", session_key, exc)
         if migrated_legacy:
@@ -2316,7 +2342,10 @@ class SessionStore:
                 # live rows or rows ended with ``agent_close``.  Explicit
                 # boundaries (compression, session_reset, new_command, etc.)
                 # are preserved — the first writer wins.
-                self._db.promote_to_session_reset(entry.session_id)
+                self._db.promote_to_session_reset(
+                    entry.session_id,
+                    **_turn_grant(self._db, entry.session_id),
+                )
             except Exception as exc:
                 logger.debug(
                     "Session DB promote_to_session_reset failed for %s: %s",
@@ -2810,7 +2839,10 @@ class SessionStore:
                     prev_session_id = recovered.session_id
                 else:
                     try:
-                        self._db.reopen_session(recovered.session_id)
+                        self._db.reopen_session(
+                            recovered.session_id,
+                            **_turn_grant(self._db, recovered.session_id),
+                        )
                     except Exception as exc:
                         logger.debug(
                             "Gateway session DB reopen failed for %s: %s",
@@ -2902,10 +2934,13 @@ class SessionStore:
                 # end_session would preserve — leaving the reset session
                 # resurrectable by stale-route recovery (#61220, #61993).
                 _promote = getattr(self._db, "promote_to_session_reset", None)
+                _grant = _turn_grant(self._db, db_end_session_id)
                 if callable(_promote):
-                    _promote(db_end_session_id, _db_end_reason)
+                    _promote(db_end_session_id, _db_end_reason, **_grant)
                 else:
-                    self._db.end_session(db_end_session_id, _db_end_reason)
+                    self._db.end_session(
+                        db_end_session_id, _db_end_reason, **_grant
+                    )
             except Exception as e:
                 # A failed end-write leaves a zombie open row still holding
                 # this chat's session_key: restart recovery will resolve the
@@ -3397,10 +3432,13 @@ class SessionStore:
                 # user reset, or recovery resurrects the reset session
                 # (#61993 — the user's /new was silently undone).
                 _promote = getattr(self._db, "promote_to_session_reset", None)
+                _grant = _turn_grant(self._db, db_end_session_id)
                 if callable(_promote):
-                    _promote(db_end_session_id, "session_reset")
+                    _promote(db_end_session_id, "session_reset", **_grant)
                 else:
-                    self._db.end_session(db_end_session_id, "session_reset")
+                    self._db.end_session(
+                        db_end_session_id, "session_reset", **_grant
+                    )
             except Exception as e:
                 # Zombie hazard — see the get_or_create twin path (#82616).
                 logger.warning(
@@ -3516,16 +3554,22 @@ class SessionStore:
                 # to the explicit switch boundary, or recovery can resurrect
                 # it over the user's /resume choice (#61220 bug class).
                 _promote = getattr(self._db, "promote_to_session_reset", None)
+                _grant = _turn_grant(self._db, db_end_session_id)
                 if callable(_promote):
-                    _promote(db_end_session_id, "session_switch")
+                    _promote(db_end_session_id, "session_switch", **_grant)
                 else:
-                    self._db.end_session(db_end_session_id, "session_switch")
+                    self._db.end_session(
+                        db_end_session_id, "session_switch", **_grant
+                    )
             except Exception as e:
                 logger.debug("Session DB end_session failed: %s", e)
 
         if self._db:
             try:
-                self._db.reopen_session(target_session_id)
+                self._db.reopen_session(
+                    target_session_id,
+                    **_turn_grant(self._db, target_session_id),
+                )
             except Exception as e:
                 logger.debug("Session DB reopen_session failed: %s", e)
             self._record_gateway_session_peer(

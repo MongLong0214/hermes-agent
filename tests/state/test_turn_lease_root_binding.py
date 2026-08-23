@@ -145,7 +145,10 @@ def test_a_grant_still_works_across_its_own_lineage_after_rotation(tmp_path):
     db.append_message("root", "user", "root context")
     token = db.try_acquire_session_turn_lease("root", _holder(), ttl_seconds=300)
     assert token is not None
-    db.end_session("root", "compression")
+    # The owner rotates its OWN segment, so it presents its own grant:
+    # end_session is fenced now that end_reason='compression' is the value the
+    # transcript guard enforces against the next appender.
+    db.end_session("root", "compression", turn_lease_holder=token)
     db.create_session("tip", source="test", parent_session_id="root")
 
     assert db.append_message(
