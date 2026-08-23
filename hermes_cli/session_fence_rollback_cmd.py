@@ -44,7 +44,6 @@ OUTPUT CONTRACT
 from __future__ import annotations
 
 import json
-import shutil
 import sqlite3
 import sys
 from pathlib import Path
@@ -162,19 +161,38 @@ def _report_rehearsal(store: Path, backup: Path, work_parent: Path = None) -> in
         return _emit_refusal(
             _unexpected(exc), store=store, backup=backup, dry_run=True
         )
+    plan = None
+    refusal = None
     try:
         try:
             plan = rollback.rehearse_turn_fence_rollback(
                 store, backup_path=backup, work_dir=work_dir
             )
         except rollback.TurnFenceRollbackRefused as exc:
-            return _emit_refusal(exc, store=store, backup=backup, dry_run=True)
+            refusal = exc
         except (sqlite3.DatabaseError, OSError) as exc:
-            return _emit_refusal(
-                _unexpected(exc), store=store, backup=backup, dry_run=True
-            )
+            refusal = _unexpected(exc)
     finally:
-        shutil.rmtree(work_dir, ignore_errors=True)
+        residue = rollback.sweep_work_dir(work_dir)
+
+    # RESIDUE OUTRANKS EVERY OTHER OUTCOME OF A DRY RUN. What is left in there
+    # is a rolled-back — that is, UNFENCED — duplicate of every conversation in
+    # the store, in a directory the operator was never told about. Reporting
+    # "nothing changed" and exiting 0 over the top of that is false twice.
+    if residue is not None:
+        return _emit_refusal(
+            rollback.TurnFenceRollbackRefused(
+                f"the dry run could not remove its working copy of {store}: "
+                f"{residue['files']} file(s) remain under "
+                f"{residue['work_dir']}{residue['error']}. That copy is an "
+                "UNFENCED duplicate of every conversation in the store — "
+                "remove that directory",
+                reason="rehearsal-residue",
+            ),
+            store=store, backup=backup, dry_run=True,
+        )
+    if refusal is not None:
+        return _emit_refusal(refusal, store=store, backup=backup, dry_run=True)
 
     _emit(
         {
@@ -189,11 +207,11 @@ def _report_rehearsal(store: Path, backup: Path, work_parent: Path = None) -> in
             "would_drop": plan["would_drop"],
             "dropped_triggers": [],
             "preflight": plan["preflight"],
-            # Which files the rehearsal had to copy to be faithful. An
-            # operator looking at `["rehearsal.db", "-wal"]` can see that the
-            # store had uncheckpointed frames and that they were carried over,
-            # rather than taking "it would work" on trust.
-            "rehearsed_on": plan["rehearsal"]["copied_files"],
+            # The private directory the rehearsal worked in, so a pin — or an
+            # operator — can check that it is gone rather than checking a
+            # location this code might move next. Naming it here is what stops
+            # the observation going blind when the work relocates.
+            "rehearsal_work_dir": plan["rehearsal"]["work_dir"],
         }
     )
     return 0
@@ -201,34 +219,58 @@ def _report_rehearsal(store: Path, backup: Path, work_parent: Path = None) -> in
 
 def _report_rollback(store: Path, backup: Path) -> int:
     """The real run. Pre-flight first, and its result is part of the report."""
+    import tempfile
+
     from hermes_cli import session_fence_rollback as rollback
 
     try:
-        plan = rollback.preflight_turn_fence_rollback(store, backup_path=backup)
-    except rollback.TurnFenceRollbackRefused as exc:
-        return _emit_refusal(exc, store=store, backup=backup, dry_run=False)
-    except (sqlite3.DatabaseError, OSError) as exc:
+        work_dir = Path(tempfile.mkdtemp(prefix="hermes-fence-preflight-"))
+    except OSError as exc:
         return _emit_refusal(
             _unexpected(exc), store=store, backup=backup, dry_run=False
         )
 
+    report = None
+    refusal = None
     try:
-        report = rollback.rollback_turn_fence(store, backup_path=backup)
-    except rollback.TurnFenceRollbackRefused as exc:
+        try:
+            # ONE call. `rollback_turn_fence` runs the pre-flight itself and
+            # returns its result — driving the pre-flight separately here ran
+            # it twice against the same working directory, which the exclusive
+            # create correctly refused as a collision with our own first copy.
+            report = rollback.rollback_turn_fence(
+                store, backup_path=backup, work_dir=work_dir
+            )
+        except rollback.TurnFenceRollbackRefused as exc:
+            refusal = exc
+        except (sqlite3.DatabaseError, OSError) as exc:
+            # A classified refusal names a next move; this does not, and saying
+            # so is the point. The store is untouched either way — every raise
+            # inside the boundary rolls its transaction back.
+            refusal = _unexpected(exc)
+    finally:
+        residue = rollback.sweep_work_dir(work_dir)
+
+    if residue is not None:
+        # Same rule as the dry run, and it applies even when the rollback
+        # SUCCEEDED: a copy of the store from before the fence came off is
+        # still a copy of every conversation.
         return _emit_refusal(
-            exc, store=store, backup=backup, dry_run=False,
-            preflight=plan["preflight"],
+            rollback.TurnFenceRollbackRefused(
+                f"the pre-flight copy of {store} could not be removed: "
+                f"{residue['files']} file(s) remain under "
+                f"{residue['work_dir']}{residue['error']}. The rollback itself "
+                f"{'completed' if report is not None else 'did not complete'}. "
+                "That copy is a duplicate of every conversation in the store — "
+                "remove that directory",
+                reason="preflight-residue",
+            ),
+            store=store, backup=backup, dry_run=False,
+            preflight=(report or {}).get("preflight"),
         )
-    except (sqlite3.DatabaseError, OSError) as exc:
-        # The pre-flight passed and the operation still did not complete. The
-        # store is untouched — every raise inside the transaction rolls it back
-        # — but this is NOT one of the classified refusals, and saying so is the
-        # point: an operator who is told "surface-mismatch" goes and looks at
-        # the surface, and one who is told "unexpected-error" goes and reads
-        # the detail.
+    if refusal is not None:
         return _emit_refusal(
-            _unexpected(exc), store=store, backup=backup, dry_run=False,
-            preflight=plan["preflight"],
+            refusal, store=store, backup=backup, dry_run=False,
         )
 
     _emit(
@@ -240,9 +282,9 @@ def _report_rollback(store: Path, backup: Path) -> int:
             "store": str(store),
             "backup": report["backup"],
             "generation": report["generation"],
-            "installed_triggers": plan["installed_triggers"],
+            "installed_triggers": report["installed_triggers"],
             "dropped_triggers": report["dropped_triggers"],
-            "preflight": plan["preflight"],
+            "preflight": report["preflight"],
         }
     )
     return 0

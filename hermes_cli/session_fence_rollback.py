@@ -221,7 +221,67 @@ def _canonical_rows(conn: sqlite3.Connection) -> dict[str, list[tuple]]:
     return rows
 
 
-def _refuse_if_live(store_path: Path) -> None:
+def _live_holders_inside_the_transaction(conn, identity_path: Path) -> list[str]:
+    """Conversations a live turn owns, decided ON *conn*, INSIDE its transaction.
+
+    THE POINT IS THE BOUNDARY, NOT THE ANSWER
+        Every writer in this program is required to check root, holder and
+        epoch in the SAME transaction as the DML it is admitting. The rollback
+        removes that fence, so it may not be held to a weaker standard than the
+        thing it removes. Deciding liveness in the pre-flight and using that
+        answer later leaves a window: a turn acquired after the check and
+        before the ``DROP`` is invisible, and the fence comes off underneath a
+        live conversation. That was reproduced, not theorised — a child that
+        took the lease between the backup and ``BEGIN EXCLUSIVE`` watched all
+        twenty-four triggers go, and the verb reported success.
+
+        Called from inside ``BEGIN EXCLUSIVE``, this closes it from both sides.
+        A contender that acquired BEFORE the lock has a row this reads and
+        refuses on. A contender that tries AFTER it must write
+        ``session_turn_leases`` to acquire, and cannot until this transaction
+        ends.
+
+        The file lock alone would not do it. An idle connection does not
+        prevent ``BEGIN EXCLUSIVE``, so "I took the lock" says nothing about
+        whether a conversation is owned; the exclusion has to be over the
+        LEASE, which is why the rows are read here rather than inferred from
+        the lock.
+
+    THE PREDICATE IS NOT REIMPLEMENTED
+        :meth:`SessionDB._turn_lease_row_is_free` is called directly, unbound,
+        against a stand-in that carries only the one attribute it reads
+        (``db_path``, for the process-local grant registry). Instantiating a
+        ``SessionDB`` here is not an option — its schema init would write, and
+        it would write to a store this transaction holds EXCLUSIVE — but a
+        second copy of the predicate is worse than either. Two opinions about
+        what a lease row means is the drift this program keeps paying for.
+    """
+    from types import SimpleNamespace
+
+    from hermes_state import SessionDB
+
+    previous = conn.row_factory
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            f"SELECT conversation_id, {SessionDB._TURN_LEASE_COLUMNS} "
+            "FROM session_turn_leases "
+            "WHERE holder IS NOT NULL AND holder != ''"
+        ).fetchall()
+    finally:
+        conn.row_factory = previous
+
+    stand_in = SimpleNamespace(db_path=Path(identity_path))
+    return sorted(
+        str(row["conversation_id"])
+        for row in rows
+        if not SessionDB._turn_lease_row_is_free(
+            stand_in, str(row["conversation_id"]), row
+        )
+    )
+
+
+def _refuse_if_live(store_path: Path, *, report_as: Path = None) -> None:
     """Refuse unless every conversation in the store is free.
 
     Delegates to :meth:`SessionDB.offline_rebuild`, which is the one predicate
@@ -229,14 +289,28 @@ def _refuse_if_live(store_path: Path) -> None:
     the question a second way here would let the two answers drift, and the
     interesting drift is the one where this module says idle and the store
     disagrees.
+
+    NEVER POINTED AT THE OPERATOR'S STORE. ``SessionDB(db_path=…)`` runs schema
+    init, and schema init WRITES — it re-creates triggers ``IF NOT EXISTS`` and
+    normalises ``messages.active``. Asking "is this store idle" through it
+    therefore initialises the store it is asking about, and a refusal that has
+    already rewritten the file cannot claim the file is as it was found. That
+    was measured: a ``live-turn`` refusal moved ``state.db``'s digest on both
+    SQLite builds. So the caller hands this a byte-faithful COPY and names the
+    real store in *report_as*.
+
+    This is an early, cheap answer and NOT the authority. The decision the
+    rollback acts on is :func:`_live_holders_inside_the_transaction`, taken
+    under the same lock as the DDL.
     """
+    reported = Path(report_as) if report_as is not None else store_path
     db = SessionDB(db_path=store_path)
     try:
         with db.offline_rebuild(reason="turn-fence rollback"):
             pass
     except SessionTurnLeaseLostError as exc:
         raise TurnFenceRollbackRefused(
-            f"refusing to roll back the turn fence on {store_path}: {exc}",
+            f"refusing to roll back the turn fence on {reported}: {exc}",
             reason="live-turn",
         ) from exc
     finally:
@@ -247,14 +321,36 @@ def _refuse_unusable_backup_path(backup_path: Path) -> None:
     """The backup destination, checked before the store is opened for writing.
 
     Split out of :func:`_make_verified_backup` so the pre-flight can answer
-    "would this run proceed" without writing anything. The checks themselves,
-    and their order relative to the liveness check, are unchanged.
+    "would this run proceed" without writing anything.
+
+    THIS IS THE MESSAGE, NOT THE GUARANTEE. What actually makes "never
+    clobber" true is the ``O_CREAT | O_EXCL`` acquisition in
+    :func:`_copy_onto_a_destination_we_created`; a check here can only be
+    stale by the time the write happens. It exists so the common case refuses
+    early, cheaply, and with a sentence that says which file is in the way.
+
+    A BACKUP IS A FAMILY OF FILES, so the whole family is checked. An operator
+    with an orphaned ``backup.db-wal`` from a previous attempt and no
+    ``backup.db`` is one WAL-mode store away from having that orphan
+    overwritten, and "the path you named does not exist" would have been true
+    and useless.
     """
-    if backup_path.exists():
+    occupied = [
+        str(candidate)
+        for candidate in [backup_path]
+        + [
+            backup_path.with_name(backup_path.name + suffix)
+            for suffix in _SIDECAR_SUFFIXES
+        ]
+        if candidate.exists()
+    ]
+    if occupied:
         raise TurnFenceRollbackRefused(
-            f"the backup path {backup_path} already exists; refusing to "
-            "overwrite it. Name a path that does not exist — a rollback whose "
-            "backup step destroys an earlier backup is not data preservation",
+            f"the backup destination is already occupied by {occupied}; "
+            "refusing to overwrite it. Name a path whose whole family — the "
+            "file and its -wal/-shm/-journal siblings — does not exist. A "
+            "rollback whose backup step destroys an earlier backup is not "
+            "data preservation",
             reason="backup-exists",
         )
     if not backup_path.parent.is_dir():
@@ -273,7 +369,157 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _byte_copy_of_the_store(store_path: Path, destination: Path) -> dict[str, Any]:
+class BoundTarget:
+    """The store this run acts on, bound by INODE rather than by name.
+
+    A PATH IS A NAME, NOT AN IDENTITY
+        Every check in this module used to re-resolve ``store_path``, so the
+        file inspected and the file mutated were only assumed to be the same
+        one. They need not be: rename the store away between the pre-flight and
+        the final open, drop a DIFFERENT valid fenced store at the same path,
+        and every consistency check passes — the surface matches, the store is
+        idle, the generation is right — while the backup describes the store
+        that left and the twenty-four drops land on the store that arrived.
+        Reproduced exactly that way.
+
+        Re-checking the surface and the liveness inside the transaction does
+        not help. Those protect CONSISTENCY, and the substitute is perfectly
+        consistent. What was missing is IDENTITY.
+
+        So the target is opened once, with ``O_NOFOLLOW`` so a symlink cannot
+        stand in for it, and the descriptor is held for the whole operation.
+        Holding it pins the inode: it cannot be recycled underneath us even if
+        the name is unlinked. ``(st_dev, st_ino)`` from that descriptor is the
+        identity every later step is measured against.
+
+    WHAT THIS CAN AND CANNOT PROMISE
+        ``sqlite3`` opens by pathname; there is no descriptor-based open to
+        hand it, so this cannot make SQLite open the bound inode by
+        construction. It can prove the name still resolves to the bound inode
+        at each point the operation relies on it — before the connection,
+        immediately after ``BEGIN EXCLUSIVE``, and again before ``COMMIT`` —
+        and refuse otherwise. A swap that happens inside one of those gaps and
+        is then swapped back would go unseen; every other ordering ends in a
+        refusal, and the failure direction is always "refuse", never "write to
+        the wrong file".
+    """
+
+    def __init__(self, path: Path) -> None:
+        import os
+
+        self.path = Path(path)
+        flags = os.O_RDONLY
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_BINARY", 0)
+        try:
+            self.fd = os.open(self.path, flags)
+        except FileNotFoundError as exc:
+            raise TurnFenceRollbackRefused(
+                f"{self.path} is not a file", reason="store-missing"
+            ) from exc
+        except OSError as exc:
+            raise TurnFenceRollbackRefused(
+                f"{self.path} could not be opened as a plain file — a symlink "
+                f"or a special file cannot be a rollback target: {exc}",
+                reason="store-unreadable",
+            ) from exc
+        info = os.fstat(self.fd)
+        self.identity = (info.st_dev, info.st_ino)
+
+    def verify(self, where: str) -> None:
+        """Refuse unless *path* still names the inode this run bound."""
+        import os
+
+        try:
+            now = os.stat(self.path)
+        except OSError as exc:
+            raise TurnFenceRollbackRefused(
+                f"{self.path} no longer resolves to the file this rollback "
+                f"bound at {where}: {exc}. Nothing was changed",
+                reason="target-replaced",
+            ) from exc
+        if (now.st_dev, now.st_ino) != self.identity:
+            raise TurnFenceRollbackRefused(
+                f"{self.path} names a DIFFERENT file at {where} than the one "
+                f"this rollback bound when it started (was "
+                f"dev={self.identity[0]} ino={self.identity[1]}, now "
+                f"dev={now.st_dev} ino={now.st_ino}). The store was replaced "
+                "mid-operation; a backup of one file and drops against another "
+                "is not a rollback. Nothing was changed",
+                reason="target-replaced",
+            )
+
+    def open_for_reading(self):
+        """A fresh read handle on the BOUND inode, never re-resolving the name.
+
+        Rewound explicitly. ``os.dup`` shares the file OFFSET with the
+        descriptor it copies, so a second reader would start wherever the first
+        one stopped — at EOF — and hand back an empty file that looks like a
+        successful copy. The byte-digest check caught exactly that; this is the
+        cause it caught.
+        """
+        import os
+
+        handle = os.fdopen(os.dup(self.fd), "rb", closefd=True)
+        handle.seek(0)
+        return handle
+
+    def close(self) -> None:
+        import os
+
+        try:
+            os.close(self.fd)
+        except OSError:  # pragma: no cover - already closed
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()
+        return False
+
+
+def _copy_onto_a_destination_we_created(
+    source: Path, destination: Path, *, source_handle=None
+) -> None:
+    """Copy *source* to a destination THIS call brought into existence.
+
+    ``Path.exists()`` followed by ``shutil.copyfile`` cannot implement "must
+    not already exist". They are two operations with a window between them, and
+    ``copyfile`` truncates whatever it opens — so a destination created in that
+    window is silently destroyed. Reproduced: a sentinel written between the
+    check and the copy was gone, and the rollback reported success.
+
+    ``O_CREAT | O_EXCL`` collapses the check and the create into one atomic
+    operation the filesystem arbitrates: either this call made the file or it
+    raises, and there is no third outcome to race. ``O_NOFOLLOW`` refuses a
+    symlink sitting at the destination, which would otherwise redirect the
+    write to a file the operator never named.
+
+    The obligation covers EVERY destination — the main file and each sidecar —
+    which is why this is the only way bytes are written here.
+    """
+    import os
+
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_BINARY", 0)
+    handle = os.open(destination, flags, 0o600)
+    reader = source_handle if source_handle is not None else open(source, "rb")
+    with reader, os.fdopen(handle, "wb") as writer:
+        shutil.copyfileobj(reader, writer)
+
+
+def _byte_copy_of_the_store(
+    store_path: Path,
+    destination: Path,
+    *,
+    what: str = "rehearsal",
+    reason: str = "rehearsal-unwritable",
+    collision_reason: str = "backup-exists",
+    bound: "BoundTarget" = None,
+) -> dict[str, Any]:
     """A copy of the store made with FILE I/O ONLY, verified byte-for-byte.
 
     WHY NOT :func:`_make_verified_backup`, WHICH ALREADY COPIES AND VERIFIES
@@ -297,18 +543,38 @@ def _byte_copy_of_the_store(store_path: Path, destination: Path) -> dict[str, An
     """
     copied: list[str] = []
     names = [""] + [suffix for suffix in _SIDECAR_SUFFIXES]
+    if bound is not None:
+        bound.verify("the start of the copy")
     try:
         for suffix in names:
             source = store_path.with_name(store_path.name + suffix)
             if suffix and not source.is_file():
                 continue
-            shutil.copyfile(source, destination.with_name(destination.name + suffix))
+            _copy_onto_a_destination_we_created(
+                source,
+                destination.with_name(destination.name + suffix),
+                # The MAIN file is read through the bound descriptor, so the
+                # bytes in the copy come from the inode this run bound and not
+                # from whatever the name resolves to now.
+                source_handle=(
+                    bound.open_for_reading() if bound is not None and not suffix
+                    else None
+                ),
+            )
             copied.append(suffix or destination.name)
+    except FileExistsError as exc:
+        raise TurnFenceRollbackRefused(
+            f"the {what} destination {exc.filename} already exists; refusing "
+            "to overwrite it. A destination that appears between the check and "
+            "the write is exactly what this refuses — the check is not the "
+            "guarantee, the exclusive create is",
+            reason=collision_reason,
+        ) from exc
     except OSError as exc:
         raise TurnFenceRollbackRefused(
-            f"the store at {store_path} could not be copied for the rehearsal: "
+            f"the store at {store_path} could not be copied for the {what}: "
             f"{exc}",
-            reason="rehearsal-unwritable",
+            reason=reason,
         ) from exc
 
     drifted = []
@@ -324,10 +590,10 @@ def _byte_copy_of_the_store(store_path: Path, destination: Path) -> dict[str, An
             drifted.append(suffix or "(main)")
     if drifted:
         raise TurnFenceRollbackRefused(
-            f"the rehearsal copy of {store_path} does not reproduce it "
+            f"the {what} copy of {store_path} does not reproduce it "
             f"byte-for-byte ({', '.join(drifted)} differ), which means the "
-            "store changed while it was being read. A rehearsal of a moving "
-            "store is a rehearsal of nothing",
+            "store changed while it was being read. A copy of a moving store "
+            "is a copy of nothing",
             reason="store-in-use",
         )
     return {"copy": str(destination), "files": copied}
@@ -389,40 +655,42 @@ def _refuse_if_this_process_owns_a_turn(
         )
 
 
-def _make_verified_backup(store_path: Path, backup_path: Path) -> dict[str, Any]:
+def _make_verified_backup(
+    store_path: Path, backup_path: Path, *, bound: "BoundTarget" = None
+) -> dict[str, Any]:
     """Copy the store and READ THE COPY BACK before anything is changed.
 
     The verification is the point. ``shutil.copyfile`` succeeding says a file
     exists at the destination; it says nothing about whether that file opens,
     or whether the rows an operator would need to restore are in it. So the
-    backup is opened and compared row-for-row against the source, and a
-    mismatch refuses the rollback rather than being logged.
+    copy is made byte-for-byte, digest-checked in both directions, and then
+    OPENED and read; a failure at any of those refuses the rollback rather than
+    being logged.
+
+    WHY THE SOURCE IS NEVER OPENED HERE, AND WHEN THIS RUNS
+        An earlier version proved the copy by opening the SOURCE and comparing
+        rows. That is a read-only connection on the operator's store, and
+        ``mode=ro`` does not stop SQLite creating ``-wal``/``-shm`` beside a
+        WAL-mode database — so the step that promised to change nothing was
+        adding files. Byte equality across the main file and every sidecar is
+        strictly stronger than the row comparison it replaces, and it needs no
+        connection to the source at all.
+
+        This runs INSIDE the caller's ``BEGIN EXCLUSIVE`` transaction, which is
+        what makes the backup a copy of the state the rollback is about to act
+        on rather than of an earlier, unprotected snapshot. No other writer can
+        move the store between this copy and the ``DROP``s.
     """
     _refuse_unusable_backup_path(backup_path)
 
-    source_conn = sqlite3.connect(f"file:{store_path}?mode=ro", uri=True)
-    try:
-        expected = _canonical_rows(source_conn)
-    finally:
-        source_conn.close()
-
-    copied: list[str] = []
-    try:
-        shutil.copyfile(store_path, backup_path)
-        copied.append(backup_path.name)
-        for suffix in _SIDECAR_SUFFIXES:
-            sidecar = store_path.with_name(store_path.name + suffix)
-            if sidecar.is_file():
-                shutil.copyfile(
-                    sidecar, backup_path.with_name(backup_path.name + suffix)
-                )
-                copied.append(backup_path.name + suffix)
-    except OSError as exc:
-        raise TurnFenceRollbackRefused(
-            f"the backup of {store_path} could not be written to "
-            f"{backup_path}: {exc}",
-            reason="backup-unwritable",
-        ) from exc
+    snapshot = _byte_copy_of_the_store(
+        store_path,
+        backup_path,
+        what="backup",
+        reason="backup-unwritable",
+        collision_reason="backup-exists",
+        bound=bound,
+    )
 
     try:
         backup_conn = sqlite3.connect(f"file:{backup_path}?mode=ro", uri=True)
@@ -433,61 +701,107 @@ def _make_verified_backup(store_path: Path, backup_path: Path) -> dict[str, Any]
         ) from exc
     try:
         found = _canonical_rows(backup_conn)
+    except TurnFenceRollbackRefused as exc:
+        raise TurnFenceRollbackRefused(
+            f"the backup at {backup_path} is a byte-identical copy that does "
+            f"not read back: {exc}. Refusing to roll back — a backup that "
+            "cannot be read back is not a backup",
+            reason="backup-unreadable",
+        ) from exc
     finally:
         backup_conn.close()
 
-    if found != expected:
-        differing = sorted(
-            table for table in expected if expected[table] != found.get(table)
-        )
-        raise TurnFenceRollbackRefused(
-            f"the backup at {backup_path} does not reproduce the store: "
-            f"{', '.join(differing)} differ. Refusing to roll back — a backup "
-            "that cannot be read back is not a backup",
-            reason="backup-mismatch",
-        )
-
     return {
         "path": str(backup_path),
-        "files": copied,
+        "files": snapshot["files"],
         "verified": True,
-        "rows": {table: len(values) for table, values in expected.items()},
+        "rows": {table: len(values) for table, values in found.items()},
     }
+
+
 
 
 def preflight_turn_fence_rollback(
     store_path: Path,
     *,
     backup_path: Path,
+    work_dir: Path,
+    bound: "BoundTarget" = None,
 ) -> dict[str, Any]:
-    """Everything that can refuse, run before the store is written to.
+    """Everything that can refuse, decided WITHOUT touching the operator's store.
 
     ONE implementation, shared. :func:`rollback_turn_fence` calls this as its
-    first act and the operator verb calls it to answer "would this proceed",
-    so a pre-flight that says yes and a run that then refuses cannot be two
+    first act and the dry run calls it to answer "would this proceed", so a
+    pre-flight that says yes and a run that then refuses cannot be two
     different opinions. A dry run that checks something other than what the
     real run checks is not a dry run.
 
-    Refuses with the ``reason`` for the check that stopped it, and attaches to
-    the exception how far the sequence got — the two things an operator needs
-    to know which move comes next.
+    EVERY SQLITE OPEN HERE IS AGAINST A COPY
+        The store is copied — main file and every sidecar, file I/O only,
+        digest-checked both ways — into *work_dir*, and the surface probe, the
+        lease read and the liveness check all run against that copy. This is
+        not fastidiousness; it is the correction for a defect that appeared
+        three times in this program under three disguises:
+
+            C4b   reading the trigger surface THROUGH ``SessionDB`` healed the
+                  answer, because schema init creates triggers IF NOT EXISTS —
+                  verify-before-mutate was verifying its own repair
+            C5    rehearsing on a copy still probed the original with
+                  ``mode=ro``, which creates ``-wal``/``-shm`` beside a
+                  WAL-mode store
+            C5    the liveness question opened ``SessionDB`` on the store and
+                  so INITIALISED the store it was asking about; a ``live-turn``
+                  refusal moved ``state.db``'s digest on both SQLite builds
+
+        Each time an inspection constructed the thing it was inspecting. The
+        rule that falls out, and that this function exists to hold: a
+        pre-flight must not build, migrate, heal or open-for-write the
+        operator's artifact. Read a copy, decide, and only then construct
+        anything.
+
+    THIS IS NOT THE AUTHORITY ON LIVENESS
+        It is the early, cheap, honest answer — it makes the common refusals
+        (wrong target, half-installed surface, a turn already in flight, an
+        occupied backup path) cost nothing and leave nothing. The decision the
+        DDL acts on is taken again inside the exclusive transaction by
+        :func:`_live_holders_inside_the_transaction`, because an answer from
+        out here is a snapshot and a contender can acquire a lease after it.
     """
     progress = _blank_preflight()
     try:
         store_path = Path(store_path)
         backup_path = Path(backup_path)
+        work_dir = Path(work_dir)
         if not store_path.is_file():
             raise TurnFenceRollbackRefused(
                 f"{store_path} is not a file", reason="store-missing"
             )
+        if bound is not None:
+            bound.verify("the start of the pre-flight")
         progress["target_present"] = True
 
+        try:
+            work_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise TurnFenceRollbackRefused(
+                f"the pre-flight directory {work_dir} could not be created, so "
+                f"there is nowhere to inspect a copy of the store: {exc}",
+                reason="rehearsal-unwritable",
+            ) from exc
+
+        copy = work_dir / "preflight.db"
+        _byte_copy_of_the_store(
+            store_path, copy, what="pre-flight",
+            collision_reason="rehearsal-unwritable", bound=bound,
+        )
+
         expected = sorted(rollback_trigger_names())
-        installed = _installed_fence_triggers(store_path)
+        installed = _installed_fence_triggers(copy, report_as=store_path)
         _refuse_unexpected_surface(store_path, installed, expected)
         progress["surface_verified"] = True
 
-        _refuse_if_live(store_path)
+        _refuse_if_this_process_owns_a_turn(copy, identity_path=store_path)
+        _refuse_if_live(copy, report_as=store_path)
         progress["offline_verified"] = True
 
         _refuse_unusable_backup_path(backup_path)
@@ -499,11 +813,106 @@ def preflight_turn_fence_rollback(
     return {
         "store": str(store_path),
         "backup_path": str(backup_path),
+        "copy": str(copy),
         "generation": hermes_state_common.TURN_FENCE_GENERATION,
         "installed_triggers": installed,
         "would_drop": expected,
         "preflight": dict(progress),
     }
+
+
+def _commit_the_rollback(
+    target_path: Path,
+    backup_path: Path,
+    expected,
+    *,
+    report_as: Path = None,
+    bound: "BoundTarget" = None,
+) -> dict[str, Any]:
+    """The exclusion boundary: decide and act without letting go in between.
+
+    ONE transaction covers the final liveness decision, the surface
+    re-verification, the backup, and every ``DROP``. Nothing here trusts an
+    answer computed outside it.
+
+    EXCLUSIVE, not IMMEDIATE: a reader mid-query on a store whose triggers are
+    about to vanish is a reader whose next statement prepares against a
+    different schema. But taking the lock is NOT the liveness check — an idle
+    connection does not prevent ``BEGIN EXCLUSIVE``, so the lock says nothing
+    about whether a conversation is owned. It is the fence around the lease
+    read, not a substitute for it.
+
+    The backup is written INSIDE the boundary, after the liveness decision and
+    before the first ``DROP``, so it is a copy of the state this transaction is
+    about to act on rather than of an earlier snapshot that a contender may
+    already have moved.
+    """
+    target_path = Path(target_path)
+    reported = Path(report_as) if report_as is not None else target_path
+    # IDENTITY, before the connection is opened by NAME. See `BoundTarget`: a
+    # store renamed away and replaced by a different valid fenced store passes
+    # every consistency check there is, because consistency is not identity.
+    if bound is not None:
+        bound.verify("the open of the final transaction")
+    conn = sqlite3.connect(str(target_path), isolation_level=None, timeout=1.0)
+    try:
+        try:
+            conn.execute("BEGIN EXCLUSIVE")
+        except sqlite3.OperationalError as exc:
+            raise TurnFenceRollbackRefused(
+                f"exclusive ownership of {reported} could not be "
+                f"established, so it is not offline: {exc}",
+                reason="not-exclusive",
+            ) from exc
+        try:
+            # 0. IDENTITY again, now that the lock is held: the connection
+            #    above was opened by name, and the name could have moved
+            #    between that call and this one.
+            if bound is not None:
+                bound.verify("the exclusive transaction")
+
+            # 1. LIVENESS, here and not earlier. A lease acquired after the
+            #    pre-flight and before this line is exactly the interleave the
+            #    fence exists to stop, and the pre-flight cannot see it.
+            owned = _live_holders_inside_the_transaction(conn, reported)
+            if owned:
+                raise TurnFenceRollbackRefused(
+                    f"refusing to roll back the turn fence on {reported}: "
+                    f"conversation(s) a live turn owns ({', '.join(owned)}) "
+                    "were admitted between the pre-flight and this "
+                    "transaction. Nothing was changed",
+                    reason="live-turn",
+                )
+
+            # 2. The surface, again, for the same reason.
+            installed = sorted(
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+                    "AND name LIKE 'hermes_turn_fence_%'"
+                ).fetchall()
+            )
+            _refuse_unexpected_surface(reported, installed, expected)
+
+            # 3. The backup, of the state this transaction is holding, read
+            #    through the BOUND descriptor so the bytes preserved are the
+            #    bound target's and not the current name's.
+            backup = _make_verified_backup(target_path, backup_path, bound=bound)
+
+            # 4. All of them, or none.
+            for name in expected:
+                conn.execute(f"DROP TRIGGER {name}")
+            # 5. IDENTITY one last time. If the name moved at any point in
+            #    this block the drops are rolled back rather than committed.
+            if bound is not None:
+                bound.verify("the commit")
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+    finally:
+        conn.close()
+    return backup
 
 
 def rehearse_turn_fence_rollback(
@@ -514,112 +923,61 @@ def rehearse_turn_fence_rollback(
 ) -> dict[str, Any]:
     """Run the REAL rollback against a disposable copy. Only READ the store.
 
-    WHY A COPY AND NOT A "CHECK ONLY" PASS OVER THE STORE
-        The liveness check is :meth:`SessionDB.offline_rebuild`, and reaching
-        it means opening the store as a store — which runs schema init, writes
-        ``messages``, and re-creates every trigger with ``IF NOT EXISTS``. A
-        rehearsal that did that has already modified the file it promised only
-        to inspect, and "the rows look the same afterwards" would not notice.
+    The pre-flight already made a byte-faithful copy and decided every
+    precondition on it; this drives :func:`_commit_the_rollback` — the same
+    boundary the real run uses, in-transaction liveness check included —
+    against that copy. What comes back is not a prediction; it is the
+    operation, performed, somewhere else.
 
-        Asking the liveness question a second, lighter way is the other wrong
-        answer: two predicates for "is this store idle" drift, and the
-        interesting drift is the one where the rehearsal says idle and the real
-        run disagrees.
-
-        So the rehearsal copies the store and its sidecars with FILE I/O, and
-        every SQLite open — the surface probe, the lease read, the liveness
-        check, and the ACTUAL :func:`rollback_turn_fence` — happens against
-        that copy. What comes back is not a prediction; it is the operation,
-        performed, somewhere else.
-
-    THE STORE IS NEVER OPENED BY SQLITE HERE, AND ``mode=ro`` IS WHY
-        An earlier version did the surface probe on the original, reasoning
-        that ``mode=ro`` cannot change anything. It can. ``mode=ro`` governs
-        the MAIN FILE; against a ``journal_mode=wal`` store with no ``-wal``
-        beside it, the connection creates ``-wal`` and ``-shm``, and whether
-        those survive its close is a property of the SQLite build:
-
-            SQLite 3.50.4  the store is opened journal_mode=DELETE anyway (the
-                           WAL-reset-bug fallback), so nothing appears — the
-                           defect was invisible on this build
-            SQLite 3.53.1  WAL is enabled, and `-wal` (empty) plus `-shm` are
-                           left behind by a read-only probe
-
-        Nothing was written — the ``-wal`` is zero bytes — but the operator's
-        directory gained two files, and this verb's whole promise is that it
-        inspected and changed nothing. ``immutable=1`` would suppress them and
-        is not the fix: it also makes SQLite ignore a ``-wal`` that holds
-        committed frames, so the rehearsal would silently read a stale store.
-        Copying first is the only answer that is both faithful and inert.
+    The store itself is never opened by SQLite: it is read as bytes, once. See
+    :func:`preflight_turn_fence_rollback` for why that is load-bearing rather
+    than tidy.
     """
     store_path = Path(store_path)
     backup_path = Path(backup_path)
     work_dir = Path(work_dir)
 
-    progress = _blank_preflight()
+    with BoundTarget(store_path) as bound:
+        plan = preflight_turn_fence_rollback(
+            store_path, backup_path=backup_path, work_dir=work_dir, bound=bound
+        )
+    copy = Path(plan["copy"])
     try:
-        if not store_path.is_file():
-            raise TurnFenceRollbackRefused(
-                f"{store_path} is not a file", reason="store-missing"
-            )
-        progress["target_present"] = True
-
-        try:
-            work_dir.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            raise TurnFenceRollbackRefused(
-                f"the rehearsal directory {work_dir} could not be created, so "
-                f"the dry run has nowhere to work: {exc}",
-                reason="rehearsal-unwritable",
-            ) from exc
-
-        # FIRST, before any SQLite open, so every later step reads the copy.
-        copy = work_dir / "rehearsal.db"
-        snapshot = _byte_copy_of_the_store(store_path, copy)
-
-        expected = sorted(rollback_trigger_names())
-        installed = _installed_fence_triggers(copy, report_as=store_path)
-        _refuse_unexpected_surface(store_path, installed, expected)
-        progress["surface_verified"] = True
-
-        _refuse_if_this_process_owns_a_turn(copy, identity_path=store_path)
-
-        try:
-            performed = rollback_turn_fence(
-                copy, backup_path=work_dir / "rehearsal-backup.db"
-            )
-        except TurnFenceRollbackRefused as exc:
-            raise TurnFenceRollbackRefused(
-                f"the rehearsal on a copy of {store_path} was refused, so the "
-                f"real run would be too: {exc}",
-                reason=exc.reason,
-            ) from exc
-        progress["offline_verified"] = True
-
-        # LAST, so the sequence matches the real run's. The path the REAL run
-        # would write, checked against the real filesystem — a rehearsal that
-        # does not notice the operator's backup path is already taken has not
-        # rehearsed the run they will type next. Checking it EARLIER would be
-        # cheaper and would make a store that is both live-owned and pointed at
-        # an occupied backup path report a different reason here than it does
-        # there, which is the whole failure this rehearsal exists to avoid.
-        _refuse_unusable_backup_path(backup_path)
-        progress["backup_path_available"] = True
+        # The rehearsal's target is the copy this run just created in its own
+        # private directory, so its identity is bound by construction — nothing
+        # else knows the name.
+        _commit_the_rollback(
+            copy,
+            work_dir / "rehearsal-backup.db",
+            plan["would_drop"],
+            report_as=store_path,
+        )
     except TurnFenceRollbackRefused as exc:
-        exc.preflight = dict(progress)
-        raise
+        refused = TurnFenceRollbackRefused(
+            f"the rehearsal on a copy of {store_path} was refused, so the "
+            f"real run would be too: {exc}",
+            reason=exc.reason,
+        )
+        refused.preflight = dict(plan["preflight"])
+        raise refused from exc
+
+    remaining = _installed_fence_triggers(copy, report_as=store_path)
+    if remaining:
+        raise TurnFenceRollbackRefused(
+            f"the rehearsal ran on a copy of {store_path} and left "
+            f"{len(remaining)} trigger(s) behind, so the real run would not be "
+            "all-or-nothing either",
+            reason="rehearsal-incomplete",
+        )
 
     return {
         "store": str(store_path),
         "backup_path": str(backup_path),
         "generation": hermes_state_common.TURN_FENCE_GENERATION,
-        "installed_triggers": installed,
-        "would_drop": performed["dropped_triggers"],
-        "rehearsal": {
-            "copy": str(copy),
-            "copied_files": snapshot["files"],
-        },
-        "preflight": dict(progress),
+        "installed_triggers": plan["installed_triggers"],
+        "would_drop": plan["would_drop"],
+        "rehearsal": {"copy": str(copy), "work_dir": str(work_dir)},
+        "preflight": dict(plan["preflight"]),
     }
 
 
@@ -627,71 +985,104 @@ def rollback_turn_fence(
     store_path: Path,
     *,
     backup_path: Path,
+    work_dir: Path = None,
 ) -> dict[str, Any]:
     """Remove the turn-fence triggers from an IDLE store, offline, atomically.
 
-    The order is the contract, and each step can only refuse. Steps 1-3 are
-    :func:`preflight_turn_fence_rollback`, shared verbatim with the dry run so
-    the two cannot hold different opinions about whether this would proceed:
+    Two phases, and which one is authoritative matters:
 
-    1. the surface the store carries is read on a READ-ONLY connection and
-       compared to the generated one. First, before anything else, because
-       every later step opens the store in a way that would repair it — see
-       :func:`_installed_fence_triggers`;
-    2. every conversation in the store is free (no live turn owns one);
-    3. the backup destination is free and writable;
-    4. a backup is written and read back row-for-row;
-    5. the file is taken EXCLUSIVE — a store another process is reading is not
-       a store that is safe to downgrade;
-    6. the surface is compared AGAIN inside that transaction, because steps 2
-       and 4 opened the file and the answer from step 1 is a snapshot;
-    7. every trigger is dropped in that same transaction, then committed.
+    PRE-FLIGHT — :func:`preflight_turn_fence_rollback`, on a byte-faithful COPY
+        The surface is the declared one; no conversation is owned; the backup
+        destination is free. Every one of these can refuse, and a refusal here
+        has not opened the operator's store with SQLite at all, so the file and
+        the directory are exactly as they were found. Shared verbatim with the
+        dry run.
 
-    Returns a report. Raises :class:`TurnFenceRollbackRefused` — and leaves the
-    store untouched — at every other outcome.
+    THE BOUNDARY — :func:`_commit_the_rollback`, on the store
+        ``BEGIN EXCLUSIVE``, then liveness AGAIN, then the surface AGAIN, then
+        the verified backup, then every ``DROP``, then ``COMMIT``. The
+        pre-flight's answers are snapshots; these are decisions, and they are
+        bound to the DML by one transaction because that is the standard this
+        program holds every other writer to. The rollback removes that fence,
+        so it does not get a weaker one.
+
+    Returns a report. Raises :class:`TurnFenceRollbackRefused` at every other
+    outcome, leaving rows and triggers as they were found; a refusal decided in
+    the pre-flight leaves the file itself byte-identical too.
+
+    *work_dir* holds the pre-flight copy. When it is ``None`` a private
+    temporary directory is used and removed; ``residue`` in the report names
+    what could not be removed, which the caller must surface rather than drop —
+    the copy is an unfenced duplicate of every conversation in the store.
     """
     store_path = Path(store_path)
     backup_path = Path(backup_path)
 
-    plan = preflight_turn_fence_rollback(store_path, backup_path=backup_path)
-    expected = plan["would_drop"]
-    backup = _make_verified_backup(store_path, backup_path)
+    owned_work_dir = work_dir is None
+    if owned_work_dir:
+        import tempfile
 
-    conn = sqlite3.connect(str(store_path), isolation_level=None, timeout=1.0)
+        work_dir = Path(tempfile.mkdtemp(prefix="hermes-fence-preflight-"))
+    else:
+        work_dir = Path(work_dir)
+
+    residue = None
     try:
-        try:
-            # EXCLUSIVE, not IMMEDIATE: a reader mid-query on a store whose
-            # triggers are about to vanish is a reader whose next statement
-            # prepares against a different schema. If the lock cannot be taken
-            # the store is in use and this is not an offline rollback.
-            conn.execute("BEGIN EXCLUSIVE")
-        except sqlite3.OperationalError as exc:
-            raise TurnFenceRollbackRefused(
-                f"exclusive ownership of {store_path} could not be "
-                f"established, so it is not offline: {exc}",
-                reason="not-exclusive",
-            ) from exc
-        try:
-            installed = sorted(
-                str(row[0])
-                for row in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type = 'trigger' "
-                    "AND name LIKE 'hermes_turn_fence_%'"
-                ).fetchall()
+        # ONE binding for the whole operation. Opened before the first check
+        # and held past the last write, so "the file we inspected" and "the
+        # file we mutated" are the same inode by construction rather than by
+        # both happening to resolve the same name.
+        with BoundTarget(store_path) as bound:
+            plan = preflight_turn_fence_rollback(
+                store_path, backup_path=backup_path, work_dir=work_dir,
+                bound=bound,
             )
-            _refuse_unexpected_surface(store_path, installed, expected)
-            for name in expected:
-                conn.execute(f"DROP TRIGGER {name}")
-            conn.execute("COMMIT")
-        except BaseException:
-            conn.execute("ROLLBACK")
-            raise
+            expected = plan["would_drop"]
+            backup = _commit_the_rollback(
+                store_path, backup_path, expected, bound=bound
+            )
     finally:
-        conn.close()
+        if owned_work_dir:
+            residue = sweep_work_dir(work_dir)
 
-    return {
+    report = {
         "store": str(store_path),
         "backup": backup,
         "generation": hermes_state_common.TURN_FENCE_GENERATION,
+        "installed_triggers": plan["installed_triggers"],
+        "preflight": plan["preflight"],
         "dropped_triggers": expected,
     }
+    if residue is not None:
+        report["residue"] = residue
+    return report
+
+
+def sweep_work_dir(work_dir: Path):
+    """Remove a working directory and PROVE it is gone. ``None`` when it is.
+
+    ``shutil.rmtree(..., ignore_errors=True)`` cannot distinguish "removed"
+    from "failed, swallowed", and what is in here is a ROLLED-BACK — that is,
+    UNFENCED — duplicate of every conversation in the store. Leaving one on
+    disk while reporting success is a data-residue failure and an output-truth
+    failure at once, so the removal is verified by looking, and what comes back
+    is the caller's problem to surface.
+
+    Reports a COUNT and the path. Never file names and never content: an
+    operator needs to know where to go and that it is not empty.
+    """
+    work_dir = Path(work_dir)
+    error = ""
+    try:
+        shutil.rmtree(work_dir)
+    except OSError as exc:
+        error = f" ({type(exc).__name__}: {exc})"
+    except Exception as exc:  # pragma: no cover - defensive
+        error = f" ({type(exc).__name__}: {exc})"
+    if not work_dir.exists():
+        return None
+    try:
+        remaining = sum(1 for entry in work_dir.rglob("*") if entry.is_file())
+    except OSError:
+        remaining = -1
+    return {"work_dir": str(work_dir), "files": remaining, "error": error}
