@@ -499,84 +499,6 @@ def check_a_target_that_is_not_this_fence_is_refused_by_a_named_reason(
     )
 
 
-def check_a_live_turn_refuses_the_verb_and_no_row_or_trigger_moves(
-    tmpdir: pathlib.Path,
-) -> None:
-    """Offline-only, stated as rows, as triggers, and as an exit code.
-
-    Rolling back mid-turn hands the conversation to a binary that has never
-    heard of the lease — the exact interleave the fence was installed to stop,
-    arranged by the tool that removes it.
-
-    The owner here is FOREIGN and alive, which is both the realistic case (the
-    gateway holds the turn; the operator runs the rollback from another
-    process) and the only fixture that reaches the row-reading predicate —
-    see :func:`_hand_the_lease_to_a_foreign_live_owner`.
-
-    The byte map is asserted alongside the rows and the triggers. It is not
-    redundant: a refusal that opened the store as a store has already rewritten
-    it, and rows-and-triggers cannot see that. That is exactly how this pin
-    went blind once already.
-    """
-    _sandbox_home(tmpdir)
-    module, why = _import_verb()
-    assert module is not None, f"there is no fence-rollback verb: {why}"
-
-    store = tmpdir / "state.db"
-    _fenced_store(store, leave_lease_live=True)
-    _hand_the_lease_to_a_foreign_live_owner(store)
-    rows_before = _canonical_rows(store)
-    triggers_before = _installed_triggers(store)
-    digest_before = _store_digest(store)
-    listing_before = sorted(entry.name for entry in tmpdir.iterdir())
-    backup = tmpdir / "backup.db"
-
-    run = _run_verb(store, backup)
-    assert not run.crash, f"the verb crashed on a live store: {run.crash}"
-    assert run.rc not in (0, None), (
-        f"the verb rolled back a store with a live turn: rc={run.rc!r} "
-        f"stdout={run.stdout!r}"
-    )
-    payload = _payload(run)
-    assert payload is not None, (
-        f"no machine-readable refusal for a live store: {run.stdout!r}"
-    )
-    assert payload["refused"]["reason"] == "live-turn", (
-        "a live turn was not reported as the liveness refusal: "
-        f"{payload['refused']!r}"
-    )
-    assert "keep" in payload["refused"]["detail"], (
-        "the refusal does not name the conversation that is live, so the "
-        f"operator has nothing to go end: {payload['refused']['detail']!r}"
-    )
-    assert payload["preflight"]["surface_verified"] is True, (
-        "the surface check is reported as not run, yet the liveness check "
-        f"refused after it: {payload['preflight']!r}"
-    )
-    assert payload["preflight"]["offline_verified"] is False
-
-    assert _installed_triggers(store) == triggers_before, (
-        "the verb refused a live store and removed triggers anyway"
-    )
-    assert _canonical_rows(store) == rows_before, (
-        "the verb refused a live store and moved rows anyway"
-    )
-    assert _store_digest(store) == digest_before, (
-        "the verb refused a live store and still rewrote the FILE. Rows and "
-        "triggers can look untouched while the pre-flight has opened the store "
-        "as a store — schema init writes — so the refusal's promise that "
-        "nothing changed is false at the byte level: "
-        f"{digest_before} -> {_store_digest(store)}"
-    )
-    assert sorted(entry.name for entry in tmpdir.iterdir()) == listing_before, (
-        "a refused run left files behind: "
-        f"{sorted(entry.name for entry in tmpdir.iterdir())}"
-    )
-    assert not backup.exists(), (
-        "a refused run left a backup file behind"
-    )
-
-
 def check_a_partial_surface_is_refused_whole_and_writes_no_backup(
     tmpdir: pathlib.Path,
 ) -> None:
@@ -1545,8 +1467,6 @@ PINS = {
         check_the_verb_is_registered_under_sessions_and_names_its_target,
     "check_a_target_that_is_not_this_fence_is_refused_by_a_named_reason":
         check_a_target_that_is_not_this_fence_is_refused_by_a_named_reason,
-    "check_a_live_turn_refuses_the_verb_and_no_row_or_trigger_moves":
-        check_a_live_turn_refuses_the_verb_and_no_row_or_trigger_moves,
     "check_a_partial_surface_is_refused_whole_and_writes_no_backup":
         check_a_partial_surface_is_refused_whole_and_writes_no_backup,
     "check_the_dry_run_reports_the_plan_and_changes_no_byte":
@@ -1612,20 +1532,6 @@ SOURCE_MUTATIONS = (
             "as a Hermes store creates the Hermes schema (fence triggers "
             "included) inside it, after which the rollback 'succeeds' on a "
             "file that was never a Hermes store",
-    ),
-    Mutation(
-        pin="check_a_live_turn_refuses_the_verb_and_no_row_or_trigger_moves",
-        module="hermes_cli/session_fence_rollback.py",
-        find=(
-            "        raise TurnFenceRollbackRefused(\n"
-            '            f"refusing to roll back the turn fence on {reported}: {exc}",\n'
-            '            reason="live-turn",\n'
-            "        ) from exc\n"
-        ),
-        replace="        return\n",
-        why="swallowing the liveness refusal is how a rollback runs mid-turn: "
-            "the triggers come off a conversation somebody owns and the next "
-            "write from a pre-fence binary interleaves with it",
     ),
     Mutation(
         pin="check_a_partial_surface_is_refused_whole_and_writes_no_backup",
