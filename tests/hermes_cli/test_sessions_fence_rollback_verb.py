@@ -1842,38 +1842,15 @@ def check_a_partial_destination_collision_keeps_only_what_the_run_created(
     )
 
 
-def check_the_backup_is_fsynced_and_so_is_its_parent_directory(
-    tmpdir: pathlib.Path,
-) -> None:
-    """A backup that is not on the platter is a backup that does not exist.
+def _fsync_inodes_during_a_rehearsal(library, store, work_dir) -> dict:
+    """Every ``fsync`` the rehearsal makes, recorded as the inode it covered.
 
-    The whole reason to take one before removing the fence is a machine that
-    stops between the two. ``write()`` returning says the kernel has the bytes;
-    it says nothing about the disk. And flushing the FILE is only half of it: an
-    unflushed directory entry means the file's contents are durable and its NAME
-    is not, so the crash leaves a backup nothing can find.
-
-    So the evidence is the two ``fsync`` calls, observed at the descriptors they
-    were made on and matched against the inodes they must have covered — the
-    backup's own, and its parent directory's. Reporting a ``durable`` flag would
-    only pin the flag.
+    Observed at the descriptor rather than trusted from a ``durable`` flag,
+    because reporting a flag would only ever pin the flag.
     """
-    _sandbox_home(tmpdir)
-    module, why = _import_verb()
-    assert module is not None, f"there is no fence-rollback verb: {why}"
-
-    from hermes_cli import session_fence_rollback as library
-
-    store = tmpdir / "state.db"
-    _fenced_store(store, leave_lease_live=False)
-    work_dir = tmpdir / "work"
-    work_dir.mkdir()
-
     flushed = []
 
     class _RecordingOs:
-        """Every attribute of ``os``, with ``fsync`` recorded as an inode."""
-
         def __getattr__(self, name):
             return getattr(os, name)
 
@@ -1889,30 +1866,85 @@ def check_the_backup_is_fsynced_and_so_is_its_parent_directory(
     previous = getattr(library, "os", None)
     library.os = _RecordingOs()
     try:
-        outcome = _rehearse(library, store, tmpdir / "backup.db", work_dir)
+        outcome = _rehearse(library, store, work_dir.parent / "backup.db", work_dir)
     finally:
         if had_os:
             library.os = previous
         else:
             del library.os
+    return {"flushed": flushed, "outcome": outcome}
 
-    assert not outcome["crash"], f"the rehearsal crashed: {outcome['crash']}"
+
+def check_the_backup_file_itself_is_flushed_to_the_platter(
+    tmpdir: pathlib.Path,
+) -> None:
+    """``write()`` returning says the KERNEL has the bytes. Not the disk.
+
+    The whole reason to take a backup before removing the fence is a machine
+    that stops between the two, and a backup that exists only in the page cache
+    is not there for exactly the failure it was taken against.
+
+    Split from the directory-entry half on purpose: the two are different
+    syscalls at different seams, either can be removed without the other, and a
+    single pin asserting both can only be killed by whichever mutation the
+    table happens to name — leaving the other half asserted and unproven.
+    """
+    _sandbox_home(tmpdir)
+    module, why = _import_verb()
+    assert module is not None, f"there is no fence-rollback verb: {why}"
+
+    from hermes_cli import session_fence_rollback as library
+
+    store = tmpdir / "state.db"
+    _fenced_store(store, leave_lease_live=False)
+    work_dir = tmpdir / "work"
+    work_dir.mkdir()
+
+    seen = _fsync_inodes_during_a_rehearsal(library, store, work_dir)
+    assert not seen["outcome"]["crash"], f"the rehearsal crashed: {seen['outcome']['crash']}"
     backup = work_dir / "rehearsal-backup.db"
     assert backup.is_file(), (
-        f"the rehearsal produced no backup to flush: {outcome['reason']!r} "
-        f"{outcome['detail']!r}"
+        f"the rehearsal produced no backup to flush: {seen['outcome']['reason']!r}"
+    )
+    info = os.stat(backup)
+    assert (info.st_dev, info.st_ino) in seen["flushed"], (
+        "the backup file was never fsynced. It exists in the page cache and "
+        f"the rollback then removed the fence: flushed={seen['flushed']!r}"
     )
 
-    backup_info = os.stat(backup)
-    parent_info = os.stat(backup.parent)
-    assert (backup_info.st_dev, backup_info.st_ino) in flushed, (
-        "the backup file was never fsynced. It exists in the page cache and the "
-        f"rollback then removed the fence: flushed={flushed!r}"
+
+def check_the_backups_directory_entry_is_flushed_too(
+    tmpdir: pathlib.Path,
+) -> None:
+    """Flushing the file is half of it. The NAME has to survive as well.
+
+    An unflushed directory entry means the backup's contents are durable and
+    the entry pointing at them is not, so the crash this backup exists for
+    leaves a file nothing can find. Same obligation, different syscall, and it
+    is the half that gets forgotten.
+    """
+    _sandbox_home(tmpdir)
+    module, why = _import_verb()
+    assert module is not None, f"there is no fence-rollback verb: {why}"
+
+    from hermes_cli import session_fence_rollback as library
+
+    store = tmpdir / "state.db"
+    _fenced_store(store, leave_lease_live=False)
+    work_dir = tmpdir / "work"
+    work_dir.mkdir()
+
+    seen = _fsync_inodes_during_a_rehearsal(library, store, work_dir)
+    assert not seen["outcome"]["crash"], f"the rehearsal crashed: {seen['outcome']['crash']}"
+    backup = work_dir / "rehearsal-backup.db"
+    assert backup.is_file(), (
+        f"the rehearsal produced no backup: {seen['outcome']['reason']!r}"
     )
-    assert (parent_info.st_dev, parent_info.st_ino) in flushed, (
+    parent = os.stat(backup.parent)
+    assert (parent.st_dev, parent.st_ino) in seen["flushed"], (
         "the backup's parent directory was never fsynced, so the file's bytes "
         "are durable and its NAME is not. A crash here leaves a backup nothing "
-        f"can find: flushed={flushed!r}"
+        f"can find: flushed={seen['flushed']!r}"
     )
 
 
@@ -2843,8 +2875,10 @@ PINS = {
         check_the_backup_is_a_logical_copy_that_restores_the_pre_rollback_state,
     "check_a_partial_destination_collision_keeps_only_what_the_run_created":
         check_a_partial_destination_collision_keeps_only_what_the_run_created,
-    "check_the_backup_is_fsynced_and_so_is_its_parent_directory":
-        check_the_backup_is_fsynced_and_so_is_its_parent_directory,
+    "check_the_backup_file_itself_is_flushed_to_the_platter":
+        check_the_backup_file_itself_is_flushed_to_the_platter,
+    "check_the_backups_directory_entry_is_flushed_too":
+        check_the_backups_directory_entry_is_flushed_too,
     "check_a_fault_after_commit_never_reports_that_nothing_changed":
         check_a_fault_after_commit_never_reports_that_nothing_changed,
     "check_a_withdrawn_backup_is_never_reported_as_one_the_operator_has":
@@ -2861,37 +2895,22 @@ SOURCE_MUTATIONS = (
     Mutation(
         pin="check_the_verb_is_registered_under_sessions_and_names_its_target",
         module="hermes_cli/session_fence_rollback_cmd.py",
-        find=(
-            '        "--store",\n'
-            "        type=Path,\n"
-            "        required=True,\n"
-        ),
-        replace=(
-            '        "--store",\n'
-            "        type=Path,\n"
-            '        default=Path("~/.hermes/state.db").expanduser(),\n'
-        ),
+        find='        "--store",\n        type=Path,\n        required=True,\n',
+        replace='        "--store",\n        type=Path,\n'
+                '        default=Path("~/.hermes/state.db").expanduser(),\n',
         why="giving the target a default is the convenient version of this "
-            "verb and the one that rolls back a store nobody named. The "
-            "invocation that damages the wrong file then looks identical in "
+            "verb and the one that acts on a store nobody named. The "
+            "invocation that touches the wrong file then looks identical in "
             "the shell history to the one the operator meant",
     ),
     Mutation(
         pin="check_a_target_that_is_not_this_fence_is_refused_by_a_named_reason",
         module="hermes_cli/session_fence_rollback.py",
-        find=(
-            "    if list(installed) == list(expected):\n"
-            "        return\n"
-        ),
-        replace=(
-            "    if True:\n"
-            "        return\n"
-        ),
-        why="without the surface check the verb decides nothing before it "
-            "opens the target as a store — and opening a foreign SQLite file "
-            "as a Hermes store creates the Hermes schema (fence triggers "
-            "included) inside it, after which the rollback 'succeeds' on a "
-            "file that was never a Hermes store",
+        find="    if list(installed) == list(expected):\n        return\n",
+        replace="    if True:\n        return\n",
+        why="without the surface check nothing decides what the target IS "
+            "before it is treated as a store, and three different wrong "
+            "targets stop being distinguishable from each other",
     ),
     Mutation(
         pin="check_a_partial_surface_is_refused_whole_and_writes_no_backup",
@@ -2899,36 +2918,37 @@ SOURCE_MUTATIONS = (
         find="    if list(installed) == list(expected):\n",
         replace="    if set(installed) <= set(expected):\n",
         why="tolerating a SUBSET is exactly 'drop what we recognise and shrug "
-            "at the rest'. The pre-flight passes, a backup is written, and the "
-            "run only discovers the missing trigger inside the transaction — "
-            "so the operator gets an unclassified failure and a stray backup "
-            "instead of a named, no-change refusal",
+            "at the rest'. A store left fenced against some writes and not "
+            "others is worse than either end state",
     ),
     Mutation(
         pin="check_the_dry_run_reports_the_plan_and_changes_no_byte",
         module="hermes_cli/session_fence_rollback_cmd.py",
-        find=(
-            "    if dry_run:\n"
-            "        return _report_rehearsal(store, backup, work_parent)\n"
-        ),
-        replace=(
-            "    if False:\n"
-            "        return _report_rehearsal(store, backup, work_parent)\n"
-        ),
-        why="a --dry-run that falls through to the real operation is worse "
-            "than no dry run at all: the operator asked what would happen and "
-            "it happened",
+        find="    if dry_run:\n        return _report_rehearsal(store, backup, work_parent)\n",
+        replace="    if False:\n        return _report_rehearsal(store, backup, work_parent)\n",
+        why="a --dry-run that falls through to the real path answers a "
+            "question the operator did not ask, and reports none of the plan "
+            "they did",
     ),
     Mutation(
-        pin="check_the_dry_run_refuses_what_the_real_run_would_refuse",
+        pin="check_the_dry_run_never_reports_that_a_refused_run_would_proceed",
+        module="hermes_cli/session_fence_rollback.py",
+        find="    try:\n        establish_offline_authority(store_path)\n",
+        replace="    try:\n        pass\n",
+        why="with the verdict on the OPERATOR's artifact dropped, the dry run "
+            "reports the rehearsal's success as the run's outcome — 'this "
+            "would proceed' about a command that refuses every time, which is "
+            "the one thing a rehearsal may never say",
+    ),
+    Mutation(
+        pin="check_the_rehearsal_asks_the_liveness_question_of_the_operators_store",
         module="hermes_cli/session_fence_rollback.py",
         find="            report_as=store_path,\n",
         replace="            report_as=None,\n",
-        why="without it the rehearsal asks the liveness question of a copy, "
-            "and the one branch of the predicate that is keyed by the store's "
-            "PATH answers about the wrong file — so a conversation this "
-            "process is mid-turn on reads free, and the dry run reports that "
-            "a run which is about to be refused would proceed",
+        why="the liveness predicate has a branch keyed by the store's PATH, "
+            "so answering it about the copy frees a conversation this process "
+            "is genuinely mid-turn on. The rehearsal then reports that a run "
+            "about to be refused would proceed",
     ),
     Mutation(
         pin="check_every_preflight_refusal_leaves_the_artifact_byte_identical",
@@ -2943,58 +2963,48 @@ SOURCE_MUTATIONS = (
     Mutation(
         pin="check_a_lease_taken_after_preflight_still_refuses_the_rollback",
         module="hermes_cli/session_fence_rollback.py",
-        find=(
-            "            owned = _live_holders_inside_the_transaction"
-            "(conn, reported)\n"
-        ),
-        replace="            owned = []\n",
-        why="without the in-transaction liveness decision the verb is back to "
-            "trusting a pre-flight answer across the whole backup step, and a "
-            "turn acquired in that window watches all twenty-four triggers go. "
-            "Re-checking the SURFACE inside the transaction does not cover it "
-            "— surface is not liveness",
+        find="            private_copy.verify()\n"
+             "            _decide_under_the_lock(conn, reported, expected, bound=None)\n",
+        replace="            private_copy.verify()\n",
+        why="without the SECOND liveness decision the boundary trusts an "
+            "answer taken before the backup, and the backup is exactly when "
+            "the lock is released — a turn acquired in that window watches "
+            "every trigger go. The identity check left in place does not "
+            "cover it: identity is not liveness",
     ),
     Mutation(
         pin="check_a_target_swapped_for_another_valid_store_is_refused",
         module="hermes_cli/session_fence_rollback.py",
-        find="        with BoundTarget(store_path) as bound:\n",
-        replace="        if True:\n            bound = None\n",
-        why="with the identity comparison gone the operation is bound to a "
-            "NAME again, and a different valid fenced store moved to that name "
-            "passes every consistency check while the backup describes the "
-            "store that left and the drops land on the one that arrived",
+        find="            private_copy.verify()\n"
+             "            _decide_under_the_lock(conn, reported, expected, bound=None)\n",
+        replace="            _decide_under_the_lock(conn, reported, expected, bound=None)\n",
+        why="without re-establishing identity at the point of use the target "
+            "is bound to a NAME again, and a different valid fenced store "
+            "moved to that name passes every consistency check while the "
+            "backup describes the file that left. The liveness decision left "
+            "in place cannot see it — the substitute is perfectly consistent",
     ),
     Mutation(
         pin="check_a_destination_appearing_after_the_check_is_never_clobbered",
         module="hermes_cli/session_fence_rollback.py",
-        find=(
-            "    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY\n"
-            '    flags |= getattr(os, "O_NOFOLLOW", 0)\n'
-            '    flags |= getattr(os, "O_BINARY", 0)\n'
-            "    handle = os.open(destination, flags, 0o600)\n"
-        ),
-        replace=(
-            "    flags = os.O_CREAT | os.O_TRUNC | os.O_WRONLY\n"
-            '    flags |= getattr(os, "O_BINARY", 0)\n'
-            "    handle = os.open(destination, flags, 0o600)\n"
-        ),
+        find="        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY\n",
+        replace="        flags = os.O_CREAT | os.O_TRUNC | os.O_WRONLY\n",
         why="restoring overwrite-capable creation is the defect itself: "
-            "copyfile truncates whatever it opens, so anything that appeared "
-            "between the existence check and the write is destroyed. No "
-            "better-placed check can fix it, because a check is what is broken",
+            "whatever appeared between the existence check and the write is "
+            "truncated. No better-placed check can fix it, because a check is "
+            "what is broken",
     ),
     Mutation(
         pin="check_an_orphan_backup_sidecar_is_not_overwritten",
         module="hermes_cli/session_fence_rollback.py",
         find='_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")\n',
         replace="_SIDECAR_SUFFIXES = ()\n",
-        why="an orphaned backup.db-wal is a destination too, and narrowing the "
-            "family to the one name the operator typed is what makes it "
-            "invisible. Aimed at the DECLARATION rather than at either guard "
-            "on purpose: the family pre-check is load-bearing on a "
-            "journal_mode=DELETE build and redundant on a WAL one, where the "
-            "exclusive create refuses first — a mutation aimed at either guard "
-            "alone scores a kill on one SQLite and none on the other",
+        why="an orphaned backup.db-wal is a destination too, and narrowing "
+            "the family to the one name the operator typed is what makes it "
+            "invisible. Aimed at the DECLARATION because the family is "
+            "load-bearing on a journal_mode=DELETE build and redundant on a "
+            "WAL one — a mutation at either guard alone scores a kill on one "
+            "SQLite and none on the other",
     ),
     Mutation(
         pin="check_a_dry_run_that_cannot_clean_up_does_not_report_success",
@@ -3002,38 +3012,123 @@ SOURCE_MUTATIONS = (
         find="    if not work_dir.exists():\n        return None\n",
         replace="    if True:\n        return None\n",
         why="trusting the removal call instead of looking is the defect: "
-            "rmtree with ignore_errors cannot distinguish 'removed' from "
-            "'failed and swallowed', so a rolled-back — unfenced — duplicate "
-            "of every conversation stays on disk while the verb exits 0 and "
-            "reports that nothing changed",
+            "rmtree cannot distinguish 'removed' from 'failed and swallowed', "
+            "so a rolled-back — unfenced — duplicate of every conversation "
+            "stays on disk while the verb reports a clean run",
     ),
     Mutation(
         pin="check_a_late_failure_does_not_retract_what_already_happened",
         module="hermes_cli/session_fence_rollback_cmd.py",
-        find='            "changed": bool(facts.get("changed", False)),\n',
-        replace='            "changed": False,\n',
-        why="hardcoding the outcome fields on the failure path is how a run "
-            "that dropped twenty-four triggers and wrote a verified backup "
-            "announces that nothing changed. The operator stops looking, and "
-            "the store they now have to restore is the one they were told not "
-            "to worry about",
+        find='                    "rehearsal-completed-with-residue"\n',
+        replace='                    "rehearsal-residue"\n',
+        why="collapsing the two situations into one reason makes a directory "
+            "holding an UNFENCED duplicate indistinguishable from one holding "
+            "a copy that still carries the fence. Same words, opposite "
+            "urgency, and the operator has no way to tell which they have",
     ),
     Mutation(
-        pin="check_the_completed_run_reports_the_surface_it_removed",
-        module="hermes_cli/session_fence_rollback_cmd.py",
-        find=(
-            '            "installed_triggers": report["installed_triggers"],\n'
-            '            "dropped_triggers": report["dropped_triggers"],\n'
-            '            "preflight": report["preflight"],\n'
-        ),
-        replace=(
-            '            "installed_triggers": [],\n'
-            '            "dropped_triggers": [],\n'
-            '            "preflight": report["preflight"],\n'
-        ),
-        why="a success report that does not name the surface it removed "
+        pin="check_the_completed_rehearsal_reports_the_surface_it_removed",
+        module="hermes_cli/session_fence_rollback.py",
+        find='            "would_drop": plan["would_drop"],\n',
+        replace='            "would_drop": [],\n',
+        why="a completion report that does not name the surface it removed "
             "leaves nothing in the output to distinguish a full rollback from "
-            "a partial one, and the operator is back to checking by hand",
+            "a partial one, and the operator is back to checking by hand — "
+            "which is the state this verb exists to replace",
+    ),
+    Mutation(
+        pin="check_no_in_place_run_succeeds_and_each_wrong_target_names_its_own_reason",
+        module="hermes_cli/session_fence_rollback.py",
+        find='DISQUALIFICATION_REASONS = {\n'
+             '    "namespace": "target-untrusted-namespace",\n'
+             '    "canonical": "canonical-store-target",\n'
+             '    "not-quiesced": "target-not-quiesced",\n'
+             '    "unknown": "offline-authority-unknown",\n'
+             '}',
+        replace='DISQUALIFICATION_REASONS = {\n'
+                '    "namespace": "offline-authority-unknown",\n'
+                '    "canonical": "offline-authority-unknown",\n'
+                '    "not-quiesced": "offline-authority-unknown",\n'
+                '    "unknown": "offline-authority-unknown",\n'
+                '}',
+
+        why="four wrong targets that print the same reason leave the operator "
+            "with one next move for four different situations. Every target "
+            "is still refused, so nothing becomes unsafe — what is lost is "
+            "the operator's ability to tell a hard-linked artifact from the "
+            "live store from an interrupted detach",
+    ),
+    Mutation(
+        pin="check_a_real_invocation_refuses_before_it_observes_the_source",
+        module="hermes_cli/session_fence_rollback.py",
+        find="    disqualify_the_target(store_path)\n    establish_offline_authority(store_path)\n",
+        replace="    disqualify_the_target(store_path)\n"
+                "    with BoundTarget(store_path):\n"
+                "        establish_offline_authority(store_path)\n",
+        why="the refusal still happens and still names itself — only the "
+            "ORDER moves, so the store is opened before the decision that "
+            "makes opening it unnecessary. On a WAL build that leaves -wal "
+            "and -shm beside the artifact, and a refusal that changed the "
+            "directory it is about to say it left alone is not a refusal",
+    ),
+    Mutation(
+        pin="check_the_backup_is_a_logical_copy_that_restores_the_pre_rollback_state",
+        module="hermes_cli/session_fence_rollback.py",
+        find='            conn.execute("VACUUM INTO ?", (str(snapshot),))\n',
+        replace="            shutil.copyfile(store_path, snapshot)\n",
+        why="a copy of the main file reproduces the bytes on disk, and "
+            "committed state does not have to be there — a row committed into "
+            "an uncheckpointed -wal is in the store and not in that file. The "
+            "backup opens, passes integrity_check and restores a database "
+            "that is missing it",
+    ),
+    Mutation(
+        pin="check_a_partial_destination_collision_keeps_only_what_the_run_created",
+        module="hermes_cli/session_fence_rollback.py",
+        find="            except FileExistsError as exc:\n                self.remove_only_what_we_created()\n",
+        replace="            except FileExistsError as exc:\n",
+        why="the run still refuses, and still refuses for the right reason — "
+            "what it stops doing is removing the half-built destination it "
+            "created before hitting the occupied sibling. The operator who "
+            "retries then collides with a file this run manufactured",
+    ),
+    Mutation(
+        pin="check_the_backup_file_itself_is_flushed_to_the_platter",
+        module="hermes_cli/session_fence_rollback.py",
+        find="            writer.flush()\n        os.fsync(handle)\n",
+        replace="            writer.flush()\n",
+        why="flush() pushes the bytes to the kernel and stops there. The "
+            "backup then exists in the page cache while the fence comes off, "
+            "which is precisely the crash it was taken against",
+    ),
+    Mutation(
+        pin="check_the_backups_directory_entry_is_flushed_too",
+        module="hermes_cli/session_fence_rollback.py",
+        find="        reservation.release_the_sidecars()\n        _fsync_the_directory(backup_path.parent)\n",
+        replace="        reservation.release_the_sidecars()\n",
+        why="the file's contents are durable and its NAME is not, so the "
+            "crash leaves a backup nothing can find. The file fsync left in "
+            "place does not cover it — they are different objects",
+    ),
+    Mutation(
+        pin="check_a_fault_after_commit_never_reports_that_nothing_changed",
+        module="hermes_cli/session_fence_rollback.py",
+        find='                outcome.advance("commit-unknown")\n',
+        replace="                pass\n",
+        why="a COMMIT that raised may have landed. Leaving the ledger at "
+            "'committing' resolves that into whatever the reader assumes, and "
+            "the assumption an operator makes about a run that reported a "
+            "failure is that nothing happened",
+    ),
+    Mutation(
+        pin="check_a_withdrawn_backup_is_never_reported_as_one_the_operator_has",
+        module="hermes_cli/session_fence_rollback.py",
+        find="        return _mark_the_backup_absent_but_not_by_us(outcome, backup_path)\n",
+        replace="        return _mark_the_backup_withdrawn(outcome, backup_path)\n",
+        why="ENOENT answers only whether the file is there. Reading it as "
+            "this run's own completed withdrawal claims an unlink and a "
+            "directory flush that never happened, so a competitor's "
+            "un-flushed removal is reported as durably ours",
     ),
 )
 

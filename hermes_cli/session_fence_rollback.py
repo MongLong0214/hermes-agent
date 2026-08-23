@@ -472,7 +472,7 @@ class _PrivateCopy:
             raise TurnFenceRollbackRefused(
                 f"{self.path} has acquired a second name or is no longer a "
                 f"plain file (links={here.st_nlink})",
-                reason="target-untrusted-namespace",
+                reason=DISQUALIFICATION_REASONS["namespace"],
             )
         if not _stat.S_ISDIR(holder.st_mode) or _stat.S_IMODE(holder.st_mode) & 0o077:
             raise TurnFenceRollbackRefused(
@@ -524,6 +524,20 @@ def prepare_the_private_copy(
     return _PrivateCopy(
         _ONLY_THE_PREPARER, copy, private, (info.st_dev, info.st_ino)
     )
+
+
+#: The four ways a target can be wrong, each a DIFFERENT next move for the
+#: operator. Declared once rather than written at four raise sites, so that
+#: "four wrong targets, four reasons" is a property of this table and can be
+#: falsified by changing this table — with the strings scattered, no single
+#: narrow change can collapse them, and the pin that asserts they are distinct
+#: has nothing that can take the distinction away.
+DISQUALIFICATION_REASONS = {
+    "namespace": "target-untrusted-namespace",
+    "canonical": "canonical-store-target",
+    "not-quiesced": "target-not-quiesced",
+    "unknown": "offline-authority-unknown",
+}
 
 
 def _canonical_store_paths() -> list:
@@ -613,7 +627,7 @@ def disqualify_the_target(artifact: Path) -> None:
             "reaches the same file and nothing this run can see governs it. A "
             "rollback is not permitted on an artifact whose namespace is not "
             "bounded. Nothing was changed",
-            reason="target-untrusted-namespace",
+            reason=DISQUALIFICATION_REASONS["namespace"],
         )
     # BY IDENTITY, against every candidate. A string comparison is what a
     # symlink or an override defeats, which is the same lesson the A/B store
@@ -625,7 +639,7 @@ def disqualify_the_target(artifact: Path) -> None:
                 f"({canonical}). The canonical store is the live one whatever "
                 "it looks like at this instant, and a detached artifact is "
                 "what this verb acts on. Nothing was changed",
-                reason="canonical-store-target",
+                reason=DISQUALIFICATION_REASONS["canonical"],
             )
     present = [
         str(artifact.with_name(artifact.name + suffix))
@@ -637,7 +651,7 @@ def disqualify_the_target(artifact: Path) -> None:
             f"{artifact} has SQLite sidecars beside it ({', '.join(present)}), "
             "so it is attached to a connection or was interrupted while it "
             "was. A detached artifact has none of these. Nothing was changed",
-            reason="target-not-quiesced",
+            reason=DISQUALIFICATION_REASONS["not-quiesced"],
         )
 
 
@@ -683,7 +697,7 @@ def establish_offline_authority(artifact: Path) -> OfflineAuthority:
         "same-size replacement satisfies it while the contents are a different "
         "database — so nothing available proves which store an artifact is or "
         "that it is detached. Nothing was changed",
-        reason="offline-authority-unknown",
+        reason=DISQUALIFICATION_REASONS["unknown"],
     )
 
 
