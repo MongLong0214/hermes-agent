@@ -489,9 +489,12 @@ class SessionManager:
                     _reuse = getattr(db, "current_turn_grant", None)
                     if callable(_reuse):
                         _grant = _reuse(state.session_id)
+                    _fence = (
+                        {"turn_lease_holder": _grant}
+                        if _grant is not None else {}
+                    )
                     db.update_session_meta(
-                        state.session_id, cwd_json, model_str,
-                        turn_lease_holder=_grant,
+                        state.session_id, cwd_json, model_str, **_fence
                     )
                 except Exception:
                     logger.debug("Failed to update ACP session metadata", exc_info=True)

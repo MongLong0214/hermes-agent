@@ -568,7 +568,19 @@ def test_this_generation_writes_every_surface_table_normally(tmp_path):
     db.append_message(
         session_id="s", role="user", content="one", turn_lease_holder=grant
     )
-    db.update_session_model("s", "a-model")
+    # update_session_model presents the grant for the same reason
+    # append_message above and delete_session below do: it writes `model`,
+    # `model_config`, `system_prompt` and `system_prompt_hash`, which are what
+    # the next turn replays under, so it now takes the turn-lease admission
+    # too. Leaving it holderless here would assert that the model switch is
+    # exempt from the fence this file exists to check, and it is the write the
+    # surface docstring names first.
+    #
+    # set_session_title and end_session stay holderless: they are still outside
+    # the lease guard (the trigger fences them against an older BINARY, which
+    # is what this test is about), and that gap is named rather than papered
+    # over — see tests/state/test_turn_lease_model_switch_fence.
+    db.update_session_model("s", "a-model", turn_lease_holder=grant)
     db.set_session_title("s", "a title")
     db.end_session("s", "completed")
     assert db.refresh_session_turn_lease("s", grant, ttl_seconds=600) is True

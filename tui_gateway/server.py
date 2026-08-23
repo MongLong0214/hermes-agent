@@ -4367,17 +4367,21 @@ def _persist_live_session_runtime(session: dict | None) -> None:
         # must present the turn's own grant. `current_turn_grant` is None when
         # nothing here owns the conversation — the case the fence admits
         # holderless — and this call is best-effort either way.
+        # ...and passed ONLY when there is one: `db` is duck-typed here (the
+        # hasattr guards below are not decoration), so with no live grant the
+        # call has to stay byte-identical or an unexpected keyword becomes a
+        # silent no-persist in the `except Exception` below.
         grant = None
         reuse = getattr(db, "current_turn_grant", None)
         if callable(reuse):
             grant = reuse(session_key)
+        fence = {"turn_lease_holder": grant} if grant is not None else {}
         if hasattr(db, "update_session_meta"):
             db.update_session_meta(
-                session_key, json.dumps(model_config), model or None,
-                turn_lease_holder=grant,
+                session_key, json.dumps(model_config), model or None, **fence
             )
         elif model and hasattr(db, "update_session_model"):
-            db.update_session_model(session_key, model, turn_lease_holder=grant)
+            db.update_session_model(session_key, model, **fence)
     except Exception:
         logger.debug("failed to persist live session runtime", exc_info=True)
 

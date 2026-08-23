@@ -2472,14 +2472,19 @@ class ContextCompressor(ContextEngine):
             # than writing holderless, which the store now refuses while a live
             # owner exists. `current_turn_grant` is None when nothing in this
             # process owns it, which is the unowned case the fence admits.
+            # Passed only when there is one: `patcher` is a duck-typed
+            # attribute lookup, and with no live grant the call must stay
+            # byte-identical or an unexpected keyword becomes a silent
+            # no-clear in the `except Exception` below.
             grant = None
             reuse = getattr(session_db, "current_turn_grant", None)
             if callable(reuse):
                 grant = reuse(session_id)
+            fence = {"turn_lease_holder": grant} if grant is not None else {}
             patcher(
                 session_id,
                 {PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None},
-                turn_lease_holder=grant,
+                **fence,
             )
         except Exception as exc:
             logger.debug("proactive prune runway clear failed: %s", exc)

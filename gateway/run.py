@@ -8293,9 +8293,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             reuse = getattr(db, "current_turn_grant", None)
             if callable(reuse):
                 grant = reuse(session_id)
+            fence = {"turn_lease_holder": grant} if grant is not None else {}
             db.update_session_meta(
-                session_id, json.dumps(config), model=model,
-                turn_lease_holder=grant,
+                session_id, json.dumps(config), model=model, **fence
             )
         except Exception:
             logger.debug("Failed to sync gateway session model metadata", exc_info=True)

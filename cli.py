@@ -8714,17 +8714,23 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # turn's own grant, and `current_turn_grant` is None when nothing
             # here owns the conversation, which is the case the fence admits
             # holderless.
+            #
+            # The grant is passed ONLY when there is one. With no live grant
+            # the call is byte-identical to what it was, which matters because
+            # `db` here is duck-typed: the CLI is driven with stand-in objects
+            # that implement update_session_model(sid, model) and nothing else,
+            # and an unexpected keyword would land in the `except Exception`
+            # below as a silent no-persist.
             _grant = None
             _reuse = getattr(db, "current_turn_grant", None)
             if callable(_reuse):
                 _grant = _reuse(sid)
-            db.update_session_model(
-                sid, result.new_model, turn_lease_holder=_grant
-            )
+            _fence = {"turn_lease_holder": _grant} if _grant is not None else {}
+            db.update_session_model(sid, result.new_model, **_fence)
             db.patch_session_model_config(sid, {
                 "gateway_runtime": route,
                 **route,
-            }, turn_lease_holder=_grant)
+            }, **_fence)
         except Exception:
             logger.debug(
                 "Failed to persist model switch to session DB", exc_info=True
