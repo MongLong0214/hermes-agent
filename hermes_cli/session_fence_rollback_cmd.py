@@ -62,18 +62,24 @@ def add_fence_rollback_parser(sessions_subparsers):
     """
     parser = sessions_subparsers.add_parser(
         "fence-rollback",
-        help="Remove the turn-fence triggers from an IDLE store you name",
+        help=(
+            "Rehearse the turn-fence rollback; a real run is refused until an "
+            "offline artifact can be proven"
+        ),
         description=(
             "Step a NAMED session store back off the turn-fence generation "
-            "barrier, offline and all-or-nothing. The store and the backup "
-            "path are both given explicitly — this command never discovers a "
-            "target and has no default. It refuses unless the store carries "
-            "exactly the fence surface this binary declares, no conversation "
-            "in it is owned by a live turn, and a verified backup can be "
-            "written first; on any refusal nothing is changed. Reopening the "
-            "store with a current binary reinstalls the fence. Prints one JSON "
-            "report on stdout (success or refusal); human-readable lines go to "
-            "stderr."
+            "barrier, offline and all-or-nothing. THIS BUILD REFUSES EVERY "
+            "REAL RUN: the rollback is permitted only on a detached artifact "
+            "whose offline authority was established elsewhere, and nothing "
+            "here can establish it — the only producer of a detached state.db "
+            "records file size only, which a same-size replacement satisfies. "
+            "So a real invocation reports which kind of target you named and "
+            "changes nothing. --dry-run performs the whole operation on a "
+            "private copy this command creates, which is the one artifact it "
+            "can prove is offline, and reports what it did along with the "
+            "refusal the real run gives. The store and the backup path are "
+            "both explicit; this command never discovers a target. Prints one "
+            "JSON report on stdout; human-readable lines go to stderr."
         ),
     )
     parser.add_argument(
@@ -98,8 +104,9 @@ def add_fence_rollback_parser(sessions_subparsers):
         "--dry-run",
         action="store_true",
         help=(
-            "Verify and rehearse on a disposable copy, then report what the "
-            "real run would remove. The store is not modified"
+            "Perform the rollback on a disposable copy of the store and report "
+            "what it removed, alongside the refusal the real run gives. The "
+            "store itself is read as bytes and never modified"
         ),
     )
     parser.add_argument(
@@ -193,7 +200,16 @@ def _report_rehearsal(store: Path, backup: Path, work_parent: Path = None) -> in
         established.get("rehearsal"), dict
     ):
         rehearsal_facts = dict(established["rehearsal"])
-    rehearsal_facts["residue_present"] = residue is not None
+    # OR, not overwrite. There are two independent things this run may have
+    # failed to remove — its working copy, and a backup it tried to withdraw —
+    # and assigning the work-dir answer over the top erased the other one. A
+    # fact nobody reads is not a fact; a fact something else overwrites is
+    # worse, because the report looks complete.
+    rehearsal_facts["residue_present"] = bool(
+        rehearsal_facts.get("residue_present")
+    ) or residue is not None
+    if residue is not None:
+        rehearsal_facts["work_dir_residue"] = residue
 
     # RESIDUE OUTRANKS EVERY OTHER OUTCOME OF A DRY RUN. What is left in there
     # is a rolled-back — that is, UNFENCED — duplicate of every conversation in
@@ -288,8 +304,16 @@ def _report_rollback(store: Path, backup: Path) -> int:
         "backup_created": outcome.backup_created,
         "backup_verified": outcome.backup_verified,
         "backup_durable": outcome.backup_durable,
+        "backup_present": outcome.backup_present,
+        "backup_withdrawn": outcome.backup_withdrawn,
         "residue_present": outcome.residue_present,
     }
+    if outcome.residue is not None:
+        # A fact nobody reads is not a fact. The library records what it could
+        # not remove or could not prove it removed; if that stops here the
+        # operator is told about a directory that is clean and a backup that
+        # exists, and neither may be true.
+        established["residue"] = outcome.residue
     if outcome.backup is not None:
         established["backup"] = outcome.backup
     if report is not None:
@@ -391,12 +415,20 @@ def _emit_refusal(
         "changed": facts.get("changed", False),
         "outcome": facts.get("outcome", "not-started"),
         "store": str(store),
-        "backup": facts.get("backup", str(backup)),
+        # NEVER the bare requested pathname. A string where an operator
+        # expects a backup record reads as "your backup is at ...", and on a
+        # refusal there is usually nothing there at all.
+        "backup": facts.get(
+            "backup",
+            {"path": str(backup), "created": False, "present": False},
+        ),
         "generation": hermes_state_common.TURN_FENCE_GENERATION,
         "installed_triggers": facts.get(
             "installed_triggers", installed_triggers or []
         ),
         "dropped_triggers": facts.get("dropped_triggers", []),
+        "backup_present": facts.get("backup_present", False),
+        "backup_withdrawn": facts.get("backup_withdrawn", False),
         "preflight": (
             preflight
             or getattr(exc, "preflight", None)
@@ -407,6 +439,8 @@ def _emit_refusal(
             "detail": str(exc),
         },
     }
+    if facts.get("residue") is not None:
+        payload["residue"] = facts["residue"]
     if rehearsal is not None:
         payload["rehearsal"] = rehearsal
     if would_drop is not None:
@@ -439,7 +473,25 @@ def _human_lines(payload: dict[str, Any]) -> list:
             )
             backup = payload.get("backup")
             if isinstance(backup, dict) and backup.get("path"):
-                lines.append(f"  Verified backup: {backup['path']}")
+                if backup.get("present") is True:
+                    lines.append(f"  Verified backup: {backup['path']}")
+                elif backup.get("present") is None:
+                    lines.append(
+                        f"  A backup was written to {backup['path']} and this "
+                        "run could not confirm removing it. Something else may "
+                        "be at that path now — look before you rely on it."
+                    )
+                else:
+                    lines.append(
+                        f"  The backup at {backup['path']} was written and then "
+                        "withdrawn by this run. It is NOT there."
+                    )
+            residue = payload.get("residue")
+            if isinstance(residue, dict):
+                lines.append(
+                    f"  Left behind: {residue.get('path')} "
+                    f"({residue.get('error')})"
+                )
         elif payload.get("changed") is None:
             lines.append(
                 "  WHETHER THE ROLLBACK LANDED IS UNKNOWN. The COMMIT was "
@@ -461,14 +513,26 @@ def _human_lines(payload: dict[str, Any]) -> list:
             )
         else:
             lines.append("  Nothing was changed.")
+        backup = payload.get("backup")
+        if (
+            isinstance(backup, dict)
+            and backup.get("created") is False
+            and payload.get("changed") is not True
+        ):
+            lines.append(
+                f"  No backup was written. Nothing is at {backup.get('path')} "
+                "because of this run."
+            )
         return lines
     if payload.get("dry_run"):
         return [
             f"✓ dry run on {payload['store']}: "
             f"{len(payload['would_drop'])} turn-fence trigger(s) would be "
             "removed.",
-            "  The store was not modified. Re-run without --dry-run to "
-            "perform it.",
+            "  The store was not modified.",
+            "  This does NOT mean a real run would succeed: this build cannot "
+            "prove any artifact you can name is offline, so `--dry-run` is the "
+            "only form of this command that does anything.",
         ]
     return [
         f"✓ removed {len(payload['dropped_triggers'])} turn-fence trigger(s) "

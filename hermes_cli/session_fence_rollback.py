@@ -728,6 +728,13 @@ class RollbackOutcome:
         self.backup_created = False
         self.backup_verified = False
         self.backup_durable = False
+        # HISTORY above, PRESENCE here, and they are not the same question. A
+        # backup that was created and then withdrawn did happen — that stays
+        # true and monotonic — and it is not there any more. One field cannot
+        # carry both, and an operator who reads "created" as "I have one" acts
+        # more boldly than one who knows they do not.
+        self.backup_present = False
+        self.backup_withdrawn = False
         self.residue_present = False
         self.residue = None
         self.backup = None
@@ -754,6 +761,7 @@ class RollbackOutcome:
             self.backup_verified = True
         elif state == "backup-durable":
             self.backup_durable = True
+            self.backup_present = True
         elif state in ("committing", "commit-unknown"):
             self.changed = None
         elif state == "committed":
@@ -766,6 +774,8 @@ class RollbackOutcome:
             "backup_created": self.backup_created,
             "backup_verified": self.backup_verified,
             "backup_durable": self.backup_durable,
+            "backup_present": self.backup_present,
+            "backup_withdrawn": self.backup_withdrawn,
             "residue_present": self.residue_present,
             "residue": self.residue,
             "backup": self.backup,
@@ -1311,6 +1321,8 @@ def _make_verified_backup(
             "verified": True,
             "durable": True,
             "rows": rows,
+            "present": True,
+            "withdrawn": False,
             # Carried so a later withdrawal can check that the file it is
             # about to unlink is still the one this run created.
             "identity": list(reservation.identities_at_acquisition[""]),
@@ -1603,6 +1615,37 @@ def _commit_the_rollback(
     return backup
 
 
+def _mark_the_backup_gone(outcome, backup_path: Path) -> None:
+    """Record the withdrawal as PRESENCE, leaving the history alone.
+
+    ``backup_created`` stays true because it happened. ``backup_present``
+    becomes false because it is not there. And the backup record stops reading
+    like a file an operator can go and use.
+    """
+    if outcome is None:
+        return
+    outcome.backup_present = False
+    outcome.backup_withdrawn = True
+    if isinstance(outcome.backup, dict):
+        outcome.backup = dict(outcome.backup, present=False, withdrawn=True)
+
+
+def _leave_the_backup_and_report_it(outcome, left: dict) -> dict:
+    """Something is at the backup path that this run may not remove.
+
+    ``present`` becomes UNKNOWN rather than false: the run's own backup may
+    still be there under a name something else now answers to, or may not, and
+    a report that picks one of those is guessing on the operator's behalf.
+    """
+    if outcome is not None:
+        outcome.residue_present = True
+        outcome.residue = left
+        outcome.backup_present = None
+        if isinstance(outcome.backup, dict):
+            outcome.backup = dict(outcome.backup, present=None, residue=left)
+    return left
+
+
 def _remove_a_backup_this_run_wrote(backup_path: Path, identity, outcome=None):
     """Unlink the backup ONLY while it is still the file this run created.
 
@@ -1612,6 +1655,12 @@ def _remove_a_backup_this_run_wrote(backup_path: Path, identity, outcome=None):
     landed and the moment a later failure decides to withdraw it, and unlinking
     by name then destroys a file that is not this run's.
 
+    THE ABSENCE IS FLUSHED TOO. Durability is a property of what the directory
+    says, not of what is in it: without the parent ``fsync`` a crash can bring
+    the entry back while the report says the backup was withdrawn. Creating one
+    flushes the parent for exactly this reason, and removing one has the same
+    obligation pointed the other way.
+
     Nor may a failure to remove it be swallowed. An undeletable backup is
     residue like any other, and residue that is not reported is residue that is
     not found.
@@ -1619,27 +1668,35 @@ def _remove_a_backup_this_run_wrote(backup_path: Path, identity, outcome=None):
     try:
         here = os.lstat(backup_path)
     except FileNotFoundError:
+        _mark_the_backup_gone(outcome, backup_path)
         return None
     except OSError as exc:
-        left = {"path": str(backup_path), "error": f"{type(exc).__name__}: {exc}"}
-        if outcome is not None:
-            outcome.residue_present = True
-            outcome.residue = left
-        return left
+        return _leave_the_backup_and_report_it(
+            outcome,
+            {"path": str(backup_path), "error": f"{type(exc).__name__}: {exc}"},
+        )
     if (here.st_dev, here.st_ino) != tuple(identity):
-        left = {"path": str(backup_path), "error": "ownership-lost"}
-        if outcome is not None:
-            outcome.residue_present = True
-            outcome.residue = left
-        return left
+        return _leave_the_backup_and_report_it(
+            outcome, {"path": str(backup_path), "error": "ownership-lost"}
+        )
     try:
         os.unlink(backup_path)
     except OSError as exc:
-        left = {"path": str(backup_path), "error": f"{type(exc).__name__}: {exc}"}
-        if outcome is not None:
-            outcome.residue_present = True
-            outcome.residue = left
-        return left
+        return _leave_the_backup_and_report_it(
+            outcome,
+            {"path": str(backup_path), "error": f"{type(exc).__name__}: {exc}"},
+        )
+    try:
+        _fsync_the_directory(backup_path.parent)
+    except OSError as exc:
+        return _leave_the_backup_and_report_it(
+            outcome,
+            {
+                "path": str(backup_path),
+                "error": f"unlinked but not flushed: {type(exc).__name__}: {exc}",
+            },
+        )
+    _mark_the_backup_gone(outcome, backup_path)
     return None
 
 

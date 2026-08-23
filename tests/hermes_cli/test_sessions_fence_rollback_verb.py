@@ -613,16 +613,37 @@ def check_the_dry_run_reports_the_plan_and_changes_no_byte(
 
     run = _run_verb(store, backup, dry_run=True)
     assert not run.crash, f"the dry run crashed: {run.crash}"
-    assert run.rc in (0, None), (
-        f"the dry run of a rollback that would succeed exited {run.rc!r}: "
-        f"{run.stdout!r}"
-    )
     payload = _payload(run)
     assert payload is not None, (
         f"the dry run printed no machine-readable plan: {run.stdout!r}"
     )
     assert payload["dry_run"] is True, (
         f"the dry run does not report itself as one: {payload!r}"
+    )
+    # THE PLAN AND THE VERDICT ARE DIFFERENT ANSWERS. The rehearsal really
+    # performs the rollback on a copy this run made, so the plan is observed
+    # rather than predicted; the real run is then refused because no target the
+    # operator can name has offline authority. Reporting the first without the
+    # second is how a dry run says "this would work" about a command that will
+    # not run, which is the failure mode a rehearsal exists to remove.
+    assert run.rc not in (0, None), (
+        f"the dry run exited {run.rc!r} about a real run that refuses. An "
+        "operator types the real command on a dry run's say-so"
+    )
+    assert payload["refused"]["reason"] == "offline-authority-unknown", (
+        f"the dry run reports a different verdict than the real run: "
+        f"{payload['refused']!r}"
+    )
+    # THE SENTENCE IS PART OF THE CONTRACT. "Re-run without --dry-run to
+    # perform it" is a promise this build cannot keep, and it is the line an
+    # operator bases their next action on — the same output-truth rule the
+    # ledger is held to, applied where it is actually read.
+    assert "Re-run without --dry-run" not in run.stderr, (
+        "the dry run tells the operator to run the real command, which this "
+        f"build refuses every time:\n{run.stderr}"
+    )
+    assert "offline-authority-unknown" in run.stderr, (
+        f"the refusal an operator reads does not name itself:\n{run.stderr}"
     )
     assert payload["changed"] is False
     assert payload["dropped_triggers"] == [], (
@@ -637,8 +658,16 @@ def check_the_dry_run_reports_the_plan_and_changes_no_byte(
     )
     assert payload["preflight"]["surface_verified"] is True
     assert payload["preflight"]["offline_verified"] is True, (
-        "the dry run did not verify liveness, so it cannot say the real run "
-        f"would proceed: {payload['preflight']!r}"
+        "the dry run did not read the lease table, so its plan rests on less "
+        f"than the real run would: {payload['preflight']!r}"
+    )
+    rehearsal = payload.get("rehearsal") or {}
+    assert rehearsal.get("outcome") == "committed", (
+        "the rehearsal did not actually perform the rollback, so what is "
+        f"reported as a plan is a prediction: {rehearsal!r}"
+    )
+    assert rehearsal.get("backup_durable") is True, (
+        f"the rehearsal reports no durable backup: {rehearsal!r}"
     )
 
     assert _store_digest(store) == before, (
@@ -1714,6 +1743,27 @@ def check_no_in_place_run_succeeds_and_each_wrong_target_names_its_own_reason(
         assert not backup.exists(), (
             f"the {reason} refusal wrote a backup for a rollback that never ran"
         )
+        # AND THE REPORT MUST NOT IMPLY OTHERWISE. A bare pathname where an
+        # operator expects a backup record reads as "your backup is at ...",
+        # and there is nothing at that path. Both renderings are checked,
+        # because two statements of one outcome that can disagree mean one of
+        # them is unpinned.
+        assert isinstance(payload["backup"], dict), (
+            f"the {reason} refusal reports a backup as a bare path: "
+            f"{payload['backup']!r}"
+        )
+        assert payload["backup"]["created"] is False, (
+            f"the {reason} refusal claims a backup was created: "
+            f"{payload['backup']!r}"
+        )
+        assert payload["backup"]["present"] is False, (
+            f"the {reason} refusal claims a backup is present: "
+            f"{payload['backup']!r}"
+        )
+        assert "No backup was written." in run.stderr, (
+            "the sentence an operator reads does not say there is no backup, "
+            f"while the JSON does. One of the two is unpinned:\n{run.stderr}"
+        )
         if sidecar is not None:
             # Removed only now, so the rows can be read without SQLite
             # rolling the journal back mid-assertion.
@@ -2213,6 +2263,251 @@ def check_a_fault_after_commit_never_reports_that_nothing_changed(
     )
 
 
+def check_a_withdrawn_backup_is_never_reported_as_one_the_operator_has(
+    tmpdir: pathlib.Path,
+) -> None:
+    """History and presence are different questions, and only one of them moves.
+
+    ``backup_created`` is a fact about the past: it happened, and a later
+    failure does not get to say it did not. ``backup_present`` is a fact about
+    now, and withdrawing the backup changes it. Carrying both in one field is
+    how a report tells an operator they hold a backup that this very run
+    deleted — and an operator who believes they hold one acts more boldly than
+    one who knows they do not, which makes that the worst direction to be wrong
+    in.
+
+    THE ABSENCE IS FLUSHED. Removing the file and not flushing the directory
+    leaves a crash able to bring the entry back while the report says the
+    backup was withdrawn. Creating one flushes the parent for that reason;
+    removing one owes the same. So the ordering is observed: the unlink, and
+    then a flush of the directory it happened in.
+
+    AND THE WITHDRAWAL IS BY IDENTITY. A published path can be replaced between
+    the moment the backup lands and the moment a failure decides to take it
+    back. Unlinking by name then destroys a file that is not this run's, and
+    deletion is the one operation with no way back. So the second leg puts a
+    stranger's file at that path and requires the run to leave it alone, say it
+    does not know whether its own backup survived, and report what it found
+    rather than tidying the question away.
+    """
+    _sandbox_home(tmpdir)
+    module, why = _import_verb()
+    assert module is not None, f"there is no fence-rollback verb: {why}"
+
+    from hermes_cli import session_fence_rollback as library
+
+    def _run_until_the_ddl_fails(where: pathlib.Path, meddle=None):
+        """Drive the boundary and fail it AFTER the backup is durable.
+
+        The failure is placed in the second decision, which is where a real one
+        lands: the backup has been written and flushed and the drops have not
+        happened. Keyed on the backup having returned rather than on a call
+        count, so the leg says which phase it is in.
+        """
+        store = where / "state.db"
+        _fenced_store(store, leave_lease_live=False)
+        work_dir = where / "work"
+        work_dir.mkdir()
+        prepared = library.prepare_the_private_copy(store, work_dir=work_dir)
+        backup = work_dir / "backup.db"
+        outcome = library.RollbackOutcome()
+
+        events = []
+
+        class _RecordingOs:
+            def __getattr__(self, name):
+                return getattr(os, name)
+
+            def fsync(self, fd):
+                try:
+                    info = os.fstat(fd)
+                    events.append(("fsync", info.st_dev, info.st_ino))
+                except OSError:
+                    pass
+                return os.fsync(fd)
+
+            def unlink(self, path, *args, **kwargs):
+                events.append(("unlink", str(path)))
+                return os.unlink(path, *args, **kwargs)
+
+        state = {"backed_up": False}
+        real_backup = library._make_verified_backup
+        real_surface = library._refuse_unexpected_surface
+
+        def _backup_then_remember(*args, **kwargs):
+            report = real_backup(*args, **kwargs)
+            state["backed_up"] = True
+            if meddle is not None:
+                meddle(backup)
+            return report
+
+        def _fail_the_decision_that_follows_the_backup(*args, **kwargs):
+            real_surface(*args, **kwargs)
+            if state["backed_up"]:
+                raise library.TurnFenceRollbackRefused(
+                    "the surface moved between the backup and the drops",
+                    reason="surface-mismatch",
+                )
+
+        library._make_verified_backup = _backup_then_remember
+        library._refuse_unexpected_surface = _fail_the_decision_that_follows_the_backup
+        had_os = hasattr(library, "os")
+        previous_os = getattr(library, "os", None)
+        library.os = _RecordingOs()
+        result = {"reason": "", "detail": "", "crash": ""}
+        try:
+            library._commit_the_rollback(
+                prepared, backup,
+                sorted(hermes_state_common.TURN_FENCE_TRIGGERS),
+                report_as=store, outcome=outcome,
+            )
+        except library.TurnFenceRollbackRefused as exc:
+            result["reason"] = getattr(exc, "reason", "refused")
+            result["detail"] = str(exc)
+        except BaseException as exc:  # noqa: BLE001 - carried, not swallowed
+            result["crash"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            library._make_verified_backup = real_backup
+            library._refuse_unexpected_surface = real_surface
+            if had_os:
+                library.os = previous_os
+            else:
+                del library.os
+        return {
+            "store": store, "target": pathlib.Path(prepared.path),
+            "backup": backup, "outcome": outcome, "events": events,
+            "result": result, "backed_up": state["backed_up"],
+        }
+
+    # (1) THE RUN WITHDRAWS ITS OWN BACKUP.
+    withdrawn_dir = tmpdir / "withdrawn"
+    withdrawn_dir.mkdir()
+    one = _run_until_the_ddl_fails(withdrawn_dir)
+    assert one["backed_up"], (
+        "the backup never landed, so the withdrawal this pin is about never "
+        f"happened: {one['result']!r}"
+    )
+    assert not one["result"]["crash"], f"the boundary crashed: {one['result']['crash']}"
+    facts = one["outcome"].facts()
+    assert facts["backup_created"] is True, (
+        f"a backup was written and the history says it was not: {facts!r}"
+    )
+    assert facts["backup_present"] is False, (
+        "the run deleted its backup and still reports one as present. An "
+        f"operator reads that as a file they can go and use: {facts!r}"
+    )
+    assert facts["backup_withdrawn"] is True, (
+        f"the withdrawal is not reported at all: {facts!r}"
+    )
+    assert facts["changed"] is False, (
+        f"nothing was dropped and the run says it changed the store: {facts!r}"
+    )
+    assert not one["backup"].exists(), (
+        "the report says the backup was withdrawn and it is still there"
+    )
+    parent = os.stat(one["backup"].parent)
+    unlinked = [
+        index for index, event in enumerate(one["events"])
+        if event[0] == "unlink" and event[1] == str(one["backup"])
+    ]
+    assert unlinked, (
+        f"the backup was never unlinked through an observable call: "
+        f"{one['events']!r}"
+    )
+    flushed_after = [
+        index for index, event in enumerate(one["events"])
+        if event[0] == "fsync"
+        and (event[1], event[2]) == (parent.st_dev, parent.st_ino)
+        and index > unlinked[-1]
+    ]
+    assert flushed_after, (
+        "the directory entry was removed and never flushed, so a crash can "
+        "bring the backup back while the report says it was withdrawn: "
+        f"{one['events']!r}"
+    )
+    assert _installed_triggers(one["target"]) == sorted(
+        hermes_state_common.TURN_FENCE_TRIGGERS
+    ), "the drops landed on a run that refused before them"
+
+    # (2) SOMETHING ELSE IS AT THAT PATH BY THEN.
+    stranger_bytes = b"a different file that arrived at the backup path"
+
+    def _replace_the_backup(path):
+        path.unlink()
+        path.write_bytes(stranger_bytes)
+
+    swapped_dir = tmpdir / "swapped"
+    swapped_dir.mkdir()
+    two = _run_until_the_ddl_fails(swapped_dir, meddle=_replace_the_backup)
+    assert two["backed_up"], "the backup never landed in the second leg"
+    assert not two["result"]["crash"], f"the boundary crashed: {two['result']['crash']}"
+    assert two["backup"].read_bytes() == stranger_bytes, (
+        "the run deleted a file it did not create. A published path is a name, "
+        "and deletion is the operation with no way back"
+    )
+    swapped_facts = two["outcome"].facts()
+    assert swapped_facts["backup_created"] is True
+    assert swapped_facts["backup_present"] is None, (
+        "the run could not remove its backup and reports a certainty about "
+        f"whether one is there: {swapped_facts!r}"
+    )
+    assert swapped_facts["backup_withdrawn"] is False, (
+        f"nothing was withdrawn and the report says it was: {swapped_facts!r}"
+    )
+    assert swapped_facts["residue_present"] is True, (
+        f"what was left behind is not reported: {swapped_facts!r}"
+    )
+    assert swapped_facts["residue"]["error"] == "ownership-lost", (
+        f"the residue does not say why it was left: {swapped_facts['residue']!r}"
+    )
+
+    # (3) AND THE VERB SAYS SO, not only the library.
+    cli_dir = tmpdir / "surfaced"
+    cli_dir.mkdir()
+    cli_store = cli_dir / "state.db"
+    _fenced_store(cli_store, leave_lease_live=False)
+    real_backup = library._make_verified_backup
+    real_surface = library._refuse_unexpected_surface
+    seen = {"backed_up": False}
+
+    def _backup_then_swap(*args, **kwargs):
+        report = real_backup(*args, **kwargs)
+        seen["backed_up"] = True
+        target = pathlib.Path(report["path"])
+        target.unlink()
+        target.write_bytes(stranger_bytes)
+        return report
+
+    def _fail_after(*args, **kwargs):
+        real_surface(*args, **kwargs)
+        if seen["backed_up"]:
+            raise library.TurnFenceRollbackRefused(
+                "the surface moved between the backup and the drops",
+                reason="surface-mismatch",
+            )
+
+    library._make_verified_backup = _backup_then_swap
+    library._refuse_unexpected_surface = _fail_after
+    try:
+        run = _run_verb(cli_store, cli_dir / "backup.db", dry_run=True)
+    finally:
+        library._make_verified_backup = real_backup
+        library._refuse_unexpected_surface = real_surface
+
+    assert seen["backed_up"], "the rehearsal never reached its backup"
+    assert not run.crash, f"the verb crashed: {run.crash}"
+    payload = _payload(run)
+    assert payload is not None, f"no machine-readable report: {run.stdout!r}"
+    rehearsal = payload.get("rehearsal") or {}
+    assert rehearsal.get("residue_present") is True, (
+        "the library recorded what it could not remove and the verb dropped "
+        f"it. A fact nobody reads is not a fact: {payload!r}"
+    )
+    assert rehearsal.get("backup_present") is None, (
+        f"the verb resolved an unknown into a certainty: {rehearsal!r}"
+    )
+
+
 PINS = {
     "check_the_verb_is_registered_under_sessions_and_names_its_target":
         check_the_verb_is_registered_under_sessions_and_names_its_target,
@@ -2250,6 +2545,8 @@ PINS = {
         check_the_backup_is_fsynced_and_so_is_its_parent_directory,
     "check_a_fault_after_commit_never_reports_that_nothing_changed":
         check_a_fault_after_commit_never_reports_that_nothing_changed,
+    "check_a_withdrawn_backup_is_never_reported_as_one_the_operator_has":
+        check_a_withdrawn_backup_is_never_reported_as_one_the_operator_has,
 }
 
 
