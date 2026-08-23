@@ -8201,17 +8201,37 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         session_id: str,
         model_config_json: str,
         model: Optional[str] = None,
+        *,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> None:
         """Update model_config and optionally model for an existing session.
 
         Uses COALESCE so that passing model=None leaves the stored model
         column unchanged.  Routes through _execute_write for the standard
         BEGIN IMMEDIATE + jitter-retry + lock guarantee.
+
+        Fenced like a transcript mutation because it writes two of the columns
+        the next turn replays under. Its two production callers
+        (``gateway/run.py`` ``_sync_session_model_from_agent`` and
+        ``tui_gateway/server.py`` ``_persist_live_session_runtime``) are
+        read-modify-writes — ``get_session`` for the current ``model_config``,
+        merge in memory, write the whole thing back — and nothing about that
+        sequence is atomic against another process's turn. There is no grant
+        such a caller could hold that would make the stale write correct, so
+        while somebody owns the conversation the write is refused.
         """
         # Barrier against queued token deltas — see update_session_model.
         self.flush_token_counts()
 
         def _do(conn):
+            # model and model_config are replayed by the next turn.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             conn.execute(
                 "UPDATE sessions SET model_config = ?, model = COALESCE(?, model) WHERE id = ?",
                 (model_config_json, model, session_id),
@@ -8233,7 +8253,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._execute_write(_do)
 
     def update_session_model(
-        self, session_id: str, model: str, provider: Optional[str] = None
+        self,
+        session_id: str,
+        model: str,
+        provider: Optional[str] = None,
+        *,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> None:
         """Update the model for a session after a mid-session switch.
 
@@ -8251,6 +8277,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         actually serves it instead of the config.yaml primary provider
         (#79536). Callers without provider knowledge leave any stored
         provider untouched.
+
+        FENCED, because every column it writes is model context
+            ``model``, ``model_config``, ``system_prompt`` and
+            ``system_prompt_hash`` are what the next turn replays under. The
+            trigger on ``("sessions", "UPDATE")`` locks out an older BINARY; it
+            has nothing to say about a second writer in this generation. So
+            without this a process could switch the model out from under a turn
+            another process was running, and — because the write also nulls the
+            assembled system prompt — delete the prompt that turn is replaying
+            under, with nothing refused and nothing logged.
+
+            Holderless writes stay legal on an unowned conversation, which is
+            every single-writer install, every fresh session and every import.
         """
         # This write bypasses the token queue, so deltas enqueued before the
         # switch must land first: a still-queued first delta carries the
@@ -8261,6 +8300,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self.flush_token_counts()
 
         def _do(conn):
+            # The columns below are what the next turn replays under.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             # Use the shared merge discipline so lineage markers like
             # _branched_from / _delegate_from survive. browser_model_lock
             # is deleted via a None patch value (same semantics as the
@@ -8332,7 +8378,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return json.dumps(config) if config else None
 
     def patch_session_model_config(
-        self, session_id: str, patch: Dict[str, Any]
+        self,
+        session_id: str,
+        patch: Dict[str, Any],
+        *,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> None:
         """Merge ``patch`` into a session's model_config JSON atomically.
 
@@ -8341,11 +8392,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         callers that need to update model_config *without* rewriting the
         transcript (the transcript-coupled path is ``archive_and_compact``'s
         ``model_config_patch``, which shares the same merge helper).
+
+        Fenced for the same reason ``update_session_model`` is: it writes one of
+        the columns the next turn replays under, and the /model commit path
+        calls it immediately after that method. Leaving it open would reopen
+        the same hole one method over.
         """
         if not session_id or not patch:
             return
 
         def _do(conn):
+            # model_config is replayed by the next turn.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             merged = self._merge_model_config_json(conn, session_id, patch)
             if merged is _MODEL_CONFIG_ROW_MISSING:
                 return
