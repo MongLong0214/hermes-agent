@@ -150,9 +150,17 @@ def assert_mutation_kills_the_pin(
     mutation: Mutation,
     pin_module: str,
     tmp_path: pathlib.Path,
+    *extra_paths: str,
 ) -> None:
-    """Clean, mutated, restored. Anything else is a row that measures nothing."""
-    tree = extract_tree(tmp_path, pin_module)
+    """Clean, mutated, restored. Anything else is a row that measures nothing.
+
+    *extra_paths* widens the extract for a pin whose enforcement seam is not in
+    the state layer. ``BASE_EXTRACT_PATHSPEC`` is deliberately narrow — enough
+    to open a store — and a pin that drives a gateway command needs the rest of
+    the package, which it asks for as ``"."`` rather than by naming the modules
+    it happens to import today.
+    """
+    tree = extract_tree(tmp_path, pin_module, *extra_paths)
     target = tree / mutation.module
     original = target.read_text(encoding="utf-8")
 

@@ -1748,6 +1748,132 @@ class GatewaySlashCommandsMixin:
             getattr(getattr(event, "source", None), "platform", None),
         )
 
+    @staticmethod
+    def _agent_runtime_identity(agent) -> dict:
+        """The five fields ``switch_model`` replaces, read off a live agent.
+
+        Captured BEFORE the in-place swap so the swap has something to be
+        undone to. The keyword names are ``switch_model``'s own, so the
+        restore is the same call as the switch with the old values in it —
+        ``agent.agent_runtime_helpers.switch_model`` already snapshots and
+        restores thirteen more attributes atomically when its own rebuild
+        fails, and going back through it inherits that instead of writing a
+        second, weaker rollback here.
+        """
+        return {
+            "new_model": getattr(agent, "model", "") or "",
+            "new_provider": getattr(agent, "provider", "") or "",
+            "api_key": getattr(agent, "api_key", "") or "",
+            "base_url": getattr(agent, "base_url", "") or "",
+            "api_mode": getattr(agent, "api_mode", "") or "",
+        }
+
+    @staticmethod
+    def _undo_model_switch(
+        cached_agent,
+        previous_identity: Optional[dict],
+        *,
+        model: str,
+        reason: str,
+    ) -> str:
+        """Put the live agent back, and say what the user is being told.
+
+        Called on every path that leaves the session row NOT carrying *model*,
+        so there is exactly one place that decides what happens to an agent
+        that was already swapped. Returns the message; the caller decorates it
+        with ``gateway.model.error_prefix``.
+        """
+        if cached_agent is not None and previous_identity:
+            try:
+                cached_agent.switch_model(**previous_identity)
+            except Exception as undo_exc:
+                # The rollback itself failed. Say so rather than reporting the
+                # original reason: the agent is now on a runtime the row does
+                # not carry, and the operator needs to know which of the two
+                # failures they are looking at.
+                logger.error(
+                    "Could not roll the live agent back after a model switch "
+                    "that did not persist (%s): %s", reason, undo_exc,
+                )
+                return (
+                    f"Model switch to {model} did not persist ({reason}) and "
+                    f"the live agent could not be restored ({undo_exc}). "
+                    f"Restart the session before continuing."
+                )
+        return (
+            f"Model switch to {model} did not persist ({reason}); "
+            f"the session is unchanged."
+        )
+
+    async def _persist_model_switch_or_undo(
+        self,
+        session_db,
+        session_id: str,
+        *,
+        model: str,
+        provider,
+        cached_agent=None,
+        previous_identity: Optional[dict] = None,
+    ) -> Optional[str]:
+        """Persist a committed /model switch; undo the in-place swap if refused.
+
+        Returns ``None`` when the session row now carries *model*, or a
+        human-readable reason when it does not. On a reason, the live agent has
+        been put back on *previous_identity*, so the two halves cannot end up
+        disagreeing about which model the conversation is on.
+
+        WHY THE CALLER MUST PRESENT A GRANT
+            ``update_session_model`` is fenced by the session turn lease. The
+            gateway's own turn takes that lease in ``run_agent.py`` for the
+            duration of the turn, and the slash path does not go through
+            ``gateway/run.py``'s asyncio turn lease — so a /model typed while
+            the gateway is answering is a second in-process writer on a
+            conversation THIS process owns. Reuse before acquire:
+            ``current_turn_grant`` returns the running turn's own grant, and
+            presenting it is what keeps the feature working. It returns
+            ``None`` when nothing here owns the conversation, which the fence
+            admits holderless, and it returns ``None`` when the owner is
+            another process — the case that has no authorised outcome and must
+            be refused.
+
+        WHY A REFUSAL IS NOT SOMETHING TO LOG AND CONTINUE
+            The caller has already mutated the live cached agent; that is the
+            feature. What it cannot do is leave the agent switched while the
+            row is not. Both sites used to wrap this whole block in
+            ``except Exception`` -> ``logger.debug``, and
+            ``SessionTurnLeaseLostError`` is a ``RuntimeError``, so the
+            refusal landed there and the user was told the switch succeeded.
+            Undoing the swap and saying so is the only outcome under which
+            memory and the row agree.
+
+        The awaits are deliberate: ``self._session_db`` is an
+        ``AsyncSessionDB``, whose ``__getattr__`` turns every method into an
+        ``asyncio.to_thread`` forwarder, so ``current_turn_grant`` comes back
+        as a coroutine here and as a plain token when a caller has pinned the
+        synchronous ``SessionDB``. ``inspect.isawaitable`` covers both without
+        the call site having to know which handle it holds.
+        """
+        try:
+            grant = None
+            reuse = getattr(session_db, "current_turn_grant", None)
+            if callable(reuse):
+                grant = reuse(session_id)
+                if inspect.isawaitable(grant):
+                    grant = await grant
+            fence = {"turn_lease_holder": grant} if grant is not None else {}
+            await session_db.update_session_model(
+                session_id, model, provider=provider, **fence
+            )
+        except Exception as exc:
+            logger.warning(
+                "Model switch to %s was not persisted for session %s: %s",
+                model, session_id, exc,
+            )
+            return self._undo_model_switch(
+                cached_agent, previous_identity, model=model, reason=str(exc)
+            )
+        return None
+
     async def _handle_model_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /model command — switch model.
 
@@ -1942,7 +2068,14 @@ class GatewaySlashCommandsMixin:
                         if _cache_lock and _cache is not None:
                             with _cache_lock:
                                 cached_entry = _cache.get(_session_key)
-                        if cached_entry and cached_entry[0] is not None:
+                        _cached_agent = (
+                            cached_entry[0] if cached_entry else None
+                        )
+                        _switch_undo = None
+                        if _cached_agent is not None:
+                            _switch_undo = _self._agent_runtime_identity(
+                                _cached_agent
+                            )
                             try:
                                 cached_entry[0].switch_model(
                                     new_model=result.new_model,
@@ -1974,19 +2107,37 @@ class GatewaySlashCommandsMixin:
 
                         # Persist the new model to the session DB so the
                         # dashboard shows the updated model (#34850).
+                        # A refusal undoes the in-place swap above and aborts
+                        # the commit — see _persist_model_switch_or_undo.
                         _sess_db = getattr(_self, "_session_db", None)
                         if _sess_db is not None:
                             try:
                                 _sess_entry = await _self.async_session_store.get_or_create_session(
                                     event.source
                                 )
-                                await _sess_db.update_session_model(
-                                    _sess_entry.session_id, result.new_model,
-                                    provider=result.target_provider,
-                                )
                             except Exception as exc:
-                                logger.debug(
-                                    "Failed to persist model switch to DB: %s", exc
+                                logger.warning(
+                                    "Could not resolve the session for a picker "
+                                    "model switch: %s", exc
+                                )
+                                _refusal = _self._undo_model_switch(
+                                    _cached_agent, _switch_undo,
+                                    model=result.new_model,
+                                    reason=f"the session could not be resolved ({exc})",
+                                )
+                            else:
+                                _refusal = await _self._persist_model_switch_or_undo(
+                                    _sess_db,
+                                    _sess_entry.session_id,
+                                    model=result.new_model,
+                                    provider=result.target_provider,
+                                    cached_agent=_cached_agent,
+                                    previous_identity=_switch_undo,
+                                )
+                            if _refusal is not None:
+                                return t(
+                                    "gateway.model.error_prefix",
+                                    error=_refusal,
                                 )
 
                         # Store model note + session override.  Use display
@@ -2255,7 +2406,10 @@ class GatewaySlashCommandsMixin:
                 with _cache_lock:
                     cached_entry = _cache.get(session_key)
 
-            if cached_entry and cached_entry[0] is not None:
+            _cached_agent = cached_entry[0] if cached_entry else None
+            _switch_undo = None
+            if _cached_agent is not None:
+                _switch_undo = self._agent_runtime_identity(_cached_agent)
                 try:
                     cached_entry[0].switch_model(
                         new_model=result.new_model,
@@ -2282,6 +2436,8 @@ class GatewaySlashCommandsMixin:
 
             # Persist the new model to the session DB so the dashboard
             # shows the updated model (#34850).
+            # A refusal undoes the in-place swap above and aborts the commit —
+            # see _persist_model_switch_or_undo.
             _sess_db = getattr(self, "_session_db", None)
             if _sess_db is not None:
                 try:
@@ -2291,14 +2447,27 @@ class GatewaySlashCommandsMixin:
                     # override just stored below (Closes #48031).
                     if getattr(_sess_entry, "was_auto_reset", False):
                         _sess_entry.was_auto_reset = False
-                    await _sess_db.update_session_model(
-                        _sess_entry.session_id, result.new_model,
-                        provider=result.target_provider,
-                    )
                 except Exception as exc:
-                    logger.debug(
-                        "Failed to persist model switch to DB: %s", exc
+                    logger.warning(
+                        "Could not resolve the session for a model switch: %s",
+                        exc,
                     )
+                    _refusal = self._undo_model_switch(
+                        _cached_agent, _switch_undo,
+                        model=result.new_model,
+                        reason=f"the session could not be resolved ({exc})",
+                    )
+                else:
+                    _refusal = await self._persist_model_switch_or_undo(
+                        _sess_db,
+                        _sess_entry.session_id,
+                        model=result.new_model,
+                        provider=result.target_provider,
+                        cached_agent=_cached_agent,
+                        previous_identity=_switch_undo,
+                    )
+                if _refusal is not None:
+                    return t("gateway.model.error_prefix", error=_refusal)
 
             # Store a note to prepend to the next user message so the model
             # knows about the switch (avoids system messages mid-history).

@@ -75,6 +75,12 @@ import time
 
 import pytest
 
+from tests.state.lease_mutation_harness import (
+    Mutation,
+    assert_every_pin_has_a_killer,
+    assert_mutation_kills_the_pin,
+)
+
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 #: This file, so a mutated extract can run the same checks it defines.
@@ -133,8 +139,14 @@ def _install_stubs(home):
         hermes_constants.get_hermes_home,
         hermes_cli.config.get_hermes_home,
         gateway_run._hermes_home,
+        model_switch.list_picker_providers,
+        model_switch.resolve_display_context_length,
     )
 
+    model_switch.list_picker_providers = lambda **kw: [
+        {"slug": "openrouter", "name": "OpenRouter", "models": [_NEW_MODEL]}
+    ]
+    model_switch.resolve_display_context_length = lambda *a, **k: 272000
     model_switch.switch_model = lambda **kw: ModelSwitchResult(
         success=True,
         new_model=_NEW_MODEL,
@@ -157,9 +169,43 @@ def _install_stubs(home):
             hermes_constants.get_hermes_home,
             hermes_cli.config.get_hermes_home,
             gateway_run._hermes_home,
+            model_switch.list_picker_providers,
+            model_switch.resolve_display_context_length,
         ) = saved
 
     return _undo
+
+
+class _FakePickerAdapter:
+    """Picker-capable adapter that captures the tap callback.
+
+    ``_handle_model_command`` gates the picker on
+    ``getattr(type(adapter), "send_model_picker", None) is not None``, so the
+    method has to exist on the class. Same shape as
+    ``tests/gateway/test_model_picker_persist``.
+    """
+
+    def __init__(self) -> None:
+        self.captured_callback = None
+
+    async def send_model_picker(self, *, on_model_selected, **kwargs):
+        import types
+
+        self.captured_callback = on_model_selected
+        return types.SimpleNamespace(success=True)
+
+
+def _success_line() -> str:
+    """The line production prints when a switch worked, rendered its own way.
+
+    Read out of the same i18n key and display formatter ``_finish_switch``
+    uses, so "the user was told it succeeded" is measured against production's
+    wording rather than against a copy of it kept here.
+    """
+    from agent.i18n import t
+    from hermes_cli.model_switch import format_model_for_display
+
+    return t("gateway.model.switched", model=format_model_for_display(_NEW_MODEL))
 
 
 def _foreign_owner(db, session_id: str) -> str:
@@ -187,11 +233,16 @@ def _foreign_owner(db, session_id: str) -> str:
     return holder
 
 
-def _drive_model_command(tmpdir, *, owner: str):
+def _drive_model_command(tmpdir, *, owner: str, path: str = "typed"):
     """Run the real ``/model`` command once; return what memory and the DB say.
 
     *owner* is ``"us"`` (the turn running in this process holds the DB grant,
     the ordinary mid-turn case) or ``"another-process"``.
+
+    *path* selects which of the two commit sites is exercised: ``"typed"``
+    drives ``_finish_switch``, ``"picker"`` drives the inline-keyboard
+    callback. They are separate blocks with separate wiring, so a fix applied
+    to one of them passes a pin that only drives the other.
     """
     from gateway.config import Platform
     from gateway.platforms.base import MessageEvent, MessageType
@@ -246,8 +297,9 @@ def _drive_model_command(tmpdir, *, owner: str):
         session_key = build_session_key(source)
         agent = _CachedAgent()
 
+        adapter = _FakePickerAdapter() if path == "picker" else None
         runner = object.__new__(GatewayRunner)
-        runner.adapters = {}
+        runner.adapters = {} if adapter is None else {Platform.TELEGRAM: adapter}
         runner._voice_mode = {}
         runner._session_model_overrides = {}
         runner._pending_one_turn_model_restores = {}
@@ -274,11 +326,27 @@ def _drive_model_command(tmpdir, *, owner: str):
         runner._async_session_store = _Store()
 
         event = MessageEvent(
-            text=f"/model {_NEW_MODEL}",
+            text="/model" if path == "picker" else f"/model {_NEW_MODEL}",
             message_type=MessageType.TEXT,
             source=source,
         )
-        reply = asyncio.run(runner._handle_model_command(event))
+
+        async def _run():
+            first = await runner._handle_model_command(event)
+            if path != "picker":
+                return first
+            assert first is None, (
+                f"the picker was not sent, so the tap callback was never "
+                f"built and this half drives nothing: {first!r}"
+            )
+            assert adapter.captured_callback is not None, (
+                "the picker callback was not wired"
+            )
+            return await adapter.captured_callback(
+                source.chat_id, _NEW_MODEL, "openrouter"
+            )
+
+        reply = asyncio.run(_run())
         row = db.get_session("sess-1")
         return {
             "reply": reply or "",
@@ -321,7 +389,12 @@ def check_a_refused_model_switch_leaves_memory_and_the_db_agreeing(
         f"a bystander's /model rewrote the route of a conversation another "
         f"process is mid-turn on: {outcome['db_model']!r}"
     )
-    assert _NEW_MODEL not in outcome["reply"] or "❌" in outcome["reply"], (
+    assert outcome["switches"] == [_NEW_MODEL, _OLD_MODEL], (
+        f"the agent did not go out and come back: {outcome['switches']!r}. "
+        f"Agreement reached by never switching at all is a different bug, not "
+        f"this fix — /model is supposed to move the live agent."
+    )
+    assert _success_line() not in outcome["reply"], (
         f"the user was told the switch succeeded while nothing was persisted: "
         f"{outcome['reply']!r}"
     )
@@ -350,8 +423,44 @@ def check_the_owning_turns_own_model_switch_lands_in_both(tmpdir) -> None:
         f"commit site has a grant to present.\n"
         f"reply to the user: {outcome['reply']!r}"
     )
-    assert _NEW_MODEL in outcome["reply"], (
+    assert _success_line() in outcome["reply"], (
         f"the switch landed but the user was not told: {outcome['reply']!r}"
+    )
+    assert outcome["switches"] == [_NEW_MODEL], (
+        f"the owner's switch was undone and re-reported as a success: "
+        f"{outcome['switches']!r}"
+    )
+
+
+def check_a_refused_picker_tap_leaves_memory_and_the_db_agreeing(tmpdir) -> None:
+    """The same claim about the OTHER commit site.
+
+    The inline-keyboard callback is a separate block with its own resolve,
+    its own persist and its own reply, and it carried the identical
+    ``except Exception`` -> ``logger.debug``. A fix wired into
+    ``_finish_switch`` alone leaves tapping a model in Telegram/Discord doing
+    exactly what typing one used to do, and only a pin that drives the tap can
+    tell the difference.
+    """
+    outcome = _drive_model_command(
+        tmpdir, owner="another-process", path="picker"
+    )
+
+    assert outcome["agent_model"] == outcome["db_model"], (
+        f"a refused picker tap left the live agent and the session row "
+        f"disagreeing: agent={outcome['agent_model']!r} "
+        f"db={outcome['db_model']!r}\nreply to the user: {outcome['reply']!r}"
+    )
+    assert outcome["db_model"] == _OLD_MODEL, (
+        f"a picker tap rewrote the route of a conversation another process is "
+        f"mid-turn on: {outcome['db_model']!r}"
+    )
+    assert outcome["switches"] == [_NEW_MODEL, _OLD_MODEL], (
+        f"the agent did not go out and come back: {outcome['switches']!r}"
+    )
+    assert _success_line() not in outcome["reply"], (
+        f"the user was told the tap succeeded while nothing was persisted: "
+        f"{outcome['reply']!r}"
     )
 
 
@@ -360,6 +469,8 @@ PINS = {
         check_a_refused_model_switch_leaves_memory_and_the_db_agreeing,
     "check_the_owning_turns_own_model_switch_lands_in_both":
         check_the_owning_turns_own_model_switch_lands_in_both,
+    "check_a_refused_picker_tap_leaves_memory_and_the_db_agreeing":
+        check_a_refused_picker_tap_leaves_memory_and_the_db_agreeing,
 }
 
 
@@ -367,3 +478,77 @@ PINS = {
 def test_model_switch_divergence_property(name, tmp_path):
     """The pin. Each property, asserted against the tree under test."""
     PINS[name](tmp_path)
+
+
+#: The enforcement seam here is in ``gateway/slash_commands.py``, not in the
+#: state layer, so every row extracts the WHOLE tree (``"."``) instead of the
+#: narrow store-only pathspec the other files in this family use.
+_WHOLE_TREE = (".",)
+
+SOURCE_MUTATIONS = (
+    Mutation(
+        pin="check_a_refused_model_switch_leaves_memory_and_the_db_agreeing",
+        module="gateway/slash_commands.py",
+        find="        if cached_agent is not None and previous_identity:\n"
+             "            try:\n"
+             "                cached_agent.switch_model(**previous_identity)\n",
+        replace="        if False:\n"
+                "            try:\n"
+                "                cached_agent.switch_model(**previous_identity)\n",
+        why="without the undo the commit site is what it was: the live agent "
+            "carries the new model, the row carries the old one, and the only "
+            "trace is a log line",
+    ),
+    Mutation(
+        pin="check_the_owning_turns_own_model_switch_lands_in_both",
+        module="gateway/slash_commands.py",
+        find="            fence = {\"turn_lease_holder\": grant} "
+             "if grant is not None else {}\n",
+        replace="            fence = {}\n",
+        why="without presenting the running turn's own grant the write is "
+            "refused by the lease THIS process holds, so the undo fires and "
+            "/model silently stops working mid-turn — the regression the "
+            "rollback would otherwise introduce",
+    ),
+    Mutation(
+        pin="check_a_refused_picker_tap_leaves_memory_and_the_db_agreeing",
+        module="gateway/slash_commands.py",
+        find="                                _refusal = await "
+             "_self._persist_model_switch_or_undo(\n"
+             "                                    _sess_db,\n"
+             "                                    _sess_entry.session_id,\n"
+             "                                    model=result.new_model,\n"
+             "                                    provider=result.target_provider,\n"
+             "                                    cached_agent=_cached_agent,\n"
+             "                                    previous_identity=_switch_undo,\n"
+             "                                )\n",
+        replace="                                _refusal = None\n"
+                "                                try:\n"
+                "                                    await _sess_db.update_session_model(\n"
+                "                                        _sess_entry.session_id,\n"
+                "                                        result.new_model,\n"
+                "                                        provider=result.target_provider,\n"
+                "                                    )\n"
+                "                                except Exception as exc:\n"
+                "                                    logger.debug(\n"
+                "                                        \"Failed to persist model \"\n"
+                "                                        \"switch to DB: %s\", exc\n"
+                "                                    )\n",
+        why="this row puts the picker callback back on its pre-fix shape and "
+            "leaves the typed path fixed. A fix wired into _finish_switch "
+            "alone survives every pin that only types /model",
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    "mutation", SOURCE_MUTATIONS, ids=[m.pin for m in SOURCE_MUTATIONS]
+)
+def test_each_pin_dies_when_its_own_guard_is_removed(mutation, tmp_path):
+    """Clean, mutated, restored. A pin that survives its mutation is not a pin."""
+    assert_mutation_kills_the_pin(mutation, str(_SELF), tmp_path, *_WHOLE_TREE)
+
+
+def test_every_pin_has_a_mutation_that_kills_it():
+    """No pin without a killer, and no killer without a pin."""
+    assert_every_pin_has_a_killer(PINS, SOURCE_MUTATIONS)
