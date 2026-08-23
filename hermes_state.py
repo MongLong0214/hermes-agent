@@ -7640,8 +7640,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return list(ids), []
         allowed, skipped = [], []
         for sid in ids:
-            root = self._session_turn_lease_key_on_conn(conn, sid)
-            (skipped if root in owned_roots else allowed).append(sid)
+            # Not `root(sid)`. A sweep that removes `sid` also severs
+            # `parent_session_id` on every direct child of it, and a BRANCH
+            # child is its own lease root — so the row it mutates belongs to a
+            # conversation the victim's own root says nothing about. The
+            # predicate is therefore over the whole REACH of removing `sid`.
+            reached = self._affected_session_ids(conn, [sid])
+            roots = {
+                self._session_turn_lease_key_on_conn(conn, other)
+                for other in reached
+            }
+            (skipped if roots & owned_roots else allowed).append(sid)
         if skipped:
             logger.info(
                 "turn lease: sweep skipped %d session(s) whose conversation is "
@@ -7671,6 +7680,72 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 f"{because}: conversation(s) a live turn owns "
                 f"({', '.join(sorted(owned))})"
             )
+
+    def _affected_session_ids(self, conn, session_ids) -> List[str]:
+        """Every session row a delete of *session_ids* MUTATES, not just names.
+
+        Admission has to be decided over the statements' reach, and a delete's
+        reach is three things, only the first of which the caller named:
+
+        the named rows      deleted outright, with their messages.
+        the delegate cascade
+                            ``_collect_delegate_child_ids`` walks the
+                            ``_delegate_from`` marker chain, and every row it
+                            finds is deleted outright too.
+        the severed children
+                            ``UPDATE sessions SET parent_session_id = NULL
+                            WHERE parent_session_id IN (…)`` runs over the
+                            union of the two above. A COMPRESSION child of a
+                            named row resolves to that row's own root, so the
+                            named grant already covers it; a BRANCH child does
+                            NOT — it is its own lease root, which is precisely
+                            why the guard on the named id never saw it.
+
+        Direct children are enough, and that is a property of the rule rather
+        than an economy: the SET NULL touches one generation, and a grandchild's
+        root is either the child (when the child is a compression parent, and
+        then the child is in this set and its root is compared) or the
+        grandchild itself (a branch of a branch, which nothing here touches).
+
+        Returns the union, sorted, INCLUDING the ids that were passed in — a
+        caller that wants "everything except what my grant covers" filters by
+        root, because id equality is the wrong comparison for a lineage.
+        """
+        seeds = [sid for sid in session_ids if sid]
+        if not seeds:
+            return []
+        doomed = set(seeds) | set(_collect_delegate_child_ids(conn, seeds))
+        ph = ",".join("?" * len(doomed))
+        severed = conn.execute(
+            f"SELECT id FROM sessions WHERE parent_session_id IN ({ph})",
+            sorted(doomed),
+        ).fetchall()
+        return sorted(doomed | {row["id"] for row in severed})
+
+    def _refuse_unless_reached_conversations_are_free(
+        self, conn, session_id: str, because: str
+    ) -> None:
+        """Every root a delete of *session_id* reaches, EXCEPT its own, is free.
+
+        The own-root exemption is not a softening. ``_check_turn_lease_guard``
+        has already decided the named root against the caller's grant; asking
+        for freeness a second time would refuse the owner's own delete of its
+        own compression lineage, because a compression child resolves to that
+        very root. A grant authorizes ONE conversation, so every OTHER root the
+        statements reach has only one admissible state, and it is free.
+        """
+        own_root = self._session_turn_lease_key_on_conn(conn, session_id)
+        reached = [
+            sid for sid in self._affected_session_ids(conn, [session_id])
+            if sid != session_id
+        ]
+        foreign = [
+            other for other in reached
+            if self._session_turn_lease_key_on_conn(conn, other)
+            != own_root
+        ]
+        if foreign:
+            self._refuse_if_any_conversation_is_owned(conn, foreign, because)
 
     def try_acquire_session_turn_lease(
         self,
@@ -13254,22 +13329,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             if cursor.fetchone() is None:
                 return False
-            # The delegate children go with the parent, and they are SEPARATE
-            # conversations with separate leases — a grant on the parent
-            # authorizes nothing about them. Guarding only session_id fences
-            # the row the operator named and none of the rows it takes with it.
+            # The rows this delete REACHES are separate conversations with
+            # separate leases — a grant on the parent authorizes nothing about
+            # them. Guarding only session_id fences the row the operator named
+            # and none of the rows it takes with it: the delegate cascade it
+            # deletes outright, and the direct children whose parent reference
+            # the SET NULL below severs. A branch child is its own lease root,
+            # so that statement was reaching into a live-owned conversation
+            # with no admission anywhere.
             #
             # Refuse rather than skip, unlike a sweep: the operator named one
             # session, and a delete that removes the parent while leaving a
             # live delegate behind is a partially applied destructive change.
             # A sweep has no such contract to keep, which is why it may skip.
-            cascade = sorted(_collect_delegate_child_ids(conn, [session_id]))
-            if cascade:
-                self._refuse_if_any_conversation_is_owned(
-                    conn, cascade,
-                    f"refusing to delete {session_id!r}: its delegate cascade "
-                    f"includes",
-                )
+            self._refuse_unless_reached_conversations_are_free(
+                conn, session_id,
+                f"refusing to delete {session_id!r}: it reaches",
+            )
             if expected_ids is not None:
                 actual_ids = {
                     session_id,
@@ -13300,6 +13376,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self,
         session_id: str,
         sessions_dir: Optional[Path] = None,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> bool:
         """Delete *session_id* only when it never gained resumable content.
 
@@ -13314,8 +13392,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         children (delegate subagent runs) are preserved — a parent that
         spawned work is not "empty" even if its own transcript never
         flushed. Returns True if the session was deleted.
+
+        Emptiness is not an exemption from admission. This method carried none
+        at all, and the id it is handed by the CLI rotation path is routinely a
+        compression continuation, whose lease root is the PARENT — a
+        conversation a live turn can own while this row still looks disposable.
         """
         def _do(conn):
+            # An empty row is still a row inside somebody's conversation.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             cursor = conn.execute(
                 """
                 DELETE FROM sessions

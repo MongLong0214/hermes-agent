@@ -388,15 +388,15 @@ SOURCE_MUTATIONS = (
         pin="check_a_delete_is_refused_while_a_branch_child_is_owned",
         module="hermes_state.py",
         find=(
-            "            reached = [\n"
-            "                sid for sid in self._affected_session_ids(conn, [session_id])\n"
-            "                if sid != session_id\n"
-            "            ]\n"
+            "        reached = [\n"
+            "            sid for sid in self._affected_session_ids(conn, [session_id])\n"
+            "            if sid != session_id\n"
+            "        ]\n"
         ),
         replace=(
-            "            reached = sorted(\n"
-            "                _collect_delegate_child_ids(conn, [session_id])\n"
-            "            )\n"
+            "        reached = sorted(\n"
+            "            _collect_delegate_child_ids(conn, [session_id])\n"
+            "        )\n"
         ),
         why="restores the pre-slice reach — the delegate cascade only — so the "
             "SET NULL on branch children is unadmitted again",
@@ -421,11 +421,15 @@ SOURCE_MUTATIONS = (
         pin="check_a_prune_skips_the_parent_of_an_owned_branch_child",
         module="hermes_state.py",
         find=(
-            "        doomed = set(seeds) | set(_collect_delegate_child_ids(conn, seeds))\n"
+            "        severed = conn.execute(\n"
+            '            f"SELECT id FROM sessions WHERE parent_session_id IN ({ph})",\n'
+            "            sorted(doomed),\n"
+            "        ).fetchall()\n"
         ),
-        replace="        doomed = set(seeds)\n",
-        why="a prune whose reach stops at the named ids cannot see the "
-            "children of the delegate rows it also deletes",
+        replace="        severed = []\n",
+        why="the severed-children arm is the whole of the reach a SET NULL "
+            "has; without it a sweep's admission is back to the victim's own "
+            "root and the branch child is invisible again",
     ),
     Mutation(
         pin="check_an_empty_session_delete_is_refused_on_an_owned_root",
@@ -447,10 +451,10 @@ SOURCE_MUTATIONS = (
         pin="check_the_owner_can_delete_its_own_compression_lineage",
         module="hermes_state.py",
         find=(
-            "                if self._session_turn_lease_key_on_conn(conn, other)\n"
-            "                != own_root\n"
+            "            if self._session_turn_lease_key_on_conn(conn, other)\n"
+            "            != own_root\n"
         ),
-        replace="                if True\n",
+        replace="            if True\n",
         why="dropping the own-root exemption makes the affected-set rule "
             "refuse the owner's own delete of its own lineage",
     ),
