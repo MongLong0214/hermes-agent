@@ -122,15 +122,26 @@ def run_pin(
         print("PIN-HELD")
         """
     )
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": str(scratch),
+        "PYTHONPATH": str(tree),
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    # A pin that needs the BASE object has to be able to find it from inside
+    # the extract, and the extract is a bare tree with no `.git`. This names an
+    # immutable commit in the real repository, which is the one thing that
+    # cannot smuggle uncommitted state into the fixture — the same reason
+    # ``HERMES_BASE_TREE_GIT_DIR`` exists at all. Without it those pins would
+    # skip inside the subprocess, and a skip in the CLEAN run reads as "the pin
+    # does not hold", i.e. as a harness fault rather than a missing fixture.
+    git_dir = _git_dir()
+    if git_dir is not None:
+        env["HERMES_BASE_TREE_GIT_DIR"] = git_dir
     return subprocess.run(
         [sys.executable, "-c", probe],
         cwd=str(tree),
-        env={
-            "PATH": "/usr/bin:/bin",
-            "HOME": str(scratch),
-            "PYTHONPATH": str(tree),
-            "PYTHONDONTWRITEBYTECODE": "1",
-        },
+        env=env,
         capture_output=True, text=True, timeout=300,
     )
 
