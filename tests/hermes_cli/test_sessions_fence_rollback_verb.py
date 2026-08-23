@@ -3562,6 +3562,183 @@ def check_a_cleanup_failure_never_replaces_the_refusal_that_decided_the_run(
     assert _installed_triggers(store) == triggers_before
 
 
+def _stamp(path: pathlib.Path, version: int) -> None:
+    conn = sqlite3.connect(str(path), isolation_level=None)
+    try:
+        conn.execute(f"PRAGMA user_version={int(version)}")
+    finally:
+        conn.close()
+
+
+def _identify(path: pathlib.Path) -> dict:
+    """Which store this is, whether it still reads, and what fence it carries."""
+    try:
+        conn = sqlite3.connect(str(path))
+    except sqlite3.DatabaseError as exc:
+        return {"readable": False, "why": f"{type(exc).__name__}: {exc}"}
+    try:
+        return {
+            "readable": True,
+            "user_version": int(conn.execute("PRAGMA user_version").fetchone()[0]),
+            "triggers": len(
+                conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='trigger' "
+                    "AND name LIKE 'hermes_turn_fence_%'"
+                ).fetchall()
+            ),
+            "integrity": str(conn.execute("PRAGMA integrity_check").fetchone()[0]),
+        }
+    except sqlite3.DatabaseError as exc:
+        return {"readable": False, "why": f"{type(exc).__name__}: {exc}"}
+    finally:
+        conn.close()
+
+
+def check_a_target_swapped_and_restored_around_the_open_cannot_be_reached(
+    tmpdir: pathlib.Path,
+) -> None:
+    """A→B→A is invisible to any number of point checks. Hold the object instead.
+
+    The persistent-substitution pin covers A→B: the identity comparison sees
+    the new inode and refuses. It does not cover A→B→A. Rename the prepared
+    copy aside, put a DIFFERENT valid fenced store at its pathname, let the
+    open happen, then put the original back — and every ``stat`` before and
+    after sees A, because the substitution existed only for the instant of the
+    resolution in between. Measured on SQLite 3.53.1: the boundary reported
+    ``outcome=committed changed=true`` with a backup on disk, having neither
+    rehearsed the prepared artifact nor left the substituted one readable.
+    Wrong target and corruption in one run, reported as a success.
+
+    A THIRD CHECK IS NOT THE FIX, BY CONSTRUCTION
+        There was already a check immediately before the open. Adding another
+        makes a third observation with the same window after it — the interval
+        is where the swap lives, and observations do not remove intervals. So
+        the pathname is resolved ONCE, by the preparer, in the call that
+        creates the file, and the connection it returns is carried through
+        decide, backup and DDL. There is no later resolution for a rename to
+        act on, which is why this pin's assertion is a COUNT: zero.
+
+    Both stores are identified by ``user_version`` and by their fence surface,
+    and both are asserted — a run that "did nothing to A" by mutating B has
+    not passed this, and neither has one that left B unreadable.
+    """
+    _sandbox_home(tmpdir)
+    module, why = _import_verb()
+    assert module is not None, f"there is no fence-rollback verb: {why}"
+
+    from hermes_cli import session_fence_rollback as library
+
+    store = tmpdir / "state.db"
+    _fenced_store(store, leave_lease_live=False)
+    _stamp(store, 111)
+
+    substitute = tmpdir / "substitute.db"
+    _fenced_store(substitute, leave_lease_live=False)
+    _stamp(substitute, 222)
+    b_before = _identify(substitute)
+    assert b_before["user_version"] == 222 and b_before["triggers"] == 24, (
+        f"the substitute fixture is not a distinguishable fenced store: {b_before!r}"
+    )
+
+    work_dir = tmpdir / "work"
+    work_dir.mkdir()
+    prepared = library.prepare_the_private_copy(store, work_dir=work_dir)
+    copy = pathlib.Path(prepared.path)
+    aside = work_dir / "prepared.aside"
+    backup = work_dir / "backup.db"
+    assert _identify(copy)["user_version"] == 111, "the prepared copy is not A"
+
+    resolutions = []
+    real_sqlite = library.sqlite3
+
+    class _SwapAroundEveryResolution:
+        """A→B→A for the exact instant of any pathname resolution of the copy."""
+
+        def __getattr__(self, name):
+            return getattr(real_sqlite, name)
+
+        def connect(self, target, *args, **kwargs):
+            if str(target) != str(copy):
+                return real_sqlite.connect(target, *args, **kwargs)
+            resolutions.append(str(target))
+            os.rename(copy, aside)
+            os.rename(substitute, copy)
+            try:
+                return real_sqlite.connect(target, *args, **kwargs)
+            finally:
+                os.rename(copy, substitute)
+                os.rename(aside, copy)
+
+    outcome = library.RollbackOutcome()
+    library.sqlite3 = _SwapAroundEveryResolution()
+    result = {"returned": None, "reason": "", "detail": "", "crash": ""}
+    try:
+        result["returned"] = library._commit_the_rollback(
+            prepared, backup, sorted(hermes_state_common.TURN_FENCE_TRIGGERS),
+            report_as=store, outcome=outcome,
+        )
+    except library.TurnFenceRollbackRefused as exc:
+        result["reason"] = getattr(exc, "reason", "refused")
+        result["detail"] = str(exc)
+    except BaseException as exc:  # noqa: BLE001 - carried, not swallowed
+        result["crash"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        library.sqlite3 = real_sqlite
+
+    assert not result["crash"], f"the boundary crashed: {result['crash']}"
+
+    a_after = _identify(copy)
+    b_after = _identify(substitute)
+    facts = outcome.facts()
+
+    # THE SUBSTITUTE IS NEVER THIS RUN'S BUSINESS, on either branch.
+    assert b_after["readable"] is True, (
+        "the substituted store was left unreadable — the run wrote to a file "
+        f"nothing prepared: {b_after!r}"
+    )
+    assert b_after == b_before, (
+        f"the substituted store was modified: {b_before!r} -> {b_after!r}"
+    )
+
+    # THE WINDOW ITSELF. Zero is the property; anything else is an interval a
+    # rename can live in, and no number of checks closes an interval.
+    assert resolutions == [], (
+        "the boundary resolved the prepared copy's pathname again after the "
+        f"preparer had already opened it: {resolutions!r}. That interval is "
+        "where A->B->A lands, and it is invisible to a check on either side"
+    )
+
+    if result["returned"] is not None:
+        # It operated, so it must have operated on the artifact that was
+        # prepared — identified, not assumed.
+        assert facts["outcome"] == "committed", f"{facts!r}"
+        assert a_after["readable"] is True, f"the prepared copy is unreadable: {a_after!r}"
+        assert a_after["user_version"] == 111, (
+            "the rollback committed against a store that is not the one "
+            f"prepared: {a_after!r}"
+        )
+        assert a_after["triggers"] == 0, (
+            f"the prepared copy was not the one rehearsed: {a_after!r}"
+        )
+        assert a_after["integrity"] == "ok", f"{a_after!r}"
+        landed = _identify(backup)
+        assert landed["readable"] and landed["user_version"] == 111, (
+            f"the backup describes a store nothing prepared: {landed!r}"
+        )
+        assert landed["triggers"] == 24, (
+            f"the backup was not taken before the drops: {landed!r}"
+        )
+    else:
+        # It refused, so nothing may have moved on either store.
+        assert facts["outcome"] not in ("committed", "commit-unknown"), f"{facts!r}"
+        assert facts["changed"] is False, f"{facts!r}"
+        assert a_after["readable"] is True, f"the prepared copy is unreadable: {a_after!r}"
+        assert a_after["user_version"] == 111 and a_after["triggers"] == 24, (
+            f"a refused run moved the prepared copy: {a_after!r}"
+        )
+        assert not backup.exists(), "a refused run left a backup behind"
+
+
 PINS = {
     "check_the_verb_is_registered_under_sessions_and_names_its_target":
         check_the_verb_is_registered_under_sessions_and_names_its_target,
@@ -3581,6 +3758,8 @@ PINS = {
         check_a_lease_taken_after_preflight_still_refuses_the_rollback,
     "check_a_target_swapped_for_another_valid_store_is_refused":
         check_a_target_swapped_for_another_valid_store_is_refused,
+    "check_a_target_swapped_and_restored_around_the_open_cannot_be_reached":
+        check_a_target_swapped_and_restored_around_the_open_cannot_be_reached,
     "check_a_destination_appearing_after_the_check_is_never_clobbered":
         check_a_destination_appearing_after_the_check_is_never_clobbered,
     "check_an_orphan_backup_sidecar_is_not_overwritten":
@@ -3697,8 +3876,9 @@ SOURCE_MUTATIONS = (
     Mutation(
         pin="check_every_preflight_refusal_leaves_the_artifact_byte_identical",
         module="hermes_cli/session_fence_rollback.py",
-        find="        _refuse_if_live(copy, report_as=store_path)\n",
-        replace="        _refuse_if_live(store_path)\n",
+        find="        owned = _live_holders_inside_the_transaction(prepared.connection, copy)\n",
+        replace="        owned = _live_holders_inside_the_transaction(prepared.connection, copy)\n"
+                "        SessionDB(db_path=store_path).close()\n",
         why="pointing the liveness check at the operator's store is how the "
             "inspection constructs the thing it is inspecting: SessionDB's "
             "schema init writes, so a refusal has already rewritten the file "
@@ -3707,9 +3887,9 @@ SOURCE_MUTATIONS = (
     Mutation(
         pin="check_a_lease_taken_after_preflight_still_refuses_the_rollback",
         module="hermes_cli/session_fence_rollback.py",
-        find="            private_copy.verify()\n"
-             "            _decide_under_the_lock(conn, reported, expected, bound=None)\n",
-        replace="            private_copy.verify()\n",
+        find="        private_copy.verify()\n"
+             "        _decide_under_the_lock(conn, reported, expected, bound=None)\n",
+        replace="        private_copy.verify()\n",
         why="without the SECOND liveness decision the boundary trusts an "
             "answer taken before the backup, and the backup is exactly when "
             "the lock is released — a turn acquired in that window watches "
@@ -3717,11 +3897,25 @@ SOURCE_MUTATIONS = (
             "cover it: identity is not liveness",
     ),
     Mutation(
+        pin="check_a_target_swapped_and_restored_around_the_open_cannot_be_reached",
+        module="hermes_cli/session_fence_rollback.py",
+        find="    conn = private_copy.connection\n",
+        replace="    conn = sqlite3.connect(\n"
+                "        str(target_path), isolation_level=None, timeout=1.0\n"
+                "    )\n",
+        why="re-opening by pathname restores the interval between the last "
+            "identity check and the open. A->B->A lands inside it and is "
+            "invisible to a stat on either side, so the rollback commits "
+            "against a store nothing prepared and leaves the substituted one "
+            "corrupted, reporting success. Every identity check stays in "
+            "place, which is the point — checks do not close intervals",
+    ),
+    Mutation(
         pin="check_a_target_swapped_for_another_valid_store_is_refused",
         module="hermes_cli/session_fence_rollback.py",
-        find="            private_copy.verify()\n"
-             "            _decide_under_the_lock(conn, reported, expected, bound=None)\n",
-        replace="            _decide_under_the_lock(conn, reported, expected, bound=None)\n",
+        find="        private_copy.verify()\n"
+             "        _decide_under_the_lock(conn, reported, expected, bound=None)\n",
+        replace="        _decide_under_the_lock(conn, reported, expected, bound=None)\n",
         why="without re-establishing identity at the point of use the target "
             "is bound to a NAME again, and a different valid fenced store "
             "moved to that name passes every consistency check while the "
@@ -3997,8 +4191,8 @@ SOURCE_MUTATIONS = (
     Mutation(
         pin="check_a_fault_after_commit_never_reports_that_nothing_changed",
         module="hermes_cli/session_fence_rollback.py",
-        find='                outcome.advance("commit-unknown")\n',
-        replace="                pass\n",
+        find='            outcome.advance("commit-unknown")\n',
+        replace="            pass\n",
         why="a COMMIT that raised may have landed. Leaving the ledger at "
             "'committing' resolves that into whatever the reader assumes, and "
             "the assumption an operator makes about a run that reported a "

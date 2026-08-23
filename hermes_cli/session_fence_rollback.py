@@ -200,6 +200,30 @@ def _installed_fence_triggers(store_path: Path, *, report_as: Path = None) -> li
         cleanup_without_displacing(conn.close)
 
 
+def _fence_triggers_on(conn, reported: Path) -> list[str]:
+    """The fence surface, read through a HELD connection.
+
+    The pathname version below opens by name, which is a second resolution of
+    something already decided about. Every read of the private copy comes
+    through here instead, so the surface that is verified and the store that is
+    mutated are the same object and not two lookups that agreed.
+    """
+    try:
+        return sorted(
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+                "AND name LIKE 'hermes_turn_fence_%'"
+            ).fetchall()
+        )
+    except sqlite3.DatabaseError as exc:
+        raise TurnFenceRollbackRefused(
+            f"{reported} does not read as a SQLite database: {exc}. "
+            "Nothing was changed",
+            reason="store-unreadable",
+        ) from exc
+
+
 def _refuse_unexpected_surface(store_path: Path, installed, expected) -> None:
     if list(installed) == list(expected):
         return
@@ -286,42 +310,6 @@ def _live_holders_inside_the_transaction(conn, identity_path: Path) -> list[str]
             stand_in, str(row["conversation_id"]), row
         )
     )
-
-
-def _refuse_if_live(store_path: Path, *, report_as: Path = None) -> None:
-    """Refuse unless every conversation in the store is free.
-
-    Delegates to :meth:`SessionDB.offline_rebuild`, which is the one predicate
-    in the tree for "is this store idle enough to rewrite wholesale". Asking
-    the question a second way here would let the two answers drift, and the
-    interesting drift is the one where this module says idle and the store
-    disagrees.
-
-    NEVER POINTED AT THE OPERATOR'S STORE. ``SessionDB(db_path=…)`` runs schema
-    init, and schema init WRITES — it re-creates triggers ``IF NOT EXISTS`` and
-    normalises ``messages.active``. Asking "is this store idle" through it
-    therefore initialises the store it is asking about, and a refusal that has
-    already rewritten the file cannot claim the file is as it was found. That
-    was measured: a ``live-turn`` refusal moved ``state.db``'s digest on both
-    SQLite builds. So the caller hands this a byte-faithful COPY and names the
-    real store in *report_as*.
-
-    This is an early, cheap answer and NOT the authority. The decision the
-    rollback acts on is :func:`_live_holders_inside_the_transaction`, taken
-    under the same lock as the DDL.
-    """
-    reported = Path(report_as) if report_as is not None else store_path
-    db = SessionDB(db_path=store_path)
-    try:
-        with db.offline_rebuild(reason="turn-fence rollback"):
-            pass
-    except SessionTurnLeaseLostError as exc:
-        raise TurnFenceRollbackRefused(
-            f"refusing to roll back the turn fence on {reported}: {exc}",
-            reason="live-turn",
-        ) from exc
-    finally:
-        cleanup_without_displacing(db.close)
 
 
 def _refuse_unusable_backup_path(backup_path: Path) -> None:
@@ -424,7 +412,9 @@ class _PrivateCopy:
         operation while the operator's artifact may not be touched.
     """
 
-    def __init__(self, sentinel, path: Path, work_dir: Path, identity) -> None:
+    def __init__(
+        self, sentinel, path: Path, work_dir: Path, identity, connection
+    ) -> None:
         if sentinel is not _ONLY_THE_PREPARER:
             raise TypeError(
                 "a private copy is built by prepare_the_private_copy, in "
@@ -436,6 +426,19 @@ class _PrivateCopy:
         self.path = Path(path)
         self.work_dir = Path(work_dir)
         self.identity = identity
+        #: THE OBJECT, not a name for it. Opened once by the preparer, in the
+        #: same call that created the file, and carried through decide →
+        #: backup → DDL. Nothing downstream resolves the pathname again, so
+        #: there is no window for a substitution to land in — the property
+        #: holds by construction rather than by checking more often.
+        self.connection = connection
+
+    def close(self) -> None:
+        """Release the held connection. The copy itself is swept with its dir."""
+        try:
+            self.connection.close()
+        except Exception:  # pragma: no cover - already closed
+            pass
 
     def verify(self) -> None:
         """Re-establish, at the point of use, what the preparer recorded.
@@ -521,8 +524,18 @@ def prepare_the_private_copy(
         bound=bound,
     )
     info = os.lstat(copy)
+    # OPENED HERE, and never re-opened. One pathname resolution for the whole
+    # life of this artifact, at the instant it was created inside a directory
+    # this process made and named.
+    try:
+        connection = sqlite3.connect(str(copy), isolation_level=None, timeout=1.0)
+    except sqlite3.DatabaseError as exc:
+        raise TurnFenceRollbackRefused(
+            f"the private copy of {store_path} could not be opened: {exc}",
+            reason="store-unreadable",
+        ) from exc
     return _PrivateCopy(
-        _ONLY_THE_PREPARER, copy, private, (info.st_dev, info.st_ino)
+        _ONLY_THE_PREPARER, copy, private, (info.st_dev, info.st_ino), connection
     )
 
 
@@ -1733,11 +1746,20 @@ def preflight_turn_fence_rollback(
         copy = prepared.path
 
         expected = sorted(rollback_trigger_names())
-        installed = _installed_fence_triggers(copy, report_as=store_path)
+        installed = _fence_triggers_on(prepared.connection, store_path)
         _refuse_unexpected_surface(store_path, installed, expected)
         progress["surface_verified"] = True
 
-        _refuse_if_live(copy, report_as=store_path)
+        # Keyed by the COPY's path, which is what routing this through
+        # SessionDB used to do. The authoritative decision is taken again
+        # inside the boundary and keyed by the store the operator named.
+        owned = _live_holders_inside_the_transaction(prepared.connection, copy)
+        if owned:
+            raise TurnFenceRollbackRefused(
+                f"refusing to roll back the turn fence on {store_path}: "
+                f"conversation(s) a live turn owns ({', '.join(owned)})",
+                reason="live-turn",
+            )
         progress["offline_verified"] = True
 
         _refuse_unusable_backup_path(backup_path)
@@ -1844,82 +1866,84 @@ def _commit_the_rollback(
     target_path = private_copy.path
     backup_path = Path(backup_path)
     reported = Path(report_as) if report_as is not None else target_path
-    conn = sqlite3.connect(str(target_path), isolation_level=None, timeout=1.0)
+    # THE HELD OBJECT. Not sqlite3.connect(target_path) — that was a second
+    # resolution of a pathname this run had already decided about, and a
+    # rename to a valid substitute and back, landing between verify() and the
+    # open, committed the rollback against the wrong file and corrupted the
+    # substitute while reporting success. Reproduced on SQLite 3.53.1.
+    conn = private_copy.connection
+    # 1. DECIDE.
     try:
-        # 1. DECIDE.
-        try:
-            conn.execute("BEGIN EXCLUSIVE")
-        except sqlite3.OperationalError as exc:
-            raise TurnFenceRollbackRefused(
-                f"exclusive ownership of {reported} could not be "
-                f"established, so it is not offline: {exc}",
-                reason="not-exclusive",
-            ) from exc
-        try:
-            _decide_under_the_lock(conn, reported, expected, bound=None)
-            expected_rows = _canonical_rows(conn)
-        finally:
-            # ROLLBACK, not COMMIT, and not only for tidiness. The decision
-            # phase writes nothing, so rolling back is what actually happened;
-            # and it leaves exactly one COMMIT in this module, which is the one
-            # whose outcome an operator has to be told about.
-            cleanup_without_displacing(lambda: conn.execute("ROLLBACK"))
-        if outcome is not None:
-            outcome.advance("preflight-passed")
-
-        # 2. BACK UP, on this connection, with no transaction open.
-        backup = _make_verified_backup(
-            conn, reported, backup_path,
-            expected_rows=expected_rows,
-            expected_triggers=list(expected),
-            outcome=outcome,
-        )
-
-        # 3. DECIDE AGAIN, AND ACT — one transaction over both.
-        try:
-            conn.execute("BEGIN EXCLUSIVE")
-        except sqlite3.OperationalError as exc:
-            _remove_a_backup_this_run_wrote(
-                backup_path, backup["identity"], outcome
-            )
-            raise TurnFenceRollbackRefused(
-                f"exclusive ownership of {reported} could not be "
-                f"re-established after the backup: {exc}",
-                reason="not-exclusive",
-            ) from exc
-        try:
-            private_copy.verify()
-            _decide_under_the_lock(conn, reported, expected, bound=None)
-            for name in expected:
-                conn.execute(f"DROP TRIGGER {name}")
-        except BaseException:
-            conn.execute("ROLLBACK")
-            _remove_a_backup_this_run_wrote(
-                backup_path, backup["identity"], outcome
-            )
-            raise
-
-        if outcome is not None:
-            outcome.advance("committing")
-        try:
-            conn.execute("COMMIT")
-        except BaseException as exc:
-            # NOT rolled back, and not reported as unchanged. SQLite may have
-            # committed and failed afterwards; "it raised" does not decide
-            # which, and neither may this.
-            if outcome is not None:
-                outcome.advance("commit-unknown")
-            raise TurnFenceRollbackRefused(
-                f"the COMMIT of the rollback on {reported} raised ({exc}). "
-                "Whether the transaction landed is UNKNOWN — do not assume the "
-                f"fence is still installed. The verified backup is at "
-                f"{backup_path}",
-                reason="commit-unknown",
-            ) from exc
-        if outcome is not None:
-            outcome.advance("committed")
+        conn.execute("BEGIN EXCLUSIVE")
+    except sqlite3.OperationalError as exc:
+        raise TurnFenceRollbackRefused(
+            f"exclusive ownership of {reported} could not be "
+            f"established, so it is not offline: {exc}",
+            reason="not-exclusive",
+        ) from exc
+    try:
+        _decide_under_the_lock(conn, reported, expected, bound=None)
+        expected_rows = _canonical_rows(conn)
     finally:
-        cleanup_without_displacing(conn.close)
+        # ROLLBACK, not COMMIT, and not only for tidiness. The decision
+        # phase writes nothing, so rolling back is what actually happened;
+        # and it leaves exactly one COMMIT in this module, which is the one
+        # whose outcome an operator has to be told about.
+        cleanup_without_displacing(lambda: conn.execute("ROLLBACK"))
+    if outcome is not None:
+        outcome.advance("preflight-passed")
+
+    # 2. BACK UP, on this connection, with no transaction open.
+    backup = _make_verified_backup(
+        conn, reported, backup_path,
+        expected_rows=expected_rows,
+        expected_triggers=list(expected),
+        outcome=outcome,
+    )
+
+    # 3. DECIDE AGAIN, AND ACT — one transaction over both.
+    try:
+        conn.execute("BEGIN EXCLUSIVE")
+    except sqlite3.OperationalError as exc:
+        _remove_a_backup_this_run_wrote(
+            backup_path, backup["identity"], outcome
+        )
+        raise TurnFenceRollbackRefused(
+            f"exclusive ownership of {reported} could not be "
+            f"re-established after the backup: {exc}",
+            reason="not-exclusive",
+        ) from exc
+    try:
+        private_copy.verify()
+        _decide_under_the_lock(conn, reported, expected, bound=None)
+        for name in expected:
+            conn.execute(f"DROP TRIGGER {name}")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        _remove_a_backup_this_run_wrote(
+            backup_path, backup["identity"], outcome
+        )
+        raise
+
+    if outcome is not None:
+        outcome.advance("committing")
+    try:
+        conn.execute("COMMIT")
+    except BaseException as exc:
+        # NOT rolled back, and not reported as unchanged. SQLite may have
+        # committed and failed afterwards; "it raised" does not decide
+        # which, and neither may this.
+        if outcome is not None:
+            outcome.advance("commit-unknown")
+        raise TurnFenceRollbackRefused(
+            f"the COMMIT of the rollback on {reported} raised ({exc}). "
+            "Whether the transaction landed is UNKNOWN — do not assume the "
+            f"fence is still installed. The verified backup is at "
+            f"{backup_path}",
+            reason="commit-unknown",
+        ) from exc
+    if outcome is not None:
+        outcome.advance("committed")
     return backup
 
 
@@ -2094,6 +2118,7 @@ def rehearse_turn_fence_rollback(
             store_path, backup_path=backup_path, work_dir=work_dir, bound=bound
         )
     copy = Path(plan["copy"])
+    prepared = plan["private_copy"]
     try:
         _commit_the_rollback(
             plan["private_copy"],
@@ -2116,7 +2141,7 @@ def rehearse_turn_fence_rollback(
         }
         raise refused from exc
 
-    remaining = _installed_fence_triggers(copy, report_as=store_path)
+    remaining = _fence_triggers_on(plan["private_copy"].connection, store_path)
     if remaining:
         raise TurnFenceRollbackRefused(
             f"the rehearsal ran on a copy of {store_path} and left "
@@ -2125,6 +2150,7 @@ def rehearse_turn_fence_rollback(
             reason="rehearsal-incomplete",
         )
 
+    prepared.close()
     established = {
         "store": str(store_path),
         "backup_path": str(backup_path),
