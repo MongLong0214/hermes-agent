@@ -10960,6 +10960,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     def set_latest_matching_message_display_kind(
         self, session_id: str, *, role: str, content: str, display_kind: str,
         display_metadata: Optional[Dict[str, Any]] = None,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> bool:
         """Stamp presentation metadata on this turn's freshly persisted row.
 
@@ -10967,11 +10969,35 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         CLI synthetic inputs call this immediately after their serial turn has
         flushed, preserving producer provenance without classifying by content
         during transcript rendering.
+
+        THAT LAST PARAGRAPH IS TRUE AND IT IS NOT THE WHOLE WRITE
+            ``display_metadata`` is the column reactions live in —
+            :data:`REACTIONS_METADATA_KEY` is a key inside it, chosen so
+            reactions survive rewind and compaction with the row — and the
+            statement below REPLACES the column rather than merging into it,
+            with the parameter defaulting to ``None`` (encoded: NULL).
+
+            So a stamp on a row carrying an unconsumed reaction deletes that
+            reaction, and the announcement the next turn was going to make is
+            gone with no error anywhere. That is model context, however the
+            write is described, and it takes the same admission as any other.
+            The one production call site already holds a grant; this closes the
+            mutator, which is what a second caller reaches.
         """
         if not session_id or not content or not display_kind:
             return False
 
         def _do(conn):
+            # display_metadata is where reactions live, and this statement
+            # REPLACES the column. A holderless stamp therefore deletes a
+            # pending announcement, which is model context however the
+            # docstring describes the write.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             row = conn.execute(
                 "SELECT id FROM messages WHERE session_id = ? AND role = ? "
                 "AND content = ? AND active = 1 ORDER BY id DESC LIMIT 1",
