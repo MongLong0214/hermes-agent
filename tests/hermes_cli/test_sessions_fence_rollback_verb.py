@@ -1617,16 +1617,12 @@ SOURCE_MUTATIONS = (
         pin="check_a_live_turn_refuses_the_verb_and_no_row_or_trigger_moves",
         module="hermes_cli/session_fence_rollback.py",
         find=(
-            "    except SessionTurnLeaseLostError as exc:\n"
             "        raise TurnFenceRollbackRefused(\n"
-            '            f"refusing to roll back the turn fence on {store_path}: {exc}",\n'
+            '            f"refusing to roll back the turn fence on {reported}: {exc}",\n'
             '            reason="live-turn",\n'
             "        ) from exc\n"
         ),
-        replace=(
-            "    except SessionTurnLeaseLostError:\n"
-            "        pass\n"
-        ),
+        replace="        return\n",
         why="swallowing the liveness refusal is how a rollback runs mid-turn: "
             "the triggers come off a conversation somebody owns and the next "
             "write from a pre-fence binary interleaves with it",
@@ -1660,11 +1656,8 @@ SOURCE_MUTATIONS = (
     Mutation(
         pin="check_the_dry_run_refuses_what_the_real_run_would_refuse",
         module="hermes_cli/session_fence_rollback.py",
-        find=(
-            "        _refuse_if_this_process_owns_a_turn"
-            "(copy, identity_path=store_path)\n"
-        ),
-        replace="        pass\n",
+        find="            report_as=store_path,\n",
+        replace="            report_as=None,\n",
         why="without it the rehearsal asks the liveness question of a copy, "
             "and the one branch of the predicate that is keyed by the store's "
             "PATH answers about the wrong file — so a conversation this "
@@ -1698,8 +1691,8 @@ SOURCE_MUTATIONS = (
     Mutation(
         pin="check_a_target_swapped_for_another_valid_store_is_refused",
         module="hermes_cli/session_fence_rollback.py",
-        find="        if (now.st_dev, now.st_ino) != self.identity:\n",
-        replace="        if False:\n",
+        find="        with BoundTarget(store_path) as bound:\n",
+        replace="        if True:\n            bound = None\n",
         why="with the identity comparison gone the operation is bound to a "
             "NAME again, and a different valid fenced store moved to that name "
             "passes every consistency check while the backup describes the "
@@ -1724,18 +1717,15 @@ SOURCE_MUTATIONS = (
     Mutation(
         pin="check_an_orphan_backup_sidecar_is_not_overwritten",
         module="hermes_cli/session_fence_rollback.py",
-        find=(
-            "        for candidate in [backup_path]\n"
-            "        + [\n"
-            "            backup_path.with_name(backup_path.name + suffix)\n"
-            "            for suffix in _SIDECAR_SUFFIXES\n"
-            "        ]\n"
-        ),
-        replace="        for candidate in [backup_path]\n",
-        why="checking only the name the operator typed leaves the rest of the "
-            "destination family unguarded — an orphaned backup.db-wal is a "
-            "destination too, and 'the path you named does not exist' is true "
-            "and useless while that file is overwritten",
+        find='_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")\n',
+        replace="_SIDECAR_SUFFIXES = ()\n",
+        why="an orphaned backup.db-wal is a destination too, and narrowing the "
+            "family to the one name the operator typed is what makes it "
+            "invisible. Aimed at the DECLARATION rather than at either guard "
+            "on purpose: the family pre-check is load-bearing on a "
+            "journal_mode=DELETE build and redundant on a WAL one, where the "
+            "exclusive create refuses first — a mutation aimed at either guard "
+            "alone scores a kill on one SQLite and none on the other",
     ),
     Mutation(
         pin="check_a_dry_run_that_cannot_clean_up_does_not_report_success",
@@ -1762,8 +1752,16 @@ SOURCE_MUTATIONS = (
     Mutation(
         pin="check_the_completed_run_reports_the_surface_it_removed",
         module="hermes_cli/session_fence_rollback_cmd.py",
-        find='            "dropped_triggers": report["dropped_triggers"],\n',
-        replace='            "dropped_triggers": [],\n',
+        find=(
+            '            "installed_triggers": report["installed_triggers"],\n'
+            '            "dropped_triggers": report["dropped_triggers"],\n'
+            '            "preflight": report["preflight"],\n'
+        ),
+        replace=(
+            '            "installed_triggers": [],\n'
+            '            "dropped_triggers": [],\n'
+            '            "preflight": report["preflight"],\n'
+        ),
         why="a success report that does not name the surface it removed "
             "leaves nothing in the output to distinguish a full rollback from "
             "a partial one, and the operator is back to checking by hand",
