@@ -476,14 +476,16 @@ SOURCE_MUTATIONS = (
     Mutation(
         pin="check_a_live_owner_process_survives_the_contender_and_its_deadline",
         module="hermes_state.py",
-        find="        if pid <= 0 or pid == os.getpid() or psutil is None:\n"
-             "            return False\n",
-        replace="        if pid <= 0 or pid == os.getpid() or psutil is None:\n"
-                "            return True\n",
-        why="this is the conservative half of the liveness predicate — "
-            "'cannot decide' answers not-dead. Flipping it declares every "
-            "owner this host cannot probe to be gone, and the contender walks "
-            "in while the owner is still answering",
+        find="        if owner_pid and int(owner_pid) == os.getpid():\n"
+             "            return live_turn_grant(self.db_path, conversation_id) is None\n"
+             "        return False\n",
+        replace="        if owner_pid and int(owner_pid) == os.getpid():\n"
+                "            return live_turn_grant(self.db_path, conversation_id) is None\n"
+                "        return True\n",
+        why="the final answer for a FOREIGN owner is 'never free' — alive, or "
+            "alive as far as we can tell. Flipping it hands a conversation "
+            "whose owner is answering a PING to the first contender that asks, "
+            "with the deadline still ahead",
     ),
     Mutation(
         pin="check_a_live_owner_process_survives_the_contender_and_its_deadline",
