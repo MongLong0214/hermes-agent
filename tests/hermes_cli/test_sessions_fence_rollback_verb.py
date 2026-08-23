@@ -1608,13 +1608,16 @@ SOURCE_MUTATIONS = (
         pin="check_a_destination_appearing_after_the_check_is_never_clobbered",
         module="hermes_cli/session_fence_rollback.py",
         find=(
+            "    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY\n"
+            '    flags |= getattr(os, "O_NOFOLLOW", 0)\n'
+            '    flags |= getattr(os, "O_BINARY", 0)\n'
             "    handle = os.open(destination, flags, 0o600)\n"
-            "    reader = source_handle if source_handle is not None "
-            'else open(source, "rb")\n'
-            '    with reader, os.fdopen(handle, "wb") as writer:\n'
-            "        shutil.copyfileobj(reader, writer)\n"
         ),
-        replace="    shutil.copyfile(source, destination)\n",
+        replace=(
+            "    flags = os.O_CREAT | os.O_TRUNC | os.O_WRONLY\n"
+            '    flags |= getattr(os, "O_BINARY", 0)\n'
+            "    handle = os.open(destination, flags, 0o600)\n"
+        ),
         why="restoring overwrite-capable creation is the defect itself: "
             "copyfile truncates whatever it opens, so anything that appeared "
             "between the existence check and the write is destroyed. No "
