@@ -8288,6 +8288,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         such a caller could hold that would make the stale write correct, so
         while somebody owns the conversation the write is refused.
         """
+        # Refuse before the barrier below spends anything (update_session_meta).
+        self._refuse_before_side_effects(session_id, turn_lease_holder)
         # Barrier against queued token deltas — see update_session_model.
         self.flush_token_counts()
 
@@ -8391,6 +8393,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # first_accounted_route overwrite in update_token_counts (row sees
         # api_call_count == 0 + a route mismatch) and resurrect the old
         # model/provider. Flushing here restores the pre-queue ordering.
+        #
+        # ...and the flush is a side effect, so admission has to be asked first
+        # or a REFUSED switch has already spent the queue. See
+        # _refuse_before_side_effects; the guard inside _do stays the authority.
+        # Refuse before the barrier below spends anything (update_session_model).
+        self._refuse_before_side_effects(session_id, turn_lease_holder)
         self.flush_token_counts()
 
         def _do(conn):
@@ -8740,6 +8748,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         method belongs on the fence surface for what it can reach, not for what
         it is named after.
         """
+        # Refuse before the barrier below spends anything (update_session_billing_route).
+        self._refuse_before_side_effects(session_id, turn_lease_holder)
         # Barrier against queued token deltas — see update_session_model.
         self.flush_token_counts()
 
@@ -10727,6 +10737,74 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             type(display_metadata).__name__,
         )
         return None
+
+    def _refuse_before_side_effects(self, session_id: str, turn_lease_holder) -> None:
+        """Refuse a fenced write BEFORE its pre-transaction side effects.
+
+        ADVISORY, NEVER AUTHORITY. This reads outside the write transaction, so
+        its answer can be stale by the time the write would run.
+        :meth:`_check_turn_lease_guard` inside ``BEGIN IMMEDIATE`` remains the
+        only thing that admits anything; this can only refuse earlier. It is
+        deliberately incapable of admitting: returning normally means "no
+        finding", not "authorized".
+
+        WHY IT HAS TO EXIST
+            Three fenced methods run ``flush_token_counts()`` before their
+            write transaction, and they have to: a delta enqueued before a
+            model switch carries the PRE-switch route, and applying it after
+            the UPDATE trips ``update_token_counts``'s ``first_accounted_route``
+            branch and resurrects the old model. The flush cannot move inside
+            ``_do`` either — it drains a background writer that takes the write
+            lock itself, so an open ``BEGIN IMMEDIATE`` would deadlock against
+            it.
+
+            With the barrier before the guard, a REFUSED call had already
+            applied the queued deltas to the database and drained the in-process
+            queue. Measured: DB usage 0 -> 9, queue 1 -> 0, switch refused. A
+            caller that catches the refusal and reports "nothing happened" is
+            wrong twice, and the spent deltas were spent under the very route
+            the switch was refused from changing.
+
+        THE ONE COST, STATED
+            A lease released between this read and the write turns an
+            admissible call into a refused one. The window is a few
+            microseconds and it means a turn just ended; the alternative is
+            spending a caller's accounting on every refusal, which is not a
+            window but a certainty.
+        """
+        if not session_id:
+            return
+        try:
+            with self._read_ctx() as conn:
+                if turn_lease_holder:
+                    if self._authorize_turn_lease_token(
+                        conn, session_id, turn_lease_holder
+                    ) is not None:
+                        return
+                    detail = (
+                        f"Session turn lease lost; refusing context write "
+                        f"for {session_id!r}"
+                    )
+                else:
+                    conversation_id, lease = self._read_turn_lease_on_conn(
+                        conn, session_id
+                    )
+                    if lease is None or self._turn_lease_row_is_free(
+                        conversation_id, lease
+                    ):
+                        return
+                    detail = (
+                        f"Session turn lease held by {lease['holder']!r} "
+                        f"(epoch {lease['epoch']}); refusing unfenced write "
+                        f"for {session_id!r}"
+                    )
+        except sqlite3.Error:
+            # Cannot tell from out here. Say nothing: the in-transaction guard
+            # still runs and is the authority. A read failure must not admit
+            # what that guard would refuse, and it does not — it only forgoes
+            # refusing early, which costs the side effects and nothing else.
+            return
+        raise SessionTurnLeaseLostError(detail)
 
     def _check_turn_lease_guard(
         self,
