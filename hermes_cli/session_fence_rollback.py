@@ -496,6 +496,31 @@ class _PrivateCopy:
                 f"plain file (links={here.st_nlink})",
                 reason=DISQUALIFICATION_REASONS["namespace"],
             )
+        # BOTH CHECKS BELOW ARE POSIX SEMANTICS, so both are refused together.
+        #
+        # `os.getuid` is absent on Windows, and `st_mode`'s permission bits do
+        # not carry POSIX ownership meaning there either -- so gating only the
+        # line a checker flags would leave the mode check reading a number that
+        # means something else. The relation this needs is "st_uid/st_mode carry
+        # POSIX ownership semantics"; `hasattr(os, "getuid")` is the standard
+        # proxy for it, named here rather than left implicit.
+        #
+        # REFUSE, DO NOT SKIP. Wrapping these in a hasattr() and continuing
+        # would make the ownership guarantee silently vanish on Windows: the
+        # private directory could be owned by anyone and the verb would proceed.
+        # A check that CANNOT RUN reporting the same thing as a check that
+        # PASSED is the defect this whole slice exists to remove.
+        #
+        # The reason is already exactly right: we cannot establish that the
+        # private directory is owner-only and ours, so we cannot establish
+        # offline authority.
+        if not hasattr(os, "getuid"):
+            raise TurnFenceRollbackRefused(
+                f"POSIX ownership semantics are unavailable on this platform, "
+                f"so nothing here can establish that the private directory "
+                f"{self.work_dir} is owner-only and owned by this process",
+                reason="offline-authority-unknown",
+            )
         if not _stat.S_ISDIR(holder.st_mode) or _stat.S_IMODE(holder.st_mode) & 0o077:
             raise TurnFenceRollbackRefused(
                 f"the private directory {self.work_dir} is no longer owner-only "
@@ -503,7 +528,7 @@ class _PrivateCopy:
                 "it is reachable by something this run did not account for",
                 reason="offline-authority-unknown",
             )
-        if holder.st_uid != os.getuid():
+        if holder.st_uid != os.getuid():  # windows-footgun: ok — unreachable without hasattr(os, "getuid"); the platform refusal above raises first
             raise TurnFenceRollbackRefused(
                 f"the private directory {self.work_dir} is not owned by this "
                 "process",
@@ -1063,7 +1088,12 @@ class BoundTarget:
         successful copy. The byte-digest check caught exactly that; this is the
         cause it caught.
         """
-        handle = os.fdopen(os.dup(self.fd), "rb", closefd=True)
+        # The rule's first-argument pattern `[^,)]+` stops at the `)` of the
+        # nested os.dup() and never reaches the mode, so its post_filter sees
+        # mode=None and cannot apply its own binary-mode exclusion. Verified by
+        # running the rule's own pattern: this line yields mode=None, while
+        # `os.fdopen(handle, "wb")` yields mode='wb'.
+        handle = os.fdopen(os.dup(self.fd), "rb", closefd=True)  # windows-footgun: ok — mode is "rb"; regex cannot see past the nested os.dup()
         handle.seek(0)
         return handle
 

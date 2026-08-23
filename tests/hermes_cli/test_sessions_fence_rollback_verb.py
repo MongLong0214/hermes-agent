@@ -3277,7 +3277,75 @@ def check_a_late_failure_does_not_retract_what_already_happened(
     )
 
 
+def check_a_platform_without_posix_ownership_refuses_rather_than_skipping(tmpdir):
+    """Where ownership CANNOT be established, the verb refuses. It does not skip.
+
+    `os.getuid` does not exist on Windows, and `st_mode`'s permission bits do
+    not carry POSIX ownership meaning there either. The tempting one-line fix --
+    wrap the call in `hasattr(os, "getuid")` and continue -- makes the ownership
+    guarantee silently vanish: the private directory could be owned by anyone
+    and the run would proceed. A check that CANNOT RUN would then report the
+    same thing as a check that PASSED.
+
+    The contract already had the answer. Both adjacent checks refuse with
+    `offline-authority-unknown`, and on such a platform that reason is exactly
+    true: nothing available establishes that the directory is owner-only and
+    ours, so offline authority is not established.
+
+    The import is lazy (`from hermes_cli import session_fence_rollback as
+    rollback`, inside functions), so the missing attribute would surface at CALL
+    time, not import time -- which is why this pin drives the call rather than
+    asserting anything about importability.
+    """
+    _sandbox_home(tmpdir)
+    module, why = _import_verb()
+    assert module is not None, f"there is no fence-rollback verb: {why}"
+
+    from hermes_cli import session_fence_rollback as library
+
+    store = tmpdir / "state.db"
+    _fenced_store(store, leave_lease_live=False)
+    work_dir = tmpdir / "work"
+    work_dir.mkdir()
+
+    class _WindowsLikeOs:
+        """``os`` as Windows presents it: no POSIX ownership calls."""
+
+        def __getattr__(self, name):
+            if name in ("getuid", "geteuid", "getgid"):
+                raise AttributeError(name)
+            return getattr(os, name)
+
+    outcome = {"reason": "", "detail": "", "crash": "", "returned": None}
+    previous_os = library.os
+    library.os = _WindowsLikeOs()
+    try:
+        prepared = library.prepare_the_private_copy(store, work_dir=work_dir)
+        outcome["returned"] = prepared.verify()
+    except library.TurnFenceRollbackRefused as exc:
+        outcome["reason"] = getattr(exc, "reason", "refused")
+        outcome["detail"] = str(exc)
+    except BaseException as exc:  # noqa: BLE001 - carried, not swallowed
+        outcome["crash"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        library.os = previous_os
+
+    assert outcome["reason"] == "offline-authority-unknown", (
+        f"a platform without POSIX ownership semantics did not refuse with "
+        f"offline-authority-unknown: {outcome!r}. Skipping the check there "
+        f"would let a private directory owned by anyone through, and the run "
+        f"would report the same outcome as one whose ownership was verified"
+    )
+    assert not outcome["crash"], (
+        f"the run died instead of refusing: {outcome['crash']}. An "
+        f"AttributeError is not a refusal -- the caller cannot tell it from a "
+        f"bug, and nothing records why offline authority was unavailable"
+    )
+
+
 PINS = {
+    "check_a_platform_without_posix_ownership_refuses_rather_than_skipping":
+        check_a_platform_without_posix_ownership_refuses_rather_than_skipping,
     "check_the_verb_is_registered_under_sessions_and_names_its_target":
         check_the_verb_is_registered_under_sessions_and_names_its_target,
     "check_a_target_that_is_not_this_fence_is_refused_by_a_named_reason":
@@ -3378,6 +3446,7 @@ BOUNDARY_EVIDENCE = frozenset({
 #: Counting them as boundary coverage is the same error as counting the anchor
 #: guard as coverage of the verb.
 MAINTENANCE_ONLY = frozenset({
+    "check_a_platform_without_posix_ownership_refuses_rather_than_skipping",
     "check_a_cleanup_failure_never_replaces_the_refusal_that_decided_the_run",
     "check_a_completed_rollback_reports_the_surface_it_removed",
     "check_a_destination_appearing_after_the_check_is_never_clobbered",
@@ -4652,7 +4721,7 @@ def test_every_pin_is_in_exactly_one_evidence_bucket():
     # is exactly how a reported number stops matching the file without anyone
     # editing the number. A pin added to either bucket must move a digit here,
     # in the same commit, and that digit is what the report quotes.
-    assert (len(BOUNDARY_EVIDENCE), len(MAINTENANCE_ONLY)) == (8, 25), (
+    assert (len(BOUNDARY_EVIDENCE), len(MAINTENANCE_ONLY)) == (8, 26), (
         "the evidence census moved and the literals did not: boundary="
         f"{len(BOUNDARY_EVIDENCE)} maintenance={len(MAINTENANCE_ONLY)}. If the "
         "change is intended, update these numbers AND every place the split is "
@@ -4666,6 +4735,20 @@ def test_sessions_fence_rollback_verb_property(name, tmp_path):
 
 
 SOURCE_MUTATIONS = (
+    Mutation(
+        pin="check_a_platform_without_posix_ownership_refuses_rather_than_skipping",
+        module="hermes_cli/session_fence_rollback.py",
+        find='        if not hasattr(os, "getuid"):\n',
+        replace="        if False:\n",
+        kills_by="a platform without POSIX ownership semantics did not refuse with",
+        why="the one-line fix a checker suggests is to gate the getuid call and "
+            "CONTINUE, which deletes exactly this guard. With it gone the run "
+            "walks into the ownership comparison on a platform that has no "
+            "os.getuid, and dies with an AttributeError instead of refusing -- "
+            "so the pin must die at its REASON assertion, not at the crash "
+            "assertion beside it. As narrow as the property: one condition "
+            "disabled, both POSIX checks below left exactly as they were",
+    ),
     Mutation(
         pin="check_a_real_invocation_refuses_before_it_observes_the_source",
         module="hermes_cli/session_fence_rollback.py",
