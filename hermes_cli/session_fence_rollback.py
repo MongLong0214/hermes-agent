@@ -48,14 +48,21 @@ WHY IT EXISTS ANYWAY
        first ``DROP``; anything unexpected refuses the whole operation, and the
        drops commit together or not at all.
 
-WHO CALLS IT
+WHO CALLS IT, AND WHAT IS CURRENTLY REACHABLE
     ``hermes sessions fence-rollback`` — :mod:`hermes_cli.session_fence_rollback_cmd`
     — and nothing else in the tree. A library function is not an operator
-    surface: it has no exit code, no way to name which precondition stopped it,
-    and no rehearsal, so the runbook entry for it is a Python one-liner. The
-    verb supplies those three and re-derives none of this: it hands
-    :func:`preflight_turn_fence_rollback` and :func:`rollback_turn_fence` a
-    store and a backup path the operator typed, and reports what they return.
+    surface: it has no exit code and no way to name which precondition stopped
+    it, so the runbook entry for it would be a Python one-liner. The verb
+    supplies both and re-derives none of this.
+
+    EVERYTHING BELOW THE REFUSAL IS UNREACHABLE FROM THE VERB TODAY. Both entry
+    points — :func:`rollback_turn_fence` and
+    :func:`rehearse_turn_fence_rollback` — refuse before they observe the
+    store. The pre-flight, the private copy, the backup, the drops and the
+    commit are intact and still under test, and no invocation reaches them.
+    They are waiting on an artifact whose coherence and detachment its PRODUCER
+    establishes; until that exists, a test that exercises them is maintenance
+    evidence and says nothing about what the verb does.
 
 THE RETURN LEG
     Rollback is not a one-way door. ``_init_schema`` creates the triggers with
@@ -126,7 +133,11 @@ class TurnFenceRollbackRefused(RuntimeError):
     def __init__(self, message: str, *, reason: str = "refused") -> None:
         super().__init__(message)
         self.reason = reason
-        self.preflight: dict[str, bool] = _blank_preflight()
+        # EMPTY, not all-false. A refusal that never reached the pre-flight has
+        # no pre-flight result, and a block of false checks would claim each of
+        # them was performed and failed. The pre-flight fills this in when it
+        # actually runs; absent means it did not.
+        self.preflight: dict[str, bool] = {}
 
 
 def rollback_trigger_names() -> tuple[str, ...]:
@@ -542,18 +553,15 @@ def prepare_the_private_copy(
     This is also the pre-flight's copy. There is not a private one for the
     rehearsal and another for inspection — one artifact, prepared once, so the
     surface that was verified is the surface that is acted on.
+
+
+    UNREACHABLE FROM THE VERB. No invocation reaches this: both entry points
+    refuse before deriving anything. It is retained and under test so it does
+    not rot before the slice that supplies a provably coherent artifact, and
+    a test exercising it is maintenance evidence, not evidence about the
+    verb's boundary.
     """
     work_dir = Path(work_dir)
-    try:
-        work_dir.mkdir(parents=True, exist_ok=True)
-        private = Path(tempfile.mkdtemp(prefix="private-", dir=str(work_dir)))
-    except OSError as exc:
-        raise TurnFenceRollbackRefused(
-            f"there is nowhere under {work_dir} to prepare a private copy of "
-            f"{store_path}: {exc}",
-            reason="rehearsal-unwritable",
-        ) from exc
-    copy = private / "preflight.db"
 
     # THE MAIN IMAGE IS NOT THE STORE WHEN SIDECARS EXIST. A row committed into
     # an uncheckpointed -wal is in the database and not in the file, so an
@@ -573,6 +581,18 @@ def prepare_the_private_copy(
             "changed",
             reason="target-not-quiesced",
         )
+
+    try:
+        work_dir.mkdir(parents=True, exist_ok=True)
+        private = Path(tempfile.mkdtemp(prefix="private-", dir=str(work_dir)))
+    except OSError as exc:
+        raise TurnFenceRollbackRefused(
+            f"there is nowhere under {work_dir} to prepare a private copy of "
+            f"{store_path}: {exc}",
+            reason="rehearsal-unwritable",
+        ) from exc
+    copy = private / "preflight.db"
+
 
     # READ ONCE, THROUGH THE DESCRIPTOR THIS RUN ALREADY HOLDS. These bytes are
     # the artifact from here on: the on-disk copy below is written FROM them
@@ -707,14 +727,24 @@ def disqualify_the_target(artifact: Path) -> None:
     artifact = Path(artifact)
     try:
         info = os.lstat(artifact)
-    except OSError:
-        # Missing, unreadable, a directory: named by the checks that follow,
-        # which say more about it than this one could.
-        return
+    except FileNotFoundError:
+        raise TurnFenceRollbackRefused(
+            f"{artifact} is not a file", reason="store-missing"
+        ) from None
+    except OSError as exc:
+        raise TurnFenceRollbackRefused(
+            f"{artifact} could not be examined: {exc}", reason="store-unreadable"
+        ) from exc
     import stat as _stat
 
     if not _stat.S_ISREG(info.st_mode):
-        return
+        # A directory, a symlink, a device. Named here rather than left to a
+        # later check, because there is no later check any more: nothing opens
+        # the target, so a fact about the pathname is the only fact available.
+        raise TurnFenceRollbackRefused(
+            f"{artifact} is not a plain file, so it is not a rollback target",
+            reason="store-unreadable",
+        )
     if info.st_nlink != 1:
         raise TurnFenceRollbackRefused(
             f"{artifact} has {info.st_nlink} hard links, so another name "
@@ -1628,6 +1658,13 @@ def _make_verified_backup(
         the removal is proved, and a failure to remove it refuses the run
         BEFORE the drops — while keeping a backup that is already durable,
         because both facts are true and the operator needs both.
+
+
+    UNREACHABLE FROM THE VERB. No invocation reaches this: both entry points
+    refuse before deriving anything. It is retained and under test so it does
+    not rot before the slice that supplies a provably coherent artifact, and
+    a test exercising it is maintenance evidence, not evidence about the
+    verb's boundary.
     """
     _refuse_unusable_backup_path(backup_path)
 
@@ -1807,6 +1844,13 @@ def preflight_turn_fence_rollback(
         was told, not who has it open — and it is not what permits the
         rollback. What permits it is which target reached the mutating
         boundary at all, and only a copy this run prepared ever does.
+
+
+    UNREACHABLE FROM THE VERB. No invocation reaches this: both entry points
+    refuse before deriving anything. It is retained and under test so it does
+    not rot before the slice that supplies a provably coherent artifact, and
+    a test exercising it is maintenance evidence, not evidence about the
+    verb's boundary.
     """
     progress = _blank_preflight()
     try:
@@ -1934,6 +1978,13 @@ def _commit_the_rollback(
     A REFUSAL AFTER THE BACKUP TAKES THE BACKUP WITH IT, with one exception:
     staging residue, where the backup landed and something else went wrong.
     Deleting a good backup to keep a failure tidy is not cleanup.
+
+
+    UNREACHABLE FROM THE VERB. No invocation reaches this: both entry points
+    refuse before deriving anything. It is retained and under test so it does
+    not rot before the slice that supplies a provably coherent artifact, and
+    a test exercising it is maintenance evidence, not evidence about the
+    verb's boundary.
     """
     if not isinstance(private_copy, _PrivateCopy):
         raise TurnFenceRollbackRefused(
@@ -2165,89 +2216,64 @@ def rehearse_turn_fence_rollback(
     store_path: Path,
     *,
     backup_path: Path,
-    work_dir: Path,
+    work_dir: Path = None,
     outcome: "RollbackOutcome" = None,
 ) -> dict[str, Any]:
-    """Perform the REAL rollback on a disposable copy, then report the verdict.
+    """Refuses before it derives anything. There is no rehearsal to report.
 
-    Two halves, and the order is the point.
+    WHY THIS NO LONGER REHEARSES, WHICH IS A STATEMENT ABOUT THE INPUT
+        The rehearsal ran against a private copy assembled by reading the
+        source's main image after checking that no sidecars sat beside it.
+        Check and read are two operations, and a writer that commits into a
+        ``-wal`` in between leaves the check's answer true and the image short
+        of committed rows. Injected at exactly that point, on both SQLite
+        builds, the run went on to report ``outcome=committed``,
+        ``changed=true``, a verified and durable backup and a full
+        ``would_drop`` — every one of them derived from an image known to be
+        missing data. The marker was in ``state.db-wal`` and absent from the
+        main file.
 
-    THE OPERATION HAPPENS. The pre-flight already prepared a byte-faithful copy
-    in a private directory; this drives :func:`_commit_the_rollback` — the same
-    boundary, the same backup, the same in-transaction decisions — against that
-    copy. What comes back is not a prediction. The copy is the only artifact in
-    this build with offline authority, and it has it because of how it was
-    made, not because of anything read out of it.
+        A third existence check does not close it. The interval is what the
+        writer uses, and adding observations does not remove intervals — that
+        move has now failed three times in this slice, at three different
+        seams, and each time the next report was of the same shape one interval
+        later.
 
-    THEN THE VERDICT THE REAL RUN WILL GIVE. A dry run that reports "this would
-    proceed" about an operation that then refuses is worse than having no dry
-    run, because the operator types the real command on its say-so. So the
-    authority over the OPERATOR's artifact is established last, and the
-    refusal it raises carries what the rehearsal established — the operator
-    learns what the rollback would do AND why it will not be permitted, from
-    one invocation.
+        So this is not a guard that needs strengthening. It is what the input
+        is: **a private copy assembled by check-then-read cannot be proven
+        coherent against a live-capable source.** The rehearsal was therefore
+        never a weaker version of the real operation; on such a source it was
+        an operation on an artifact whose contents nobody can vouch for, and
+        every fact downstream inherited that — the backup, the surface, the
+        commit.
 
-    The store itself is never opened by SQLite: it is read as bytes, once.
+    WHAT IT DOES INSTEAD
+        Refuses, before a working directory is created, before the source is
+        opened, before any image is taken. What comes back is a refusal and
+        the reason for it, and the source is byte-for-byte and file-for-file as
+        it was found. No ``committed``, no ``backup_created``, no
+        ``backup_verified``, no ``backup_durable``, no ``would_drop`` — because
+        none of them is produced, not because they are withheld.
+
+        The machinery below — the exclusive destination acquisition, the
+        logical backup, the flushes, the withdrawal ledger — is intact and
+        still under test. It is waiting for an artifact whose coherence is
+        established by its producer, which is a different slice's work and
+        cannot be manufactured here.
     """
     store_path = Path(store_path)
     backup_path = Path(backup_path)
-    work_dir = Path(work_dir)
     outcome = outcome if outcome is not None else RollbackOutcome()
 
-    with BoundTarget(store_path) as bound:
-        plan = preflight_turn_fence_rollback(
-            store_path, backup_path=backup_path, work_dir=work_dir, bound=bound
-        )
-    copy = Path(plan["copy"])
-    prepared = plan["private_copy"]
-    try:
-        _commit_the_rollback(
-            plan["private_copy"],
-            work_dir / "rehearsal-backup.db",
-            plan["would_drop"],
-            report_as=store_path,
-            outcome=outcome,
-        )
-    except TurnFenceRollbackRefused as exc:
-        refused = TurnFenceRollbackRefused(
-            f"the rehearsal on a copy of {store_path} was refused, so the "
-            f"real run would be too: {exc}",
-            reason=exc.reason,
-        )
-        refused.preflight = dict(plan["preflight"])
-        refused.established = {
-            "installed_triggers": plan["installed_triggers"],
-            "would_drop": plan["would_drop"],
-            "rehearsal": dict(outcome.facts(), copy=str(copy)),
-        }
-        raise refused from exc
-
-    remaining = _fence_triggers_on(plan["private_copy"].connection, store_path)
-    if remaining:
-        raise TurnFenceRollbackRefused(
-            f"the rehearsal ran on a copy of {store_path} and left "
-            f"{len(remaining)} trigger(s) behind, so the real run would not be "
-            "all-or-nothing either",
-            reason="rehearsal-incomplete",
-        )
-
-    prepared.close()
-    established = {
-        "store": str(store_path),
-        "backup_path": str(backup_path),
-        "generation": hermes_state_common.TURN_FENCE_GENERATION,
-        "installed_triggers": plan["installed_triggers"],
-        "would_drop": plan["would_drop"],
-        "rehearsal": dict(outcome.facts(), copy=str(copy)),
-        "preflight": dict(plan["preflight"]),
-    }
-    try:
-        establish_offline_authority(store_path)
-    except TurnFenceRollbackRefused as exc:
-        exc.preflight = dict(plan["preflight"])
-        exc.established = established
-        raise
-    return established  # pragma: no cover - establish_offline_authority always raises
+    # BEFORE ANYTHING IS CREATED, OPENED OR READ. Placed here rather than after
+    # the pre-flight for the same reason it is first in the real path: the
+    # pre-flight's own answers come from the image this cannot vouch for, so
+    # deciding after it would be deciding on the strength of what is in doubt.
+    disqualify_the_target(store_path)
+    establish_offline_authority(store_path)
+    raise AssertionError(  # pragma: no cover - establish_offline_authority raises
+        "establish_offline_authority returned; it has no success path"
+    )
 
 
 def rollback_turn_fence(
@@ -2284,13 +2310,15 @@ def rollback_turn_fence(
         beside the artifact, and a refusal that changed the directory it is
         about to say it left alone is not a refusal.
 
-        A DRY RUN (:func:`rehearse_turn_fence_rollback`) is where the pre-flight
-        on a private copy, the identity binding, the in-transaction liveness
-        and surface decisions, the backup, the drops and the commit all happen
-        — against that copy, never against the operator's store. That is the
-        only path on which the operation runs, and it runs on every dry-run
-        invocation, so the boundary is not green merely because nothing reaches
-        it.
+        A DRY RUN (:func:`rehearse_turn_fence_rollback`) now refuses at the
+        same two statements, for the same reason, before it derives anything.
+        It used to run the pre-flight, the backup, the drops and the commit
+        against a private copy — and that copy was assembled by checking for
+        sidecars and then reading the main image, which cannot be proven
+        coherent against a live-capable store. Every fact it reported was
+        derived from an image that a writer committing in that interval leaves
+        short. So there is no path on which the operation runs, and nothing
+        below the refusal is green because it was executed.
 
         An earlier version of this paragraph claimed the real path ran "the
         pre-flight, the identity binding, and the in-transaction decisions on

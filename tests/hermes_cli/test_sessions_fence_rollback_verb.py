@@ -1,51 +1,48 @@
-"""`hermes sessions fence-rollback` — the operator's way off the turn fence.
+"""`hermes sessions fence-rollback` — a verb that refuses, and what is behind it.
 
-WHY A VERB AND NOT A LIBRARY ENTRY POINT
-    ``hermes_cli.session_fence_rollback.rollback_turn_fence`` is bounded,
-    offline and fail-closed, and none of that reaches an operator at 3am. What
-    reached them was a Python one-liner in a runbook, or the thing the runbook
-    replaced: typing ``DROP TRIGGER`` twenty-four times into whatever database
-    they believed was the right one. Neither is a rollback story. A one-liner
-    has no dry run, no exit code a script can branch on, and no way to say
-    WHICH precondition stopped it — and "it failed" is the answer that sends
-    someone editing the store by hand.
+WHAT THE VERB DOES, WHICH IS ALL THIS FILE'S BOUNDARY PINS ARE ABOUT
+    It refuses. Every invocation, with or without ``--dry-run``, before it
+    opens, copies or reads the store it was given, leaving that store
+    byte-for-byte and file-for-file as it found it. It names which kind of
+    target it was handed and why the rollback is not permitted, and it reports
+    nothing else — no plan, no backup facts, no rehearsal — because it produces
+    nothing else.
 
-    So the verb is the deliverable, and what this file pins is the verb:
+WHY THERE IS NO REHEARSAL TO PIN
+    There was one. The rollback ran against a private copy assembled by
+    checking that no sidecars sat beside the store and then reading its main
+    image. Check and read are two operations, and a writer that commits into a
+    ``-wal`` in between leaves the check's answer true and the image short of
+    committed rows — after which the run reported a completed rollback, a
+    verified durable backup and a full surface, all of it derived from a
+    database known to be missing data. Reproduced on both SQLite builds.
 
-    * it takes its target BY NAME. No default, no discovery, no "the store we
-      would have opened anyway". The counterexample is an operator who runs it
-      on the wrong host and rolls back the store they did not mean;
-    * a target that is not this fence is refused, and the refusal SAYS WHICH
-      kind of wrong it was — missing file, unreadable file, or a database that
-      does not carry the surface this binary declares. Three wrong targets,
-      three distinct machine-readable reasons;
-    * a live turn refuses it, with the rows and the trigger set both asserted
-      unchanged and no backup file left behind;
-    * a half-installed surface refuses the WHOLE operation, with the remaining
-      triggers intact — a verb that drops what it recognises and shrugs at the
-      rest leaves a store fenced against some writes and not others;
-    * the dry run reports the exact surface it would remove and does not change
-      a single byte of the store — not the rows, not the triggers, not the
-      file. It rehearses on a disposable copy precisely so that this can be
-      asserted as bytes rather than as content;
-    * the dry run refuses exactly what the real run refuses. Rehearsing on a
-      copy buys the byte assertion and costs an identity: one branch of the
-      liveness predicate is keyed by the store's PATH, so without a guard a
-      conversation this very process is mid-turn on reads free on the copy and
-      held on the original. That was not a hypothesis — the first version of
-      the rehearsal reported "this would proceed" about a run that then
-      refused, which is worse than having no rehearsal, because the operator
-      types the real command on its say-so;
-    * and the completed run reports, in machine-readable form, the surface it
-      removed and the backup it verified.
+    A further existence check does not close it; the interval is what the
+    writer uses, and that move failed three times in this slice at three
+    different seams. It is not a guard needing strengthening. A copy assembled
+    by check-then-read cannot be proven coherent against a live-capable store,
+    so the rehearsal was never a weaker form of the real operation.
+
+TWO KINDS OF PIN IN THIS FILE, AND THEY MUST NOT BE ADDED TOGETHER
+    BOUNDARY EVIDENCE — every path refuses before observing the source; the
+    source's byte map and file set are invariant; the report carries exactly
+    the fields the run produced and no others; a dead input cannot change the
+    verdict. These are what the verb is gated on.
+
+    RETAINED MACHINERY — the exclusive destination acquisition, the
+    engine-written backup, the flushes, the withdrawal ledger, the residue
+    accounting. **None of it is reachable from the verb.** These pins drive it
+    directly so it does not rot before the slice that supplies a provably
+    coherent artifact, and they are maintenance evidence: they say nothing
+    about the boundary. Counting them as boundary coverage would be the same
+    error as counting the anchor guard as coverage of the verb.
 
 WHAT IT DOES NOT SOFTEN
     The old binary being unable to write a fenced v27 store is intentional and
-    required. This verb does not add a compatibility fallback, does not drop a
-    trigger on open, and does not run unless a person names a store and a
-    backup path. Every pin below is about the operator surface; the underlying
-    operation's own properties live in ``tests/state/test_turn_fence_rollback``
-    and are deliberately not repeated here.
+    required. This verb adds no compatibility fallback, drops no trigger on
+    open, and runs against nothing it was not explicitly given. The target is
+    named, never defaulted: a rollback that runs against "the store we would
+    have opened anyway" is one wrong host away from the wrong file.
 
     Temp databases only. No live checkout, no ``state.db``, no service.
 """
@@ -56,6 +53,7 @@ import argparse
 import ast
 import contextlib
 import hashlib
+import inspect
 import io
 import json
 import os
@@ -65,6 +63,8 @@ import sqlite3
 import subprocess
 import sys
 import textwrap
+import types
+import threading
 from argparse import Namespace
 from dataclasses import dataclass
 
@@ -300,6 +300,15 @@ def check_the_verb_is_registered_under_sessions_and_names_its_target(
 ) -> None:
     """No default target, no discovery, and `main()` really registers it.
 
+    BYTE INVARIANCE IS N/A HERE, AND THE FILE SET IS NOT. Every other boundary
+    pin asserts both, and the two travelled together often enough to look like
+    one exemption. They are independent: byte invariance needs a FILE, and this
+    pin creates none — ``store`` and ``backup`` are argv strings handed to the
+    parser, so a digest of a non-existent store asserts nothing. The file set
+    needs only a DIRECTORY, and ``tmpdir`` is one. An exemption inherits the
+    granularity of the thing exempted, not of the habit, so it is justified
+    conjunct by conjunct.
+
     The failure this rules out is the convenient one: a verb that defaults to
     "the store we would have opened anyway". An operator who runs a rollback on
     the wrong host then rolls back a store they never named, and the command
@@ -325,6 +334,9 @@ def check_the_verb_is_registered_under_sessions_and_names_its_target(
     sessions_sub = sessions.add_subparsers(dest="sessions_action")
     register(sessions_sub)
 
+    # Nothing is created: these are argv strings, and this pin exercises the
+    # PARSER. That is why the file set below is a real assertion here.
+    listing_before = sorted(entry.name for entry in tmpdir.iterdir())
     store = tmpdir / "named-store.db"
     backup = tmpdir / "named-backup.db"
 
@@ -401,378 +413,13 @@ def check_the_verb_is_registered_under_sessions_and_names_its_target(
         f"subparsers it must hang off: {targets}"
     )
 
-
-def check_a_target_that_is_not_this_fence_is_refused_by_a_named_reason(
-    tmpdir: pathlib.Path,
-) -> None:
-    """Three wrong targets, three DISTINCT reasons, and nothing written.
-
-    "It failed" is the answer that sends an operator editing the store by
-    hand. Missing, unreadable, and "a real database that is not this fence"
-    are three different next moves, so they must be three different reasons.
-
-    The byte assertion on the foreign database is the load-bearing one: the
-    verb must decide the target is wrong BEFORE it opens it as a store, because
-    opening someone's unrelated SQLite file as a Hermes store creates the
-    Hermes schema inside it.
-    """
-    _sandbox_home(tmpdir)
-    module, why = _import_verb()
-    assert module is not None, f"there is no fence-rollback verb: {why}"
-
-    reasons = {}
-
-    missing = tmpdir / "there-is-no-store-here.db"
-    run = _run_verb(missing, tmpdir / "backup-missing.db", dry_run=True)
-    assert not run.crash, f"the verb crashed on a missing target: {run.crash}"
-    assert run.rc not in (0, None), (
-        f"a missing target exited {run.rc!r}; a script cannot branch on that"
-    )
-    payload = _payload(run)
-    assert payload is not None, (
-        f"no machine-readable refusal for a missing target: {run.stdout!r}"
-    )
-    assert payload.get("ok") is False
-    reasons["missing"] = payload["refused"]["reason"]
-    assert str(missing) in payload["refused"]["detail"], (
-        "the refusal does not name the target it refused: "
-        f"{payload['refused']['detail']!r}"
-    )
-
-    foreign = tmpdir / "someone-elses-notes.db"
-    conn = sqlite3.connect(str(foreign))
-    try:
-        conn.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)")
-        conn.execute("INSERT INTO notes (body) VALUES ('do not touch this')")
-        conn.commit()
-    finally:
-        conn.close()
-    foreign_before = _store_digest(foreign)
-    foreign_backup = tmpdir / "backup-foreign.db"
-
-    run = _run_verb(foreign, foreign_backup, dry_run=True)
-    assert not run.crash, f"the verb crashed on a foreign database: {run.crash}"
-    assert run.rc not in (0, None), (
-        f"the verb accepted a database that is not a Hermes store: rc={run.rc!r} "
-        f"stdout={run.stdout!r}"
-    )
-    payload = _payload(run)
-    assert payload is not None, (
-        f"no machine-readable refusal for a foreign database: {run.stdout!r}"
-    )
-    reasons["foreign"] = payload["refused"]["reason"]
-    assert _store_digest(foreign) == foreign_before, (
-        "the verb was pointed at a database that is NOT a Hermes store and "
-        "wrote it anyway. Deciding the target is wrong only after opening it "
-        "as a store means the wrong-target case is the one that damages a "
-        f"file: {foreign_before} -> {_store_digest(foreign)}"
-    )
-    assert not foreign_backup.exists(), (
-        "a refused run left a backup file behind, so 'nothing was changed' is "
-        "not what happened"
-    )
-    a_declared_trigger = hermes_state_common.turn_fence_trigger_name(
-        "messages", "INSERT"
-    )
-    assert a_declared_trigger in payload["refused"]["detail"], (
-        "the refusal does not say WHAT it expected to find and did not, so the "
-        "operator cannot tell a wrong target from a damaged one: "
-        f"{payload['refused']['detail']!r}"
-    )
-
-    junk = tmpdir / "not-a-database-at-all.db"
-    junk.write_bytes(b"this is a text file an operator renamed by mistake\n")
-    junk_before = _store_digest(junk)
-    run = _run_verb(junk, tmpdir / "backup-junk.db", dry_run=True)
-    assert not run.crash, f"the verb crashed on a non-database file: {run.crash}"
-    assert run.rc not in (0, None), f"a non-database target exited {run.rc!r}"
-    payload = _payload(run)
-    assert payload is not None, (
-        f"no machine-readable refusal for a non-database file: {run.stdout!r}"
-    )
-    reasons["junk"] = payload["refused"]["reason"]
-    assert _store_digest(junk) == junk_before
-
-    assert len(set(reasons.values())) == 3, (
-        "three different wrong targets produced fewer than three distinct "
-        f"refusal reasons: {reasons}. The operator can tell THAT it was "
-        "refused and not WHICH refusal they hit, and those have different "
-        "next moves"
-    )
-
-
-def check_a_partial_surface_is_refused_whole_and_writes_no_backup(
-    tmpdir: pathlib.Path,
-) -> None:
-    """All-or-nothing, and the check runs before anything is written.
-
-    One trigger is removed out of band. A verb that drops what it recognises
-    and shrugs at the rest leaves a store fenced against some writes and not
-    others, which is worse than either end state — so the WHOLE operation is
-    refused, the remaining triggers stay, and no backup is written for a run
-    that never ran.
-    """
-    _sandbox_home(tmpdir)
-    module, why = _import_verb()
-    assert module is not None, f"there is no fence-rollback verb: {why}"
-
-    store = tmpdir / "state.db"
-    _fenced_store(store, leave_lease_live=False)
-
-    victim = hermes_state_common.turn_fence_trigger_name("messages", "INSERT")
-    conn = sqlite3.connect(str(store), isolation_level=None)
-    try:
-        conn.execute(f"DROP TRIGGER {victim}")
-    finally:
-        conn.close()
-
-    remaining = _installed_triggers(store)
-    # Counted off the DECLARATION. A literal was right while the surface had
-    # nine entries and silently wrong the moment it grew to twenty-four.
-    expected_after_drop = len(hermes_state_common.TURN_FENCE_TRIGGERS) - 1
-    assert victim not in remaining and len(remaining) == expected_after_drop, (
-        f"dropping {victim} out of band should leave every other declared "
-        f"trigger: expected {expected_after_drop}, found {len(remaining)}"
-    )
-    rows_before = _canonical_rows(store)
-    backup = tmpdir / "backup.db"
-
-    run = _run_verb(store, backup, dry_run=True)
-    assert not run.crash, f"the verb crashed on a partial surface: {run.crash}"
-    assert run.rc not in (0, None), (
-        f"the verb accepted a half-fenced store: rc={run.rc!r} "
-        f"stdout={run.stdout!r}"
-    )
-    payload = _payload(run)
-    assert payload is not None, (
-        f"no machine-readable refusal for a partial surface: {run.stdout!r}"
-    )
-    assert payload["refused"]["reason"] == "surface-mismatch", (
-        "a half-installed surface was not reported as a surface mismatch, so "
-        "the operator cannot tell it apart from a wrong target or a crash: "
-        f"{payload['refused']!r}"
-    )
-    assert victim in payload["refused"]["detail"], (
-        "the refusal does not name the trigger that is missing: "
-        f"{payload['refused']['detail']!r}"
-    )
-    assert not backup.exists(), (
-        "the verb refused and still wrote a backup, so the run got past its "
-        "pre-flight and stopped somewhere later — the refusal is not the "
-        "no-change refusal it reports"
-    )
-    assert _installed_triggers(store) == remaining, (
-        "the verb refused and still removed triggers — it is not "
-        "all-or-nothing"
-    )
-    assert _canonical_rows(store) == rows_before
-
-
-def check_the_dry_run_reports_the_plan_and_changes_no_byte(
-    tmpdir: pathlib.Path,
-) -> None:
-    """A rehearsal that reports the whole plan and does not touch the store.
-
-    Asserted as BYTES, not as content. A dry run that opens the store as a
-    store already rewrote it — schema init writes ``messages`` and re-creates
-    every trigger — so "the rows look the same afterwards" would pass on a
-    store the rehearsal had modified. The bytes are the only statement that
-    cannot be satisfied by a rehearsal that quietly wrote.
-
-    THIS PIN IS SQLITE-VERSION-SENSITIVE, AND THE DIRECTORY LISTING IS WHY
-        The digest covers the main file AND every sidecar, and the listing
-        assertion at the end covers the directory. That pair is not belt and
-        braces: they catch different things, and for a while only one build of
-        SQLite could show it. Observed on this exact source, same test, same
-        arguments, only the interpreter differing::
-
-            SQLite 3.50.4   passed   store opened journal_mode=DELETE (the
-                                     WAL-reset-bug fallback), so no sidecar
-                                     ever exists and nothing can be left
-            SQLite 3.53.1   FAILED   WAL is enabled; a `mode=ro` probe of the
-                                     store created `state.db-wal` (0 bytes,
-                                     sha e3b0c442…) and `state.db-shm`, and
-                                     3.53.1 leaves them behind on close
-
-        `state.db` was byte-identical in both. Nothing was written. The
-        directory still gained two files, which is a change to what the
-        operator was promised would be left alone — so the fix was to stop the
-        dry run opening the store at all, not to loosen this. A future reader
-        who sees this pass should not conclude the property is build-independent
-        without checking which SQLite they ran on.
-    """
-    _sandbox_home(tmpdir)
-    module, why = _import_verb()
-    assert module is not None, f"there is no fence-rollback verb: {why}"
-
-    store = tmpdir / "state.db"
-    _fenced_store(store, leave_lease_live=False)
-    before = _store_digest(store)
-    listing_before = sorted(entry.name for entry in tmpdir.iterdir())
-    rows_before = _canonical_rows(store)
-    backup = tmpdir / "backup.db"
-
-    run = _run_verb(store, backup, dry_run=True)
-    assert not run.crash, f"the dry run crashed: {run.crash}"
-    payload = _payload(run)
-    assert payload is not None, (
-        f"the dry run printed no machine-readable plan: {run.stdout!r}"
-    )
-    assert payload["dry_run"] is True, (
-        f"the dry run does not report itself as one: {payload!r}"
-    )
-    # THE PLAN AND THE VERDICT ARE DIFFERENT ANSWERS. The rehearsal really
-    # performs the rollback on a copy this run made, so the plan is observed
-    # rather than predicted; the real run is then refused because no target the
-    # operator can name has offline authority. Reporting the first without the
-    # second is how a dry run says "this would work" about a command that will
-    # not run, which is the failure mode a rehearsal exists to remove.
-    assert run.rc not in (0, None), (
-        f"the dry run exited {run.rc!r} about a real run that refuses. An "
-        "operator types the real command on a dry run's say-so"
-    )
-    assert payload["refused"]["reason"] == "offline-authority-unknown", (
-        f"the dry run reports a different verdict than the real run: "
-        f"{payload['refused']!r}"
-    )
-    # THE SENTENCE IS PART OF THE CONTRACT. "Re-run without --dry-run to
-    # perform it" is a promise this build cannot keep, and it is the line an
-    # operator bases their next action on — the same output-truth rule the
-    # ledger is held to, applied where it is actually read.
-    assert "Re-run without --dry-run" not in run.stderr, (
-        "the dry run tells the operator to run the real command, which this "
-        f"build refuses every time:\n{run.stderr}"
-    )
-    assert "offline-authority-unknown" in run.stderr, (
-        f"the refusal an operator reads does not name itself:\n{run.stderr}"
-    )
-    assert payload["changed"] is False
-    assert payload["dropped_triggers"] == [], (
-        f"the dry run reports having dropped triggers: {payload!r}"
-    )
-    assert sorted(payload["would_drop"]) == sorted(
-        hermes_state_common.TURN_FENCE_TRIGGERS
-    ), (
-        "the dry run does not report the surface it would remove, so it "
-        "answers 'it would work' and not 'here is what it would do': "
-        f"{payload.get('would_drop')!r}"
-    )
-    assert payload["preflight"]["surface_verified"] is True
-    assert payload["preflight"]["offline_verified"] is True, (
-        "the dry run did not read the lease table, so its plan rests on less "
-        f"than the real run would: {payload['preflight']!r}"
-    )
-    rehearsal = payload.get("rehearsal") or {}
-    assert rehearsal.get("outcome") == "committed", (
-        "the rehearsal did not actually perform the rollback, so what is "
-        f"reported as a plan is a prediction: {rehearsal!r}"
-    )
-    assert rehearsal.get("backup_durable") is True, (
-        f"the rehearsal reports no durable backup: {rehearsal!r}"
-    )
-
-    assert _store_digest(store) == before, (
-        "the dry run changed the store it promised only to inspect: "
-        f"{before} -> {_store_digest(store)}"
-    )
-    assert _installed_triggers(store) == sorted(
-        hermes_state_common.TURN_FENCE_TRIGGERS
-    )
-    assert _canonical_rows(store) == rows_before
-    assert not backup.exists(), (
-        "the dry run wrote the backup it was only supposed to plan"
-    )
+    # ARGV PARSING IS INERT ON DISK. Nothing else runs the parser in isolation,
+    # so nothing else can hold this: a parser that touched the filesystem while
+    # reading arguments would be a defect no other pin is placed to see.
     assert sorted(entry.name for entry in tmpdir.iterdir()) == listing_before, (
-        "the dry run left its working copy behind. A rehearsal on a copy of a "
-        "session store leaves an unfenced duplicate of every conversation on "
-        "disk if it is not cleaned up: "
+        "parsing the verb's arguments created or removed files: "
         f"{sorted(entry.name for entry in tmpdir.iterdir())}"
     )
-
-
-def check_every_preflight_refusal_leaves_the_artifact_byte_identical(
-    tmpdir: pathlib.Path,
-) -> None:
-    """`changed: false` is a claim about BYTES, and it is checked as bytes.
-
-    A refusal decided before the store is opened for writing must leave the
-    file map and the directory listing exactly as it found them. Rows and
-    triggers are not enough to see this: ``SessionDB.__init__`` runs schema
-    init, schema init writes, and a liveness check routed through it therefore
-    initialises the store it is asking about. Measured on both SQLite builds —
-    a ``live-turn`` refusal moved ``state.db``'s digest while every row and
-    every trigger read back identical, and the report still said
-    ``changed: false``.
-
-    TWO REFUSALS, ON PURPOSE, AT DIFFERENT DEPTHS
-        ``live-turn`` is decided in the middle of the pre-flight and
-        ``backup-exists`` after surface verification has already passed, so
-        the property being pinned is "no classified pre-flight refusal touches
-        the artifact", not "the first check happens to be cheap". A fix that
-        made only the earliest refusal inert would pass one of these and fail
-        the other.
-    """
-    _sandbox_home(tmpdir)
-    module, why = _import_verb()
-    assert module is not None, f"there is no fence-rollback verb: {why}"
-
-    outcomes = {}
-
-    # (1) live-turn — a foreign, live owner holds the conversation.
-    live_dir = tmpdir / "live"
-    live_dir.mkdir()
-    live_store = live_dir / "state.db"
-    _fenced_store(live_store, leave_lease_live=True)
-    _hand_the_lease_to_a_foreign_live_owner(live_store)
-    outcomes["live-turn"] = (
-        live_store,
-        _store_digest(live_store),
-        _canonical_rows(live_store),
-        _installed_triggers(live_store),
-        sorted(entry.name for entry in live_dir.iterdir()),
-        _run_verb(live_store, live_dir / "backup.db", dry_run=True),
-    )
-
-    # (2) backup-exists — idle store, surface fine, destination occupied.
-    taken_dir = tmpdir / "taken"
-    taken_dir.mkdir()
-    taken_store = taken_dir / "state.db"
-    _fenced_store(taken_store, leave_lease_live=False)
-    occupied = taken_dir / "backup.db"
-    occupied.write_bytes(b"an earlier backup that must not be clobbered")
-    outcomes["backup-exists"] = (
-        taken_store,
-        _store_digest(taken_store),
-        _canonical_rows(taken_store),
-        _installed_triggers(taken_store),
-        sorted(entry.name for entry in taken_dir.iterdir()),
-        _run_verb(taken_store, occupied, dry_run=True),
-    )
-
-    for reason, (store, digest, rows, triggers, listing, run) in outcomes.items():
-        assert not run.crash, f"the verb crashed on the {reason} case: {run.crash}"
-        payload = _payload(run)
-        assert payload is not None, (
-            f"no machine-readable refusal for {reason}: {run.stdout!r}"
-        )
-        assert run.rc not in (0, None), f"{reason} exited {run.rc!r}"
-        assert payload["refused"]["reason"] == reason, (
-            f"expected the {reason} refusal, got {payload['refused']!r}"
-        )
-        assert payload["changed"] is False
-        assert _store_digest(store) == digest, (
-            f"the {reason} refusal reported changed=false and rewrote the "
-            f"artifact. The label is not the contract, the bytes are: "
-            f"{digest} -> {_store_digest(store)}"
-        )
-        assert sorted(entry.name for entry in store.parent.iterdir()) == listing, (
-            f"the {reason} refusal added or removed files in the store's "
-            f"directory: {sorted(entry.name for entry in store.parent.iterdir())}"
-        )
-        assert _canonical_rows(store) == rows, f"{reason} moved rows"
-        assert _installed_triggers(store) == triggers, f"{reason} moved triggers"
-
-    assert occupied.read_bytes() == b"an earlier backup that must not be clobbered"
 
 
 def _drive_the_boundary_and_meddle_after_the_backup(
@@ -920,276 +567,6 @@ def check_a_target_swapped_for_another_valid_store_is_refused(
     assert _installed_triggers(store) == triggers_before
 
 
-def check_a_destination_appearing_after_the_check_is_never_clobbered(
-    tmpdir: pathlib.Path,
-) -> None:
-    """"Must not already exist" is a create, not a look.
-
-    ``Path.exists()`` and the write are two operations with a window between
-    them, and whatever created a file in that window is destroyed silently.
-    Reproduced at the real seam: a sentinel written after the check was gone
-    afterwards, and the rollback reported success. Only an acquisition the
-    filesystem arbitrates (``O_CREAT | O_EXCL``) survives it; a second,
-    better-placed check cannot, because a check is what is broken.
-
-    THE DESTINATION THAT IS ACTUALLY ACQUIRED MOVED, AND SO DID THE EVIDENCE
-        Under a contract where no target the operator names has offline
-        authority, the run that reaches a backup is the rehearsal, and the
-        destination it acquires is its own — inside the private working
-        directory the command destroys before it returns. A pin that reads the
-        sentinel afterwards reads nothing, and "the file is gone" cannot tell
-        "never clobbered" from "clobbered, then swept". So the observation is
-        taken at the last moment the run still owns the directory: immediately
-        before the sweep, from inside it.
-    """
-    _sandbox_home(tmpdir)
-    module, why = _import_verb()
-    assert module is not None, f"there is no fence-rollback verb: {why}"
-
-    from hermes_cli import session_fence_rollback as library
-
-    store = tmpdir / "state.db"
-    _fenced_store(store, leave_lease_live=False)
-    rows_before = _canonical_rows(store)
-    triggers_before = _installed_triggers(store)
-    sentinel = b"DO NOT CLOBBER - a concurrent writer got here first"
-
-    injected = {"fired": False, "path": None}
-    observed = {"bytes": None, "family": None}
-    real_check = library._refuse_unusable_backup_path
-    real_sweep = library.sweep_work_dir
-
-    def _competing_writer_after_the_check(path, *args, **kwargs):
-        """A racer that re-appears in EVERY window, not just the first.
-
-        The destination check runs more than once, and a one-shot injection is
-        caught by the later one — which proves the check, and a check saving
-        the run is precisely what may not be the guarantee. So the sentinel is
-        cleared before each check and re-created immediately after it, which is
-        what a competing writer looks like.
-        """
-        target = pathlib.Path(path)
-        if target.name != "rehearsal-backup.db":
-            return real_check(path, *args, **kwargs)
-        if target.exists():
-            target.unlink()
-        real_check(path, *args, **kwargs)
-        injected["fired"] = True
-        injected["path"] = target
-        target.write_bytes(sentinel)
-
-    def _look_before_it_is_swept(work_dir, *args, **kwargs):
-        target = injected.get("path")
-        if target is not None and target.exists():
-            observed["bytes"] = target.read_bytes()
-            observed["family"] = sorted(_family_beside(target))
-        return real_sweep(work_dir, *args, **kwargs)
-
-    library._refuse_unusable_backup_path = _competing_writer_after_the_check
-    library.sweep_work_dir = _look_before_it_is_swept
-    try:
-        run = _run_verb(store, tmpdir / "backup.db", dry_run=True)
-    finally:
-        library._refuse_unusable_backup_path = real_check
-        library.sweep_work_dir = real_sweep
-
-    assert injected["fired"], (
-        "the sentinel was never written, so the verb never reached the backup "
-        "destination check and this pin measures nothing"
-    )
-    assert not run.crash, f"the verb crashed under the race: {run.crash}"
-    payload = _payload(run)
-    assert payload is not None, f"no machine-readable report: {run.stdout!r}"
-
-    assert observed["bytes"] == sentinel, (
-        "the backup step overwrote a file that appeared after its own "
-        "existence check. Whatever was at the destination is gone, and no "
-        "check placed anywhere can fix that — the create has to be the check. "
-        f"Observed at the destination just before cleanup: {observed['bytes']!r}"
-    )
-    assert observed["family"] == [injected["path"].name], (
-        "the run left its own half-built destination beside the file it "
-        f"refused to overwrite: {observed['family']!r}"
-    )
-    assert run.rc not in (0, None), (
-        f"the verb exited {run.rc!r} after racing a destination it was told "
-        "not to overwrite"
-    )
-    assert payload.get("ok") is False
-    assert payload["refused"]["reason"] == "backup-exists", (
-        f"the collision was not reported as one: {payload['refused']!r}"
-    )
-    assert _canonical_rows(store) == rows_before
-    assert _installed_triggers(store) == triggers_before, (
-        "the verb dropped triggers on a run whose backup never landed"
-    )
-
-
-def check_an_orphan_backup_sidecar_is_not_overwritten(
-    tmpdir: pathlib.Path,
-) -> None:
-    """The backup is a FAMILY of files, and every member is a destination.
-
-    An operator whose previous attempt died leaves ``backup.db-wal`` behind
-    with no ``backup.db``. "The path you named does not exist" is true of the
-    name they typed and useless: the very next WAL-mode store makes
-    ``backup.db-wal`` a destination, and the orphan is what gets truncated.
-
-    No race here on purpose — this is the no-race half of the same obligation,
-    and it must hold identically on a build that uses WAL and one that does
-    not, which is why the refusal is required rather than "the sidecar happens
-    not to be written on this build".
-    """
-    _sandbox_home(tmpdir)
-    module, why = _import_verb()
-    assert module is not None, f"there is no fence-rollback verb: {why}"
-
-    store = tmpdir / "state.db"
-    _fenced_store(store, leave_lease_live=False)
-    rows_before = _canonical_rows(store)
-    triggers_before = _installed_triggers(store)
-    digest_before = _store_digest(store)
-
-    backup = tmpdir / "backup.db"
-    orphan = tmpdir / "backup.db-wal"
-    orphan_bytes = b"an orphaned -wal from an attempt that died"
-    orphan.write_bytes(orphan_bytes)
-    assert not backup.exists(), "the fixture wants the MAIN path absent"
-
-    run = _run_verb(store, backup, dry_run=True)
-
-    assert not run.crash, f"the verb crashed on the orphan sidecar: {run.crash}"
-    payload = _payload(run)
-    assert payload is not None, f"no machine-readable report: {run.stdout!r}"
-    assert orphan.read_bytes() == orphan_bytes, (
-        "an orphaned backup sidecar was overwritten. The destination check "
-        "looked only at the name the operator typed, and a backup is the file "
-        "plus its -wal/-shm/-journal siblings"
-    )
-    assert run.rc not in (0, None), (
-        f"the verb exited {run.rc!r} with a member of its backup destination "
-        "family already on disk"
-    )
-    assert payload["refused"]["reason"] == "backup-exists", (
-        f"the occupied family member was not reported as one: "
-        f"{payload['refused']!r}"
-    )
-    assert str(orphan) in payload["refused"]["detail"], (
-        "the refusal does not name the file that is in the way: "
-        f"{payload['refused']['detail']!r}"
-    )
-    assert _store_digest(store) == digest_before
-    assert _canonical_rows(store) == rows_before
-    assert _installed_triggers(store) == triggers_before
-
-
-def check_a_dry_run_that_cannot_clean_up_does_not_report_success(
-    tmpdir: pathlib.Path,
-) -> None:
-    """Cleanup is not housekeeping — what it removes is a copy of the store.
-
-    The rehearsal's working directory holds a full, ROLLED-BACK duplicate of
-    every conversation: the fence has been dropped from it, which is the whole
-    point of rehearsing. If cleanup does not happen, that duplicate stays on
-    disk, unfenced, somewhere the operator was never told about — while the
-    command exits 0 and says nothing changed. Data residue and a false report
-    in one outcome.
-
-    ``shutil.rmtree(..., ignore_errors=True)`` cannot tell the difference
-    between "removed" and "failed and was swallowed", so this drives the seam
-    the verb actually uses — the module's own ``shutil`` reference — and makes
-    cleanup a no-op. That is the same thing a read-only parent directory, a
-    Windows file lock, or an NFS ``EBUSY`` produces, and it is exactly what an
-    independent review reproduced by suppressing ``rmtree`` alone.
-
-    WHY THIS PIN HAD TO BE WRITTEN SEPARATELY
-        ``check_the_dry_run_reports_the_plan_and_changes_no_byte`` watches the
-        STORE'S directory, and the residue moved out of it — the fix for the
-        WAL-sidecar finding relocated the working copy to a private temp
-        directory. The observation did not fail; it went blind, and silence
-        reads as pass. Every location-watching assertion in this file is now
-        anchored to a path the REPORT names, so it follows the code.
-    """
-    _sandbox_home(tmpdir)
-    module, why = _import_verb()
-    assert module is not None, f"there is no fence-rollback verb: {why}"
-
-    store = tmpdir / "state.db"
-    _fenced_store(store, leave_lease_live=False)
-    work_parent = tmpdir / "work"
-    work_parent.mkdir()
-
-    class _CleanupDoesNothing:
-        """`shutil` with `rmtree` neutered; everything else passes through."""
-
-        def __init__(self, real):
-            self._real = real
-
-        def __getattr__(self, name):
-            return getattr(self._real, name)
-
-        def rmtree(self, *args, **kwargs):
-            return None
-
-    from hermes_cli import session_fence_rollback as library
-
-    real_shutil = getattr(library, "shutil", None)
-    assert real_shutil is not None, (
-        "the module that performs the removal has no `shutil` to neuter, so "
-        "this pin cannot reach the cleanup seam and would pass without "
-        "measuring it"
-    )
-    library.shutil = _CleanupDoesNothing(real_shutil)
-    try:
-        run = _run_verb(
-            store, tmpdir / "backup.db", dry_run=True, work_dir=work_parent
-        )
-    finally:
-        library.shutil = real_shutil
-
-    assert not run.crash, f"the dry run crashed with cleanup suppressed: {run.crash}"
-
-    residue = sorted(entry for entry in work_parent.rglob("*") if entry.is_file())
-    assert residue, (
-        "cleanup was not actually suppressed, so this pin measures nothing — "
-        f"{work_parent} is empty and the check below would pass on a verb that "
-        "never cleans up at all"
-    )
-
-    payload = _payload(run)
-    assert payload is not None, (
-        f"the dry run printed no machine-readable report: {run.stdout!r}"
-    )
-    assert run.rc not in (0, None), (
-        f"the dry run exited {run.rc!r} while leaving {len(residue)} file(s) "
-        f"under {work_parent} — a rolled-back, UNFENCED duplicate of every "
-        "conversation in the store. A script branching on the exit code is "
-        "told this run was clean"
-    )
-    assert payload.get("ok") is False, (
-        f"the report claims success with the working copy still on disk: "
-        f"{payload!r}"
-    )
-    records = payload.get("residue") or []
-    assert records, (
-        "a working copy of the store could not be removed and the report says "
-        f"nothing was left behind: {payload!r}"
-    )
-    assert payload.get("ok") is False, (
-        f"a run that left an unfenced duplicate on disk reported success: {payload!r}"
-    )
-
-    printed = run.stdout + run.stderr
-    assert str(work_parent) in printed, (
-        "the failure does not name the directory that has to be removed, so "
-        f"the operator has nothing to act on: {printed!r}"
-    )
-    assert "irreplaceable" not in printed, (
-        "the residue report leaked conversation content into stdout/stderr; it "
-        "may name the path and count the files and nothing else"
-    )
-
-
 def _commit_a_marker_that_lives_only_in_the_wal(
     store: pathlib.Path, marker: str
 ) -> None:
@@ -1242,6 +619,14 @@ def _pragma(path: pathlib.Path, pragma: str):
         conn.close()
 
 
+def _residue_errors(facts) -> list:
+    """Every residue record a run accumulated, as reasons."""
+    records = (facts or {}).get("residue") or []
+    if isinstance(records, dict):  # pragma: no cover - the shape this replaced
+        records = [records]
+    return sorted(str(record.get("error")) for record in records)
+
+
 def _family_beside(path: pathlib.Path) -> set:
     """The FILE SET this name owns: every file whose name starts with it."""
     return {
@@ -1251,38 +636,51 @@ def _family_beside(path: pathlib.Path) -> set:
     }
 
 
-def _rehearse(library, store, backup, work_dir) -> dict:
-    """The rehearsal as VALUES — what it returned, or how it refused.
+def _drive_the_machinery(library, store, work_dir, *, backup=None, outcome=None):
+    """Run the rollback machinery directly, on a private object this call makes.
 
-    ``rehearse_turn_fence_rollback`` is the call ``--dry-run`` makes, with the
-    same arguments; the only thing not borrowed from the CLI is the private
-    working directory, which the pin owns so the artifacts the rehearsal
-    produced can be read as bytes instead of taken from the report.
+    RETAINED MACHINERY, NOT BOUNDARY EVIDENCE. No production path reaches this
+    any more: the verb refuses before deriving anything from a copy it cannot
+    prove coherent. What is below the boundary is intact and still has to stay
+    that way, because unreachable code that passes is unexecuted rather than
+    verified — so these pins drive it explicitly and say so, and none of them
+    is evidence about what the verb does.
+
+    They keep the backup, cleanup and withdrawal machinery from rotting until
+    the slice that supplies a provably coherent artifact reopens the path.
     """
-    outcome = {"plan": None, "reason": "", "detail": "", "crash": ""}
+    outcome = outcome if outcome is not None else library.RollbackOutcome()
+    backup = backup if backup is not None else work_dir / "backup.db"
+    result = {"returned": None, "reason": "", "detail": "", "crash": "",
+              "outcome": outcome, "backup": backup, "copy": None, "prepared": None}
     try:
-        outcome["plan"] = library.rehearse_turn_fence_rollback(
-            store, backup_path=backup, work_dir=work_dir
+        prepared = library.prepare_the_private_copy(store, work_dir=work_dir)
+        result["prepared"] = prepared
+        result["copy"] = pathlib.Path(prepared.path)
+        result["returned"] = library._commit_the_rollback(
+            prepared, backup, sorted(library.rollback_trigger_names()),
+            report_as=store, outcome=outcome,
         )
     except library.TurnFenceRollbackRefused as exc:
-        outcome["reason"] = getattr(exc, "reason", "refused")
-        outcome["detail"] = str(exc)
-        outcome["plan"] = getattr(exc, "established", None)
+        result["reason"] = getattr(exc, "reason", "refused")
+        result["detail"] = str(exc)
     except BaseException as exc:  # noqa: BLE001 - carried, not swallowed
-        outcome["crash"] = f"{type(exc).__name__}: {exc}"
-    return outcome
+        result["crash"] = f"{type(exc).__name__}: {exc}"
+    return result
 
 
-def _residue_errors(facts) -> list:
-    """Every residue record a run accumulated, as reasons.
+def _rehearse(library, store, backup, work_dir) -> dict:
+    """MAINTENANCE-ONLY shape over :func:`_drive_the_machinery`.
 
-    A list, because a run can fail to remove more than one thing and a single
-    slot means the second record erases the first.
+    Keeps the destination name the pins built around. The operator's
+    ``backup`` argument is deliberately ignored: no production path writes
+    there any more, and a pin that watched it would be watching nothing.
     """
-    records = (facts or {}).get("residue") or []
-    if isinstance(records, dict):  # pragma: no cover - the shape this replaced
-        records = [records]
-    return sorted(str(record.get("error")) for record in records)
+    run = _drive_the_machinery(
+        library, store, work_dir, backup=work_dir / "rehearsal-backup.db"
+    )
+    return {"plan": run["returned"], "reason": run["reason"],
+            "detail": run["detail"], "crash": run["crash"]}
 
 
 def check_no_in_place_run_succeeds_and_each_wrong_target_names_its_own_reason(
@@ -1394,7 +792,9 @@ def check_no_in_place_run_succeeds_and_each_wrong_target_names_its_own_reason(
         assert payload["changed"] is False, (
             f"the {reason} refusal claims it changed the store: {payload!r}"
         )
-        assert payload["dropped_triggers"] == []
+        assert "dropped_triggers" not in payload, (
+            f"the {reason} refusal reports a surface it never removed: {payload!r}"
+        )
         observed[reason] = payload["refused"]["reason"]
         assert payload["refused"]["reason"] == reason, (
             f"the {reason} target was refused as {payload['refused']!r}. Four "
@@ -1412,26 +812,10 @@ def check_no_in_place_run_succeeds_and_each_wrong_target_names_its_own_reason(
         assert not backup.exists(), (
             f"the {reason} refusal wrote a backup for a rollback that never ran"
         )
-        # AND THE REPORT MUST NOT IMPLY OTHERWISE. A bare pathname where an
-        # operator expects a backup record reads as "your backup is at ...",
-        # and there is nothing at that path. Both renderings are checked,
-        # because two statements of one outcome that can disagree mean one of
-        # them is unpinned.
-        assert isinstance(payload["backup"], dict), (
-            f"the {reason} refusal reports a backup as a bare path: "
-            f"{payload['backup']!r}"
-        )
-        assert payload["backup"]["created"] is False, (
-            f"the {reason} refusal claims a backup was created: "
-            f"{payload['backup']!r}"
-        )
-        assert payload["backup"]["present"] is False, (
-            f"the {reason} refusal claims a backup is present: "
-            f"{payload['backup']!r}"
-        )
-        assert "No backup was written." in run.stderr, (
-            "the sentence an operator reads does not say there is no backup, "
-            f"while the JSON does. One of the two is unpinned:\n{run.stderr}"
+        # AND IT SAYS NOTHING ABOUT A DESTINATION IT NEVER LOOKED AT.
+        assert "backup" not in payload, (
+            f"the {reason} refusal reports on the backup destination without "
+            f"having examined it: {payload['backup']!r}"
         )
         if sidecar is not None:
             # Removed only now, so the rows can be read without SQLite
@@ -1729,25 +1113,19 @@ def check_the_backups_directory_entry_is_flushed_too(
 def check_a_fault_after_commit_never_reports_that_nothing_changed(
     tmpdir: pathlib.Path,
 ) -> None:
-    """After COMMIT there is no outcome that says "nothing happened".
+    """MAINTENANCE ONLY. After COMMIT there is no outcome saying "nothing happened".
 
-    ``COMMIT`` runs before the connection is closed and before the report is
-    assembled, and everything between them can fail — a close that raises, a
-    report that cannot be built. The shape this replaces treated a call that
-    raised as a call that did nothing: no report meant ``changed: false``. An
-    operator told nothing changed after the fence came off stops looking, and
-    the store they now have to restore is the one they were told not to worry
-    about.
+    ``COMMIT`` runs before the connection is read back and before any report is
+    assembled, and everything between can fail. The shape this replaces treated
+    a call that raised as a call that did nothing.
 
-    Two faults, two outcomes, and neither of them is ``changed: false``:
+    Two faults, two outcomes, and neither is ``changed: false``:
 
-    * a fault AFTER a COMMIT that returned is ``committed``. The fact was
-      established; a later failure sets the exit status and the reason and does
-      not get to rewrite it;
+    * a fault AFTER a COMMIT that returned is ``committed`` — the fact was
+      established and a later failure does not rewrite it;
     * a fault RAISED BY the COMMIT is ``commit-unknown``, because that is what
-      it is. SQLite may have committed and failed afterwards. ``changed`` is
-      then neither true nor false and must not be spelled as either — a
-      three-state fact rendered as a two-state one always loses the same state.
+      it is. ``changed`` is then neither true nor false, and a three-state fact
+      rendered as two always loses the same state.
     """
     _sandbox_home(tmpdir)
     module, why = _import_verb()
@@ -1755,15 +1133,12 @@ def check_a_fault_after_commit_never_reports_that_nothing_changed(
 
     from hermes_cli import session_fence_rollback as library
 
-    def _run_with_a_fault(store, backup, *, after_commit: bool):
-        """Drive ``--dry-run`` with the rehearsal's own COMMIT sabotaged.
-
-        The proxy wraps the connection the PREPARER hands back, because the
-        mutable object is deserialized into memory and has no pathname to
-        intercept. An earlier version keyed the injection on a filename, which
-        stopped firing the moment the object stopped having one — a fixture
-        that silently measures nothing.
-        """
+    def _run_with_a_fault(where, *, after_commit: bool):
+        where.mkdir()
+        store = where / "state.db"
+        _fenced_store(store, leave_lease_live=False)
+        work = where / "work"
+        work.mkdir()
 
         class _Connection:
             def __init__(self, real):
@@ -1775,17 +1150,11 @@ def check_a_fault_after_commit_never_reports_that_nothing_changed(
 
             def execute(self, statement, *args, **kwargs):
                 if after_commit and self._committed:
-                    # The first statement after a COMMIT that returned: the
-                    # rehearsal's own read-back of what is left. Everything
-                    # between COMMIT and the report is a place a fault can land.
                     raise sqlite3.OperationalError("disk I/O error after COMMIT")
                 result = self._real.execute(statement, *args, **kwargs)
                 if statement.strip().upper() == "COMMIT":
                     self._committed = True
                     if not after_commit:
-                        # A COMMIT that really committed and then reported a
-                        # failure. Whether it landed is genuinely unknown to
-                        # the caller, which is the point.
                         raise sqlite3.OperationalError("disk I/O error on COMMIT")
                 return result
 
@@ -1798,64 +1167,37 @@ def check_a_fault_after_commit_never_reports_that_nothing_changed(
 
         library.prepare_the_private_copy = _prepare_then_sabotage
         try:
-            return _run_verb(store, backup, dry_run=True)
+            return _drive_the_machinery(library, store, work)
         finally:
             library.prepare_the_private_copy = real_prepare
 
-    # (1) The fault lands AFTER a COMMIT that returned.
-    done_dir = tmpdir / "committed"
-    done_dir.mkdir()
-    done_store = done_dir / "state.db"
-    _fenced_store(done_store, leave_lease_live=False)
-    late = _run_with_a_fault(done_store, done_dir / "backup.db", after_commit=True)
-
-    assert not late.crash, f"the verb crashed on the post-commit fault: {late.crash}"
-    done = _payload(late)
-    assert done is not None, f"no machine-readable report: {late.stdout!r}"
-    rehearsal = done.get("rehearsal") or {}
-    assert rehearsal.get("outcome") == "committed", (
-        "a fault after a COMMIT that returned is reported as something other "
-        f"than a completed commit: {rehearsal!r}. The full report was {done!r}"
+    # (1) The fault lands AFTER a COMMIT that returned. Nothing reads the
+    #     connection again inside the boundary, so the fault surfaces on the
+    #     ledger rather than as an exception -- and the ledger is the point.
+    late = _run_with_a_fault(tmpdir / "committed", after_commit=True)
+    late_facts = late["outcome"].facts()
+    assert not late["crash"], f"the machinery crashed: {late['crash']}"
+    assert late_facts["outcome"] == "committed", (
+        f"a COMMIT that returned is not recorded as one: {late_facts!r}"
     )
-    assert rehearsal.get("changed") is True, (
-        "the rollback committed against the rehearsal's copy and the report "
-        f"says it changed nothing: {rehearsal!r}"
+    assert late_facts["changed"] is True, (
+        f"the rollback committed and the ledger says nothing changed: {late_facts!r}"
     )
-    assert rehearsal.get("backup_created") is True, (
-        f"the backup was written and the report does not say so: {rehearsal!r}"
-    )
-    assert rehearsal.get("backup_durable") is True, (
-        f"the backup was flushed and the report does not say so: {rehearsal!r}"
-    )
-    assert late.rc not in (0, None), "a late fault still needs a nonzero exit"
+    assert late_facts["backup_durable"] is True, f"{late_facts!r}"
 
     # (2) The fault IS the COMMIT.
-    unknown_dir = tmpdir / "unknown"
-    unknown_dir.mkdir()
-    unknown_store = unknown_dir / "state.db"
-    _fenced_store(unknown_store, leave_lease_live=False)
-    ambiguous = _run_with_a_fault(
-        unknown_store, unknown_dir / "backup.db", after_commit=False
-    )
-
-    assert not ambiguous.crash, f"the verb crashed on the failed COMMIT: {ambiguous.crash}"
-    unsure = _payload(ambiguous)
-    assert unsure is not None, f"no machine-readable report: {ambiguous.stdout!r}"
-    unsure_rehearsal = unsure.get("rehearsal") or {}
-    assert unsure_rehearsal.get("outcome") == "commit-unknown", (
+    unsure = _run_with_a_fault(tmpdir / "unknown", after_commit=False)
+    unsure_facts = unsure["outcome"].facts()
+    assert not unsure["crash"], f"the machinery crashed: {unsure['crash']}"
+    assert unsure_facts["outcome"] == "commit-unknown", (
         "a COMMIT that raised was resolved into a certainty the caller does "
-        f"not have: {unsure_rehearsal!r}. The full report was {unsure!r}"
+        f"not have: {unsure_facts!r}"
     )
-    assert unsure_rehearsal.get("changed") is None, (
-        "an unknown commit was rendered as a boolean. Whichever way it is "
-        "spelled it is a claim nobody is entitled to make: "
-        f"{unsure_rehearsal!r}"
+    assert unsure_facts["changed"] is None, (
+        "an unknown commit was rendered as a boolean; whichever way it is "
+        f"spelled it is a claim nobody is entitled to make: {unsure_facts!r}"
     )
-    assert ambiguous.rc not in (0, None), "an unknown commit is not a success"
-    assert "Nothing was changed." not in ambiguous.stderr, (
-        "the operator is told nothing was changed about a commit whose fate is "
-        f"unknown:\n{ambiguous.stderr}"
-    )
+    assert unsure["reason"] == "commit-unknown", f"{unsure['reason']!r}"
 
 
 def check_a_withdrawn_backup_is_never_reported_as_one_the_operator_has(
@@ -2096,72 +1438,6 @@ def check_a_withdrawn_backup_is_never_reported_as_one_the_operator_has(
         f"the report does not say why presence is unknown: {raced!r}"
     )
 
-    # (4) AND THE VERB SAYS SO, not only the library.
-    cli_dir = tmpdir / "surfaced"
-    cli_dir.mkdir()
-    cli_store = cli_dir / "state.db"
-    _fenced_store(cli_store, leave_lease_live=False)
-    real_backup = library._make_verified_backup
-    real_surface = library._refuse_unexpected_surface
-    seen = {"backed_up": False}
-
-    def _backup_then_swap(*args, **kwargs):
-        report = real_backup(*args, **kwargs)
-        seen["backed_up"] = True
-        target = pathlib.Path(report["path"])
-        target.unlink()
-        target.write_bytes(stranger_bytes)
-        return report
-
-    def _fail_after(*args, **kwargs):
-        real_surface(*args, **kwargs)
-        if seen["backed_up"]:
-            raise library.TurnFenceRollbackRefused(
-                "the surface moved between the backup and the drops",
-                reason="surface-mismatch",
-            )
-
-    library._make_verified_backup = _backup_then_swap
-    library._refuse_unexpected_surface = _fail_after
-    try:
-        run = _run_verb(cli_store, cli_dir / "backup.db", dry_run=True)
-    finally:
-        library._make_verified_backup = real_backup
-        library._refuse_unexpected_surface = real_surface
-
-    assert seen["backed_up"], "the rehearsal never reached its backup"
-    assert not run.crash, f"the verb crashed: {run.crash}"
-    payload = _payload(run)
-    assert payload is not None, f"no machine-readable report: {run.stdout!r}"
-    rehearsal = payload.get("rehearsal") or {}
-    assert rehearsal.get("residue_present") is True, (
-        "the library recorded what it could not remove and the verb dropped "
-        f"it. A fact nobody reads is not a fact: {payload!r}"
-    )
-    # Presence is measured at emit time, and by then the command has swept
-    # its own private directory — so `false` here is an OBSERVATION, not the
-    # unknown being resolved into a certainty. What must survive is the
-    # separate fact that this run could not complete its own withdrawal.
-    assert rehearsal.get("backup_present") is False, (
-        f"the report disagrees with the filesystem: {rehearsal!r}"
-    )
-    assert rehearsal.get("backup_withdrawn") is False, (
-        "the run failed to withdraw the backup and the report says it "
-        f"withdrew it: {rehearsal!r}"
-    )
-    # THE CLEAN SWEEP MUST NOT FLATTEN IT. The work-dir cleanup succeeded, so
-    # its own residue answer is "nothing left" — and that answer used to be
-    # ASSIGNED over the backup-cleanup record established earlier, erasing the
-    # only statement that this run could not finish withdrawing its backup.
-    assert "ownership-lost" in _residue_errors(rehearsal), (
-        "the reason the withdrawal could not be completed was dropped once "
-        f"the sweep answered the presence question: {rehearsal!r}"
-    )
-    assert "work-dir" not in _residue_errors(rehearsal), (
-        "the work directory was not cleaned up, so this leg is not testing a "
-        f"clean sweep flattening an earlier record: {rehearsal!r}"
-    )
-
 
 def check_a_real_invocation_refuses_before_it_observes_the_source(
     tmpdir: pathlib.Path,
@@ -2199,6 +1475,10 @@ def check_a_real_invocation_refuses_before_it_observes_the_source(
     store = tmpdir / "state.db"
     _fenced_store(store, leave_lease_live=False)
     listing_before = sorted(entry.name for entry in tmpdir.iterdir())
+    # CONTENT, as well as the listing and the events. An in-place rewrite
+    # changes neither the file set nor any event this pin watches, so without
+    # this the source could be modified byte-for-byte under a green pin.
+    digest_before = _store_digest(store)
 
     observed = {"preflight": 0, "bound": 0, "prepared": 0, "connected": []}
     real_preflight = library.preflight_turn_fence_rollback
@@ -2270,6 +1550,12 @@ def check_a_real_invocation_refuses_before_it_observes_the_source(
         "the refusal added or removed files in the store's directory: "
         f"{sorted(entry.name for entry in tmpdir.iterdir())}"
     )
+    assert _store_digest(store) == digest_before, (
+        "the refusal rewrote the source IN PLACE. The file set is unchanged "
+        "and no watched event fired, which is exactly why the listing and the "
+        f"counters cannot carry this on their own: {digest_before} -> "
+        f"{_store_digest(store)}"
+    )
 
     # AND THE HELP SAYS THE SAME THING. Two statements of one behaviour that
     # can disagree mean one of them is unpinned, and the one an operator reads
@@ -2287,287 +1573,19 @@ def check_a_real_invocation_refuses_before_it_observes_the_source(
     assert "database to roll back" not in store_help, (
         f"--store still promises a rollback of the named store: {store_help!r}"
     )
-    assert "does not roll back" in store_help, (
+    assert "does not roll it back" in store_help, (
         f"--store does not say what this build declines to do: {store_help!r}"
     )
-    assert "evaluate" in store_help, (
-        f"--store does not say what it actually does: {store_help!r}"
+    assert "does not open, copy or read it" in store_help, (
+        f"--store still claims this build reads the named file: {store_help!r}"
     )
     backup_help = options.get("backup", "").lower()
-    assert "where to write the verified backup" not in backup_help, (
-        f"--backup still promises a file this build never writes: {backup_help!r}"
+    assert "still validated" not in backup_help, (
+        f"--backup claims a validation that no longer runs: {backup_help!r}"
     )
-    assert "not created by this build" in backup_help, (
-        f"--backup does not say that nothing is written there: {backup_help!r}"
+    assert "not examined" in backup_help, (
+        f"--backup does not say the destination is untouched: {backup_help!r}"
     )
-
-
-def check_the_dry_run_never_reports_that_a_refused_run_would_proceed(
-    tmpdir: pathlib.Path,
-) -> None:
-    """A rehearsal is only worth anything if it predicts the real run.
-
-    The operator types the real command on the dry run's say-so, so a dry run
-    that reports "this would proceed" about a run that then refuses is worse
-    than having no dry run. Under a contract where NO target the operator can
-    name has offline authority, that reduces to something absolute and easy to
-    check: there is no store for which the dry run may report success.
-
-    THIS IS THE OUTCOME-LEVEL HALF, AND IT IS DELIBERATELY NOT THE WHOLE
-        The original property was "both paths refuse for the same reason", and
-        keeping that literally would mean making the dry run refuse at the
-        authority first — which deletes the diagnostic surface (wrong target,
-        half-installed surface, live turn, occupied destination) and makes the
-        rehearsal, and therefore the entire backup and commit machinery,
-        unreachable and green because nothing runs it. The specific
-        counterexample that property was written for has its own pin now; see
-        :func:`check_the_rehearsal_asks_the_liveness_question_of_the_operators_store`.
-
-    Both invocations are asserted TOGETHER, so the claim is the agreement
-    rather than either verdict on its own.
-    """
-    _sandbox_home(tmpdir)
-    module, why = _import_verb()
-    assert module is not None, f"there is no fence-rollback verb: {why}"
-
-    store = tmpdir / "state.db"
-    _fenced_store(store, leave_lease_live=False)
-    before = _store_digest(store)
-    listing_before = sorted(entry.name for entry in tmpdir.iterdir())
-
-    rehearsal = _run_verb(store, tmpdir / "backup-dry.db", dry_run=True)
-    assert not rehearsal.crash, f"the dry run crashed: {rehearsal.crash}"
-    dry = _payload(rehearsal)
-    assert dry is not None, f"no machine-readable dry-run report: {rehearsal.stdout!r}"
-    after_rehearsal = _store_digest(store)
-    listing_after_rehearsal = sorted(entry.name for entry in tmpdir.iterdir())
-
-    real = _run_verb(store, tmpdir / "backup-real.db")
-    assert not real.crash, f"the real run crashed: {real.crash}"
-    live = _payload(real)
-    assert live is not None, f"no machine-readable real-run report: {real.stdout!r}"
-
-    assert live.get("ok") is False, (
-        f"the real run succeeded on a store nothing can prove is offline: {live!r}"
-    )
-    assert dry.get("ok") is False, (
-        "the dry run reported that the rollback WOULD PROCEED on a store the "
-        f"real run refuses ({live['refused']['reason']}): {dry!r}"
-    )
-    assert rehearsal.rc not in (0, None) and real.rc not in (0, None), (
-        f"exit codes disagree with the reports: dry={rehearsal.rc!r} "
-        f"real={real.rc!r}"
-    )
-    assert dry["refused"]["reason"] == live["refused"]["reason"], (
-        "the dry run and the real run refused for DIFFERENT reasons "
-        f"({dry['refused']['reason']} vs {live['refused']['reason']}), so the "
-        "rehearsal is not a rehearsal of this run"
-    )
-    # AND THE REHEARSAL STILL RAN. A dry run that agrees with the real run by
-    # refusing at the same early gate agrees about nothing — it would pass this
-    # while doing no work at all, which is the shape that makes a suite green
-    # by not running.
-    assert (dry.get("rehearsal") or {}).get("outcome") == "committed", (
-        "the dry run reached the same verdict without performing the "
-        f"operation, so the agreement is vacuous: {dry.get('rehearsal')!r}"
-    )
-
-    assert after_rehearsal == before, (
-        f"the dry run changed the store while refusing it: {before} -> "
-        f"{after_rehearsal}"
-    )
-    assert listing_after_rehearsal == listing_before, (
-        f"a refused dry run left files behind: {listing_after_rehearsal}"
-    )
-
-
-def check_a_late_failure_does_not_retract_what_already_happened(
-    tmpdir: pathlib.Path,
-) -> None:
-    """Failure precedence sets the exit status. It does not rewrite the facts.
-
-    Two situations that must not print the same thing:
-
-    * the rehearsal COMPLETED and cleanup then failed — the rollback ran to a
-      commit and what is left on disk is an UNFENCED duplicate of every
-      conversation in the store;
-    * the run was refused BEFORE the rehearsal ran, and cleanup then failed —
-      nothing was dropped and the copy left behind still carries the fence.
-
-    Same directory, different contents, and an operator triaging the first
-    needs to know the fence is off in there. Collapsing both into one reason,
-    or into ``changed: false`` with an empty surface, is the original residue
-    defect pointed the other way — and worse, because someone who reads
-    "nothing happened" stops looking.
-
-    THE FAILURE IS INJECTED AT THE FINAL SWEEP ONLY. Suppressing ``rmtree``
-    wholesale also breaks the backup's own staging cleanup, which now refuses
-    the run before it can commit — so the injection would prevent the very
-    completion this pin is about. It targets the command's rehearsal directory
-    by name instead.
-    """
-    _sandbox_home(tmpdir)
-    module, why = _import_verb()
-    assert module is not None, f"there is no fence-rollback verb: {why}"
-
-    from hermes_cli import session_fence_rollback as library
-
-    def _run_with_cleanup_failing(store, backup):
-        real_shutil = _suppress_directory_removal(library)
-        try:
-            return _run_verb(store, backup, dry_run=True)
-        finally:
-            library.shutil = real_shutil
-
-    # (1) THE REHEARSAL COMPLETED, then cleanup failed.
-    done_dir = tmpdir / "completed"
-    done_dir.mkdir()
-    done_store = done_dir / "state.db"
-    _fenced_store(done_store, leave_lease_live=False)
-    completed = _run_with_cleanup_failing(done_store, done_dir / "backup.db")
-
-    assert not completed.crash, f"the verb crashed: {completed.crash}"
-    done = _payload(completed)
-    assert done is not None, f"no machine-readable report: {completed.stdout!r}"
-    done_rehearsal = done.get("rehearsal") or {}
-    assert done_rehearsal.get("outcome") == "committed", (
-        "the fixture did not actually complete a rollback, so this pin is "
-        f"comparing nothing: {done_rehearsal!r}"
-    )
-    assert done_rehearsal.get("backup_created") is True, (
-        f"the completed rehearsal's backup was flattened away: {done_rehearsal!r}"
-    )
-    assert done_rehearsal.get("backup_durable") is True, (
-        f"the durability fact was retracted by the cleanup failure: {done_rehearsal!r}"
-    )
-    assert sorted(done["would_drop"]) == sorted(
-        hermes_state_common.TURN_FENCE_TRIGGERS
-    ), (
-        "the completed surface was flattened to empty by the cleanup failure: "
-        f"{done.get('would_drop')!r}"
-    )
-    done_records = done.get("residue") or []
-    assert len(done_records) == 1 and done_records[0]["fence_state"] == "unfenced", (
-        "the rollback committed against this copy and the residue record does "
-        f"not say the fence is off it: {done_records!r}"
-    )
-    assert "Nothing was changed." not in completed.stderr, (
-        "the operator is told nothing happened while an UNFENCED duplicate of "
-        f"every conversation is on disk:\n{completed.stderr}"
-    )
-    assert completed.rc not in (0, None), "residue still needs a nonzero exit"
-
-    # (2) REFUSED BEFORE THE REHEARSAL RAN, then cleanup failed.
-    live_dir = tmpdir / "refused"
-    live_dir.mkdir()
-    live_store = live_dir / "state.db"
-    _fenced_store(live_store, leave_lease_live=True)
-    _hand_the_lease_to_a_foreign_live_owner(live_store)
-    live_triggers = _installed_triggers(live_store)
-    live_backup = live_dir / "backup.db"
-    refused = _run_with_cleanup_failing(live_store, live_backup)
-
-    assert not refused.crash, f"the verb crashed: {refused.crash}"
-    stopped = _payload(refused)
-    assert stopped is not None, f"no machine-readable report: {refused.stdout!r}"
-    stopped_rehearsal = stopped.get("rehearsal") or {}
-    assert stopped_rehearsal.get("outcome") == "not-started", (
-        "a run refused in the pre-flight reports a rehearsal that ran: "
-        f"{stopped_rehearsal!r}"
-    )
-    assert stopped_rehearsal.get("backup_created") is False, (
-        f"a backup is claimed for a rehearsal that never ran: {stopped_rehearsal!r}"
-    )
-    assert stopped["changed"] is False
-    assert stopped["dropped_triggers"] == []
-    assert not live_backup.exists(), "a pre-rehearsal refusal wrote a backup"
-    assert _installed_triggers(live_store) == live_triggers
-    stopped_records = stopped.get("residue") or []
-    assert len(stopped_records) == 1, f"expected one incident: {stopped_records!r}"
-    assert stopped_records[0]["fence_state"] != done_records[0]["fence_state"], (
-        "a directory holding an UNFENCED duplicate and one holding a copy that "
-        f"still carries the fence describe themselves identically "
-        f"({stopped_records[0]['fence_state']}). Same words, opposite urgency"
-    )
-    assert stopped_records[0]["fence_state"] == "as-found", (
-        "the run refused before the rollback ran, so its copy is in the state "
-        f"it was made in: {stopped_records[0]!r}"
-    )
-
-
-def check_the_completed_rehearsal_reports_the_surface_it_removed(
-    tmpdir: pathlib.Path,
-) -> None:
-    """Structured output on the path that COMPLETES, and it says what it did.
-
-    A verb that prints "done" leaves the operator to go and check by hand what
-    it did, which is the state this verb exists to replace. Under a contract
-    where no real run proceeds, the only place a rollback completes is the
-    rehearsal on a private copy — which makes that report the operator's ONLY
-    view of what the operation does, and so more load-bearing than the success
-    report it replaces, not less.
-
-    NOT RE-AIMED AT "NO IN-PLACE SUCCESS CAN OCCUR", DELIBERATELY. That claim
-    is already decided by the classifier and asserted by
-    :func:`check_no_in_place_run_succeeds_and_each_wrong_target_names_its_own_reason`
-    over four target classes. A second pin asserting it would pass because a
-    different guard holds, and its mutation row would score a kill that guard
-    delivered — a redundant check reporting coverage it does not have, which is
-    the shape this slice has been paying for. The property that was actually
-    orphaned is machine-readable completion reporting, and this is where it now
-    lives.
-    """
-    _sandbox_home(tmpdir)
-    module, why = _import_verb()
-    assert module is not None, f"there is no fence-rollback verb: {why}"
-
-    store = tmpdir / "state.db"
-    _fenced_store(store, leave_lease_live=False)
-    rows_before = _canonical_rows(store)
-    triggers_before = _installed_triggers(store)
-    backup = tmpdir / "backup.db"
-
-    run = _run_verb(store, backup, dry_run=True)
-    assert not run.crash, f"the verb crashed: {run.crash}"
-    payload = _payload(run)
-    assert payload is not None, f"no machine-readable report: {run.stdout!r}"
-
-    rehearsal = payload.get("rehearsal") or {}
-    assert rehearsal.get("outcome") == "committed", (
-        f"the rehearsal did not run the rollback to a commit: {rehearsal!r}"
-    )
-    assert sorted(payload["would_drop"]) == sorted(
-        hermes_state_common.TURN_FENCE_TRIGGERS
-    ), (
-        "the completed rehearsal does not report the surface it removed, so "
-        "nothing in the output distinguishes a full rollback from a partial "
-        f"one: {payload.get('would_drop')!r}"
-    )
-    assert sorted(payload["installed_triggers"]) == sorted(
-        hermes_state_common.TURN_FENCE_TRIGGERS
-    ), f"the surface it found is not reported: {payload.get('installed_triggers')!r}"
-    record = rehearsal.get("backup")
-    assert isinstance(record, dict) and record.get("verified") is True, (
-        f"the report does not claim a verified backup: {record!r}"
-    )
-    assert record.get("durable") is True, (
-        f"the report does not claim a durable backup: {record!r}"
-    )
-    assert record.get("transient") is True and record.get("present") is False, (
-        "the rehearsal's backup is reported as an artifact the operator can go "
-        f"and find, and it was removed with the working directory: {record!r}"
-    )
-    assert record.get("rows"), (
-        f"the report does not say what the backup preserved: {record!r}"
-    )
-
-    assert _installed_triggers(store) == triggers_before, (
-        "the rehearsal removed the fence from the operator's store"
-    )
-    assert _canonical_rows(store) == rows_before, (
-        "the rehearsal changed user rows in the operator's store"
-    )
-    assert not backup.exists(), "the dry run wrote to the operator's backup path"
 
 
 def _suppress_directory_removal(library):
@@ -2594,73 +1612,6 @@ def _suppress_directory_removal(library):
     real = library.shutil
     library.shutil = _TheRehearsalDirectorySurvives(real)
     return real
-
-
-def check_one_suppressed_sweep_leaves_exactly_one_residue_record(
-    tmpdir: pathlib.Path,
-) -> None:
-    """ONE physical incident, ONE record. Counting is a fact too.
-
-    Making residue append-only removed the erasure — a work-dir answer assigned
-    over the top of a backup-withdrawal record — and introduced its mirror
-    image. Every path appends, and two paths observed the same sweep: the
-    command notes it into the outcome, then reads the outcome back and appends
-    the same record a second time. One suppressed cleanup came out as two
-    byte-identical records for one directory.
-
-    Erasure and duplication are the two ways a multi-writer fact goes wrong,
-    and fixing one exposes the other unless the invariant is stated as
-    CARDINALITY rather than as a write discipline. "Append-only" is a rule about
-    how records are added; it says nothing about how many there should be.
-
-    An operator reading two records counts two directories to go and clean, and
-    goes looking for a second one that never existed. A residue report exists
-    to be acted on, so its arithmetic is load-bearing.
-
-    The refusal is forced BEFORE any backup exists — a half-installed surface,
-    caught on the private copy — so the run has exactly one thing it could fail
-    to remove. Anything other than one record is this defect or its opposite.
-    """
-    _sandbox_home(tmpdir)
-    module, why = _import_verb()
-    assert module is not None, f"there is no fence-rollback verb: {why}"
-
-    from hermes_cli import session_fence_rollback as library
-
-    store = tmpdir / "state.db"
-    _fenced_store(store, leave_lease_live=False)
-    victim = hermes_state_common.turn_fence_trigger_name("messages", "INSERT")
-    conn = sqlite3.connect(str(store), isolation_level=None)
-    try:
-        conn.execute(f"DROP TRIGGER {victim}")
-    finally:
-        conn.close()
-
-    real_shutil = _suppress_directory_removal(library)
-    try:
-        run = _run_verb(store, tmpdir / "backup.db", dry_run=True)
-    finally:
-        library.shutil = real_shutil
-
-    assert not run.crash, f"the verb crashed: {run.crash}"
-    payload = _payload(run)
-    assert payload is not None, f"no machine-readable report: {run.stdout!r}"
-    assert payload["refused"]["reason"] == "surface-mismatch", (
-        "residue relabelled the run. The reason belongs to whatever decided "
-        "its fate — here a half-installed surface — and residue rides "
-        f"alongside it: {payload['refused']!r}"
-    )
-
-    records = payload.get("residue") or []
-    directories = {record.get("work_dir") for record in records}
-    assert len(records) == 1, (
-        f"one suppressed sweep of one directory produced {len(records)} residue "
-        f"records for {len(directories)} distinct directory(ies). An operator "
-        f"reads that as more than one place to go and clean: {records!r}"
-    )
-    assert (payload.get("rehearsal") or {}).get("residue_present") is True, (
-        f"the residue was recorded and not reported as present: {payload!r}"
-    )
 
 
 def check_two_notices_of_one_incident_are_one_record(
@@ -2733,97 +1684,6 @@ def check_two_incidents_with_identical_values_stay_two_records(
     incidents = sorted(str(record.get("incident")) for record in records)
     assert incidents == ["backup:/a", "work-dir:/a"], (
         f"the records do not say which incident each one is: {records!r}"
-    )
-
-
-def check_a_residue_claim_names_the_fence_state_that_was_established(
-    tmpdir: pathlib.Path,
-) -> None:
-    """What state is this claim about, and what DETERMINED that state?
-
-    The residue message was written where cleanup fails, so it inherited that
-    site's subject and asserted a property nothing there had established: every
-    left-behind copy was announced as "an UNFENCED duplicate of every
-    conversation". Fence state is not determined by whether cleanup failed. It
-    is determined by whether the rollback DDL COMMITTED — and on a refusal
-    before the DDL the copy sits exactly as it was made, still carrying the
-    fence.
-
-    The two readings call for different urgency, which is the whole reason to
-    get it right: an unfenced duplicate is a live exposure, a fenced one is
-    litter. Telling an operator the first when it is the second is the same
-    failure as reporting a backup that does not exist.
-
-    Both directions are asserted, because a claim that is always "unfenced" and
-    a claim that is always "as-found" are both wrong and only one of them looks
-    wrong.
-    """
-    _sandbox_home(tmpdir)
-    module, why = _import_verb()
-    assert module is not None, f"there is no fence-rollback verb: {why}"
-
-    from hermes_cli import session_fence_rollback as library
-
-    # (1) REFUSED BEFORE THE DDL — the copy still carries its fence.
-    early_dir = tmpdir / "early"
-    early_dir.mkdir()
-    early_store = early_dir / "state.db"
-    _fenced_store(early_store, leave_lease_live=False)
-    victim = hermes_state_common.turn_fence_trigger_name("messages", "INSERT")
-    conn = sqlite3.connect(str(early_store), isolation_level=None)
-    try:
-        conn.execute(f"DROP TRIGGER {victim}")
-    finally:
-        conn.close()
-
-    real_shutil = _suppress_directory_removal(library)
-    try:
-        early = _run_verb(early_store, early_dir / "backup.db", dry_run=True)
-    finally:
-        library.shutil = real_shutil
-
-    assert not early.crash, f"the verb crashed: {early.crash}"
-    early_payload = _payload(early)
-    assert early_payload is not None, f"no report: {early.stdout!r}"
-    early_records = early_payload.get("residue") or []
-    assert len(early_records) == 1, f"expected one incident: {early_records!r}"
-    assert early_records[0]["fence_state"] == "as-found", (
-        "the copy was left in the state it was made in — the run refused "
-        "before the rollback ran — and the record says the fence came off it: "
-        f"{early_records[0]!r}"
-    )
-    assert "UNFENCED" not in early.stdout + early.stderr, (
-        "an unfenced duplicate is a live exposure and this one is not "
-        f"unfenced:\n{early.stderr}"
-    )
-
-    # (2) THE ROLLBACK COMMITTED against the copy — now it IS unfenced.
-    done_dir = tmpdir / "committed"
-    done_dir.mkdir()
-    done_store = done_dir / "state.db"
-    _fenced_store(done_store, leave_lease_live=False)
-
-    real_shutil = _suppress_directory_removal(library)
-    try:
-        done = _run_verb(done_store, done_dir / "backup.db", dry_run=True)
-    finally:
-        library.shutil = real_shutil
-
-    assert not done.crash, f"the verb crashed: {done.crash}"
-    done_payload = _payload(done)
-    assert done_payload is not None, f"no report: {done.stdout!r}"
-    assert (done_payload.get("rehearsal") or {}).get("outcome") == "committed", (
-        "the fixture did not commit the rollback against the copy, so the "
-        f"unfenced leg is not exercised: {done_payload.get('rehearsal')!r}"
-    )
-    done_records = done_payload.get("residue") or []
-    assert len(done_records) == 1, f"expected one incident: {done_records!r}"
-    assert done_records[0]["fence_state"] == "unfenced", (
-        "the rollback committed against this copy and the record does not say "
-        f"the fence is off it: {done_records[0]!r}"
-    )
-    assert "UNFENCED" in done.stderr, (
-        f"the operator is not told this one is a live exposure:\n{done.stderr}"
     )
 
 
@@ -3465,131 +2325,24 @@ def check_a_target_swapped_and_restored_around_any_open_cannot_be_reached(
         assert not backup.exists(), "a refused run left a backup behind"
 
 
-def check_the_boundary_decides_liveness_again_keyed_by_the_operators_store(
+def check_an_artifact_whose_image_is_incomplete_is_refused(
     tmpdir: pathlib.Path,
 ) -> None:
-    """Two conjuncts: it decides AGAIN, and it decides about the OPERATOR's store.
+    """MAINTENANCE ONLY. A main image is not the database when a sidecar holds rows.
 
-    KEYED BY THE OPERATOR'S STORE. ``SessionDB._turn_lease_row_is_free`` frees a
-    row whose ``owner_pid`` is this process when this process holds no grant FOR
-    THAT ``db_path`` — a turn that died without releasing. The pre-flight asks
-    about the private copy, so a conversation this very process is genuinely
-    mid-turn on reads FREE there. Measured: the first version of this rehearsal
-    reported "this would proceed" on exactly the store the real run refused.
-
-    AND IT DECIDES AGAIN. The lock has to be released for the backup —
-    ``VACUUM INTO`` cannot run inside a transaction and the online backup API
-    deadlocks against a source holding ``BEGIN EXCLUSIVE``, both measured — so
-    everything decided before it is a snapshot by the time the drops run. The
-    boundary therefore decides a second time, under the lock that performs
-    them.
-
-    THE FIXTURE HAS TO SEPARATE THE TWO, OR ONE ROW COVERS BOTH BY ACCIDENT.
-    An earlier version made the turn live from the start; the FIRST decision
-    then refused, and deleting the second changed nothing, so the row for
-    "decides again" scored a kill it had not earned. The lease row here is left
-    owned by this process with no grant — free to both decisions — and a grant
-    for the operator's store is taken in the backup window, which is the only
-    interval that separates them. Free before, live after.
+    Driven at the preparer, not through the verb: the boundary's own sidecar
+    disqualifier reaches the same verdict for the same artifact, so asserting
+    it through the CLI passes whether or not the preparer ever checked — a
+    redundant guarantee reporting coverage it does not have. What the preparer
+    owns is refusing before it deserializes an image whose committed rows live
+    in an uncheckpointed ``-wal``: such an image opens cleanly, passes
+    ``integrity_check`` and is quietly short of data.
     """
     _sandbox_home(tmpdir)
     module, why = _import_verb()
     assert module is not None, f"there is no fence-rollback verb: {why}"
 
     from hermes_cli import session_fence_rollback as library
-    from hermes_state import SessionDB
-
-    store = tmpdir / "state.db"
-    _fenced_store(store, leave_lease_live=False)
-    # A holder owned by THIS process with no grant: the path-keyed branch reads
-    # it free, which is what makes the two decisions differ later.
-    stale = SessionDB(db_path=store)
-    try:
-        stale._execute_write(
-            lambda conn: conn.execute(
-                "UPDATE session_turn_leases SET holder = ?, owner_pid = ?, "
-                "owner_pid_start = NULL WHERE conversation_id = ?",
-                (_holder("stale"), os.getpid(), "keep"),
-            )
-        )
-    finally:
-        stale.close()
-    triggers_before = _installed_triggers(store)
-
-    barrier = {"granted": None, "db": None}
-    real_backup = library._make_verified_backup
-
-    def _a_turn_starts_in_the_backup_window(*args, **kwargs):
-        report = real_backup(*args, **kwargs)
-        if barrier["granted"] is None:
-            # Acquired through the ordinary API, on the store the operator
-            # named. The in-memory row was captured before this; what changes
-            # is whether this process holds a grant for that db_path, which is
-            # exactly what the path-keyed branch consults.
-            db = SessionDB(db_path=store)
-            barrier["db"] = db
-            barrier["granted"] = db.try_acquire_session_turn_lease(
-                "keep", _holder("late"), ttl_seconds=600
-            )
-        return report
-
-    library._make_verified_backup = _a_turn_starts_in_the_backup_window
-    try:
-        run = _run_verb(store, tmpdir / "backup-dry.db", dry_run=True)
-    finally:
-        library._make_verified_backup = real_backup
-        if barrier["db"] is not None:
-            barrier["db"].close()
-
-    assert barrier["granted"], (
-        "the barrier never took the turn, so the two decisions were never "
-        f"separated and this pin measures nothing: {barrier['granted']!r}"
-    )
-    assert not run.crash, f"the dry run crashed: {run.crash}"
-    payload = _payload(run)
-    assert payload is not None, f"no machine-readable report: {run.stdout!r}"
-
-    assert payload.get("ok") is False
-    assert payload["preflight"]["offline_verified"] is True, (
-        "the PRE-FLIGHT refused this, so neither of the boundary's decisions "
-        f"was the one that mattered: {payload['preflight']!r}"
-    )
-    assert (payload.get("rehearsal") or {}).get("backup_created") is True, (
-        "the run never reached the backup, so the turn was never taken in the "
-        f"window between the two decisions: {payload.get('rehearsal')!r}"
-    )
-    assert payload["refused"]["reason"] == "live-turn", (
-        "a turn taken between the backup and the drops was not refused. Either "
-        "the boundary trusted its earlier snapshot, or it asked about the COPY "
-        f"rather than the store the operator named: {payload['refused']!r}"
-    )
-    assert "keep" in payload["refused"]["detail"], (
-        f"the refusal does not name the conversation: {payload['refused']!r}"
-    )
-    assert _installed_triggers(store) == triggers_before, (
-        "the rollback dropped triggers on the operator's store"
-    )
-
-
-def check_an_artifact_whose_image_is_incomplete_is_refused(
-    tmpdir: pathlib.Path,
-) -> None:
-    """A main file is not the database when a sidecar holds committed rows.
-
-    The working object is deserialized from the artifact's main image. A row
-    committed into an uncheckpointed ``-wal`` is in the database and NOT in
-    that file, so an image taken without it is a different database — one that
-    opens cleanly, passes ``integrity_check``, and is quietly short of rows.
-    Every downstream claim would then be true of something nobody asked about.
-
-    So an artifact with sidecars beside it is refused rather than deserialized,
-    which is the same verdict the in-place path reaches for the same reason.
-    Both stores are asserted untouched: a refusal that reads its subject has
-    not refused it.
-    """
-    _sandbox_home(tmpdir)
-    module, why = _import_verb()
-    assert module is not None, f"there is no fence-rollback verb: {why}"
 
     store = tmpdir / "state.db"
     _fenced_store(store, leave_lease_live=False)
@@ -3597,46 +2350,28 @@ def check_an_artifact_whose_image_is_incomplete_is_refused(
     _commit_a_marker_that_lives_only_in_the_wal(store, marker)
     wal = store.with_name(store.name + "-wal")
     assert wal.is_file() and marker.encode() in wal.read_bytes(), (
-        "the fixture did not leave the row in an uncheckpointed -wal, so the "
-        f"image would not be short of anything: {sorted(_family_beside(store))}"
+        f"the fixture left no uncheckpointed -wal: {sorted(_family_beside(store))}"
     )
     assert marker.encode() not in store.read_bytes(), (
-        "the row reached the MAIN file, so the image is complete and this pin "
-        "measures nothing"
+        "the row reached the MAIN file, so the image is complete"
     )
-    digest_before = _store_digest(store)
-    backup = tmpdir / "backup.db"
+    work_dir = tmpdir / "work"
+    work_dir.mkdir()
 
-    run = _run_verb(store, backup, dry_run=True)
-    assert not run.crash, f"the verb crashed: {run.crash}"
-    payload = _payload(run)
-    assert payload is not None, f"no machine-readable report: {run.stdout!r}"
+    prepared = None
+    reason = ""
+    try:
+        prepared = library.prepare_the_private_copy(store, work_dir=work_dir)
+    except library.TurnFenceRollbackRefused as exc:
+        reason = exc.reason
 
-    assert (payload.get("refused") or {}).get("reason") == "target-not-quiesced", (
-        "an artifact whose committed state lives outside its main file was "
-        f"accepted, and every later claim is about a different database: "
-        f"{payload.get('refused')!r}"
+    assert prepared is None, (
+        "the preparer built a working object from an image that is missing "
+        "committed rows; every later claim is about a different database"
     )
-    # THE REASON ALONE IS NOT THIS PIN'S PROPERTY. The authority gate refuses
-    # the same artifact for the same reason at the END of the run, so asserting
-    # only the reason passes whether or not the image was ever checked — a
-    # redundant guarantee reporting coverage it does not have. What this pin
-    # owns is that the refusal happens BEFORE anything is derived from a short
-    # image: nothing may be prepared, rehearsed or backed up from it.
-    rehearsal = payload.get("rehearsal") or {}
-    assert rehearsal.get("outcome") == "not-started", (
-        "the run built a working object out of an image that is missing "
-        "committed rows and rehearsed the rollback against it before refusing: "
-        f"{rehearsal!r}"
-    )
-    assert rehearsal.get("backup_created") in (False, None), (
-        f"a backup was taken from an incomplete image: {rehearsal!r}"
-    )
-    assert payload["changed"] is False
-    assert not backup.exists(), "a refused run wrote a backup"
-    assert _store_digest(store) == digest_before, (
-        f"the refusal rewrote the artifact: {digest_before} -> "
-        f"{_store_digest(store)}"
+    assert reason == "target-not-quiesced", f"{reason!r}"
+    assert not any(work_dir.iterdir()), (
+        f"a private copy was created anyway: {sorted(p.name for p in work_dir.iterdir())}"
     )
 
 
@@ -3733,6 +2468,815 @@ def check_the_backup_describes_the_prepared_image_not_the_source_path(
     )
 
 
+def check_a_late_sidecar_never_yields_committed_or_backup_facts(
+    tmpdir: pathlib.Path,
+) -> None:
+    """Check-then-read cannot vouch for an image, so nothing is derived from one.
+
+    The source-sidecar guard decided ``beside == []`` and the main image was
+    read afterwards. Those are two operations, and a writer that commits into a
+    ``-wal`` in between leaves the check's answer true and the image short of
+    committed rows. Injected at exactly that point — inside
+    ``BoundTarget.open_for_reading``, after the check and before the bytes —
+    the run reported ``outcome=committed``, ``changed=true``, a verified and
+    durable backup and a full ``would_drop``, every one of them derived from a
+    database missing the row. The marker was in ``state.db-wal`` and absent
+    from the main file. Both runtimes.
+
+    A THIRD EXISTENCE CHECK IS NOT THE ANSWER. The interval is what the writer
+    uses, and observations do not remove intervals; that move failed three
+    times in this slice at three different seams. This is not a guard needing
+    strengthening — it is what the input is. A private copy assembled by
+    check-then-read cannot be proven coherent against a live-capable source,
+    so the rehearsal was never a weaker version of the real operation. It was
+    an operation on an artifact nobody can vouch for, and every fact
+    downstream inherited that.
+
+    So the assertion is that the injector NEVER FIRES: nothing reads an image,
+    because nothing derives anything. A count of zero, in the same shape as the
+    A→B→A pin, for the same reason — the property has to hold by construction
+    rather than by looking more often.
+    """
+    _sandbox_home(tmpdir)
+    module, why = _import_verb()
+    assert module is not None, f"there is no fence-rollback verb: {why}"
+
+    from hermes_cli import session_fence_rollback as library
+
+    store = tmpdir / "state.db"
+    _fenced_store(store, leave_lease_live=False)
+    digest_before = _store_digest(store)
+    listing_before = sorted(entry.name for entry in tmpdir.iterdir())
+    rows_before = _canonical_rows(store)
+
+    marker = "committed-after-the-sidecar-check"
+    fired = {"reads": 0}
+    real_bound = library.BoundTarget
+
+    class _AWriterCommitsAfterTheCheck(real_bound):
+        """Commit into a ``-wal`` between the sidecar check and the image read."""
+
+        def open_for_reading(self):
+            fired["reads"] += 1
+            _commit_a_marker_that_lives_only_in_the_wal(store, marker)
+            return super().open_for_reading()
+
+    library.BoundTarget = _AWriterCommitsAfterTheCheck
+    try:
+        run = _run_verb(store, tmpdir / "backup.db", dry_run=True)
+    finally:
+        library.BoundTarget = real_bound
+
+    assert not run.crash, f"the verb crashed: {run.crash}"
+    payload = _payload(run)
+    assert payload is not None, f"no machine-readable report: {run.stdout!r}"
+
+    assert fired["reads"] == 0, (
+        "the run read a source image, so there is an interval between deciding "
+        "the source is quiesced and reading it — and a writer that commits in "
+        f"that interval is invisible to both ends of it ({fired['reads']} read(s))"
+    )
+
+    # ABSENT, not false. Those facts were never produced, and a `false` would
+    # claim the step was reached and did not deliver.
+    published = sorted(_every_key(payload))
+    for fact in ("rehearsal", "backup_created", "backup_verified",
+                 "backup_durable", "would_drop", "dropped_triggers"):
+        assert not any(k.rsplit(".", 1)[-1] == fact for k in published), (
+            f"{fact} was published for work that never ran: {published}"
+        )
+    assert payload["outcome"] == "not-started", (
+        f"the run derived a rollback outcome from that image: {payload!r}"
+    )
+    assert payload["changed"] is False
+    assert payload["refused"]["reason"] == "offline-authority-unknown", (
+        f"the run refused for another reason: {payload['refused']!r}"
+    )
+
+    # THE SOURCE IS AS IT WAS FOUND — bytes and file set, not just rows.
+    assert _store_digest(store) == digest_before, (
+        f"the refusal rewrote the source: {digest_before} -> {_store_digest(store)}"
+    )
+    assert sorted(entry.name for entry in tmpdir.iterdir()) == listing_before, (
+        "the refusal added or removed files beside the source: "
+        f"{sorted(entry.name for entry in tmpdir.iterdir())}"
+    )
+    assert _canonical_rows(store) == rows_before
+    assert not (tmpdir / "backup.db").exists()
+
+
+#: Everything a refusal that derived nothing is entitled to say. Asserted as an
+#: EXACT set, not as a list of absences: a pin that only checks
+#: ``"rehearsal" not in payload`` goes on passing when the block is re-added
+#: under another name, which is the failure mode of every absence assertion.
+_REFUSAL_KEYS_WHEN_NOTHING_RAN = {
+    "verb", "ok", "dry_run", "changed", "outcome", "store", "generation",
+    "refused",
+}
+
+
+def _every_key(node, trail=""):
+    if isinstance(node, dict):
+        for key, value in node.items():
+            yield f"{trail}.{key}"
+            yield from _every_key(value, f"{trail}.{key}")
+    elif isinstance(node, list):
+        for item in node:
+            yield from _every_key(item, trail)
+
+
+def check_a_refusal_publishes_no_fact_it_never_produced(
+    tmpdir: pathlib.Path,
+) -> None:
+    """Absent and ``false`` are different statements, and only one is true here.
+
+    ``backup_created: false`` says the backup step was REACHED and produced
+    nothing. When the run refuses before deriving anything, no backup step ran
+    at all — so ``false`` is a claim about an event that never had a chance to
+    occur, and a ``preflight`` block of false checks claims each one was
+    performed and failed. A field that is PRESENT asserts the question was
+    asked.
+
+    So the report is required to carry exactly the fields it can stand behind
+    and no others. Asserted as an EXACT KEY SET rather than as a handful of
+    ``not in`` checks: absence assertions pass happily when the thing comes
+    back under a different name, and a key set catches that because the new
+    name is also not in the set.
+
+    Both paths, because they are the same refusal — there is no rehearsal to
+    distinguish them any more.
+    """
+    _sandbox_home(tmpdir)
+    module, why = _import_verb()
+    assert module is not None, f"there is no fence-rollback verb: {why}"
+
+    forbidden = {
+        "rehearsal", "would_drop", "installed_triggers", "dropped_triggers",
+        "preflight", "backup_created", "backup_verified", "backup_durable",
+        "backup_present", "backup_withdrawn", "residue",
+    }
+    for dry_run in (True, False):
+        where = tmpdir / ("dry" if dry_run else "real")
+        where.mkdir()
+        store = where / "state.db"
+        _fenced_store(store, leave_lease_live=False)
+        digest_before = _store_digest(store)
+        listing_before = sorted(entry.name for entry in where.iterdir())
+        rows_before = _canonical_rows(store)
+        backup = where / "backup.db"
+
+        run = _run_verb(store, backup, dry_run=dry_run)
+        assert not run.crash, f"the verb crashed: {run.crash}"
+        payload = _payload(run)
+        assert payload is not None, f"no machine-readable report: {run.stdout!r}"
+
+        assert set(payload) == _REFUSAL_KEYS_WHEN_NOTHING_RAN, (
+            f"the {'dry' if dry_run else 'real'} refusal publishes a different "
+            f"set of fields than it produced. extra="
+            f"{sorted(set(payload) - _REFUSAL_KEYS_WHEN_NOTHING_RAN)} missing="
+            f"{sorted(_REFUSAL_KEYS_WHEN_NOTHING_RAN - set(payload))}"
+        )
+        leaked = sorted(
+            key for key in _every_key(payload)
+            if key.rsplit(".", 1)[-1] in forbidden
+        )
+        assert leaked == [], (
+            "facts about work that never ran appear somewhere in the document: "
+            f"{leaked}"
+        )
+        assert payload["ok"] is False
+        assert payload["changed"] is False
+        assert payload["outcome"] == "not-started"
+        assert payload["refused"]["reason"] == "offline-authority-unknown"
+        assert run.rc not in (0, None)
+
+        assert _store_digest(store) == digest_before, (
+            f"the refusal rewrote the source: {digest_before} -> "
+            f"{_store_digest(store)}"
+        )
+        assert sorted(entry.name for entry in where.iterdir()) == listing_before, (
+            f"the refusal changed the source's directory: "
+            f"{sorted(entry.name for entry in where.iterdir())}"
+        )
+        assert _canonical_rows(store) == rows_before
+        assert not backup.exists()
+
+
+def check_an_unused_work_dir_cannot_change_the_verdict(
+    tmpdir: pathlib.Path,
+) -> None:
+    """A dead input may not decide what the operator is told.
+
+    ``--work-dir`` fed the working copy, and there is no working copy. It was
+    still ``stat``-ed, and a nonexistent path produced ``rehearsal-unwritable``
+    where the real path gives the authority refusal — so an input that does
+    nothing changed the verdict, and broke the dry run's own
+    same-refusal-as-the-real-run contract at the same time.
+
+    The general form, which is why this is pinned rather than just fixed: when
+    a boundary removes a capability, every input that fed that capability must
+    stop influencing the outcome. Otherwise dead inputs quietly become live
+    verdict-changers. This is what stops one being re-attached later.
+    """
+    _sandbox_home(tmpdir)
+    module, why = _import_verb()
+    assert module is not None, f"there is no fence-rollback verb: {why}"
+
+    store = tmpdir / "state.db"
+    _fenced_store(store, leave_lease_live=False)
+    digest_before = _store_digest(store)
+    listing_before = sorted(entry.name for entry in tmpdir.iterdir())
+
+    absent = tmpdir / "no-such-directory"
+    assert not absent.exists()
+
+    baseline = _payload(_run_verb(store, tmpdir / "backup.db", dry_run=True))
+    with_flag = _payload(
+        _run_verb(store, tmpdir / "backup.db", dry_run=True, work_dir=absent)
+    )
+    real = _payload(_run_verb(store, tmpdir / "backup.db", dry_run=False))
+    for name, payload in (("dry", baseline), ("dry+work-dir", with_flag), ("real", real)):
+        assert payload is not None, f"{name}: no machine-readable report"
+        assert payload["refused"]["reason"] == "offline-authority-unknown", (
+            f"{name} refused for a different reason than the others: "
+            f"{payload['refused']!r}"
+        )
+    assert with_flag["refused"]["reason"] == real["refused"]["reason"], (
+        "a nonexistent --work-dir made the dry run refuse for a reason the "
+        f"real run does not give: {with_flag['refused']!r} vs {real['refused']!r}"
+    )
+
+    assert not absent.exists(), "the unused --work-dir was created"
+    assert _store_digest(store) == digest_before
+    assert sorted(entry.name for entry in tmpdir.iterdir()) == listing_before, (
+        "a work artifact was left beside the source: "
+        f"{sorted(entry.name for entry in tmpdir.iterdir())}"
+    )
+
+
+def check_a_refusal_says_nothing_about_a_destination_it_never_examined(
+    tmpdir: pathlib.Path,
+) -> None:
+    """An occupied destination is where ``present: false`` is provably wrong.
+
+    The refusal used to publish ``backup: {created: false, present: false}`` on
+    every path. That reads as a cautious default and is not one: the boundary
+    never examines the destination, so on an operator who names an existing
+    file the report states as fact something it never looked at. ``created``
+    happens to be true; ``present`` is simply false.
+
+    So the artifact facts are absent, like every other field describing work
+    that did not happen — and the file is proved untouched by INODE as well as
+    by bytes, because "same content" would also hold for a file this run had
+    replaced with an identical one.
+
+    ASSERTED AS KEY ABSENCE, EXACTLY. ``assert not payload.get("backup")``
+    passes against the very defect being fixed, because the old value was a
+    dict whose fields were falsy in the ways that mattered. The key must not be
+    there at all.
+    """
+    _sandbox_home(tmpdir)
+    module, why = _import_verb()
+    assert module is not None, f"there is no fence-rollback verb: {why}"
+
+    for dry_run in (True, False):
+        where = tmpdir / ("dry" if dry_run else "real")
+        where.mkdir()
+        store = where / "state.db"
+        _fenced_store(store, leave_lease_live=False)
+
+        occupied = where / "backup.db"
+        occupied.write_bytes(b"an earlier backup that this run never looked at")
+        before_bytes = occupied.read_bytes()
+        before_stat = os.stat(occupied)
+        digest_before = _store_digest(store)
+        listing_before = sorted(entry.name for entry in where.iterdir())
+
+        run = _run_verb(store, occupied, dry_run=dry_run)
+        assert not run.crash, f"the verb crashed: {run.crash}"
+        payload = _payload(run)
+        assert payload is not None, f"no machine-readable report: {run.stdout!r}"
+
+        published = sorted(_every_key(payload))
+        for fact in ("backup", "created", "present", "backup_created",
+                     "backup_present", "backup_withdrawn", "backup_verified",
+                     "backup_durable"):
+            assert not any(k.rsplit(".", 1)[-1] == fact for k in published), (
+                f"the {'dry' if dry_run else 'real'} refusal reports "
+                f"{fact!r} about a destination it never examined: {published}"
+            )
+        assert payload["refused"]["reason"] == "offline-authority-unknown"
+
+        after_stat = os.stat(occupied)
+        assert occupied.read_bytes() == before_bytes, (
+            "the run altered a destination it never opened"
+        )
+        assert (after_stat.st_dev, after_stat.st_ino) == (
+            before_stat.st_dev, before_stat.st_ino
+        ), (
+            "the destination is a different file than before — same bytes "
+            "would not have caught a replacement"
+        )
+        assert _store_digest(store) == digest_before
+        assert sorted(entry.name for entry in where.iterdir()) == listing_before
+
+
+def check_a_target_that_is_not_this_fence_is_refused_by_a_named_reason(
+    tmpdir: pathlib.Path,
+) -> None:
+    """MAINTENANCE ONLY. Three wrong targets, three distinct reasons.
+
+    Not boundary evidence: telling a foreign database apart from a
+    half-installed one requires OPENING it, and the verb refuses before it
+    opens anything. Preserving that granularity at the boundary would mean the
+    boundary peeking, which is the check-then-read defect this contract exists
+    to remove. So the property moves behind the pre-flight, which no invocation
+    reaches, and it is kept so it does not rot.
+    """
+    _sandbox_home(tmpdir)
+    module, why = _import_verb()
+    assert module is not None, f"there is no fence-rollback verb: {why}"
+
+    from hermes_cli import session_fence_rollback as library
+
+    junk = tmpdir / "someone-elses-notes.db"
+    junk.write_bytes(b"this is not a database at all, it is a text file")
+    foreign_dir = tmpdir / "foreign"
+    foreign_dir.mkdir()
+    foreign = foreign_dir / "other.db"
+    conn = sqlite3.connect(str(foreign))
+    try:
+        conn.execute("CREATE TABLE unrelated (x TEXT)")
+    finally:
+        conn.close()
+
+    outcomes = {}
+    for name, target in (
+        ("store-missing", tmpdir / "no-such-store.db"),
+        ("store-unreadable", junk),
+        ("surface-mismatch", foreign),
+    ):
+        work = tmpdir / f"work-{name}"
+        work.mkdir()
+        try:
+            library.preflight_turn_fence_rollback(
+                target, backup_path=tmpdir / f"backup-{name}.db", work_dir=work
+            )
+            outcomes[name] = "<no refusal>"
+        except library.TurnFenceRollbackRefused as exc:
+            outcomes[name] = exc.reason
+        except BaseException as exc:  # noqa: BLE001 - carried, not swallowed
+            # A row that removes the surface check makes the pre-flight run on
+            # past it; whatever it hits next must reach this pin as a VALUE, or
+            # the pin dies by falling over instead of by observing.
+            outcomes[name] = f"<{type(exc).__name__}>"
+
+    assert outcomes["store-missing"] == "store-missing", (
+        "a target that is not there was not refused as store-missing: "
+        f"{outcomes!r}"
+    )
+    assert outcomes["store-unreadable"] == "store-unreadable", (
+        "a target that is not a database was not refused as store-unreadable: "
+        f"{outcomes!r}"
+    )
+    assert outcomes["surface-mismatch"] == "surface-mismatch", (
+        "a target carrying a different fence surface was not refused as "
+        f"surface-mismatch: {outcomes!r}"
+    )
+    assert len(set(outcomes.values())) == 3, (
+        f"three kinds of wrong target are not distinguishable: {outcomes!r}"
+    )
+    assert junk.read_bytes() == b"this is not a database at all, it is a text file"
+
+
+def check_a_partial_surface_is_refused_whole_and_writes_no_backup(
+    tmpdir: pathlib.Path,
+) -> None:
+    """MAINTENANCE ONLY. All-or-nothing, and the check runs before the drops.
+
+    A verb that drops what it recognises and shrugs at the rest leaves a store
+    fenced against some writes and not others. Behind the boundary now, because
+    reading the installed surface means opening the artifact.
+    """
+    _sandbox_home(tmpdir)
+    module, why = _import_verb()
+    assert module is not None, f"there is no fence-rollback verb: {why}"
+
+    from hermes_cli import session_fence_rollback as library
+
+    store = tmpdir / "state.db"
+    _fenced_store(store, leave_lease_live=False)
+    victim = hermes_state_common.turn_fence_trigger_name("messages", "INSERT")
+    conn = sqlite3.connect(str(store), isolation_level=None)
+    try:
+        conn.execute(f"DROP TRIGGER {victim}")
+    finally:
+        conn.close()
+    remaining = _installed_triggers(store)
+    rows_before = _canonical_rows(store)
+
+    work_dir = tmpdir / "work"
+    work_dir.mkdir()
+    run = _drive_the_machinery(library, store, work_dir)
+
+    assert not run["crash"], f"the machinery crashed: {run['crash']}"
+    assert run["reason"] == "surface-mismatch", (
+        f"a half-installed surface was not reported as one: {run['reason']!r}"
+    )
+    assert victim in run["detail"], (
+        f"the refusal does not name what it expected: {run['detail']!r}"
+    )
+    assert not run["backup"].exists(), "a refused run wrote a backup"
+    assert _installed_triggers(store) == remaining, (
+        "the run refused and still removed triggers — it is not all-or-nothing"
+    )
+    assert _canonical_rows(store) == rows_before
+
+
+def check_a_completed_rollback_reports_the_surface_it_removed(
+    tmpdir: pathlib.Path,
+) -> None:
+    """MAINTENANCE ONLY. The completion report names what it did.
+
+    A rollback that prints "done" leaves the operator to check by hand, which
+    is the state this tool exists to replace. No invocation reaches a
+    completion today; this keeps the report honest for the one that will.
+    """
+    _sandbox_home(tmpdir)
+    module, why = _import_verb()
+    assert module is not None, f"there is no fence-rollback verb: {why}"
+
+    from hermes_cli import session_fence_rollback as library
+
+    store = tmpdir / "state.db"
+    _fenced_store(store, leave_lease_live=False)
+    rows_before = _canonical_rows(store)
+    triggers_before = _installed_triggers(store)
+
+    work_dir = tmpdir / "work"
+    work_dir.mkdir()
+    run = _drive_the_machinery(library, store, work_dir)
+    facts = run["outcome"].facts()
+
+    assert not run["crash"], f"the machinery crashed: {run['crash']}"
+    assert run["returned"] is not None, f"the rollback did not complete: {run['reason']!r}"
+    assert facts["outcome"] == "committed", f"{facts!r}"
+    assert sorted(run["returned"]["rows"]) if False else True
+    report = run["returned"]
+    assert report["verified"] is True, f"no verified backup claimed: {report!r}"
+    assert report["durable"] is True, f"no durable backup claimed: {report!r}"
+    assert report["rows"], f"the report does not say what was preserved: {report!r}"
+    assert run["backup"].is_file()
+    assert _canonical_rows(run["backup"]) == rows_before, (
+        "the backup does not reproduce the prepared state"
+    )
+    assert _installed_triggers(run["backup"]) == triggers_before, (
+        "the backup was taken after the drops"
+    )
+    # The source was never the subject.
+    assert _installed_triggers(store) == triggers_before
+    assert _canonical_rows(store) == rows_before
+
+
+def check_a_destination_appearing_after_the_check_is_never_clobbered(
+    tmpdir: pathlib.Path,
+) -> None:
+    """MAINTENANCE ONLY. "Must not already exist" is a create, not a look."""
+    _sandbox_home(tmpdir)
+    module, why = _import_verb()
+    assert module is not None, f"there is no fence-rollback verb: {why}"
+
+    from hermes_cli import session_fence_rollback as library
+
+    store = tmpdir / "state.db"
+    _fenced_store(store, leave_lease_live=False)
+    work_dir = tmpdir / "work"
+    work_dir.mkdir()
+    backup = work_dir / "backup.db"
+    sentinel = b"DO NOT CLOBBER - a concurrent writer got here first"
+    injected = {"fired": False}
+    real_check = library._refuse_unusable_backup_path
+
+    def _competing_writer_after_the_check(path, *args, **kwargs):
+        target = pathlib.Path(path)
+        if target.name != backup.name:
+            return real_check(path, *args, **kwargs)
+        if target.exists():
+            target.unlink()
+        real_check(path, *args, **kwargs)
+        injected["fired"] = True
+        target.write_bytes(sentinel)
+
+    library._refuse_unusable_backup_path = _competing_writer_after_the_check
+    try:
+        run = _drive_the_machinery(library, store, work_dir, backup=backup)
+    finally:
+        library._refuse_unusable_backup_path = real_check
+
+    assert injected["fired"], "the sentinel was never written; this measures nothing"
+    assert not run["crash"], f"the machinery crashed: {run['crash']}"
+    assert backup.read_bytes() == sentinel, (
+        "the backup step overwrote a file that appeared after its own check"
+    )
+    assert run["reason"] == "backup-exists", f"{run['reason']!r} {run['detail']!r}"
+    assert _installed_triggers(store) == sorted(hermes_state_common.TURN_FENCE_TRIGGERS)
+
+
+def check_an_orphan_backup_sidecar_is_not_overwritten(
+    tmpdir: pathlib.Path,
+) -> None:
+    """MAINTENANCE ONLY. A backup destination is a FAMILY, every member of it."""
+    _sandbox_home(tmpdir)
+    module, why = _import_verb()
+    assert module is not None, f"there is no fence-rollback verb: {why}"
+
+    from hermes_cli import session_fence_rollback as library
+
+    store = tmpdir / "state.db"
+    _fenced_store(store, leave_lease_live=False)
+    digest_before = _store_digest(store)
+    work_dir = tmpdir / "work"
+    work_dir.mkdir()
+    backup = work_dir / "backup.db"
+    orphan = work_dir / "backup.db-wal"
+    orphan_bytes = b"an orphaned -wal from an attempt that died"
+    orphan.write_bytes(orphan_bytes)
+
+    run = _drive_the_machinery(library, store, work_dir, backup=backup)
+
+    assert not run["crash"], f"the machinery crashed: {run['crash']}"
+    assert orphan.read_bytes() == orphan_bytes, (
+        "an orphaned backup sidecar was overwritten"
+    )
+    assert run["reason"] == "backup-exists", (
+        "an orphan sidecar at the backup destination was not reported as an "
+        f"existing backup: {run['reason']!r}"
+    )
+    assert str(orphan) in run["detail"], (
+        f"the refusal does not name the file in the way: {run['detail']!r}"
+    )
+    assert _store_digest(store) == digest_before
+
+
+def check_a_run_that_cannot_clean_up_does_not_report_success(
+    tmpdir: pathlib.Path,
+) -> None:
+    """MAINTENANCE ONLY. Looking is the proof; rmtree returning is not.
+
+    ``rmtree(..., ignore_errors=True)`` cannot tell "removed" from "failed and
+    swallowed", and what is in a staging directory is a copy of every
+    conversation in the store.
+    """
+    _sandbox_home(tmpdir)
+    module, why = _import_verb()
+    assert module is not None, f"there is no fence-rollback verb: {why}"
+
+    from hermes_cli import session_fence_rollback as library
+
+    store = tmpdir / "state.db"
+    _fenced_store(store, leave_lease_live=False)
+    work_dir = tmpdir / "work"
+    work_dir.mkdir()
+
+    class _StagingSurvives:
+        def __init__(self, real):
+            self._real = real
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+        def rmtree(self, path, *args, **kwargs):
+            if pathlib.Path(path).name.startswith(".fence-rollback-backup-"):
+                return None
+            return self._real.rmtree(path, *args, **kwargs)
+
+    real_shutil = library.shutil
+    library.shutil = _StagingSurvives(real_shutil)
+    try:
+        run = _drive_the_machinery(library, store, work_dir)
+    finally:
+        library.shutil = real_shutil
+
+    facts = run["outcome"].facts()
+    assert not run["crash"], f"the machinery crashed: {run['crash']}"
+    assert run["returned"] is None, (
+        f"a run that could not clean up reported a completed backup: {run!r}"
+    )
+    assert run["reason"] == "backup-staging-residue", f"{run['reason']!r}"
+    assert facts["residue_present"] is True, (
+        f"the un-removable staging copy is unreported: {facts!r}"
+    )
+    assert any(
+        r.get("obligation") == "the backup staging directory"
+        for r in facts["residue"]
+    ), f"the residue does not name what it is: {facts['residue']!r}"
+
+
+def check_a_residue_claim_names_the_fence_state_that_was_established(
+    tmpdir: pathlib.Path,
+) -> None:
+    """MAINTENANCE ONLY. A claim is bound to what determines it.
+
+    The message was generated where cleanup fails and inherited that site's
+    subject, announcing every left-behind copy as an UNFENCED duplicate. Fence
+    state is determined by whether the DDL committed against THAT artifact —
+    and the working object is now an in-memory image, so nothing left on disk
+    is ever unfenced. The claim must therefore never be ``unfenced``, and a
+    record that says so is describing a file that does not exist.
+    """
+    _sandbox_home(tmpdir)
+    module, why = _import_verb()
+    assert module is not None, f"there is no fence-rollback verb: {why}"
+
+    from hermes_cli import session_fence_rollback as library
+
+    store = tmpdir / "state.db"
+    _fenced_store(store, leave_lease_live=False)
+    work_dir = tmpdir / "work"
+    work_dir.mkdir()
+
+    class _StagingSurvives:
+        def __init__(self, real):
+            self._real = real
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+        def rmtree(self, path, *args, **kwargs):
+            if pathlib.Path(path).name.startswith(".fence-rollback-backup-"):
+                return None
+            return self._real.rmtree(path, *args, **kwargs)
+
+    real_shutil = library.shutil
+    library.shutil = _StagingSurvives(real_shutil)
+    try:
+        run = _drive_the_machinery(library, store, work_dir)
+    finally:
+        library.shutil = real_shutil
+
+    records = run["outcome"].facts()["residue"]
+    assert records, "nothing was left behind, so this pin measures nothing"
+    for record in records:
+        assert record["fence_state"] != "unfenced", (
+            "a left-behind artifact is announced as an UNFENCED duplicate of "
+            "every conversation, and no on-disk artifact is ever unfenced — "
+            f"the rollback runs against an in-memory image: {record!r}"
+        )
+        on_disk = pathlib.Path(record["path"])
+        if record.get("holds") == "store-copy" and on_disk.is_file():
+            assert _installed_triggers(on_disk) != [], (
+                f"the record and the file disagree about the fence: {record!r}"
+            )
+
+
+def check_the_boundary_decides_liveness_again_keyed_by_the_operators_store(
+    tmpdir: pathlib.Path,
+) -> None:
+    """MAINTENANCE ONLY. Two conjuncts: it decides AGAIN, keyed by the STORE.
+
+    The lock must be released for the backup, so everything decided before it
+    is a snapshot by the time the drops run. And the identity the liveness
+    predicate is keyed by has to be the store the operator named, not the
+    working object — a conversation this process is mid-turn on reads FREE
+    against any other key.
+
+    The fixture separates the two decisions deliberately: the lease row is
+    owned by this process with NO grant, so both decisions would read it free,
+    and the grant is taken in the backup window — the only interval between
+    them. Free before, live after. Without that, the first decision refuses and
+    a row deleting the second scores a kill it has not earned.
+    """
+    _sandbox_home(tmpdir)
+    module, why = _import_verb()
+    assert module is not None, f"there is no fence-rollback verb: {why}"
+
+    from hermes_cli import session_fence_rollback as library
+    from hermes_state import SessionDB
+
+    store = tmpdir / "state.db"
+    _fenced_store(store, leave_lease_live=False)
+    stale = SessionDB(db_path=store)
+    try:
+        stale._execute_write(
+            lambda conn: conn.execute(
+                "UPDATE session_turn_leases SET holder = ?, owner_pid = ?, "
+                "owner_pid_start = NULL WHERE conversation_id = ?",
+                (_holder("stale"), os.getpid(), "keep"),
+            )
+        )
+    finally:
+        stale.close()
+    triggers_before = _installed_triggers(store)
+
+    work_dir = tmpdir / "work"
+    work_dir.mkdir()
+    barrier = {"granted": None, "db": None}
+
+    def _a_turn_starts_in_the_backup_window(copy, backup):
+        if barrier["granted"] is None:
+            db = SessionDB(db_path=store)
+            barrier["db"] = db
+            barrier["granted"] = db.try_acquire_session_turn_lease(
+                "keep", _holder("late"), ttl_seconds=600
+            )
+
+    try:
+        run = _drive_the_boundary_and_meddle_after_the_backup(
+            library, store, work_dir, _a_turn_starts_in_the_backup_window
+        )
+    finally:
+        if barrier["db"] is not None:
+            barrier["db"].close()
+
+    assert run["backed_up"], "the backup never landed, so there was no window"
+    assert barrier["granted"], (
+        f"the barrier never took the turn: {barrier['granted']!r}"
+    )
+    assert not run["result"]["crash"], f"the boundary crashed: {run['result']['crash']}"
+    assert run["result"]["reason"] == "live-turn", (
+        "a turn taken between the backup and the drops was not refused. Either "
+        "the boundary trusted its earlier snapshot, or it asked about the "
+        f"working object rather than the store named: {run['result']!r}"
+    )
+    assert "keep" in run["result"]["detail"], f"{run['result']!r}"
+    assert _installed_triggers(store) == triggers_before
+
+
+def check_a_late_failure_does_not_retract_what_already_happened(
+    tmpdir: pathlib.Path,
+) -> None:
+    """MAINTENANCE ONLY. Failure precedence sets the status, not the facts.
+
+    Two situations that must not print the same thing: a rollback that
+    COMPLETED and whose cleanup then failed, and one refused before it mutated
+    anything whose cleanup then failed. Collapsing them into one outcome is the
+    residue defect pointed the other way — an operator told "nothing happened"
+    stops looking for the backup they now depend on.
+    """
+    _sandbox_home(tmpdir)
+    module, why = _import_verb()
+    assert module is not None, f"there is no fence-rollback verb: {why}"
+
+    from hermes_cli import session_fence_rollback as library
+
+    class _StagingSurvives:
+        def __init__(self, real):
+            self._real = real
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+        def rmtree(self, path, *args, **kwargs):
+            if pathlib.Path(path).name.startswith(".fence-rollback-backup-"):
+                return None
+            return self._real.rmtree(path, *args, **kwargs)
+
+    def _run(where, *, break_surface):
+        where.mkdir()
+        store = where / "state.db"
+        _fenced_store(store, leave_lease_live=False)
+        if break_surface:
+            victim = hermes_state_common.turn_fence_trigger_name("messages", "INSERT")
+            conn = sqlite3.connect(str(store), isolation_level=None)
+            try:
+                conn.execute(f"DROP TRIGGER {victim}")
+            finally:
+                conn.close()
+        work = where / "work"
+        work.mkdir()
+        real_shutil = library.shutil
+        library.shutil = _StagingSurvives(real_shutil)
+        try:
+            return _drive_the_machinery(library, store, work)
+        finally:
+            library.shutil = real_shutil
+
+    done = _run(tmpdir / "completed", break_surface=False)
+    done_facts = done["outcome"].facts()
+    assert not done["crash"], f"the machinery crashed: {done['crash']}"
+    assert done_facts["backup_created"] is True, (
+        f"a backup landed and the report denies it: {done_facts!r}"
+    )
+    assert done_facts["backup_durable"] is True, f"{done_facts!r}"
+    assert done_facts["residue_present"] is True, (
+        f"the un-removable staging copy is unreported: {done_facts!r}"
+    )
+    assert done["reason"] == "backup-staging-residue", f"{done['reason']!r}"
+
+    stopped = _run(tmpdir / "refused", break_surface=True)
+    stopped_facts = stopped["outcome"].facts()
+    assert not stopped["crash"], f"the machinery crashed: {stopped['crash']}"
+    assert stopped_facts["backup_created"] is False, (
+        f"a backup is claimed for a run refused before it: {stopped_facts!r}"
+    )
+    assert stopped_facts["outcome"] == "not-started", f"{stopped_facts!r}"
+    assert stopped["reason"] == "surface-mismatch", f"{stopped['reason']!r}"
+    assert stopped["reason"] != done["reason"], (
+        "a run that completed and one that never started report the SAME "
+        f"outcome ({stopped['reason']})"
+    )
+
+
 PINS = {
     "check_the_verb_is_registered_under_sessions_and_names_its_target":
         check_the_verb_is_registered_under_sessions_and_names_its_target,
@@ -3740,14 +3284,8 @@ PINS = {
         check_a_target_that_is_not_this_fence_is_refused_by_a_named_reason,
     "check_a_partial_surface_is_refused_whole_and_writes_no_backup":
         check_a_partial_surface_is_refused_whole_and_writes_no_backup,
-    "check_the_dry_run_reports_the_plan_and_changes_no_byte":
-        check_the_dry_run_reports_the_plan_and_changes_no_byte,
-    "check_the_dry_run_never_reports_that_a_refused_run_would_proceed":
-        check_the_dry_run_never_reports_that_a_refused_run_would_proceed,
     "check_the_boundary_decides_liveness_again_keyed_by_the_operators_store":
         check_the_boundary_decides_liveness_again_keyed_by_the_operators_store,
-    "check_every_preflight_refusal_leaves_the_artifact_byte_identical":
-        check_every_preflight_refusal_leaves_the_artifact_byte_identical,
     "check_a_target_swapped_for_another_valid_store_is_refused":
         check_a_target_swapped_for_another_valid_store_is_refused,
     "check_a_target_swapped_and_restored_around_any_open_cannot_be_reached":
@@ -3756,10 +3294,8 @@ PINS = {
         check_a_destination_appearing_after_the_check_is_never_clobbered,
     "check_an_orphan_backup_sidecar_is_not_overwritten":
         check_an_orphan_backup_sidecar_is_not_overwritten,
-    "check_a_dry_run_that_cannot_clean_up_does_not_report_success":
-        check_a_dry_run_that_cannot_clean_up_does_not_report_success,
-    "check_one_suppressed_sweep_leaves_exactly_one_residue_record":
-        check_one_suppressed_sweep_leaves_exactly_one_residue_record,
+    "check_a_run_that_cannot_clean_up_does_not_report_success":
+        check_a_run_that_cannot_clean_up_does_not_report_success,
     "check_two_notices_of_one_incident_are_one_record":
         check_two_notices_of_one_incident_are_one_record,
     "check_two_incidents_with_identical_values_stay_two_records":
@@ -3780,12 +3316,20 @@ PINS = {
         check_a_cleanup_failure_never_replaces_the_refusal_that_decided_the_run,
     "check_a_late_failure_does_not_retract_what_already_happened":
         check_a_late_failure_does_not_retract_what_already_happened,
-    "check_the_completed_rehearsal_reports_the_surface_it_removed":
-        check_the_completed_rehearsal_reports_the_surface_it_removed,
+    "check_a_completed_rollback_reports_the_surface_it_removed":
+        check_a_completed_rollback_reports_the_surface_it_removed,
     "check_no_in_place_run_succeeds_and_each_wrong_target_names_its_own_reason":
         check_no_in_place_run_succeeds_and_each_wrong_target_names_its_own_reason,
     "check_a_real_invocation_refuses_before_it_observes_the_source":
         check_a_real_invocation_refuses_before_it_observes_the_source,
+    "check_a_late_sidecar_never_yields_committed_or_backup_facts":
+        check_a_late_sidecar_never_yields_committed_or_backup_facts,
+    "check_a_refusal_publishes_no_fact_it_never_produced":
+        check_a_refusal_publishes_no_fact_it_never_produced,
+    "check_an_unused_work_dir_cannot_change_the_verdict":
+        check_an_unused_work_dir_cannot_change_the_verdict,
+    "check_a_refusal_says_nothing_about_a_destination_it_never_examined":
+        check_a_refusal_says_nothing_about_a_destination_it_never_examined,
     "check_an_artifact_whose_image_is_incomplete_is_refused":
         check_an_artifact_whose_image_is_incomplete_is_refused,
     "check_the_backup_describes_the_prepared_image_not_the_source_path":
@@ -3803,6 +3347,1319 @@ PINS = {
 }
 
 
+
+#: WHAT C5 IS GATED ON. Every pin here drives the verb through its public
+#: entry points and asserts what the boundary guarantees: that a refusal is
+#: reached from pathname metadata alone, before the store is opened, copied or
+#: read; that the source's bytes and file set are invariant across it; and that
+#: the report carries exactly the fields the run produced.
+#:
+#: A pin belongs here only if it can reach its verdict WITHOUT touching the
+#: machinery. That is not a stylistic rule — the two buckets are counted
+#: differently, so a boundary pin that quietly acquires machinery reach would
+#: inflate the number that decides whether this slice is evidenced.
+BOUNDARY_EVIDENCE = frozenset({
+    "check_the_verb_is_registered_under_sessions_and_names_its_target",
+    "check_no_in_place_run_succeeds_and_each_wrong_target_names_its_own_reason",
+    "check_a_real_invocation_refuses_before_it_observes_the_source",
+    "check_a_late_sidecar_never_yields_committed_or_backup_facts",
+    "check_a_refusal_publishes_no_fact_it_never_produced",
+    "check_a_refusal_says_nothing_about_a_destination_it_never_examined",
+    "check_an_unused_work_dir_cannot_change_the_verdict",
+    "check_a_run_that_creates_nothing_reports_no_residue",
+})
+
+#: MACHINERY NO INVOCATION REACHES. The exclusive destination acquisition, the
+#: engine-written backup, the flushes, the withdrawal ledger, the residue
+#: accounting, the private-copy preparation. These pins drive it directly so it
+#: does not rot before the slice that supplies a provably coherent artifact.
+#:
+#: They are maintenance evidence and say NOTHING about what the verb does.
+#: Counting them as boundary coverage is the same error as counting the anchor
+#: guard as coverage of the verb.
+MAINTENANCE_ONLY = frozenset({
+    "check_a_cleanup_failure_never_replaces_the_refusal_that_decided_the_run",
+    "check_a_completed_rollback_reports_the_surface_it_removed",
+    "check_a_destination_appearing_after_the_check_is_never_clobbered",
+    "check_a_fault_after_commit_never_reports_that_nothing_changed",
+    "check_a_foreign_file_at_a_reserved_sidecar_is_never_deleted",
+    "check_a_late_failure_does_not_retract_what_already_happened",
+    "check_a_partial_destination_collision_keeps_only_what_the_run_created",
+    "check_a_partial_surface_is_refused_whole_and_writes_no_backup",
+    "check_a_residue_claim_names_the_fence_state_that_was_established",
+    "check_a_run_that_cannot_clean_up_does_not_report_success",
+    "check_a_sidecar_that_cannot_be_released_is_not_a_successful_backup",
+    "check_a_sidecar_that_vanished_is_not_claimed_as_our_removal",
+    "check_a_target_swapped_and_restored_around_any_open_cannot_be_reached",
+    "check_a_target_swapped_for_another_valid_store_is_refused",
+    "check_a_target_that_is_not_this_fence_is_refused_by_a_named_reason",
+    "check_a_withdrawn_backup_is_never_reported_as_one_the_operator_has",
+    "check_an_artifact_whose_image_is_incomplete_is_refused",
+    "check_an_orphan_backup_sidecar_is_not_overwritten",
+    "check_every_surviving_destination_member_is_reported_exactly_once",
+    "check_the_backup_describes_the_prepared_image_not_the_source_path",
+    "check_the_backup_file_itself_is_flushed_to_the_platter",
+    "check_the_backups_directory_entry_is_flushed_too",
+    "check_the_boundary_decides_liveness_again_keyed_by_the_operators_store",
+    "check_two_incidents_with_identical_values_stay_two_records",
+    "check_two_notices_of_one_incident_are_one_record",
+})
+
+#: Calling any of these is machinery reach. Attribute references are not — a
+#: boundary pin may wrap ``preflight_turn_fence_rollback`` to COUNT that it was
+#: never called, which is the opposite of driving it.
+#: THE ONLY LIBRARY CODE OBJECTS A BOUNDARY-EVIDENCE PIN MAY ENTER.
+#:
+#: WRITTEN BY HAND AND CONFIRMED ONE BY ONE, not derived from what the pins do
+#: today. A baseline taken from current execution RATIFIES current execution: a
+#: new deep call would approve itself on its first run and the gate would
+#: certify the thing it exists to catch.
+#:
+#: Every entry below is on the refusal path -- it constructs a record, compares
+#: pathnames or inodes, or is a fail-closed wrapper. None of them prepares a
+#: copy, reads the store, decides under a lock, backs up, or commits.
+#:
+#: ``disqualify_the_target.<listcomp>`` is a COMPREHENSION inside an approved
+#: function, and it is listed because the roster is a set of CODE OBJECTS: a
+#: comprehension is its own code object and `sys.setprofile` reports it
+#: separately. The roster IS descriptor-rooted and DOES see it, because it
+#: recurses ``co_consts`` from each live root -- what a descriptor enumeration
+#: would miss is nested objects, and recursing is exactly how that is closed.
+#: Module-rooting is a different thing and deliberately not used: it would add
+#: the six import-time bodies and break identity matching.
+_APPROVED_BOUNDARY_SURFACE = frozenset({
+    "RollbackOutcome.__init__",
+    "RollbackOutcome.facts",
+    "RollbackOutcome.residue_present",
+    "TurnFenceRollbackRefused.__init__",
+    "_canonical_store_paths",
+    "_same_file",
+    "disqualify_the_target",
+    "disqualify_the_target.<listcomp>",
+    "establish_offline_authority",
+    "rehearse_turn_fence_rollback",
+    "rollback_turn_fence",
+})
+
+#: The BOUNDARY RUNTIME denominator: live descriptor roots plus their nested
+#: closures. 58 named + 21 nested. The module body and the five class bodies are
+#: deliberately NOT here -- they execute at import, before any pin runs, and
+#: cannot be re-entered afterwards, so they are outside the claim "this pin's
+#: execution reaches nothing deep". Covering them needs a separate instrument
+#: (a fresh isolated import under the profiler), not a bigger runtime roster.
+_LIBRARY_CODE_OBJECT_COUNT = 79
+
+#: Reported separately, as a STATIC fact, never as the dynamic denominator.
+_IMPORT_TIME_CODE_OBJECT_COUNT = 85
+_IMPORT_TIME_ONLY_BODIES = 6
+
+
+def _all_library_code_objects():
+    """Live code objects a boundary pin can enter, keyed by ``id()``.
+
+    IDENTITY, NOT VALUE. CPython code objects hash and compare by CONTENT, so a
+    dict keyed by code objects matches a compile-derived graph too -- the roster
+    would appear to work while being built from objects no live frame ever uses,
+    and the day content diverged it would report total false-CLEAN, which is
+    indistinguishable from a perfect run. Keying by ``id()`` makes the match mean
+    what it says; the objects are held in ``_LIVE_CODE_OBJECTS`` so the ids stay
+    valid for the process lifetime.
+
+    Rooted at the imported module's DESCRIPTORS (functions, staticmethods,
+    classmethods, property accessors) and recursed through ``co_consts``, so
+    comprehensions, lambdas and generators are classified rather than excluded.
+    """
+    import hermes_cli.session_fence_rollback as library
+
+    where = library.__file__
+    roots = []
+
+    def collect(obj, label):
+        code = getattr(obj, "__code__", None)
+        if code is not None and code.co_filename == where:
+            roots.append((code, label))
+
+    for name, value in vars(library).items():
+        if isinstance(value, types.FunctionType):
+            collect(value, name)
+        elif isinstance(value, type) and getattr(value, "__module__", None) == library.__name__:
+            for attribute, member in vars(value).items():
+                label = f"{name}.{attribute}"
+                if isinstance(member, types.FunctionType):
+                    collect(member, label)
+                elif isinstance(member, (staticmethod, classmethod)):
+                    collect(member.__func__, label)
+                elif isinstance(member, property):
+                    for kind in ("fget", "fset", "fdel"):
+                        accessor = getattr(member, kind)
+                        if accessor is not None:
+                            collect(accessor, label)
+
+    labels, live = {}, []
+    stack = list(roots)
+    while stack:
+        code, path = stack.pop()
+        if id(code) in labels:
+            continue
+        label = path
+        if label in labels.values():
+            label = f"{path}#{code.co_firstlineno}"
+        labels[id(code)] = label
+        live.append(code)
+        for constant in code.co_consts:
+            if isinstance(constant, types.CodeType):
+                stack.append((constant, f"{path}.{constant.co_name}"))
+    _LIVE_CODE_OBJECTS.extend(live)
+    return labels
+
+
+#: Holds strong references so the ids used as roster keys cannot be recycled.
+_LIVE_CODE_OBJECTS = []
+
+
+def _deep_code_objects():
+    """Everything NOT approved. Deep by default, approved only by argument."""
+    return {
+        key: label for key, label in _all_library_code_objects().items()
+        if label not in _APPROVED_BOUNDARY_SURFACE
+    }
+
+
+def _wrapper_code_objects():
+    """The approved surface. Evidence that the subject RAN at all."""
+    return {
+        key: label for key, label in _all_library_code_objects().items()
+        if label in _APPROVED_BOUNDARY_SURFACE
+    }
+
+
+#: `threading.setprofile` is an ordinary Python function, so disabling the thread
+#: hook arrives as a `call` event carrying this code object. `sys.setprofile` is a
+#: C function, so it arrives as `c_call` with itself as `arg`. Both were measured
+#: on both runtimes; they are the two ways the instrument can be switched off.
+_THREADING_SETPROFILE_CODE = threading.setprofile.__code__
+
+
+class _DeepCallTracer:
+    """Records entries into the deep roster; restores whatever was installed."""
+
+    def __init__(self, roster):
+        self.roster = roster
+        self.entered = []
+        self.still_installed = False
+        self.sys_hook_intact = False
+        self.thread_hook_intact = False
+        self.tampered = None
+        # SCOPING: the judgement window opens once __enter__ has installed both
+        # hooks and closes the instant __exit__ begins. The harness's own install
+        # happens BEFORE this hook is active, so it cannot see it; its own restore
+        # happens after `_closing` is set, so it does not accuse itself. This
+        # boundary is where the check would go wrong if it did.
+        self._closing = False
+        self._previous_sys = None
+        self._previous_thread = None
+        # BIND ONCE. `self._hook` builds a NEW bound-method object on every
+        # attribute access, so `sys.getprofile() is self._hook` compares two
+        # different objects and is never true -- the post-check would fail on a
+        # perfectly installed hook.
+        self._bound_hook = self._hook
+
+    def _hook(self, frame, event, arg):
+        # TAMPER IS A TRANSITION, NOT AN END STATE. Identity at exit cannot see
+        #
+        #     h = sys.getprofile(); sys.setprofile(None)
+        #     ...a deep call happens here, unobserved...
+        #     sys.setprofile(h)
+        #
+        # because both hooks are correct again by the time anyone looks. This is
+        # the third instance of that shape in this slice -- after the A->B->A
+        # rollback target and the alias map read at its final state -- and the
+        # fix is the same each time: watch the transition.
+        #
+        # MONOTONIC: set once, never cleared, for the same reason the outcome
+        # ledger is monotonic. A flag that can be turned off is an end state again.
+        if not self._closing and self.tampered is None:
+            if event == "c_call" and arg is sys.setprofile:
+                self.tampered = "sys.setprofile"
+            elif event == "call" and frame.f_code is _THREADING_SETPROFILE_CODE:
+                self.tampered = "threading.setprofile"
+        if event == "call" and id(frame.f_code) in self.roster:
+            self.entered.append(self.roster[id(frame.f_code)])
+        return None
+
+    def __enter__(self):
+        # BOTH hooks are captured. Storing only the sys hook and then calling
+        # threading.setprofile(None) DESTROYS a pre-existing thread hook instead
+        # of restoring it -- the class promises restoration and delivered it for
+        # one of the two.
+        self._previous_sys = sys.getprofile()
+        self._previous_thread = threading.getprofile()
+        # threading.setprofile FIRST: sys.setprofile is per-thread and does not
+        # reach threads that start later, and does not apply retroactively at all.
+        threading.setprofile(self._bound_hook)
+        sys.setprofile(self._bound_hook)
+        return self
+
+    def __exit__(self, *exc_info):
+        # THE HOOK MUST STILL BE OURS. Code under test can call
+        # sys.setprofile(None) -- directly, or through a library that profiles
+        # something of its own -- and a hook uninstalled midway reports clean for
+        # everything after that point, which is indistinguishable from a clean run.
+        # BOTH HOOKS, against the cached identity. Checking only sys.getprofile()
+        # leaves threading.setprofile(None) mid-subject undetected: new threads
+        # then run unobserved while still_installed stays True, and the run
+        # reports CLEAN for whatever they did.
+        #
+        # IDENTITY, NOT EQUALITY. Bound methods compare equal when __self__ and
+        # __func__ match, so `==` would also pass for a hook installed by a
+        # DIFFERENT tracer instance or a nested harness -- the check would then
+        # mean "something resembling my hook is installed".
+        self._closing = True
+        self.sys_hook_intact = sys.getprofile() is self._bound_hook
+        self.thread_hook_intact = threading.getprofile() is self._bound_hook
+        self.still_installed = (
+            self.sys_hook_intact and self.thread_hook_intact
+            and self.tampered is None
+        )
+        sys.setprofile(self._previous_sys)
+        threading.setprofile(self._previous_thread)
+        return False
+
+
+#: The ONE boundary pin that spawns a child, and why. Disposition B: exempted by
+#: name with the exemption CHECKED, because an exemption whose precondition is
+#: unverified is the defect this slice keeps finding. A profile hook does not
+#: cross a process boundary, so whatever the child runs is invisible; the argv
+#: assertion below is what stops that invisibility from widening silently.
+_PIN_THAT_SPAWNS_A_CHILD = "check_a_late_sidecar_never_yields_committed_or_backup_facts"
+_WHY_IT_SPAWNS = (
+    "a committed-but-uncheckpointed WAL row needs a separate connection from a "
+    "separate process, which is the whole subject of this pin"
+)
+
+
+def _validate_surface_partition(approved):
+    """The partition itself, so a planted mutation can be required to fail."""
+    everything = _all_library_code_objects()
+    labels = set(everything.values())
+    approved_labels = labels & set(approved)
+    deep_labels = labels - set(approved)
+    phantom = set(approved) - labels
+    assert not phantom, (
+        f"approved names that are not library code objects: {sorted(phantom)}. "
+        f"A rename left the allowlist behind, and a stale entry approves nothing "
+        f"while looking like it approves something"
+    )
+    assert len(approved_labels) + len(deep_labels) == len(labels), (
+        "the partition does not sum to the surface"
+    )
+    assert approved_labels | deep_labels == labels
+    assert not (approved_labels & deep_labels)
+    return labels, approved_labels, deep_labels
+
+
+def _assert_surface_literals(approved):
+    """THE GATE ITSELF, callable with a mutated allowlist.
+
+    Factored so a planted mutation can be required to kill this exact assertion.
+    A planted test that only observes "the counts moved" proves the arithmetic
+    works, not that the gate fires -- the same distinction as a mutation row that
+    kills by crashing instead of by violating the property it names.
+    """
+    labels, approved_labels, deep = _validate_surface_partition(approved)
+    assert (len(labels), len(approved_labels), len(deep)) == (
+        _LIBRARY_CODE_OBJECT_COUNT, 11, _LIBRARY_CODE_OBJECT_COUNT - 11,
+    ), (
+        f"library runtime surface: {len(labels)} code objects, "
+        f"{len(approved_labels)} approved, {len(deep)} deep. Expected "
+        f"{_LIBRARY_CODE_OBJECT_COUNT}/11/{_LIBRARY_CODE_OBJECT_COUNT - 11}. A "
+        f"code object appeared, left, or moved between the sets: classify it "
+        f"deliberately. Do NOT edit the literal to make this green"
+    )
+    assert approved_labels == set(_APPROVED_BOUNDARY_SURFACE), (
+        f"the approved set drifted: "
+        f"{sorted(approved_labels ^ set(_APPROVED_BOUNDARY_SURFACE))}"
+    )
+    return labels, approved_labels, deep
+
+
+def test_the_library_surface_partition_is_exact():
+    """79 total, 11 approved, 68 deep -- as literals, and as exact sets.
+
+    IF THIS FAILS BECAUSE THE COUNT MOVED: a code object appeared in or left the
+    library and is unclassified. Add it to the approved list WITH A REASON it is
+    safe for a boundary-evidence pin to enter, or leave it deep. Do NOT edit the
+    number to make the gate green -- that is the one edit that kills this guard
+    completely, and it looks like maintenance.
+
+    Counts alone are not enough: a new object replacing a removed one keeps the
+    total identical, so the sets are compared both ways.
+    """
+    labels, approved, deep = _assert_surface_literals(_APPROVED_BOUNDARY_SURFACE)
+
+    # NESTED code objects ARE inside this count: the enumeration is rooted at
+    # the imported module's LIVE DESCRIPTORS and recurses co_consts, so comprehensions, lambdas and
+    # generators are classified rather than excluded with an argument.
+    nested = sorted(label for label in labels if "<" in label.rsplit(".", 1)[-1])
+    assert nested, (
+        "no nested code objects were enumerated at all, so the recursion is not "
+        "reaching them and the roster is descriptor-shaped again"
+    )
+
+
+def test_the_roster_holds_live_identities_not_compiled_copies():
+    """PLANTED CONTROL for the most dangerous possible failure.
+
+    A compile-derived graph is NOT the imported module's objects. Because code
+    objects compare and hash by CONTENT, a roster built from one would appear to
+    work -- and the day the content diverged it would match nothing and report
+    total false-CLEAN, which looks exactly like a perfect run. So the roster is
+    keyed by ``id()``, and this pins the distinction that makes that safe.
+    """
+    import hermes_cli.session_fence_rollback as library
+
+    roster = _all_library_code_objects()
+    live = library.rollback_turn_fence.__code__
+    assert id(live) in roster, (
+        "a production function's live code object is not in the roster by "
+        "identity, so the tracer is watching objects no frame will ever carry"
+    )
+
+    compiled = library.__loader__.get_code(library.__name__)
+    compiled_objects = []
+    stack = [compiled]
+    while stack:
+        code = stack.pop()
+        compiled_objects.append(code)
+        stack.extend(c for c in code.co_consts if isinstance(c, types.CodeType))
+
+    twin = next((c for c in compiled_objects if c == live), None)
+    assert twin is not None, "expected a content-equal compiled twin to exist"
+    assert twin is not live, "the compiled graph unexpectedly shares identity"
+    assert id(twin) not in roster, (
+        "a compile-derived code object is present in the roster by identity, so "
+        "the roster is not built from the imported module"
+    )
+
+
+def test_a_nested_deep_code_object_fires_the_tracer():
+    """POSITIVE CONTROL for a NESTED object, called directly.
+
+    The named-function control cannot show this: comprehensions, lambdas and
+    generators are separate code objects, and a roster that reached only named
+    descriptors would miss deep logic moved one level in.
+    """
+    import hermes_cli.session_fence_rollback as library
+
+    deep = _deep_code_objects()
+    by_id = {id(code): code for code in _LIVE_CODE_OBJECTS}
+    candidates = [
+        (key, label) for key, label in deep.items()
+        if label.rsplit(".", 1)[-1].startswith("<")
+        and by_id[key].co_argcount == 1
+    ]
+    assert candidates, "no nested deep code object is callable as a probe"
+    key, label = sorted(candidates, key=lambda item: item[1])[0]
+    probe = types.FunctionType(by_id[key], vars(library))
+    # NOT a faulting probe: a comprehension over an empty iterator returns
+    # cleanly, so any exception here is a real failure and must propagate.
+    entered = _deep_calls_of(lambda: probe(iter(())))
+    assert label in entered, (
+        f"a nested deep code object ({label}) ran and the tracer did not record "
+        f"it, so nested objects are unwatched"
+    )
+
+
+#: sha256 of the child script AS IT EXECUTES -- after textwrap.dedent, which is
+#: what the fixture actually hands to the interpreter. Hashing the raw literal
+#: pins a string the child process never sees.
+#:
+#: CHECK THE ARTIFACT THAT EXECUTES, NEVER THE ARTIFACT THAT IS WRITTEN. Same
+#: rule as the roster: a compile-derived code graph is not the imported module's
+#: objects, and a source literal is not the dedented bytes. Wherever a value is
+#: transformed on the way to use -- dedent, format, encode, compile, strip -- the
+#: transformed value is the subject. The rest of this file was scanned for the
+#: same shape: `marker.encode()` at the WAL assertions searches the artifact's own
+#: bytes (correct direction), and the two `.strip()` uses normalise a command
+#: result and an SQL statement. This was the only instance.
+_WAL_CHILD_SCRIPT_SHA256 = (
+    "e34a7e84f8965060539312e00b1e8b6be2b634b6209626e94264b32627d19ff9"
+)
+
+
+#: WHAT THE CHILD MUST DO, written from the fixture's PURPOSE, not read back
+#: from its source. The digest alone is a baseline derived from the subject: it
+#: changes whenever the subject changes and therefore approves whatever the
+#: subject becomes. These are the independent expectations the digest anchors.
+_WAL_CHILD_MUST_CONTAIN = (
+    "sqlite3.connect(sys.argv[1]",        # the store this test names, not another
+    "PRAGMA journal_mode=WAL",            # the marker must live in a WAL
+    "PRAGMA wal_autocheckpoint=0",        # ...and must NOT be checkpointed out
+    "INSERT INTO wal_marker",             # one row, in the fixture's own table
+    "(sys.argv[2],)",                     # the marker value this test passes
+    "os._exit(0)",                        # hard exit: a polite close checkpoints
+)
+#: A child on a boundary pin's path runs where the tracer cannot see. These are
+#: the things it must never grow into.
+_WAL_CHILD_MUST_NOT_CONTAIN = (
+    "DROP", "DELETE", "ATTACH", "subprocess", "os.system", "eval(", "exec(",
+    "unlink", "rmtree", "import hermes",
+)
+
+
+def test_the_child_the_wal_fixture_runs_is_pinned_by_content():
+    """The one shell-out on a boundary pin's path, pinned as independent facts.
+
+    A profile hook does not cross a process boundary, so whatever this child runs
+    is invisible to the tracer. An argv PREFIX check approves any script that
+    starts `python -c`; a digest ALONE is an expectation derived from the subject
+    and moves with it. So the interpreter, the required behaviours, the forbidden
+    behaviours, the target arguments and the digest are asserted separately --
+    widening the script or adding a command fails several of them at once.
+    """
+    tree = ast.parse((REPO_ROOT / _SELF).read_text(encoding="utf-8"))
+    owner = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_commit_a_marker_that_lives_only_in_the_wal"
+    )
+    calls = [
+        node for node in ast.walk(owner)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        and node.func.attr in ("run", "Popen", "call", "check_output")
+        and getattr(node.func.value, "id", "") == "subprocess"
+    ]
+    assert len(calls) == 1, f"expected exactly one shell-out, found {len(calls)}"
+    argv = calls[0].args[0]
+    assert isinstance(argv, ast.List) and len(argv.elts) == 5, (
+        f"the child's argv shape changed: {len(getattr(argv, 'elts', []))} elements"
+    )
+
+    interpreter = argv.elts[0]
+    assert isinstance(interpreter, ast.Attribute) \
+        and interpreter.attr == "executable" \
+        and getattr(interpreter.value, "id", "") == "sys", (
+        "the child no longer runs THIS interpreter"
+    )
+    assert isinstance(argv.elts[1], ast.Constant) and argv.elts[1].value == "-c"
+
+    script_call = argv.elts[2]
+    assert isinstance(script_call, ast.Call) \
+        and isinstance(script_call.func, ast.Attribute) \
+        and script_call.func.attr == "dedent" \
+        and getattr(script_call.func.value, "id", "") == "textwrap", (
+        "the child's script is no longer textwrap.dedent(<literal>). The exact "
+        "transform matters: every assertion below is computed by applying it, so "
+        "a different one would leave them checking bytes that never run"
+    )
+    literal = script_call.args[0]
+    assert isinstance(literal, ast.Constant) and isinstance(literal.value, str), (
+        "the child's script is computed rather than literal; what it runs is no "
+        "longer decidable from the source"
+    )
+    # THE EXECUTED BYTES, not the written ones.
+    body = textwrap.dedent(literal.value)
+
+    missing = [need for need in _WAL_CHILD_MUST_CONTAIN if need not in body]
+    assert not missing, (
+        f"the child no longer does what this fixture exists to do: {missing}. "
+        f"Without an uncheckpointed WAL row the pin is testing nothing"
+    )
+    forbidden = [banned for banned in _WAL_CHILD_MUST_NOT_CONTAIN if banned in body]
+    assert not forbidden, (
+        f"the child gained {forbidden}. It runs where the tracer cannot follow, "
+        f"so its reach is bounded here or nowhere"
+    )
+    assert body.count("sqlite3.connect") == 1, (
+        f"the child opens {body.count('sqlite3.connect')} connections; one store, "
+        f"one connection is the contract"
+    )
+
+    digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    assert digest == _WAL_CHILD_SCRIPT_SHA256, (
+        f"the child script changed (sha256 {digest}). The behavioural assertions "
+        f"above still pass, so this is a REVIEW prompt, not a defect: re-read the "
+        f"script, satisfy yourself it touches nothing in the deep roster, then "
+        f"update this digest"
+    )
+
+    store_argument, marker_argument = argv.elts[3], argv.elts[4]
+    assert isinstance(store_argument, ast.Call) \
+        and getattr(store_argument.func, "id", "") == "str" \
+        and getattr(store_argument.args[0], "id", "") == "store", (
+        "the child is no longer pointed at this test's own `store`"
+    )
+    assert isinstance(marker_argument, ast.Name) and marker_argument.id == "marker", (
+        "the child no longer receives this test's own `marker` value"
+    )
+
+
+def test_the_import_time_census_is_a_separate_fact():
+    """85 code objects exist; 79 are reachable by a pin. Both, never conflated.
+
+    The six extra are the module body and five class bodies. They execute at
+    IMPORT, before any boundary pin runs, so a pin cannot re-enter them -- they
+    are outside the claim this gate makes, not inside it and unwatched. Verifying
+    them dynamically would need a fresh isolated import under the profiler, which
+    is a different instrument; folding them into this roster would break identity
+    matching and silently disarm the gate.
+    """
+    import hermes_cli.session_fence_rollback as library
+
+    compiled = library.__loader__.get_code(library.__name__)
+    total, stack = 0, [compiled]
+    while stack:
+        code = stack.pop()
+        total += 1
+        stack.extend(c for c in code.co_consts if isinstance(c, types.CodeType))
+    assert total == _IMPORT_TIME_CODE_OBJECT_COUNT, (
+        f"the import-time census moved to {total}. This is a STATIC fact about "
+        f"the module, reported beside the runtime roster and never as its "
+        f"denominator"
+    )
+    assert total - _LIBRARY_CODE_OBJECT_COUNT == _IMPORT_TIME_ONLY_BODIES, (
+        f"the import-time-only bodies moved to "
+        f"{total - _LIBRARY_CODE_OBJECT_COUNT}: a new class body or module-level "
+        f"executable block appeared, and it runs where this gate cannot see"
+    )
+
+
+def test_moving_a_deep_object_into_the_allowlist_is_caught():
+    """PLANTED: approving something that is not in the library must fail."""
+    with pytest.raises(AssertionError, match="not library code objects"):
+        _validate_surface_partition(
+            set(_APPROVED_BOUNDARY_SURFACE) | {"a_function_that_does_not_exist"}
+        )
+
+
+def test_a_real_deep_label_in_the_allowlist_kills_the_gate():
+    """PLANTED: approve something genuinely deep; the exact gate must die.
+
+    Not a phantom name, and not an observation that the arithmetic moved: a real
+    deep code object is moved into the allowlist and the SAME assertion the real
+    test relies on is required to raise.
+    """
+    _, _, deep = _validate_surface_partition(_APPROVED_BOUNDARY_SURFACE)
+    victim = sorted(deep)[0]
+    assert victim not in _APPROVED_BOUNDARY_SURFACE
+    with pytest.raises(AssertionError) as caught:
+        _assert_surface_literals(set(_APPROVED_BOUNDARY_SURFACE) | {victim})
+    message = str(caught.value)
+    assert "approved" in message and ("12" in message or "drifted" in message), (
+        f"the gate raised, but not about the allowlist widening: {message[:200]}"
+    )
+
+
+def test_widening_the_allowlist_changes_the_deep_roster():
+    """PLANTED: a real deep object moved into the allowlist stops being watched.
+
+    This is the edit the gate exists to make expensive, so it is shown working:
+    the object disappears from the deep roster, and the pinned literal catches it.
+    """
+    _, _, deep = _validate_surface_partition(_APPROVED_BOUNDARY_SURFACE)
+    victim = sorted(deep)[0]
+    _, widened, narrowed = _validate_surface_partition(
+        set(_APPROVED_BOUNDARY_SURFACE) | {victim}
+    )
+    assert victim in widened and victim not in narrowed, (
+        f"{victim} was moved into the allowlist and the partition did not move"
+    )
+    assert len(narrowed) == len(deep) - 1
+    assert len(widened) != len(_APPROVED_BOUNDARY_SURFACE), (
+        "the approved count did not change, so the pinned literal would not catch it"
+    )
+
+
+def test_an_arbitrary_deep_code_object_fires_the_tracer():
+    """POSITIVE CONTROL on a deep object OTHER than the one the shapes use.
+
+    Otherwise "the tracer fires" could be true only of one specially-handled
+    function rather than of the roster.
+    """
+    import hermes_cli.session_fence_rollback as library
+
+    deep = _deep_code_objects()
+    chosen = "_make_verified_backup"
+    assert chosen in set(deep.values()), f"{chosen} is not in the deep roster"
+    # BUILT FROM THE SIGNATURE. A profile `call` event fires when the frame is
+    # pushed, and argument binding happens first -- a hand-written arity that
+    # drifts raises TypeError with no frame, and the probe would report "no deep
+    # call" while looking like a clean result.
+    target = getattr(library, chosen)
+    parameters = inspect.signature(target).parameters
+    positional, keywords = [], {}
+    for parameter in parameters.values():
+        if parameter.default is not inspect.Parameter.empty:
+            continue
+        if parameter.kind is inspect.Parameter.KEYWORD_ONLY:
+            keywords[parameter.name] = None
+        elif parameter.kind in (inspect.Parameter.POSITIONAL_ONLY,
+                                inspect.Parameter.POSITIONAL_OR_KEYWORD):
+            positional.append(None)
+    entered = _deep_calls_of_a_faulting_probe(
+        lambda: target(*positional, **keywords), chosen,
+        fault=AttributeError, because="has no attribute 'with_name'",
+    )
+    assert chosen in entered
+
+
+def test_the_tracer_restores_both_hooks_it_found():
+    """Exact identity restoration of BOTH hooks, including the raising path.
+
+    `finally` blocks are the least-exercised code in any harness, so the path
+    where the subject raises is the one that rots silently.
+    """
+    def planted_sys(frame, event, arg):
+        return None
+
+    def planted_thread(frame, event, arg):
+        return None
+
+    sys.setprofile(planted_sys)
+    threading.setprofile(planted_thread)
+    try:
+        _deep_calls_of(lambda: None)
+        assert sys.getprofile() is planted_sys, "the sys hook was not restored"
+        assert threading.getprofile() is planted_thread, (
+            "the thread hook was destroyed rather than restored"
+        )
+        with pytest.raises(RuntimeError):
+            _deep_calls_of(lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+        assert sys.getprofile() is planted_sys, (
+            "the sys hook was not restored on the raising path"
+        )
+        assert threading.getprofile() is planted_thread, (
+            "the thread hook was not restored on the raising path"
+        )
+    finally:
+        sys.setprofile(None)
+        threading.setprofile(None)
+
+
+def test_the_post_check_detects_a_hook_uninstalled_mid_run():
+    """PLANTED INSTANCE for the post-check itself.
+
+    A guard I was asked for is not exempt from the standard asked of everything
+    else: its first implementation compared bound-method objects that are rebuilt
+    on every attribute access, so it was False while the hook was correctly
+    installed. Untested, this check is exactly the kind this slice removes.
+    """
+    with pytest.raises(AssertionError, match="sys intact=False"):
+        _deep_calls_of(lambda: sys.setprofile(None))
+
+
+def _a_deep_call_that_would_be_missed():
+    """One real deep entry, used inside a blinded window by the ABA controls."""
+    import hermes_cli.session_fence_rollback as library
+
+    try:
+        library.prepare_the_private_copy(None, work_dir=None)
+    except TypeError:
+        pass
+
+
+def test_the_post_check_detects_a_sys_hook_uninstalled_and_RESTORED():
+    """PLANTED ABA: blind the sys hook, make a deep call, put the hook back.
+
+    This is the case that passes an end-state identity check: at exit both hooks
+    are the original objects and nothing looks wrong. The deep call in the middle
+    was never observed, so the run would report CLEAN -- the same defect as an
+    A->B->A rollback target that is correct whenever anyone stats it.
+    """
+    def aba():
+        original = sys.getprofile()
+        sys.setprofile(None)
+        _a_deep_call_that_would_be_missed()
+        sys.setprofile(original)
+
+    with pytest.raises(AssertionError, match="tamper='sys.setprofile'"):
+        _deep_calls_of(aba)
+
+
+def test_the_post_check_detects_a_THREAD_hook_uninstalled_and_RESTORED():
+    """PLANTED ABA on the thread hook, same shape, same requirement."""
+    def aba():
+        original = threading.getprofile()
+        threading.setprofile(None)
+        _a_deep_call_that_would_be_missed()
+        threading.setprofile(original)
+
+    with pytest.raises(AssertionError, match="tamper='threading.setprofile'"):
+        _deep_calls_of(aba)
+
+
+def test_the_tamper_flag_is_monotonic():
+    """Set once, never cleared. A flag that can be turned off is an end state.
+
+    The subject tampers and then does ordinary work; the flag must survive it,
+    or a run could blind the instrument early and clear the evidence later.
+    """
+    def tamper_then_behave():
+        original = sys.getprofile()
+        sys.setprofile(None)
+        sys.setprofile(original)
+        for _ in range(50):
+            sorted(range(10))
+
+    with pytest.raises(AssertionError, match="tamper='sys.setprofile'"):
+        _deep_calls_of(tamper_then_behave)
+
+
+def test_the_tracer_does_not_accuse_its_own_install_or_restore():
+    """SCOPING CONTROL: the harness's own hook management is outside the window.
+
+    Without this the tracer trips on itself and every result is a failure --
+    which is the failure mode a too-wide guard has, and it is as useless as one
+    that never fires.
+    """
+    assert _deep_calls_of(lambda: None) == [], (
+        "a clean subject reported deep calls"
+    )
+    entered = _deep_calls_of(lambda: sorted(range(5)))
+    assert entered == [], "the tracer accused its own install or restore"
+
+
+def test_the_post_check_detects_the_THREAD_hook_being_removed():
+    """PLANTED for the half the post-check used to miss.
+
+    Checking only `sys.getprofile()` leaves `threading.setprofile(None)`
+    undetected: threads started after that point run unobserved while the run
+    still reports CLEAN. Same shape as asserting one conjunct of two.
+    """
+    with pytest.raises(AssertionError, match="thread intact=False"):
+        _deep_calls_of(lambda: threading.setprofile(None))
+
+
+def test_a_boundary_subject_that_fails_is_not_reported_as_clean():
+    """A pin that dies must be a FAILURE, never a zero.
+
+    An aborted run and a clean run produce the same silence -- zero deep calls --
+    and the silence gets read as the good outcome. Same shape as a mutation row
+    that kills by crashing instead of by violating its property.
+    """
+    with pytest.raises(AssertionError, match="PIN_FAILED"):
+        _deep_calls_of(lambda: (_ for _ in ()).throw(AssertionError("PIN_FAILED")))
+
+
+def test_the_subprocess_census_of_the_boundary_pins(tmp_path):
+    """TWO censuses, because they disagree and both are load-bearing.
+
+    STATIC (source reachability): 1 of 8. The late-sidecar pin calls
+    ``_commit_a_marker_that_lives_only_in_the_wal``, which shells out -- a
+    committed-but-uncheckpointed WAL row needs a separate connection from a
+    separate process, which is the whole subject of that pin.
+
+    DYNAMIC (execution): 0 of 8, measured on BOTH runtimes. The shell-out sits
+    behind a guard that is not taken on either, so the tracer's blind spot is
+    real but currently unexercised.
+
+    Reporting only one of these would be wrong in opposite directions: "1 of 8"
+    overstates today's blind spot, and "0 of 8" hides a path one guard change
+    away from reopening it. So both are asserted -- any child appearing at
+    runtime is loud, and a new shell-out anywhere in the closure is loud.
+    """
+    # DYNAMIC
+    seen = []
+    real_run = subprocess.run
+
+    def counting_run(argv, *args, **kwargs):
+        seen.append(argv)
+        return real_run(argv, *args, **kwargs)
+
+    spawning = {}
+    for name in sorted(BOUNDARY_EVIDENCE):
+        seen.clear()
+        where = tmp_path / name[:40]
+        where.mkdir(parents=True, exist_ok=True)
+        subprocess.run = counting_run
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                PINS[name](where)
+        finally:
+            subprocess.run = real_run
+        if seen:
+            spawning[name] = [list(argv[:2]) for argv in seen]
+
+    assert not spawning, (
+        f"a boundary pin spawned a child at runtime: {spawning}. A child is "
+        f"invisible to the profile hook, so its deep calls are unobserved and "
+        f"this gate's silence would no longer mean anything for that pin"
+    )
+
+    # STATIC
+    tree = ast.parse((REPO_ROOT / _SELF).read_text(encoding="utf-8"))
+    functions = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    closure, frontier = set(BOUNDARY_EVIDENCE), set(BOUNDARY_EVIDENCE)
+    while frontier:
+        nxt = set()
+        for name in frontier:
+            for node in ast.walk(functions[name]):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+                        and node.func.id in functions and node.func.id not in closure:
+                    nxt.add(node.func.id)
+        closure |= nxt
+        frontier = nxt
+    shelling = sorted(
+        name for name in closure
+        if any(
+            isinstance(node, ast.Attribute) and node.attr in ("run", "Popen",
+                                                              "check_output")
+            and isinstance(node.value, ast.Name) and node.value.id == "subprocess"
+            for node in ast.walk(functions[name])
+        )
+    )
+    assert shelling == ["_commit_a_marker_that_lives_only_in_the_wal"], (
+        f"the set of boundary-reachable functions that shell out changed: "
+        f"{shelling}. Each one is a region the tracer cannot see into, so a new "
+        f"one is a deliberate decision, not an edit"
+    )
+
+
+#: Measured: the registration pin exercises argparse only and never reaches the
+#: library, so it is the one boundary pin that enters no wrapper.
+_PIN_THAT_ONLY_PARSES = "check_the_verb_is_registered_under_sessions_and_names_its_target"
+
+
+def test_the_boundary_pins_actually_execute_the_verb(tmp_path):
+    """THE SECOND PROOF. "Zero deep calls" needs both halves, separately.
+
+        was the INSTRUMENT live?   the dispatch-shape positive controls
+        did the SUBJECT run?       this
+
+    Both can be false independently and both look like zero. A pin that returned
+    immediately, or one whose fixture silently skipped the verb, would report a
+    clean gate forever.
+    """
+    roster = _wrapper_code_objects()
+    entered_by = {}
+    for name in sorted(BOUNDARY_EVIDENCE):
+        where = tmp_path / name[:40]
+        where.mkdir(parents=True, exist_ok=True)
+        tracer = _DeepCallTracer(roster)
+        with tracer:
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                PINS[name](where)
+        assert tracer.still_installed, f"the hook did not survive {name}"
+        entered_by[name] = sorted(set(tracer.entered))
+
+    silent = sorted(n for n, entered in entered_by.items() if not entered)
+    assert silent == [_PIN_THAT_ONLY_PARSES], (
+        f"boundary pins that never entered the library at all: {silent}. Their "
+        f"zero-deep-calls result would be true of a pin that ran nothing, so it "
+        f"proves nothing about reach"
+    )
+    assert "rollback_turn_fence" in set().union(*entered_by.values()), (
+        "no boundary pin entered the public entry point, so the verb under test "
+        "was never actually driven"
+    )
+
+
+@pytest.mark.parametrize("pin", sorted(BOUNDARY_EVIDENCE), ids=sorted(BOUNDARY_EVIDENCE))
+def test_no_boundary_pin_enters_deep_maintenance(pin, tmp_path):
+    """The gate, executed rather than read.
+
+    Replaces a static classifier that was corrected in nineteen rounds and was
+    still returning CLEAN for ordinary method and attribute dispatch. This
+    watches code objects execute, so alias, helper, decorator, constructor,
+    method and runtime attribute assignment are all one check.
+    """
+    entered = _deep_calls_of(lambda: PINS[pin](tmp_path))
+    assert not entered, (
+        f"{pin} is counted as boundary evidence and it ENTERED deep maintenance "
+        f"code: {sorted(set(entered))}. Either the pin is maintenance and the "
+        f"registry is wrong, or it acquired reach it should not have"
+    )
+
+
+def _the_deep_target():
+    """One deep callable, invoked with a signature-correct call.
+
+    ARITY MATTERS HERE. A profile ``call`` event fires when the frame is pushed,
+    and argument binding happens first -- so calling a deep function with the
+    wrong arity raises TypeError with no frame and no event, and the tracer
+    would report nothing while looking like it had observed a clean run.
+    """
+    import hermes_cli.session_fence_rollback as library
+
+    def enter_it():
+        library.prepare_the_private_copy(None, work_dir=None)
+
+    return enter_it
+
+
+def _shape_direct(deep):
+    deep()
+
+
+def _shape_same_scope_alias(deep):
+    alias = deep
+    alias()
+
+
+def _shape_nested_helper(deep):
+    def helper():
+        deep()
+    helper()
+
+
+def _shape_decorated_binding(deep):
+    def swap(_fn):
+        return deep
+    @swap
+    def helper():
+        return 1
+    helper()
+
+
+def _shape_class_method(deep):
+    class Holder:
+        def go(self):
+            deep()
+    Holder().go()
+
+
+def _shape_attribute_assignment(deep):
+    class Holder:
+        marker = 1
+    holder = Holder()
+    holder.run = deep
+    holder.run()
+
+
+def _shape_clean_method(deep):
+    class Holder:
+        def go(self):
+            return 1
+    Holder().go()
+
+
+#: Every dispatch shape that defeated the static classifier, and one that must
+#: stay clean. All six reaching shapes are the SAME code object under different
+#: spellings, which is the point of tracing rather than reading.
+_DISPATCH_SHAPES = {
+    "direct": (_shape_direct, True),
+    "same-scope-alias": (_shape_same_scope_alias, True),
+    "nested-helper": (_shape_nested_helper, True),
+    "decorated-binding": (_shape_decorated_binding, True),
+    "class-method": (_shape_class_method, True),
+    "attribute-assignment": (_shape_attribute_assignment, True),
+    "clean-method": (_shape_clean_method, False),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_DISPATCH_SHAPES), ids=sorted(_DISPATCH_SHAPES))
+def test_the_tracer_sees_every_dispatch_shape(shape):
+    """POSITIVE CONTROLS. A tracer that never fires looks exactly like a clean run.
+
+    Six of these defeated the static classifier one round at a time -- alias,
+    nested helper, decorated rebinding, class method, runtime attribute
+    assignment. Under a code-object roster they are one case. The seventh must
+    stay clean, or "detects everything" would pass by flagging everything.
+    """
+    subject, must_fire = _DISPATCH_SHAPES[shape]
+    deep = _the_deep_target()
+    if must_fire:
+        entered = _deep_calls_of_a_faulting_probe(
+            lambda: subject(deep), "prepare_the_private_copy",
+            fault=TypeError, because="expected str, bytes or os.PathLike object",
+        )
+        assert entered, (
+            f"the {shape} shape reached a deep maintenance callable and the "
+            f"tracer saw nothing. Either the hook was not installed or the "
+            f"roster is not keyed by the code object that ran"
+        )
+    else:
+        entered = _deep_calls_of(lambda: subject(deep))
+        assert not entered, (
+            f"the {shape} shape entered {entered}, but it calls nothing deep"
+        )
+
+
+def _deep_calls_of(subject):
+    """Execute *subject* under the tracer. EXCEPTIONS PROPAGATE.
+
+    Swallowing here would make a pin that crashed -- or that failed its own
+    behavioural assertion -- produce the same observable as a clean run: zero
+    deep calls. The gate would then manufacture CLEAN out of a broken execution.
+
+    "Nothing found" owes two separate proofs, and neither substitutes for the
+    other: that the INSTRUMENT was live (the positive control) and that the
+    SUBJECT actually ran (this). Both can be false independently and both look
+    like zero.
+    """
+    tracer = _DeepCallTracer(_deep_code_objects())
+    with tracer:
+        subject()
+    assert tracer.still_installed, (
+        f"the instrument did not hold for the whole subject, so an empty result "
+        f"proves nothing: sys intact={tracer.sys_hook_intact}, thread "
+        f"intact={tracer.thread_hook_intact}, tamper={tracer.tampered!r}. A "
+        f"tamper with both identities restored is the ABA case: correct at the "
+        f"end, blind in the middle"
+    )
+    return tracer.entered
+
+
+def _deep_calls_of_a_faulting_probe(subject, expected, *, fault, because):
+    """For SYNTHETIC probes that fault on purpose after entering a deep callable.
+
+    THE FAULT CONTRACT IS EXACT. *fault* is the only exception type tolerated
+    and *because* must appear in its message; anything else is re-raised. A
+    control that passes on ANY exception is not proving the detector fired, only
+    that something went wrong -- which is the same defect as a subject that
+    swallows, one level in: the instrument that proves the detector works has to
+    fail for the right reason too.
+    """
+    tracer = _DeepCallTracer(_deep_code_objects())
+    with tracer:
+        try:
+            subject()
+        except fault as exc:
+            assert because in str(exc), (
+                f"the probe raised {type(exc).__name__} but not for the expected "
+                f"reason: wanted {because!r} in the message, got {str(exc)!r}. A "
+                f"different failure at the same point would otherwise pass"
+            )
+        except BaseException as exc:  # noqa: BLE001 - re-raised deliberately
+            raise AssertionError(
+                f"the probe raised {type(exc).__name__}: {exc}. Only {fault.__name__} "
+                f"({because!r}) is the expected fault; anything else is a real bug "
+                f"the control would have hidden"
+            ) from exc
+    assert tracer.still_installed, (
+        f"the instrument did not hold for the probe: sys={tracer.sys_hook_intact}, "
+        f"thread={tracer.thread_hook_intact}, tamper={tracer.tampered!r}"
+    )
+    assert expected in tracer.entered, (
+        f"the probe was supposed to enter {expected!r} and the tracer recorded "
+        f"{tracer.entered}. Catching its fault would hide a dead instrument"
+    )
+    return tracer.entered
+
+
+"""Names a handler treats as known-safe. An explicit roster, not a fallback."""
+
+
+#: EVERY PARAMETRIZED NODE AND THE EXACT EXPRESSION IT MUST FAN OUT OVER.
+#:
+#: A TOTAL IS NOT A COMPOSITION. `126 collected` looked healthy while
+#: `test_sessions_fence_rollback_verb_property` had lost its parametrize and 33
+#: pins had collapsed into one unrunnable item -- one number that many different
+#: compositions can produce, so it cannot say WHICH one it is.
+#:
+#: The decorator was deleted by a bulk edit whose span ended at the next node's
+#: `lineno`, which for a decorated function points at the `def` -- so the
+#: FOLLOWING node's decorators fell inside the deleted range.
+#:
+#: EXACT EXPRESSIONS, COMPARED STRUCTURALLY. The first version of this guard used
+#: `collection in ast.unparse(second_arg)` and accepted any callee whose name
+#: ended in `parametrize`; `sorted(NOT_PINS)` satisfies a substring test for
+#: "PINS", so a guard against a collapsing collection could be satisfied by the
+#: WRONG collection. That is the fourth time in this slice a weaker relation
+#: stood in for identity -- after `"AssertionError" in trace`, a decorator matched
+#: by NAME, and a hook compared by EQUALITY. State the relation the claim needs,
+#: then check that the code uses that relation: here the claim is "this exact
+#: expression", so it is structural AST equality, never containment.
+_PARAMETRIZED_NODES = {
+    "test_sessions_fence_rollback_verb_property": (
+        "name", "sorted(PINS)", "sorted(PINS)", "PINS",
+    ),
+    "test_each_pin_dies_when_its_own_guard_is_removed": (
+        "mutation", "SOURCE_MUTATIONS", "[m.pin for m in SOURCE_MUTATIONS]",
+        "SOURCE_MUTATIONS",
+    ),
+    "test_each_source_mutation_produces_the_behaviour_it_claims": (
+        "mutation", "SOURCE_MUTATIONS", "[m.pin for m in SOURCE_MUTATIONS]",
+        "SOURCE_MUTATIONS",
+    ),
+    "test_no_boundary_pin_enters_deep_maintenance": (
+        "pin", "sorted(BOUNDARY_EVIDENCE)", "sorted(BOUNDARY_EVIDENCE)",
+        "BOUNDARY_EVIDENCE",
+    ),
+    "test_the_tracer_sees_every_dispatch_shape": (
+        "shape", "sorted(_DISPATCH_SHAPES)", "sorted(_DISPATCH_SHAPES)",
+        "_DISPATCH_SHAPES",
+    ),
+}
+
+
+def _is_pytest_parametrize(decorator) -> bool:
+    """Exactly ``pytest.mark.parametrize``. Not "a callee ending in parametrize"."""
+    if not isinstance(decorator, ast.Call):
+        return False
+    func = decorator.func
+    return (
+        isinstance(func, ast.Attribute) and func.attr == "parametrize"
+        and isinstance(func.value, ast.Attribute) and func.value.attr == "mark"
+        and isinstance(func.value.value, ast.Name) and func.value.value.id == "pytest"
+    )
+
+
+def _same_expression(node, expected: str) -> bool:
+    """Structural equality against *expected* parsed as an expression."""
+    return ast.dump(node) == ast.dump(ast.parse(expected, mode="eval").body)
+
+
+def _check_parametrized_nodes(source: str) -> None:
+    """The guard, over arbitrary source, so a planted mutation can kill it."""
+    functions = {
+        node.name: node for node in ast.parse(source).body
+        if isinstance(node, ast.FunctionDef)
+    }
+    for name, (argument, over, ids, _collection) in sorted(_PARAMETRIZED_NODES.items()):
+        node = functions.get(name)
+        assert node is not None, f"{name} no longer exists"
+        marks = [d for d in node.decorator_list if _is_pytest_parametrize(d)]
+        assert len(marks) == 1, (
+            f"{name} carries {len(marks)} pytest.mark.parametrize decorators, "
+            f"expected exactly 1. With none it runs as a single item -- or errors "
+            f"on a missing fixture, taking every case with it"
+        )
+        mark = marks[0]
+        assert len(mark.args) == 2, (
+            f"{name}: parametrize takes ({argument!r}, <collection>); found "
+            f"{len(mark.args)} positional arguments"
+        )
+        assert isinstance(mark.args[0], ast.Constant) \
+            and mark.args[0].value == argument, (
+            f"{name} is parametrized over "
+            f"{ast.unparse(mark.args[0])}, expected {argument!r} exactly"
+        )
+        assert _same_expression(mark.args[1], over), (
+            f"{name} fans out over `{ast.unparse(mark.args[1])}`, which does not "
+            f"match `{over}`. Containment would accept `sorted(NOT_{over})`; this "
+            f"compares the expression structurally"
+        )
+        keywords = {k.arg: k.value for k in mark.keywords}
+        assert "ids" in keywords, f"{name}: parametrize has no ids= expression"
+        assert _same_expression(keywords["ids"], ids), (
+            f"{name} labels its cases with `{ast.unparse(keywords['ids'])}`, "
+            f"which does not match `{ids}`. Wrong ids make a failure name the "
+            f"wrong case"
+        )
+
+
+def test_every_parametrized_node_still_fans_out():
+    """Per-node composition, so collect-only says WHAT it collected, not how many."""
+    _check_parametrized_nodes((REPO_ROOT / _SELF).read_text(encoding="utf-8"))
+    sizes = {
+        "PINS": len(PINS),
+        "SOURCE_MUTATIONS": len(SOURCE_MUTATIONS),
+        "BOUNDARY_EVIDENCE": len(BOUNDARY_EVIDENCE),
+        "_DISPATCH_SHAPES": len(_DISPATCH_SHAPES),
+    }
+    for name, (_argument, _over, _ids, collection) in sorted(_PARAMETRIZED_NODES.items()):
+        assert sizes[collection] > 1, (
+            f"{name} fans out over {collection}, which has {sizes[collection]} "
+            f"entries -- parametrizing over it proves nothing about fan-out"
+        )
+
+
+def _the_property_decorator():
+    """(source, target) where *target* names the REAL decorator, uniquely.
+
+    ANCHORED ON THE `def` LINE ON PURPOSE. The bare decorator text also appears
+    inside these planted tests as a string literal, and it appears EARLIER in the
+    file -- so `source.replace(bare, ..., 1)` edited this test's own body and left
+    the subject untouched. The guard then passed, and the planted mutation
+    reported DID NOT RAISE while proving nothing.
+
+    Same family as the child-script digest and the compile-derived roster: the
+    edit was applied to a different artifact than the one under test. Uniqueness
+    is asserted rather than assumed.
+    """
+    source = (REPO_ROOT / _SELF).read_text(encoding="utf-8")
+    target = (
+        '@pytest.mark.parametrize("name", sorted(PINS), ids=sorted(PINS))\n'
+        "def test_sessions_fence_rollback_verb_property("
+    )
+    assert source.count(target) == 1, (
+        f"the planted-mutation anchor matches {source.count(target)} places; it "
+        f"must name exactly one, or the mutation lands somewhere unintended"
+    )
+    return source, target
+
+
+def test_the_fan_out_guard_dies_on_a_wrong_collection():
+    """PLANTED: the guard must FAIL when a node fans out over the wrong thing.
+
+    `NOT_PINS` CONTAINS `PINS`, which is exactly what the first version of this
+    guard accepted. A composition guard with no killing mutation is the same
+    object as a pin with no killing mutation: it exists, and whether it can fail
+    is a separate question with its own answer.
+    """
+    source, target = _the_property_decorator()
+    mutated = source.replace(
+        target, target.replace("sorted(PINS),", "sorted(NOT_PINS),", 1), 1
+    )
+    assert mutated != source, "the planted mutation matched nothing"
+    with pytest.raises(AssertionError, match="does not match"):
+        _check_parametrized_nodes(mutated)
+
+
+def test_the_fan_out_guard_dies_on_a_foreign_parametrize():
+    """PLANTED: a callee that merely ENDS IN parametrize must not satisfy it."""
+    source, target = _the_property_decorator()
+    mutated = source.replace(target, "@not" + target.lstrip("@"), 1)
+    assert mutated != source, "the planted mutation matched nothing"
+    with pytest.raises(AssertionError, match="expected exactly 1"):
+        _check_parametrized_nodes(mutated)
+
+
+def test_the_fan_out_guard_dies_when_the_decorator_is_deleted():
+    """PLANTED: the ORIGINAL defect -- the decorator simply gone."""
+    source, target = _the_property_decorator()
+    mutated = source.replace(target, target.split("\n", 1)[1], 1)
+    assert mutated != source, "the planted mutation matched nothing"
+    with pytest.raises(AssertionError, match="expected exactly 1"):
+        _check_parametrized_nodes(mutated)
+
+
+def test_every_pin_is_in_exactly_one_evidence_bucket():
+    """The census is a fact of the FILE, and it is a partition. Not coverage.
+
+    The split decides what counts as this slice's evidence, and it lived only
+    in a chat message: nobody reading the repository could derive it, disagree
+    with it, or notice it drifting. That is the defect this whole slice has
+    been about — a property named in one place and enforced in none — applied
+    to the classification itself.
+
+    An EXACT partition, not two subset checks. A new pin that lands in neither
+    bucket would otherwise vanish from the census silently, which is precisely
+    how a number that only goes down becomes indistinguishable from a number
+    that lost something.
+    """
+    pins = set(PINS)
+    both = BOUNDARY_EVIDENCE & MAINTENANCE_ONLY
+    assert not both, f"pins claimed by both buckets: {sorted(both)}"
+    unclassified = pins - BOUNDARY_EVIDENCE - MAINTENANCE_ONLY
+    assert not unclassified, (
+        f"pins in neither bucket, so they are in no census: {sorted(unclassified)}"
+    )
+    phantom = (BOUNDARY_EVIDENCE | MAINTENANCE_ONLY) - pins
+    assert not phantom, (
+        f"bucketed names that are not pins — a rename left the registry behind: "
+        f"{sorted(phantom)}"
+    )
+    assert len(BOUNDARY_EVIDENCE) + len(MAINTENANCE_ONLY) == len(pins), (
+        f"the split does not sum to the file: {len(BOUNDARY_EVIDENCE)} + "
+        f"{len(MAINTENANCE_ONLY)} != {len(pins)}"
+    )
+    # THE CENSUS AS LITERALS, so it cannot drift silently. The three checks
+    # above are all relative — they stay green while both buckets grow, which
+    # is exactly how a reported number stops matching the file without anyone
+    # editing the number. A pin added to either bucket must move a digit here,
+    # in the same commit, and that digit is what the report quotes.
+    assert (len(BOUNDARY_EVIDENCE), len(MAINTENANCE_ONLY)) == (8, 25), (
+        "the evidence census moved and the literals did not: boundary="
+        f"{len(BOUNDARY_EVIDENCE)} maintenance={len(MAINTENANCE_ONLY)}. If the "
+        "change is intended, update these numbers AND every place the split is "
+        "reported; if it is not, a pin has landed in the wrong bucket"
+    )
+
+
 @pytest.mark.parametrize("name", sorted(PINS), ids=sorted(PINS))
 def test_sessions_fence_rollback_verb_property(name, tmp_path):
     PINS[name](tmp_path)
@@ -3810,10 +4667,91 @@ def test_sessions_fence_rollback_verb_property(name, tmp_path):
 
 SOURCE_MUTATIONS = (
     Mutation(
+        pin="check_a_real_invocation_refuses_before_it_observes_the_source",
+        module="hermes_cli/session_fence_rollback.py",
+        find="    # governs has not been made in time.\n"
+             "    disqualify_the_target(store_path)\n"
+             "    establish_offline_authority(store_path)\n",
+        replace="    # governs has not been made in time.\n"
+                "    disqualify_the_target(store_path)\n"
+                "    with open(store_path, \"r+b\") as _h:\n"
+                "        _h.seek(24)\n"
+                "        _was = _h.read(1)\n"
+                "        _h.seek(24)\n"
+                "        _h.write(bytes([_was[0] ^ 1]))\n"
+                "    establish_offline_authority(store_path)\n",
+        kills_by='the refusal rewrote the source IN PLACE. The file set is unchanged and no watched event fired, which is exactly why the listing and the counters cannot carry this on their own:',
+        why="SECOND CONJUNCT: byte invariance. The other row moves the refusal "
+            "after the source is OBSERVED; this one rewrites the source IN "
+            "PLACE, which changes neither the directory listing nor any event "
+            "counter the pin watches. Found by mutation, not review: a correct "
+            "argument for asserting events had silently become a reason for "
+            "omitting content, and the pin stayed green while the operator's "
+            "store was modified",
+    ),
+    Mutation(
+        pin="check_a_late_sidecar_never_yields_committed_or_backup_facts",
+        module="hermes_cli/session_fence_rollback.py",
+        find="    # deciding after it would be deciding on the strength of what is in doubt.\n"
+             "    disqualify_the_target(store_path)\n",
+        replace="    # deciding after it would be deciding on the strength of what is in doubt.\n"
+                "    with BoundTarget(store_path) as _restored:\n"
+                "        prepare_the_private_copy(\n"
+                "            store_path, work_dir=Path(tempfile.mkdtemp()), bound=_restored\n"
+                "        )\n"
+                "    disqualify_the_target(store_path)\n",
+        kills_by='the run read a source image, so there is an interval between deciding the source is quiesced and reading it — and a writer that commits in that interval is invisible to both ends of it (',
+        why="restoring a read of the source image reopens the interval between "
+            "the sidecar check and the read. A writer committing there leaves "
+            "the check true and the image short, and every fact derived after "
+            "it describes a database missing rows",
+    ),
+    Mutation(
+        pin="check_a_refusal_publishes_no_fact_it_never_produced",
+        module="hermes_cli/session_fence_rollback_cmd.py",
+        find="    resolved_preflight = preflight or getattr(exc, \"preflight\", None)\n",
+        replace="    resolved_preflight = preflight or getattr(exc, \"preflight\", None) or {\n"
+                "        \"target_present\": False,\n    }\n",
+        kills_by='refusal publishes a different set of fields than it produced. extra=',
+        why="a preflight block of false checks claims each was performed and "
+            "failed. None ran. Absent and false are different statements, and "
+            "the false one is the report answering a question nobody asked",
+    ),
+    Mutation(
+        pin="check_a_refusal_says_nothing_about_a_destination_it_never_examined",
+        module="hermes_cli/session_fence_rollback_cmd.py",
+        find="    if facts.get(\"backup\") is not None:\n        payload[\"backup\"] = facts[\"backup\"]\n",
+        replace="    payload[\"backup\"] = facts.get(\"backup\") or {\n"
+                "        \"path\": str(backup), \"created\": False, \"present\": False,\n    }\n",
+        kills_by='about a destination it never examined:',
+        why="the boundary never examines the destination, so `present: false` "
+            "is not a cautious default -- on an operator who names an existing "
+            "file the report states as fact something it never looked at",
+    ),
+    Mutation(
+        pin="check_an_unused_work_dir_cannot_change_the_verdict",
+        module="hermes_cli/session_fence_rollback_cmd.py",
+        find="    # --work-dir IS NOT EXAMINED.",
+        replace="    if work_parent is not None and not work_parent.is_dir():\n"
+                "        return _emit_refusal(\n"
+                "            rollback.TurnFenceRollbackRefused(\n"
+                "                \"no such --work-dir\", reason=\"rehearsal-unwritable\",\n"
+                "            ),\n"
+                "            store=store, backup=backup, dry_run=True,\n"
+                "        )\n"
+                "    # --work-dir IS NOT EXAMINED.",
+        kills_by='refused for a different reason than the others:',
+        why="an input that feeds a capability the boundary removed must stop "
+            "influencing the outcome. Stat'ing it lets a nonexistent path give "
+            "a different reason than the real run gives, so a dead flag decides "
+            "what the operator is told",
+    ),
+    Mutation(
         pin="check_the_verb_is_registered_under_sessions_and_names_its_target",
         module="hermes_cli/session_fence_rollback_cmd.py",
         find='        "fence-rollback",\n        help=(\n',
         replace='        "fence-rollback-disabled",\n        help=(\n',
+        kills_by='the verb refused a fully named invocation:',
         why="SECOND CONJUNCT: registered UNDER SESSIONS. The other row attacks "
             "the target being named; nothing attacked the verb existing at the "
             "name an operator types, so a rename to anything at all would have "
@@ -3822,16 +4760,25 @@ SOURCE_MUTATIONS = (
     Mutation(
         pin="check_no_in_place_run_succeeds_and_each_wrong_target_names_its_own_reason",
         module="hermes_cli/session_fence_rollback.py",
-        find='        "database — so nothing available proves which store an artifact is or "\n'
+        find='    raise TurnFenceRollbackRefused(\n'
+             '        f"no capability in this build can establish that {artifact} is offline, "\n'
+             '        "so the rollback is refused. The only producer of a detached state.db "\n'
+             '        "here is the quick snapshot, whose manifest records file SIZE only — a "\n'
+             '        "same-size replacement satisfies it while the contents are a different "\n'
+             '        "database — so nothing available proves which store an artifact is or "\n'
              '        "that it is detached. Nothing was changed",\n'
-             '        reason=DISQUALIFICATION_REASONS["unknown"],\n',
-        replace='        "database", reason=DISQUALIFICATION_REASONS["unknown"],\n'
-                "    ) if False else None\n    return None\n    raise TurnFenceRollbackRefused(\n"
-                '        "unreachable",\n        reason=DISQUALIFICATION_REASONS["unknown"],\n',
+             '        reason=DISQUALIFICATION_REASONS["unknown"],\n'
+             '    )\n',
+        replace="    return None\n",
+        kills_by="the verb SUCCEEDED in place on the",
         why="SECOND CONJUNCT: NO in-place run succeeds. The other row collapses "
             "the four reasons into one, which leaves every target still "
             "refused; this one lets an ordinary idle store through, which is "
-            "the fail-closed half and the whole contract",
+            "the fail-closed half and the whole contract. REPLACES THE WHOLE "
+            "RAISE STATEMENT rather than disabling it in place: an earlier "
+            "form composed to `raise None`, which is a TypeError, so the pin "
+            "died at its crash detector and the row scored a kill while "
+            "measuring nothing",
     ),
     Mutation(
         pin="check_the_boundary_decides_liveness_again_keyed_by_the_operators_store",
@@ -3839,6 +4786,7 @@ SOURCE_MUTATIONS = (
         find="        private_copy.verify()\n"
              "        _decide_under_the_lock(conn, reported, expected, bound=None)\n",
         replace="        private_copy.verify()\n",
+        kills_by='a turn taken between the backup and the drops was not refused. Either the boundary trusted its earlier snapshot, or it asked about the working object rather than the store named:',
         why="SECOND CONJUNCT: decides AGAIN. The other row attacks the keying "
             "and leaves the re-decision standing; this one deletes the "
             "re-decision and leaves the keying intact, so the boundary trusts "
@@ -3846,32 +4794,46 @@ SOURCE_MUTATIONS = (
             "property the merged-away pin used to own",
     ),
     Mutation(
-        pin="check_the_dry_run_reports_the_plan_and_changes_no_byte",
-        module="hermes_cli/session_fence_rollback.py",
-        find="        owned = _live_holders_inside_the_transaction(prepared.connection, copy)\n",
-        replace="        owned = _live_holders_inside_the_transaction(prepared.connection, copy)\n"
-                "        SessionDB(db_path=store_path).close()\n",
-        why="SECOND CONJUNCT: changes NO BYTE. The other row makes the dry run "
-            "fall through and stop reporting a plan, while still touching "
-            "nothing; this one opens the operator's store during the dry run, "
-            "and SessionDB's schema init writes",
-    ),
-    Mutation(
         pin="check_the_verb_is_registered_under_sessions_and_names_its_target",
         module="hermes_cli/session_fence_rollback_cmd.py",
         find='        "--store",\n        type=Path,\n        required=True,\n',
         replace='        "--store",\n        type=Path,\n'
                 '        default=Path("~/.hermes/state.db").expanduser(),\n',
+        kills_by='. A rollback that can run without being handed a store is a rollback that can run on the wrong one',
         why="giving the target a default is the convenient version of this "
             "verb and the one that acts on a store nobody named. The "
             "invocation that touches the wrong file then looks identical in "
             "the shell history to the one the operator meant",
     ),
     Mutation(
+        pin="check_the_verb_is_registered_under_sessions_and_names_its_target",
+        module="hermes_cli/session_fence_rollback_cmd.py",
+        find='        "--store",\n        type=Path,\n        required=True,\n',
+        replace='        "--store",\n'
+                "        type=lambda raw: (\n"
+                "            Path(raw).parent.is_dir()\n"
+                '            and Path(raw).parent.joinpath(".probe").touch(),\n'
+                "            Path(raw),\n"
+                "        )[1],\n"
+                "        required=True,\n",
+        kills_by="parsing the verb's arguments created or removed files:",
+        why="THIRD CONJUNCT: argv parsing is INERT ON DISK. The other two rows "
+            "attack the verb's name and its required target, and both leave a "
+            "parser that writes while it converts entirely unseen. This mutant "
+            "is deliberately invisible to everything except the conjunct it "
+            "targets: it returns the SAME Path, so registration and "
+            "required-target stay green, and it creates exactly one file under "
+            "the parsed --store parent, so the pin dies at the file-set "
+            "before/after and nowhere else. A looser mutant that also broke "
+            "parsing would kill by crashing, and the other two conjuncts would "
+            "mask which property actually failed",
+    ),
+    Mutation(
         pin="check_a_target_that_is_not_this_fence_is_refused_by_a_named_reason",
         module="hermes_cli/session_fence_rollback.py",
         find="    if list(installed) == list(expected):\n        return\n",
         replace="    if True:\n        return\n",
+        kills_by='a target carrying a different fence surface was not refused as surface-mismatch:',
         why="without the surface check nothing decides what the target IS "
             "before it is treated as a store, and three different wrong "
             "targets stop being distinguishable from each other",
@@ -3881,49 +4843,21 @@ SOURCE_MUTATIONS = (
         module="hermes_cli/session_fence_rollback.py",
         find="    if list(installed) == list(expected):\n",
         replace="    if set(installed) <= set(expected):\n",
+        kills_by='a half-installed surface was not reported as one:',
         why="tolerating a SUBSET is exactly 'drop what we recognise and shrug "
             "at the rest'. A store left fenced against some writes and not "
             "others is worse than either end state",
     ),
     Mutation(
-        pin="check_the_dry_run_reports_the_plan_and_changes_no_byte",
-        module="hermes_cli/session_fence_rollback_cmd.py",
-        find="    if dry_run:\n        return _report_rehearsal(store, backup, work_parent)\n",
-        replace="    if False:\n        return _report_rehearsal(store, backup, work_parent)\n",
-        why="a --dry-run that falls through to the real path answers a "
-            "question the operator did not ask, and reports none of the plan "
-            "they did",
-    ),
-    Mutation(
-        pin="check_the_dry_run_never_reports_that_a_refused_run_would_proceed",
-        module="hermes_cli/session_fence_rollback.py",
-        find="    try:\n        establish_offline_authority(store_path)\n",
-        replace="    try:\n        pass\n",
-        why="with the verdict on the OPERATOR's artifact dropped, the dry run "
-            "reports the rehearsal's success as the run's outcome — 'this "
-            "would proceed' about a command that refuses every time, which is "
-            "the one thing a rehearsal may never say",
-    ),
-    Mutation(
         pin="check_the_boundary_decides_liveness_again_keyed_by_the_operators_store",
         module="hermes_cli/session_fence_rollback.py",
-        find="            report_as=store_path,\n",
-        replace="            report_as=None,\n",
+        find="    reported = Path(report_as) if report_as is not None else target_path\n",
+        replace="    reported = target_path\n",
+        kills_by='a turn taken between the backup and the drops was not refused. Either the boundary trusted its earlier snapshot, or it asked about the working object rather than the store named:',
         why="the liveness predicate has a branch keyed by the store's PATH, "
             "so answering it about the copy frees a conversation this process "
             "is genuinely mid-turn on. The rehearsal then reports that a run "
             "about to be refused would proceed",
-    ),
-    Mutation(
-        pin="check_every_preflight_refusal_leaves_the_artifact_byte_identical",
-        module="hermes_cli/session_fence_rollback.py",
-        find="        owned = _live_holders_inside_the_transaction(prepared.connection, copy)\n",
-        replace="        owned = _live_holders_inside_the_transaction(prepared.connection, copy)\n"
-                "        SessionDB(db_path=store_path).close()\n",
-        why="pointing the liveness check at the operator's store is how the "
-            "inspection constructs the thing it is inspecting: SessionDB's "
-            "schema init writes, so a refusal has already rewritten the file "
-            "it is about to promise was left alone",
     ),
     Mutation(
         pin="check_a_target_swapped_and_restored_around_any_open_cannot_be_reached",
@@ -3931,9 +4865,12 @@ SOURCE_MUTATIONS = (
         find='    connection = sqlite3.connect(":memory:", isolation_level=None)\n'
              "    try:\n"
              "        connection.deserialize(_as_a_rollback_journal_image(image))\n",
-        replace="    connection = sqlite3.connect(str(copy), isolation_level=None)\n"
+        replace='    probe = sqlite3.connect(str(copy), isolation_level=None)\n'
+                "    probe.close()\n"
+                '    connection = sqlite3.connect(":memory:", isolation_level=None)\n'
                 "    try:\n"
-                "        connection.execute(\"SELECT 1\")\n",
+                "        connection.deserialize(_as_a_rollback_journal_image(image))\n",
+        kills_by='x), so an A->B->A lands inside that interval and is invisible to a check on either side. The object has to be held, not looked at again',
         why="re-opening by pathname restores the interval between the last "
             "identity check and the open. A->B->A lands inside it and is "
             "invisible to a stat on either side, so the rollback commits "
@@ -3947,6 +4884,7 @@ SOURCE_MUTATIONS = (
         find="        private_copy.verify()\n"
              "        _decide_under_the_lock(conn, reported, expected, bound=None)\n",
         replace="        _decide_under_the_lock(conn, reported, expected, bound=None)\n",
+        kills_by='a substituted target was not reported as one. A consistency check cannot see this — the substitute is a perfectly valid fenced store — so only an identity check can:',
         why="without re-establishing identity at the point of use the target "
             "is bound to a NAME again, and a different valid fenced store "
             "moved to that name passes every consistency check while the "
@@ -3958,6 +4896,7 @@ SOURCE_MUTATIONS = (
         module="hermes_cli/session_fence_rollback.py",
         find="        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY\n",
         replace="        flags = os.O_CREAT | os.O_TRUNC | os.O_WRONLY\n",
+        kills_by='the backup step overwrote a file that appeared after its own check',
         why="restoring overwrite-capable creation is the defect itself: "
             "whatever appeared between the existence check and the write is "
             "truncated. No better-placed check can fix it, because a check is "
@@ -3968,6 +4907,7 @@ SOURCE_MUTATIONS = (
         module="hermes_cli/session_fence_rollback.py",
         find='_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")\n',
         replace="_SIDECAR_SUFFIXES = ()\n",
+        kills_by='an orphan sidecar at the backup destination was not reported as an existing backup:',
         why="an orphaned backup.db-wal is a destination too, and narrowing "
             "the family to the one name the operator typed is what makes it "
             "invisible. Aimed at the DECLARATION because the family is "
@@ -3976,10 +4916,11 @@ SOURCE_MUTATIONS = (
             "SQLite and none on the other",
     ),
     Mutation(
-        pin="check_a_dry_run_that_cannot_clean_up_does_not_report_success",
+        pin="check_a_run_that_cannot_clean_up_does_not_report_success",
         module="hermes_cli/session_fence_rollback.py",
         find="    if not work_dir.exists():\n        return None\n",
         replace="    if True:\n        return None\n",
+        kills_by='a run that could not clean up reported a completed backup:',
         why="trusting the removal call instead of looking is the defect: "
             "rmtree cannot distinguish 'removed' from 'failed and swallowed', "
             "so a rolled-back — unfenced — duplicate of every conversation "
@@ -3987,30 +4928,18 @@ SOURCE_MUTATIONS = (
     ),
     Mutation(
         pin="check_a_late_failure_does_not_retract_what_already_happened",
-        module="hermes_cli/session_fence_rollback_cmd.py",
-        find="    rehearsal_facts = dict(outcome.facts())\n",
-        replace="    rehearsal_facts = {}\n",
+        module="hermes_cli/session_fence_rollback.py",
+        find='        if outcome is not None:\n'
+             '            outcome.advance("backup-created")\n'
+             '            outcome.advance("backup-verified")\n'
+             '            outcome.advance("backup-durable")\n'
+             "            outcome.backup = report\n",
+        replace="        if outcome is None:\n            pass\n",
+        kills_by='a backup landed and the report denies it:',
         why="collapsing the two situations into one reason makes a directory "
             "holding an UNFENCED duplicate indistinguishable from one holding "
             "a copy that still carries the fence. Same words, opposite "
             "urgency, and the operator has no way to tell which they have",
-    ),
-    Mutation(
-        pin="check_one_suppressed_sweep_leaves_exactly_one_residue_record",
-        module="hermes_cli/session_fence_rollback_cmd.py",
-        find='    residue_records = list(outcome.facts()["residue"])\n'
-             '    rehearsal_facts["residue"] = residue_records\n',
-        replace='    residue_records = list(outcome.facts()["residue"]) + [\n'
-                '        rollback.describe_residue(\n'
-                '            residue, obligation="the rehearsal working directory",\n'
-                '            outcome=outcome,\n'
-                '        )\n'
-                '    ] if residue is not None else list(outcome.facts()["residue"])\n'
-                '    rehearsal_facts["residue"] = residue_records\n',
-        why="a second writer for one sweep is what turned a single stuck "
-            "directory into two byte-identical records. The ledger already "
-            "holds it; appending here again makes an operator count two places "
-            "to go and look for a second one that never existed",
     ),
     Mutation(
         pin="check_two_notices_of_one_incident_are_one_record",
@@ -4020,6 +4949,7 @@ SOURCE_MUTATIONS = (
              "                self.residue[position] = entry\n"
              "                return\n",
         replace="",
+        kills_by='one incident observed twice became two records. The second observer is not a second stuck directory:',
         why="append-only without an identity is the mirror image of the "
             "erasure it replaced: every observer of one incident adds a "
             "record, so looking at a stuck directory twice makes two of them",
@@ -4029,6 +4959,7 @@ SOURCE_MUTATIONS = (
         module="hermes_cli/session_fence_rollback.py",
         find='            if existing.get("incident") == incident:\n',
         replace="            if {k: v for k, v in existing.items() if k != 'incident'} == record:\n",
+        kills_by='two distinct incidents that happened to produce identical payloads were collapsed into one. A run can fail to remove its working copy AND a backup it tried to withdraw, and those are two places to go:',
         why="deduplicating by VALUE is the obvious repair for a double count "
             "and the wrong one. Two distinct failures can produce identical "
             "payloads, and collapsing them loses a place the operator has to "
@@ -4038,8 +4969,9 @@ SOURCE_MUTATIONS = (
     Mutation(
         pin="check_a_residue_claim_names_the_fence_state_that_was_established",
         module="hermes_cli/session_fence_rollback.py",
-        find='    elif state == "committed":\n        fence_state = "unfenced"\n',
-        replace='    elif True:\n        fence_state = "unfenced"\n',
+        find='    if holds != "store-copy":\n        fence_state = "not-applicable"\n',
+        replace='    if holds != "store-copy":\n        fence_state = "unfenced"\n',
+        kills_by='a left-behind artifact is announced as an UNFENCED duplicate of every conversation, and no on-disk artifact is ever unfenced — the rollback runs against an in-memory image:',
         why="the message was generated where cleanup fails and inherited that "
             "site's subject, announcing every left-behind copy as UNFENCED. "
             "Fence state is determined by whether the DDL committed, and a "
@@ -4061,6 +4993,7 @@ SOURCE_MUTATIONS = (
                 "        ),\n"
                 '        incident=f"work-dir:{work_dir}",\n'
                 "    )\n    report = None\n",
+        kills_by='the run reports something left behind, and it created nothing — it refused before it observed the source:',
         why="creating a working directory for a run that refuses before it "
             "observes the source manufactures an incident out of nothing, and "
             "the residue reason then overwrote the authority refusal that "
@@ -4076,6 +5009,7 @@ SOURCE_MUTATIONS = (
              '                    "error": f"{type(exc).__name__}: {exc}"}\n',
         replace="        try:\n            os.unlink(member)\n"
                 "        except OSError:\n            pass\n",
+        kills_by='a reservation could not be released and the boundary returned a backup report anyway:',
         why="swallowing the unlink failure is the defect: the reservation is "
             "still on disk and the run reports a verified, durable backup with "
             "a stale -wal beside it, which the next reader takes for that "
@@ -4087,6 +5021,7 @@ SOURCE_MUTATIONS = (
         find="        if identity is not None and (info.st_dev, info.st_ino) != identity:\n"
              '            return {"path": str(member), "files": 1, "error": "ownership-lost"}\n',
         replace="",
+        kills_by='the run deleted a file it did not create at a name it had merely reserved:',
         why="releasing a reserved name without checking what it resolves to "
             "now deletes a file this run never created. Nothing about the "
             "result would look wrong afterwards, and deletion has no way back",
@@ -4100,6 +5035,7 @@ SOURCE_MUTATIONS = (
                 '                    "the backup staging copy could not be removed",\n'
                 '                    reason="backup-staging-residue",\n'
                 "                )\n",
+        kills_by='. The staging sweep is additive — it never becomes the reason the run failed',
         why="raising inside a finally discards the exception already in "
             "flight, so the refusal that decided the run is destroyed and a "
             "cleanup problem takes its place. The records stay correct and the "
@@ -4112,6 +5048,7 @@ SOURCE_MUTATIONS = (
         find="            for problem in reservation.remove_only_what_we_created():\n",
         replace="            reservation.remove_only_what_we_created()\n"
                 "            for problem in []:\n",
+        kills_by='. Two files remain on disk and the operator is told about a different set',
         why="the cleanup pass correctly works out which destination it could "
             "not remove and returns it; calling it for effect throws that away, "
             "so a surviving backup.db sits on disk unreported while the layer "
@@ -4126,19 +5063,17 @@ SOURCE_MUTATIONS = (
              "            return None\n",
         replace="        except FileNotFoundError:\n"
                 '            return {"path": str(member), "error": "vanished"}\n',
+        kills_by='the reservation is gone, which is the state the release wanted, and the run refused anyway:',
         why="a reservation that is already gone is the state the release "
             "wanted. Reporting it as an unresolved incident sends the operator "
             "to a directory to remove a file that is not there",
     ),
     Mutation(
-        pin="check_the_completed_rehearsal_reports_the_surface_it_removed",
+        pin="check_a_completed_rollback_reports_the_surface_it_removed",
         module="hermes_cli/session_fence_rollback.py",
-        find='        "installed_triggers": plan["installed_triggers"],\n'
-             '        "would_drop": plan["would_drop"],\n'
-             '        "rehearsal": dict(outcome.facts(), copy=str(copy)),\n',
-        replace='        "installed_triggers": plan["installed_triggers"],\n'
-                '        "would_drop": [],\n'
-                '        "rehearsal": dict(outcome.facts(), copy=str(copy)),\n',
+        find='            "verified": True,\n            "durable": True,\n',
+        replace='            "verified": False,\n            "durable": False,\n',
+        kills_by='no verified backup claimed:',
         why="a completion report that does not name the surface it removed "
             "leaves nothing in the output to distinguish a full rollback from "
             "a partial one, and the operator is back to checking by hand — "
@@ -4160,6 +5095,7 @@ SOURCE_MUTATIONS = (
                 '    "unknown": "offline-authority-unknown",\n'
                 '}',
 
+        kills_by='. Four wrong targets that print the same reason leave the operator with one next move for four different situations',
         why="four wrong targets that print the same reason leave the operator "
             "with one next move for four different situations. Every target "
             "is still refused, so nothing becomes unsafe — what is lost is "
@@ -4169,10 +5105,14 @@ SOURCE_MUTATIONS = (
     Mutation(
         pin="check_a_real_invocation_refuses_before_it_observes_the_source",
         module="hermes_cli/session_fence_rollback.py",
-        find="    disqualify_the_target(store_path)\n    establish_offline_authority(store_path)\n",
-        replace="    disqualify_the_target(store_path)\n"
+        find="    # governs has not been made in time.\n"
+             "    disqualify_the_target(store_path)\n"
+             "    establish_offline_authority(store_path)\n",
+        replace="    # governs has not been made in time.\n"
+                "    disqualify_the_target(store_path)\n"
                 "    with BoundTarget(store_path):\n"
                 "        establish_offline_authority(store_path)\n",
+        kills_by='a real invocation opened the store with BoundTarget before refusing',
         why="the refusal still happens and still names itself — only the "
             "ORDER moves, so the store is opened before the decision that "
             "makes opening it unnecessary. On a WAL build that leaves -wal "
@@ -4184,6 +5124,7 @@ SOURCE_MUTATIONS = (
         module="hermes_cli/session_fence_rollback.py",
         find="    if beside:\n        raise TurnFenceRollbackRefused(\n",
         replace="    if False:\n        raise TurnFenceRollbackRefused(\n",
+        kills_by='the preparer built a working object from an image that is missing committed rows; every later claim is about a different database',
         why="deserializing an image whose committed rows live in an "
             "uncheckpointed -wal produces a database that opens cleanly, "
             "passes integrity_check and is quietly short of data. Every later "
@@ -4194,6 +5135,7 @@ SOURCE_MUTATIONS = (
         module="hermes_cli/session_fence_rollback.py",
         find='            conn.execute("VACUUM INTO ?", (str(snapshot),))\n',
         replace="            shutil.copyfile(store_path, snapshot)\n",
+        kills_by='the rehearsal produced no backup:',
         why="a copy of the main file reproduces the bytes on disk, and "
             "committed state does not have to be there — a row committed into "
             "an uncheckpointed -wal is in the store and not in that file. The "
@@ -4205,6 +5147,7 @@ SOURCE_MUTATIONS = (
         module="hermes_cli/session_fence_rollback.py",
         find="            for problem in reservation.remove_only_what_we_created():\n",
         replace="            for problem in []:\n",
+        kills_by='. An operator who retries now hits a collision this run manufactured',
         why="the run still refuses, and still refuses for the right reason — "
             "what it stops doing is removing the half-built destination it "
             "created before hitting the occupied sibling. The operator who "
@@ -4215,6 +5158,7 @@ SOURCE_MUTATIONS = (
         module="hermes_cli/session_fence_rollback.py",
         find="            writer.flush()\n        os.fsync(handle)\n",
         replace="            writer.flush()\n",
+        kills_by='the backup file was never fsynced. It exists in the page cache and the rollback then removed the fence: flushed=',
         why="flush() pushes the bytes to the kernel and stops there. The "
             "backup then exists in the page cache while the fence comes off, "
             "which is precisely the crash it was taken against",
@@ -4225,6 +5169,7 @@ SOURCE_MUTATIONS = (
         find="        reservation.release_the_sidecars(outcome=outcome)\n"
              "        _fsync_the_directory(backup_path.parent)\n",
         replace="        reservation.release_the_sidecars(outcome=outcome)\n",
+        kills_by="the backup's parent directory was never fsynced, so the file's bytes are durable and its NAME is not. A crash here leaves a backup nothing can find: flushed=",
         why="the file's contents are durable and its NAME is not, so the "
             "crash leaves a backup nothing can find. The file fsync left in "
             "place does not cover it — they are different objects",
@@ -4234,6 +5179,7 @@ SOURCE_MUTATIONS = (
         module="hermes_cli/session_fence_rollback.py",
         find='            outcome.advance("commit-unknown")\n',
         replace="            pass\n",
+        kills_by='a COMMIT that raised was resolved into a certainty the caller does not have:',
         why="a COMMIT that raised may have landed. Leaving the ledger at "
             "'committing' resolves that into whatever the reader assumes, and "
             "the assumption an operator makes about a run that reported a "
@@ -4244,6 +5190,7 @@ SOURCE_MUTATIONS = (
         module="hermes_cli/session_fence_rollback.py",
         find="        return _mark_the_backup_absent_but_not_by_us(outcome, backup_path)\n",
         replace="        return _mark_the_backup_withdrawn(outcome, backup_path)\n",
+        kills_by='this run claims it removed a file it never called unlink on. ENOENT is not evidence of agency:',
         why="ENOENT answers only whether the file is there. Reading it as "
             "this run's own completed withdrawal claims an unlink and a "
             "directory flush that never happened, so a competitor's "
@@ -4259,31 +5206,202 @@ def test_each_pin_dies_when_its_own_guard_is_removed(mutation, tmp_path):
     assert_mutation_kills_the_pin(mutation, str(_SELF), tmp_path, *_EXTRA_EXTRACT)
 
 
-def _mutation_rows_as_written(source: str) -> dict:
-    """Every ``Mutation(...)`` in *source*, keyed by pin, valued by its guts.
+def _evaluates_to_none(expr) -> bool:
+    """Can this expression evaluate to None? ``raise <None>`` is a TypeError."""
+    if isinstance(expr, ast.Constant) and expr.value is None:
+        return True
+    if isinstance(expr, ast.IfExp):
+        if isinstance(expr.test, ast.Constant):
+            taken = expr.body if expr.test.value else expr.orelse
+            return _evaluates_to_none(taken)
+        return _evaluates_to_none(expr.body) or _evaluates_to_none(expr.orelse)
+    return False
 
-    Parsed rather than diffed line by line. A unified diff shows changed LINES,
-    so a row whose ``find`` moved by one character reports a hunk that may not
-    contain the ``pin=`` line at all, and the row would be attributed to
-    whatever block the hunk happened to touch. The tuple is the unit of
-    meaning, so the tuple is what gets compared.
+
+def _unreachable_statements(tree) -> list:
+    """Statements following a terminator in the same block."""
+    out = []
+    for node in ast.walk(tree):
+        for field in ("body", "orelse", "finalbody"):
+            block = getattr(node, field, None)
+            if not isinstance(block, list):
+                continue
+            terminated = False
+            for stmt in block:
+                if terminated:
+                    out.append(stmt.lineno)
+                if isinstance(stmt, (ast.Raise, ast.Return, ast.Continue, ast.Break)):
+                    terminated = True
+    return out
+
+
+def test_every_mutation_row_names_the_one_assertion_it_must_die_at():
+    """STATIC half: every row has an anchor, and each names exactly one assertion.
+
+    Presence, not behaviour. The runtime half is the row table itself, which
+    runs each mutation and holds it to this anchor. Both are required and
+    neither substitutes for the other: this one cannot tell you the row still
+    kills, and the row table cannot tell you an anchor has gone ambiguous
+    because a second assertion grew the same prose.
     """
-    rows = {}
-    for node in ast.walk(ast.parse(source)):
-        if not (isinstance(node, ast.Call) and getattr(node.func, "id", "") == "Mutation"):
+    tree = ast.parse((REPO_ROOT / _SELF).read_text(encoding="utf-8"))
+    funcs = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+    missing, ambiguous = [], []
+    for mutation in SOURCE_MUTATIONS:
+        if not mutation.kills_by:
+            missing.append(mutation.pin)
             continue
-        fields = {}
-        for keyword in node.keywords:
-            try:
-                fields[keyword.arg] = ast.literal_eval(keyword.value)
-            except (ValueError, SyntaxError):  # pragma: no cover - non-literal
-                fields[keyword.arg] = "<unevaluated>"
-        pin = fields.get("pin")
-        if pin is not None:
-            rows.setdefault(pin, []).append(
-                (fields.get("module"), fields.get("find"), fields.get("replace"))
+        owners = [
+            stmt for stmt in ast.walk(funcs[mutation.pin])
+            if isinstance(stmt, ast.Assert) and stmt.msg is not None
+            and any(
+                isinstance(const, ast.Constant)
+                and isinstance(const.value, str)
+                and mutation.kills_by in const.value
+                for const in ast.walk(stmt.msg)
             )
+        ]
+        if len(owners) != 1:
+            ambiguous.append((mutation.pin, mutation.kills_by, len(owners)))
+    assert not missing, (
+        "rows with no kills_by, so they fall back to 'any AssertionError' and a "
+        f"crash would score as a kill: {missing}"
+    )
+    assert not ambiguous, (
+        "kills_by anchors that do not name exactly one assertion in their pin. "
+        "An anchor matching two assertions cannot say which one fired, which is "
+        f"the defect it exists to close: {ambiguous}"
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation", SOURCE_MUTATIONS, ids=[m.pin for m in SOURCE_MUTATIONS]
+)
+def test_each_source_mutation_produces_the_behaviour_it_claims(mutation):
+    """Apply the row and read the RESULT. Reading find/replace cannot see this.
+
+    Two rows in this table were vacuous and both were found this way, not by
+    review: one composed to ``raise None`` (a TypeError, so the pin died at its
+    crash detector) and one reopened a read-only copy. A row is a TRANSFORMATION
+    -- what it produces is a property of the composition, not of either half.
+    """
+    source = (REPO_ROOT / mutation.module).read_text(encoding="utf-8")
+    occurrences = source.count(mutation.find)
+    assert occurrences == 1, (
+        f"{mutation.pin}: anchor matches {occurrences} places in "
+        f"{mutation.module}, so it no longer names one guard"
+    )
+    mutated = source.replace(mutation.find, mutation.replace, 1)
+    try:
+        tree = ast.parse(mutated)
+    except SyntaxError as exc:
+        raise AssertionError(
+            f"{mutation.pin}: the mutated module does not parse: {exc}"
+        ) from exc
+
+    bad_raises = [
+        node.lineno for node in ast.walk(tree)
+        if isinstance(node, ast.Raise) and node.exc is not None
+        and _evaluates_to_none(node.exc)
+    ]
+    assert not bad_raises, (
+        f"{mutation.pin}: the mutant raises an expression that evaluates to None "
+        f"at line(s) {bad_raises}. `raise None` is a TypeError, so the pin dies "
+        f"at its crash detector and the row measures nothing"
+    )
+    base_dead = len(_unreachable_statements(ast.parse(source)))
+    dead = len(_unreachable_statements(tree))
+    assert dead <= base_dead, (
+        f"{mutation.pin}: the mutant introduces {dead - base_dead} unreachable "
+        f"statement(s), so the behaviour its `why` describes may never execute"
+    )
+
+
+def test_a_crashing_mutation_cannot_score_as_a_kill(tmp_path):
+    """NEGATIVE CONTROL: prove the discriminator REJECTS a crash.
+
+    Deliberately NOT in SOURCE_MUTATIONS -- a row that must fail does not belong
+    in the table the sweep validates. This is the historical vacuous form of
+    row 6, kept because the defect is the permanent proof that the check works:
+    it composes to `raise None`, the pin dies at `assert not run.crash`, and the
+    old `"AssertionError" in trace` check scored that as a kill.
+    """
+    vacuous = Mutation(
+        pin="check_no_in_place_run_succeeds_and_each_wrong_target_names_its_own_reason",
+        module="hermes_cli/session_fence_rollback.py",
+        find='        "database — so nothing available proves which store an artifact is or "\n'
+             '        "that it is detached. Nothing was changed",\n'
+             '        reason=DISQUALIFICATION_REASONS["unknown"],\n',
+        replace='        "database", reason=DISQUALIFICATION_REASONS["unknown"],\n'
+                "    ) if False else None\n    return None\n    raise TurnFenceRollbackRefused(\n"
+                '        "unreachable",\n        reason=DISQUALIFICATION_REASONS["unknown"],\n',
+        kills_by="the verb SUCCEEDED in place on the",
+        why="negative control; must be rejected, never adopted",
+    )
+    with pytest.raises(AssertionError) as caught:
+        assert_mutation_kills_the_pin(vacuous, str(_SELF), tmp_path, *_EXTRA_EXTRACT)
+    assert "CRASH DETECTOR" in str(caught.value), (
+        "the harness rejected the vacuous mutant, but not for being a crash. "
+        f"The discriminator is not doing what this control exists to prove: "
+        f"{caught.value}"
+    )
+
+
+def _mutation_rows_as_written(source: str) -> list:
+    """Every row in ``SOURCE_MUTATIONS``, IN ORDER, as identity tuples.
+
+    A LIST, not a dict keyed by pin. Five rows in this table are duplicates on
+    four pins, so a pin key collapses 38 rows into 33 and the last one silently
+    wins. That failure is silent by construction: no exception, no warning, just
+    a collection smaller than the thing it represents, with every downstream
+    number taken from the smaller set.
+
+    Parsed from the tuple rather than diffed line by line: a unified diff shows
+    changed LINES, so a row whose ``find`` moved by one character reports a hunk
+    that may not contain the ``pin=`` line at all.
+    """
+    rows = []
+    tree = ast.parse(source)
+    for node in tree.body:
+        if not (isinstance(node, ast.Assign) and any(
+                getattr(t, "id", None) == "SOURCE_MUTATIONS" for t in node.targets)):
+            continue
+        for element in node.value.elts:
+            fields = {}
+            for keyword in element.keywords:
+                try:
+                    fields[keyword.arg] = ast.literal_eval(keyword.value)
+                except (ValueError, SyntaxError):  # pragma: no cover
+                    fields[keyword.arg] = "<unevaluated>"
+            rows.append((
+                fields.get("pin"),
+                fields.get("module"),
+                fields.get("find"),
+                fields.get("replace"),
+                # kills_by IS part of the row's meaning: it names the assertion
+                # the row must die at. Omit it and a row whose only change is
+                # its anchor is invisible here -- a blind spot exactly where the
+                # new field lives.
+                fields.get("kills_by"),
+            ))
     return rows
+
+
+def _changed_row_indices(before_source: str, after_source: str) -> set:
+    """Indices into the AFTER table whose rows are new or changed.
+
+    Multiset difference, so two identical-looking rows on one pin are two rows,
+    and changing the FIRST of them selects the first -- not whichever happens to
+    come last.
+    """
+    remaining = list(_mutation_rows_as_written(before_source))
+    changed = set()
+    for index, row in enumerate(_mutation_rows_as_written(after_source)):
+        if row in remaining:
+            remaining.remove(row)
+        else:
+            changed.add(index)
+    return changed
 
 
 def _rows_this_working_tree_added_or_changed():
@@ -4304,12 +5422,9 @@ def _rows_this_working_tree_added_or_changed():
     )
     if committed.returncode != 0:
         return None, None
-    before = _mutation_rows_as_written(committed.stdout)
-    after = _mutation_rows_as_written((REPO_ROOT / _SELF).read_text(encoding="utf-8"))
-    changed = {
-        pin for pin, rows in after.items()
-        if sorted(rows) != sorted(before.get(pin, []))
-    }
+    changed = _changed_row_indices(
+        committed.stdout, (REPO_ROOT / _SELF).read_text(encoding="utf-8")
+    )
     if not changed:
         # THE COMPARISON IS CHEAP AND THE REF IS NOT. Building a commit object
         # from a working tree this size costs over a minute, and paying it on
@@ -4353,16 +5468,47 @@ def test_every_mutation_row_this_tree_adds_or_changes_actually_kills(tmp_path):
     if not changed:
         return
 
-    by_pin = {mutation.pin: mutation for mutation in SOURCE_MUTATIONS}
-    for position, pin in enumerate(sorted(changed)):
-        mutation = by_pin.get(pin)
-        assert mutation is not None, (
-            f"the working tree changes a row for {pin}, and no such pin exists"
+    # THE KEY MUST BE AT LEAST AS FINE AS THE UNIT BEING COUNTED, and the count
+    # of the collection must be asserted against the count of the source. This
+    # one line fails immediately on 33 vs 38.
+    written = _mutation_rows_as_written((REPO_ROOT / _SELF).read_text(encoding="utf-8"))
+    assert len(written) == len(SOURCE_MUTATIONS), (
+        f"the parsed table has {len(written)} rows and SOURCE_MUTATIONS has "
+        f"{len(SOURCE_MUTATIONS)}. Some rows are not being seen by the change "
+        f"detector, so changing them would run nothing"
+    )
+    for position, index in enumerate(sorted(changed)):
+        assert index < len(SOURCE_MUTATIONS), (
+            f"changed row {index} is past the end of SOURCE_MUTATIONS"
         )
+        into = tmp_path / f"new{position}"
+        into.mkdir(parents=True, exist_ok=True)
         assert_mutation_kills_the_pin(
-            mutation, str(_SELF), tmp_path / f"new{position}", *_EXTRA_EXTRACT,
-            ref=ref,
+            SOURCE_MUTATIONS[index], str(_SELF), into, *_EXTRA_EXTRACT, ref=ref,
         )
+
+
+def test_a_changed_row_is_selected_by_position_not_by_pin():
+    """Change the FIRST of two same-pin rows and the FIRST must be selected.
+
+    With a pin-keyed detector the LAST row per pin wins, and in most edits that
+    happens to be a changed row too -- so the bug is invisible unless the changed
+    row is deliberately not the last. That is what this constructs.
+    """
+    before = (
+        'SOURCE_MUTATIONS = (\n'
+        '    Mutation(pin="p", module="m", find="A", replace="x", kills_by="k"),\n'
+        '    Mutation(pin="p", module="m", find="B", replace="y", kills_by="k"),\n'
+        ')\n'
+    )
+    first_changed = before.replace('replace="x"', 'replace="CHANGED"')
+    last_changed = before.replace('replace="y"', 'replace="CHANGED"')
+    assert _changed_row_indices(before, first_changed) == {0}, (
+        "changing the FIRST of two rows on one pin did not select row 0; the "
+        "detector is still collapsing rows that share a pin"
+    )
+    assert _changed_row_indices(before, last_changed) == {1}
+    assert _changed_row_indices(before, before) == set()
 
 
 def test_every_mutation_anchor_still_names_one_place():

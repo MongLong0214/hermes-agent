@@ -153,6 +153,69 @@ def _fenced_store(path: pathlib.Path, *, leave_lease_live: bool):
     return grant
 
 
+def _private_work_dir(tmp_path: pathlib.Path) -> pathlib.Path:
+    work = tmp_path / f"work-{os.urandom(4).hex()}"
+    work.mkdir()
+    return work
+
+
+def _rehearsal_refusal(rollback, store, backup, tmp_path):
+    """MAINTENANCE ONLY. Drive the machinery and hand back how it refused.
+
+    These properties used to be driven through ``rollback_turn_fence``. Both
+    library entry points now refuse before they observe the store, so a test
+    driven through either reaches ``offline-authority-unknown`` and stops
+    testing what its name says — failing for the wrong reason is the same
+    defect as passing for the wrong one, and both stop being evidence.
+
+    The properties themselves did not stop mattering, so they move behind the
+    direct private-machinery driver. Nothing here is evidence about the verb's
+    boundary; it keeps the machinery from rotting until an artifact whose
+    coherence its producer establishes reopens the path.
+    """
+    work = _private_work_dir(tmp_path)
+    try:
+        prepared = rollback.prepare_the_private_copy(store, work_dir=work)
+    except rollback.TurnFenceRollbackRefused as exc:
+        return exc
+    try:
+        rollback._commit_the_rollback(
+            prepared, backup, sorted(rollback.rollback_trigger_names()),
+            report_as=store,
+        )
+    except rollback.TurnFenceRollbackRefused as exc:
+        return exc
+    finally:
+        prepared.close()
+    raise AssertionError("the machinery did not refuse at all")
+
+
+def _roll_back_the_private_object(rollback, store, backup, tmp_path):
+    """Perform the real rollback on the private object; return report + image.
+
+    The same boundary the rehearsal drives, entered directly so the test can
+    keep the resulting database. ``serialize()`` materializes it into bytes THE
+    TEST then writes to a temp file — the production path never writes a
+    rolled-back store anywhere, and this does not make it. It is how a probe
+    gets something to open.
+    """
+    prepared = rollback.prepare_the_private_copy(
+        store, work_dir=_private_work_dir(tmp_path)
+    )
+    try:
+        report = rollback._commit_the_rollback(
+            prepared, backup, sorted(rollback.rollback_trigger_names()),
+            report_as=store,
+        )
+        return report, prepared.connection.serialize()
+    finally:
+        prepared.close()
+
+
+def _materialize(image: bytes, where: pathlib.Path) -> pathlib.Path:
+    where.write_bytes(image)
+    return where
+
 def test_rollback_refuses_while_a_conversation_is_live_owned(tmp_path):
     """Offline-only, stated as rows and as triggers.
 
@@ -167,10 +230,12 @@ def test_rollback_refuses_while_a_conversation_is_live_owned(tmp_path):
     before_rows = _canonical_rows(store)
     before_triggers = _installed_triggers(store)
 
-    with pytest.raises(rollback.TurnFenceRollbackRefused) as caught:
-        rollback.rollback_turn_fence(store, backup_path=tmp_path / "backup.db")
+    refusal = _rehearsal_refusal(rollback, store, tmp_path / "backup.db", tmp_path)
 
-    assert "keep" in str(caught.value)
+    assert refusal.reason == "live-turn", (
+        f"the live turn was not what refused this: {refusal.reason} — {refusal}"
+    )
+    assert "keep" in str(refusal)
     assert _canonical_rows(store) == before_rows
     assert _installed_triggers(store) == before_triggers
 
@@ -191,10 +256,12 @@ def test_rollback_refuses_when_the_backup_cannot_be_made(tmp_path):
     occupied = tmp_path / "backup.db"
     occupied.write_bytes(b"not a database, and not to be clobbered")
 
-    with pytest.raises(rollback.TurnFenceRollbackRefused) as caught:
-        rollback.rollback_turn_fence(store, backup_path=occupied)
+    refusal = _rehearsal_refusal(rollback, store, occupied, tmp_path)
 
-    assert "backup" in str(caught.value).lower()
+    assert refusal.reason == "backup-exists", (
+        f"the occupied destination was not what refused this: {refusal.reason}"
+    )
+    assert "backup" in str(refusal).lower()
     assert occupied.read_bytes() == b"not a database, and not to be clobbered"
     assert _canonical_rows(store) == before_rows
     assert _installed_triggers(store) == before_triggers
@@ -213,12 +280,138 @@ def test_the_backup_is_a_readable_copy_of_the_rows_before_any_ddl(tmp_path):
     before_rows = _canonical_rows(store)
 
     backup = tmp_path / "backup.db"
-    report = rollback.rollback_turn_fence(store, backup_path=backup)
+    report, _image = _roll_back_the_private_object(
+        rollback, store, backup, tmp_path
+    )
 
-    assert report["backup"]["verified"] is True
+    # `_commit_the_rollback` returns the backup report itself, not a wrapper.
+    assert report["verified"] is True
+    assert report["durable"] is True
     assert backup.is_file()
     assert _canonical_rows(backup) == before_rows
+    # And the source is untouched: the object rolled back was the private copy.
+    assert _installed_triggers(store) == sorted(
+        hermes_state_common.TURN_FENCE_TRIGGERS
+    )
+    assert _canonical_rows(store) == before_rows
 
+
+def test_rollback_verifies_the_installed_surface_before_changing_anything(
+    tmp_path,
+):
+    """All-or-nothing, and the check runs first.
+
+    One trigger is removed out of band, so the store's installed surface is no
+    longer the expected one. The rollback must refuse the WHOLE operation and
+    leave the other triggers in place: a rollback that drops what it recognises
+    and shrugs at the rest leaves a store that is fenced against some writes
+    and not others, which is the worst of both.
+    """
+    rollback = _rollback_module()
+    store = tmp_path / "state.db"
+    _fenced_store(store, leave_lease_live=False)
+
+    victim = hermes_state_common.turn_fence_trigger_name("messages", "INSERT")
+    conn = sqlite3.connect(str(store), isolation_level=None)
+    try:
+        conn.execute(f"DROP TRIGGER {victim}")
+    finally:
+        conn.close()
+
+    remaining = _installed_triggers(store)
+    # Counted off the DECLARATION, not typed. A literal here was right while the
+    # surface had nine entries and silently wrong the moment it grew: the assert
+    # would have failed on a store that was in exactly the intended state.
+    expected_after_drop = len(rollback.rollback_trigger_names()) - 1
+    assert victim not in remaining and len(remaining) == expected_after_drop, (
+        f"dropping {victim} out of band should leave every other declared "
+        f"trigger in place: expected {expected_after_drop}, found "
+        f"{len(remaining)} — {sorted(remaining)}"
+    )
+
+    refusal = _rehearsal_refusal(rollback, store, tmp_path / "backup.db", tmp_path)
+
+    assert refusal.reason == "surface-mismatch", (
+        f"the half-installed surface was not what refused this: {refusal.reason}"
+    )
+    assert victim in str(refusal)
+    assert _installed_triggers(store) == remaining, (
+        "the rollback refused and still removed triggers — it is not "
+        "all-or-nothing"
+    )
+
+
+def test_the_real_path_refuses_before_it_observes_or_mutates_the_source(
+    tmp_path, monkeypatch
+):
+    """The in-place entry point refuses, and refuses BEFORE it looks.
+
+    Every property above now runs against a private object, so one test has to
+    hold the thing that made that necessary: ``rollback_turn_fence`` is offered
+    an ordinary idle fenced store and must decline it without opening,
+    copying or preparing anything. Asserted as EVENTS, because bytes agreeing
+    would also be consistent with an open that happened to leave no trace on
+    this build — and on a WAL build a read-only probe leaves ``-wal`` and
+    ``-shm`` behind.
+    """
+    rollback = _rollback_module()
+    store = tmp_path / "state.db"
+    _fenced_store(store, leave_lease_live=False)
+    before_rows = _canonical_rows(store)
+    before_triggers = _installed_triggers(store)
+    listing_before = sorted(entry.name for entry in tmp_path.iterdir())
+
+    seen = {"preflight": 0, "bound": 0, "prepared": 0, "opened": []}
+    real_sqlite_connect = rollback.sqlite3.connect
+
+    def _watch(name, real):
+        def _counted(*args, **kwargs):
+            seen[name] += 1
+            return real(*args, **kwargs)
+        return _counted
+
+    monkeypatch.setattr(
+        rollback, "preflight_turn_fence_rollback",
+        _watch("preflight", rollback.preflight_turn_fence_rollback),
+    )
+    monkeypatch.setattr(
+        rollback, "BoundTarget", _watch("bound", rollback.BoundTarget)
+    )
+    monkeypatch.setattr(
+        rollback, "prepare_the_private_copy",
+        _watch("prepared", rollback.prepare_the_private_copy),
+    )
+
+    class _WatchingSqlite:
+        def __getattr__(self, name):
+            return getattr(sqlite3, name)
+
+        def connect(self, target, *args, **kwargs):
+            seen["opened"].append(str(target))
+            return real_sqlite_connect(target, *args, **kwargs)
+
+    monkeypatch.setattr(rollback, "sqlite3", _WatchingSqlite())
+
+    with pytest.raises(rollback.TurnFenceRollbackRefused) as caught:
+        rollback.rollback_turn_fence(store, backup_path=tmp_path / "backup.db")
+
+    assert caught.value.reason == "offline-authority-unknown", (
+        f"the in-place path refused for another reason: {caught.value.reason}"
+    )
+    assert seen["preflight"] == 0, "the real path ran the pre-flight"
+    assert seen["bound"] == 0, "the real path opened the store with BoundTarget"
+    assert seen["prepared"] == 0, (
+        "the real path made a private copy for a run that cannot proceed"
+    )
+    assert [t for t in seen["opened"] if str(store) in t] == [], (
+        f"the real path opened the operator's store: {seen['opened']!r}"
+    )
+    assert _canonical_rows(store) == before_rows
+    assert _installed_triggers(store) == before_triggers
+    assert sorted(entry.name for entry in tmp_path.iterdir()) == listing_before, (
+        "the refusal added or removed files beside the store"
+    )
+    assert not (tmp_path / "backup.db").exists()
 
 def test_the_rollback_trigger_set_is_generated_from_the_declaration(
     tmp_path, monkeypatch
@@ -251,49 +444,6 @@ def test_the_rollback_trigger_set_is_generated_from_the_declaration(
     derived = rollback.rollback_trigger_names()
     assert "hermes_turn_fence_system_prompts_insert" in derived
     assert sorted(derived) == sorted(hermes_state_common.TURN_FENCE_TRIGGERS)
-
-
-def test_rollback_verifies_the_installed_surface_before_changing_anything(
-    tmp_path,
-):
-    """All-or-nothing, and the check runs first.
-
-    One trigger is removed out of band, so the store's installed surface is no
-    longer the expected one. The rollback must refuse the WHOLE operation and
-    leave the other eight in place: a rollback that drops what it recognises
-    and shrugs at the rest leaves a store that is fenced against some writes
-    and not others, which is the worst of both.
-    """
-    rollback = _rollback_module()
-    store = tmp_path / "state.db"
-    _fenced_store(store, leave_lease_live=False)
-
-    victim = hermes_state_common.turn_fence_trigger_name("messages", "INSERT")
-    conn = sqlite3.connect(str(store), isolation_level=None)
-    try:
-        conn.execute(f"DROP TRIGGER {victim}")
-    finally:
-        conn.close()
-
-    remaining = _installed_triggers(store)
-    # Counted off the DECLARATION, not typed. A literal here was right while the
-    # surface had nine entries and silently wrong the moment it grew: the assert
-    # would have failed on a store that was in exactly the intended state.
-    expected_after_drop = len(rollback.rollback_trigger_names()) - 1
-    assert victim not in remaining and len(remaining) == expected_after_drop, (
-        f"dropping {victim} out of band should leave every other declared "
-        f"trigger in place: expected {expected_after_drop}, found "
-        f"{len(remaining)} — {sorted(remaining)}"
-    )
-
-    with pytest.raises(rollback.TurnFenceRollbackRefused) as caught:
-        rollback.rollback_turn_fence(store, backup_path=tmp_path / "backup.db")
-
-    assert victim in str(caught.value)
-    assert _installed_triggers(store) == remaining, (
-        "the rollback refused and still removed triggers — it is not "
-        "all-or-nothing"
-    )
 
 
 def _old_binary_probe(tree: pathlib.Path, store: pathlib.Path, tmp_path):
@@ -353,7 +503,15 @@ def test_temp_db_acceptance_rows_survive_and_the_exact_old_binary_writes(
     1. the old binary CANNOT write the fenced store (otherwise the rollback is
        measuring nothing);
     2. rollback leaves every ``sessions`` / ``messages`` / lease row identical;
-    3. the same old binary can then OPEN and WRITE the rolled-back copy.
+    3. the same old binary can then OPEN and WRITE the rolled-back result.
+
+    WHERE THE ROLLED-BACK STORE COMES FROM. The rollback runs on a private
+    object with no pathname, so there is no file for a probe to open until this
+    test makes one: ``serialize()`` gives the bytes and the TEST writes them
+    into its own temp directory. Production writes a rolled-back store nowhere,
+    and this does not change that — it is a probe needing something to open,
+    not a success path being manufactured. What is being measured is unchanged:
+    the old binary meets exactly the database the rollback produced.
     """
     rollback = _rollback_module()
 
@@ -369,19 +527,20 @@ def test_temp_db_acceptance_rows_survive_and_the_exact_old_binary_writes(
         f"\n{fenced.stdout}\n{fenced.stderr}"
     )
 
-    rolled_back = tmp_path / "rolled-back.db"
-    shutil.copyfile(original, rolled_back)
-    before_rows = _canonical_rows(rolled_back)
+    before_rows = _canonical_rows(original)
+    report, image = _roll_back_the_private_object(
+        rollback, original, tmp_path / "rollback-backup.db", tmp_path
+    )
+    assert report["verified"] is True and report["durable"] is True
 
-    report = rollback.rollback_turn_fence(
-        rolled_back, backup_path=tmp_path / "rollback-backup.db"
-    )
-    assert sorted(report["dropped_triggers"]) == sorted(
-        hermes_state_common.TURN_FENCE_TRIGGERS
-    )
+    rolled_back = _materialize(image, tmp_path / "rolled-back.db")
     assert _installed_triggers(rolled_back) == []
     assert _canonical_rows(rolled_back) == before_rows, (
         "the rollback changed user rows; it is only allowed to remove triggers"
+    )
+    # And the source it was prepared from is untouched.
+    assert _installed_triggers(original) == sorted(
+        hermes_state_common.TURN_FENCE_TRIGGERS
     )
 
     old = _old_binary_probe(base_binary_tree, rolled_back, tmp_path)
@@ -401,7 +560,7 @@ def test_a_current_binary_reinstalls_the_fence_on_a_rolled_back_store(
 ):
     """The return leg. Rollback is not a one-way door, and not a permanent one.
 
-    Reopening the rolled-back copy with the current binary must put the fence
+    Reopening the rolled-back result with the current binary must put the fence
     back — it is ``CREATE TRIGGER IF NOT EXISTS`` in schema init, so this is a
     property of the store, not of the rollback tool — and the same old binary
     must then be refused again. Without this, a rolled-back store stays
@@ -411,16 +570,19 @@ def test_a_current_binary_reinstalls_the_fence_on_a_rolled_back_store(
 
     store = tmp_path / "state.db"
     _fenced_store(store, leave_lease_live=False)
-    rollback.rollback_turn_fence(store, backup_path=tmp_path / "backup.db")
-    assert _installed_triggers(store) == []
+    _report, image = _roll_back_the_private_object(
+        rollback, store, tmp_path / "backup.db", tmp_path
+    )
+    rolled_back = _materialize(image, tmp_path / "rolled-back.db")
+    assert _installed_triggers(rolled_back) == []
 
-    reopened = SessionDB(db_path=store)
+    reopened = SessionDB(db_path=rolled_back)
     reopened.close()
-    assert _installed_triggers(store) == sorted(
+    assert _installed_triggers(rolled_back) == sorted(
         hermes_state_common.TURN_FENCE_TRIGGERS
     ), "reopening with the current binary did not reinstall the fence"
 
-    again = _old_binary_probe(base_binary_tree, store, tmp_path)
+    again = _old_binary_probe(base_binary_tree, rolled_back, tmp_path)
     assert again.returncode == 0, again.stderr
     assert "WRITE-OK" not in again.stdout, (
         "the old binary wrote a store the current binary had re-fenced:\n"

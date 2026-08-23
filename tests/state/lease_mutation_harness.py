@@ -26,6 +26,7 @@ files that use it.
 from __future__ import annotations
 
 import pathlib
+import re
 import subprocess
 import sys
 import textwrap
@@ -60,6 +61,25 @@ class Mutation:
     find: str
     replace: str
     why: str
+    kills_by: str = ""
+    """Content-keyed anchor naming the ONE assertion this row must die at.
+
+    Optional so the 22 other tables that share this harness keep working, but a
+    row that sets it gets the strict discrimination below, and the pin that
+    owns the row should assert every row in its own table sets it.
+
+    Why an anchor per row rather than "an AssertionError happened": a pin
+    carries more than the property it is pinned on. Six pins in the C5 table
+    carry ``assert not run.crash``, which IS the pin's own assertion — so a
+    mutation that merely crashes the verb trips it, and a check that asks only
+    "did an AssertionError fire" reads that as a kill. It is not one. The row
+    scores discrimination while discriminating nothing, which is the exact
+    defect this harness exists to catch, sitting inside the harness.
+
+    Keyed by content and required to match one assertion, for the same reason
+    ``find`` is: a line number goes stale silently, and an anchor matching two
+    assertions cannot say which one fired.
+    """
 
 
 class OwnerRefused(str):
@@ -189,6 +209,28 @@ def run_pin(
     )
 
 
+_CRASH_DETECTOR_MARKERS = ("the verb crashed", "the run crashed")
+"""Assertion text that means "the subject fell over", not "the property broke".
+
+Pins assert this so a crash is not silently read as a passing run. That makes it
+the pin's own assertion, which is why "the pin's own AssertionError" does not
+discriminate and this list has to exist.
+"""
+
+
+def _final_assertion_message(trace: str):
+    """The message of the LAST ``AssertionError`` in *trace*, or ``None``.
+
+    The last one is the one that terminated the pin. Scanning the whole trace
+    for the anchor instead would accept a run where the target text appears in
+    an earlier passing context, in a printed diff, or in a captured log line —
+    substring-anywhere is the check being replaced, so it must not come back in
+    the replacement.
+    """
+    hits = re.findall(r"^E?\s*AssertionError:\s*(.*)$", trace, re.M)
+    return hits[-1] if hits else None
+
+
 def assert_mutation_kills_the_pin(
     mutation: Mutation,
     pin_module: str,
@@ -245,7 +287,8 @@ def assert_mutation_kills_the_pin(
     # the wrong seam, and both are rows that would keep passing after the guard
     # they name is deleted.
     trace = f"{killed.stdout}\n{killed.stderr}"
-    assert "AssertionError" in trace, (
+    message = _final_assertion_message(trace)
+    assert message is not None, (
         f"{mutation.pin} failed under its mutation, but NOT by its own "
         f"assertion — nothing in the failure names an AssertionError, so the "
         f"pin never reached the observation it exists to make. A row that "
@@ -254,6 +297,30 @@ def assert_mutation_kills_the_pin(
         f"mutation: {mutation.module} :: {mutation.find!r} -> "
         f"{mutation.replace!r}\n{trace}"
     )
+    # AND IT HAS TO BE THE *PROPERTY* ASSERTION, NOT ANY ASSERTION.
+    #
+    # "The pin's own AssertionError" is still not enough, which is a thing this
+    # harness got wrong about itself. Pins carry a crash detector — six in the
+    # C5 table are literally `assert not run.crash` — and that is the pin's own
+    # assert. A mutant that crashes the verb trips it and reads as a kill. So a
+    # row that names its target assertion is held to it: the LAST AssertionError
+    # (the one that terminated the pin, not one printed in a passing diff along
+    # the way) must be the row's, and must not be a crash detector.
+    if mutation.kills_by:
+        crashed = [m for m in _CRASH_DETECTOR_MARKERS if m in message]
+        assert not crashed, (
+            f"{mutation.pin} died at its CRASH DETECTOR ({crashed[0]!r}), not at "
+            f"the property its row targets. The mutant broke the verb instead of "
+            f"changing its behaviour, so this row proves the mutation runs and "
+            f"nothing about the property.\n  targeted: {mutation.kills_by!r}\n"
+            f"  actual  : {message!r}"
+        )
+        assert mutation.kills_by in message, (
+            f"{mutation.pin} died at a DIFFERENT assertion than its row targets, "
+            f"so the row is aimed at the wrong seam or the guard it names is not "
+            f"the guard that fired.\n  targeted: {mutation.kills_by!r}\n"
+            f"  actual  : {message!r}"
+        )
     assert "PIN-HELD" not in killed.stdout, (
         f"{mutation.pin} printed PIN-HELD under its mutation and then exited "
         f"non-zero anyway, so the non-zero exit came from something after the "

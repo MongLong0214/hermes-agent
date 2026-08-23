@@ -1,44 +1,58 @@
-"""``hermes sessions fence-rollback`` — the operator surface over the rollback.
+"""``hermes sessions fence-rollback`` — the operator surface, currently a refusal.
 
-WHAT WAS MISSING, GIVEN THAT THE OPERATION ALREADY EXISTED
-    :mod:`hermes_cli.session_fence_rollback` is bounded, offline, fail-closed
-    and all-or-nothing, and none of that reaches a person at 3am. What reached
-    them was a Python one-liner pasted into a runbook — or the thing the
-    one-liner replaced, twenty-four hand-typed ``DROP TRIGGER`` statements
-    against whatever database they believed was the right one.
+WHAT THIS VERB DOES TODAY
+    It refuses. Every invocation, with or without ``--dry-run``, before it
+    opens, copies or reads the store it was given. It reports which kind of
+    target you named and why the rollback is not permitted, and it leaves the
+    store byte-for-byte and file-for-file as it found it.
 
-    A one-liner is not a production rollback because it has:
+    That is the whole behaviour, and the help strings below say so. They said
+    otherwise twice in this slice while the behaviour underneath them had
+    already moved, which is the failure an operator meets first.
 
-    * no exit code a script or a runbook step can branch on;
-    * no way to say WHICH precondition stopped it. "It failed" is the answer
-      that sends somebody editing the store by hand;
-    * no rehearsal. The first time the operator learns what it would do is
-      after it has done it.
+WHY THERE IS NO REHEARSAL ANY MORE
+    There was one: the rollback ran against a private copy assembled by
+    checking that no sidecars sat beside the store and then reading its main
+    image. Check and read are two operations. A writer that commits into a
+    ``-wal`` in between leaves the check's answer true and the image missing
+    committed rows — and the run then reported a completed rollback, a verified
+    durable backup and a full surface, every one of those derived from a
+    database known to be short. Reproduced on both SQLite builds.
 
-    So this module is four things and nothing else: a named target, a
-    pre-flight whose result is reported, a rehearsal that provably changes
-    nothing, and a machine-readable report on BOTH outcomes.
+    A further existence check does not close that. The interval is what the
+    writer uses, and observations do not remove intervals. It is not a guard
+    that needs strengthening: a copy assembled by check-then-read cannot be
+    proven coherent against a live-capable store, so the rehearsal was never a
+    weaker form of the real operation — it was an operation on an artifact
+    nobody can vouch for, and every fact downstream inherited that.
 
-WHAT IT DELIBERATELY IS NOT
+    So no plan, no backup, no rehearsal is reported. Those fields are absent
+    rather than false, because absent and ``false`` are different statements:
+    ``backup_created: false`` would claim the backup step was reached.
+
+WHAT THIS DELIBERATELY IS NOT
     Not a compatibility fallback, not an automatic trigger drop, not a
     discovery pass over the machine's stores. The old binary being unable to
-    write a fenced store is intentional and required, and this verb does not
-    soften it — it only gives the person who has decided to step back off the
-    barrier a way to do it that can be audited afterwards.
+    write a fenced store is intentional and required, and nothing here softens
+    it.
 
     The target is named, never defaulted. A rollback that runs against "the
-    store we would have opened anyway" is one wrong host away from destroying
-    the fence on a store nobody meant to touch, and the invocation that does it
-    looks identical in the shell history to the one they meant.
+    store we would have opened anyway" is one wrong host away from the wrong
+    file, and the invocation that does it looks identical in the shell history
+    to the one they meant.
 
-    The backup path is named too, for the same reason: the operator decides
-    where a copy of their conversations lands.
+WHAT IS WAITING BEHIND IT
+    The machinery — exclusive destination acquisition, an engine-written
+    backup, flushes of the file and its directory entry, an ownership-checked
+    withdrawal ledger — is intact and still under test. It is waiting for an
+    artifact whose coherence and detachment its producer establishes, which is
+    a different slice's work and cannot be manufactured here.
 
 OUTPUT CONTRACT
-    stdout carries exactly one JSON document, on success and on refusal alike.
-    Human-readable lines go to stderr. That split is what lets a runbook step
-    do ``hermes sessions fence-rollback … | jq -r .refused.reason`` while a
-    person watching the terminal still reads a sentence.
+    stdout carries exactly one JSON document. Human-readable lines go to
+    stderr. That split is what lets a runbook step do
+    ``hermes sessions fence-rollback … | jq -r .refused.reason`` while a person
+    watching the terminal still reads a sentence.
 """
 
 from __future__ import annotations
@@ -63,23 +77,23 @@ def add_fence_rollback_parser(sessions_subparsers):
     parser = sessions_subparsers.add_parser(
         "fence-rollback",
         help=(
-            "Rehearse the turn-fence rollback; a real run is refused until an "
-            "offline artifact can be proven"
+            "Report why a turn-fence rollback is refused; this build performs "
+            "none, with or without --dry-run"
         ),
         description=(
             "Step a NAMED session store back off the turn-fence generation "
-            "barrier, offline and all-or-nothing. THIS BUILD REFUSES EVERY "
-            "REAL RUN: the rollback is permitted only on a detached artifact "
-            "whose offline authority was established elsewhere, and nothing "
-            "here can establish it — the only producer of a detached state.db "
-            "records file size only, which a same-size replacement satisfies. "
-            "So a real invocation reports which kind of target you named and "
-            "changes nothing. --dry-run performs the whole operation on a "
-            "private copy this command creates, which is the one artifact it "
-            "can prove is offline, and reports what it did along with the "
-            "refusal the real run gives. The store and the backup path are "
-            "both explicit; this command never discovers a target. Prints one "
-            "JSON report on stdout; human-readable lines go to stderr."
+            "barrier. THIS BUILD REFUSES EVERY INVOCATION, with or without "
+            "--dry-run, and does so before it opens, copies or reads the store "
+            "you name. The rollback is permitted only on an artifact whose "
+            "coherence and detachment its producer established, and nothing "
+            "here can establish either: a private copy assembled by checking "
+            "for sidecars and then reading the main image cannot be proven "
+            "coherent against a live-capable store, because a writer that "
+            "commits between the check and the read leaves the check true and "
+            "the image short. So no plan, no backup and no rehearsal is "
+            "reported — none is produced. What you get is the refusal, its "
+            "reason, and a store that is byte-for-byte as you left it. Prints "
+            "one JSON report on stdout; human-readable lines go to stderr."
         ),
     )
     parser.add_argument(
@@ -87,10 +101,10 @@ def add_fence_rollback_parser(sessions_subparsers):
         type=Path,
         required=True,
         help=(
-            "The session database to EVALUATE and rehearse against. Required "
-            "and never defaulted — name the file you mean. This build does not "
-            "roll back any store you can name: the run is refused and the file "
-            "is read as bytes, never opened as a database"
+            "The session database this refusal is about. Required and never "
+            "defaulted — name the file you mean. This build does not roll it "
+            "back, and does not open, copy or read it: the refusal is decided "
+            "from the pathname before anything is examined"
         ),
     )
     parser.add_argument(
@@ -98,24 +112,21 @@ def add_fence_rollback_parser(sessions_subparsers):
         type=Path,
         required=True,
         help=(
-            "The destination RESERVED for the verified backup an "
-            "authority-bearing run would write before dropping any trigger. "
-            "NOT created by this build — nothing is written here. It is still "
-            "required and still validated, because an occupied destination is "
-            "a refusal you need to find out about now rather than at the "
-            "moment a real run would be about to overwrite something. Must not "
-            "already exist, including its -wal/-shm/-journal siblings"
+            "Where an authority-bearing run would write its verified backup. "
+            "This build never reaches the backup step, so the path is not "
+            "examined and nothing is reported about it — an existing file "
+            "there neither changes the outcome nor is mentioned. Still "
+            "required so the invocation that eventually performs one names it"
         ),
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
         help=(
-            "Perform the rollback on a disposable copy of the store and report "
-            "what it removed, alongside the refusal the real run gives. The "
-            "copy and its backup live in a private directory and are removed "
-            "before this exits; the store itself is read as bytes and never "
-            "modified. This is the only form of the command that does anything"
+            "Accepted, and currently identical to a real run: both refuse "
+            "before observing the store, for the same reason. No copy is made "
+            "and no rollback is rehearsed, because a copy this command "
+            "assembles cannot be proven to hold every committed row"
         ),
     )
     parser.add_argument(
@@ -123,10 +134,11 @@ def add_fence_rollback_parser(sessions_subparsers):
         type=Path,
         default=None,
         help=(
-            "Existing directory to hold --dry-run's disposable copy of the "
-            "store and its transient backup (defaults to the system temporary "
-            "directory). Both are removed before this exits. Point it at a "
-            "volume with room for a second copy of a large store"
+            "ACCEPTED AND UNUSED while this build fails closed. Nothing is "
+            "written anywhere, so this path is neither created, examined, nor "
+            "required to exist — passing a nonexistent one changes nothing. "
+            "Kept so existing invocations keep parsing; removing it is a "
+            "public-compatibility decision and not this change"
         ),
     )
     return parser
@@ -146,130 +158,59 @@ def run_fence_rollback(args) -> int:
 
 
 def _report_rehearsal(store: Path, backup: Path, work_parent: Path = None) -> int:
-    """``--dry-run``: rehearse on a copy, report the plan AND the verdict.
+    """``--dry-run``: the same refusal the real run gives, and nothing else.
 
-    THE COPY DOES NOT GO IN THE OPERATOR'S DIRECTORY. An earlier version put it
-    beside the store, reasoning that a hidden subdirectory removed in a
-    ``finally`` leaves the listing exactly as it found it. It does — until the
-    process dies hard, and then a full UNFENCED duplicate of every conversation
-    is sitting next to the original with nothing to draw attention to it.
-    ``mkdtemp`` is 0700 and lives where the platform already expects disposable
-    copies; ``--work-dir`` moves it for a store too large for that volume.
+    IT NO LONGER REHEARSES, AND THAT IS A STATEMENT ABOUT THE INPUT
+        The rehearsal ran on a private copy assembled by reading the source's
+        main image after checking no sidecars sat beside it. A writer that
+        commits into a ``-wal`` between the check and the read leaves the check
+        true and the image short — and the run then reported a committed
+        rollback, a verified durable backup and a full surface, every one of
+        them derived from a database known to be missing rows.
 
-    THE REHEARSAL COMPLETING IS NOT THE REAL RUN PROCEEDING. The rollback is
-    permitted only on an artifact whose offline authority was established
-    elsewhere, and the copy this rehearsal makes is the only artifact that
-    qualifies. So a dry run reports both: what the operation did on the copy,
-    and the refusal the operator will get if they type the real command.
+        A copy assembled that way cannot be proven coherent against a
+        live-capable source, so the honest report is a refusal with nothing
+        attached: no plan, no backup facts, no working directory. Those fields
+        are absent because they are not produced, not because they are
+        withheld.
+
+    NOTHING IS CREATED. Not a working directory, not a copy. A dry run that
+    manufactures an artifact for an operation that cannot proceed leaves the
+    operator an incident to clean up that this run invented.
     """
-    import tempfile
-
     from hermes_cli import session_fence_rollback as rollback
 
-    if work_parent is not None and not work_parent.is_dir():
-        return _emit_refusal(
-            rollback.TurnFenceRollbackRefused(
-                f"--work-dir {work_parent} is not an existing directory, so "
-                "the dry run has nowhere to put its copy",
-                reason="rehearsal-unwritable",
-            ),
-            store=store, backup=backup, dry_run=True,
-        )
-    try:
-        work_dir = Path(tempfile.mkdtemp(
-            prefix="hermes-fence-rehearsal-",
-            dir=str(work_parent) if work_parent is not None else None,
-        ))
-    except OSError as exc:
-        return _emit_refusal(
-            _unexpected(exc), store=store, backup=backup, dry_run=True
-        )
+    # --work-dir IS NOT EXAMINED. Nothing creates a working copy any more, so
+    # the flag feeds a capability that no longer exists — and it was still
+    # stat'd, and could still change the verdict: a nonexistent path produced
+    # `rehearsal-unwritable` where the real path gives the authority refusal,
+    # so a dead input decided what the operator was told AND broke the dry
+    # run's own same-refusal-as-real contract. When a boundary removes a
+    # capability, every input that fed it must stop influencing the outcome.
+
     outcome = rollback.RollbackOutcome()
-    plan = None
     refusal = None
     try:
-        try:
-            plan = rollback.rehearse_turn_fence_rollback(
-                store, backup_path=backup, work_dir=work_dir, outcome=outcome
-            )
-        except rollback.TurnFenceRollbackRefused as exc:
-            refusal = exc
-        except (sqlite3.DatabaseError, OSError) as exc:
-            refusal = _unexpected(exc)
-    finally:
-        # ONE ENTRY POINT. The record goes into the outcome and is read back
-        # from there; nothing downstream appends. Two writers observing one
-        # sweep is what turned a single stuck directory into two identical
-        # records, and a second entry point is how that returns.
-        residue = rollback.sweep_work_dir(work_dir)
-        if residue is not None:
-            copies = sorted(work_dir.glob("private-*/preflight.db"))
-            outcome.note_residue(
-                rollback.describe_residue(
-                    residue,
-                    obligation="the rehearsal working directory",
-                    outcome=outcome,
-                    copy_path=str(copies[0]) if copies else None,
-                ),
-                incident=f"work-dir:{work_dir}",
-            )
+        rollback.rehearse_turn_fence_rollback(
+            store, backup_path=backup, work_dir=work_parent, outcome=outcome
+        )
+    except rollback.TurnFenceRollbackRefused as exc:
+        refusal = exc
+    except (sqlite3.DatabaseError, OSError) as exc:
+        refusal = _unexpected(exc)
 
-    # WHAT THE REHEARSAL ESTABLISHED, decided by the steps that established it.
-    # Read from the outcome the run wrote into rather than from a report it may
-    # never have returned: a fault after the rehearsal's COMMIT raises, and a
-    # caller that reads only the return value concludes nothing happened.
-    established = getattr(refusal, "established", None)
-    rehearsal_facts = dict(outcome.facts())
-    if isinstance(established, dict) and isinstance(
-        established.get("rehearsal"), dict
-    ):
-        rehearsal_facts = dict(established["rehearsal"])
-    # The ledger is the single source for residue. The snapshot above was taken
-    # when the operation ended and the sweep happens after it, so this is a
-    # re-read, never an append.
-    residue_records = list(outcome.facts()["residue"])
-    rehearsal_facts["residue"] = residue_records
-    rehearsal_facts["residue_present"] = bool(residue_records)
-    _settle_the_transient_artifacts(rehearsal_facts, swept=residue is None)
-
-    if refusal is None and residue_records:
-        # Nothing else decided this run's fate, so residue names it. When
-        # something did, the reason below stays ITS reason and the residue
-        # rides alongside — a late failure sets the exit status, it does not
-        # get to relabel what the run was refused for.
+    if refusal is None:  # pragma: no cover - the rehearsal has no success path
         refusal = rollback.TurnFenceRollbackRefused(
-            f"the dry run left {len(residue_records)} thing(s) behind that it "
-            "created and could not remove",
-            reason="residue-not-removed",
+            "the rehearsal returned without refusing, which it has no path to do",
+            reason="unexpected-error",
         )
-    if refusal is not None:
-        return _emit_refusal(
-            refusal, store=store, backup=backup, dry_run=True,
-            rehearsal=rehearsal_facts,
-            residue=residue_records,
-            would_drop=(established or {}).get("would_drop"),
-            installed_triggers=(established or {}).get("installed_triggers"),
-        )
-
-    # Unreachable while nothing can establish offline authority over the
-    # operator's artifact; kept honest rather than asserted away.
-    _emit(
-        {
-            "verb": _VERB,
-            "ok": True,
-            "dry_run": True,
-            "changed": False,
-            "store": str(store),
-            "backup": str(backup),
-            "generation": plan["generation"],
-            "installed_triggers": plan["installed_triggers"],
-            "would_drop": plan["would_drop"],
-            "dropped_triggers": [],
-            "preflight": plan["preflight"],
-            "rehearsal": rehearsal_facts,
-        }
+    # NO `rehearsal` BLOCK. Nothing was rehearsed, so there are no rehearsal
+    # facts — not false ones. Passing the ledger here would publish
+    # backup_created=false about a backup step that never ran.
+    return _emit_refusal(
+        refusal, store=store, backup=backup, dry_run=True,
+        residue=list(outcome.facts()["residue"]) or None,
     )
-    return 0
 
 
 def _settle_the_transient_artifacts(facts: dict, *, swept: bool) -> None:
@@ -439,18 +380,25 @@ def _emit_refusal(
     would_drop: list | None = None,
     installed_triggers: list | None = None,
 ) -> int:
-    """Report a failure WITHOUT retracting what already happened.
+    """Report a failure WITHOUT retracting what happened, and without inventing
+    answers to questions that were never asked.
 
-    A late failure does not undo the facts established before it. The original
-    cleanup blocker was residue on disk while claiming success; flattening
-    `changed`, `dropped_triggers` and the backup into their empty values on
-    every error path is the same defect pointed the other way, and worse — an
-    operator told "Nothing was changed." after the fence came off stops
-    looking, because they have been told there is nothing to find.
+    ABSENT AND ``false`` ARE DIFFERENT STATEMENTS, and this is the finer form of
+    the output-truth rule the rest of this module already follows.
+    ``backup_created: false`` says the backup step was REACHED and did not
+    produce one. When the run refuses before deriving anything, no backup step
+    ran at all — so rendering ``false`` is a claim about an event that never had
+    a chance to occur. The same goes for a ``preflight`` block of all-false
+    checks that were never performed, and for an empty ``would_drop``.
 
-    So failure precedence decides the exit status and the primary reason.
-    *established* decides the outcome fields, and it is whatever the run
-    actually accomplished before it went wrong.
+    A field that is PRESENT asserts that the question was asked. So every field
+    below that describes work is emitted only when that work happened, and the
+    keys are absent otherwise. Nothing is withheld; there is nothing to
+    withhold.
+
+    A late failure still does not undo the facts established before it: where
+    work DID happen, *established* carries it, and failure precedence decides
+    only the exit status and the primary reason.
     """
     from hermes_cli import session_fence_rollback as rollback
 
@@ -464,37 +412,36 @@ def _emit_refusal(
         "changed": facts.get("changed", False),
         "outcome": facts.get("outcome", "not-started"),
         "store": str(store),
-        # NEVER the bare requested pathname. A string where an operator
-        # expects a backup record reads as "your backup is at ...", and on a
-        # refusal there is usually nothing there at all.
-        "backup": facts.get(
-            "backup",
-            {"path": str(backup), "created": False, "present": False},
-        ),
         "generation": hermes_state_common.TURN_FENCE_GENERATION,
-        "installed_triggers": facts.get(
-            "installed_triggers", installed_triggers or []
-        ),
-        "dropped_triggers": facts.get("dropped_triggers", []),
-        "backup_present": facts.get("backup_present", False),
-        "backup_withdrawn": facts.get("backup_withdrawn", False),
-        "preflight": (
-            preflight
-            or getattr(exc, "preflight", None)
-            or rollback._blank_preflight()
-        ),
         "refused": {
             "reason": getattr(exc, "reason", "refused"),
             "detail": str(exc),
         },
     }
+    # EACH OF THESE ONLY WHEN THE WORK BEHIND IT HAPPENED.
+    resolved_preflight = preflight or getattr(exc, "preflight", None)
+    if resolved_preflight:
+        payload["preflight"] = resolved_preflight
+    if installed_triggers or facts.get("installed_triggers"):
+        payload["installed_triggers"] = (
+            facts.get("installed_triggers") or installed_triggers
+        )
+    if facts.get("dropped_triggers"):
+        payload["dropped_triggers"] = facts["dropped_triggers"]
+    if would_drop:
+        payload["would_drop"] = would_drop
+    # THE BACKUP DESTINATION IS NEVER EXAMINED BY A NOT-STARTED REFUSAL, so it
+    # says nothing about it. `present: false` looked like a cautious default
+    # and is objectively wrong the moment the operator names an existing file:
+    # the report would be stating as fact something it never looked at. Absent,
+    # like every other field describing work that did not happen.
+    if facts.get("backup") is not None:
+        payload["backup"] = facts["backup"]
+    if rehearsal:
+        payload["rehearsal"] = rehearsal
     records = residue if residue is not None else facts.get("residue")
     if records:
         payload["residue"] = records
-    if rehearsal is not None:
-        payload["rehearsal"] = rehearsal
-    if would_drop is not None:
-        payload["would_drop"] = would_drop
     _emit(payload)
     return 1
 
@@ -564,16 +511,6 @@ def _human_lines(payload: dict[str, Any]) -> list:
             # Rendered from the record's own derived fields, so the sentence
             # and the structured output cannot disagree about one incident.
             lines.append(rollback.residue_sentence(record))
-        backup = payload.get("backup")
-        if (
-            isinstance(backup, dict)
-            and backup.get("created") is False
-            and payload.get("changed") is not True
-        ):
-            lines.append(
-                f"  No backup was written. Nothing is at {backup.get('path')} "
-                "because of this run."
-            )
         return lines
     if payload.get("dry_run"):
         return [
