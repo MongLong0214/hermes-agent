@@ -58,13 +58,24 @@ FOUR CLASSES, AND EVERY ONE OF THEM IS A PREDICATE OVER THE SOURCE
 from __future__ import annotations
 
 import ast
+import pathlib
 import re
 
 import pytest
 
 import hermes_state_common
+from tests.state.lease_mutation_harness import (
+    Mutation,
+    assert_every_pin_has_a_killer,
+    assert_mutation_kills_the_pin,
+)
 from tests.state import test_turn_fence_surface as surface_mod
 from tests.state import test_turn_lease_writer_census as census_mod
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+_SELF = pathlib.Path(__file__).resolve().relative_to(REPO_ROOT)
+#: The ratchet reads the SessionDB source; it needs the tree, not a store.
+_EXTRA_EXTRACT = (".",)
 
 #: Any statement that writes a table, and which table.
 WRITE_STATEMENT = re.compile(
@@ -260,18 +271,21 @@ def _report(verdicts: dict) -> str:
     return "\n".join(lines)
 
 
-def test_the_canonical_writer_residual_is_zero_and_the_counts_are_printed(capsys):
+def check_the_canonical_writer_residual_is_zero(_tmpdir=None) -> None:
     """The ratchet. A writer with no class fails here and names itself.
 
     The counts are PRINTED rather than written into a docstring for the reason
     the raw-sink census prints its own: three places in this branch once stated
     three different numbers for one set, because a number in prose is a number
     nobody re-derives.
+
+    Takes an ignored directory argument so the mutation harness can drive it
+    with the same signature every other pin has; it needs no store, because it
+    reads source rather than rows.
     """
     verdicts = census()
     report = _report(verdicts)
-    with capsys.disabled():
-        print("\n" + report)
+    print("\n" + report)
 
     assert verdicts, "the census found no writers at all; the scan is broken"
     residual = sorted(n for n, v in verdicts.items() if v == "RESIDUAL")
@@ -395,3 +409,49 @@ def test_every_fenced_table_has_a_census_that_counts_its_writers():
         f"  counted by this file: {sorted(counted_here)}\n"
         f"  counted by the raw-sink census: {sorted(counted_raw)}"
     )
+
+
+PINS = {
+    "check_the_canonical_writer_residual_is_zero":
+        check_the_canonical_writer_residual_is_zero,
+}
+
+
+@pytest.mark.parametrize("name", sorted(PINS), ids=sorted(PINS))
+def test_canonical_writer_residual_property(name, capsys):
+    with capsys.disabled():
+        PINS[name]()
+
+
+SOURCE_MUTATIONS = (
+    Mutation(
+        pin="check_the_canonical_writer_residual_is_zero",
+        module="hermes_state.py",
+        find=(
+            "            self._admit_routing_write(\n"
+            "                conn, [(scope, session_key)], entry_json,\n"
+            "                turn_lease_holder, turn_lease_ttl_seconds,\n"
+            "            )\n"
+        ),
+        replace="",
+        why="save_gateway_routing_entry then writes the routing index — which "
+            "decides where a platform reply lands — inside a transaction that "
+            "consults nothing. It reaches no admission, extends no admitted "
+            "transaction, is not connection setup and carries no token scope, "
+            "so the census must name it. A ratchet that cannot see a writer "
+            "losing its admission is the hand-run script this file replaced",
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    "mutation", SOURCE_MUTATIONS, ids=[m.pin for m in SOURCE_MUTATIONS]
+)
+def test_each_pin_dies_when_its_own_guard_is_removed(mutation, tmp_path):
+    assert_mutation_kills_the_pin(
+        mutation, str(_SELF), tmp_path, *_EXTRA_EXTRACT
+    )
+
+
+def test_every_pin_has_a_mutation_that_kills_it():
+    assert_every_pin_has_a_killer(PINS, SOURCE_MUTATIONS)

@@ -96,8 +96,20 @@ import pytest
 
 import hermes_state_common
 from hermes_state_common import TURN_FENCE_FUNCTION_NAME
+from tests.state.lease_mutation_harness import (
+    Mutation,
+    assert_every_pin_has_a_killer,
+    assert_mutation_kills_the_pin,
+)
 from tests.state import test_turn_fence_adjunct_surface as adjunct
 from tests.state import test_turn_lease_writer_census as census_mod
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+_SELF = pathlib.Path(__file__).resolve().relative_to(REPO_ROOT)
+#: The migration pin opens a real store and drives `tools/async_delegation`
+#: through the shared fixture; take the whole tree rather than naming the
+#: modules it happens to import today.
+_EXTRA_EXTRACT = (".",)
 
 
 def turn_fence_trigger_name(table: str, operation: str) -> str:
@@ -864,7 +876,9 @@ def _regress_to_a_legacy_store(store):
         conn.close()
 
 
-def test_a_legacy_store_migrates_under_the_fence_and_comes_out_fenced(tmp_path):
+def check_a_legacy_store_migrates_under_the_fence_and_comes_out_fenced(
+    tmp_path,
+) -> None:
     """The other direction of the downgrade contract, and it is not symmetric.
 
     The rollback side proves an old binary is REFUSED. This side proves the
@@ -943,3 +957,60 @@ def test_a_legacy_store_migrates_under_the_fence_and_comes_out_fenced(tmp_path):
         f"it, so the fence DDL has to run after every heal — and this is the "
         f"only place that would notice it moving."
     )
+
+
+#: The one property in this file that is not already its own mutation table.
+#: Everything else here either DERIVES an answer and compares it to production
+#: (a derivation that stops deriving fails on its own), or drops a trigger and
+#: requires the write through — ``test_every_declared_trigger_is_the_reason_its_
+#: write_fails`` is twenty-four mutation rows in a loop. The migration property
+#: is different: it depends on an ORDERING inside ``_init_schema`` that nothing
+#: else observes, so it needs a row that moves that ordering.
+PINS = {
+    "check_a_legacy_store_migrates_under_the_fence_and_comes_out_fenced":
+        check_a_legacy_store_migrates_under_the_fence_and_comes_out_fenced,
+}
+
+
+@pytest.mark.parametrize("name", sorted(PINS), ids=sorted(PINS))
+def test_turn_fence_surface_property(name, tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    PINS[name](tmp_path / "work")
+
+
+SOURCE_MUTATIONS = (
+    Mutation(
+        pin="check_a_legacy_store_migrates_under_the_fence_and_comes_out_fenced",
+        module="hermes_state_schema.py",
+        find="        cursor.executescript(TURN_FENCE_TRIGGER_SQL)\n",
+        replace="",
+        why="_init_schema's last statement is what puts the barrier on the "
+            "store, and a MIGRATED store is where that matters most: "
+            "_heal_gateway_routing_pk and _heal_session_model_usage_pk rebuild "
+            "a table by RENAME + CREATE + INSERT...SELECT, and the CREATE "
+            "produces a table with no trigger on it. Removed, the pin fails "
+            "naming every missing trigger.\n"
+            "WHAT THIS ROW DOES NOT DISTINGUISH, stated so nobody reads more "
+            "into it: it removes the DDL rather than moving it. A single "
+            "content-keyed substitution cannot relocate a statement, and "
+            "`CREATE TRIGGER IF NOT EXISTS` at the end is idempotent, so "
+            "installing it EARLIER as well changes nothing and cannot be the "
+            "row. The ordering half was measured directly instead — moving the "
+            "executescript in front of the two heals makes this same pin fail "
+            "with exactly six triggers missing, the three on gateway_routing "
+            "and the three on session_model_usage.",
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    "mutation", SOURCE_MUTATIONS, ids=[m.pin for m in SOURCE_MUTATIONS]
+)
+def test_each_pin_dies_when_its_own_guard_is_removed(mutation, tmp_path):
+    assert_mutation_kills_the_pin(
+        mutation, str(_SELF), tmp_path, *_EXTRA_EXTRACT
+    )
+
+
+def test_every_pin_has_a_mutation_that_kills_it():
+    assert_every_pin_has_a_killer(PINS, SOURCE_MUTATIONS)
