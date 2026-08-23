@@ -4411,7 +4411,15 @@ def _persist_live_session_system_prompt(session: dict | None) -> None:
     try:
         prompt = agent._build_system_prompt(None)
         agent._cached_system_prompt = prompt
-        db.update_system_prompt(getattr(agent, "session_id", None) or session_key, prompt)
+        from hermes_state import turn_grant_kwargs
+
+        _prompt_session = getattr(agent, "session_id", None) or session_key
+        # Fenced write on the LIVE session, which may be mid-turn in this
+        # process — present the turn's own grant, holderless when there is none.
+        db.update_system_prompt(
+            _prompt_session, prompt,
+            **turn_grant_kwargs(db, _prompt_session),
+        )
     except Exception:
         logger.warning(
             "failed to persist live session system prompt for session %s",

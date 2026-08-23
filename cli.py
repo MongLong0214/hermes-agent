@@ -13203,7 +13203,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if db is None or not session_key or session_key == "default":
             return
         try:
-            db.set_session_yolo(session_key, enabled)
+            # Fenced: the flag rides in model_config, which the next turn
+            # replays whole. /yolo can be typed mid-turn — present the grant.
+            from hermes_state import turn_grant_kwargs
+
+            db.set_session_yolo(
+                session_key, enabled,
+                **turn_grant_kwargs(db, session_key),
+            )
         except Exception:
             pass
 

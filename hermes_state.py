@@ -19,6 +19,7 @@ import atexit
 import contextlib
 import errno
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -3238,6 +3239,72 @@ def make_turn_lease_holder(purpose: str) -> str:
     /retry rewrite from a shutdown spool drain.
     """
     return f"pid={os.getpid()}:turn={purpose}:platform=writer"
+
+
+def turn_grant_kwargs(db, session_id) -> Dict[str, Any]:
+    """``{"turn_lease_holder": grant}`` when THIS process owns *session_id*'s turn.
+
+    Reuse before acquire, written once. Four production sites had already
+    hand-rolled this idiom (the gateway metadata sync, the TUI live persist,
+    the compressor, the ACP adapter) and every one of them carries the same
+    two footnotes, because getting either wrong is silent:
+
+    * the keyword is passed ONLY when there is a grant. Several of these
+      callers hold a duck-typed handle, so an unexpected keyword becomes a
+      ``TypeError`` swallowed by the surrounding ``except`` — a no-persist that
+      looks exactly like a successful write.
+    * ``None`` here is not a failure. It is the ordinary answer on an unowned
+      conversation (fresh sessions, imports, single-writer installs), which the
+      fence admits holderless, and it is also the answer when the owner is
+      ANOTHER process — which the fence refuses. The caller does not have to
+      tell those apart; the admission does.
+
+    ONLY A REAL GRANT IS PRESENTED, and that is a correctness rule rather than
+    a defensive one. ``_authorize_turn_lease_token`` admits a holder by its
+    ``epoch``, its ``conversation_id`` and its string value; anything else
+    fails that check and the write is REFUSED. So presenting a not-a-grant
+    turns an admitted holderless write into a refused one — strictly worse
+    than presenting nothing. Two shapes reach here in practice and both are
+    ``is not None``:
+
+    * a coroutine, when the handle is an ``AsyncSessionDB`` (its
+      ``__getattr__`` turns every method into an ``asyncio.to_thread``
+      forwarder). It is closed here so it cannot surface later as an
+      un-awaited warning; async call sites await ``current_turn_grant``
+      themselves.
+    * a test double, when the handle is a mock. ``getattr`` finds a callable
+      and it returns another mock.
+
+    Both degrade to holderless, which is what a caller holding no grant should
+    present.
+    """
+    reuse = getattr(db, "current_turn_grant", None)
+    if not callable(reuse):
+        return {}
+    try:
+        grant = reuse(session_id)
+    except Exception:
+        logger.debug("current_turn_grant failed for %s", session_id, exc_info=True)
+        return {}
+    if inspect.isawaitable(grant):
+        close = getattr(grant, "close", None)
+        if callable(close):
+            close()
+        logger.debug(
+            "turn_grant_kwargs was handed an async session handle for %s; "
+            "the call site must await current_turn_grant itself",
+            session_id,
+        )
+        return {}
+    if not isinstance(grant, SessionTurnLeaseToken):
+        if grant is not None:
+            logger.debug(
+                "current_turn_grant returned a %s for %s, not a grant; "
+                "writing holderless",
+                type(grant).__name__, session_id,
+            )
+        return {}
+    return {"turn_lease_holder": grant}
 
 
 class SessionTurnLeaseScope:
@@ -8239,10 +8306,37 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._execute_write(_do)
 
     def update_system_prompt(
-        self, session_id: str, system_prompt: Optional[str]
+        self,
+        session_id: str,
+        system_prompt: Optional[str],
+        *,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> None:
-        """Store the full assembled system prompt snapshot."""
+        """Store the full assembled system prompt snapshot.
+
+        Fenced. The snapshot is not metadata about the conversation — it is the
+        first thing the next turn sends, so replacing it changes what the model
+        sees as surely as changing ``model`` does. ``TURN_FENCE_SURFACE``'s
+        declaration names it in as many words, and the base-binary probe that
+        motivated the surface ran this exact method against a conversation this
+        generation held the lease on, unrefused.
+
+        Its production callers are the agent's own turn
+        (``agent/conversation_loop``, ``agent/conversation_compression``) and
+        the TUI's live persist, all of which run INSIDE a turn this process
+        owns. They present that turn's grant via ``current_turn_grant``; a
+        writer that gets ``None`` there is genuinely an alternate writer, and
+        holderless writes stay legal on an unowned conversation.
+        """
         def _do(conn):
+            # The prompt snapshot is what the next turn resumes from.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             system_prompt_hash = self._store_system_prompt(conn, system_prompt)
             conn.execute(
                 "UPDATE sessions "
@@ -8446,12 +8540,28 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         model_options: Optional[Dict[str, Any]] = None,
         route_source: Optional[str] = None,
         confirmed: bool = False,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> None:
         """Persist a Browser / API client runtime lock without clobbering lineage markers.
 
         Merges ``browser_model_lock`` into the existing ``model_config`` JSON so
         ``_branched_from`` / ``_delegate_from`` survive. Nulls ``system_prompt``
         so cached ``Model:`` / ``Provider:`` footers cannot lie after a switch.
+
+        FENCED, and this is the method the previous fence was bypassable
+        through. Its statement writes ``model_config``, ``model``,
+        ``system_prompt`` and ``system_prompt_hash`` — every column
+        ``update_session_model`` writes — and it had zero admission calls while
+        that method had one. A fence the adjacent method walks around is not a
+        fence; the only difference between the two was which one somebody had
+        looked at.
+
+        The one production caller is ``gateway/platforms/api_server``, on a
+        request that carries a runtime lock. That request is very often not the
+        process running the turn, which is the case the refusal is for; when it
+        IS this process, ``current_turn_grant`` hands back the turn's own grant
+        and the write lands.
         """
         lock = {
             "provider": provider or "",
@@ -8463,6 +8573,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         }
 
         def _do(conn):
+            # This rewrites the whole route the next turn replays under.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             merged = self._merge_model_config_json(
                 conn, session_id, {"browser_model_lock": lock}
             )
@@ -8480,7 +8597,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             self._delete_unreferenced_system_prompts(conn)
         self._execute_write(_do)
 
-    def set_session_yolo(self, session_id: str, enabled: bool) -> None:
+    def set_session_yolo(
+        self,
+        session_id: str,
+        enabled: bool,
+        *,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> None:
         """Persist the per-session YOLO bypass flag into ``model_config``.
 
         Merges ``yolo_mode`` into the existing ``model_config`` JSON (same
@@ -8491,11 +8615,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         process. No-op when the session row doesn't exist yet; the
         creation-time ``model_config`` carries the flag for ``--yolo``
         launches.
+
+        Fenced for the same reason ``patch_session_model_config`` is: the merge
+        is a read-modify-write on ``model_config``, which is one column and is
+        replayed whole. A merge performed against a snapshot the owner has
+        since replaced writes the old document back with one key changed.
         """
         if not session_id:
             return
 
         def _do(conn):
+            # The yolo flag rides in model_config, which the next turn replays.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             merged = self._merge_model_config_json(
                 conn, session_id, {"yolo_mode": bool(enabled)}
             )
@@ -8585,6 +8721,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         provider: str,
         base_url: str,
         billing_mode: Optional[str] = None,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> None:
         """Unconditionally update the billing provider/base_url for a session.
 
@@ -8595,11 +8733,24 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         Also nulls ``system_prompt`` so the cached snapshot (which embeds a
         stale ``Model:`` / ``Provider:`` header) is rebuilt — matching the
         behavior of ``update_session_model`` (see #48173, #48248).
+
+        Fenced because of that second half. The billing columns are
+        bookkeeping the provider never sees; the two prompt columns it NULLs on
+        the way past are exactly what the running turn resumes from, and a
+        method belongs on the fence surface for what it can reach, not for what
+        it is named after.
         """
         # Barrier against queued token deltas — see update_session_model.
         self.flush_token_counts()
 
         def _do(conn):
+            # Nulling the prompt snapshot changes what the next turn replays.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             conn.execute(
                 """UPDATE sessions SET
                    billing_provider = ?,

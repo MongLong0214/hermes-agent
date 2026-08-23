@@ -3755,8 +3755,15 @@ def compress_context(
                 # In-place mode still updates/replaces the current row here.
                 # Rotation already published prompt + compacted handoff atomically.
                 if in_place:
+                    # Fenced write, inside this process's own turn — present
+                    # the grant. See hermes_state.turn_grant_kwargs.
+                    from hermes_state import turn_grant_kwargs
+
                     agent._session_db.update_system_prompt(
-                        agent.session_id, new_system_prompt
+                        agent.session_id, new_system_prompt,
+                        **turn_grant_kwargs(
+                            agent._session_db, agent.session_id
+                        ),
                     )
                     agent._last_flushed_db_idx = 0
                 else:

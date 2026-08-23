@@ -3043,11 +3043,17 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     _session_id = getattr(agent, "session_id", None)
     if _session_db is not None and _session_id:
         try:
+            # Fenced: this NULLs the assembled prompt on the way past, so it
+            # is a context write however it is named. The switch runs inside
+            # this process's turn — present that turn's grant.
+            from hermes_state import turn_grant_kwargs
+
             _session_db.update_session_billing_route(
                 _session_id,
                 provider=agent.provider,
                 base_url=agent.base_url,
                 billing_mode=getattr(agent, "api_mode", None),
+                **turn_grant_kwargs(_session_db, _session_id),
             )
         except Exception:
             logger.warning(

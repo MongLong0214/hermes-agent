@@ -386,7 +386,9 @@ def _owned_session(db, session_id="s", *, tag="owner"):
     return grant
 
 
-def _refused_then_owned_then_free(tmpdir, bystander, owner_write, free_write):
+def _refused_then_owned_then_free(
+    tmpdir, bystander, owner_write, free_write, observe
+):
     """The three-part shape every pin below uses.
 
     * a holderless write while somebody owns the conversation is refused AND
@@ -395,6 +397,14 @@ def _refused_then_owned_then_free(tmpdir, bystander, owner_write, free_write):
       refusal above is indistinguishable from a fence that refuses everybody;
     * once the lease is released, a holderless write lands again, which is
       every single-writer install, every fresh session and every import.
+
+    *observe* returns the value a landed write must MOVE, and it is per-pin
+    rather than the replay tuple for a reason found by running this:
+    ``update_session_billing_route``'s only replay-column effect is NULLing two
+    columns that the previous step already NULLed, so "the replay tuple
+    changed" reads as "the write was refused" on the second call. A landedness
+    probe that a legitimate write cannot move is a check that fails on correct
+    code, which is the same fault as one that passes on broken code.
     """
     from hermes_state import SessionTurnLeaseLostError
 
@@ -402,6 +412,7 @@ def _refused_then_owned_then_free(tmpdir, bystander, owner_write, free_write):
     try:
         grant = _owned_session(db)
         before = _replay_state(db, "s")
+        before_observed = observe(db)
         assert before[0] == "anthropic/claude-before"
         assert before[3], "the fixture has no prompt hash to lose"
 
@@ -418,21 +429,38 @@ def _refused_then_owned_then_free(tmpdir, bystander, owner_write, free_write):
             f"the refused write changed the replay columns anyway: "
             f"{_replay_state(db, 's')!r} != {before!r}"
         )
+        assert observe(db) == before_observed, (
+            f"the refused write landed anyway: {observe(db)!r} != "
+            f"{before_observed!r}"
+        )
 
         owner_write(db, grant)
-        after_owner = _replay_state(db, "s")
-        assert after_owner != before, (
-            f"the owner's own write was refused: {after_owner!r} == {before!r}"
+        after_owner = observe(db)
+        assert after_owner != before_observed, (
+            f"the owner's own write was refused: {after_owner!r} == "
+            f"{before_observed!r}"
         )
 
         db.release_session_turn_lease("s", grant)
         free_write(db)
-        assert _replay_state(db, "s") != after_owner, (
-            "a holderless write is refused even on a FREE conversation, which "
-            "breaks every single-writer install"
+        assert observe(db) != after_owner, (
+            f"a holderless write is refused even on a FREE conversation, which "
+            f"breaks every single-writer install: {observe(db)!r}"
         )
     finally:
         db.close()
+
+
+def _model_config(db):
+    return (db.get_session("s") or {}).get("model_config")
+
+
+def _prompt_hash(db):
+    return (db.get_session("s") or {}).get("system_prompt_hash")
+
+
+def _billing_provider(db):
+    return (db.get_session("s") or {}).get("billing_provider")
 
 
 def check_a_runtime_lock_write_is_refused_while_a_live_owner_holds_it(
@@ -459,6 +487,7 @@ def check_a_runtime_lock_write_is_refused_while_a_live_owner_holds_it(
         lambda db: db.update_session_runtime_lock(
             "s", model="anthropic/claude-free", provider="free", confirmed=True,
         ),
+        _model_config,
     )
 
 
@@ -477,6 +506,7 @@ def check_a_system_prompt_rewrite_is_refused_while_a_live_owner_holds_it(
             "s", "OWNER PROMPT", turn_lease_holder=grant
         ),
         lambda db: db.update_system_prompt("s", "FREE PROMPT"),
+        _prompt_hash,
     )
 
 
@@ -502,6 +532,7 @@ def check_a_billing_route_write_is_refused_while_a_live_owner_holds_it(
         lambda db: db.update_session_billing_route(
             "s", provider="free", base_url="https://free.example",
         ),
+        _billing_provider,
     )
 
 
@@ -520,6 +551,7 @@ def check_a_yolo_toggle_is_refused_while_a_live_owner_holds_it(tmpdir) -> None:
             "s", True, turn_lease_holder=grant
         ),
         lambda db: db.set_session_yolo("s", False),
+        _model_config,
     )
 
 
