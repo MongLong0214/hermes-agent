@@ -689,86 +689,6 @@ def check_the_dry_run_reports_the_plan_and_changes_no_byte(
     )
 
 
-def check_the_dry_run_refuses_what_the_real_run_would_refuse(
-    tmpdir: pathlib.Path,
-) -> None:
-    """The rehearsal is only worth anything if it predicts the real run.
-
-    Rehearsing on a copy is what buys the byte assertion, and it costs an
-    identity. ``SessionDB._turn_lease_row_is_free`` frees a row whose
-    ``owner_pid`` is this process when this process holds no grant FOR THAT
-    ``db_path`` — a turn that died without releasing. The copy has a different
-    path, so a conversation this very process is genuinely mid-turn on reads
-    free on the copy and held on the original.
-
-    Measured, not reasoned about: the first version of this rehearsal reported
-    "this would proceed" on exactly the store the real run then refused. A
-    rehearsal that predicts the wrong outcome is worse than no rehearsal — the
-    operator types the real command on its say-so.
-
-    Both invocations are asserted here TOGETHER, so the claim is the agreement
-    rather than either verdict on its own.
-
-    Also SQLite-version-sensitive, for the reason spelled out in
-    :func:`check_the_dry_run_reports_the_plan_and_changes_no_byte`: the digest
-    below passed on SQLite 3.50.4 and failed on 3.53.1 while `state.db` itself
-    was byte-identical, because a `mode=ro` probe of a WAL-mode store leaves
-    `-wal` and `-shm` behind on the newer build.
-    """
-    _sandbox_home(tmpdir)
-    module, why = _import_verb()
-    assert module is not None, f"there is no fence-rollback verb: {why}"
-
-    store = tmpdir / "state.db"
-    _fenced_store(store, leave_lease_live=True)
-    before = _store_digest(store)
-    listing_before = sorted(entry.name for entry in tmpdir.iterdir())
-
-    rehearsal = _run_verb(store, tmpdir / "backup-dry.db", dry_run=True)
-    assert not rehearsal.crash, f"the dry run crashed on a live store: {rehearsal.crash}"
-    dry = _payload(rehearsal)
-    assert dry is not None, (
-        f"the dry run printed no machine-readable report: {rehearsal.stdout!r}"
-    )
-    # Read BEFORE the real run below. The real run's own liveness check opens
-    # the store as a store, and that writes — so a digest taken after it would
-    # attribute the real run's bytes to the rehearsal.
-    after_rehearsal = _store_digest(store)
-    listing_after_rehearsal = sorted(entry.name for entry in tmpdir.iterdir())
-
-    real = _run_verb(store, tmpdir / "backup-real.db")
-    assert not real.crash, f"the real run crashed on a live store: {real.crash}"
-    live = _payload(real)
-    assert live is not None, (
-        f"the real run printed no machine-readable report: {real.stdout!r}"
-    )
-    assert live.get("ok") is False and live["refused"]["reason"] == "live-turn", (
-        "the fixture did not produce a store the real run refuses, so this "
-        f"check is comparing nothing: {live!r}"
-    )
-
-    assert dry.get("ok") is False, (
-        "the dry run reported that the rollback WOULD PROCEED on a store the "
-        f"real run refuses ({live['refused']['reason']}). The rehearsal is "
-        "run on a copy, and the copy does not carry the store's path — so an "
-        "answer that depends on the path is an answer about the wrong file: "
-        f"{dry!r}"
-    )
-    assert dry["refused"]["reason"] == live["refused"]["reason"], (
-        "the dry run and the real run refused for DIFFERENT reasons "
-        f"({dry['refused']['reason']} vs {live['refused']['reason']}), so the "
-        "rehearsal is not a rehearsal of this run"
-    )
-
-    assert after_rehearsal == before, (
-        f"the dry run changed the store while refusing it: {before} -> "
-        f"{after_rehearsal}"
-    )
-    assert listing_after_rehearsal == listing_before, (
-        f"a refused dry run left files behind: {listing_after_rehearsal}"
-    )
-
-
 def check_every_preflight_refusal_leaves_the_artifact_byte_identical(
     tmpdir: pathlib.Path,
 ) -> None:
@@ -854,29 +774,77 @@ def check_every_preflight_refusal_leaves_the_artifact_byte_identical(
     assert occupied.read_bytes() == b"an earlier backup that must not be clobbered"
 
 
+def _drive_the_boundary_and_meddle_after_the_backup(
+    library, store: pathlib.Path, work_dir: pathlib.Path, meddle
+) -> dict:
+    """Enter the mutating boundary on the production preparer's own target.
+
+    The backup lands, *meddle* runs, and then the second decision happens —
+    which is the window every check/use property in this verb lives in. The
+    boundary takes a private copy only :func:`prepare_the_private_copy` builds,
+    so this is the same entry the rehearsal uses and the same one an
+    authority-bearing caller would.
+    """
+    prepared = library.prepare_the_private_copy(store, work_dir=work_dir)
+    copy = pathlib.Path(prepared.path)
+    backup = work_dir / "backup.db"
+    outcome = library.RollbackOutcome()
+    state = {"backed_up": False}
+    real_backup = library._make_verified_backup
+
+    def _backup_then_meddle(*args, **kwargs):
+        report = real_backup(*args, **kwargs)
+        state["backed_up"] = True
+        meddle(copy, backup)
+        return report
+
+    library._make_verified_backup = _backup_then_meddle
+    result = {"reason": "", "detail": "", "crash": ""}
+    try:
+        library._commit_the_rollback(
+            prepared, backup, sorted(hermes_state_common.TURN_FENCE_TRIGGERS),
+            report_as=store, outcome=outcome,
+        )
+    except library.TurnFenceRollbackRefused as exc:
+        result["reason"] = getattr(exc, "reason", "refused")
+        result["detail"] = str(exc)
+    except BaseException as exc:  # noqa: BLE001 - carried, not swallowed
+        result["crash"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        library._make_verified_backup = real_backup
+    return {
+        "copy": copy, "backup": backup, "outcome": outcome,
+        "result": result, "backed_up": state["backed_up"],
+    }
+
+
 def check_a_lease_taken_after_preflight_still_refuses_the_rollback(
     tmpdir: pathlib.Path,
 ) -> None:
     """Check and use, bound by ONE exclusion boundary. Nothing weaker.
 
     Every writer in this program must check root, holder and epoch in the same
-    transaction as its DML. The verb REMOVES that fence, so it does not get a
-    weaker standard — and it had one: liveness was decided in the pre-flight
-    and used much later, with only the trigger surface re-checked inside the
-    exclusive transaction. Surface is not liveness.
+    transaction as its DML. The operation that REMOVES that fence does not get
+    a weaker standard, and it had one: liveness was decided once and used much
+    later, with only the trigger surface re-checked before the drops. Surface
+    is not liveness.
 
-    The barrier below is deterministic, not timed. A real child process takes
-    a real lease on the conversation at the one moment that matters — after
-    the pre-flight has returned its verdict and before the store is mutated —
-    by wrapping the pre-flight itself. No sleeping, no TTL games, no holder
-    string heuristics: the child acquires through the ordinary API and its
-    grant is confirmed on stdout before the parent is allowed to continue.
+    THE WINDOW MOVED WITH THE BACKUP, AND SO DOES THIS
+        The backup cannot run inside a transaction — ``VACUUM INTO`` refuses
+        and the online backup API deadlocks against a source holding
+        ``BEGIN EXCLUSIVE``, both measured — so the lock is released for it and
+        every decision is taken again under the lock that drops. That release
+        IS the window, and a turn acquired in it is exactly the interleave the
+        fence exists to stop. So the barrier sits there: the backup lands, a
+        real child takes a real lease through the ordinary API, and only then
+        does the second decision run.
 
-    The child then CLOSES its connection and stays alive. That is deliberate:
-    with no connection held, ``BEGIN EXCLUSIVE`` succeeds, so the rollback
-    cannot be rescued by file locking and has to refuse on the LEASE ROW or
-    not at all. An idle connection does not prevent ``BEGIN EXCLUSIVE`` either,
-    which is the same point from the other side.
+        Deterministic, not timed. The child confirms its grant on stdout before
+        the parent continues, then CLOSES its connection and stays alive — with
+        nothing held open, ``BEGIN EXCLUSIVE`` still succeeds, so the refusal
+        has to come from the LEASE ROW or not at all. An idle connection does
+        not prevent ``BEGIN EXCLUSIVE`` either, which is the same point from
+        the other side.
     """
     _sandbox_home(tmpdir)
     module, why = _import_verb()
@@ -888,17 +856,19 @@ def check_a_lease_taken_after_preflight_still_refuses_the_rollback(
     _fenced_store(store, leave_lease_live=False)
     rows_before = _canonical_rows(store)
     triggers_before = _installed_triggers(store)
-    backup = tmpdir / "backup.db"
+    work_dir = tmpdir / "work"
+    work_dir.mkdir()
 
     child_script = textwrap.dedent(
         """
+        import os
         import pathlib
         import sys
         from hermes_state import SessionDB
 
         db = SessionDB(db_path=pathlib.Path(sys.argv[1]))
         grant = db.try_acquire_session_turn_lease(
-            "keep", "pid=%d:turn=late:platform=test" % __import__("os").getpid(),
+            "keep", "pid=%d:turn=late:platform=test" % os.getpid(),
             ttl_seconds=600,
         )
         db.close()
@@ -907,30 +877,26 @@ def check_a_lease_taken_after_preflight_still_refuses_the_rollback(
         sys.stdin.read()
         """
     )
-
     started = {}
 
-    def _acquire_the_lease_late(*args, **kwargs):
-        """Wrap the pre-flight: let it answer, THEN let a real turn start."""
-        verdict = started["real_preflight"](*args, **kwargs)
-        if "child" not in started:
-            child = subprocess.Popen(
-                [sys.executable, "-c", child_script, str(store)],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                text=True, env=dict(os.environ),
-            )
-            started["child"] = child
-            # One blocking read, not a poll: the child prints exactly one line
-            # once the grant is decided, so the parent resumes at a known point.
-            started["grant"] = (child.stdout.readline() or "").strip()
-        return verdict
+    def _a_turn_starts_in_the_backup_window(copy, backup):
+        if "child" in started:
+            return
+        child = subprocess.Popen(
+            [sys.executable, "-c", child_script, str(copy)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            text=True, env=dict(os.environ),
+        )
+        started["child"] = child
+        # One blocking read, not a poll: the child prints exactly one line once
+        # the grant is decided, so the parent resumes at a known point.
+        started["grant"] = (child.stdout.readline() or "").strip()
 
-    started["real_preflight"] = library.preflight_turn_fence_rollback
-    library.preflight_turn_fence_rollback = _acquire_the_lease_late
     try:
-        run = _run_verb(store, backup)
+        run = _drive_the_boundary_and_meddle_after_the_backup(
+            library, store, work_dir, _a_turn_starts_in_the_backup_window
+        )
     finally:
-        library.preflight_turn_fence_rollback = started["real_preflight"]
         child = started.get("child")
         if child is not None:
             try:
@@ -942,53 +908,34 @@ def check_a_lease_taken_after_preflight_still_refuses_the_rollback(
             except Exception:
                 child.kill()
 
+    assert run["backed_up"], "the backup never landed, so there was no window"
     assert started.get("grant") == "GRANT", (
         "the barrier child did not actually acquire the turn lease "
         f"({started.get('grant')!r}), so this pin measures nothing — it would "
-        "pass against a verb with no in-transaction liveness check at all"
+        "pass against a boundary with no second liveness decision at all"
     )
-    assert not run.crash, f"the verb crashed under the barrier: {run.crash}"
-
-    payload = _payload(run)
-    assert payload is not None, f"no machine-readable report: {run.stdout!r}"
-    assert run.rc not in (0, None), (
-        f"a turn was acquired between the pre-flight and the mutation and the "
-        f"rollback went ahead anyway: rc={run.rc!r}. The fence came off "
-        "underneath a live conversation, which is the exact interleave it "
-        "exists to prevent"
+    assert not run["result"]["crash"], f"the boundary crashed: {run['result']['crash']}"
+    assert run["result"]["reason"] == "live-turn", (
+        "a turn was acquired between the backup and the drops and the rollback "
+        f"went ahead anyway: {run['result']!r}. The fence came off underneath a "
+        "live conversation, which is the exact interleave it exists to prevent"
     )
-    assert payload.get("ok") is False
-    assert payload["refused"]["reason"] == "live-turn", (
-        "the late lease was not reported as a liveness refusal: "
-        f"{payload['refused']!r}"
+    assert "keep" in run["result"]["detail"], (
+        f"the refusal does not name the conversation: {run['result']!r}"
     )
-    assert "keep" in payload["refused"]["detail"], (
-        f"the refusal does not name the conversation: {payload['refused']!r}"
+    assert _installed_triggers(run["copy"]) == sorted(
+        hermes_state_common.TURN_FENCE_TRIGGERS
+    ), "the rollback dropped triggers out from under a live turn"
+    facts = run["outcome"].facts()
+    assert facts["changed"] is False, (
+        f"nothing was dropped and the run says it changed the store: {facts!r}"
     )
-
-    assert _installed_triggers(store) == triggers_before, (
-        "the rollback dropped triggers out from under a live turn"
-    )
-    # Every protected table EXCEPT the lease table, which the barrier child
-    # deliberately wrote — comparing it against a snapshot taken before the
-    # child ran would be measuring the child's acquisition, not the rollback's
-    # restraint.
-    after = _canonical_rows(store)
-    for table in sorted(rows_before):
-        if table == "session_turn_leases":
-            continue
-        assert after[table] == rows_before[table], (
-            f"the rollback moved {table} under a live turn"
-        )
-    leases = after["session_turn_leases"]
-    assert leases and all(row[1] for row in leases), (
-        "the live turn's lease row was cleared by a rollback that refused it: "
-        f"{leases}"
-    )
-    assert not backup.exists(), (
+    assert not run["backup"].exists(), (
         "a run refused inside the boundary still left a backup on disk, so the "
         "backup does not correspond to a state anything relied on"
     )
+    assert _canonical_rows(store) == rows_before
+    assert _installed_triggers(store) == triggers_before
 
 
 def check_a_target_swapped_for_another_valid_store_is_refused(
@@ -997,121 +944,25 @@ def check_a_target_swapped_for_another_valid_store_is_refused(
     """A path is a name. The operation has to be bound to a FILE.
 
     Every other counterexample in this file is check/use TIMING. This one is
-    check/use SUBJECT, and no amount of re-checking fixes it: rename the named
-    store away after the pre-flight, drop a DIFFERENT valid fenced idle store
+    check/use SUBJECT, and no amount of re-checking fixes it: move the target
+    away after it has been inspected, drop a DIFFERENT valid fenced idle store
     at the same path, and every consistency check passes — the surface is the
     declared one, nothing is live, the generation matches — while the backup
-    describes the store that left and the twenty-four drops land on the store
-    that arrived. Reproduced exactly that way, reporting success.
+    describes the store that left and the drops land on the store that arrived.
 
-    So the assertions are about identity, and they are made on BOTH stores:
-    the one the operator named must be untouched, and the substitute must be
-    untouched too. A run that "did nothing to A" by rolling back B has not
-    passed this.
-    """
-    _sandbox_home(tmpdir)
-    module, why = _import_verb()
-    assert module is not None, f"there is no fence-rollback verb: {why}"
+    IDENTITY MOVED TO THE ARTIFACT THAT IS ACTUALLY MUTATED
+        The operator's store is no longer opened for writing by anything, so
+        the substitution that matters is of the private copy: it is prepared,
+        inspected, backed up, and only then dropped against, and the backup
+        window in the middle is a real interval during which its pathname can
+        be made to mean a different file. :meth:`_PrivateCopy.verify`
+        re-establishes ``(st_dev, st_ino)`` at the point of use rather than
+        trusting the object it was handed, and that is what this pins.
 
-    from hermes_cli import session_fence_rollback as library
-
-    named = tmpdir / "state.db"
-    _fenced_store(named, leave_lease_live=False)
-    a_rows = _canonical_rows(named)
-    a_triggers = _installed_triggers(named)
-
-    substitute_home = tmpdir / "substitute"
-    substitute_home.mkdir()
-    substitute = substitute_home / "other.db"
-    _fenced_store(substitute, leave_lease_live=False)
-    # A must be distinguishable from B, or "the drops hit B" cannot be seen.
-    conn = sqlite3.connect(str(substitute))
-    try:
-        b_sessions = sorted(r[0] for r in conn.execute("SELECT id FROM sessions"))
-    finally:
-        conn.close()
-    b_rows = _canonical_rows(substitute)
-    b_triggers = _installed_triggers(substitute)
-
-    moved_aside = tmpdir / "moved-aside.db"
-    swapped = {"done": False}
-    real_preflight = library.preflight_turn_fence_rollback
-
-    def _swap_the_target_after_the_preflight(*args, **kwargs):
-        verdict = real_preflight(*args, **kwargs)
-        if not swapped["done"]:
-            swapped["done"] = True
-            os.rename(named, moved_aside)
-            for suffix in ("-wal", "-shm", "-journal"):
-                sidecar = named.with_name(named.name + suffix)
-                if sidecar.exists():
-                    os.rename(sidecar, moved_aside.with_name(moved_aside.name + suffix))
-            os.rename(substitute, named)
-            for suffix in ("-wal", "-shm", "-journal"):
-                sidecar = substitute.with_name(substitute.name + suffix)
-                if sidecar.exists():
-                    os.rename(sidecar, named.with_name(named.name + suffix))
-        return verdict
-
-    library.preflight_turn_fence_rollback = _swap_the_target_after_the_preflight
-    try:
-        run = _run_verb(named, tmpdir / "backup.db")
-    finally:
-        library.preflight_turn_fence_rollback = real_preflight
-
-    assert swapped["done"], (
-        "the swap never happened, so this pin measures nothing"
-    )
-    assert not run.crash, f"the verb crashed under the swap: {run.crash}"
-    payload = _payload(run)
-    assert payload is not None, f"no machine-readable report: {run.stdout!r}"
-
-    assert run.rc not in (0, None), (
-        f"the verb exited {run.rc!r} after its target was replaced. The backup "
-        "it wrote belongs to one file and the drops landed on another"
-    )
-    assert payload.get("ok") is False
-    assert payload["refused"]["reason"] == "target-replaced", (
-        "a substituted target was not reported as one. A consistency check "
-        "cannot see this — the substitute is a perfectly valid fenced store — "
-        f"so only an identity check can: {payload['refused']!r}"
-    )
-
-    # Where A ended up, it must be whole.
-    assert _canonical_rows(moved_aside) == a_rows, (
-        "the store the operator NAMED lost rows while it was renamed aside"
-    )
-    assert _installed_triggers(moved_aside) == a_triggers, (
-        "the store the operator NAMED lost fence triggers"
-    )
-    # And the substitute, now sitting at the named path, must be whole too.
-    assert _installed_triggers(named) == b_triggers, (
-        "the rollback dropped the fence from the SUBSTITUTE store — a file the "
-        f"operator never named. Its sessions are {b_sessions}"
-    )
-    assert _canonical_rows(named) == b_rows, "the substitute lost rows"
-    assert not (tmpdir / "backup.db").exists(), (
-        "a refused run left a backup behind, and a backup taken across a "
-        "target swap describes neither store"
-    )
-
-
-def check_a_destination_appearing_after_the_check_is_never_clobbered(
-    tmpdir: pathlib.Path,
-) -> None:
-    """"Must not already exist" is a create, not a look.
-
-    ``Path.exists()`` and ``shutil.copyfile`` are two operations with a window
-    between them, and ``copyfile`` truncates whatever it opens. So a
-    destination created in that window is destroyed silently. Reproduced at the
-    real seam: a sentinel written after the check was gone afterwards, and the
-    rollback reported success and dropped all twenty-four triggers.
-
-    The barrier is deterministic and sits exactly where the defect is — the
-    check returns, THEN the sentinel appears, THEN the copy runs. Only an
-    acquisition the filesystem arbitrates (``O_CREAT | O_EXCL``) can survive
-    it; a second, better-placed check cannot, because a check is what is
-    broken.
+    The assertions are about identity, and they are made on BOTH stores: the
+    one that was prepared must be untouched where it ended up, and the
+    substitute must be untouched too. A run that "did nothing to A" by rolling
+    back B has not passed this.
     """
     _sandbox_home(tmpdir)
     module, why = _import_verb()
@@ -1123,30 +974,113 @@ def check_a_destination_appearing_after_the_check_is_never_clobbered(
     _fenced_store(store, leave_lease_live=False)
     rows_before = _canonical_rows(store)
     triggers_before = _installed_triggers(store)
-    backup = tmpdir / "backup.db"
+
+    substitute_home = tmpdir / "substitute"
+    substitute_home.mkdir()
+    substitute = substitute_home / "other.db"
+    _fenced_store(substitute, leave_lease_live=False)
+    conn = sqlite3.connect(str(substitute))
+    try:
+        b_sessions = sorted(str(r[0]) for r in conn.execute("SELECT id FROM sessions"))
+    finally:
+        conn.close()
+    b_rows = _canonical_rows(substitute)
+    b_triggers = _installed_triggers(substitute)
+
+    work_dir = tmpdir / "work"
+    work_dir.mkdir()
+    moved_aside = tmpdir / "moved-aside.db"
+    swapped = {"done": False}
+
+    def _substitute_the_target_in_the_backup_window(copy, backup):
+        if swapped["done"]:
+            return
+        swapped["done"] = True
+        os.rename(copy, moved_aside)
+        for suffix in ("-wal", "-shm", "-journal"):
+            sidecar = copy.with_name(copy.name + suffix)
+            if sidecar.exists():
+                os.rename(sidecar, moved_aside.with_name(moved_aside.name + suffix))
+        os.rename(substitute, copy)
+
+    run = _drive_the_boundary_and_meddle_after_the_backup(
+        library, store, work_dir, _substitute_the_target_in_the_backup_window
+    )
+
+    assert run["backed_up"], "the backup never landed, so there was no window"
+    assert swapped["done"], "the swap never happened, so this pin measures nothing"
+    assert not run["result"]["crash"], f"the boundary crashed: {run['result']['crash']}"
+    assert run["result"]["reason"] == "target-replaced", (
+        "a substituted target was not reported as one. A consistency check "
+        "cannot see this — the substitute is a perfectly valid fenced store — "
+        f"so only an identity check can: {run['result']!r}"
+    )
+
+    # Where the prepared copy ended up, it must be whole.
+    assert _installed_triggers(moved_aside) == sorted(
+        hermes_state_common.TURN_FENCE_TRIGGERS
+    ), "the copy that was prepared lost fence triggers while it was renamed aside"
+    # And the substitute, now sitting at the prepared path, must be whole too.
+    assert _installed_triggers(run["copy"]) == b_triggers, (
+        "the rollback dropped the fence from the SUBSTITUTE store — a file "
+        f"nothing prepared. Its sessions are {b_sessions}"
+    )
+    assert _canonical_rows(run["copy"]) == b_rows, "the substitute lost rows"
+    assert not run["backup"].exists(), (
+        "a refused run left a backup behind, and a backup taken across a "
+        "target swap describes neither store"
+    )
+    assert _canonical_rows(store) == rows_before
+    assert _installed_triggers(store) == triggers_before
+
+
+def check_a_destination_appearing_after_the_check_is_never_clobbered(
+    tmpdir: pathlib.Path,
+) -> None:
+    """"Must not already exist" is a create, not a look.
+
+    ``Path.exists()`` and the write are two operations with a window between
+    them, and whatever created a file in that window is destroyed silently.
+    Reproduced at the real seam: a sentinel written after the check was gone
+    afterwards, and the rollback reported success. Only an acquisition the
+    filesystem arbitrates (``O_CREAT | O_EXCL``) survives it; a second,
+    better-placed check cannot, because a check is what is broken.
+
+    THE DESTINATION THAT IS ACTUALLY ACQUIRED MOVED, AND SO DID THE EVIDENCE
+        Under a contract where no target the operator names has offline
+        authority, the run that reaches a backup is the rehearsal, and the
+        destination it acquires is its own — inside the private working
+        directory the command destroys before it returns. A pin that reads the
+        sentinel afterwards reads nothing, and "the file is gone" cannot tell
+        "never clobbered" from "clobbered, then swept". So the observation is
+        taken at the last moment the run still owns the directory: immediately
+        before the sweep, from inside it.
+    """
+    _sandbox_home(tmpdir)
+    module, why = _import_verb()
+    assert module is not None, f"there is no fence-rollback verb: {why}"
+
+    from hermes_cli import session_fence_rollback as library
+
+    store = tmpdir / "state.db"
+    _fenced_store(store, leave_lease_live=False)
+    rows_before = _canonical_rows(store)
+    triggers_before = _installed_triggers(store)
     sentinel = b"DO NOT CLOBBER - a concurrent writer got here first"
 
     injected = {"fired": False, "path": None}
+    observed = {"bytes": None, "family": None}
     real_check = library._refuse_unusable_backup_path
+    real_sweep = library.sweep_work_dir
 
     def _competing_writer_after_the_check(path, *args, **kwargs):
         """A racer that re-appears in EVERY window, not just the first.
 
-        The destination check runs more than once — pre-flight, then again at
-        the acquisition — and a one-shot injection is caught by the second
-        check, which proves nothing: a check saving the run is exactly what is
-        not allowed to be the guarantee. So the sentinel is cleared before each
-        check and re-created immediately after it, which is what a competing
-        writer looks like. Only an acquisition the filesystem arbitrates can
-        survive that.
-
-        AIMED AT THE DESTINATION THAT IS ACTUALLY ACQUIRED. Under a contract
-        where no target the operator can name has offline authority, the run
-        that reaches a backup is the rehearsal, and the destination it acquires
-        is its own — so the sentinel goes where the bytes are about to be
-        written, which is the only place a clobber could happen. Keyed by the
-        name the check is called with rather than by a path this pin computes,
-        because the working directory is the command's and not this pin's.
+        The destination check runs more than once, and a one-shot injection is
+        caught by the later one — which proves the check, and a check saving
+        the run is precisely what may not be the guarantee. So the sentinel is
+        cleared before each check and re-created immediately after it, which is
+        what a competing writer looks like.
         """
         target = pathlib.Path(path)
         if target.name != "rehearsal-backup.db":
@@ -1158,25 +1092,38 @@ def check_a_destination_appearing_after_the_check_is_never_clobbered(
         injected["path"] = target
         target.write_bytes(sentinel)
 
+    def _look_before_it_is_swept(work_dir, *args, **kwargs):
+        target = injected.get("path")
+        if target is not None and target.exists():
+            observed["bytes"] = target.read_bytes()
+            observed["family"] = sorted(_family_beside(target))
+        return real_sweep(work_dir, *args, **kwargs)
+
     library._refuse_unusable_backup_path = _competing_writer_after_the_check
+    library.sweep_work_dir = _look_before_it_is_swept
     try:
-        run = _run_verb(store, backup, dry_run=True)
+        run = _run_verb(store, tmpdir / "backup.db", dry_run=True)
     finally:
         library._refuse_unusable_backup_path = real_check
+        library.sweep_work_dir = real_sweep
 
     assert injected["fired"], (
         "the sentinel was never written, so the verb never reached the backup "
         "destination check and this pin measures nothing"
     )
     assert not run.crash, f"the verb crashed under the race: {run.crash}"
-
     payload = _payload(run)
     assert payload is not None, f"no machine-readable report: {run.stdout!r}"
-    landed = injected["path"]
-    assert landed.read_bytes() == sentinel, (
+
+    assert observed["bytes"] == sentinel, (
         "the backup step overwrote a file that appeared after its own "
         "existence check. Whatever was at the destination is gone, and no "
-        "check placed anywhere can fix that — the create has to be the check"
+        "check placed anywhere can fix that — the create has to be the check. "
+        f"Observed at the destination just before cleanup: {observed['bytes']!r}"
+    )
+    assert observed["family"] == [injected["path"].name], (
+        "the run left its own half-built destination beside the file it "
+        f"refused to overwrite: {observed['family']!r}"
     )
     assert run.rc not in (0, None), (
         f"the verb exited {run.rc!r} after racing a destination it was told "
@@ -1353,186 +1300,6 @@ def check_a_dry_run_that_cannot_clean_up_does_not_report_success(
     )
 
 
-def check_a_late_failure_does_not_retract_what_already_happened(
-    tmpdir: pathlib.Path,
-) -> None:
-    """Failure precedence sets the exit status. It does not rewrite the facts.
-
-    Two situations that must not print the same thing:
-
-    * the rollback COMPLETED and cleanup then failed — twenty-four triggers are
-      gone and a verified backup exists;
-    * the run was refused BEFORE it mutated anything, and cleanup then failed —
-      nothing was dropped and no backup was written.
-
-    Collapsing both into ``changed: false`` / ``dropped_triggers: []`` /
-    "Nothing was changed." is the original residue defect pointed the other
-    way, and worse: an operator who reads "nothing was changed" after the fence
-    came off stops looking. They will not go and find the unfenced store or the
-    backup they now depend on, because they have been told there is nothing to
-    find.
-    """
-    _sandbox_home(tmpdir)
-    module, why = _import_verb()
-    assert module is not None, f"there is no fence-rollback verb: {why}"
-
-    from hermes_cli import session_fence_rollback as library
-
-    class _CleanupDoesNothing:
-        def __init__(self, real):
-            self._real = real
-
-        def __getattr__(self, name):
-            return getattr(self._real, name)
-
-        def rmtree(self, *args, **kwargs):
-            return None
-
-    def _run_with_cleanup_suppressed(store, backup):
-        real_shutil = library.shutil
-        library.shutil = _CleanupDoesNothing(real_shutil)
-        try:
-            return _run_verb(store, backup)
-        finally:
-            library.shutil = real_shutil
-
-    # (1) COMPLETED, then cleanup failed.
-    done_dir = tmpdir / "completed"
-    done_dir.mkdir()
-    done_store = done_dir / "state.db"
-    _fenced_store(done_store, leave_lease_live=False)
-    done_backup = done_dir / "backup.db"
-    completed = _run_with_cleanup_suppressed(done_store, done_backup)
-
-    assert not completed.crash, f"the verb crashed: {completed.crash}"
-    done = _payload(completed)
-    assert done is not None, f"no machine-readable report: {completed.stdout!r}"
-    assert _installed_triggers(done_store) == [], (
-        "the fixture did not actually complete a rollback, so this pin is "
-        "comparing nothing"
-    )
-    assert done_backup.is_file(), "the fixture did not produce a backup"
-    assert done["changed"] is True, (
-        "the fence came off and a verified backup was written, and the report "
-        f"says changed=false. A late failure retracted an earlier fact: {done!r}"
-    )
-    assert sorted(done["dropped_triggers"]) == sorted(
-        hermes_state_common.TURN_FENCE_TRIGGERS
-    ), (
-        "the completed surface was flattened to empty by the cleanup failure: "
-        f"{done.get('dropped_triggers')!r}"
-    )
-    assert isinstance(done.get("backup"), dict) and done["backup"].get("verified"), (
-        f"the verified backup was dropped from the report: {done.get('backup')!r}"
-    )
-    assert "Nothing was changed." not in completed.stderr, (
-        "the operator is told nothing changed after twenty-four triggers came "
-        f"off. They will stop looking:\n{completed.stderr}"
-    )
-    assert done["refused"]["reason"] == "completed-with-residue", (
-        "a completed run with residue is not distinguishable from a run that "
-        f"never mutated anything: {done['refused']!r}"
-    )
-    assert completed.rc not in (0, None), "residue still needs a nonzero exit"
-
-    # (2) REFUSED before mutating, then cleanup failed.
-    live_dir = tmpdir / "refused"
-    live_dir.mkdir()
-    live_store = live_dir / "state.db"
-    _fenced_store(live_store, leave_lease_live=True)
-    _hand_the_lease_to_a_foreign_live_owner(live_store)
-    live_triggers = _installed_triggers(live_store)
-    live_backup = live_dir / "backup.db"
-    refused = _run_with_cleanup_suppressed(live_store, live_backup)
-
-    assert not refused.crash, f"the verb crashed: {refused.crash}"
-    stopped = _payload(refused)
-    assert stopped is not None, f"no machine-readable report: {refused.stdout!r}"
-    assert stopped["changed"] is False, (
-        "a run that never mutated the store reports changed=true: "
-        f"{stopped!r}"
-    )
-    assert stopped["dropped_triggers"] == []
-    assert not live_backup.exists(), "a pre-mutation refusal wrote a backup"
-    assert _installed_triggers(live_store) == live_triggers
-    assert stopped["refused"]["reason"] != done["refused"]["reason"], (
-        "a run that completed and a run that never started report the SAME "
-        f"outcome ({stopped['refused']['reason']}). Two different situations "
-        "that print the same thing is the defect"
-    )
-
-
-def check_the_completed_run_reports_the_surface_it_removed(
-    tmpdir: pathlib.Path,
-) -> None:
-    """Structured output on SUCCESS too, and it says what was removed.
-
-    A verb that prints "done" leaves the operator to go and check by hand what
-    it did, which is the state the verb exists to replace.
-    """
-    _sandbox_home(tmpdir)
-    module, why = _import_verb()
-    assert module is not None, f"there is no fence-rollback verb: {why}"
-
-    store = tmpdir / "state.db"
-    _fenced_store(store, leave_lease_live=False)
-    rows_before = _canonical_rows(store)
-    backup = tmpdir / "backup.db"
-
-    run = _run_verb(store, backup)
-    assert not run.crash, f"the verb crashed on a store it should roll back: {run.crash}"
-    assert run.rc in (0, None), (
-        f"the verb refused an idle, fully fenced store: rc={run.rc!r} "
-        f"stdout={run.stdout!r} stderr={run.stderr!r}"
-    )
-    payload = _payload(run)
-    assert payload is not None, (
-        f"the verb printed no machine-readable report on success: {run.stdout!r}"
-    )
-    assert payload["ok"] is True
-    assert payload["dry_run"] is False
-    assert payload["changed"] is True
-    assert sorted(payload["dropped_triggers"]) == sorted(
-        hermes_state_common.TURN_FENCE_TRIGGERS
-    ), (
-        "the completed run does not report the surface it removed, so nothing "
-        "in the output distinguishes a full rollback from a partial one: "
-        f"{payload.get('dropped_triggers')!r}"
-    )
-    assert payload["backup"]["verified"] is True, (
-        f"the report does not claim a verified backup: {payload.get('backup')!r}"
-    )
-    assert payload["backup"]["path"] == str(backup)
-
-    assert _installed_triggers(store) == [], (
-        "the verb reported success and the fence is still installed"
-    )
-    assert _canonical_rows(store) == rows_before, (
-        "the rollback changed user rows; it is only allowed to remove triggers"
-    )
-    assert backup.is_file() and _canonical_rows(backup) == rows_before, (
-        "the backup the report claims to have verified does not reproduce the "
-        "store"
-    )
-
-
-# ---------------------------------------------------------------------------
-# The offline-required contract.
-#
-# The verb's success path is permitted ONLY on an artifact whose offline
-# authority was established EXTERNALLY, and this build has no capability that
-# can establish it. So every in-place invocation refuses, and the pins below
-# are about (a) that the refusal is classified rather than generic and (b) that
-# the operation the future authority-bearing caller will drive is nonetheless
-# exercised and correct — through the REHEARSAL, which really performs it on a
-# copy this run made in its own private directory.
-#
-# Why the rehearsal is the seam and not a hand-built call: it is what
-# ``--dry-run`` drives, with the same arguments, so the backup, durability and
-# commit machinery is reached by a production path rather than pinned as dead
-# code. A helper whose greenness comes from never running is not covered.
-# ---------------------------------------------------------------------------
-
 def _commit_a_marker_that_lives_only_in_the_wal(
     store: pathlib.Path, marker: str
 ) -> None:
@@ -1614,6 +1381,18 @@ def _rehearse(library, store, backup, work_dir) -> dict:
     except BaseException as exc:  # noqa: BLE001 - carried, not swallowed
         outcome["crash"] = f"{type(exc).__name__}: {exc}"
     return outcome
+
+
+def _residue_errors(facts) -> list:
+    """Every residue record a run accumulated, as reasons.
+
+    A list, because a run can fail to remove more than one thing and a single
+    slot means the second record erases the first.
+    """
+    records = (facts or {}).get("residue") or []
+    if isinstance(records, dict):  # pragma: no cover - the shape this replaced
+        records = [records]
+    return sorted(str(record.get("error")) for record in records)
 
 
 def check_no_in_place_run_succeeds_and_each_wrong_target_names_its_own_reason(
@@ -2457,7 +2236,7 @@ def check_a_withdrawn_backup_is_never_reported_as_one_the_operator_has(
     assert swapped_facts["residue_present"] is True, (
         f"what was left behind is not reported: {swapped_facts!r}"
     )
-    assert swapped_facts["residue"]["error"] == "ownership-lost", (
+    assert "ownership-lost" in _residue_errors(swapped_facts), (
         f"the residue does not say why it was left: {swapped_facts['residue']!r}"
     )
 
@@ -2494,7 +2273,7 @@ def check_a_withdrawn_backup_is_never_reported_as_one_the_operator_has(
         "an observation somebody else made is reported as a certainty this "
         f"run established: {raced!r}"
     )
-    assert raced["residue"]["error"] == "absent-not-by-this-run", (
+    assert "absent-not-by-this-run" in _residue_errors(raced), (
         f"the report does not say why presence is unknown: {raced!r}"
     )
 
@@ -2551,10 +2330,480 @@ def check_a_withdrawn_backup_is_never_reported_as_one_the_operator_has(
         "the run failed to withdraw the backup and the report says it "
         f"withdrew it: {rehearsal!r}"
     )
-    assert rehearsal["residue"]["error"] == "ownership-lost", (
+    # THE CLEAN SWEEP MUST NOT FLATTEN IT. The work-dir cleanup succeeded, so
+    # its own residue answer is "nothing left" — and that answer used to be
+    # ASSIGNED over the backup-cleanup record established earlier, erasing the
+    # only statement that this run could not finish withdrawing its backup.
+    assert "ownership-lost" in _residue_errors(rehearsal), (
         "the reason the withdrawal could not be completed was dropped once "
         f"the sweep answered the presence question: {rehearsal!r}"
     )
+    assert "work-dir" not in _residue_errors(rehearsal), (
+        "the work directory was not cleaned up, so this leg is not testing a "
+        f"clean sweep flattening an earlier record: {rehearsal!r}"
+    )
+
+
+def check_a_real_invocation_refuses_before_it_observes_the_source(
+    tmpdir: pathlib.Path,
+) -> None:
+    """The documented order and the executed order are the same order.
+
+    ``rollback_turn_fence`` says a real invocation refuses before it observes
+    the source at all, and its docstring once said the opposite — that the
+    pre-flight, the identity binding and the in-transaction decisions ran on
+    the operator's own store first. They have not since the refusal moved ahead
+    of every side effect. A claim about CONTROL FLOW is as checkable as a claim
+    about a guarantee, and left unchecked it teaches the next reader the shape
+    this contract replaced.
+
+    WHY THE ORDER IS THE PROPERTY AND NOT AN OPTIMISATION
+        Opening the source is not free. A ``mode=ro`` probe of a WAL-mode store
+        creates ``-wal`` and ``-shm`` beside it, and on SQLite 3.53.1 they
+        survive the close — measured, on this file, with ``state.db`` itself
+        byte-identical. A refusal that added two files to the operator's
+        directory has changed the thing it is about to say it left alone. So
+        "refuses first" is what makes "nothing was changed" true, and it is
+        asserted as EVENTS, not inferred from the bytes: bytes agreeing would
+        also be consistent with an open that happened to leave no trace on this
+        build.
+
+    Each step the docstring says does not run is observed separately, so a
+    failure names WHICH one started running rather than that something did.
+    """
+    _sandbox_home(tmpdir)
+    module, why = _import_verb()
+    assert module is not None, f"there is no fence-rollback verb: {why}"
+
+    from hermes_cli import session_fence_rollback as library
+
+    store = tmpdir / "state.db"
+    _fenced_store(store, leave_lease_live=False)
+    listing_before = sorted(entry.name for entry in tmpdir.iterdir())
+
+    observed = {"preflight": 0, "bound": 0, "prepared": 0, "connected": []}
+    real_preflight = library.preflight_turn_fence_rollback
+    real_bound = library.BoundTarget
+    real_prepare = library.prepare_the_private_copy
+    real_sqlite = library.sqlite3
+
+    def _count_preflight(*args, **kwargs):
+        observed["preflight"] += 1
+        return real_preflight(*args, **kwargs)
+
+    def _count_bound(*args, **kwargs):
+        observed["bound"] += 1
+        return real_bound(*args, **kwargs)
+
+    def _count_prepare(*args, **kwargs):
+        observed["prepared"] += 1
+        return real_prepare(*args, **kwargs)
+
+    class _WatchingSqlite:
+        def __getattr__(self, name):
+            return getattr(real_sqlite, name)
+
+        def connect(self, target, *args, **kwargs):
+            observed["connected"].append(str(target))
+            return real_sqlite.connect(target, *args, **kwargs)
+
+    library.preflight_turn_fence_rollback = _count_preflight
+    library.BoundTarget = _count_bound
+    library.prepare_the_private_copy = _count_prepare
+    library.sqlite3 = _WatchingSqlite()
+    try:
+        run = _run_verb(store, tmpdir / "backup.db")
+    finally:
+        library.preflight_turn_fence_rollback = real_preflight
+        library.BoundTarget = real_bound
+        library.prepare_the_private_copy = real_prepare
+        library.sqlite3 = real_sqlite
+
+    assert not run.crash, f"the verb crashed: {run.crash}"
+    payload = _payload(run)
+    assert payload is not None, f"no machine-readable report: {run.stdout!r}"
+    assert payload["refused"]["reason"] == "offline-authority-unknown", (
+        f"the fixture did not reach the authority refusal: {payload['refused']!r}"
+    )
+
+    assert observed["preflight"] == 0, (
+        "a real invocation ran the pre-flight. The docstring says it refuses "
+        "before it observes the source, and the pre-flight copies the store"
+    )
+    assert observed["bound"] == 0, (
+        "a real invocation opened the store with BoundTarget before refusing"
+    )
+    assert observed["prepared"] == 0, (
+        "a real invocation made a private copy of the store for a run that "
+        "cannot proceed — an unfenced duplicate written for nothing"
+    )
+    touched = [
+        target for target in observed["connected"]
+        if str(store) in target
+    ]
+    assert touched == [], (
+        "a real invocation opened the operator's store with SQLite before "
+        f"refusing: {touched!r}. On a WAL build that leaves -wal and -shm "
+        "beside the artifact, so the refusal changes the directory it is "
+        "about to say it left alone"
+    )
+    assert sorted(entry.name for entry in tmpdir.iterdir()) == listing_before, (
+        "the refusal added or removed files in the store's directory: "
+        f"{sorted(entry.name for entry in tmpdir.iterdir())}"
+    )
+
+    # AND THE HELP SAYS THE SAME THING. Two statements of one behaviour that
+    # can disagree mean one of them is unpinned, and the one an operator reads
+    # is the option help.
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="sessions_action")
+    registered = module.add_fence_rollback_parser(subparsers)
+    options = {
+        action.dest: (action.help or "") for action in registered._actions
+    }
+    # The banned strings are the PROMISES, not the word. "does not roll back"
+    # is the correction; a bare substring check would reject the fix and pass
+    # the defect, which is a check that reads its own subject backwards.
+    store_help = options.get("store", "").lower()
+    assert "database to roll back" not in store_help, (
+        f"--store still promises a rollback of the named store: {store_help!r}"
+    )
+    assert "does not roll back" in store_help, (
+        f"--store does not say what this build declines to do: {store_help!r}"
+    )
+    assert "evaluate" in store_help, (
+        f"--store does not say what it actually does: {store_help!r}"
+    )
+    backup_help = options.get("backup", "").lower()
+    assert "where to write the verified backup" not in backup_help, (
+        f"--backup still promises a file this build never writes: {backup_help!r}"
+    )
+    assert "not created by this build" in backup_help, (
+        f"--backup does not say that nothing is written there: {backup_help!r}"
+    )
+
+
+def check_the_dry_run_never_reports_that_a_refused_run_would_proceed(
+    tmpdir: pathlib.Path,
+) -> None:
+    """A rehearsal is only worth anything if it predicts the real run.
+
+    The operator types the real command on the dry run's say-so, so a dry run
+    that reports "this would proceed" about a run that then refuses is worse
+    than having no dry run. Under a contract where NO target the operator can
+    name has offline authority, that reduces to something absolute and easy to
+    check: there is no store for which the dry run may report success.
+
+    THIS IS THE OUTCOME-LEVEL HALF, AND IT IS DELIBERATELY NOT THE WHOLE
+        The original property was "both paths refuse for the same reason", and
+        keeping that literally would mean making the dry run refuse at the
+        authority first — which deletes the diagnostic surface (wrong target,
+        half-installed surface, live turn, occupied destination) and makes the
+        rehearsal, and therefore the entire backup and commit machinery,
+        unreachable and green because nothing runs it. The specific
+        counterexample that property was written for has its own pin now; see
+        :func:`check_the_rehearsal_asks_the_liveness_question_of_the_operators_store`.
+
+    Both invocations are asserted TOGETHER, so the claim is the agreement
+    rather than either verdict on its own.
+    """
+    _sandbox_home(tmpdir)
+    module, why = _import_verb()
+    assert module is not None, f"there is no fence-rollback verb: {why}"
+
+    store = tmpdir / "state.db"
+    _fenced_store(store, leave_lease_live=False)
+    before = _store_digest(store)
+    listing_before = sorted(entry.name for entry in tmpdir.iterdir())
+
+    rehearsal = _run_verb(store, tmpdir / "backup-dry.db", dry_run=True)
+    assert not rehearsal.crash, f"the dry run crashed: {rehearsal.crash}"
+    dry = _payload(rehearsal)
+    assert dry is not None, f"no machine-readable dry-run report: {rehearsal.stdout!r}"
+    after_rehearsal = _store_digest(store)
+    listing_after_rehearsal = sorted(entry.name for entry in tmpdir.iterdir())
+
+    real = _run_verb(store, tmpdir / "backup-real.db")
+    assert not real.crash, f"the real run crashed: {real.crash}"
+    live = _payload(real)
+    assert live is not None, f"no machine-readable real-run report: {real.stdout!r}"
+
+    assert live.get("ok") is False, (
+        f"the real run succeeded on a store nothing can prove is offline: {live!r}"
+    )
+    assert dry.get("ok") is False, (
+        "the dry run reported that the rollback WOULD PROCEED on a store the "
+        f"real run refuses ({live['refused']['reason']}): {dry!r}"
+    )
+    assert rehearsal.rc not in (0, None) and real.rc not in (0, None), (
+        f"exit codes disagree with the reports: dry={rehearsal.rc!r} "
+        f"real={real.rc!r}"
+    )
+    assert dry["refused"]["reason"] == live["refused"]["reason"], (
+        "the dry run and the real run refused for DIFFERENT reasons "
+        f"({dry['refused']['reason']} vs {live['refused']['reason']}), so the "
+        "rehearsal is not a rehearsal of this run"
+    )
+    # AND THE REHEARSAL STILL RAN. A dry run that agrees with the real run by
+    # refusing at the same early gate agrees about nothing — it would pass this
+    # while doing no work at all, which is the shape that makes a suite green
+    # by not running.
+    assert (dry.get("rehearsal") or {}).get("outcome") == "committed", (
+        "the dry run reached the same verdict without performing the "
+        f"operation, so the agreement is vacuous: {dry.get('rehearsal')!r}"
+    )
+
+    assert after_rehearsal == before, (
+        f"the dry run changed the store while refusing it: {before} -> "
+        f"{after_rehearsal}"
+    )
+    assert listing_after_rehearsal == listing_before, (
+        f"a refused dry run left files behind: {listing_after_rehearsal}"
+    )
+
+
+def check_the_rehearsal_asks_the_liveness_question_of_the_operators_store(
+    tmpdir: pathlib.Path,
+) -> None:
+    """Rehearsing on a copy buys a byte assertion and costs an IDENTITY.
+
+    ``SessionDB._turn_lease_row_is_free`` frees a row whose ``owner_pid`` is
+    this process when this process holds no grant FOR THAT ``db_path`` — a turn
+    that died without releasing. The rehearsal's copy has a different path, so
+    a conversation this very process is genuinely mid-turn on reads FREE on the
+    copy and HELD on the original.
+
+    Measured, not reasoned about: the first version of this rehearsal reported
+    "this would proceed" on exactly the store the real run then refused. The
+    fix is that the in-transaction liveness decision is keyed by the store the
+    operator named rather than by the file it happens to be reading, and that
+    is what this pins — the one place where a copy must not be allowed to
+    answer as itself.
+    """
+    _sandbox_home(tmpdir)
+    module, why = _import_verb()
+    assert module is not None, f"there is no fence-rollback verb: {why}"
+
+    store = tmpdir / "state.db"
+    # The grant stays held BY THIS PROCESS, which is what puts the decision on
+    # the path-keyed branch. A foreign holder would be caught by the row read
+    # and would never exercise the identity this pin is named for.
+    _fenced_store(store, leave_lease_live=True)
+    before = _store_digest(store)
+    listing_before = sorted(entry.name for entry in tmpdir.iterdir())
+
+    run = _run_verb(store, tmpdir / "backup-dry.db", dry_run=True)
+    assert not run.crash, f"the dry run crashed on a live store: {run.crash}"
+    payload = _payload(run)
+    assert payload is not None, f"no machine-readable report: {run.stdout!r}"
+
+    assert payload.get("ok") is False
+    assert payload["refused"]["reason"] == "live-turn", (
+        "a conversation this process is mid-turn on read FREE, because the "
+        "liveness question was answered about the COPY rather than about the "
+        f"store the operator named: {payload['refused']!r}"
+    )
+    assert "keep" in payload["refused"]["detail"], (
+        f"the refusal does not name the conversation: {payload['refused']!r}"
+    )
+    assert _store_digest(store) == before, (
+        f"the dry run changed the store while refusing it: {before} -> "
+        f"{_store_digest(store)}"
+    )
+    assert sorted(entry.name for entry in tmpdir.iterdir()) == listing_before, (
+        f"a refused dry run left files behind: "
+        f"{sorted(entry.name for entry in tmpdir.iterdir())}"
+    )
+
+
+def check_a_late_failure_does_not_retract_what_already_happened(
+    tmpdir: pathlib.Path,
+) -> None:
+    """Failure precedence sets the exit status. It does not rewrite the facts.
+
+    Two situations that must not print the same thing:
+
+    * the rehearsal COMPLETED and cleanup then failed — the rollback ran to a
+      commit and what is left on disk is an UNFENCED duplicate of every
+      conversation in the store;
+    * the run was refused BEFORE the rehearsal ran, and cleanup then failed —
+      nothing was dropped and the copy left behind still carries the fence.
+
+    Same directory, different contents, and an operator triaging the first
+    needs to know the fence is off in there. Collapsing both into one reason,
+    or into ``changed: false`` with an empty surface, is the original residue
+    defect pointed the other way — and worse, because someone who reads
+    "nothing happened" stops looking.
+
+    THE FAILURE IS INJECTED AT THE FINAL SWEEP ONLY. Suppressing ``rmtree``
+    wholesale also breaks the backup's own staging cleanup, which now refuses
+    the run before it can commit — so the injection would prevent the very
+    completion this pin is about. It targets the command's rehearsal directory
+    by name instead.
+    """
+    _sandbox_home(tmpdir)
+    module, why = _import_verb()
+    assert module is not None, f"there is no fence-rollback verb: {why}"
+
+    from hermes_cli import session_fence_rollback as library
+
+    real_sweep = library.sweep_work_dir
+
+    def _the_final_cleanup_fails(work_dir, *args, **kwargs):
+        result = real_sweep(work_dir, *args, **kwargs)
+        if pathlib.Path(work_dir).name.startswith("hermes-fence-rehearsal-"):
+            return {"work_dir": str(work_dir), "files": 3, "error": ""}
+        return result
+
+    def _run_with_cleanup_failing(store, backup):
+        library.sweep_work_dir = _the_final_cleanup_fails
+        try:
+            return _run_verb(store, backup, dry_run=True)
+        finally:
+            library.sweep_work_dir = real_sweep
+
+    # (1) THE REHEARSAL COMPLETED, then cleanup failed.
+    done_dir = tmpdir / "completed"
+    done_dir.mkdir()
+    done_store = done_dir / "state.db"
+    _fenced_store(done_store, leave_lease_live=False)
+    completed = _run_with_cleanup_failing(done_store, done_dir / "backup.db")
+
+    assert not completed.crash, f"the verb crashed: {completed.crash}"
+    done = _payload(completed)
+    assert done is not None, f"no machine-readable report: {completed.stdout!r}"
+    done_rehearsal = done.get("rehearsal") or {}
+    assert done_rehearsal.get("outcome") == "committed", (
+        "the fixture did not actually complete a rollback, so this pin is "
+        f"comparing nothing: {done_rehearsal!r}"
+    )
+    assert done_rehearsal.get("backup_created") is True, (
+        f"the completed rehearsal's backup was flattened away: {done_rehearsal!r}"
+    )
+    assert done_rehearsal.get("backup_durable") is True, (
+        f"the durability fact was retracted by the cleanup failure: {done_rehearsal!r}"
+    )
+    assert sorted(done["would_drop"]) == sorted(
+        hermes_state_common.TURN_FENCE_TRIGGERS
+    ), (
+        "the completed surface was flattened to empty by the cleanup failure: "
+        f"{done.get('would_drop')!r}"
+    )
+    assert done["refused"]["reason"] == "rehearsal-completed-with-residue", (
+        f"a completed rehearsal with residue is not distinguishable: "
+        f"{done['refused']!r}"
+    )
+    assert "Nothing was changed." not in completed.stderr, (
+        "the operator is told nothing happened while an UNFENCED duplicate of "
+        f"every conversation is on disk:\n{completed.stderr}"
+    )
+    assert completed.rc not in (0, None), "residue still needs a nonzero exit"
+
+    # (2) REFUSED BEFORE THE REHEARSAL RAN, then cleanup failed.
+    live_dir = tmpdir / "refused"
+    live_dir.mkdir()
+    live_store = live_dir / "state.db"
+    _fenced_store(live_store, leave_lease_live=True)
+    _hand_the_lease_to_a_foreign_live_owner(live_store)
+    live_triggers = _installed_triggers(live_store)
+    live_backup = live_dir / "backup.db"
+    refused = _run_with_cleanup_failing(live_store, live_backup)
+
+    assert not refused.crash, f"the verb crashed: {refused.crash}"
+    stopped = _payload(refused)
+    assert stopped is not None, f"no machine-readable report: {refused.stdout!r}"
+    stopped_rehearsal = stopped.get("rehearsal") or {}
+    assert stopped_rehearsal.get("outcome") == "not-started", (
+        "a run refused in the pre-flight reports a rehearsal that ran: "
+        f"{stopped_rehearsal!r}"
+    )
+    assert stopped_rehearsal.get("backup_created") is False, (
+        f"a backup is claimed for a rehearsal that never ran: {stopped_rehearsal!r}"
+    )
+    assert stopped["changed"] is False
+    assert stopped["dropped_triggers"] == []
+    assert not live_backup.exists(), "a pre-rehearsal refusal wrote a backup"
+    assert _installed_triggers(live_store) == live_triggers
+    assert stopped["refused"]["reason"] != done["refused"]["reason"], (
+        "a run whose rehearsal completed and a run that never started report "
+        f"the SAME outcome ({stopped['refused']['reason']}). Two different "
+        "situations that print the same thing is the defect"
+    )
+
+
+def check_the_completed_rehearsal_reports_the_surface_it_removed(
+    tmpdir: pathlib.Path,
+) -> None:
+    """Structured output on the path that COMPLETES, and it says what it did.
+
+    A verb that prints "done" leaves the operator to go and check by hand what
+    it did, which is the state this verb exists to replace. Under a contract
+    where no real run proceeds, the only place a rollback completes is the
+    rehearsal on a private copy — which makes that report the operator's ONLY
+    view of what the operation does, and so more load-bearing than the success
+    report it replaces, not less.
+
+    NOT RE-AIMED AT "NO IN-PLACE SUCCESS CAN OCCUR", DELIBERATELY. That claim
+    is already decided by the classifier and asserted by
+    :func:`check_no_in_place_run_succeeds_and_each_wrong_target_names_its_own_reason`
+    over four target classes. A second pin asserting it would pass because a
+    different guard holds, and its mutation row would score a kill that guard
+    delivered — a redundant check reporting coverage it does not have, which is
+    the shape this slice has been paying for. The property that was actually
+    orphaned is machine-readable completion reporting, and this is where it now
+    lives.
+    """
+    _sandbox_home(tmpdir)
+    module, why = _import_verb()
+    assert module is not None, f"there is no fence-rollback verb: {why}"
+
+    store = tmpdir / "state.db"
+    _fenced_store(store, leave_lease_live=False)
+    rows_before = _canonical_rows(store)
+    triggers_before = _installed_triggers(store)
+    backup = tmpdir / "backup.db"
+
+    run = _run_verb(store, backup, dry_run=True)
+    assert not run.crash, f"the verb crashed: {run.crash}"
+    payload = _payload(run)
+    assert payload is not None, f"no machine-readable report: {run.stdout!r}"
+
+    rehearsal = payload.get("rehearsal") or {}
+    assert rehearsal.get("outcome") == "committed", (
+        f"the rehearsal did not run the rollback to a commit: {rehearsal!r}"
+    )
+    assert sorted(payload["would_drop"]) == sorted(
+        hermes_state_common.TURN_FENCE_TRIGGERS
+    ), (
+        "the completed rehearsal does not report the surface it removed, so "
+        "nothing in the output distinguishes a full rollback from a partial "
+        f"one: {payload.get('would_drop')!r}"
+    )
+    assert sorted(payload["installed_triggers"]) == sorted(
+        hermes_state_common.TURN_FENCE_TRIGGERS
+    ), f"the surface it found is not reported: {payload.get('installed_triggers')!r}"
+    record = rehearsal.get("backup")
+    assert isinstance(record, dict) and record.get("verified") is True, (
+        f"the report does not claim a verified backup: {record!r}"
+    )
+    assert record.get("durable") is True, (
+        f"the report does not claim a durable backup: {record!r}"
+    )
+    assert record.get("transient") is True and record.get("present") is False, (
+        "the rehearsal's backup is reported as an artifact the operator can go "
+        f"and find, and it was removed with the working directory: {record!r}"
+    )
+    assert record.get("rows"), (
+        f"the report does not say what the backup preserved: {record!r}"
+    )
+
+    assert _installed_triggers(store) == triggers_before, (
+        "the rehearsal removed the fence from the operator's store"
+    )
+    assert _canonical_rows(store) == rows_before, (
+        "the rehearsal changed user rows in the operator's store"
+    )
+    assert not backup.exists(), "the dry run wrote to the operator's backup path"
 
 
 PINS = {
@@ -2566,8 +2815,10 @@ PINS = {
         check_a_partial_surface_is_refused_whole_and_writes_no_backup,
     "check_the_dry_run_reports_the_plan_and_changes_no_byte":
         check_the_dry_run_reports_the_plan_and_changes_no_byte,
-    "check_the_dry_run_refuses_what_the_real_run_would_refuse":
-        check_the_dry_run_refuses_what_the_real_run_would_refuse,
+    "check_the_dry_run_never_reports_that_a_refused_run_would_proceed":
+        check_the_dry_run_never_reports_that_a_refused_run_would_proceed,
+    "check_the_rehearsal_asks_the_liveness_question_of_the_operators_store":
+        check_the_rehearsal_asks_the_liveness_question_of_the_operators_store,
     "check_every_preflight_refusal_leaves_the_artifact_byte_identical":
         check_every_preflight_refusal_leaves_the_artifact_byte_identical,
     "check_a_lease_taken_after_preflight_still_refuses_the_rollback":
@@ -2582,10 +2833,12 @@ PINS = {
         check_a_dry_run_that_cannot_clean_up_does_not_report_success,
     "check_a_late_failure_does_not_retract_what_already_happened":
         check_a_late_failure_does_not_retract_what_already_happened,
-    "check_the_completed_run_reports_the_surface_it_removed":
-        check_the_completed_run_reports_the_surface_it_removed,
+    "check_the_completed_rehearsal_reports_the_surface_it_removed":
+        check_the_completed_rehearsal_reports_the_surface_it_removed,
     "check_no_in_place_run_succeeds_and_each_wrong_target_names_its_own_reason":
         check_no_in_place_run_succeeds_and_each_wrong_target_names_its_own_reason,
+    "check_a_real_invocation_refuses_before_it_observes_the_source":
+        check_a_real_invocation_refuses_before_it_observes_the_source,
     "check_the_backup_is_a_logical_copy_that_restores_the_pre_rollback_state":
         check_the_backup_is_a_logical_copy_that_restores_the_pre_rollback_state,
     "check_a_partial_destination_collision_keeps_only_what_the_run_created":

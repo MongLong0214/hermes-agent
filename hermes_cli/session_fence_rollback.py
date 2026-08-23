@@ -757,8 +757,13 @@ class RollbackOutcome:
         self.backup_unlinked_by_this_run = False
         self.backup_absence_durable = False
         self.backup_withdrawn = False
-        self.residue_present = False
-        self.residue = None
+        # A LIST, and never assigned over. Three independent things a run
+        # can fail to remove — a staging copy, a backup it tried to withdraw,
+        # a working directory — and a single slot means last writer wins and
+        # an earlier record silently disappears. That shape has now cost this
+        # slice three separate bugs, so it is removed rather than guarded:
+        # append-only, and `residue_present` is derived from it.
+        self.residue = []
         self.backup = None
 
     def advance(self, state: str) -> None:
@@ -789,6 +794,16 @@ class RollbackOutcome:
         elif state == "committed":
             self.changed = True
 
+    @property
+    def residue_present(self) -> bool:
+        """Derived, so it cannot disagree with what was actually recorded."""
+        return bool(self.residue)
+
+    def note_residue(self, record: dict) -> None:
+        """Add something this run could not remove. Never replaces a record."""
+        if record is not None:
+            self.residue.append(dict(record))
+
     def facts(self) -> dict[str, Any]:
         return {
             "outcome": self.outcome,
@@ -800,8 +815,8 @@ class RollbackOutcome:
             "backup_unlinked_by_this_run": self.backup_unlinked_by_this_run,
             "backup_absence_durable": self.backup_absence_durable,
             "backup_withdrawn": self.backup_withdrawn,
-            "residue_present": self.residue_present,
-            "residue": self.residue,
+            "residue_present": bool(self.residue),
+            "residue": list(self.residue),
             "backup": self.backup,
         }
 
@@ -1365,8 +1380,7 @@ def _make_verified_backup(
             residue = sweep_work_dir(staging)
             if residue is not None:
                 if outcome is not None:
-                    outcome.residue_present = True
-                    outcome.residue = residue
+                    outcome.note_residue(residue)
                 # The durable backup is NOT removed. It exists, it restores,
                 # and telling the operator otherwise to keep the failure tidy
                 # is the same lie as reporting success over residue.
@@ -1684,8 +1698,7 @@ def _mark_the_backup_absent_but_not_by_us(outcome, backup_path: Path) -> dict:
         outcome.backup_absence_durable = None
         outcome.backup_present = None
         outcome.backup_withdrawn = False
-        outcome.residue_present = True
-        outcome.residue = left
+        outcome.note_residue(left)
         if isinstance(outcome.backup, dict):
             outcome.backup = dict(outcome.backup, present=None, residue=left)
     return left
@@ -1704,8 +1717,7 @@ def _leave_the_backup_and_report_it(outcome, left: dict, *, unlinked=False) -> d
     whether to expect the entry back after a crash.
     """
     if outcome is not None:
-        outcome.residue_present = True
-        outcome.residue = left
+        outcome.note_residue(left)
         outcome.backup_present = None
         outcome.backup_withdrawn = False
         outcome.backup_unlinked_by_this_run = bool(unlinked)
@@ -1879,19 +1891,35 @@ def rollback_turn_fence(
         a success gated on an inference, and every inference available here has
         a counterexample.
 
-    WHAT STILL RUNS, AND WHY IT IS NOT DEAD CODE
-        Everything up to the authority: the pre-flight on a copy, the identity
-        binding, the in-transaction liveness and surface decisions on the
-        operator's own store. And the operation itself — backup, drops, commit
-        — is driven on every invocation by
-        :func:`rehearse_turn_fence_rollback`, against the private copy. A
-        boundary that is only ever green because nothing reaches it is not
-        verified, so nothing here is left to that.
+    THE ORDER, AS IT ACTUALLY EXECUTES — TWO PATHS, NOT ONE
+        A REAL INVOCATION (this function) refuses BEFORE IT OBSERVES THE
+        SOURCE AT ALL. ``disqualify_the_target`` and
+        ``establish_offline_authority`` are the first two statements; the
+        second always raises. Nothing below them runs: no pre-flight, no
+        ``BoundTarget``, no copy, no SQLite handle on the store, no working
+        directory. That is deliberate and it is the acceptance property —
+        opening the source is not free, because it can leave ``-wal``/``-shm``
+        beside the artifact, and a refusal that changed the directory it is
+        about to say it left alone is not a refusal.
 
-    Raises :class:`TurnFenceRollbackRefused` on every outcome, leaving rows and
-    triggers as they were found; a refusal decided in the pre-flight leaves the
-    file itself byte-identical too. *outcome* is the caller's, so what a run
-    established is readable even on the paths where this raises.
+        A DRY RUN (:func:`rehearse_turn_fence_rollback`) is where the pre-flight
+        on a private copy, the identity binding, the in-transaction liveness
+        and surface decisions, the backup, the drops and the commit all happen
+        — against that copy, never against the operator's store. That is the
+        only path on which the operation runs, and it runs on every dry-run
+        invocation, so the boundary is not green merely because nothing reaches
+        it.
+
+        An earlier version of this paragraph claimed the real path ran "the
+        pre-flight, the identity binding, and the in-transaction decisions on
+        the operator's own store". It does not, and has not since the refusal
+        moved ahead of every side effect. A docstring that blurs the two paths
+        teaches the next reader the shape this contract replaced.
+
+    Raises :class:`TurnFenceRollbackRefused` on every outcome, leaving the
+    store byte-identical — including its directory listing, because nothing
+    here opens it. *outcome* is the caller's, so what a run established is
+    readable even on the paths where this raises.
     """
     store_path = Path(store_path)
     backup_path = Path(backup_path)
@@ -1933,8 +1961,7 @@ def rollback_turn_fence(
         if owned_work_dir:
             residue = sweep_work_dir(work_dir)
             if residue is not None:
-                outcome.residue_present = True
-                outcome.residue = residue
+                outcome.note_residue(residue)
 
     report = {
         "store": str(store_path),

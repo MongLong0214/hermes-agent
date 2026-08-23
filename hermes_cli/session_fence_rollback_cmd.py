@@ -198,7 +198,11 @@ def _report_rehearsal(store: Path, backup: Path, work_parent: Path = None) -> in
             refusal = _unexpected(exc)
     finally:
         residue = rollback.sweep_work_dir(work_dir)
-        outcome.residue_present = residue is not None
+        # note_residue, never assignment. `residue_present` is derived from an
+        # append-only list precisely so this line cannot erase a backup-cleanup
+        # or staging record established earlier by a path that already returned.
+        if residue is not None:
+            outcome.note_residue(dict(residue, error=residue.get("error") or "work-dir"))
 
     # WHAT THE REHEARSAL ESTABLISHED, decided by the steps that established it.
     # Read from the outcome the run wrote into rather than from a report it may
@@ -220,6 +224,9 @@ def _report_rehearsal(store: Path, backup: Path, work_parent: Path = None) -> in
     ) or residue is not None
     if residue is not None:
         rehearsal_facts["work_dir_residue"] = residue
+        rehearsal_facts["residue"] = list(rehearsal_facts.get("residue") or []) + [
+            dict(residue, error=residue.get("error") or "work-dir")
+        ]
     _settle_the_transient_artifacts(rehearsal_facts, swept=residue is None)
 
     # RESIDUE OUTRANKS EVERY OTHER OUTCOME OF A DRY RUN. What is left in there
@@ -234,7 +241,18 @@ def _report_rehearsal(store: Path, backup: Path, work_parent: Path = None) -> in
                 f"{residue['work_dir']}{residue['error']}. That copy is an "
                 "UNFENCED duplicate of every conversation in the store — "
                 "remove that directory",
-                reason="rehearsal-residue",
+                # TWO SITUATIONS, TWO REASONS. A dry run whose rehearsal ran to
+                # a commit leaves a rolled-back — UNFENCED — duplicate behind; a
+                # dry run refused in the pre-flight leaves a copy that still
+                # carries the fence. Same directory, different contents, and an
+                # operator triaging the first needs to know the fence is off in
+                # there. Collapsing them into one reason is the same flattening
+                # this pin's other half exists to stop.
+                reason=(
+                    "rehearsal-completed-with-residue"
+                    if (rehearsal_facts.get("outcome") == "committed")
+                    else "rehearsal-residue"
+                ),
             ),
             store=store, backup=backup, dry_run=True,
             preflight=(established or {}).get("preflight"),
@@ -351,7 +369,11 @@ def _report_rollback(store: Path, backup: Path) -> int:
             refusal = _unexpected(exc)
     finally:
         residue = rollback.sweep_work_dir(work_dir)
-        outcome.residue_present = residue is not None
+        # note_residue, never assignment. `residue_present` is derived from an
+        # append-only list precisely so this line cannot erase a backup-cleanup
+        # or staging record established earlier by a path that already returned.
+        if residue is not None:
+            outcome.note_residue(dict(residue, error=residue.get("error") or "work-dir"))
 
     # THE FACTS THE RUN ESTABLISHED, read from the object the run wrote into
     # and not from a report it may never have returned. Whatever goes wrong
