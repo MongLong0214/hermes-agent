@@ -3408,7 +3408,9 @@ MAINTENANCE_ONLY = frozenset({
 #: Calling any of these is machinery reach. Attribute references are not — a
 #: boundary pin may wrap ``preflight_turn_fence_rollback`` to COUNT that it was
 #: never called, which is the opposite of driving it.
-#: THE ONLY LIBRARY CODE OBJECTS A BOUNDARY-EVIDENCE PIN MAY ENTER.
+#: THE ONLY LIBRARY CODE OBJECTS A BOUNDARY-EVIDENCE PIN MAY ENTER, paired
+#: with the exact total/approved/deep and import-time counts for each supported
+#: CPython minor.
 #:
 #: WRITTEN BY HAND AND CONFIRMED ONE BY ONE, not derived from what the pins do
 #: today. A baseline taken from current execution RATIFIES current execution: a
@@ -3419,38 +3421,79 @@ MAINTENANCE_ONLY = frozenset({
 #: pathnames or inodes, or is a fail-closed wrapper. None of them prepares a
 #: copy, reads the store, decides under a lock, backs up, or commits.
 #:
-#: ``disqualify_the_target.<listcomp>`` is a COMPREHENSION inside an approved
-#: function, and it is listed because the roster is a set of CODE OBJECTS: a
-#: comprehension is its own code object and `sys.setprofile` reports it
-#: separately. The roster IS descriptor-rooted and DOES see it, because it
-#: recurses ``co_consts`` from each live root -- what a descriptor enumeration
-#: would miss is nested objects, and recursing is exactly how that is closed.
-#: Module-rooting is a different thing and deliberately not used: it would add
-#: the six import-time bodies and break identity matching.
-_APPROVED_BOUNDARY_SURFACE = frozenset({
-    "RollbackOutcome.__init__",
-    "RollbackOutcome.facts",
-    "RollbackOutcome.residue_present",
-    "TurnFenceRollbackRefused.__init__",
-    "_canonical_store_paths",
-    "_same_file",
-    "disqualify_the_target",
-    "disqualify_the_target.<listcomp>",
-    "establish_offline_authority",
-    "rehearse_turn_fence_rollback",
-    "rollback_turn_fence",
-})
+#: On CPython 3.11 ``disqualify_the_target.<listcomp>`` is a separate approved
+#: code object and `sys.setprofile` reports it separately. PEP 709 inlines that
+#: comprehension on 3.12+, so approving the 3.11-only label there would be a
+#: phantom allowlist entry. Other comprehensions disappear from the deep roster
+#: for the same reason. Each minor therefore gets a complete literal contract;
+#: an unmeasured implementation or minor fails closed at collection.
+_RUNTIME_SURFACE_CONTRACTS = {
+    ("cpython", (3, 11)): (
+        frozenset({
+            "RollbackOutcome.__init__",
+            "RollbackOutcome.facts",
+            "RollbackOutcome.residue_present",
+            "TurnFenceRollbackRefused.__init__",
+            "_canonical_store_paths",
+            "_same_file",
+            "disqualify_the_target",
+            "disqualify_the_target.<listcomp>",
+            "establish_offline_authority",
+            "rehearse_turn_fence_rollback",
+            "rollback_turn_fence",
+        }),
+        (79, 11, 68),
+        85,
+    ),
+    ("cpython", (3, 12)): (
+        frozenset({
+            "RollbackOutcome.__init__",
+            "RollbackOutcome.facts",
+            "RollbackOutcome.residue_present",
+            "TurnFenceRollbackRefused.__init__",
+            "_canonical_store_paths",
+            "_same_file",
+            "disqualify_the_target",
+            "establish_offline_authority",
+            "rehearse_turn_fence_rollback",
+            "rollback_turn_fence",
+        }),
+        (70, 10, 60),
+        76,
+    ),
+    ("cpython", (3, 13)): (
+        frozenset({
+            "RollbackOutcome.__init__",
+            "RollbackOutcome.facts",
+            "RollbackOutcome.residue_present",
+            "TurnFenceRollbackRefused.__init__",
+            "_canonical_store_paths",
+            "_same_file",
+            "disqualify_the_target",
+            "establish_offline_authority",
+            "rehearse_turn_fence_rollback",
+            "rollback_turn_fence",
+        }),
+        (70, 10, 60),
+        76,
+    ),
+}
+try:
+    (
+        _APPROVED_BOUNDARY_SURFACE,
+        _LIBRARY_CODE_OBJECT_COUNTS,
+        _IMPORT_TIME_CODE_OBJECT_COUNT,
+    ) = _RUNTIME_SURFACE_CONTRACTS[
+        (sys.implementation.name, sys.version_info[:2])
+    ]
+except KeyError:
+    raise AssertionError(
+        "the C5 runtime census has no literal contract for "
+        f"{sys.implementation.name} {sys.version_info.major}.{sys.version_info.minor}"
+    ) from None
 
-#: The BOUNDARY RUNTIME denominator: live descriptor roots plus their nested
-#: closures. 58 named + 21 nested. The module body and the five class bodies are
-#: deliberately NOT here -- they execute at import, before any pin runs, and
-#: cannot be re-entered afterwards, so they are outside the claim "this pin's
-#: execution reaches nothing deep". Covering them needs a separate instrument
-#: (a fresh isolated import under the profiler), not a bigger runtime roster.
-_LIBRARY_CODE_OBJECT_COUNT = 79
-
-#: Reported separately, as a STATIC fact, never as the dynamic denominator.
-_IMPORT_TIME_CODE_OBJECT_COUNT = 85
+#: The module body and five class bodies are reported separately as a STATIC
+#: fact, never folded into the selected runtime denominator.
 _IMPORT_TIME_ONLY_BODIES = 6
 
 
@@ -3667,12 +3710,12 @@ def _assert_surface_literals(approved):
     kills by crashing instead of by violating the property it names.
     """
     labels, approved_labels, deep = _validate_surface_partition(approved)
-    assert (len(labels), len(approved_labels), len(deep)) == (
-        _LIBRARY_CODE_OBJECT_COUNT, 11, _LIBRARY_CODE_OBJECT_COUNT - 11,
-    ), (
+    assert (len(labels), len(approved_labels), len(deep)) == \
+            _LIBRARY_CODE_OBJECT_COUNTS, (
         f"library runtime surface: {len(labels)} code objects, "
         f"{len(approved_labels)} approved, {len(deep)} deep. Expected "
-        f"{_LIBRARY_CODE_OBJECT_COUNT}/11/{_LIBRARY_CODE_OBJECT_COUNT - 11}. A "
+        f"{_LIBRARY_CODE_OBJECT_COUNTS[0]}/{_LIBRARY_CODE_OBJECT_COUNTS[1]}/"
+        f"{_LIBRARY_CODE_OBJECT_COUNTS[2]}. A "
         f"code object appeared, left, or moved between the sets: classify it "
         f"deliberately. Do NOT edit the literal to make this green"
     )
@@ -3684,7 +3727,7 @@ def _assert_surface_literals(approved):
 
 
 def test_the_library_surface_partition_is_exact():
-    """79 total, 11 approved, 68 deep -- as literals, and as exact sets.
+    """This CPython minor's total/approved/deep literals and exact sets agree.
 
     IF THIS FAILS BECAUSE THE COUNT MOVED: a code object appeared in or left the
     library and is unclassified. Add it to the approved list WITH A REASON it is
@@ -3761,9 +3804,15 @@ def test_a_nested_deep_code_object_fires_the_tracer():
     assert candidates, "no nested deep code object is callable as a probe"
     key, label = sorted(candidates, key=lambda item: item[1])[0]
     probe = types.FunctionType(by_id[key], vars(library))
-    # NOT a faulting probe: a comprehension over an empty iterator returns
-    # cleanly, so any exception here is a real failure and must propagate.
-    entered = _deep_calls_of(lambda: probe(iter(())))
+    # NOT a faulting probe: a nested callable over an empty iterator returns
+    # cleanly. Generators on 3.12+ do not enter their frame until iteration, so
+    # exhaust the empty result to prove the nested code object actually ran.
+    def run_probe():
+        result = probe(iter(()))
+        if by_id[key].co_flags & inspect.CO_GENERATOR:
+            tuple(result)
+
+    entered = _deep_calls_of(run_probe)
     assert label in entered, (
         f"a nested deep code object ({label}) ran and the tracer did not record "
         f"it, so nested objects are unwatched"
@@ -3895,7 +3944,7 @@ def test_the_child_the_wal_fixture_runs_is_pinned_by_content():
 
 
 def test_the_import_time_census_is_a_separate_fact():
-    """85 code objects exist; 79 are reachable by a pin. Both, never conflated.
+    """Import-time and pin-reachable counts stay exact and never conflated.
 
     The six extra are the module body and five class bodies. They execute at
     IMPORT, before any boundary pin runs, so a pin cannot re-enter them -- they
@@ -3917,9 +3966,9 @@ def test_the_import_time_census_is_a_separate_fact():
         f"the module, reported beside the runtime roster and never as its "
         f"denominator"
     )
-    assert total - _LIBRARY_CODE_OBJECT_COUNT == _IMPORT_TIME_ONLY_BODIES, (
+    assert total - _LIBRARY_CODE_OBJECT_COUNTS[0] == _IMPORT_TIME_ONLY_BODIES, (
         f"the import-time-only bodies moved to "
-        f"{total - _LIBRARY_CODE_OBJECT_COUNT}: a new class body or module-level "
+        f"{total - _LIBRARY_CODE_OBJECT_COUNTS[0]}: a new class body or module-level "
         f"executable block appeared, and it runs where this gate cannot see"
     )
 
@@ -3945,7 +3994,7 @@ def test_a_real_deep_label_in_the_allowlist_kills_the_gate():
     with pytest.raises(AssertionError) as caught:
         _assert_surface_literals(set(_APPROVED_BOUNDARY_SURFACE) | {victim})
     message = str(caught.value)
-    assert "approved" in message and ("12" in message or "drifted" in message), (
+    assert "approved" in message and "moved between the sets" in message, (
         f"the gate raised, but not about the allowlist widening: {message[:200]}"
     )
 
