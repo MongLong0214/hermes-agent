@@ -110,7 +110,7 @@ def _import_verb():
     return module, ""
 
 
-def _run_verb(store, backup, *, dry_run=False) -> VerbRun:
+def _run_verb(store, backup, *, dry_run=False, work_dir=None) -> VerbRun:
     """Drive the verb THROUGH `cmd_sessions`, so the wiring is under test too.
 
     Going straight at the handler would pass while ``hermes sessions
@@ -124,6 +124,7 @@ def _run_verb(store, backup, *, dry_run=False) -> VerbRun:
         store=store,
         backup=backup,
         dry_run=dry_run,
+        work_dir=work_dir,
     )
     out, err = io.StringIO(), io.StringIO()
     crash = ""
@@ -588,6 +589,28 @@ def check_the_dry_run_reports_the_plan_and_changes_no_byte(
     every trigger — so "the rows look the same afterwards" would pass on a
     store the rehearsal had modified. The bytes are the only statement that
     cannot be satisfied by a rehearsal that quietly wrote.
+
+    THIS PIN IS SQLITE-VERSION-SENSITIVE, AND THE DIRECTORY LISTING IS WHY
+        The digest covers the main file AND every sidecar, and the listing
+        assertion at the end covers the directory. That pair is not belt and
+        braces: they catch different things, and for a while only one build of
+        SQLite could show it. Observed on this exact source, same test, same
+        arguments, only the interpreter differing::
+
+            SQLite 3.50.4   passed   store opened journal_mode=DELETE (the
+                                     WAL-reset-bug fallback), so no sidecar
+                                     ever exists and nothing can be left
+            SQLite 3.53.1   FAILED   WAL is enabled; a `mode=ro` probe of the
+                                     store created `state.db-wal` (0 bytes,
+                                     sha e3b0c442…) and `state.db-shm`, and
+                                     3.53.1 leaves them behind on close
+
+        `state.db` was byte-identical in both. Nothing was written. The
+        directory still gained two files, which is a change to what the
+        operator was promised would be left alone — so the fix was to stop the
+        dry run opening the store at all, not to loosen this. A future reader
+        who sees this pass should not conclude the property is build-independent
+        without checking which SQLite they ran on.
     """
     _sandbox_home(tmpdir)
     module, why = _import_verb()
@@ -668,6 +691,12 @@ def check_the_dry_run_refuses_what_the_real_run_would_refuse(
 
     Both invocations are asserted here TOGETHER, so the claim is the agreement
     rather than either verdict on its own.
+
+    Also SQLite-version-sensitive, for the reason spelled out in
+    :func:`check_the_dry_run_reports_the_plan_and_changes_no_byte`: the digest
+    below passed on SQLite 3.50.4 and failed on 3.53.1 while `state.db` itself
+    was byte-identical, because a `mode=ro` probe of a WAL-mode store leaves
+    `-wal` and `-shm` behind on the newer build.
     """
     _sandbox_home(tmpdir)
     module, why = _import_verb()
@@ -868,8 +897,14 @@ SOURCE_MUTATIONS = (
     Mutation(
         pin="check_the_dry_run_reports_the_plan_and_changes_no_byte",
         module="hermes_cli/session_fence_rollback_cmd.py",
-        find="    if dry_run:\n        return _report_rehearsal(store, backup)\n",
-        replace="    if False:\n        return _report_rehearsal(store, backup)\n",
+        find=(
+            "    if dry_run:\n"
+            "        return _report_rehearsal(store, backup, work_parent)\n"
+        ),
+        replace=(
+            "    if False:\n"
+            "        return _report_rehearsal(store, backup, work_parent)\n"
+        ),
         why="a --dry-run that falls through to the real operation is worse "
             "than no dry run at all: the operator asked what would happen and "
             "it happened",

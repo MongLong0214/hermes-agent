@@ -62,6 +62,7 @@ THE RETURN LEG
 
 from __future__ import annotations
 
+import hashlib
 import shutil
 import sqlite3
 from pathlib import Path
@@ -140,7 +141,7 @@ def rollback_trigger_names() -> tuple[str, ...]:
     )
 
 
-def _installed_fence_triggers(store_path: Path) -> list[str]:
+def _installed_fence_triggers(store_path: Path, *, report_as: Path = None) -> list[str]:
     """The fence triggers a store carries, read WITHOUT opening it as a store.
 
     A plain read-only connection, deliberately. ``SessionDB.__init__`` runs
@@ -153,12 +154,21 @@ def _installed_fence_triggers(store_path: Path) -> list[str]:
     what the first version of this module did, and
     ``test_rollback_verifies_the_installed_surface_before_changing_anything``
     is what noticed.
+
+    ``mode=ro`` IS NOT "TOUCHES NOTHING". It makes the MAIN FILE read-only and
+    says nothing about the sidecars: against a ``journal_mode=wal`` store with
+    no ``-wal`` beside it, this connection CREATES ``-wal`` and ``-shm``, and
+    whether they survive its close differs by SQLite build. So a caller that
+    has promised to leave a directory as it found it must point this at a copy
+    — see :func:`rehearse_turn_fence_rollback` — and pass *report_as* so the
+    refusal still names the store the operator typed rather than the copy.
     """
+    reported = Path(report_as) if report_as is not None else store_path
     try:
         conn = sqlite3.connect(f"file:{store_path}?mode=ro", uri=True)
     except sqlite3.DatabaseError as exc:
         raise TurnFenceRollbackRefused(
-            f"{store_path} could not be opened as a database at all: {exc}. "
+            f"{reported} could not be opened as a database at all: {exc}. "
             "Nothing was changed",
             reason="store-unreadable",
         ) from exc
@@ -175,7 +185,7 @@ def _installed_fence_triggers(store_path: Path) -> list[str]:
         # DIFFERENT next move from "a database that is not this fence", so it
         # gets a different reason rather than being folded into the mismatch.
         raise TurnFenceRollbackRefused(
-            f"{store_path} does not read as a SQLite database: {exc}. "
+            f"{reported} does not read as a SQLite database: {exc}. "
             "Nothing was changed",
             reason="store-unreadable",
         ) from exc
@@ -255,7 +265,77 @@ def _refuse_unusable_backup_path(backup_path: Path) -> None:
         )
 
 
-def _refuse_if_this_process_owns_a_turn(store_path: Path) -> None:
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _byte_copy_of_the_store(store_path: Path, destination: Path) -> dict[str, Any]:
+    """A copy of the store made with FILE I/O ONLY, verified byte-for-byte.
+
+    WHY NOT :func:`_make_verified_backup`, WHICH ALREADY COPIES AND VERIFIES
+        Because that one verifies by opening the SOURCE and comparing rows, and
+        opening the source is the thing this exists to avoid. See
+        :func:`_installed_fence_triggers`: ``mode=ro`` constrains the main file
+        and not the sidecars, so any SQLite open of a WAL-mode store can add
+        ``-wal`` and ``-shm`` to the operator's directory. A dry run that does
+        that has changed the directory it promised to leave alone.
+
+        So the verification here is on BYTES: every file is copied, then the
+        source and the copy are both re-read and their digests compared. A
+        byte-identical copy of the main file and every sidecar IS the store —
+        including any ``-wal`` holding committed frames that have not been
+        checkpointed, which is exactly what an ``immutable=1`` open would have
+        silently skipped. Row-level verification still happens, one level down,
+        when the rehearsal's own rollback writes its backup off this copy.
+
+    A digest that moves between the two reads means something is writing to the
+    store right now, which is not a store this operation may proceed on.
+    """
+    copied: list[str] = []
+    names = [""] + [suffix for suffix in _SIDECAR_SUFFIXES]
+    try:
+        for suffix in names:
+            source = store_path.with_name(store_path.name + suffix)
+            if suffix and not source.is_file():
+                continue
+            shutil.copyfile(source, destination.with_name(destination.name + suffix))
+            copied.append(suffix or destination.name)
+    except OSError as exc:
+        raise TurnFenceRollbackRefused(
+            f"the store at {store_path} could not be copied for the rehearsal: "
+            f"{exc}",
+            reason="rehearsal-unwritable",
+        ) from exc
+
+    drifted = []
+    for suffix in names:
+        source = store_path.with_name(store_path.name + suffix)
+        mirror = destination.with_name(destination.name + suffix)
+        if not source.is_file() and not mirror.is_file():
+            continue
+        if not source.is_file() or not mirror.is_file():
+            drifted.append(suffix or "(main)")
+            continue
+        if _sha256(source) != _sha256(mirror):
+            drifted.append(suffix or "(main)")
+    if drifted:
+        raise TurnFenceRollbackRefused(
+            f"the rehearsal copy of {store_path} does not reproduce it "
+            f"byte-for-byte ({', '.join(drifted)} differ), which means the "
+            "store changed while it was being read. A rehearsal of a moving "
+            "store is a rehearsal of nothing",
+            reason="store-in-use",
+        )
+    return {"copy": str(destination), "files": copied}
+
+
+def _refuse_if_this_process_owns_a_turn(
+    store_path: Path, *, identity_path: Path = None
+) -> None:
     """Close the ONE branch of the liveness predicate that is keyed by path.
 
     :meth:`SessionDB._turn_lease_row_is_free` frees a row whose ``owner_pid``
@@ -272,8 +352,14 @@ def _refuse_if_this_process_owns_a_turn(store_path: Path) -> None:
     names, and only for the process-local registry. This is not a second
     opinion about liveness: the row-reading branches stay where they are, on
     :func:`_refuse_if_live`.
+
+    The ROWS may be read from anywhere faithful — a rehearsal hands the copy —
+    but *identity_path* is what the registry is keyed on, and defaults to the
+    file the rows came from.
     """
     from hermes_state import live_turn_grant
+
+    identity = Path(identity_path) if identity_path is not None else store_path
 
     conn = sqlite3.connect(f"file:{store_path}?mode=ro", uri=True)
     try:
@@ -283,7 +369,7 @@ def _refuse_if_this_process_owns_a_turn(store_path: Path) -> None:
         ).fetchall()
     except sqlite3.DatabaseError as exc:
         raise TurnFenceRollbackRefused(
-            f"could not read the turn leases of {store_path}: {exc}",
+            f"could not read the turn leases of {identity}: {exc}",
             reason="store-unreadable",
         ) from exc
     finally:
@@ -292,11 +378,11 @@ def _refuse_if_this_process_owns_a_turn(store_path: Path) -> None:
     held = sorted(
         str(row[0])
         for row in rows
-        if live_turn_grant(store_path, str(row[0])) is not None
+        if live_turn_grant(identity, str(row[0])) is not None
     )
     if held:
         raise TurnFenceRollbackRefused(
-            f"refusing to roll back the turn fence on {store_path}: this "
+            f"refusing to roll back the turn fence on {identity}: this "
             f"process holds a live turn on {held}, so the real run would "
             "refuse. End those turns first",
             reason="live-turn",
@@ -440,11 +526,31 @@ def rehearse_turn_fence_rollback(
         interesting drift is the one where the rehearsal says idle and the real
         run disagrees.
 
-        So the rehearsal copies the store and its sidecars, verifies the copy
-        reproduces every fenced table row-for-row, and then runs the ACTUAL
-        :func:`rollback_turn_fence` on the copy. The store itself sees one
-        read-only connection and one file read. What comes back is not a
-        prediction — it is the operation, performed.
+        So the rehearsal copies the store and its sidecars with FILE I/O, and
+        every SQLite open — the surface probe, the lease read, the liveness
+        check, and the ACTUAL :func:`rollback_turn_fence` — happens against
+        that copy. What comes back is not a prediction; it is the operation,
+        performed, somewhere else.
+
+    THE STORE IS NEVER OPENED BY SQLITE HERE, AND ``mode=ro`` IS WHY
+        An earlier version did the surface probe on the original, reasoning
+        that ``mode=ro`` cannot change anything. It can. ``mode=ro`` governs
+        the MAIN FILE; against a ``journal_mode=wal`` store with no ``-wal``
+        beside it, the connection creates ``-wal`` and ``-shm``, and whether
+        those survive its close is a property of the SQLite build:
+
+            SQLite 3.50.4  the store is opened journal_mode=DELETE anyway (the
+                           WAL-reset-bug fallback), so nothing appears — the
+                           defect was invisible on this build
+            SQLite 3.53.1  WAL is enabled, and `-wal` (empty) plus `-shm` are
+                           left behind by a read-only probe
+
+        Nothing was written — the ``-wal`` is zero bytes — but the operator's
+        directory gained two files, and this verb's whole promise is that it
+        inspected and changed nothing. ``immutable=1`` would suppress them and
+        is not the fix: it also makes SQLite ignore a ``-wal`` that holds
+        committed frames, so the rehearsal would silently read a stale store.
+        Copying first is the only answer that is both faithful and inert.
     """
     store_path = Path(store_path)
     backup_path = Path(backup_path)
@@ -458,13 +564,6 @@ def rehearse_turn_fence_rollback(
             )
         progress["target_present"] = True
 
-        expected = sorted(rollback_trigger_names())
-        installed = _installed_fence_triggers(store_path)
-        _refuse_unexpected_surface(store_path, installed, expected)
-        progress["surface_verified"] = True
-
-        _refuse_if_this_process_owns_a_turn(store_path)
-
         try:
             work_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -474,8 +573,17 @@ def rehearse_turn_fence_rollback(
                 reason="rehearsal-unwritable",
             ) from exc
 
+        # FIRST, before any SQLite open, so every later step reads the copy.
         copy = work_dir / "rehearsal.db"
-        snapshot = _make_verified_backup(store_path, copy)
+        snapshot = _byte_copy_of_the_store(store_path, copy)
+
+        expected = sorted(rollback_trigger_names())
+        installed = _installed_fence_triggers(copy, report_as=store_path)
+        _refuse_unexpected_surface(store_path, installed, expected)
+        progress["surface_verified"] = True
+
+        _refuse_if_this_process_owns_a_turn(copy, identity_path=store_path)
+
         try:
             performed = rollback_turn_fence(
                 copy, backup_path=work_dir / "rehearsal-backup.db"
@@ -509,7 +617,7 @@ def rehearse_turn_fence_rollback(
         "would_drop": performed["dropped_triggers"],
         "rehearsal": {
             "copy": str(copy),
-            "rows": snapshot["rows"],
+            "copied_files": snapshot["files"],
         },
         "preflight": dict(progress),
     }

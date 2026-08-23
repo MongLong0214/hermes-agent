@@ -44,7 +44,6 @@ OUTPUT CONTRACT
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import sqlite3
 import sys
@@ -104,6 +103,16 @@ def add_fence_rollback_parser(sessions_subparsers):
             "real run would remove. The store is not modified"
         ),
     )
+    parser.add_argument(
+        "--work-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Existing directory for --dry-run's disposable copy of the store "
+            "(defaults to the system temporary directory). Point it at a "
+            "volume with room for a second copy of a large store"
+        ),
+    )
     return parser
 
 
@@ -112,22 +121,47 @@ def run_fence_rollback(args) -> int:
     store = Path(getattr(args, "store")).expanduser()
     backup = Path(getattr(args, "backup")).expanduser()
     dry_run = bool(getattr(args, "dry_run", False))
+    work_parent = getattr(args, "work_dir", None)
+    work_parent = Path(work_parent).expanduser() if work_parent else None
 
     if dry_run:
-        return _report_rehearsal(store, backup)
+        return _report_rehearsal(store, backup, work_parent)
     return _report_rollback(store, backup)
 
 
-def _report_rehearsal(store: Path, backup: Path) -> int:
-    """``--dry-run``: rehearse on a copy, report the plan, touch nothing."""
+def _report_rehearsal(store: Path, backup: Path, work_parent: Path = None) -> int:
+    """``--dry-run``: rehearse on a copy, report the plan, touch nothing.
+
+    THE COPY DOES NOT GO IN THE OPERATOR'S DIRECTORY. An earlier version put it
+    beside the store, reasoning that a hidden subdirectory removed in a
+    ``finally`` leaves the listing exactly as it found it. It does — until the
+    process dies hard, and then a full UNFENCED duplicate of every conversation
+    is sitting next to the original with nothing to draw attention to it.
+    ``mkdtemp`` is 0700 and lives where the platform already expects disposable
+    copies; ``--work-dir`` moves it for a store too large for that volume.
+    """
+    import tempfile
+
     from hermes_cli import session_fence_rollback as rollback
 
-    # Beside the STORE, not beside the backup. The store's directory is one the
-    # real run must already be able to write (SQLite puts its journal there),
-    # and using it means the rehearsal needs no early opinion about the backup
-    # path — which is what lets the dry run check things in the same order the
-    # real run does. Hidden, PID-suffixed, and removed in the `finally` below.
-    work_dir = store.parent / f".{store.name}.fence-rehearsal-{os.getpid()}"
+    if work_parent is not None and not work_parent.is_dir():
+        return _emit_refusal(
+            rollback.TurnFenceRollbackRefused(
+                f"--work-dir {work_parent} is not an existing directory, so "
+                "the dry run has nowhere to put its copy",
+                reason="rehearsal-unwritable",
+            ),
+            store=store, backup=backup, dry_run=True,
+        )
+    try:
+        work_dir = Path(tempfile.mkdtemp(
+            prefix="hermes-fence-rehearsal-",
+            dir=str(work_parent) if work_parent is not None else None,
+        ))
+    except OSError as exc:
+        return _emit_refusal(
+            _unexpected(exc), store=store, backup=backup, dry_run=True
+        )
     try:
         try:
             plan = rollback.rehearse_turn_fence_rollback(
@@ -155,6 +189,11 @@ def _report_rehearsal(store: Path, backup: Path) -> int:
             "would_drop": plan["would_drop"],
             "dropped_triggers": [],
             "preflight": plan["preflight"],
+            # Which files the rehearsal had to copy to be faithful. An
+            # operator looking at `["rehearsal.db", "-wal"]` can see that the
+            # store had uncheckpointed frames and that they were carried over,
+            # rather than taking "it would work" on trust.
+            "rehearsed_on": plan["rehearsal"]["copied_files"],
         }
     )
     return 0
