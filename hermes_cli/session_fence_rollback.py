@@ -197,7 +197,7 @@ def _installed_fence_triggers(store_path: Path, *, report_as: Path = None) -> li
             reason="store-unreadable",
         ) from exc
     finally:
-        conn.close()
+        cleanup_without_displacing(conn.close)
 
 
 def _refuse_unexpected_surface(store_path: Path, installed, expected) -> None:
@@ -321,7 +321,7 @@ def _refuse_if_live(store_path: Path, *, report_as: Path = None) -> None:
             reason="live-turn",
         ) from exc
     finally:
-        db.close()
+        cleanup_without_displacing(db.close)
 
 
 def _refuse_unusable_backup_path(backup_path: Path) -> None:
@@ -1376,6 +1376,30 @@ def residue_sentence(record: dict) -> str:
     return f"  Left behind: {where} — {what}{detail}"
 
 
+def cleanup_without_displacing(action) -> None:
+    """Run a ``finally`` cleanup without discarding the exception in flight.
+
+    Raising inside a ``finally`` DESTROYS the live exception — the refusal that
+    decided the run never reaches the caller and a cleanup failure takes its
+    place. An explicit ``raise`` there is easy to spot; a ``close()`` or an
+    ``execute("ROLLBACK")`` that happens to fail is the same trap wearing
+    ordinary clothes, and it only shows when both go wrong at once.
+
+    So: when something is already propagating, a cleanup failure is swallowed —
+    the primary refusal outranks it, and what was left behind is recorded on
+    the ledger rather than thrown. When nothing is propagating, the cleanup
+    failure IS the failure and is raised normally.
+    """
+    import sys as _sys
+
+    in_flight = _sys.exc_info()[0] is not None
+    try:
+        action()
+    except BaseException:
+        if not in_flight:
+            raise
+
+
 def _fsync_the_directory(directory: Path) -> None:
     """Flush the DIRECTORY ENTRY, not only the bytes.
 
@@ -1429,7 +1453,7 @@ def _verify_the_snapshot_restores(
             reason="backup-unreadable",
         ) from exc
     finally:
-        conn.close()
+        cleanup_without_displacing(conn.close)
 
     if found != expected_rows:
         differing = sorted(
@@ -1516,6 +1540,7 @@ def _make_verified_backup(
     staging = None
     reservation = None
     report = None
+    staging_left = None
     try:
         try:
             staging = Path(
@@ -1599,31 +1624,45 @@ def _make_verified_backup(
                     )
         raise
     finally:
+        # RECORDS. NEVER RAISES. Raising inside a `finally` DISCARDS the
+        # exception already in flight — the language destroys it, so the
+        # refusal that actually decided this run never reaches the caller and
+        # a cleanup problem takes its place. That is a late failure retracting
+        # an established fact, delivered by control flow instead of by an
+        # assignment, and it is invisible unless both happen at once.
         if staging is not None:
-            residue = sweep_work_dir(staging)
-            if residue is not None:
-                if outcome is not None:
-                    outcome.note_residue(
-                        describe_residue(
-                            residue,
-                            obligation="the backup staging directory",
-                            outcome=outcome,
-                        ),
-                        incident=f"staging:{staging}",
-                    )
-                # The durable backup is NOT removed. It exists, it restores,
-                # and telling the operator otherwise to keep the failure tidy
-                # is the same lie as reporting success over residue.
-                refused = TurnFenceRollbackRefused(
-                    f"the backup of {store_path} landed, and its staging copy "
-                    f"could not be removed: {residue['files']} file(s) remain "
-                    f"under {residue['work_dir']}{residue['error']}. That copy "
-                    "is a duplicate of every conversation in the store — "
-                    "remove that directory. The rollback did not proceed",
-                    reason="backup-staging-residue",
+            staging_left = sweep_work_dir(staging)
+            if staging_left is not None and outcome is not None:
+                outcome.note_residue(
+                    describe_residue(
+                        staging_left,
+                        obligation="the backup staging directory",
+                        outcome=outcome,
+                    ),
+                    incident=f"staging:{staging}",
                 )
-                refused.residue = residue
-                raise refused
+
+    # OUTSIDE the finally, so this is reached only when nothing else was in
+    # flight. When something was, the residue above is carried on the ledger
+    # and the original refusal propagates untouched.
+    if staging_left is not None:
+        # RENDERED FROM THE OUTCOME, not from the branch that is printing.
+        # "The backup landed" is a claim about the final verified-and-durable
+        # fact, and on this path that fact is false three ways.
+        landed = bool(getattr(outcome, "backup_durable", False))
+        opening = (
+            f"the backup of {store_path} landed, and its staging copy could "
+            "not be removed"
+            if landed
+            else f"the staging copy of the backup of {store_path} could not be removed"
+        )
+        raise TurnFenceRollbackRefused(
+            f"{opening}: {staging_left['files']} file(s) remain under "
+            f"{staging_left['work_dir']}{staging_left['error']}. That copy is "
+            "a duplicate of every conversation in the store — remove that "
+            "directory. The rollback did not proceed",
+            reason="backup-staging-residue",
+        )
 
     return report
 
@@ -1824,7 +1863,7 @@ def _commit_the_rollback(
             # phase writes nothing, so rolling back is what actually happened;
             # and it leaves exactly one COMMIT in this module, which is the one
             # whose outcome an operator has to be told about.
-            conn.execute("ROLLBACK")
+            cleanup_without_displacing(lambda: conn.execute("ROLLBACK"))
         if outcome is not None:
             outcome.advance("preflight-passed")
 
@@ -1880,7 +1919,7 @@ def _commit_the_rollback(
         if outcome is not None:
             outcome.advance("committed")
     finally:
-        conn.close()
+        cleanup_without_displacing(conn.close)
     return backup
 
 

@@ -3466,6 +3466,102 @@ def check_every_surviving_destination_member_is_reported_exactly_once(
     assert _installed_triggers(store) == triggers_before
 
 
+def check_a_cleanup_failure_never_replaces_the_refusal_that_decided_the_run(
+    tmpdir: pathlib.Path,
+) -> None:
+    """A ``finally`` that raises DESTROYS the exception already in flight.
+
+    Python discards the live exception when a ``finally`` raises, so the
+    refusal that actually decided the run never reaches the caller and a
+    cleanup problem takes its place. That is a late failure retracting an
+    established fact — the same obligation as the ledger's — delivered by
+    control flow instead of by an assignment, which is why it survived the
+    ledger being made monotonic. It is invisible unless two things go wrong at
+    once, and this pin is the case where they do.
+
+    An explicit ``raise`` in a ``finally`` is easy to see. A ``close()`` or an
+    ``execute("ROLLBACK")`` that happens to fail is the identical trap in
+    ordinary clothes, so cleanup here records and lets the original propagate,
+    and only raises when nothing else is propagating.
+
+    AND THE PROSE IS RENDERED FROM THE OUTCOME. "The backup landed" is a claim
+    about the final verified-and-durable fact; on this path that fact is false
+    three ways, and the sentence was being written by the branch that happened
+    to be printing rather than read from the thing that decides it.
+    """
+    _sandbox_home(tmpdir)
+    module, why = _import_verb()
+    assert module is not None, f"there is no fence-rollback verb: {why}"
+
+    from hermes_cli import session_fence_rollback as library
+
+    store = tmpdir / "state.db"
+    _fenced_store(store, leave_lease_live=False)
+    triggers_before = _installed_triggers(store)
+    work_dir = tmpdir / "work"
+    work_dir.mkdir()
+
+    class _StagingSurvives:
+        def __init__(self, real):
+            self._real = real
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+        def rmtree(self, path, *args, **kwargs):
+            if pathlib.Path(path).name.startswith(".fence-rollback-backup-"):
+                return None
+            return self._real.rmtree(path, *args, **kwargs)
+
+    def _pin_the_wal_sidecar(path, op):
+        if op == "unlink" and path.name.endswith("backup.db-wal"):
+            raise PermissionError("pinned sidecar")
+
+    real_shutil = library.shutil
+    library.shutil = _StagingSurvives(real_shutil)
+    try:
+        run = _drive_the_boundary_with_unlink_failing(
+            library, store, work_dir, _pin_the_wal_sidecar
+        )
+    finally:
+        library.shutil = real_shutil
+
+    facts = run["outcome"].facts()
+    assert not run["result"]["crash"], f"the boundary crashed: {run['result']['crash']}"
+    assert run["result"]["returned"] is None, (
+        f"the run reported a backup: {run['result']['returned']!r}"
+    )
+
+    assert run["result"]["reason"] == "backup-destination-residue", (
+        "a cleanup problem in a finally replaced the refusal that decided this "
+        f"run: {run['result']['reason']!r}. The staging sweep is additive — it "
+        "never becomes the reason the run failed"
+    )
+    assert "landed" not in run["result"]["detail"], (
+        "the message says the backup landed, and the outcome says it was "
+        f"never created, verified or made durable: {run['result']['detail']!r}"
+    )
+
+    incidents = sorted(record["incident"] for record in facts["residue"])
+    assert len(incidents) == len(set(incidents)) and len(incidents) == 2, (
+        "two physical incidents — a pinned sidecar and an un-swept staging "
+        f"directory — are not reported exactly once each: {facts['residue']!r}"
+    )
+    assert any(i.startswith("staging:") for i in incidents), (
+        f"the staging directory is not reported: {incidents!r}"
+    )
+    assert any(i.startswith("destination:") for i in incidents), (
+        f"the pinned sidecar is not reported: {incidents!r}"
+    )
+
+    assert facts["backup_created"] is False, f"a backup is claimed: {facts!r}"
+    assert facts["backup_verified"] is False, f"a valid backup is claimed: {facts!r}"
+    assert facts["backup_durable"] is False, f"durability is claimed: {facts!r}"
+    assert facts["changed"] is False
+    assert _installed_triggers(run["copy"]) == triggers_before
+    assert _installed_triggers(store) == triggers_before
+
+
 PINS = {
     "check_the_verb_is_registered_under_sessions_and_names_its_target":
         check_the_verb_is_registered_under_sessions_and_names_its_target,
@@ -3509,6 +3605,8 @@ PINS = {
         check_a_sidecar_that_vanished_is_not_claimed_as_our_removal,
     "check_every_surviving_destination_member_is_reported_exactly_once":
         check_every_surviving_destination_member_is_reported_exactly_once,
+    "check_a_cleanup_failure_never_replaces_the_refusal_that_decided_the_run":
+        check_a_cleanup_failure_never_replaces_the_refusal_that_decided_the_run,
     "check_a_late_failure_does_not_retract_what_already_happened":
         check_a_late_failure_does_not_retract_what_already_happened,
     "check_the_completed_rehearsal_reports_the_surface_it_removed":
@@ -3768,6 +3866,21 @@ SOURCE_MUTATIONS = (
         why="releasing a reserved name without checking what it resolves to "
             "now deletes a file this run never created. Nothing about the "
             "result would look wrong afterwards, and deletion has no way back",
+    ),
+    Mutation(
+        pin="check_a_cleanup_failure_never_replaces_the_refusal_that_decided_the_run",
+        module="hermes_cli/session_fence_rollback.py",
+        find='                    incident=f"staging:{staging}",\n                )\n',
+        replace='                    incident=f"staging:{staging}",\n                )\n'
+                "                raise TurnFenceRollbackRefused(\n"
+                '                    "the backup staging copy could not be removed",\n'
+                '                    reason="backup-staging-residue",\n'
+                "                )\n",
+        why="raising inside a finally discards the exception already in "
+            "flight, so the refusal that decided the run is destroyed and a "
+            "cleanup problem takes its place. The records stay correct and the "
+            "primary reason contradicts them, which is the hardest kind of "
+            "wrong report to notice",
     ),
     Mutation(
         pin="check_every_surviving_destination_member_is_reported_exactly_once",
