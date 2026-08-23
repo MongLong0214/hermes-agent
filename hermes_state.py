@@ -7981,8 +7981,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                             ``_delegate_from`` marker chain, and every row it
                             finds is deleted outright too.
         the severed children
-                            ``UPDATE sessions SET parent_session_id = NULL
-                            WHERE parent_session_id IN (…)`` runs over the
+                            the orphaning statement — which sets
+                            ``parent_session_id`` to NULL for every direct
+                            child — runs over the
                             union of the two above. A COMPRESSION child of a
                             named row resolves to that row's own root, so the
                             named grant already covers it; a BRANCH child does
