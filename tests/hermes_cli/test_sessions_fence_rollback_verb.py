@@ -3845,13 +3845,12 @@ SOURCE_MUTATIONS = (
     Mutation(
         pin="check_a_sidecar_that_cannot_be_released_is_not_a_successful_backup",
         module="hermes_cli/session_fence_rollback.py",
-        find="        except OSError as exc:\n"
-             '            return {"path": str(member), "error": f"{type(exc).__name__}: {exc}"}\n'
-             "        self.identities.pop(suffix, None)\n"
-             "        return None",
-        replace="        except OSError:\n            pass\n"
-                "        self.identities.pop(suffix, None)\n"
-                "        return None",
+        find="        try:\n            os.unlink(member)\n"
+             "        except OSError as exc:\n"
+             '            return {"path": str(member), "files": 1,\n'
+             '                    "error": f"{type(exc).__name__}: {exc}"}\n',
+        replace="        try:\n            os.unlink(member)\n"
+                "        except OSError:\n            pass\n",
         why="swallowing the unlink failure is the defect: the reservation is "
             "still on disk and the run reports a verified, durable backup with "
             "a stale -wal beside it, which the next reader takes for that "
@@ -3861,7 +3860,7 @@ SOURCE_MUTATIONS = (
         pin="check_a_foreign_file_at_a_reserved_sidecar_is_never_deleted",
         module="hermes_cli/session_fence_rollback.py",
         find="        if identity is not None and (info.st_dev, info.st_ino) != identity:\n"
-             '            return {"path": str(member), "error": "ownership-lost"}\n',
+             '            return {"path": str(member), "files": 1, "error": "ownership-lost"}\n',
         replace="",
         why="releasing a reserved name without checking what it resolves to "
             "now deletes a file this run never created. Nothing about the "
@@ -3969,9 +3968,8 @@ SOURCE_MUTATIONS = (
     Mutation(
         pin="check_a_partial_destination_collision_keeps_only_what_the_run_created",
         module="hermes_cli/session_fence_rollback.py",
-        find="        if reservation is not None:\n"
-             "            reservation.remove_only_what_we_created()\n",
-        replace="        if reservation is not None:\n            pass\n",
+        find="            for problem in reservation.remove_only_what_we_created():\n",
+        replace="            for problem in []:\n",
         why="the run still refuses, and still refuses for the right reason — "
             "what it stops doing is removing the half-built destination it "
             "created before hitting the occupied sibling. The operator who "
