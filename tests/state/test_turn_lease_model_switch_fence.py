@@ -129,6 +129,69 @@ def _owned_session(db, session_id="s", *, tag="owner"):
 # The properties.
 # ---------------------------------------------------------------------------
 
+def _the_in_transaction_guard_still_refuses(db, session_id, write) -> None:
+    """Take the lease DURING the flush, i.e. AFTER the advisory read.
+
+    ``update_session_model`` and ``update_session_meta`` now carry two
+    admission points: ``_refuse_before_side_effects`` before the token-queue
+    barrier, and ``_check_turn_lease_guard`` inside ``BEGIN IMMEDIATE``. With
+    both in place, "a bystander is refused" is satisfied by either, so removing
+    the in-transaction guard stopped killing these pins — the harness reported
+    exactly that, and it was right: the pins had become claims about the pair
+    rather than about the guard.
+
+    So each pin also drives this leg. The conversation is FREE when the call
+    starts, and the lease is taken inside ``flush_token_counts``, which runs
+    between the advisory read and the write transaction. The advisory check has
+    already returned "no finding" and cannot be consulted again; only the guard
+    inside the transaction can refuse. That is the property worth pinning
+    anyway: the early refusal exists to protect side effects, it is not the
+    authority.
+    """
+    from hermes_state import SessionTurnLeaseLostError
+
+    db.create_session("window", "test")
+    db.append_message("window", "user", "window context")
+    db.update_session_model("window", "anthropic/claude-before")
+    before = _replay_state(db, "window")
+    assert db.get_session_turn_lease("window") is None, (
+        "the conversation must start FREE or the advisory check refuses first "
+        "and this leg measures the wrong guard"
+    )
+
+    taken = {}
+    original_flush = db.flush_token_counts
+
+    def _flush_and_take_the_lease(*args, **kwargs):
+        db.flush_token_counts = original_flush
+        taken["grant"] = db.try_acquire_session_turn_lease(
+            "window", _holder("landed-mid-call"), ttl_seconds=600
+        )
+        return original_flush(*args, **kwargs)
+
+    db.flush_token_counts = _flush_and_take_the_lease
+    try:
+        write(db, "window")
+    except SessionTurnLeaseLostError:
+        pass
+    else:
+        raise AssertionError(
+            "a write was admitted although the conversation was taken between "
+            "the advisory read and the write transaction. The advisory check "
+            "cannot see that, which is why it is not the authority"
+        )
+    finally:
+        db.flush_token_counts = original_flush
+    assert taken.get("grant"), (
+        "the lease was never taken, so the window was never opened and this "
+        "leg proves nothing"
+    )
+    assert _replay_state(db, "window") == before, (
+        f"the refused write changed the route anyway: "
+        f"{_replay_state(db, 'window')!r} != {before!r}"
+    )
+
+
 def check_a_model_switch_is_refused_while_a_live_owner_holds_it(tmpdir) -> None:
     """/model against a conversation somebody is mid-turn on.
 
@@ -175,6 +238,11 @@ def check_a_model_switch_is_refused_while_a_live_owner_holds_it(tmpdir) -> None:
         assert _replay_state(db, "s")[0] == "anthropic/claude-free", (
             "holderless model switches are refused even on a free "
             "conversation, which breaks every single-writer install"
+        )
+
+        _the_in_transaction_guard_still_refuses(
+            db, "s",
+            lambda d, sid: d.update_session_model(sid, "anthropic/claude-window"),
         )
     finally:
         db.close()
@@ -263,6 +331,14 @@ def check_a_meta_write_is_refused_while_a_live_owner_holds_it(tmpdir) -> None:
         after = _replay_state(db, "s")
         assert after[0] == "anthropic/claude-owner", (
             f"the owner's own meta write was refused: {after!r}"
+        )
+
+        _the_in_transaction_guard_still_refuses(
+            db, "s",
+            lambda d, sid: d.update_session_meta(
+                sid, json.dumps({"gateway_runtime": "window"}),
+                model="anthropic/claude-window",
+            ),
         )
     finally:
         db.close()
