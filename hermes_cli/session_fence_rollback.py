@@ -68,6 +68,7 @@ THE RETURN LEG
 from __future__ import annotations
 
 import hashlib
+import io
 import os
 import shutil
 import sqlite3
@@ -426,11 +427,18 @@ class _PrivateCopy:
         self.path = Path(path)
         self.work_dir = Path(work_dir)
         self.identity = identity
-        #: THE OBJECT, not a name for it. Opened once by the preparer, in the
-        #: same call that created the file, and carried through decide →
-        #: backup → DDL. Nothing downstream resolves the pathname again, so
-        #: there is no window for a substitution to land in — the property
-        #: holds by construction rather than by checking more often.
+        #: THE OBJECT, and it has no pathname at all. Deserialized from the
+        #: bytes this run read, so there is nothing for a rename to act on at
+        #: any point in its life — not downstream, and not inside the preparer
+        #: either, which is where the previous version still had two intervals
+        #: (copy → lstat → connect) and lost an A→B→A across the last one.
+        #:
+        #: An earlier comment here claimed "one pathname resolution, at the
+        #: instant it was created". That was false: creation and the SQLite
+        #: open were separate resolutions with an interval between them, and
+        #: same-call and 0700 close nothing against a same-UID actor. The
+        #: sentence is recorded because it is the kind that stops the next
+        #: reader looking.
         self.connection = connection
 
     def close(self) -> None:
@@ -492,6 +500,34 @@ class _PrivateCopy:
             )
 
 
+def _as_a_rollback_journal_image(image: bytes) -> bytes:
+    """Declare the working image rollback-journal so it can back a memory DB.
+
+    A WAL-mode image cannot: ``BEGIN EXCLUSIVE`` on it fails with "unable to
+    open database file", because there is nowhere for a write-ahead log to
+    live. Measured identically on SQLite 3.50.4 and 3.53.1, and it is only
+    reachable on a build that enables WAL — which is exactly the divergence the
+    dual-runtime requirement exists to surface, since the other build would
+    have gone on passing.
+
+    Bytes 18 and 19 of the SQLite header are the file-format write and read
+    versions: 2 is WAL, 1 is a rollback journal. Nothing else is touched, and
+    this is safe here for a specific reason — an artifact with sidecars beside
+    it was already refused above, so anything reaching this point is fully
+    checkpointed and its main image is the whole database. The declaration is
+    changed; no content is.
+
+    Applied to the IN-MEMORY working copy only. The on-disk evidence copy keeps
+    the bytes exactly as they were read.
+    """
+    if len(image) < 20:
+        return image
+    patched = bytearray(image)
+    patched[18] = 1
+    patched[19] = 1
+    return bytes(patched)
+
+
 def prepare_the_private_copy(
     store_path: Path, *, work_dir: Path, bound: "BoundTarget" = None
 ) -> "_PrivateCopy":
@@ -518,22 +554,67 @@ def prepare_the_private_copy(
             reason="rehearsal-unwritable",
         ) from exc
     copy = private / "preflight.db"
-    _byte_copy_of_the_store(
-        store_path, copy, what="pre-flight",
-        collision_reason="rehearsal-unwritable",
-        bound=bound,
-    )
-    info = os.lstat(copy)
-    # OPENED HERE, and never re-opened. One pathname resolution for the whole
-    # life of this artifact, at the instant it was created inside a directory
-    # this process made and named.
-    try:
-        connection = sqlite3.connect(str(copy), isolation_level=None, timeout=1.0)
-    except sqlite3.DatabaseError as exc:
+
+    # THE MAIN IMAGE IS NOT THE STORE WHEN SIDECARS EXIST. A row committed into
+    # an uncheckpointed -wal is in the database and not in the file, so an
+    # image taken without it is a different database that opens cleanly and is
+    # quietly missing data. Refuse rather than deserialize something
+    # insufficient — the same verdict the in-place path already reaches.
+    beside = [
+        str(store_path.with_name(store_path.name + suffix))
+        for suffix in _SIDECAR_SUFFIXES
+        if store_path.with_name(store_path.name + suffix).exists()
+    ]
+    if beside:
         raise TurnFenceRollbackRefused(
-            f"the private copy of {store_path} could not be opened: {exc}",
+            f"{store_path} has SQLite sidecars beside it ({', '.join(beside)}), "
+            "so its main image is not the whole database and a copy of that "
+            "image would be silently short of committed rows. Nothing was "
+            "changed",
+            reason="target-not-quiesced",
+        )
+
+    # READ ONCE, THROUGH THE DESCRIPTOR THIS RUN ALREADY HOLDS. These bytes are
+    # the artifact from here on: the on-disk copy below is written FROM them
+    # and is evidence, not the subject.
+    try:
+        if bound is not None:
+            with bound.open_for_reading() as reader:
+                image = reader.read()
+        else:
+            with open(store_path, "rb") as reader:
+                image = reader.read()
+    except OSError as exc:
+        raise TurnFenceRollbackRefused(
+            f"{store_path} could not be read: {exc}", reason="store-unreadable"
+        ) from exc
+
+    try:
+        _copy_onto_a_destination_we_created(
+            None, copy, source_handle=io.BytesIO(image)
+        )
+    except OSError as exc:
+        raise TurnFenceRollbackRefused(
+            f"a private copy of {store_path} could not be written under "
+            f"{private}: {exc}",
+            reason="rehearsal-unwritable",
+        ) from exc
+
+    # THE MUTABLE OBJECT HAS NO NAME. Loaded from the bytes in hand, so decide,
+    # backup and DDL all act on something no rename can reach. This is the
+    # difference between closing the window and observing it more often, and
+    # observing it more often is what failed twice.
+    connection = sqlite3.connect(":memory:", isolation_level=None)
+    try:
+        connection.deserialize(_as_a_rollback_journal_image(image))
+    except (sqlite3.DatabaseError, OverflowError, BufferError) as exc:
+        connection.close()
+        raise TurnFenceRollbackRefused(
+            f"{store_path} does not read as a SQLite database: {exc}. "
+            "Nothing was changed",
             reason="store-unreadable",
         ) from exc
+    info = os.lstat(copy)
     return _PrivateCopy(
         _ONLY_THE_PREPARER, copy, private, (info.st_dev, info.st_ino), connection
     )

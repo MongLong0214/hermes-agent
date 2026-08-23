@@ -785,22 +785,27 @@ def _drive_the_boundary_and_meddle_after_the_backup(
     so this is the same entry the rehearsal uses and the same one an
     authority-bearing caller would.
     """
-    prepared = library.prepare_the_private_copy(store, work_dir=work_dir)
-    copy = pathlib.Path(prepared.path)
     backup = work_dir / "backup.db"
     outcome = library.RollbackOutcome()
-    state = {"backed_up": False}
+    state = {"backed_up": False, "copy": None}
     real_backup = library._make_verified_backup
 
     def _backup_then_meddle(*args, **kwargs):
         report = real_backup(*args, **kwargs)
         state["backed_up"] = True
-        meddle(copy, backup)
+        meddle(state["copy"], backup)
         return report
 
+    # ARMED BEFORE THE PREPARER RUNS. A probe that begins at the boundary a fix
+    # defends can only confirm that fix; the preparer has its own sequence, and
+    # a defect that moves into it is invisible to an observer installed after
+    # it returns. That is not hypothetical here — it is how a green suite sat
+    # over a live A->B->A for a round.
     library._make_verified_backup = _backup_then_meddle
     result = {"reason": "", "detail": "", "crash": ""}
     try:
+        prepared = library.prepare_the_private_copy(store, work_dir=work_dir)
+        state["copy"] = copy = pathlib.Path(prepared.path)
         library._commit_the_rollback(
             prepared, backup, sorted(hermes_state_common.TURN_FENCE_TRIGGERS),
             report_as=store, outcome=outcome,
@@ -813,129 +818,9 @@ def _drive_the_boundary_and_meddle_after_the_backup(
     finally:
         library._make_verified_backup = real_backup
     return {
-        "copy": copy, "backup": backup, "outcome": outcome,
+        "copy": state["copy"], "backup": backup, "outcome": outcome,
         "result": result, "backed_up": state["backed_up"],
     }
-
-
-def check_a_lease_taken_after_preflight_still_refuses_the_rollback(
-    tmpdir: pathlib.Path,
-) -> None:
-    """Check and use, bound by ONE exclusion boundary. Nothing weaker.
-
-    Every writer in this program must check root, holder and epoch in the same
-    transaction as its DML. The operation that REMOVES that fence does not get
-    a weaker standard, and it had one: liveness was decided once and used much
-    later, with only the trigger surface re-checked before the drops. Surface
-    is not liveness.
-
-    THE WINDOW MOVED WITH THE BACKUP, AND SO DOES THIS
-        The backup cannot run inside a transaction — ``VACUUM INTO`` refuses
-        and the online backup API deadlocks against a source holding
-        ``BEGIN EXCLUSIVE``, both measured — so the lock is released for it and
-        every decision is taken again under the lock that drops. That release
-        IS the window, and a turn acquired in it is exactly the interleave the
-        fence exists to stop. So the barrier sits there: the backup lands, a
-        real child takes a real lease through the ordinary API, and only then
-        does the second decision run.
-
-        Deterministic, not timed. The child confirms its grant on stdout before
-        the parent continues, then CLOSES its connection and stays alive — with
-        nothing held open, ``BEGIN EXCLUSIVE`` still succeeds, so the refusal
-        has to come from the LEASE ROW or not at all. An idle connection does
-        not prevent ``BEGIN EXCLUSIVE`` either, which is the same point from
-        the other side.
-    """
-    _sandbox_home(tmpdir)
-    module, why = _import_verb()
-    assert module is not None, f"there is no fence-rollback verb: {why}"
-
-    from hermes_cli import session_fence_rollback as library
-
-    store = tmpdir / "state.db"
-    _fenced_store(store, leave_lease_live=False)
-    rows_before = _canonical_rows(store)
-    triggers_before = _installed_triggers(store)
-    work_dir = tmpdir / "work"
-    work_dir.mkdir()
-
-    child_script = textwrap.dedent(
-        """
-        import os
-        import pathlib
-        import sys
-        from hermes_state import SessionDB
-
-        db = SessionDB(db_path=pathlib.Path(sys.argv[1]))
-        grant = db.try_acquire_session_turn_lease(
-            "keep", "pid=%d:turn=late:platform=test" % os.getpid(),
-            ttl_seconds=600,
-        )
-        db.close()
-        print("GRANT" if grant else "NO-GRANT", flush=True)
-        # Stay alive, holding nothing open, until the parent closes stdin.
-        sys.stdin.read()
-        """
-    )
-    started = {}
-
-    def _a_turn_starts_in_the_backup_window(copy, backup):
-        if "child" in started:
-            return
-        child = subprocess.Popen(
-            [sys.executable, "-c", child_script, str(copy)],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            text=True, env=dict(os.environ),
-        )
-        started["child"] = child
-        # One blocking read, not a poll: the child prints exactly one line once
-        # the grant is decided, so the parent resumes at a known point.
-        started["grant"] = (child.stdout.readline() or "").strip()
-
-    try:
-        run = _drive_the_boundary_and_meddle_after_the_backup(
-            library, store, work_dir, _a_turn_starts_in_the_backup_window
-        )
-    finally:
-        child = started.get("child")
-        if child is not None:
-            try:
-                child.stdin.close()
-            except Exception:
-                pass
-            try:
-                child.wait(timeout=30)
-            except Exception:
-                child.kill()
-
-    assert run["backed_up"], "the backup never landed, so there was no window"
-    assert started.get("grant") == "GRANT", (
-        "the barrier child did not actually acquire the turn lease "
-        f"({started.get('grant')!r}), so this pin measures nothing — it would "
-        "pass against a boundary with no second liveness decision at all"
-    )
-    assert not run["result"]["crash"], f"the boundary crashed: {run['result']['crash']}"
-    assert run["result"]["reason"] == "live-turn", (
-        "a turn was acquired between the backup and the drops and the rollback "
-        f"went ahead anyway: {run['result']!r}. The fence came off underneath a "
-        "live conversation, which is the exact interleave it exists to prevent"
-    )
-    assert "keep" in run["result"]["detail"], (
-        f"the refusal does not name the conversation: {run['result']!r}"
-    )
-    assert _installed_triggers(run["copy"]) == sorted(
-        hermes_state_common.TURN_FENCE_TRIGGERS
-    ), "the rollback dropped triggers out from under a live turn"
-    facts = run["outcome"].facts()
-    assert facts["changed"] is False, (
-        f"nothing was dropped and the run says it changed the store: {facts!r}"
-    )
-    assert not run["backup"].exists(), (
-        "a run refused inside the boundary still left a backup on disk, so the "
-        "backup does not correspond to a state anything relied on"
-    )
-    assert _canonical_rows(store) == rows_before
-    assert _installed_triggers(store) == triggers_before
 
 
 def check_a_target_swapped_for_another_valid_store_is_refused(
@@ -1561,120 +1446,6 @@ def check_no_in_place_run_succeeds_and_each_wrong_target_names_its_own_reason(
     )
 
 
-def check_the_backup_is_a_logical_copy_that_restores_the_pre_rollback_state(
-    tmpdir: pathlib.Path,
-) -> None:
-    """A backup is proven by RESTORING it, and it captures COMMITTED state.
-
-    Two claims, and the second is what makes the first mean anything.
-
-    IT IS TAKEN BY SQLITE, FROM THE SOURCE CONNECTION. Whether that is
-    ``VACUUM INTO`` (this repo already uses it, ``hermes_state.py:14858``) or
-    the online backup API is not this pin's business — both produce a database
-    the engine assembled from the source's committed view, and the property is
-    what they have in common, not the artifact one of them happens to leave.
-    A copy of the main file has neither: it reproduces whatever bytes are on
-    disk, and committed state does not have to be there yet. So the artifact
-    carries a row that is COMMITTED and lives only in an uncheckpointed
-    ``-wal`` — asserted as bytes, in the main file and in the sidecar, before
-    anything is copied — and the restored backup has to contain it.
-
-    IT RESTORES. Not "it opens" — an earlier version proved the backup by
-    opening it, and a file that opens can be missing every row the operator
-    needs. So it is copied to a fresh path, read as a store, and compared
-    against what the artifact carried BEFORE the rollback: the rows, and the
-    fence surface that was still on it then.
-
-    The ``-shm`` leg is observed on the FILE SET before the backup is opened,
-    because opening a WAL-mode database is itself enough to create one. A
-    backup that arrives with a shared-memory file beside it hands its next
-    reader a coordination file for a connection that no longer exists.
-    """
-    _sandbox_home(tmpdir)
-    module, why = _import_verb()
-    assert module is not None, f"there is no fence-rollback verb: {why}"
-
-    from hermes_cli import session_fence_rollback as library
-
-    store = tmpdir / "state.db"
-    _fenced_store(store, leave_lease_live=False)
-    rows_before = _canonical_rows(store)
-    triggers_before = _installed_triggers(store)
-
-    marker = "committed-but-not-checkpointed"
-    _commit_a_marker_that_lives_only_in_the_wal(store, marker)
-    wal = store.with_name(store.name + "-wal")
-    assert wal.is_file() and marker.encode() in wal.read_bytes(), (
-        "the fixture did not leave the row in an uncheckpointed -wal, so a "
-        "copy of the main file would carry it and this pin would measure "
-        f"nothing: {sorted(_family_beside(store))}"
-    )
-    assert marker.encode() not in store.read_bytes(), (
-        "the row reached the MAIN file, so it is not committed state living "
-        "outside it and the property under test is not exercised"
-    )
-
-    work_dir = tmpdir / "work"
-    work_dir.mkdir()
-    outcome = _rehearse(library, store, tmpdir / "backup.db", work_dir)
-    assert not outcome["crash"], f"the rehearsal crashed: {outcome['crash']}"
-
-    backup = work_dir / "rehearsal-backup.db"
-    assert backup.is_file(), (
-        "the rehearsal performed the operation and produced no backup at "
-        f"{backup}: {sorted(p.name for p in work_dir.iterdir())} "
-        f"(refusal: {outcome['reason']} {outcome['detail']})"
-    )
-    # THE FILE SET FIRST. Opening the backup can create the -shm this asserts
-    # the absence of, so the observation has to precede the open.
-    assert _family_beside(backup) == {backup.name}, (
-        "the backup arrived as a FAMILY of files. What the engine hands back "
-        "is one database and nothing else: "
-        f"{sorted(_family_beside(backup))}"
-    )
-
-    assert _pragma(backup, "integrity_check") == "ok", (
-        f"the backup does not pass integrity_check: "
-        f"{_pragma(backup, 'integrity_check')!r}"
-    )
-
-    # RESTORE IT — a copy to a path nothing else knows, read as a store.
-    restored = tmpdir / "restored.db"
-    shutil.copyfile(backup, restored)
-    conn = sqlite3.connect(str(restored))
-    try:
-        rows = conn.execute("SELECT who FROM wal_marker").fetchall()
-        held = sorted(str(row[0]) for row in rows)
-        content = sorted(
-            str(row[0]) for row in conn.execute("SELECT content FROM messages")
-        )
-    except sqlite3.DatabaseError as exc:
-        held = [f"<unreadable: {exc}>"]
-        content = []
-    finally:
-        conn.close()
-    assert held == [marker], (
-        "the restored backup is missing the row that was committed into the "
-        f"-wal: {held!r}. It reproduces the bytes that were in the main file, "
-        "which is not the state the source connection had committed"
-    )
-    assert "irreplaceable" in content, (
-        f"the restored store has lost the message rows: {content!r}"
-    )
-    assert _canonical_rows(restored) == rows_before, (
-        "the backup does not restore the rows the artifact carried before the "
-        "rollback, so it is not a way back"
-    )
-    assert _installed_triggers(restored) == triggers_before, (
-        "the backup was taken AFTER the drops — it restores a store with no "
-        f"fence on it: {_installed_triggers(restored)}"
-    )
-
-    # And the artifact the operator named was never the subject.
-    assert _installed_triggers(store) == triggers_before
-    assert _canonical_rows(store) == rows_before
-
-
 def check_a_partial_destination_collision_keeps_only_what_the_run_created(
     tmpdir: pathlib.Path,
 ) -> None:
@@ -1728,12 +1499,6 @@ def check_a_partial_destination_collision_keeps_only_what_the_run_created(
 
     work_dir = tmpdir / "work"
     work_dir.mkdir()
-    prepared = library.prepare_the_private_copy(store, work_dir=work_dir)
-    target = pathlib.Path(prepared.path)
-    target_triggers = _installed_triggers(target)
-    assert target_triggers == sorted(hermes_state_common.TURN_FENCE_TRIGGERS), (
-        f"the prepared copy is not a fenced store: {target_triggers}"
-    )
 
     backup = work_dir / "backup.db"
     squatter = work_dir / "backup.db-shm"
@@ -1771,16 +1536,24 @@ def check_a_partial_destination_collision_keeps_only_what_the_run_created(
             squatter.write_bytes(squatter_bytes)
 
     outcome = library.RollbackOutcome()
-    # What is in the destination's directory before the run: the private copy
-    # the preparer made, and nothing else. The squatter arrives during it.
-    listing_before = sorted(entry.name for entry in work_dir.iterdir())
 
+    # ARMED BEFORE THE PREPARER RUNS, then the preparer, then the boundary. A
+    # probe that begins at the boundary a fix defends can only confirm that
+    # fix — the preparer has its own sequence and its own seams.
     library._refuse_unusable_backup_path = _a_sidecar_appears_after_the_check
     had_os = hasattr(library, "os")
     previous_os = getattr(library, "os", None)
     library.os = _RecordingOs()
     refusal = {"reason": "", "detail": "", "returned": None, "crash": ""}
+    target = None
     try:
+        prepared = library.prepare_the_private_copy(store, work_dir=work_dir)
+        target = pathlib.Path(prepared.path)
+        target_triggers = _installed_triggers(target)
+        assert target_triggers == sorted(hermes_state_common.TURN_FENCE_TRIGGERS), (
+            f"the prepared copy is not a fenced store: {target_triggers}"
+        )
+        listing_before = sorted(entry.name for entry in work_dir.iterdir())
         refusal["returned"] = library._commit_the_rollback(
             prepared, backup, sorted(hermes_state_common.TURN_FENCE_TRIGGERS),
             report_as=store, outcome=outcome,
@@ -1981,53 +1754,59 @@ def check_a_fault_after_commit_never_reports_that_nothing_changed(
 
     from hermes_cli import session_fence_rollback as library
 
-    def _run_with_a_fault(store, backup, *, break_close: bool):
-        """Drive ``--dry-run`` with the rehearsal's own COMMIT sabotaged."""
+    def _run_with_a_fault(store, backup, *, after_commit: bool):
+        """Drive ``--dry-run`` with the rehearsal's own COMMIT sabotaged.
+
+        The proxy wraps the connection the PREPARER hands back, because the
+        mutable object is deserialized into memory and has no pathname to
+        intercept. An earlier version keyed the injection on a filename, which
+        stopped firing the moment the object stopped having one — a fixture
+        that silently measures nothing.
+        """
 
         class _Connection:
             def __init__(self, real):
                 self._real = real
+                self._committed = False
 
             def __getattr__(self, name):
                 return getattr(self._real, name)
 
             def execute(self, statement, *args, **kwargs):
-                result = self._real.execute(statement, *args, **kwargs)
-                if not break_close and statement.strip().upper() == "COMMIT":
-                    # A COMMIT that really committed and then reported a
-                    # failure. Whether the transaction landed is genuinely
-                    # unknown to the caller, which is the point.
+                if after_commit and self._committed:
+                    # The first statement after a COMMIT that returned: the
+                    # rehearsal's own read-back of what is left. Everything
+                    # between COMMIT and the report is a place a fault can land.
                     raise sqlite3.OperationalError("disk I/O error after COMMIT")
+                result = self._real.execute(statement, *args, **kwargs)
+                if statement.strip().upper() == "COMMIT":
+                    self._committed = True
+                    if not after_commit:
+                        # A COMMIT that really committed and then reported a
+                        # failure. Whether it landed is genuinely unknown to
+                        # the caller, which is the point.
+                        raise sqlite3.OperationalError("disk I/O error on COMMIT")
                 return result
 
-            def close(self):
-                self._real.close()
-                if break_close:
-                    raise sqlite3.OperationalError("disk I/O error on close")
+        real_prepare = library.prepare_the_private_copy
 
-        class _Sqlite:
-            def __getattr__(self, name):
-                return getattr(sqlite3, name)
+        def _prepare_then_sabotage(*args, **kwargs):
+            prepared = real_prepare(*args, **kwargs)
+            prepared.connection = _Connection(prepared.connection)
+            return prepared
 
-            def connect(self, target, *args, **kwargs):
-                real = sqlite3.connect(target, *args, **kwargs)
-                if str(target).endswith("preflight.db"):
-                    return _Connection(real)
-                return real
-
-        previous = library.sqlite3
-        library.sqlite3 = _Sqlite()
+        library.prepare_the_private_copy = _prepare_then_sabotage
         try:
             return _run_verb(store, backup, dry_run=True)
         finally:
-            library.sqlite3 = previous
+            library.prepare_the_private_copy = real_prepare
 
     # (1) The fault lands AFTER a COMMIT that returned.
     done_dir = tmpdir / "committed"
     done_dir.mkdir()
     done_store = done_dir / "state.db"
     _fenced_store(done_store, leave_lease_live=False)
-    late = _run_with_a_fault(done_store, done_dir / "backup.db", break_close=True)
+    late = _run_with_a_fault(done_store, done_dir / "backup.db", after_commit=True)
 
     assert not late.crash, f"the verb crashed on the post-commit fault: {late.crash}"
     done = _payload(late)
@@ -2055,7 +1834,7 @@ def check_a_fault_after_commit_never_reports_that_nothing_changed(
     unknown_store = unknown_dir / "state.db"
     _fenced_store(unknown_store, leave_lease_live=False)
     ambiguous = _run_with_a_fault(
-        unknown_store, unknown_dir / "backup.db", break_close=False
+        unknown_store, unknown_dir / "backup.db", after_commit=False
     )
 
     assert not ambiguous.crash, f"the verb crashed on the failed COMMIT: {ambiguous.crash}"
@@ -2123,9 +1902,9 @@ def check_a_withdrawn_backup_is_never_reported_as_one_the_operator_has(
         _fenced_store(store, leave_lease_live=False)
         work_dir = where / "work"
         work_dir.mkdir()
-        prepared = library.prepare_the_private_copy(store, work_dir=work_dir)
         backup = work_dir / "backup.db"
         outcome = library.RollbackOutcome()
+        held = {"copy": None}
 
         events = []
 
@@ -2164,6 +1943,7 @@ def check_a_withdrawn_backup_is_never_reported_as_one_the_operator_has(
                     reason="surface-mismatch",
                 )
 
+        # ARMED BEFORE THE PREPARER, for the reason recorded above.
         library._make_verified_backup = _backup_then_remember
         library._refuse_unexpected_surface = _fail_the_decision_that_follows_the_backup
         had_os = hasattr(library, "os")
@@ -2171,6 +1951,8 @@ def check_a_withdrawn_backup_is_never_reported_as_one_the_operator_has(
         library.os = _RecordingOs()
         result = {"reason": "", "detail": "", "crash": ""}
         try:
+            prepared = library.prepare_the_private_copy(store, work_dir=work_dir)
+            held["copy"] = pathlib.Path(prepared.path)
             library._commit_the_rollback(
                 prepared, backup,
                 sorted(hermes_state_common.TURN_FENCE_TRIGGERS),
@@ -2189,7 +1971,7 @@ def check_a_withdrawn_backup_is_never_reported_as_one_the_operator_has(
             else:
                 del library.os
         return {
-            "store": store, "target": pathlib.Path(prepared.path),
+            "store": store, "target": held["copy"],
             "backup": backup, "outcome": outcome, "events": events,
             "result": result, "backed_up": state["backed_up"],
         }
@@ -2595,60 +2377,6 @@ def check_the_dry_run_never_reports_that_a_refused_run_would_proceed(
     )
     assert listing_after_rehearsal == listing_before, (
         f"a refused dry run left files behind: {listing_after_rehearsal}"
-    )
-
-
-def check_the_rehearsal_asks_the_liveness_question_of_the_operators_store(
-    tmpdir: pathlib.Path,
-) -> None:
-    """Rehearsing on a copy buys a byte assertion and costs an IDENTITY.
-
-    ``SessionDB._turn_lease_row_is_free`` frees a row whose ``owner_pid`` is
-    this process when this process holds no grant FOR THAT ``db_path`` — a turn
-    that died without releasing. The rehearsal's copy has a different path, so
-    a conversation this very process is genuinely mid-turn on reads FREE on the
-    copy and HELD on the original.
-
-    Measured, not reasoned about: the first version of this rehearsal reported
-    "this would proceed" on exactly the store the real run then refused. The
-    fix is that the in-transaction liveness decision is keyed by the store the
-    operator named rather than by the file it happens to be reading, and that
-    is what this pins — the one place where a copy must not be allowed to
-    answer as itself.
-    """
-    _sandbox_home(tmpdir)
-    module, why = _import_verb()
-    assert module is not None, f"there is no fence-rollback verb: {why}"
-
-    store = tmpdir / "state.db"
-    # The grant stays held BY THIS PROCESS, which is what puts the decision on
-    # the path-keyed branch. A foreign holder would be caught by the row read
-    # and would never exercise the identity this pin is named for.
-    _fenced_store(store, leave_lease_live=True)
-    before = _store_digest(store)
-    listing_before = sorted(entry.name for entry in tmpdir.iterdir())
-
-    run = _run_verb(store, tmpdir / "backup-dry.db", dry_run=True)
-    assert not run.crash, f"the dry run crashed on a live store: {run.crash}"
-    payload = _payload(run)
-    assert payload is not None, f"no machine-readable report: {run.stdout!r}"
-
-    assert payload.get("ok") is False
-    assert payload["refused"]["reason"] == "live-turn", (
-        "a conversation this process is mid-turn on read FREE, because the "
-        "liveness question was answered about the COPY rather than about the "
-        f"store the operator named: {payload['refused']!r}"
-    )
-    assert "keep" in payload["refused"]["detail"], (
-        f"the refusal does not name the conversation: {payload['refused']!r}"
-    )
-    assert _store_digest(store) == before, (
-        f"the dry run changed the store while refusing it: {before} -> "
-        f"{_store_digest(store)}"
-    )
-    assert sorted(entry.name for entry in tmpdir.iterdir()) == listing_before, (
-        f"a refused dry run left files behind: "
-        f"{sorted(entry.name for entry in tmpdir.iterdir())}"
     )
 
 
@@ -3162,9 +2890,9 @@ def _drive_the_boundary_with_unlink_failing(library, store, work_dir, sabotage):
     the private working directory so a sidecar left behind is a real artifact
     in the operator's chosen location, not something the sweep tidies away.
     """
-    prepared = library.prepare_the_private_copy(store, work_dir=work_dir)
     backup = work_dir.parent / "backup.db"
     outcome = library.RollbackOutcome()
+    prepared = {"copy": None}
 
     class _SabotagedOs:
         def __getattr__(self, name):
@@ -3180,11 +2908,14 @@ def _drive_the_boundary_with_unlink_failing(library, store, work_dir, sabotage):
 
     had_os = hasattr(library, "os")
     previous = getattr(library, "os", None)
+    # ARMED BEFORE THE PREPARER, for the reason recorded above.
     library.os = _SabotagedOs()
     result = {"returned": None, "reason": "", "detail": "", "crash": ""}
     try:
+        handle = library.prepare_the_private_copy(store, work_dir=work_dir)
+        prepared["copy"] = pathlib.Path(handle.path)
         result["returned"] = library._commit_the_rollback(
-            prepared, backup, sorted(hermes_state_common.TURN_FENCE_TRIGGERS),
+            handle, backup, sorted(hermes_state_common.TURN_FENCE_TRIGGERS),
             report_as=store, outcome=outcome,
         )
     except library.TurnFenceRollbackRefused as exc:
@@ -3198,7 +2929,7 @@ def _drive_the_boundary_with_unlink_failing(library, store, work_dir, sabotage):
         else:
             del library.os
     return {"backup": backup, "outcome": outcome, "result": result,
-            "copy": pathlib.Path(prepared.path)}
+            "copy": prepared["copy"]}
 
 
 def check_a_sidecar_that_cannot_be_released_is_not_a_successful_backup(
@@ -3594,33 +3325,34 @@ def _identify(path: pathlib.Path) -> dict:
         conn.close()
 
 
-def check_a_target_swapped_and_restored_around_the_open_cannot_be_reached(
+def check_a_target_swapped_and_restored_around_any_open_cannot_be_reached(
     tmpdir: pathlib.Path,
 ) -> None:
-    """A→B→A is invisible to any number of point checks. Hold the object instead.
+    """A→B→A is invisible to any number of point checks. Hold the object.
 
-    The persistent-substitution pin covers A→B: the identity comparison sees
-    the new inode and refuses. It does not cover A→B→A. Rename the prepared
-    copy aside, put a DIFFERENT valid fenced store at its pathname, let the
-    open happen, then put the original back — and every ``stat`` before and
-    after sees A, because the substitution existed only for the instant of the
-    resolution in between. Measured on SQLite 3.53.1: the boundary reported
-    ``outcome=committed changed=true`` with a backup on disk, having neither
-    rehearsed the prepared artifact nor left the substituted one readable.
-    Wrong target and corruption in one run, reported as a success.
+    Rename the prepared copy aside, put a DIFFERENT valid fenced store at its
+    pathname, let an open happen, then put the original back. Every ``stat``
+    before and after sees A, because the substitution existed only for the
+    instant of the resolution in between. Measured: a committed rollback
+    against a store nothing prepared, with the substituted one left corrupted,
+    reported as a successful rehearsal.
+
+    THE PROBE STARTS BEFORE THE CODE'S OWN SETUP, WHICH IS THE POINT
+        An earlier version of this pin installed the swap only after
+        ``prepare_the_private_copy`` returned. That proved the boundary does
+        not reopen the pathname — true, and the thing that had just been fixed
+        — while saying nothing about the preparer's own sequence, which still
+        had copy → lstat → connect: three resolutions and two intervals. The
+        defect had moved one function upstream and the suite was green over it.
+
+        An attacker does not have to attack where the defence is. So this arms
+        the swap FIRST and lets it fire at any resolution of the copy's
+        pathname, wherever the code chooses to make one.
 
     A THIRD CHECK IS NOT THE FIX, BY CONSTRUCTION
-        There was already a check immediately before the open. Adding another
-        makes a third observation with the same window after it — the interval
-        is where the swap lives, and observations do not remove intervals. So
-        the pathname is resolved ONCE, by the preparer, in the call that
-        creates the file, and the connection it returns is carried through
-        decide, backup and DDL. There is no later resolution for a rename to
-        act on, which is why this pin's assertion is a COUNT: zero.
-
-    Both stores are identified by ``user_version`` and by their fence surface,
-    and both are asserted — a run that "did nothing to A" by mutating B has
-    not passed this, and neither has one that left B unreadable.
+        Observations do not remove intervals — the interval is where the swap
+        lives. The mutable object is now deserialized from bytes this run holds
+        and has no pathname at all, so the assertion is a COUNT: zero.
     """
     _sandbox_home(tmpdir)
     module, why = _import_verb()
@@ -3631,6 +3363,7 @@ def check_a_target_swapped_and_restored_around_the_open_cannot_be_reached(
     store = tmpdir / "state.db"
     _fenced_store(store, leave_lease_live=False)
     _stamp(store, 111)
+    a_before = _identify(store)
 
     substitute = tmpdir / "substitute.db"
     _fenced_store(substitute, leave_lease_live=False)
@@ -3642,40 +3375,48 @@ def check_a_target_swapped_and_restored_around_the_open_cannot_be_reached(
 
     work_dir = tmpdir / "work"
     work_dir.mkdir()
-    prepared = library.prepare_the_private_copy(store, work_dir=work_dir)
-    copy = pathlib.Path(prepared.path)
-    aside = work_dir / "prepared.aside"
     backup = work_dir / "backup.db"
-    assert _identify(copy)["user_version"] == 111, "the prepared copy is not A"
-
     resolutions = []
     real_sqlite = library.sqlite3
 
     class _SwapAroundEveryResolution:
-        """A→B→A for the exact instant of any pathname resolution of the copy."""
+        """A→B→A for the exact instant of ANY resolution of the copy's name."""
 
         def __getattr__(self, name):
             return getattr(real_sqlite, name)
 
         def connect(self, target, *args, **kwargs):
-            if str(target) != str(copy):
+            spelled = str(target)
+            if not spelled.endswith("preflight.db"):
                 return real_sqlite.connect(target, *args, **kwargs)
-            resolutions.append(str(target))
-            os.rename(copy, aside)
-            os.rename(substitute, copy)
+            resolutions.append(spelled)
+            here = pathlib.Path(spelled)
+            aside = here.parent / "aside.db"
+            os.rename(here, aside)
+            os.rename(substitute, here)
             try:
                 return real_sqlite.connect(target, *args, **kwargs)
             finally:
-                os.rename(copy, substitute)
-                os.rename(aside, copy)
+                os.rename(here, substitute)
+                os.rename(aside, here)
 
     outcome = library.RollbackOutcome()
+    # ARMED BEFORE THE PREPARER RUNS. The preparer is inside the attack window,
+    # not outside it.
     library.sqlite3 = _SwapAroundEveryResolution()
-    result = {"returned": None, "reason": "", "detail": "", "crash": ""}
+    result = {"returned": None, "reason": "", "detail": "", "crash": "", "copy": None}
     try:
+        prepared = library.prepare_the_private_copy(store, work_dir=work_dir)
+        result["copy"] = pathlib.Path(prepared.path)
         result["returned"] = library._commit_the_rollback(
             prepared, backup, sorted(hermes_state_common.TURN_FENCE_TRIGGERS),
             report_as=store, outcome=outcome,
+        )
+        result["remaining"] = len(
+            prepared.connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger' "
+                "AND name LIKE 'hermes_turn_fence_%'"
+            ).fetchall()
         )
     except library.TurnFenceRollbackRefused as exc:
         result["reason"] = getattr(exc, "reason", "refused")
@@ -3685,42 +3426,31 @@ def check_a_target_swapped_and_restored_around_the_open_cannot_be_reached(
     finally:
         library.sqlite3 = real_sqlite
 
-    assert not result["crash"], f"the boundary crashed: {result['crash']}"
+    assert not result["crash"], f"the run crashed: {result['crash']}"
 
-    a_after = _identify(copy)
-    b_after = _identify(substitute)
-    facts = outcome.facts()
-
-    # THE SUBSTITUTE IS NEVER THIS RUN'S BUSINESS, on either branch.
-    assert b_after["readable"] is True, (
-        "the substituted store was left unreadable — the run wrote to a file "
-        f"nothing prepared: {b_after!r}"
+    # NEITHER STORE IS EVER THIS RUN'S SUBJECT, on either branch.
+    assert _identify(substitute) == b_before, (
+        f"the substituted store was modified: {b_before!r} -> "
+        f"{_identify(substitute)!r}"
     )
-    assert b_after == b_before, (
-        f"the substituted store was modified: {b_before!r} -> {b_after!r}"
+    assert _identify(store) == a_before, (
+        f"the source store was modified: {a_before!r} -> {_identify(store)!r}"
     )
 
     # THE WINDOW ITSELF. Zero is the property; anything else is an interval a
-    # rename can live in, and no number of checks closes an interval.
+    # rename can live in, wherever in the code it happens to be.
     assert resolutions == [], (
-        "the boundary resolved the prepared copy's pathname again after the "
-        f"preparer had already opened it: {resolutions!r}. That interval is "
-        "where A->B->A lands, and it is invisible to a check on either side"
+        "the copy's pathname was resolved by SQLite at least once "
+        f"({len(resolutions)}x), so an A->B->A lands inside that interval and "
+        "is invisible to a check on either side. The object has to be held, "
+        "not looked at again"
     )
 
     if result["returned"] is not None:
-        # It operated, so it must have operated on the artifact that was
-        # prepared — identified, not assumed.
-        assert facts["outcome"] == "committed", f"{facts!r}"
-        assert a_after["readable"] is True, f"the prepared copy is unreadable: {a_after!r}"
-        assert a_after["user_version"] == 111, (
-            "the rollback committed against a store that is not the one "
-            f"prepared: {a_after!r}"
+        assert outcome.facts()["outcome"] == "committed", f"{outcome.facts()!r}"
+        assert result["remaining"] == 0, (
+            f"the rollback did not run against the prepared image: {result!r}"
         )
-        assert a_after["triggers"] == 0, (
-            f"the prepared copy was not the one rehearsed: {a_after!r}"
-        )
-        assert a_after["integrity"] == "ok", f"{a_after!r}"
         landed = _identify(backup)
         assert landed["readable"] and landed["user_version"] == 111, (
             f"the backup describes a store nothing prepared: {landed!r}"
@@ -3729,14 +3459,219 @@ def check_a_target_swapped_and_restored_around_the_open_cannot_be_reached(
             f"the backup was not taken before the drops: {landed!r}"
         )
     else:
-        # It refused, so nothing may have moved on either store.
-        assert facts["outcome"] not in ("committed", "commit-unknown"), f"{facts!r}"
-        assert facts["changed"] is False, f"{facts!r}"
-        assert a_after["readable"] is True, f"the prepared copy is unreadable: {a_after!r}"
-        assert a_after["user_version"] == 111 and a_after["triggers"] == 24, (
-            f"a refused run moved the prepared copy: {a_after!r}"
-        )
+        assert outcome.facts()["outcome"] not in ("committed", "commit-unknown")
+        assert outcome.facts()["changed"] is False
         assert not backup.exists(), "a refused run left a backup behind"
+
+
+def check_the_boundary_decides_liveness_again_keyed_by_the_operators_store(
+    tmpdir: pathlib.Path,
+) -> None:
+    """The pre-flight's answer is a snapshot. The boundary's is the decision.
+
+    ``SessionDB._turn_lease_row_is_free`` frees a row whose ``owner_pid`` is
+    this process when this process holds no grant FOR THAT ``db_path`` — a turn
+    that died without releasing. The pre-flight asks about the private copy, so
+    a conversation this very process is genuinely mid-turn on reads FREE there.
+    The boundary asks again, keyed by the store the operator NAMED, and that is
+    the answer the drops are bound to.
+
+    Measured, not reasoned about: the first version of this rehearsal reported
+    "this would proceed" on exactly the store the real run then refused.
+
+    MERGED FROM TWO PINS, DELIBERATELY. There was a second pin here for "a turn
+    acquired between the backup and the drops". With the mutable object
+    deserialized into memory, no other process can reach it — that interleave
+    is unreachable by construction rather than merely unobserved — and the two
+    pins had collapsed onto one observable that a single mutation killed twice.
+    A redundant check reports coverage it does not have, so it is one pin with
+    one killer, and the reason is recorded rather than the pin quietly dropped.
+    """
+    _sandbox_home(tmpdir)
+    module, why = _import_verb()
+    assert module is not None, f"there is no fence-rollback verb: {why}"
+
+    store = tmpdir / "state.db"
+    # The grant stays held BY THIS PROCESS, which is what puts the decision on
+    # the path-keyed branch. A foreign holder would be caught by the row read
+    # in the pre-flight and would never exercise the identity this pin names.
+    _fenced_store(store, leave_lease_live=True)
+    before = _store_digest(store)
+    listing_before = sorted(entry.name for entry in tmpdir.iterdir())
+
+    run = _run_verb(store, tmpdir / "backup-dry.db", dry_run=True)
+    assert not run.crash, f"the dry run crashed on a live store: {run.crash}"
+    payload = _payload(run)
+    assert payload is not None, f"no machine-readable report: {run.stdout!r}"
+
+    assert payload.get("ok") is False
+    assert payload["preflight"]["offline_verified"] is True, (
+        "the PRE-FLIGHT refused this, so the boundary's own decision was never "
+        f"the one that mattered and this pin measures nothing: {payload['preflight']!r}"
+    )
+    assert payload["refused"]["reason"] == "live-turn", (
+        "a conversation this process is mid-turn on read FREE, because the "
+        "liveness question was answered about the COPY rather than about the "
+        f"store the operator named: {payload['refused']!r}"
+    )
+    assert "keep" in payload["refused"]["detail"], (
+        f"the refusal does not name the conversation: {payload['refused']!r}"
+    )
+    assert _store_digest(store) == before, (
+        f"the dry run changed the store while refusing it: {before} -> "
+        f"{_store_digest(store)}"
+    )
+    assert sorted(entry.name for entry in tmpdir.iterdir()) == listing_before, (
+        f"a refused dry run left files behind: "
+        f"{sorted(entry.name for entry in tmpdir.iterdir())}"
+    )
+
+
+def check_an_artifact_whose_image_is_incomplete_is_refused(
+    tmpdir: pathlib.Path,
+) -> None:
+    """A main file is not the database when a sidecar holds committed rows.
+
+    The working object is deserialized from the artifact's main image. A row
+    committed into an uncheckpointed ``-wal`` is in the database and NOT in
+    that file, so an image taken without it is a different database — one that
+    opens cleanly, passes ``integrity_check``, and is quietly short of rows.
+    Every downstream claim would then be true of something nobody asked about.
+
+    So an artifact with sidecars beside it is refused rather than deserialized,
+    which is the same verdict the in-place path reaches for the same reason.
+    Both stores are asserted untouched: a refusal that reads its subject has
+    not refused it.
+    """
+    _sandbox_home(tmpdir)
+    module, why = _import_verb()
+    assert module is not None, f"there is no fence-rollback verb: {why}"
+
+    store = tmpdir / "state.db"
+    _fenced_store(store, leave_lease_live=False)
+    marker = "committed-but-not-checkpointed"
+    _commit_a_marker_that_lives_only_in_the_wal(store, marker)
+    wal = store.with_name(store.name + "-wal")
+    assert wal.is_file() and marker.encode() in wal.read_bytes(), (
+        "the fixture did not leave the row in an uncheckpointed -wal, so the "
+        f"image would not be short of anything: {sorted(_family_beside(store))}"
+    )
+    assert marker.encode() not in store.read_bytes(), (
+        "the row reached the MAIN file, so the image is complete and this pin "
+        "measures nothing"
+    )
+    digest_before = _store_digest(store)
+    backup = tmpdir / "backup.db"
+
+    run = _run_verb(store, backup, dry_run=True)
+    assert not run.crash, f"the verb crashed: {run.crash}"
+    payload = _payload(run)
+    assert payload is not None, f"no machine-readable report: {run.stdout!r}"
+
+    assert payload["refused"]["reason"] == "target-not-quiesced", (
+        "an artifact whose committed state lives outside its main file was "
+        f"accepted, and every later claim is about a different database: "
+        f"{payload['refused']!r}"
+    )
+    assert payload["changed"] is False
+    assert not backup.exists(), "a refused run wrote a backup"
+    assert _store_digest(store) == digest_before, (
+        f"the refusal rewrote the artifact: {digest_before} -> "
+        f"{_store_digest(store)}"
+    )
+
+
+def check_the_backup_describes_the_prepared_image_not_the_source_path(
+    tmpdir: pathlib.Path,
+) -> None:
+    """The backup comes from the object being rolled back, not from a pathname.
+
+    The engine writes it from the connection the DDL runs on, so it describes
+    the artifact this run prepared. A copy taken from the source PATH describes
+    whatever is at that path when the copy happens — a different object, and on
+    a live-ish store a moving one.
+
+    The two are told apart by changing the source after preparation: the backup
+    must show the prepared state and not the later one. That is a property of
+    both permitted implementations — ``VACUUM INTO`` and the online backup API
+    — and false of any file copy, which is the distinction that matters rather
+    than which call was used.
+    """
+    _sandbox_home(tmpdir)
+    module, why = _import_verb()
+    assert module is not None, f"there is no fence-rollback verb: {why}"
+
+    from hermes_cli import session_fence_rollback as library
+    from hermes_state import SessionDB
+
+    store = tmpdir / "state.db"
+    _fenced_store(store, leave_lease_live=False)
+    rows_before = _canonical_rows(store)
+    triggers_before = _installed_triggers(store)
+
+    work_dir = tmpdir / "work"
+    work_dir.mkdir()
+    added = "written-after-the-image-was-taken"
+    real_backup = library._make_verified_backup
+    moved = {"done": False}
+
+    def _change_the_source_then_back_up(*args, **kwargs):
+        if not moved["done"]:
+            moved["done"] = True
+            db = SessionDB(db_path=store)
+            try:
+                grant = db.try_acquire_session_turn_lease(
+                    "keep", _holder("later"), ttl_seconds=600
+                )
+                db.append_message(
+                    session_id="keep", role="user", content=added,
+                    turn_lease_holder=grant,
+                )
+                db.release_session_turn_lease("keep", grant)
+            finally:
+                db.close()
+        return real_backup(*args, **kwargs)
+
+    library._make_verified_backup = _change_the_source_then_back_up
+    try:
+        outcome = _rehearse(library, store, tmpdir / "backup.db", work_dir)
+    finally:
+        library._make_verified_backup = real_backup
+
+    assert moved["done"], "the source was never changed, so this pin compares nothing"
+    assert not outcome["crash"], f"the rehearsal crashed: {outcome['crash']}"
+    backup = work_dir / "rehearsal-backup.db"
+    assert backup.is_file(), (
+        f"the rehearsal produced no backup: {outcome['reason']!r} {outcome['detail']!r}"
+    )
+    assert _family_beside(backup) == {backup.name}, (
+        f"the backup arrived as a family of files: {sorted(_family_beside(backup))}"
+    )
+
+    conn = sqlite3.connect(str(backup))
+    try:
+        content = sorted(str(r[0]) for r in conn.execute("SELECT content FROM messages"))
+    finally:
+        conn.close()
+    assert added not in content, (
+        "the backup carries a row written to the source AFTER the image was "
+        "taken, so it was copied from the pathname rather than written from "
+        f"the object being rolled back: {content!r}"
+    )
+    assert "irreplaceable" in content, (
+        f"the backup lost the rows the prepared image carried: {content!r}"
+    )
+    assert _installed_triggers(backup) == triggers_before, (
+        "the backup was taken after the drops — it restores an unfenced store: "
+        f"{_installed_triggers(backup)}"
+    )
+    assert _pragma(backup, "integrity_check") == "ok"
+
+    restored = tmpdir / "restored.db"
+    shutil.copyfile(backup, restored)
+    assert _canonical_rows(restored) == rows_before, (
+        "the backup does not restore the state the artifact was prepared from"
+    )
 
 
 PINS = {
@@ -3750,16 +3685,14 @@ PINS = {
         check_the_dry_run_reports_the_plan_and_changes_no_byte,
     "check_the_dry_run_never_reports_that_a_refused_run_would_proceed":
         check_the_dry_run_never_reports_that_a_refused_run_would_proceed,
-    "check_the_rehearsal_asks_the_liveness_question_of_the_operators_store":
-        check_the_rehearsal_asks_the_liveness_question_of_the_operators_store,
+    "check_the_boundary_decides_liveness_again_keyed_by_the_operators_store":
+        check_the_boundary_decides_liveness_again_keyed_by_the_operators_store,
     "check_every_preflight_refusal_leaves_the_artifact_byte_identical":
         check_every_preflight_refusal_leaves_the_artifact_byte_identical,
-    "check_a_lease_taken_after_preflight_still_refuses_the_rollback":
-        check_a_lease_taken_after_preflight_still_refuses_the_rollback,
     "check_a_target_swapped_for_another_valid_store_is_refused":
         check_a_target_swapped_for_another_valid_store_is_refused,
-    "check_a_target_swapped_and_restored_around_the_open_cannot_be_reached":
-        check_a_target_swapped_and_restored_around_the_open_cannot_be_reached,
+    "check_a_target_swapped_and_restored_around_any_open_cannot_be_reached":
+        check_a_target_swapped_and_restored_around_any_open_cannot_be_reached,
     "check_a_destination_appearing_after_the_check_is_never_clobbered":
         check_a_destination_appearing_after_the_check_is_never_clobbered,
     "check_an_orphan_backup_sidecar_is_not_overwritten":
@@ -3794,8 +3727,10 @@ PINS = {
         check_no_in_place_run_succeeds_and_each_wrong_target_names_its_own_reason,
     "check_a_real_invocation_refuses_before_it_observes_the_source":
         check_a_real_invocation_refuses_before_it_observes_the_source,
-    "check_the_backup_is_a_logical_copy_that_restores_the_pre_rollback_state":
-        check_the_backup_is_a_logical_copy_that_restores_the_pre_rollback_state,
+    "check_an_artifact_whose_image_is_incomplete_is_refused":
+        check_an_artifact_whose_image_is_incomplete_is_refused,
+    "check_the_backup_describes_the_prepared_image_not_the_source_path":
+        check_the_backup_describes_the_prepared_image_not_the_source_path,
     "check_a_partial_destination_collision_keeps_only_what_the_run_created":
         check_a_partial_destination_collision_keeps_only_what_the_run_created,
     "check_the_backup_file_itself_is_flushed_to_the_platter":
@@ -3864,7 +3799,7 @@ SOURCE_MUTATIONS = (
             "the one thing a rehearsal may never say",
     ),
     Mutation(
-        pin="check_the_rehearsal_asks_the_liveness_question_of_the_operators_store",
+        pin="check_the_boundary_decides_liveness_again_keyed_by_the_operators_store",
         module="hermes_cli/session_fence_rollback.py",
         find="            report_as=store_path,\n",
         replace="            report_as=None,\n",
@@ -3885,24 +3820,14 @@ SOURCE_MUTATIONS = (
             "it is about to promise was left alone",
     ),
     Mutation(
-        pin="check_a_lease_taken_after_preflight_still_refuses_the_rollback",
+        pin="check_a_target_swapped_and_restored_around_any_open_cannot_be_reached",
         module="hermes_cli/session_fence_rollback.py",
-        find="        private_copy.verify()\n"
-             "        _decide_under_the_lock(conn, reported, expected, bound=None)\n",
-        replace="        private_copy.verify()\n",
-        why="without the SECOND liveness decision the boundary trusts an "
-            "answer taken before the backup, and the backup is exactly when "
-            "the lock is released — a turn acquired in that window watches "
-            "every trigger go. The identity check left in place does not "
-            "cover it: identity is not liveness",
-    ),
-    Mutation(
-        pin="check_a_target_swapped_and_restored_around_the_open_cannot_be_reached",
-        module="hermes_cli/session_fence_rollback.py",
-        find="    conn = private_copy.connection\n",
-        replace="    conn = sqlite3.connect(\n"
-                "        str(target_path), isolation_level=None, timeout=1.0\n"
-                "    )\n",
+        find='    connection = sqlite3.connect(":memory:", isolation_level=None)\n'
+             "    try:\n"
+             "        connection.deserialize(_as_a_rollback_journal_image(image))\n",
+        replace="    connection = sqlite3.connect(str(copy), isolation_level=None)\n"
+                "    try:\n"
+                "        connection.execute(\"SELECT 1\")\n",
         why="re-opening by pathname restores the interval between the last "
             "identity check and the open. A->B->A lands inside it and is "
             "invisible to a stat on either side, so the rollback commits "
@@ -4149,7 +4074,17 @@ SOURCE_MUTATIONS = (
             "directory it is about to say it left alone is not a refusal",
     ),
     Mutation(
-        pin="check_the_backup_is_a_logical_copy_that_restores_the_pre_rollback_state",
+        pin="check_an_artifact_whose_image_is_incomplete_is_refused",
+        module="hermes_cli/session_fence_rollback.py",
+        find="    if beside:\n        raise TurnFenceRollbackRefused(\n",
+        replace="    if False:\n        raise TurnFenceRollbackRefused(\n",
+        why="deserializing an image whose committed rows live in an "
+            "uncheckpointed -wal produces a database that opens cleanly, "
+            "passes integrity_check and is quietly short of data. Every later "
+            "claim is then true of something nobody asked about",
+    ),
+    Mutation(
+        pin="check_the_backup_describes_the_prepared_image_not_the_source_path",
         module="hermes_cli/session_fence_rollback.py",
         find='            conn.execute("VACUUM INTO ?", (str(snapshot),))\n',
         replace="            shutil.copyfile(store_path, snapshot)\n",
