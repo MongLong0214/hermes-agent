@@ -6592,6 +6592,32 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         "  AND COALESCE({alias}source, '') != 'tool'\n"
     )
 
+    # The same exclusion for a RECURSIVE descent, where the parent varies per
+    # row. ``_NON_CONTINUATION_CHILD_FILTER_SQL`` binds one queried parent id
+    # (`!= ?`) and so cannot be used inside a walk; this is the IS NULL form the
+    # sibling walks already use for exactly that reason — the compression
+    # lineage CTE in ``record_gateway_session_peer`` and the forward walk in
+    # ``resolve_resume_session_id``. Not a new rule, the existing one in the
+    # shape a recursive CTE can take.
+    #
+    # Presence-only matching is right HERE and wrong there: a walk that has
+    # descended N generations has no single parent id to bind, and a
+    # continuation that inherited ``_delegate_from`` from a delegate's own
+    # parent is excluded by this form. That is the conservative direction for a
+    # flag write — the lineage keeps one row it could have flipped — where for
+    # orphan reopen and adoption it would have been fail-open.
+    #
+    # One constant rather than four copies because the four writers that use it
+    # are character-identical today and drifted into this defect together;
+    # ``_check_session_flag_write`` gives the same reason for being one helper.
+    _CONTINUATION_DESCENDANT_FILTER_SQL = (
+        "      AND json_extract(COALESCE(child.model_config, '{}'),"
+        " '$._branched_from') IS NULL\n"
+        "      AND json_extract(COALESCE(child.model_config, '{}'),"
+        " '$._delegate_from') IS NULL\n"
+        "      AND COALESCE(child.source, '') != 'tool'\n"
+    )
+
     def find_live_compression_child(
         self, parent_session_id: str
     ) -> Optional[Dict[str, Any]]:
@@ -8217,21 +8243,48 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         finally:
             conn.row_factory = previous
 
+    def _classify_by_granted_root(self, conn, ids, turn_lease_holder):
+        """Split *ids* into (one id the grant names, everything it does NOT).
+
+        By canonical ROOT on both sides, never by id equality. A conversation is
+        a lineage, so it routinely arrives as SEVERAL ids at once — a routing
+        rotation carries the root it is leaving and the continuation it is
+        moving to, and a delete carries the tip plus the rows it severs. Picking
+        one of them as "the named one" and sending its SIBLINGS to the freeness
+        check asks whether the caller's own conversation is owned; it is, by the
+        caller, so it refuses.
+
+        That is not a hypothetical: it is what ``save_gateway_routing_entry``
+        does on an ordinary compression rotation, and it fails there today.
+
+        ``_affected_session_ids`` states the rule in this file already — "a
+        caller that wants 'everything except what my grant covers' filters by
+        root, because id equality is the wrong comparison for a lineage" — and
+        ``_refuse_unless_reached_conversations_are_free`` follows it. The two
+        multi-target admitters did not, so they share this one seam now and
+        cannot drift apart again.
+
+        A holder with no stamped root classifies EVERY id into *rest*, which is
+        the holderless contract unchanged: no grant, so nothing is exempt from
+        freeness.
+        """
+        granted_root = getattr(turn_lease_holder, "conversation_id", None)
+        roots = {
+            sid: self._session_turn_lease_key_on_conn(conn, sid) for sid in ids
+        }
+        named = next((sid for sid in ids if roots[sid] == granted_root), None)
+        rest = [sid for sid in ids if roots[sid] != granted_root]
+        return named, rest
+
     def _admit_on_connection(
         self, conn, ids, because, turn_lease_holder, turn_lease_ttl_seconds
     ) -> None:
-        granted_root = getattr(turn_lease_holder, "conversation_id", None)
-        named = next(
-            (sid for sid in ids
-             if self._session_turn_lease_key_on_conn(conn, sid) == granted_root),
-            None,
-        )
+        named, rest = self._classify_by_granted_root(conn, ids, turn_lease_holder)
         if named is not None:
             self._check_turn_lease_guard(
                 conn, named, turn_lease_holder,
                 turn_lease_ttl_seconds=turn_lease_ttl_seconds,
             )
-        rest = [sid for sid in ids if sid != named]
         if rest:
             self._refuse_if_any_conversation_is_owned(conn, rest, because)
 
@@ -8281,18 +8334,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         affected = self._routing_affected_session_ids(conn, keys, entry_json)
         if not affected:
             return
-        granted_root = getattr(turn_lease_holder, "conversation_id", None)
-        named = next(
-            (sid for sid in affected
-             if self._session_turn_lease_key_on_conn(conn, sid) == granted_root),
-            None,
+        named, rest = self._classify_by_granted_root(
+            conn, affected, turn_lease_holder
         )
         if named is not None:
             self._check_turn_lease_guard(
                 conn, named, turn_lease_holder,
                 turn_lease_ttl_seconds=turn_lease_ttl_seconds,
             )
-        rest = [sid for sid in affected if sid != named]
         if rest:
             self._refuse_if_any_conversation_is_owned(
                 conn, rest,
@@ -8539,6 +8588,46 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return bool(self._execute_write(_do))
 
+    @staticmethod
+    def _scope_release_target(session_id: str, token) -> str:
+        """The id :meth:`session_turn_lease` must release on: the STAMPED root.
+
+        ``release_session_turn_lease`` re-derives a root from the id it is
+        handed, and that is RIGHT and must stay that way: a caller presenting a
+        grant for one conversation while naming another has misaddressed the
+        release, and the pins on that behaviour require it to disturb neither
+        conversation. The derivation is what refuses it.
+
+        This scope is the one caller for which the derivation cannot work, and
+        not by misaddressing — by construction. It acquires against
+        ``root(session_id)``, hands the body a lease, and only THEN releases;
+        the body may have deleted the very row the walk needs. Both shipped
+        delete callers do exactly that: ``DELETE /api/sessions/{id}`` and
+        ``hermes sessions delete`` open this scope on the id the operator named
+        — for a compressed conversation that is the continuation tip every
+        listing shows, not the root — and delete it inside the block.
+
+        ``_session_turn_lease_key_on_conn`` returns an id it cannot find
+        unchanged, so the re-derived root is then the deleted tip, it does not
+        match the root stamped into the grant, authorization returns ``None``,
+        and the release is skipped behind a ``logger.debug``. The conversation
+        stays held FOREVER — this design deliberately removed the clock from
+        ``_turn_lease_row_is_free``, so there is no TTL left to heal it, and
+        ``force_release_session_turn_lease`` has no CLI verb in front of it.
+
+        So the scope releases on what it ACQUIRED on, which it knows and the
+        walk can only guess at. ``_authorize_turn_lease_token``'s own docstring
+        already says why that is the authority: "the grant's root is immutable
+        because it was stamped when the lease was issued". Nothing the body does
+        can move it, deleting rows included. This is not a loosening of the
+        release rule — the token still has to own the row it names.
+
+        The fallback to *session_id* is for a token carrying no stamp. Such a
+        grant is refused a step later anyway, so this keeps that path exactly as
+        it was rather than raising somewhere new.
+        """
+        return getattr(token, "conversation_id", None) or session_id
+
     def release_session_turn_lease(self, session_id: str, holder) -> None:
         """Release a lease iff *holder* still owns it at its generation.
 
@@ -8699,7 +8788,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 token=token, session_id=live_session_id, messages=messages
             )
         finally:
-            self.release_session_turn_lease(session_id, token)
+            # On the root the acquire STAMPED, not the id the caller passed:
+            # the body may have deleted that row, and a release that has to
+            # re-derive its target from a deleted id frees nothing, forever.
+            self.release_session_turn_lease(
+                self._scope_release_target(session_id, token), token
+            )
 
     @contextlib.contextmanager
     def offline_rebuild(self, *, reason: str):
@@ -10630,6 +10724,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     JOIN sessions parent ON parent.id = d.id
                     JOIN sessions child ON child.parent_session_id = parent.id
                     WHERE parent.end_reason = 'compression'
+                """
+                + self._CONTINUATION_DESCENDANT_FILTER_SQL
+                + """
                   ),
                   lineage(id) AS (
                     SELECT id FROM ancestors
@@ -10691,6 +10788,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     JOIN sessions parent ON parent.id = d.id
                     JOIN sessions child ON child.parent_session_id = parent.id
                     WHERE parent.end_reason = 'compression'
+                """
+                + self._CONTINUATION_DESCENDANT_FILTER_SQL
+                + """
                   ),
                   lineage(id) AS (
                     SELECT id FROM ancestors
@@ -10754,6 +10854,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     JOIN sessions parent ON parent.id = d.id
                     JOIN sessions child ON child.parent_session_id = parent.id
                     WHERE parent.end_reason = 'compression'
+                """
+                + self._CONTINUATION_DESCENDANT_FILTER_SQL
+                + """
                   ),
                   lineage(id) AS (
                     SELECT id FROM ancestors
@@ -10823,6 +10926,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     JOIN sessions parent ON parent.id = d.id
                     JOIN sessions child ON child.parent_session_id = parent.id
                     WHERE parent.end_reason = 'compression'
+                """
+                + self._CONTINUATION_DESCENDANT_FILTER_SQL
+                + """
                   ),
                   lineage(id) AS (
                     SELECT id FROM ancestors
