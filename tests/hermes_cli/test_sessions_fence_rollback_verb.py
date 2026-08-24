@@ -5101,7 +5101,36 @@ SOURCE_MUTATIONS = (
     Mutation(
         pin="check_a_foreign_file_at_a_reserved_sidecar_is_never_deleted",
         module="hermes_cli/session_fence_rollback.py",
+        # BOTH checks, not just the first. A second, revalidating lstat now
+        # runs immediately before the unlink (closing the swap-in-the-window
+        # hole below this one) — and on THIS pin's fixture the sabotage fires
+        # on every lstat, not only the first, so it re-swaps in front of that
+        # second check too. Removing only the first check left the second one
+        # standing in for it: the pin kept passing, discriminating nothing —
+        # a redundant check reporting coverage it did not have. Removing both
+        # is what actually restores the "no check at all" state this pin
+        # exists to catch.
         find="        if identity is not None and (info.st_dev, info.st_ino) != identity:\n"
+             '            return {"path": str(member), "files": 1, "error": "ownership-lost"}\n'
+             "        # A SECOND check, immediately before the unlink. The descriptor closed\n"
+             "        # above no longer pins the inode, and the unlink below still names the\n"
+             "        # file by PATH — POSIX has no call that unlinks \"this exact inode at\n"
+             "        # this name\" atomically, and holding the descriptor open across the\n"
+             "        # unlink is not on the table either: the close has to happen first,\n"
+             "        # which is the same ordering Windows requires. So this does not CLOSE\n"
+             "        # the window between the first check and the unlink — nothing built on\n"
+             "        # unlink-by-path can — it SHRINKS it, from \"close, a comparison and a\n"
+             "        # dict pop\" down to the instant right before the call that destroys\n"
+             "        # the file. A name that changed since the FIRST check is caught here\n"
+             "        # instead of silently unlinked.\n"
+             "        try:\n"
+             "            revalidated = os.lstat(member)\n"
+             "        except FileNotFoundError:\n"
+             "            return None\n"
+             "        except OSError as exc:\n"
+             '            return {"path": str(member), "files": 1,\n'
+             '                    "error": f"{type(exc).__name__}: {exc}"}\n'
+             "        if (revalidated.st_dev, revalidated.st_ino) != identity:\n"
              '            return {"path": str(member), "files": 1, "error": "ownership-lost"}\n',
         replace="",
         kills_by='the run deleted a file it did not create at a name it had merely reserved:',
