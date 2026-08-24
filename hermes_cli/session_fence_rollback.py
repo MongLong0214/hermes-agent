@@ -854,8 +854,19 @@ def establish_offline_authority(artifact: Path) -> OfflineAuthority:
 #: states are INTERNAL: they describe a file in a private staging directory
 #: that the operator will never see and that is removed either way. Only the
 #: three ``backup-*`` states are claims about the artifact at the path the
-#: operator named. ``committed`` and ``commit-unknown`` are alternatives at the
-#: same depth: both terminal, and neither may follow the other.
+#: operator named. ``committed``, ``committed-with-residue`` and
+#: ``commit-unknown`` are alternatives at the same depth: all three terminal,
+#: and none may follow another.
+#:
+#: ``committed-with-residue`` exists because a plain ``committed`` is a claim
+#: nobody may make while a ``cleanup_required`` leftover from the sidecar
+#: release is still outstanding — the terminal contract is that a leftover is
+#: never promoted to success, and the COMMIT genuinely landing (unlike
+#: ``commit-unknown``, where whether it landed is unknown) is a separate fact
+#: from whether cleanup finished. Both are true at once here, so both have to
+#: be sayable: ``changed`` becomes ``True`` exactly as it does for
+#: ``committed``, and ``residue_present`` — already independent of ``outcome``
+#: — says the rest.
 _OUTCOME_RANK = {
     "not-started": 0,
     "preflight-passed": 1,
@@ -866,6 +877,7 @@ _OUTCOME_RANK = {
     "backup-durable": 6,
     "committing": 7,
     "committed": 8,
+    "committed-with-residue": 8,
     "commit-unknown": 8,
 }
 
@@ -954,7 +966,7 @@ class RollbackOutcome:
             self.backup_present = True
         elif state in ("committing", "commit-unknown"):
             self.changed = None
-        elif state == "committed":
+        elif state in ("committed", "committed-with-residue"):
             self.changed = True
 
     @property
@@ -1427,31 +1439,66 @@ class _AcquiredDestinations:
         does not try to authorise a delete more carefully; it stops deleting.
         Whatever ``lstat`` finds at *member* after the close is reported, not
         acted on.
+
+        A FAILING CLOSE MUST STILL BE VISIBLE. ``_close_handle`` used to pop
+        its handle out of ``self.handles`` as its very first act and then
+        swallow ``os.close``'s ``OSError`` in a bare ``except: pass`` — so a
+        close that genuinely failed left the fd open on the OS side while
+        every tracking structure had already forgotten it: a leak invisible
+        to any later cleanup pass, because nothing said it still needed
+        handling. ``_close_handle`` now returns a description of that
+        failure instead of swallowing it, and it is folded into whatever
+        this method reports — ``cleanup_required`` (and the ``lstat``
+        ``OSError`` case) already carry an ``error`` string, so a close
+        failure is appended to it rather than requiring new vocabulary.
         """
-        self._close_handle(suffix)
+        close_error = self._close_handle(suffix)
         try:
             os.lstat(member)
         except FileNotFoundError:
-            return None
+            if close_error is None:
+                return None
+            return {"path": str(member), "files": 1, "error": close_error}
         except OSError as exc:
-            return {"path": str(member), "files": 1,
-                    "error": f"{type(exc).__name__}: {exc}"}
-        return {"path": str(member), "files": 1, "error": "cleanup_required"}
+            error = f"{type(exc).__name__}: {exc}"
+            if close_error is not None:
+                error = f"{error}; {close_error}"
+            return {"path": str(member), "files": 1, "error": error}
+        error = "cleanup_required"
+        if close_error is not None:
+            error = f"{error}; {close_error}"
+        return {"path": str(member), "files": 1, "error": error}
 
-    def _close_handle(self, suffix: str) -> None:
-        """Close this name's descriptor. Always safe; always done first.
+    def _close_handle(self, suffix: str):
+        """Close this name's descriptor. Always attempted; never re-attempted.
+
+        Returns ``None`` on an ordinary close (or when there is nothing to
+        close for *suffix*), or a string describing what ``os.close`` raised.
+
+        TRACKING IS DROPPED ONLY AFTER THE ATTEMPT. It used to be popped out
+        of ``self.handles`` as this method's first statement, with the
+        close's ``OSError`` then swallowed in a bare ``except: pass`` — so a
+        close that genuinely failed left the fd open while every tracking
+        structure had already forgotten it: a leak no later cleanup pass
+        could find, because nothing said it still needed handling. The pop
+        now happens in a ``finally``, after the attempt, and a failure comes
+        back as a value instead of vanishing.
 
         The descriptor is a different resource from the name — closing it
         does not by itself give up the name's ownership, which is why
         ``_release`` still holds the suffix claimed in ``self.identities``
         until ``_resolve_release`` returns.
         """
-        handle = self.handles.pop(suffix, None)
-        if handle is not None:
-            try:
-                os.close(handle)
-            except OSError:  # pragma: no cover - already closed
-                pass
+        handle = self.handles.get(suffix)
+        if handle is None:
+            return None
+        try:
+            os.close(handle)
+        except OSError as exc:
+            return f"close failed: {type(exc).__name__}: {exc}"
+        finally:
+            self.handles.pop(suffix, None)
+        return None
 
     def close(self) -> None:
         for suffix in list(self.handles):
@@ -2148,7 +2195,16 @@ def _commit_the_rollback(
             reason="commit-unknown",
         ) from exc
     if outcome is not None:
-        outcome.advance("committed")
+        # A LEFTOVER IS NEVER PROMOTED TO SUCCESS. The COMMIT above genuinely
+        # landed — that fact is real and ``changed`` says so either way — but
+        # a ``cleanup_required`` residue already noted against the ledger (the
+        # sidecar release runs during the backup step, before this point)
+        # means cleanup did not fully complete, and plain ``committed`` is a
+        # claim of exactly that. So the terminal state names which one
+        # happened instead of overwriting the distinction.
+        outcome.advance(
+            "committed-with-residue" if outcome.residue_present else "committed"
+        )
     return backup
 
 

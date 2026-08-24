@@ -86,10 +86,13 @@ def check_the_real_boundary_never_calls_unlink_and_reports_leftovers(
     Nothing between ``acquire()`` and ``release_the_sidecars()`` ever writes to
     or removes the reserved ``-wal``/``-shm``/``-journal`` placeholders, so on
     an ordinary, non-adversarial run they are still on disk when release runs.
-    Under the removed-unlink contract that is not a failure: the rollback
-    still backs up and commits, and each placeholder is reported as
-    ``cleanup_required`` residue rather than silently deleted or silently
-    dropped.
+    Under the removed-unlink contract that is not a failure that BLOCKS the
+    rollback: the backup still lands and the COMMIT still runs, and each
+    placeholder is reported as ``cleanup_required`` residue rather than
+    silently deleted or silently dropped. But it is not a SILENT success
+    either — the terminal contract is that a leftover is never promoted to
+    plain ``committed``, so a run that lands with residue outstanding reports
+    ``committed-with-residue``, not ``committed``.
     """
     pins = _load_verb_pins()
     from hermes_cli import session_fence_rollback as lib
@@ -135,8 +138,16 @@ def check_the_real_boundary_never_calls_unlink_and_reports_leftovers(
         "an ordinary run did not produce a backup — removing the unlink must "
         f"not break the common path: {returned!r}"
     )
-    assert outcome.outcome == "committed", (
-        f"an ordinary run did not commit: {outcome.outcome!r}"
+    assert outcome.outcome == "committed-with-residue", (
+        f"an ordinary run leaves the reserved sidecar placeholders behind as "
+        f"cleanup_required residue, so it must not be promoted to a plain "
+        f"'committed' outcome — a leftover may never be reported as a clean "
+        f"success: {outcome.outcome!r}"
+    )
+    assert outcome.residue_present, (
+        "this pin's own scenario is supposed to leave residue behind; if "
+        "none is present the outcome assertion above is not testing what it "
+        f"claims to: {outcome.facts()!r}"
     )
 
     sidecars = ("-wal", "-shm", "-journal")
@@ -508,6 +519,84 @@ def check_a_sidecar_removed_by_something_else_before_release_is_reported_clean(
         reservation.close()
 
 
+def check_a_close_failure_does_not_vanish_the_fd_from_tracking(tmpdir) -> None:
+    """A ``close()`` that raises must not erase the descriptor from every dict.
+
+    ``_close_handle`` used to pop the handle out of ``self.handles`` as its
+    very first act and then swallow ``os.close``'s ``OSError`` in a bare
+    ``except: pass``. A close that genuinely fails then leaves the fd open on
+    the OS side while ``self.handles`` — and, once ``_release`` pops it,
+    ``self.identities`` too — have already forgotten the suffix: a leak no
+    later cleanup pass can find, because nothing says it still needs
+    handling, and the failure itself is nowhere in the reported outcome.
+
+    Proven directly: ``os.close`` is stubbed to raise for exactly this
+    handle, and afterward the fd is checked with ``os.fstat`` — a real,
+    still-open descriptor, not an inference from the absence of a crash.
+    """
+    import hermes_cli.session_fence_rollback as sfr
+    from hermes_cli.session_fence_rollback import _AcquiredDestinations
+
+    where = pathlib.Path(tmpdir)
+    backup = where / "backup.db"
+    reservation = _AcquiredDestinations(backup)
+    reservation.acquire()
+    suffix = ""
+    handle = reservation.handles[suffix]
+    real_close = os.close
+
+    class _FailingCloseOs(_UnlinkSpy):
+        def close(self, fd, *args, **kwargs):
+            if fd == handle:
+                raise OSError(5, "simulated close failure")
+            return real_close(fd, *args, **kwargs)
+
+    failing = _FailingCloseOs()
+    had_lib_os = hasattr(sfr, "os")
+    previous_lib_os = getattr(sfr, "os", None)
+    sfr.os = failing
+    try:
+        problem = reservation._release(suffix)
+    finally:
+        if had_lib_os:
+            sfr.os = previous_lib_os
+        else:
+            del sfr.os
+
+    try:
+        os.fstat(handle)
+        fd_still_open = True
+    except OSError:
+        fd_still_open = False
+
+    try:
+        assert fd_still_open, (
+            "the injected close failure did not actually leave the fd open, "
+            "so this probe measures nothing about the leak"
+        )
+        assert suffix not in reservation.handles, (
+            f"the handle for suffix {suffix!r} is still tracked after "
+            f"_release: {reservation.handles!r} — that contradicts the "
+            "leak this pin is reproducing"
+        )
+        assert suffix not in reservation.identities, (
+            f"the suffix {suffix!r} is still claimed after _release: "
+            f"{reservation.identities!r}"
+        )
+        assert problem is not None and "close failed" in problem.get("error", ""), (
+            f"a close() that raised OSError was swallowed silently: "
+            f"_release returned {problem!r} with no trace of the failure, "
+            f"even though the fd is still open and now untracked in every "
+            f"dict this object keeps"
+        )
+    finally:
+        if fd_still_open:
+            real_close(handle)
+        reservation.identities.clear()
+        reservation.handles.pop(suffix, None)
+        reservation.close()
+
+
 PINS = {
     "check_the_real_boundary_never_calls_unlink_and_reports_leftovers":
         check_the_real_boundary_never_calls_unlink_and_reports_leftovers,
@@ -521,6 +610,8 @@ PINS = {
         check_a_second_release_of_an_already_resolved_suffix_is_a_safe_no_op,
     "check_a_sidecar_removed_by_something_else_before_release_is_reported_clean":
         check_a_sidecar_removed_by_something_else_before_release_is_reported_clean,
+    "check_a_close_failure_does_not_vanish_the_fd_from_tracking":
+        check_a_close_failure_does_not_vanish_the_fd_from_tracking,
 }
 
 
@@ -536,25 +627,36 @@ def test_sidecar_release_identity_property(name, tmp_path):
 #: each pin's own assertion — not a shared crash detector — is what has to
 #: fire.
 _REINTRODUCE_UNLINK_FIND = (
-    "        self._close_handle(suffix)\n"
+    "        close_error = self._close_handle(suffix)\n"
     "        try:\n"
     "            os.lstat(member)\n"
     "        except FileNotFoundError:\n"
-    "            return None\n"
+    "            if close_error is None:\n"
+    "                return None\n"
+    '            return {"path": str(member), "files": 1, "error": close_error}\n'
     "        except OSError as exc:\n"
-    '            return {"path": str(member), "files": 1,\n'
-    '                    "error": f"{type(exc).__name__}: {exc}"}\n'
-    '        return {"path": str(member), "files": 1, "error": "cleanup_required"}\n'
+    '            error = f"{type(exc).__name__}: {exc}"\n'
+    "            if close_error is not None:\n"
+    '                error = f"{error}; {close_error}"\n'
+    '            return {"path": str(member), "files": 1, "error": error}\n'
+    '        error = "cleanup_required"\n'
+    "        if close_error is not None:\n"
+    '            error = f"{error}; {close_error}"\n'
+    '        return {"path": str(member), "files": 1, "error": error}\n'
 )
 _REINTRODUCE_UNLINK_REPLACE = (
-    "        self._close_handle(suffix)\n"
+    "        close_error = self._close_handle(suffix)\n"
     "        try:\n"
     "            os.lstat(member)\n"
     "        except FileNotFoundError:\n"
-    "            return None\n"
+    "            if close_error is None:\n"
+    "                return None\n"
+    '            return {"path": str(member), "files": 1, "error": close_error}\n'
     "        except OSError as exc:\n"
-    '            return {"path": str(member), "files": 1,\n'
-    '                    "error": f"{type(exc).__name__}: {exc}"}\n'
+    '            error = f"{type(exc).__name__}: {exc}"\n'
+    "            if close_error is not None:\n"
+    '                error = f"{error}; {close_error}"\n'
+    '            return {"path": str(member), "files": 1, "error": error}\n'
     "        try:\n"
     "            os.unlink(member)\n"
     "        except OSError:\n"
@@ -648,12 +750,16 @@ SOURCE_MUTATIONS = (
         pin="check_a_sidecar_removed_by_something_else_before_release_is_reported_clean",
         module="hermes_cli/session_fence_rollback.py",
         find=(
+            "        close_error = self._close_handle(suffix)\n"
             "        try:\n"
             "            os.lstat(member)\n"
             "        except FileNotFoundError:\n"
-            "            return None\n"
+            "            if close_error is None:\n"
+            "                return None\n"
+            '            return {"path": str(member), "files": 1, "error": close_error}\n'
         ),
         replace=(
+            "        close_error = self._close_handle(suffix)\n"
             "        try:\n"
             "            os.lstat(member)\n"
             "        except FileNotFoundError:\n"
@@ -663,6 +769,67 @@ SOURCE_MUTATIONS = (
             "incident. Reporting it as residue sends the operator to a "
             "directory to remove a file that is not there",
         kills_by="a name that resolves to nothing was reported as residue",
+    ),
+    Mutation(
+        pin="check_a_close_failure_does_not_vanish_the_fd_from_tracking",
+        module="hermes_cli/session_fence_rollback.py",
+        find=(
+            "        handle = self.handles.get(suffix)\n"
+            "        if handle is None:\n"
+            "            return None\n"
+            "        try:\n"
+            "            os.close(handle)\n"
+            "        except OSError as exc:\n"
+            '            return f"close failed: {type(exc).__name__}: {exc}"\n'
+            "        finally:\n"
+            "            self.handles.pop(suffix, None)\n"
+            "        return None\n"
+        ),
+        replace=(
+            "        handle = self.handles.pop(suffix, None)\n"
+            "        if handle is not None:\n"
+            "            try:\n"
+            "                os.close(handle)\n"
+            "            except OSError:\n"
+            "                pass\n"
+            "        return None\n"
+        ),
+        why="popping the handle out of self.handles BEFORE the close is "
+            "attempted, and swallowing os.close's OSError in a bare "
+            "except: pass, is the exact hole this pin exists to catch — a "
+            "close that genuinely fails then leaves the fd open while every "
+            "tracking dict has already forgotten it, with no trace of the "
+            "failure anywhere in the reported outcome",
+        kills_by="a close() that raised OSError was swallowed silently",
+    ),
+    Mutation(
+        pin="check_the_real_boundary_never_calls_unlink_and_reports_leftovers",
+        module="hermes_cli/session_fence_rollback.py",
+        find=(
+            "    if outcome is not None:\n"
+            "        # A LEFTOVER IS NEVER PROMOTED TO SUCCESS. The COMMIT above genuinely\n"
+            "        # landed — that fact is real and ``changed`` says so either way — but\n"
+            "        # a ``cleanup_required`` residue already noted against the ledger (the\n"
+            "        # sidecar release runs during the backup step, before this point)\n"
+            "        # means cleanup did not fully complete, and plain ``committed`` is a\n"
+            "        # claim of exactly that. So the terminal state names which one\n"
+            "        # happened instead of overwriting the distinction.\n"
+            '        outcome.advance(\n'
+            '            "committed-with-residue" if outcome.residue_present else "committed"\n'
+            "        )\n"
+            "    return backup\n"
+        ),
+        replace=(
+            "    if outcome is not None:\n"
+            '        outcome.advance("committed")\n'
+            "    return backup\n"
+        ),
+        why="promoting the outcome to a plain 'committed' regardless of "
+            "outstanding cleanup_required residue is exactly bug 2: a "
+            "leftover from the sidecar release must never be reported as a "
+            "clean success",
+        kills_by="an ordinary run leaves the reserved sidecar placeholders "
+            "behind as cleanup_required residue",
     ),
 )
 

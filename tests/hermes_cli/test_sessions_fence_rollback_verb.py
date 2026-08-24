@@ -1214,7 +1214,7 @@ def check_a_fault_after_commit_never_reports_that_nothing_changed(
     late = _run_with_a_fault(tmpdir / "committed", after_commit=True)
     late_facts = late["outcome"].facts()
     assert not late["crash"], f"the machinery crashed: {late['crash']}"
-    assert late_facts["outcome"] == "committed", (
+    assert late_facts["outcome"] in ("committed", "committed-with-residue"), (
         f"a COMMIT that returned is not recorded as one: {late_facts!r}"
     )
     assert late_facts["changed"] is True, (
@@ -1852,10 +1852,13 @@ def check_a_leftover_reserved_sidecar_does_not_block_a_successful_backup(
     whatever is still at the name. Nothing between ``acquire()`` and
     ``release_the_sidecars()`` ever writes to or removes those placeholders,
     so on an ORDINARY, non-adversarial run — no sabotage at all — they are
-    STILL there when release runs. That is not a failure any more: the
-    backup is still verified and durable and the rollback still commits, and
-    each placeholder is reported as ``cleanup_required`` residue rather than
-    silently deleted or silently dropped.
+    STILL there when release runs. That does not FATALLY block the run: the
+    backup is still verified and durable and the DDL still commits, and each
+    placeholder is reported as ``cleanup_required`` residue rather than
+    silently deleted or silently dropped. But it is not a silent success
+    either — the terminal contract is that a leftover is never promoted to
+    success, so the outcome this ordinary run reports is
+    ``committed-with-residue``, not a plain ``committed``.
     """
     _sandbox_home(tmpdir)
     module, why = _import_verb()
@@ -1894,8 +1897,10 @@ def check_a_leftover_reserved_sidecar_does_not_block_a_successful_backup(
     assert facts["backup_verified"] is True, (
         f"a verified backup is not claimed: {facts!r}"
     )
-    assert facts["outcome"] == "committed", (
-        f"an ordinary run did not commit: {facts!r}"
+    assert facts["outcome"] == "committed-with-residue", (
+        f"an ordinary run with a leftover reserved sidecar must not be "
+        f"promoted to a plain 'committed' outcome — a leftover may never be "
+        f"reported as a clean success: {facts!r}"
     )
     assert facts["changed"] is True, (
         f"the run does not report it changed the store: {facts!r}"
@@ -2405,7 +2410,9 @@ def check_a_target_swapped_and_restored_around_any_open_cannot_be_reached(
     )
 
     if result["returned"] is not None:
-        assert outcome.facts()["outcome"] == "committed", f"{outcome.facts()!r}"
+        assert outcome.facts()["outcome"] in (
+            "committed", "committed-with-residue",
+        ), f"{outcome.facts()!r}"
         assert result["remaining"] == 0, (
             f"the rollback did not run against the prepared image: {result!r}"
         )
@@ -2417,7 +2424,9 @@ def check_a_target_swapped_and_restored_around_any_open_cannot_be_reached(
             f"the backup was not taken before the drops: {landed!r}"
         )
     else:
-        assert outcome.facts()["outcome"] not in ("committed", "commit-unknown")
+        assert outcome.facts()["outcome"] not in (
+            "committed", "committed-with-residue", "commit-unknown",
+        )
         assert outcome.facts()["changed"] is False
         assert not backup.exists(), "a refused run left a backup behind"
 
@@ -3026,7 +3035,7 @@ def check_a_completed_rollback_reports_the_surface_it_removed(
 
     assert not run["crash"], f"the machinery crashed: {run['crash']}"
     assert run["returned"] is not None, f"the rollback did not complete: {run['reason']!r}"
-    assert facts["outcome"] == "committed", f"{facts!r}"
+    assert facts["outcome"] in ("committed", "committed-with-residue"), f"{facts!r}"
     assert sorted(run["returned"]["rows"]) if False else True
     report = run["returned"]
     assert report["verified"] is True, f"no verified backup claimed: {report!r}"
@@ -5245,23 +5254,34 @@ SOURCE_MUTATIONS = (
     Mutation(
         pin="check_a_foreign_file_at_a_reserved_sidecar_is_never_deleted",
         module="hermes_cli/session_fence_rollback.py",
-        find="        self._close_handle(suffix)\n"
+        find="        close_error = self._close_handle(suffix)\n"
              "        try:\n"
              "            os.lstat(member)\n"
              "        except FileNotFoundError:\n"
-             "            return None\n"
+             "            if close_error is None:\n"
+             "                return None\n"
+             '            return {"path": str(member), "files": 1, "error": close_error}\n'
              "        except OSError as exc:\n"
-             '            return {"path": str(member), "files": 1,\n'
-             '                    "error": f"{type(exc).__name__}: {exc}"}\n'
-             '        return {"path": str(member), "files": 1, "error": "cleanup_required"}\n',
-        replace="        self._close_handle(suffix)\n"
+             '            error = f"{type(exc).__name__}: {exc}"\n'
+             "            if close_error is not None:\n"
+             '                error = f"{error}; {close_error}"\n'
+             '            return {"path": str(member), "files": 1, "error": error}\n'
+             '        error = "cleanup_required"\n'
+             "        if close_error is not None:\n"
+             '            error = f"{error}; {close_error}"\n'
+             '        return {"path": str(member), "files": 1, "error": error}\n',
+        replace="        close_error = self._close_handle(suffix)\n"
                 "        try:\n"
                 "            os.lstat(member)\n"
                 "        except FileNotFoundError:\n"
-                "            return None\n"
+                "            if close_error is None:\n"
+                "                return None\n"
+                '            return {"path": str(member), "files": 1, "error": close_error}\n'
                 "        except OSError as exc:\n"
-                '            return {"path": str(member), "files": 1,\n'
-                '                    "error": f"{type(exc).__name__}: {exc}"}\n'
+                '            error = f"{type(exc).__name__}: {exc}"\n'
+                "            if close_error is not None:\n"
+                '                error = f"{error}; {close_error}"\n'
+                '            return {"path": str(member), "files": 1, "error": error}\n'
                 "        try:\n"
                 "            os.unlink(member)\n"
                 "        except OSError:\n"
@@ -5305,12 +5325,14 @@ SOURCE_MUTATIONS = (
     Mutation(
         pin="check_a_sidecar_that_vanished_is_not_claimed_as_our_removal",
         module="hermes_cli/session_fence_rollback.py",
-        find="        self._close_handle(suffix)\n"
+        find="        close_error = self._close_handle(suffix)\n"
              "        try:\n"
              "            os.lstat(member)\n"
              "        except FileNotFoundError:\n"
-             "            return None\n",
-        replace="        self._close_handle(suffix)\n"
+             "            if close_error is None:\n"
+             "                return None\n"
+             '            return {"path": str(member), "files": 1, "error": close_error}\n',
+        replace="        close_error = self._close_handle(suffix)\n"
                 "        try:\n"
                 "            os.lstat(member)\n"
                 "        except FileNotFoundError:\n"
