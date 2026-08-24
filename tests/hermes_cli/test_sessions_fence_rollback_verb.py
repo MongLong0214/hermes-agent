@@ -3511,15 +3511,15 @@ _APPROVED_BOUNDARY_SURFACE = frozenset({
 })
 
 #: The BOUNDARY RUNTIME denominator: live descriptor roots plus their nested
-#: closures. 58 named + 21 nested. The module body and the five class bodies are
+#: closures. 60 named + 21 nested. The module body and the five class bodies are
 #: deliberately NOT here -- they execute at import, before any pin runs, and
 #: cannot be re-entered afterwards, so they are outside the claim "this pin's
 #: execution reaches nothing deep". Covering them needs a separate instrument
 #: (a fresh isolated import under the profiler), not a bigger runtime roster.
-_LIBRARY_CODE_OBJECT_COUNT = 79
+_LIBRARY_CODE_OBJECT_COUNT = 81
 
 #: Reported separately, as a STATIC fact, never as the dynamic denominator.
-_IMPORT_TIME_CODE_OBJECT_COUNT = 85
+_IMPORT_TIME_CODE_OBJECT_COUNT = 87
 _IMPORT_TIME_ONLY_BODIES = 6
 
 

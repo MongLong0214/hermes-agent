@@ -1390,7 +1390,6 @@ class _AcquiredDestinations:
         info = self._identity_check_target(suffix, member)
         self._close_handle(suffix)
         if info is None:
-            self.identities.pop(suffix, None)
             return None
         if isinstance(info, dict):
             return info
@@ -1423,6 +1422,7 @@ class _AcquiredDestinations:
         try:
             return os.lstat(member)
         except FileNotFoundError:
+            self.identities.pop(suffix, None)
             return None
         except OSError as exc:
             return {"path": str(member), "files": 1,
