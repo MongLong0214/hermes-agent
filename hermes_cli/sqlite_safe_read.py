@@ -73,9 +73,6 @@ logger = logging.getLogger(__name__)
 
 SQLITE_HEADER_MAGIC = b"SQLite format 3\x00"
 
-# Offset of the 4-byte big-endian page-count field in the SQLite header.
-_HEADER_PAGE_COUNT_OFFSET = 28
-
 # Guards BOTH the registry and the lifecycle syscalls it describes. Reentrant
 # because connect_tracked -> _canonical_db_path -> ... stays on one thread.
 _live_lock = threading.RLock()

@@ -241,7 +241,6 @@ CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 RESPONSES_AUTO_TRUNCATION_HISTORY_LIMIT = 100
-_COMPRESSED_SUMMARY_METADATA_KEY = "_compressed_summary"
 
 
 class ThreadSafeAsyncQueue(asyncio.Queue):

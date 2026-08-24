@@ -41,7 +41,6 @@ logger = logging.getLogger(__name__)
 COPILOT_OAUTH_CLIENT_ID = "Iv1.b507a08c87ecfe98"
 # Token type prefixes
 _CLASSIC_PAT_PREFIX = "ghp_"
-_SUPPORTED_PREFIXES = ("gho_", "github_pat_", "ghu_")
 
 # Env var search order (matches Copilot CLI)
 COPILOT_ENV_VARS = ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")

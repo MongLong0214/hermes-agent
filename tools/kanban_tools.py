@@ -440,16 +440,6 @@ def _ok(**fields: Any) -> str:
     return json.dumps({"ok": True, **fields})
 
 
-def _normalize_profile(value: Any) -> Optional[str]:
-    """Normalize CLI-compatible assignee sentinels for the tool surface."""
-    if value is None:
-        return None
-    text = str(value).strip()
-    if not text or text.lower() in {"none", "-", "null"}:
-        return None
-    return text
-
-
 def _parse_bool_arg(args: dict, name: str, *, default: bool = False):
     value = args.get(name)
     if value is None:

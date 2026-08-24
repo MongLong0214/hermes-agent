@@ -719,15 +719,6 @@ def redact_cdp_url(value: object) -> str:
     return text
 
 
-def _redact_http_request_target_query_params(text: str) -> str:
-    """Redact sensitive query params in HTTP access-log request targets."""
-    def _sub(m: re.Match) -> str:
-        prefix = m.group(1)
-        query = _redact_query_string(m.group(2))
-        return f"{prefix}?{query}"
-    return _HTTP_REQUEST_TARGET_QUERY_RE.sub(_sub, text)
-
-
 def _redact_form_body(text: str) -> str:
     """Redact sensitive values in a form-urlencoded body.
 
@@ -1408,12 +1399,6 @@ _HTTP_METHOD_SUBSTRINGS = (
     "TRACE ",
     "CONNECT ",
 )
-
-
-def _has_http_method_substring(text: str) -> bool:
-    """Cheap pre-check before scanning for access-log request targets."""
-    upper = text.upper()
-    return any(method in upper for method in _HTTP_METHOD_SUBSTRINGS)
 
 
 class RedactingFormatter(logging.Formatter):

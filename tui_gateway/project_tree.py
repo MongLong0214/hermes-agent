@@ -128,15 +128,6 @@ def kanban_worktree_dir(path: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
-def _is_path_under(folder: str, target: str) -> bool:
-    """True when ``target`` equals ``folder`` or is nested under it (segment-wise)."""
-    f = _comparison_segments(folder)
-    t = _comparison_segments(target)
-    if not f or len(f) > len(t):
-        return False
-    return all(f[i] == t[i] for i in range(len(f)))
-
-
 def _with_base_name(path: str, name: str) -> str:
     stripped = re.sub(r"[/\\]+$", "", path)
     return re.sub(r"[^/\\]+$", name, stripped)
