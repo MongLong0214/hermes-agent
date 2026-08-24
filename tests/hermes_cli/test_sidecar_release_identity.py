@@ -597,6 +597,89 @@ def check_a_close_failure_does_not_vanish_the_fd_from_tracking(tmpdir) -> None:
         reservation.close()
 
 
+def check_the_close_method_does_not_swallow_a_failed_close(tmpdir) -> None:
+    """``close()`` is the OTHER call site over ``self.handles`` — the one the
+    happy path in ``_make_verified_backup`` actually calls — and it carried
+    the identical defect ``_close_handle`` was corrected for: pop the handle
+    out of ``self.handles`` before the close was even attempted, then
+    swallow ``os.close``'s ``OSError`` in a bare ``except OSError: pass``.
+    Fixing ``_close_handle`` alone left this second, independently-written
+    loop over the same dict still discarding a genuine close failure — the
+    caller of ``close()`` learns nothing went wrong, even though a
+    descriptor is left open on the OS side with every tracking structure
+    already forgetting it.
+
+    Proven directly: ``os.close`` is stubbed to raise for exactly one of the
+    handles ``acquire()`` created, ``close()`` is called, and the probe checks
+    two things a swallowing implementation cannot produce together — the
+    failing descriptor is still genuinely open (``os.fstat`` succeeds), AND
+    the failure is visible to the caller (``close()`` raises, rather than
+    returning as if nothing happened).
+    """
+    import hermes_cli.session_fence_rollback as sfr
+    from hermes_cli.session_fence_rollback import _AcquiredDestinations
+
+    where = pathlib.Path(tmpdir)
+    backup = where / "backup.db"
+    reservation = _AcquiredDestinations(backup)
+    reservation.acquire()
+    suffix = ""
+    handle = reservation.handles[suffix]
+    real_close = os.close
+
+    class _FailingCloseOs(_UnlinkSpy):
+        def close(self, fd, *args, **kwargs):
+            if fd == handle:
+                raise OSError(5, "simulated close failure")
+            return real_close(fd, *args, **kwargs)
+
+    failing = _FailingCloseOs()
+    had_lib_os = hasattr(sfr, "os")
+    previous_lib_os = getattr(sfr, "os", None)
+    sfr.os = failing
+    raised = None
+    try:
+        try:
+            reservation.close()
+        except OSError as exc:
+            raised = exc
+    finally:
+        if had_lib_os:
+            sfr.os = previous_lib_os
+        else:
+            del sfr.os
+
+    try:
+        os.fstat(handle)
+        fd_still_open = True
+    except OSError:
+        fd_still_open = False
+
+    try:
+        assert fd_still_open, (
+            "the injected close failure did not actually leave the fd open, "
+            "so this probe measures nothing about the leak"
+        )
+        assert suffix not in reservation.handles, (
+            f"the handle for suffix {suffix!r} is still tracked after "
+            f"close(): {reservation.handles!r} — close() must attempt every "
+            "handle even when one of them fails"
+        )
+        assert raised is not None, (
+            "close() swallowed a failing close silently: the fd is still "
+            "open and now untracked in every dict this object keeps, and "
+            "nothing propagated to the caller to say so"
+        )
+        assert "close failed" in str(raised), (
+            f"close() raised, but without a trace of what failed: {raised!r}"
+        )
+    finally:
+        if fd_still_open:
+            real_close(handle)
+        reservation.identities.clear()
+        reservation.handles.clear()
+
+
 PINS = {
     "check_the_real_boundary_never_calls_unlink_and_reports_leftovers":
         check_the_real_boundary_never_calls_unlink_and_reports_leftovers,
@@ -612,6 +695,8 @@ PINS = {
         check_a_sidecar_removed_by_something_else_before_release_is_reported_clean,
     "check_a_close_failure_does_not_vanish_the_fd_from_tracking":
         check_a_close_failure_does_not_vanish_the_fd_from_tracking,
+    "check_the_close_method_does_not_swallow_a_failed_close":
+        check_the_close_method_does_not_swallow_a_failed_close,
 }
 
 
@@ -801,6 +886,37 @@ SOURCE_MUTATIONS = (
             "tracking dict has already forgotten it, with no trace of the "
             "failure anywhere in the reported outcome",
         kills_by="a close() that raised OSError was swallowed silently",
+    ),
+    Mutation(
+        pin="check_the_close_method_does_not_swallow_a_failed_close",
+        module="hermes_cli/session_fence_rollback.py",
+        find=(
+            "        errors = []\n"
+            "        for suffix in list(self.handles):\n"
+            "            error = self._close_handle(suffix)\n"
+            "            if error is not None:\n"
+            '                errors.append(f"{suffix or \'(main)\'}: {error}")\n'
+            "        if errors:\n"
+            '            raise OSError("close() failed for " + "; ".join(errors))\n'
+        ),
+        replace=(
+            "        for suffix in list(self.handles):\n"
+            "            handle = self.handles.pop(suffix, None)\n"
+            "            if handle is not None:\n"
+            "                try:\n"
+            "                    os.close(handle)\n"
+            "                except OSError:  # pragma: no cover - already closed\n"
+            "                    pass\n"
+        ),
+        why="popping the handle out of self.handles BEFORE the close is "
+            "attempted, and swallowing os.close's OSError in a bare "
+            "except: pass, at the OTHER call site over self.handles — the "
+            "one close() itself uses, and the one the happy path actually "
+            "calls — is the exact hole this pin exists to catch: a close "
+            "that genuinely fails leaves the fd open while every tracking "
+            "dict has already forgotten it, and the caller of close() never "
+            "learns anything failed",
+        kills_by="close() swallowed a failing close silently",
     ),
     Mutation(
         pin="check_the_real_boundary_never_calls_unlink_and_reports_leftovers",

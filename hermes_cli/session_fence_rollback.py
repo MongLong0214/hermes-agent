@@ -1501,13 +1501,33 @@ class _AcquiredDestinations:
         return None
 
     def close(self) -> None:
+        """Close every remaining descriptor. Never swallowed, never re-tried.
+
+        A SECOND SITE WITH THE SAME DEFECT ``_close_handle`` WAS FIXED FOR.
+        This used to pop each handle out of ``self.handles`` before the close
+        was even attempted, then swallow ``os.close``'s ``OSError`` in a bare
+        ``except OSError: pass`` — the identical shape ``_close_handle`` had:
+        a close that genuinely fails left the fd open on the OS side while
+        ``self.handles`` had already forgotten the suffix, with no trace of
+        the failure anywhere. Fixing one call site and not the other left the
+        leak reachable through this method, which is what the happy path in
+        :func:`_make_verified_backup` actually calls.
+
+        Delegating to ``_close_handle`` per suffix reuses the corrected
+        shape exactly: the close is attempted first, the suffix is dropped
+        from ``self.handles`` only in ``_close_handle``'s own ``finally``,
+        after that attempt — and a failure is collected here rather than
+        discarded, then raised once every remaining handle has had its own
+        attempt, so one failing descriptor does not stop the others from
+        being given theirs.
+        """
+        errors = []
         for suffix in list(self.handles):
-            handle = self.handles.pop(suffix, None)
-            if handle is not None:
-                try:
-                    os.close(handle)
-                except OSError:  # pragma: no cover - already closed
-                    pass
+            error = self._close_handle(suffix)
+            if error is not None:
+                errors.append(f"{suffix or '(main)'}: {error}")
+        if errors:
+            raise OSError("close() failed for " + "; ".join(errors))
 
     def remove_only_what_we_created(self) -> list:
         """Close every name still owned. Returns what is still there.
