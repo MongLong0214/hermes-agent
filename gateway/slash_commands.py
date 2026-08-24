@@ -5102,8 +5102,28 @@ class GatewaySlashCommandsMixin:
                 display_name=current_entry.display_name,
             )
         except Exception as e:
-            logger.error("Failed to create branch session: %s", e)
-            return t("gateway.branch.create_failed", error=e)
+            # create_session()'s write itself already commits the row before
+            # any best-effort post-commit maintenance (periodic WAL
+            # checkpoint / incremental FTS merge in
+            # SessionDB._execute_write) runs — and that maintenance step is
+            # not guaranteed exception-safe. If one of those later steps
+            # raises, the exception lands here even though the branch row is
+            # already durably committed. Reporting create_failed in that case
+            # would be a lie: the caller believes branching failed while a
+            # fully routable "shadow" session now exists with nobody told
+            # about it. Check the actual outcome before reporting it.
+            try:
+                row_exists = await self._session_db.get_session(new_session_id)
+            except Exception:
+                row_exists = None
+            if not row_exists:
+                logger.error("Failed to create branch session: %s", e)
+                return t("gateway.branch.create_failed", error=e)
+            logger.warning(
+                "create_session for branch %s raised %r after the row was "
+                "already committed; continuing since it actually succeeded",
+                new_session_id, e,
+            )
 
         # Copy conversation history to the new session in bounded-chunk
         # transactions (see #23254): one txn per row was the removed
