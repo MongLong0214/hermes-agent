@@ -3152,6 +3152,25 @@ class SessionTurnLeaseLostError(RuntimeError):
     """
 
 
+class PartialBatchInsertError(RuntimeError):
+    """A chunked :meth:`SessionDB.append_messages_batch` failed partway.
+
+    Each chunk commits in its own ``_execute_write`` transaction, so a
+    failure on a later chunk does not undo the rows earlier chunks already
+    committed. ``inserted`` carries that real count so a caller (e.g.
+    ``/branch``'s history copy) can report what actually landed instead of
+    treating the whole copy as having inserted zero rows.
+    """
+
+    def __init__(self, inserted: int, cause: BaseException):
+        self.inserted = inserted
+        self.cause = cause
+        super().__init__(
+            f"append_messages_batch: {inserted} row(s) committed across "
+            f"earlier chunks before a later chunk failed: {cause!r}"
+        )
+
+
 def _connect_tracked_db(path, tracking_path=None, **kwargs):
     """``sqlite3.connect`` that registers the open fd for lock-safety.
 
@@ -4517,13 +4536,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         except Exception:
                             pass
                         raise
-                # Success — periodic best-effort checkpoint + FTS merge.
-                self._write_count += 1
-                if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
-                    self._try_wal_checkpoint()
-                if self._write_count % self._FTS_MERGE_EVERY_N_WRITES == 0:
-                    self._try_incremental_merge_fts()
-                return result
             except SessionCompressionInProgressError:
                 # A live foreign compression lock is transient: the compressor
                 # publishes in a couple of seconds. Without any wait, a steer
@@ -4587,6 +4599,29 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
                     continue
                 raise
+            else:
+                # The write already committed. Everything below is
+                # best-effort periodic maintenance (WAL checkpoint / FTS
+                # merge) — it must never be mistaken for the write itself
+                # failing, and must never bounce control back to the top of
+                # this loop (which would re-run *fn* and double-commit).
+                # Guard it here, independent of whether each maintenance
+                # helper already catches its own errors, so a caller can
+                # rely on "no exception from _execute_write" meaning the
+                # data landed, full stop.
+                self._write_count += 1
+                try:
+                    if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
+                        self._try_wal_checkpoint()
+                    if self._write_count % self._FTS_MERGE_EVERY_N_WRITES == 0:
+                        self._try_incremental_merge_fts()
+                except Exception as exc:
+                    logger.warning(
+                        "post-commit maintenance failed after a successful "
+                        "write (the write itself already committed): %s",
+                        exc,
+                    )
+                return result
 
     def _sleep_before_write_retry(
         self, deadline: float, patience_s: float
@@ -9997,13 +10032,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if chunk_rows is not None and len(messages) > chunk_rows:
             inserted_total = 0
             for start in range(0, len(messages), chunk_rows):
-                inserted_total += self.append_messages_batch(
-                    session_id,
-                    messages[start:start + chunk_rows],
-                    compression_lock_holder=compression_lock_holder,
-                    turn_lease_holder=turn_lease_holder,
-                    turn_lease_ttl_seconds=turn_lease_ttl_seconds,
-                )
+                try:
+                    inserted_total += self.append_messages_batch(
+                        session_id,
+                        messages[start:start + chunk_rows],
+                        compression_lock_holder=compression_lock_holder,
+                        turn_lease_holder=turn_lease_holder,
+                        turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+                    )
+                except Exception as exc:
+                    # Earlier chunks already committed in their own
+                    # transactions -- losing that count here (a bare raise)
+                    # is what made a partial copy report "0 messages
+                    # copied". Carry it so the caller can tell the two
+                    # apart.
+                    raise PartialBatchInsertError(inserted_total, exc) from exc
             return inserted_total
 
         def _do(conn):

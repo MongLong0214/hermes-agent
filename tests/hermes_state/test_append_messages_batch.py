@@ -13,6 +13,7 @@ import pytest
 
 from hermes_state import (
     CompressionSessionClosedError,
+    PartialBatchInsertError,
     SessionDB,
 )
 
@@ -154,6 +155,40 @@ class TestAppendMessagesBatch:
         ).fetchone()
         assert row["message_count"] == 0
         assert row["tool_call_count"] == 0
+
+    def test_chunked_partial_commit_count_surfaces_on_later_chunk_failure(
+        self, db, monkeypatch
+    ):
+        """A later chunk failing must not erase the earlier chunks' commits.
+
+        Each chunk commits in its own transaction (see ``chunk_rows``). A
+        failure on chunk N previously propagated a bare exception with no
+        way for the caller to learn that chunks 1..N-1 already landed --
+        the root cause of /branch reporting "0 messages copied" even when
+        most of the history actually made it in.
+        """
+        real_insert = SessionDB._insert_message_rows
+        calls = {"n": 0}
+
+        def flaky_insert(self_db, conn, session_id, messages):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise sqlite3.OperationalError("boom on second chunk")
+            return real_insert(self_db, conn, session_id, messages)
+
+        monkeypatch.setattr(SessionDB, "_insert_message_rows", flaky_insert)
+
+        msgs = [{"role": "user", "content": f"m{i}"} for i in range(5)]
+        with pytest.raises(PartialBatchInsertError) as excinfo:
+            db.append_messages_batch("sess-batch", msgs, chunk_rows=2)
+
+        assert excinfo.value.inserted == 2, (
+            "the first chunk (2 rows) committed before the second chunk "
+            "raised -- the exception must carry that count, not report 0"
+        )
+
+        count = db._conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        assert count == 2, "only the first chunk's rows should be durably committed"
 
     def test_compression_closed_session_rejected(self, db):
         db._conn.execute(

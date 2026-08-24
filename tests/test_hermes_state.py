@@ -4484,6 +4484,61 @@ class TestDisplayMetadataReadPaths:
             target.close()
 
 
+class TestExecuteWritePostCommitMaintenanceInvariant:
+    """A post-commit maintenance failure must not read as a write failure.
+
+    ``_execute_write`` commits the caller's write, then runs best-effort
+    periodic maintenance (WAL checkpoint / incremental FTS merge). If that
+    LATER step raises, the exception previously propagated out of
+    ``_execute_write`` exactly like a pre-commit failure -- so a caller
+    could not tell "nothing happened" from "it happened, then maintenance
+    hiccuped afterward" (the root cause behind /branch under-reporting a
+    successful copy as failed).
+    """
+
+    def test_checkpoint_failure_after_commit_does_not_raise_or_lose_the_write(
+        self, db, monkeypatch
+    ):
+        db.create_session("s-maint", source="cli")
+        monkeypatch.setattr(SessionDB, "_CHECKPOINT_EVERY_N_WRITES", 1)
+        monkeypatch.setattr(
+            SessionDB,
+            "_try_wal_checkpoint",
+            lambda self_db: (_ for _ in ()).throw(RuntimeError("boom checkpoint")),
+        )
+
+        # Must not raise -- the commit already happened.
+        db.append_message("s-maint", "user", "hello")
+
+        row = db._conn.execute(
+            "SELECT content FROM messages WHERE session_id = ?", ("s-maint",)
+        ).fetchone()
+        assert row is not None, (
+            "the write committed but a post-commit checkpoint failure made "
+            "it look like nothing was ever inserted"
+        )
+
+    def test_fts_merge_failure_after_commit_does_not_raise_or_lose_the_write(
+        self, db, monkeypatch
+    ):
+        db.create_session("s-maint2", source="cli")
+        monkeypatch.setattr(SessionDB, "_FTS_MERGE_EVERY_N_WRITES", 1)
+        monkeypatch.setattr(
+            SessionDB,
+            "_try_incremental_merge_fts",
+            lambda self_db: (_ for _ in ()).throw(RuntimeError("boom fts merge")),
+        )
+
+        # Must not raise -- the commit already happened.
+        db.append_message("s-maint2", "user", "hello")
+
+        row = db._conn.execute(
+            "SELECT content FROM messages WHERE session_id = ?", ("s-maint2",)
+        ).fetchone()
+        assert row is not None, (
+            "the write committed but a post-commit FTS-merge failure made "
+            "it look like nothing was ever inserted"
+        )
 
 
 class TestGatewayRoutingPkHeal:
