@@ -78,6 +78,9 @@ gateway:
     switch_failed:         "Ramo creato ma il passaggio ad esso non è riuscito."
     branched_one:          "⑂ Diramato in **{title}** ({count} messaggio copiato)\nOriginale: `{parent}`\nRamo: `{new}`\nUsa `/resume` per tornare all'originale."
     branched_many:         "⑂ Diramato in **{title}** ({count} messaggi copiati)\nOriginale: `{parent}`\nRamo: `{new}`\nUsa `/resume` per tornare all'originale."
+    incomplete_copy_and_title: "\n⚠️ La copia della cronologia e l'impostazione del titolo non sono state completate — il ramo è stato creato, ma potrebbero mancare la cronologia della conversazione e il titolo."
+    incomplete_copy:       "\n⚠️ La copia della cronologia non è stata completata — il ramo è stato creato, ma potrebbe mancare la cronologia della conversazione."
+    incomplete_title:      "\n⚠️ L'impostazione del titolo non è stata completata — il ramo è stato creato, ma il titolo potrebbe non essere stato impostato."
 
   commands:
     usage:                 "Uso: `/commands [page]`"

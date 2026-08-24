@@ -78,6 +78,9 @@ gateway:
     switch_failed:         "ブランチは作成されましたが、切り替えに失敗しました。"
     branched_one:          "⑂ **{title}** に分岐しました ({count} メッセージをコピー)\n元: `{parent}`\nブランチ: `{new}`\n元のセッションに戻るには `/resume` を使用してください。"
     branched_many:         "⑂ **{title}** に分岐しました ({count} メッセージをコピー)\n元: `{parent}`\nブランチ: `{new}`\n元のセッションに戻るには `/resume` を使用してください。"
+    incomplete_copy_and_title: "\n⚠️ 履歴のコピーとタイトルの設定が完了しませんでした — ブランチは作成されましたが、会話履歴とタイトルが欠けている可能性があります。"
+    incomplete_copy:       "\n⚠️ 履歴のコピーが完了しませんでした — ブランチは作成されましたが、会話履歴が欠けている可能性があります。"
+    incomplete_title:      "\n⚠️ タイトルの設定が完了しませんでした — ブランチは作成されましたが、タイトルが設定されていない可能性があります。"
 
   commands:
     usage:                 "使い方: `/commands [page]`"

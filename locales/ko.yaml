@@ -78,6 +78,9 @@ gateway:
     switch_failed:         "분기는 생성되었으나 전환에 실패했습니다."
     branched_one:          "⑂ **{title}**(으)로 분기했습니다 (메시지 {count}개 복사됨)\n원본: `{parent}`\n분기: `{new}`\n원본으로 돌아가려면 `/resume`을 사용하세요."
     branched_many:         "⑂ **{title}**(으)로 분기했습니다 (메시지 {count}개 복사됨)\n원본: `{parent}`\n분기: `{new}`\n원본으로 돌아가려면 `/resume`을 사용하세요."
+    incomplete_copy_and_title: "\n⚠️ 히스토리 복사와 제목 설정이 완료되지 않았습니다 — 분기는 생성되었으나 대화 내용과 제목이 누락되었을 수 있습니다."
+    incomplete_copy:       "\n⚠️ 히스토리 복사가 완료되지 않았습니다 — 분기는 생성되었으나 대화 내용이 누락되었을 수 있습니다."
+    incomplete_title:      "\n⚠️ 제목 설정이 완료되지 않았습니다 — 분기는 생성되었으나 제목이 설정되지 않았을 수 있습니다."
 
   commands:
     usage:                 "사용법: `/commands [page]`"

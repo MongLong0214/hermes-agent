@@ -78,6 +78,9 @@ gateway:
     switch_failed:         "分支已创建，但无法切换到它。"
     branched_one:          "⑂ 已分支到 **{title}**（已复制 {count} 条消息）\n原始：`{parent}`\n分支：`{new}`\n使用 `/resume` 切换回原始会话。"
     branched_many:         "⑂ 已分支到 **{title}**（已复制 {count} 条消息）\n原始：`{parent}`\n分支：`{new}`\n使用 `/resume` 切换回原始会话。"
+    incomplete_copy_and_title: "\n⚠️ 历史记录复制和标题设置均未完成 — 分支已创建，但可能缺少对话记录和标题。"
+    incomplete_copy:       "\n⚠️ 历史记录复制未完成 — 分支已创建，但可能缺少对话记录。"
+    incomplete_title:      "\n⚠️ 标题设置未完成 — 分支已创建，但可能未设置标题。"
 
   commands:
     usage:                 "用法：`/commands [page]`"

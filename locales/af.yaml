@@ -78,6 +78,9 @@ gateway:
     switch_failed:         "Tak is geskep, maar oorskakeling het misluk."
     branched_one:          "⑂ Vertak na **{title}** ({count} boodskap gekopieer)\nOorspronklik: `{parent}`\nTak: `{new}`\nGebruik `/resume` om terug te gaan na die oorspronklike."
     branched_many:         "⑂ Vertak na **{title}** ({count} boodskappe gekopieer)\nOorspronklik: `{parent}`\nTak: `{new}`\nGebruik `/resume` om terug te gaan na die oorspronklike."
+    incomplete_copy_and_title: "\n⚠️ Geskiedeniskopiëring en titelinstelling is nie voltooi nie — die tak is geskep, maar geskiedenis en titel ontbreek moontlik."
+    incomplete_copy:       "\n⚠️ Geskiedeniskopiëring is nie voltooi nie — die tak is geskep, maar geskiedenis ontbreek moontlik."
+    incomplete_title:      "\n⚠️ Titelinstelling is nie voltooi nie — die tak is geskep, maar die titel is moontlik nie ingestel nie."
 
   commands:
     usage:                 "Gebruik: `/commands [page]`"

@@ -5142,6 +5142,7 @@ class GatewaySlashCommandsMixin:
         # write-amplification pattern, and a history can be hundreds of rows.
         # Best-effort like the old loop — a failed copy still yields a
         # usable (partial) branch.
+        copy_ok = True
         try:
             await self._session_db.append_messages_batch(
                 new_session_id,
@@ -5172,7 +5173,9 @@ class GatewaySlashCommandsMixin:
             # Still best-effort (see #23254) -- a failed copy still yields a
             # usable (partial) branch, so we don't fail the whole command
             # over it. But a bare `pass` here left zero trace, so a copy
-            # failure was indistinguishable from a full success. Record it.
+            # failure was indistinguishable from a full success. Record it,
+            # and flag it so the response text below doesn't lie about it.
+            copy_ok = False
             logger.error(
                 "Failed to copy history to branch %s: %r -- branch will be "
                 "created with a partial/empty history",
@@ -5180,11 +5183,23 @@ class GatewaySlashCommandsMixin:
             )
 
         # Set title
+        title_ok = True
         try:
-            await self._session_db.set_session_title(new_session_id, branch_title)
+            title_result = await self._session_db.set_session_title(new_session_id, branch_title)
+            if title_result is False:
+                # set_session_title() reports failure by returning False
+                # instead of raising (e.g. a lost compare-and-swap) -- that
+                # is not the same as success and must not be silent either.
+                title_ok = False
+                logger.error(
+                    "set_session_title returned False for %r on branch %s "
+                    "-- branch will be left untitled",
+                    branch_title, new_session_id,
+                )
         except Exception as title_err:
             # Same reasoning as the history-copy step above: best-effort,
             # but must not be silent.
+            title_ok = False
             logger.error(
                 "Failed to set title %r on branch %s: %r -- branch will be "
                 "left untitled",
@@ -5200,9 +5215,24 @@ class GatewaySlashCommandsMixin:
         # Evict any cached agent for this session
         self._evict_cached_agent(session_key)
 
-        msg_count = len([m for m in history if m.get("role") == "user"])
+        # msg_count feeds the "N messages copied" wording below, so it must
+        # reflect what was actually copied -- claiming a nonzero count when
+        # the copy failed would repeat the exact lie this fix exists to stop.
+        msg_count = len([m for m in history if m.get("role") == "user"]) if copy_ok else 0
         key = "gateway.branch.branched_one" if msg_count == 1 else "gateway.branch.branched_many"
-        return t(key, title=branch_title, count=msg_count, parent=parent_session_id, new=new_session_id)
+        result = t(key, title=branch_title, count=msg_count, parent=parent_session_id, new=new_session_id)
+
+        # copy_ok/title_ok can each fail independently -- append an honest
+        # note rather than silently returning the same full-success text
+        # (same "build a note, append it" shape as the /new title-note path
+        # above).
+        if not copy_ok and not title_ok:
+            result += t("gateway.branch.incomplete_copy_and_title")
+        elif not copy_ok:
+            result += t("gateway.branch.incomplete_copy")
+        elif not title_ok:
+            result += t("gateway.branch.incomplete_title")
+        return result
 
     async def _handle_topup_command(self, event: MessageEvent) -> str:
         """Handle /topup -- show the Nous balance and hand off to the portal.

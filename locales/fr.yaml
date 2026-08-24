@@ -78,6 +78,9 @@ gateway:
     switch_failed:         "Branche créée mais impossible de basculer dessus."
     branched_one:          "⑂ Branche **{title}** créée ({count} message copié)\nOriginal : `{parent}`\nBranche : `{new}`\nUtilisez `/resume` pour revenir à l'original."
     branched_many:         "⑂ Branche **{title}** créée ({count} messages copiés)\nOriginal : `{parent}`\nBranche : `{new}`\nUtilisez `/resume` pour revenir à l'original."
+    incomplete_copy_and_title: "\n⚠️ La copie de l'historique et la définition du titre ne se sont pas terminées — la branche a été créée, mais il peut lui manquer l'historique de conversation et le titre."
+    incomplete_copy:       "\n⚠️ La copie de l'historique ne s'est pas terminée — la branche a été créée, mais il peut lui manquer l'historique de conversation."
+    incomplete_title:      "\n⚠️ La définition du titre ne s'est pas terminée — la branche a été créée, mais le titre n'est peut-être pas défini."
 
   commands:
     usage:                 "Utilisation : `/commands [page]`"

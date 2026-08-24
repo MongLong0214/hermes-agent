@@ -78,6 +78,9 @@ gateway:
     switch_failed:         "Az ág létrejött, de nem sikerült rá váltani."
     branched_one:          "⑂ Új ág: **{title}** ({count} üzenet másolva)\nEredeti: `{parent}`\nÁg: `{new}`\nHasználd a `/resume` parancsot az eredetihez való visszatéréshez."
     branched_many:         "⑂ Új ág: **{title}** ({count} üzenet másolva)\nEredeti: `{parent}`\nÁg: `{new}`\nHasználd a `/resume` parancsot az eredetihez való visszatéréshez."
+    incomplete_copy_and_title: "\n⚠️ Az előzmények másolása és a cím beállítása nem fejeződött be — az ág létrejött, de hiányozhat belőle az előzmény és a cím."
+    incomplete_copy:       "\n⚠️ Az előzmények másolása nem fejeződött be — az ág létrejött, de hiányozhat belőle az előzmény."
+    incomplete_title:      "\n⚠️ A cím beállítása nem fejeződött be — az ág létrejött, de lehet, hogy a cím nincs beállítva."
 
   commands:
     usage:                 "Használat: `/commands [page]`"

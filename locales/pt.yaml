@@ -78,6 +78,9 @@ gateway:
     switch_failed:         "Ramo criado, mas não foi possível mudar para ele."
     branched_one:          "⑂ Ramificado para **{title}** ({count} mensagem copiada)\nOriginal: `{parent}`\nRamo: `{new}`\nUsa `/resume` para voltar ao original."
     branched_many:         "⑂ Ramificado para **{title}** ({count} mensagens copiadas)\nOriginal: `{parent}`\nRamo: `{new}`\nUsa `/resume` para voltar ao original."
+    incomplete_copy_and_title: "\n⚠️ A cópia do histórico e a definição do título não foram concluídas — o ramo foi criado, mas pode faltar-lhe o histórico da conversa e o título."
+    incomplete_copy:       "\n⚠️ A cópia do histórico não foi concluída — o ramo foi criado, mas pode faltar-lhe o histórico da conversa."
+    incomplete_title:      "\n⚠️ A definição do título não foi concluída — o ramo foi criado, mas o título pode não ter sido definido."
 
   commands:
     usage:                 "Uso: `/commands [page]`"

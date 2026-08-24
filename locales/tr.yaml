@@ -78,6 +78,9 @@ gateway:
     switch_failed:         "Dal oluşturuldu ancak ona geçilemedi."
     branched_one:          "⑂ **{title}** dalına geçildi ({count} mesaj kopyalandı)\nOrijinal: `{parent}`\nDal: `{new}`\nOrijinale geri dönmek için `/resume` kullanın."
     branched_many:         "⑂ **{title}** dalına geçildi ({count} mesaj kopyalandı)\nOrijinal: `{parent}`\nDal: `{new}`\nOrijinale geri dönmek için `/resume` kullanın."
+    incomplete_copy_and_title: "\n⚠️ Geçmiş kopyalama ve başlık ayarlama tamamlanmadı — dal oluşturuldu, ancak konuşma geçmişi ve başlık eksik olabilir."
+    incomplete_copy:       "\n⚠️ Geçmiş kopyalama tamamlanmadı — dal oluşturuldu, ancak konuşma geçmişi eksik olabilir."
+    incomplete_title:      "\n⚠️ Başlık ayarlama tamamlanmadı — dal oluşturuldu, ancak başlık ayarlanmamış olabilir."
 
   commands:
     usage:                 "Kullanım: `/commands [page]`"

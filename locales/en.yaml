@@ -93,6 +93,9 @@ gateway:
     switch_failed:         "Branch created but failed to switch to it."
     branched_one:          "⑂ Branched to **{title}** ({count} message copied)\nOriginal: `{parent}`\nBranch: `{new}`\nUse `/resume` to switch back to the original."
     branched_many:         "⑂ Branched to **{title}** ({count} messages copied)\nOriginal: `{parent}`\nBranch: `{new}`\nUse `/resume` to switch back to the original."
+    incomplete_copy_and_title: "\n⚠️ History copy and title-set did not complete — the branch was created but may be missing conversation history and its title."
+    incomplete_copy:       "\n⚠️ History copy did not complete — the branch was created but may be missing conversation history."
+    incomplete_title:      "\n⚠️ Title-set did not complete — the branch was created but the title may not be set."
 
   commands:
     usage:                 "Usage: `/commands [page]`"

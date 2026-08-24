@@ -82,6 +82,9 @@ gateway:
     switch_failed:         "Cruthaíodh an brainse ach theip ar athrú chuige."
     branched_one:          "⑂ Brainseáilte go **{title}** ({count} teachtaireacht cóipeáilte)\nBunaidh: `{parent}`\nBrainse: `{new}`\nÚsáid `/resume` chun filleadh ar an mbunaidh."
     branched_many:         "⑂ Brainseáilte go **{title}** ({count} teachtaireacht cóipeáilte)\nBunaidh: `{parent}`\nBrainse: `{new}`\nÚsáid `/resume` chun filleadh ar an mbunaidh."
+    incomplete_copy_and_title: "\n⚠️ Níor críochnaíodh cóipeáil na staire ná socrú an teidil — cruthaíodh an brainse, ach seans go bhfuil stair an chomhrá agus an teideal ar iarraidh."
+    incomplete_copy:       "\n⚠️ Níor críochnaíodh cóipeáil na staire — cruthaíodh an brainse, ach seans go bhfuil stair an chomhrá ar iarraidh."
+    incomplete_title:      "\n⚠️ Níor críochnaíodh socrú an teidil — cruthaíodh an brainse, ach seans nár socraíodh an teideal."
 
   commands:
     usage:                 "Úsáid: `/commands [page]`"

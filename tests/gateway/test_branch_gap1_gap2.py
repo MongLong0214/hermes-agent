@@ -29,6 +29,7 @@ import unittest.mock as mock
 
 import pytest
 
+from agent.i18n import t
 from gateway.config import GatewayConfig, Platform
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource, SessionStore
@@ -117,8 +118,18 @@ class TestBranchGap1ConfirmGetSessionRaises:
         ), mock.patch.object(
             store._db, "get_session", side_effect=_get_session_raises_for_new_row
         ):
-            with pytest.raises(RuntimeError):
+            with pytest.raises(RuntimeError) as excinfo:
                 await runner._handle_branch_command(_make_event("/branch"))
+
+        # The propagated exception must be the confirm-side failure (from
+        # get_session()), not the original create_session exception re-raised
+        # by accident -- those are two different bugs with two different
+        # messages, and a test that only checks the exception *type*
+        # (RuntimeError) would pass even if the code accidentally re-raised
+        # ``e`` instead of ``confirm_err``.
+        assert str(excinfo.value) == "simulated get_session flush/read failure", (
+            f"expected the confirm-side exception to propagate, got: {excinfo.value!r}"
+        )
 
         new_session_id = captured.get("id")
         assert new_session_id, "create_session was never called"
@@ -186,4 +197,119 @@ class TestBranchGap2SwallowedSubStepFailures:
         assert matching, (
             "title-set failure left no trace in the logs -- it was "
             "silently swallowed even though the returned message claims success"
+        )
+
+
+class TestBranchGap2ResponseTextHonesty:
+    """Logging the failure (above) is not enough -- the user-facing text
+    itself must not claim the same full success it would have claimed if
+    copy/title had actually completed.
+    """
+
+    @pytest.mark.asyncio
+    async def test_both_copy_and_title_failure_text_differs_from_full_success(
+        self, store, caplog
+    ):
+        source = _make_source()
+        parent_entry = store.get_or_create_session(source)
+        store._db.append_message(parent_entry.session_id, role="user", content="hello")
+
+        runner = _make_branch_runner(store)
+
+        real_create_session = store._db.create_session
+        captured: dict[str, str] = {}
+
+        def _capture_create(session_id, source, **kwargs):
+            captured["id"] = session_id
+            return real_create_session(session_id, source, **kwargs)
+
+        with mock.patch.object(
+            store._db, "create_session", side_effect=_capture_create
+        ), mock.patch.object(
+            store._db,
+            "append_messages_batch",
+            side_effect=RuntimeError("simulated history-copy failure"),
+        ), mock.patch.object(
+            store._db,
+            "set_session_title",
+            side_effect=RuntimeError("simulated title-set failure"),
+        ):
+            with caplog.at_level(logging.ERROR, logger="gateway.run"):
+                result = await runner._handle_branch_command(_make_event("/branch mybranch"))
+
+        new_session_id = captured["id"]
+        assert new_session_id, "create_session was never called"
+
+        # What the buggy code always returned regardless of outcome: the
+        # plain full-success text claiming 1 message was copied.
+        full_success_text = t(
+            "gateway.branch.branched_one",
+            title="mybranch",
+            count=1,
+            parent=parent_entry.session_id,
+            new=new_session_id,
+        )
+        assert result != full_success_text, (
+            "response text is identical to the full-success message even "
+            "though both history-copy and title-set failed -- the caller "
+            "cannot tell the branch is incomplete"
+        )
+        # The best-effort branch must still be reported as created (not
+        # discarded/rolled back just because sub-steps failed).
+        assert new_session_id in result
+
+    @pytest.mark.asyncio
+    async def test_title_set_returning_false_is_detected_and_reported(
+        self, store, caplog
+    ):
+        """set_session_title() can return False on failure instead of
+        raising -- that must be treated as a failure too, not just the
+        exception path.
+        """
+        source = _make_source()
+        parent_entry = store.get_or_create_session(source)
+        store._db.append_message(parent_entry.session_id, role="user", content="hello")
+
+        runner = _make_branch_runner(store)
+
+        real_create_session = store._db.create_session
+        captured: dict[str, str] = {}
+
+        def _capture_create(session_id, source, **kwargs):
+            captured["id"] = session_id
+            return real_create_session(session_id, source, **kwargs)
+
+        with mock.patch.object(
+            store._db, "create_session", side_effect=_capture_create
+        ), mock.patch.object(
+            store._db, "set_session_title", return_value=False
+        ):
+            with caplog.at_level(logging.ERROR, logger="gateway.run"):
+                result = await runner._handle_branch_command(_make_event("/branch mybranch2"))
+
+        new_session_id = captured["id"]
+        assert new_session_id, "create_session was never called"
+
+        # Copy succeeded here, so the count is still accurate -- only the
+        # title-set silently returned False. The message must still differ
+        # from plain full success.
+        full_success_text = t(
+            "gateway.branch.branched_one",
+            title="mybranch2",
+            count=1,
+            parent=parent_entry.session_id,
+            new=new_session_id,
+        )
+        assert result != full_success_text, (
+            "set_session_title() returned False (not an exception) but the "
+            "response text still claims full success -- a False return was "
+            "not detected"
+        )
+
+        matching = [
+            r for r in caplog.records
+            if "mybranch2" in r.getMessage() and new_session_id in r.getMessage()
+        ]
+        assert matching, (
+            "set_session_title() returning False left no trace in the logs"
         )
