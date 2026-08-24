@@ -81,6 +81,8 @@ gateway:
     incomplete_copy_and_title: "\n⚠️ La copie de l'historique et la définition du titre ne se sont pas terminées — la branche a été créée, mais il peut lui manquer l'historique de conversation et le titre."
     incomplete_copy:       "\n⚠️ La copie de l'historique ne s'est pas terminée — la branche a été créée, mais il peut lui manquer l'historique de conversation."
     incomplete_title:      "\n⚠️ La définition du titre ne s'est pas terminée — la branche a été créée, mais le titre n'est peut-être pas défini."
+    incomplete_copy_partial: "\n⚠️ La copie de l'historique a été interrompue en cours de route — {count} message(s) ont été enregistrés avant l'arrêt, mais il peut encore manquer une partie de l'historique."
+    incomplete_copy_partial_and_title: "\n⚠️ La copie de l'historique a été interrompue en cours de route et la définition du titre ne s'est pas terminée — {count} message(s) ont été enregistrés avant l'arrêt, mais il peut encore manquer une partie de l'historique et le titre."
 
   commands:
     usage:                 "Utilisation : `/commands [page]`"

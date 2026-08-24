@@ -81,6 +81,8 @@ gateway:
     incomplete_copy_and_title: "\n⚠️ Verlaufskopie und Titelvergabe wurden nicht abgeschlossen — die Verzweigung wurde erstellt, aber Verlauf und Titel fehlen möglicherweise."
     incomplete_copy:       "\n⚠️ Verlaufskopie wurde nicht abgeschlossen — die Verzweigung wurde erstellt, aber der Verlauf fehlt möglicherweise."
     incomplete_title:      "\n⚠️ Titelvergabe wurde nicht abgeschlossen — die Verzweigung wurde erstellt, aber der Titel ist möglicherweise nicht gesetzt."
+    incomplete_copy_partial: "\n⚠️ Die Verlaufskopie wurde mittendrin unterbrochen — {count} Nachricht(en) wurden gespeichert, bevor sie stoppte, aber es fehlt möglicherweise noch Verlauf."
+    incomplete_copy_partial_and_title: "\n⚠️ Die Verlaufskopie wurde mittendrin unterbrochen und die Titelvergabe wurde nicht abgeschlossen — {count} Nachricht(en) wurden gespeichert, bevor sie stoppte, aber Verlauf und Titel fehlen möglicherweise noch."
 
   commands:
     usage:                 "Verwendung: `/commands [page]`"

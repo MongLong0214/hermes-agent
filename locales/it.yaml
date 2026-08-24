@@ -81,6 +81,8 @@ gateway:
     incomplete_copy_and_title: "\n⚠️ La copia della cronologia e l'impostazione del titolo non sono state completate — il ramo è stato creato, ma potrebbero mancare la cronologia della conversazione e il titolo."
     incomplete_copy:       "\n⚠️ La copia della cronologia non è stata completata — il ramo è stato creato, ma potrebbe mancare la cronologia della conversazione."
     incomplete_title:      "\n⚠️ L'impostazione del titolo non è stata completata — il ramo è stato creato, ma il titolo potrebbe non essere stato impostato."
+    incomplete_copy_partial: "\n⚠️ La copia della cronologia si è interrotta a metà — {count} messaggio/i sono stati salvati prima dell'interruzione, ma potrebbe ancora mancare parte della cronologia."
+    incomplete_copy_partial_and_title: "\n⚠️ La copia della cronologia si è interrotta a metà e l'impostazione del titolo non è stata completata — {count} messaggio/i sono stati salvati prima dell'interruzione, ma potrebbero ancora mancare parte della cronologia e il titolo."
 
   commands:
     usage:                 "Uso: `/commands [page]`"

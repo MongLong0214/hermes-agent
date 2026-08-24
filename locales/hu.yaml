@@ -81,6 +81,8 @@ gateway:
     incomplete_copy_and_title: "\n⚠️ Az előzmények másolása és a cím beállítása nem fejeződött be — az ág létrejött, de hiányozhat belőle az előzmény és a cím."
     incomplete_copy:       "\n⚠️ Az előzmények másolása nem fejeződött be — az ág létrejött, de hiányozhat belőle az előzmény."
     incomplete_title:      "\n⚠️ A cím beállítása nem fejeződött be — az ág létrejött, de lehet, hogy a cím nincs beállítva."
+    incomplete_copy_partial: "\n⚠️ Az előzmények másolása félbeszakadt — {count} üzenet mentődött, mielőtt leállt, de továbbra is hiányozhat belőle valamennyi előzmény."
+    incomplete_copy_partial_and_title: "\n⚠️ Az előzmények másolása félbeszakadt, és a cím beállítása nem fejeződött be — {count} üzenet mentődött, mielőtt leállt, de továbbra is hiányozhat belőle valamennyi előzmény és a cím."
 
   commands:
     usage:                 "Használat: `/commands [page]`"

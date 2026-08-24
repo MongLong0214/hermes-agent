@@ -81,6 +81,8 @@ gateway:
     incomplete_copy_and_title: "\n⚠️ 歷史記錄複製與標題設定均未完成 — 分支已建立，但可能缺少對話記錄與標題。"
     incomplete_copy:       "\n⚠️ 歷史記錄複製未完成 — 分支已建立，但可能缺少對話記錄。"
     incomplete_title:      "\n⚠️ 標題設定未完成 — 分支已建立，但可能未設定標題。"
+    incomplete_copy_partial: "\n⚠️ 歷史記錄複製中途被中斷 — 停止前已儲存 {count} 則訊息，但部分對話記錄可能仍然缺失。"
+    incomplete_copy_partial_and_title: "\n⚠️ 歷史記錄複製中途被中斷，且標題設定未完成 — 停止前已儲存 {count} 則訊息，但部分對話記錄與標題可能仍然缺失。"
 
   commands:
     usage:                 "用法：`/commands [page]`"

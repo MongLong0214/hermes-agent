@@ -81,6 +81,8 @@ gateway:
     incomplete_copy_and_title: "\n⚠️ Geçmiş kopyalama ve başlık ayarlama tamamlanmadı — dal oluşturuldu, ancak konuşma geçmişi ve başlık eksik olabilir."
     incomplete_copy:       "\n⚠️ Geçmiş kopyalama tamamlanmadı — dal oluşturuldu, ancak konuşma geçmişi eksik olabilir."
     incomplete_title:      "\n⚠️ Başlık ayarlama tamamlanmadı — dal oluşturuldu, ancak başlık ayarlanmamış olabilir."
+    incomplete_copy_partial: "\n⚠️ Geçmiş kopyalama yarıda kesildi — durmadan önce {count} mesaj kaydedildi, ancak geçmişin bir kısmı hâlâ eksik olabilir."
+    incomplete_copy_partial_and_title: "\n⚠️ Geçmiş kopyalama yarıda kesildi ve başlık ayarlama tamamlanmadı — durmadan önce {count} mesaj kaydedildi, ancak geçmişin bir kısmı ve başlık hâlâ eksik olabilir."
 
   commands:
     usage:                 "Kullanım: `/commands [page]`"

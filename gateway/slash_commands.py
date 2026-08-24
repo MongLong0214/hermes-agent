@@ -5142,7 +5142,15 @@ class GatewaySlashCommandsMixin:
         # write-amplification pattern, and a history can be hundreds of rows.
         # Best-effort like the old loop — a failed copy still yields a
         # usable (partial) branch.
+        from hermes_state import PartialBatchInsertError
+
         copy_ok = True
+        # Rows actually committed. Each chunk lands in its own transaction,
+        # so a mid-copy failure does not undo earlier chunks -- defaults to
+        # the full count on success (append_messages_batch inserts exactly
+        # one row per input dict, in order) and is corrected below on the
+        # failure paths so it always reflects what is really in state.db.
+        copied_rows = len(history)
         try:
             await self._session_db.append_messages_batch(
                 new_session_id,
@@ -5169,6 +5177,17 @@ class GatewaySlashCommandsMixin:
                 ],
                 chunk_rows=500,
             )
+        except PartialBatchInsertError as copy_err:
+            # Some earlier chunks committed before a later one failed --
+            # report what actually landed instead of claiming zero.
+            copy_ok = False
+            copied_rows = copy_err.inserted
+            logger.error(
+                "Partial copy of history to branch %s: %d row(s) committed "
+                "before a later chunk failed: %r -- branch will be created "
+                "with a partial history",
+                new_session_id, copied_rows, copy_err,
+            )
         except Exception as copy_err:
             # Still best-effort (see #23254) -- a failed copy still yields a
             # usable (partial) branch, so we don't fail the whole command
@@ -5176,6 +5195,7 @@ class GatewaySlashCommandsMixin:
             # failure was indistinguishable from a full success. Record it,
             # and flag it so the response text below doesn't lie about it.
             copy_ok = False
+            copied_rows = 0
             logger.error(
                 "Failed to copy history to branch %s: %r -- branch will be "
                 "created with a partial/empty history",
@@ -5218,18 +5238,31 @@ class GatewaySlashCommandsMixin:
         # msg_count feeds the "N messages copied" wording below, so it must
         # reflect what was actually copied -- claiming a nonzero count when
         # the copy failed would repeat the exact lie this fix exists to stop.
-        msg_count = len([m for m in history if m.get("role") == "user"]) if copy_ok else 0
+        # copied_rows is a prefix of history (chunks commit in order), so
+        # slicing it down to the actually-committed rows before counting
+        # user turns keeps a partial copy's count accurate too.
+        msg_count = len([m for m in history[:copied_rows] if m.get("role") == "user"])
         key = "gateway.branch.branched_one" if msg_count == 1 else "gateway.branch.branched_many"
         result = t(key, title=branch_title, count=msg_count, parent=parent_session_id, new=new_session_id)
 
         # copy_ok/title_ok can each fail independently -- append an honest
         # note rather than silently returning the same full-success text
         # (same "build a note, append it" shape as the /new title-note path
-        # above).
-        if not copy_ok and not title_ok:
+        # above). A copy failure that still landed some rows (msg_count > 0,
+        # e.g. a later chunk's post-commit maintenance hiccup after earlier
+        # chunks committed) gets milder wording than one that landed
+        # nothing -- both are real, but "did not complete" reads as "your
+        # data is gone", which is only true in the zero-rows case.
+        copy_partial = not copy_ok and msg_count > 0
+        copy_total_failure = not copy_ok and msg_count == 0
+        if copy_total_failure and not title_ok:
             result += t("gateway.branch.incomplete_copy_and_title")
-        elif not copy_ok:
+        elif copy_total_failure:
             result += t("gateway.branch.incomplete_copy")
+        elif copy_partial and not title_ok:
+            result += t("gateway.branch.incomplete_copy_partial_and_title", count=msg_count)
+        elif copy_partial:
+            result += t("gateway.branch.incomplete_copy_partial", count=msg_count)
         elif not title_ok:
             result += t("gateway.branch.incomplete_title")
         return result

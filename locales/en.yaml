@@ -96,6 +96,8 @@ gateway:
     incomplete_copy_and_title: "\n⚠️ History copy and title-set did not complete — the branch was created but may be missing conversation history and its title."
     incomplete_copy:       "\n⚠️ History copy did not complete — the branch was created but may be missing conversation history."
     incomplete_title:      "\n⚠️ Title-set did not complete — the branch was created but the title may not be set."
+    incomplete_copy_partial: "\n⚠️ History copy was interrupted partway — {count} message(s) were saved before it stopped, but some history may still be missing."
+    incomplete_copy_partial_and_title: "\n⚠️ History copy was interrupted partway and title-set did not complete — {count} message(s) were saved before it stopped, but some history and its title may be missing."
 
   commands:
     usage:                 "Usage: `/commands [page]`"

@@ -81,6 +81,8 @@ gateway:
     incomplete_copy_and_title: "\n⚠️ La copia del historial y la asignación del título no se completaron — la rama se creó, pero puede faltarle el historial de conversación y el título."
     incomplete_copy:       "\n⚠️ La copia del historial no se completó — la rama se creó, pero puede faltarle el historial de conversación."
     incomplete_title:      "\n⚠️ La asignación del título no se completó — la rama se creó, pero es posible que el título no se haya establecido."
+    incomplete_copy_partial: "\n⚠️ La copia del historial se interrumpió a la mitad — se guardaron {count} mensaje(s) antes de detenerse, pero puede que aún falte parte del historial."
+    incomplete_copy_partial_and_title: "\n⚠️ La copia del historial se interrumpió a la mitad y la asignación del título no se completó — se guardaron {count} mensaje(s) antes de detenerse, pero puede que aún falten parte del historial y el título."
 
   commands:
     usage:                 "Uso: `/commands [page]`"

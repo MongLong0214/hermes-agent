@@ -85,6 +85,8 @@ gateway:
     incomplete_copy_and_title: "\n⚠️ Níor críochnaíodh cóipeáil na staire ná socrú an teidil — cruthaíodh an brainse, ach seans go bhfuil stair an chomhrá agus an teideal ar iarraidh."
     incomplete_copy:       "\n⚠️ Níor críochnaíodh cóipeáil na staire — cruthaíodh an brainse, ach seans go bhfuil stair an chomhrá ar iarraidh."
     incomplete_title:      "\n⚠️ Níor críochnaíodh socrú an teidil — cruthaíodh an brainse, ach seans nár socraíodh an teideal."
+    incomplete_copy_partial: "\n⚠️ Cuireadh isteach ar chóipeáil na staire leath bealaigh — sábháladh {count} teachtaireacht(aí) sular stop sé, ach seans go bhfuil cuid den stair ar iarraidh fós."
+    incomplete_copy_partial_and_title: "\n⚠️ Cuireadh isteach ar chóipeáil na staire leath bealaigh agus níor críochnaíodh socrú an teidil — sábháladh {count} teachtaireacht(aí) sular stop sé, ach seans go bhfuil cuid den stair agus an teideal ar iarraidh fós."
 
   commands:
     usage:                 "Úsáid: `/commands [page]`"

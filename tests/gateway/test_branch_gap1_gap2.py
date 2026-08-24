@@ -33,7 +33,7 @@ from agent.i18n import t
 from gateway.config import GatewayConfig, Platform
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource, SessionStore
-from hermes_state import AsyncSessionDB
+from hermes_state import AsyncSessionDB, PartialBatchInsertError
 
 
 @pytest.fixture()
@@ -110,7 +110,11 @@ class TestBranchGap1ConfirmGetSessionRaises:
             # flush/read -- but only for the branch row being confirmed, so
             # unrelated get_session calls elsewhere are unaffected.
             if captured.get("id") and session_id == captured["id"]:
-                raise RuntimeError("simulated get_session flush/read failure")
+                confirm_exception = RuntimeError(
+                    "simulated get_session flush/read failure"
+                )
+                captured["confirm_exception"] = confirm_exception
+                raise confirm_exception
             return real_get_session(session_id)
 
         with mock.patch.object(
@@ -121,14 +125,17 @@ class TestBranchGap1ConfirmGetSessionRaises:
             with pytest.raises(RuntimeError) as excinfo:
                 await runner._handle_branch_command(_make_event("/branch"))
 
-        # The propagated exception must be the confirm-side failure (from
-        # get_session()), not the original create_session exception re-raised
-        # by accident -- those are two different bugs with two different
-        # messages, and a test that only checks the exception *type*
-        # (RuntimeError) would pass even if the code accidentally re-raised
-        # ``e`` instead of ``confirm_err``.
-        assert str(excinfo.value) == "simulated get_session flush/read failure", (
-            f"expected the confirm-side exception to propagate, got: {excinfo.value!r}"
+        # The propagated exception must be the EXACT confirm-side failure
+        # object (from get_session()), not merely an exception with the same
+        # message -- those are two different bugs (re-raising the original
+        # create_session exception ``e`` by accident could coincidentally
+        # carry an equal-looking message) and only an identity check tells
+        # them apart.
+        confirm_exception = captured.get("confirm_exception")
+        assert confirm_exception is not None, "get_session was never invoked for the new row"
+        assert excinfo.value is confirm_exception, (
+            f"expected the exact confirm-side exception instance to propagate, "
+            f"got a different object: {excinfo.value!r}"
         )
 
         new_session_id = captured.get("id")
@@ -254,6 +261,14 @@ class TestBranchGap2ResponseTextHonesty:
             "though both history-copy and title-set failed -- the caller "
             "cannot tell the branch is incomplete"
         )
+        # A plain (non-PartialBatchInsertError) exception with zero rows
+        # copied is a real, total failure -- must get the harsher
+        # "did not complete" combined note, not merely "some other text".
+        incomplete_note = t("gateway.branch.incomplete_copy_and_title")
+        assert incomplete_note in result, (
+            f"expected the combined copy+title failure note {incomplete_note!r} "
+            f"in the response, got: {result!r}"
+        )
         # The best-effort branch must still be reported as created (not
         # discarded/rolled back just because sub-steps failed).
         assert new_session_id in result
@@ -305,6 +320,13 @@ class TestBranchGap2ResponseTextHonesty:
             "response text still claims full success -- a False return was "
             "not detected"
         )
+        # Copy fully succeeded, so only the title-only note is correct here
+        # -- assert the actual key/text, not just "differs from success".
+        incomplete_note = t("gateway.branch.incomplete_title")
+        assert incomplete_note in result, (
+            f"expected the title-only incomplete note {incomplete_note!r} in "
+            f"the response, got: {result!r}"
+        )
 
         matching = [
             r for r in caplog.records
@@ -312,4 +334,78 @@ class TestBranchGap2ResponseTextHonesty:
         ]
         assert matching, (
             "set_session_title() returning False left no trace in the logs"
+        )
+
+
+class TestBranchGap3ChunkedPartialCopyCount:
+    """A chunked copy that commits some rows before a later chunk fails
+    must report the real count, and use the milder partial-copy note --
+    not the same "0 messages copied" / "did not complete" text used for a
+    copy that landed nothing at all.
+    """
+
+    @pytest.mark.asyncio
+    async def test_partial_batch_insert_error_reports_actual_count_and_milder_note(
+        self, store, caplog
+    ):
+        source = _make_source()
+        parent_entry = store.get_or_create_session(source)
+        # 3 user + 2 assistant messages, in order.
+        store._db.append_message(parent_entry.session_id, role="user", content="m1")
+        store._db.append_message(parent_entry.session_id, role="assistant", content="a1")
+        store._db.append_message(parent_entry.session_id, role="user", content="m2")
+        store._db.append_message(parent_entry.session_id, role="assistant", content="a2")
+        store._db.append_message(parent_entry.session_id, role="user", content="m3")
+
+        runner = _make_branch_runner(store)
+
+        real_create_session = store._db.create_session
+        captured: dict[str, str] = {}
+
+        def _capture_create(session_id, source, **kwargs):
+            captured["id"] = session_id
+            return real_create_session(session_id, source, **kwargs)
+
+        # Simulate: first 3 rows (m1, a1, m2) committed in earlier chunks,
+        # then the next chunk failed -- 2 of the 3 original user messages
+        # actually landed.
+        def _partial_copy(*args, **kwargs):
+            raise PartialBatchInsertError(3, RuntimeError("simulated later-chunk failure"))
+
+        with mock.patch.object(
+            store._db, "create_session", side_effect=_capture_create
+        ), mock.patch.object(
+            store._db, "append_messages_batch", side_effect=_partial_copy
+        ):
+            with caplog.at_level(logging.ERROR, logger="gateway.run"):
+                result = await runner._handle_branch_command(_make_event("/branch partialbranch"))
+
+        new_session_id = captured["id"]
+        assert new_session_id, "create_session was never called"
+
+        # 2 of the 3 user messages are in the committed prefix (m1, a1, m2)
+        # -- the reported count must reflect that, not 0.
+        expected_partial_text = t(
+            "gateway.branch.branched_many",
+            title="partialbranch",
+            count=2,
+            parent=parent_entry.session_id,
+            new=new_session_id,
+        )
+        assert result.startswith(expected_partial_text), (
+            f"expected the headline to report 2 messages copied (the actual "
+            f"committed prefix), got: {result!r}"
+        )
+
+        # Milder note: some data landed, so this must NOT be the harsh
+        # "did not complete" text used when nothing committed at all.
+        harsh_note = t("gateway.branch.incomplete_copy")
+        assert harsh_note not in result, (
+            f"partial copy (2/3 landed) was reported with the same harsh "
+            f"note as a total failure: {result!r}"
+        )
+        milder_note = t("gateway.branch.incomplete_copy_partial", count=2)
+        assert milder_note in result, (
+            f"expected the milder partial-copy note {milder_note!r} in the "
+            f"response, got: {result!r}"
         )

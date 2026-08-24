@@ -81,6 +81,8 @@ gateway:
     incomplete_copy_and_title: "\n⚠️ Geskiedeniskopiëring en titelinstelling is nie voltooi nie — die tak is geskep, maar geskiedenis en titel ontbreek moontlik."
     incomplete_copy:       "\n⚠️ Geskiedeniskopiëring is nie voltooi nie — die tak is geskep, maar geskiedenis ontbreek moontlik."
     incomplete_title:      "\n⚠️ Titelinstelling is nie voltooi nie — die tak is geskep, maar die titel is moontlik nie ingestel nie."
+    incomplete_copy_partial: "\n⚠️ Geskiedeniskopiëring is halfpad onderbreek — {count} boodskap(pe) is gestoor voordat dit gestop het, maar geskiedenis ontbreek moontlik steeds."
+    incomplete_copy_partial_and_title: "\n⚠️ Geskiedeniskopiëring is halfpad onderbreek en titelinstelling is nie voltooi nie — {count} boodskap(pe) is gestoor voordat dit gestop het, maar geskiedenis en titel ontbreek moontlik steeds."
 
   commands:
     usage:                 "Gebruik: `/commands [page]`"

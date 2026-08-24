@@ -81,6 +81,8 @@ gateway:
     incomplete_copy_and_title: "\n⚠️ A cópia do histórico e a definição do título não foram concluídas — o ramo foi criado, mas pode faltar-lhe o histórico da conversa e o título."
     incomplete_copy:       "\n⚠️ A cópia do histórico não foi concluída — o ramo foi criado, mas pode faltar-lhe o histórico da conversa."
     incomplete_title:      "\n⚠️ A definição do título não foi concluída — o ramo foi criado, mas o título pode não ter sido definido."
+    incomplete_copy_partial: "\n⚠️ A cópia do histórico foi interrompida a meio — {count} mensagem(ns) foram guardadas antes de parar, mas ainda pode faltar parte do histórico."
+    incomplete_copy_partial_and_title: "\n⚠️ A cópia do histórico foi interrompida a meio e a definição do título não foi concluída — {count} mensagem(ns) foram guardadas antes de parar, mas ainda pode faltar parte do histórico e o título."
 
   commands:
     usage:                 "Uso: `/commands [page]`"
