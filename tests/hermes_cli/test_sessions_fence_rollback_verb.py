@@ -868,10 +868,16 @@ def check_a_partial_destination_collision_keeps_only_what_the_run_created(
     private staging directory is created and verified before the destination is
     touched, and it is not the operator's backup: reporting ``backup_created``
     when IT appears leaves the ledger saying a backup was made and verified
-    while the collision path has just removed every file. So the public facts
-    are asserted false here, and the directory is asserted to hold nothing this
-    run put in it — including the staging directory, which lives beside the
-    BACKUP and not in the work dir the residue pin watches.
+    while the collision path has not produced one. So the public facts are
+    asserted false here.
+
+    WHAT THIS RUN CREATED IS NOW REPORTED, NOT REMOVED. There is no atomic
+    check-and-delete on this platform, so the cleanup on this path no longer
+    unlinks the members it exclusively created before hitting the collision —
+    it closes them and reports each as residue, at its concrete path, for a
+    person to remove by hand. The one thing that was never this run's to
+    touch either way is the squatter: it existed before the run and it must
+    survive untouched, which this pin still asserts directly.
     """
     _sandbox_home(tmpdir)
     module, why = _import_verb()
@@ -890,9 +896,10 @@ def check_a_partial_destination_collision_keeps_only_what_the_run_created(
     squatter_bytes = b"a shared-memory file from an attempt that died"
 
     exclusive_creates = []
+    unlink_calls = []
 
     class _RecordingOs:
-        """``os``, with every exclusive create recorded as a phase event."""
+        """``os``, with every exclusive create (and any unlink) recorded."""
 
         def __getattr__(self, name):
             return getattr(os, name)
@@ -901,6 +908,10 @@ def check_a_partial_destination_collision_keeps_only_what_the_run_created(
             if flags & os.O_EXCL:
                 exclusive_creates.append(str(path))
             return os.open(path, flags, *args, **kwargs)
+
+        def unlink(self, path, *args, **kwargs):
+            unlink_calls.append(str(path))
+            return os.unlink(path, *args, **kwargs)
 
     planted = {"fired": False}
     real_check = library._refuse_unusable_backup_path
@@ -960,13 +971,18 @@ def check_a_partial_destination_collision_keeps_only_what_the_run_created(
         "the run never reached its own backup destination"
     )
     assert not refusal["crash"], f"the boundary crashed: {refusal['crash']}"
+    assert not unlink_calls, (
+        f"the boundary called os.unlink {len(unlink_calls)} time(s): "
+        f"{unlink_calls!r}. There is no atomic check-and-delete on this "
+        f"platform, so cleanup here may only close and report, never delete"
+    )
     assert refusal["reason"] == "backup-exists", (
         "a member of the backup destination family was already there and the "
         f"run did not refuse for that reason: {refusal['reason']!r} "
         f"{refusal['detail']!r}"
     )
     assert squatter.read_bytes() == squatter_bytes, (
-        "the run removed a file it did not create. The collision artifact is "
+        "the run touched a file it did not create. The collision artifact is "
         "the one thing at that destination that is not this run's to touch"
     )
     assert str(backup) in exclusive_creates, (
@@ -975,20 +991,41 @@ def check_a_partial_destination_collision_keeps_only_what_the_run_created(
         "whatever refused it was something else, and the property this pin is "
         f"named for was never exercised: {exclusive_creates!r}"
     )
-    assert _family_beside(backup) == {squatter.name}, (
-        "the refused run left its own half-built destination behind: "
-        f"{sorted(_family_beside(backup))}. An operator who retries now hits a "
-        "collision this run manufactured"
+    # WHAT THIS RUN CREATED SURVIVES TOO, NOW REPORTED RATHER THAN REMOVED —
+    # there is no atomic check-and-delete on this platform. The main member
+    # and the "-wal" sidecar were exclusively created before the collision on
+    # "-shm", so both are still on disk beside the untouched squatter.
+    orphaned_main = backup
+    orphaned_wal = backup.with_name(backup.name + "-wal")
+    assert _family_beside(backup) == {
+        backup.name, orphaned_wal.name, squatter.name,
+    }, (
+        "the refused run's own half-built destination is not exactly what "
+        f"survives beside the untouched squatter: {sorted(_family_beside(backup))}"
     )
     assert sorted(entry.name for entry in work_dir.iterdir()) == sorted(
-        listing_before + [squatter.name]
+        listing_before + [backup.name, orphaned_wal.name, squatter.name]
     ), (
         "the refused run left something in the destination's directory that "
-        "was not there before and is not the squatter — the staging directory "
-        "lives HERE, beside the backup, not in the work dir the residue pin "
-        f"watches: {sorted(entry.name for entry in work_dir.iterdir())}"
+        "is not accounted for — the staging directory lives HERE, beside the "
+        "backup, not in the work dir the residue pin watches: "
+        f"{sorted(entry.name for entry in work_dir.iterdir())}"
     )
     facts = outcome.facts()
+    reported = {record["path"]: record for record in facts["residue"]}
+    for member in (orphaned_main, orphaned_wal):
+        assert str(member) in reported, (
+            f"{member} survived the refusal and is not reported as residue: "
+            f"{facts['residue']!r}"
+        )
+        assert reported[str(member)]["error"] == "cleanup_required", (
+            f"{member} is not reported as needing cleanup: "
+            f"{reported[str(member)]!r}"
+        )
+    assert str(squatter) not in reported, (
+        f"the squatter — not this run's to touch — is reported as this run's "
+        f"own residue: {facts['residue']!r}"
+    )
     assert facts["backup_created"] is False, (
         "the ledger says a backup was created and there is no backup: the "
         f"private staging snapshot is not the operator's backup: {facts!r}"
@@ -1754,6 +1791,7 @@ def _drive_the_boundary_with_unlink_failing(library, store, work_dir, sabotage):
     backup = work_dir.parent / "backup.db"
     outcome = library.RollbackOutcome()
     prepared = {"copy": None}
+    unlink_calls: list = []
 
     class _SabotagedOs:
         def __getattr__(self, name):
@@ -1764,6 +1802,12 @@ def _drive_the_boundary_with_unlink_failing(library, store, work_dir, sabotage):
             return os.lstat(path, *args, **kwargs)
 
         def unlink(self, path, *args, **kwargs):
+            # THE SIDECAR RELEASE NEVER CALLS THIS ANY MORE — there is no
+            # atomic check-and-delete on this platform, so nothing on that
+            # path unlinks a reserved sidecar. Recorded, not just sabotaged,
+            # so a caller can assert the count directly rather than infer it
+            # from the outcome.
+            unlink_calls.append(pathlib.Path(path))
             sabotage(pathlib.Path(path), "unlink")
             return os.unlink(path, *args, **kwargs)
 
@@ -1790,37 +1834,28 @@ def _drive_the_boundary_with_unlink_failing(library, store, work_dir, sabotage):
         else:
             del library.os
     return {"backup": backup, "outcome": outcome, "result": result,
-            "copy": prepared["copy"]}
+            "copy": prepared["copy"], "unlink_calls": unlink_calls}
 
 
-def check_a_sidecar_that_cannot_be_released_is_not_a_successful_backup(
+def check_a_leftover_reserved_sidecar_does_not_block_a_successful_backup(
     tmpdir: pathlib.Path,
 ) -> None:
-    """Ownership is held until the release RESULT is known, not until it starts.
+    """A leftover reserved sidecar is the ORDINARY case now, and reported, not fatal.
 
-    The destination family is reserved with exclusive creates, and the sidecar
-    reservations are handed back at the end so the backup is one file. Handing
-    back is an operation that can fail — a pinned file, a permission change, a
-    filesystem that says no — and the release path dropped the handle and the
-    recorded identity BEFORE attempting it, then swallowed every error. By the
-    time the unlink failed there was nothing left to report with and nothing to
-    retry from, so the run returned a verified, durable backup while an
-    unreleased reservation sat beside it on disk, unmentioned.
+    ``release_the_sidecars`` used to unlink each reserved ``-wal``/``-shm``/
+    ``-journal`` placeholder to hand the name back, and a release that failed
+    halfway used to swallow the error and report a verified, durable backup
+    with a stale reservation sitting beside it, unmentioned.
 
-    THIS IS THE SHAPE ALREADY FIXED ONCE, ONE SEAM OVER. Presence was
-    snapshotted before the sweep and re-emitted as current; here ownership is
-    discarded before the release and the outcome is emitted as if it had
-    succeeded. Both are *state that governs an operation released before that
-    operation's result is known*, and the repair is the same: keep the thing
-    that decides until the decision is in.
-
-    An unreleased ``-wal`` beside a database is not litter. The next reader
-    picks it up as that database's write-ahead log, which is the exact hazard
-    the family reservation exists to prevent — so this cannot be a success.
-
-    The durability claims are re-checked THROUGH THIS PATH, not merely where
-    they were written: a release that failed halfway leaves the parent
-    directory in a state the earlier fsync no longer describes.
+    There is no atomic check-and-delete on this platform, so the unlink is
+    gone entirely — release now only closes the descriptor and reports
+    whatever is still at the name. Nothing between ``acquire()`` and
+    ``release_the_sidecars()`` ever writes to or removes those placeholders,
+    so on an ORDINARY, non-adversarial run — no sabotage at all — they are
+    STILL there when release runs. That is not a failure any more: the
+    backup is still verified and durable and the rollback still commits, and
+    each placeholder is reported as ``cleanup_required`` residue rather than
+    silently deleted or silently dropped.
     """
     _sandbox_home(tmpdir)
     module, why = _import_verb()
@@ -1834,12 +1869,11 @@ def check_a_sidecar_that_cannot_be_released_is_not_a_successful_backup(
     work_dir = tmpdir / "work"
     work_dir.mkdir()
 
-    def _pin_the_wal_sidecar(path, op):
-        if op == "unlink" and path.name.endswith("backup.db-wal"):
-            raise PermissionError("pinned sidecar")
+    def _no_sabotage(path, op):
+        return None
 
     run = _drive_the_boundary_with_unlink_failing(
-        library, store, work_dir, _pin_the_wal_sidecar
+        library, store, work_dir, _no_sabotage
     )
     facts = run["outcome"].facts()
     orphan = run["backup"].with_name(run["backup"].name + "-wal")
@@ -1849,35 +1883,38 @@ def check_a_sidecar_that_cannot_be_released_is_not_a_successful_backup(
         "the fixture did not actually leave a sidecar behind, so this pin "
         f"measures nothing: {sorted(_family_beside(run['backup']))}"
     )
-    assert run["result"]["returned"] is None, (
-        "a reservation could not be released and the boundary returned a "
-        f"backup report anyway: {run['result']['returned']!r}. There is a "
-        "stale -wal beside that database and the next reader will use it"
+    assert run["result"]["returned"] is not None, (
+        "an ordinary run with a leftover reserved sidecar did not produce a "
+        f"backup: {run['result']!r}. Removing the unlink must not break the "
+        "common path"
     )
-    assert facts["backup_durable"] is False, (
-        f"a durable backup is claimed for a destination family that was never "
-        f"cleanly established: {facts!r}"
+    assert facts["backup_durable"] is True, (
+        f"a durable backup is not claimed for an ordinary run: {facts!r}"
     )
-    assert facts["backup_verified"] is False, (
-        f"a verified backup is claimed: {facts!r}"
+    assert facts["backup_verified"] is True, (
+        f"a verified backup is not claimed: {facts!r}"
     )
-    assert facts["outcome"] not in ("committed", "commit-unknown"), (
-        f"the rollback committed on a run whose backup never completed: {facts!r}"
+    assert facts["outcome"] == "committed", (
+        f"an ordinary run did not commit: {facts!r}"
     )
-    assert facts["changed"] is False, (
-        f"the run reports it changed the store: {facts!r}"
+    assert facts["changed"] is True, (
+        f"the run does not report it changed the store: {facts!r}"
     )
     assert facts["residue_present"] is True, (
-        f"the unreleased reservation is on disk and unreported: {facts!r}"
+        f"the leftover reservation is on disk and unreported: {facts!r}"
     )
-    assert any(
-        str(orphan) == record.get("path") for record in facts["residue"]
-    ), (
+    reported = {record["path"]: record for record in facts["residue"]}
+    assert str(orphan) in reported, (
         f"the residue does not name the file that was left: {facts['residue']!r}"
     )
-    assert _installed_triggers(run["copy"]) == triggers_before, (
-        "triggers were dropped on a run whose backup did not complete"
+    assert reported[str(orphan)]["error"] == "cleanup_required", (
+        f"the leftover reservation is not reported as cleanup_required: "
+        f"{reported[str(orphan)]!r}"
     )
+    # THE DDL RUNS ON THE IN-MEMORY CONNECTION, never on the on-disk copy file
+    # or on the real store — both stay exactly as they were found, success or
+    # not.
+    assert _installed_triggers(run["copy"]) == triggers_before
     assert _installed_triggers(store) == triggers_before
 
 
@@ -1887,13 +1924,17 @@ def check_a_foreign_file_at_a_reserved_sidecar_is_never_deleted(
     """A reserved name that now resolves elsewhere is not ours to remove.
 
     Between reserving a sidecar and handing it back, the pathname can come to
-    mean a different file. Releasing by NAME then deletes something this run
-    never created — the same rule the published backup already follows, and it
-    binds harder here because nothing about the sidecar's contents would ever
-    look wrong afterwards.
+    mean a different file. There is no atomic check-and-delete on this
+    platform, so release no longer deletes anything at all — this pin proves
+    that directly, by watching the real unlink spy, rather than inferring it
+    from the outcome. The property this file exists to hold is now trivially
+    true (nothing past the close can ever call unlink), but "trivially true"
+    still has to be measured, not just asserted by removing the call.
 
-    So identity decides, the foreign file survives, and the run says it could
-    not finish rather than tidying the question away.
+    So the foreign file survives, the run still completes — a leftover
+    reserved name, foreign or not, is reported as residue rather than a
+    reason to refuse — and it is reported for a person to look at, not
+    tidied away.
     """
     _sandbox_home(tmpdir)
     module, why = _import_verb()
@@ -1908,7 +1949,7 @@ def check_a_foreign_file_at_a_reserved_sidecar_is_never_deleted(
     stranger = b"a different file that arrived at the reserved sidecar"
 
     def _swap_the_sidecar_for_a_strangers_file(path, op):
-        # BEFORE the identity check, which is the window that matters: the
+        # BEFORE the existence check, which is the window that matters: the
         # reservation is handed back by NAME, and the name can come to mean a
         # different file between reserving it and releasing it.
         if op == "lstat" and path.name.endswith("backup.db-wal") and path.exists():
@@ -1922,15 +1963,28 @@ def check_a_foreign_file_at_a_reserved_sidecar_is_never_deleted(
     orphan = run["backup"].with_name(run["backup"].name + "-wal")
 
     assert not run["result"]["crash"], f"the boundary crashed: {run['result']['crash']}"
+    assert not run["unlink_calls"], (
+        f"the boundary called os.unlink {len(run['unlink_calls'])} time(s): "
+        f"{run['unlink_calls']!r}. There is no atomic check-and-delete on "
+        f"this platform, so nothing past the close may unlink a reserved "
+        f"sidecar, foreign file or not"
+    )
     assert orphan.exists() and orphan.read_bytes() == stranger, (
         "the run deleted a file it did not create at a name it had merely "
         f"reserved: {orphan.exists()!r}"
     )
-    assert run["result"]["returned"] is None, (
-        f"the run reported a completed backup: {run['result']['returned']!r}"
+    assert run["result"]["returned"] is not None, (
+        f"a leftover reserved name — even a foreign one — must not block an "
+        f"otherwise ordinary run: {run['result']!r}"
     )
-    assert "ownership-lost" in _residue_errors(facts), (
-        f"the report does not say the name stopped being ours: {facts['residue']!r}"
+    reported = {record["path"]: record for record in facts["residue"]}
+    assert str(orphan) in reported, (
+        f"the report does not name the foreign file left at the reserved "
+        f"name: {facts['residue']!r}"
+    )
+    assert reported[str(orphan)]["error"] == "cleanup_required", (
+        f"the foreign file is not reported as needing cleanup: "
+        f"{reported[str(orphan)]!r}"
     )
 
 
@@ -1967,40 +2021,45 @@ def check_a_sidecar_that_vanished_is_not_claimed_as_our_removal(
     orphan = run["backup"].with_name(run["backup"].name + "-wal")
 
     assert not run["result"]["crash"], f"the boundary crashed: {run['result']['crash']}"
+    assert not run["unlink_calls"], (
+        f"the boundary called os.unlink {len(run['unlink_calls'])} time(s) "
+        f"resolving an already-absent name: {run['unlink_calls']!r}"
+    )
     assert not orphan.exists(), "the fixture left the sidecar in place"
     assert run["result"]["returned"] is not None, (
         "the reservation is gone, which is the state the release wanted, and "
         f"the run refused anyway: {run['result']!r}"
     )
-    assert facts["residue_present"] is False, (
-        f"nothing is at that name and residue is reported: {facts['residue']!r}"
+    # THE OTHER TWO RESERVED SIDECARS (-shm, -journal) ARE STILL ON DISK —
+    # nothing deletes them any more, so they are residue too. That is a
+    # separate, expected fact about the ordinary case (see
+    # check_a_leftover_reserved_sidecar_does_not_block_a_successful_backup);
+    # what THIS pin asserts is scoped to the vanished name specifically.
+    assert not any(
+        record.get("path") == str(orphan) for record in facts["residue"]
+    ), (
+        f"nothing is at {orphan} and it is reported as residue anyway: "
+        f"{facts['residue']!r}"
     )
 
 
 def check_every_surviving_destination_member_is_reported_exactly_once(
     tmpdir: pathlib.Path,
 ) -> None:
-    """A cleanup that RETURNS its failures, and a caller that reads them.
+    """A cleanup that RETURNS its findings, and a caller that reads them.
 
-    The release path was taught to hold ownership until the result was known,
-    and it does: it detects the member it could not remove and returns it. The
-    caller then called it for effect and threw the list away, so a surviving
-    ``backup.db`` sat on disk while the layer below had already worked out that
-    it was there. The defect did not survive where it was fixed — it reappeared
-    one level up, where the fix was invisible from outside.
-
-    That is the second time in this slice a defect has moved up a level after
-    being closed down one, so the rule is stated rather than filed: after
-    fixing something, check its CALLERS. Every level that consumes the fixed
-    thing's result. A return value describing a failure is a fact, and a fact
-    nobody reads is not a fact.
-
-    THE CARDINALITY RULE, ACROSS LAYERS THIS TIME. Both the sidecar release and
-    the cleanup pass can see the same physical file, so the incident key is the
-    MEMBER — not the layer that noticed it. One surviving destination is one
-    record however many passes observe it, and two surviving members are two.
-
-    And the refusal that decided the run stays primary: residue is additive.
+    ``release_the_sidecars`` closes and reports every reserved sidecar name —
+    never by deleting, there is no atomic check-and-delete on this platform —
+    and pops each from ``self.identities`` the instant it is resolved. So by
+    the time a LATER failure (here, the confirmation step) drives the
+    ``except BaseException`` handler in ``_make_verified_backup`` into calling
+    ``remove_only_what_we_created()`` on the SAME reservation, only the main
+    member ``""`` is still claimed — the sidecars are already gone from that
+    dict. Both call sites still write into the SAME residue ledger, though,
+    and the cardinality rule is that every surviving member is reported
+    EXACTLY once however many call sites see it — not once per call site, and
+    not silently dropped because a different call site already reported the
+    other three.
     """
     _sandbox_home(tmpdir)
     module, why = _import_verb()
@@ -2014,34 +2073,52 @@ def check_every_surviving_destination_member_is_reported_exactly_once(
     work_dir = tmpdir / "work"
     work_dir.mkdir()
 
-    def _pin_both_the_sidecar_and_the_backup(path, op):
-        if op == "unlink" and path.name in ("backup.db-wal", "backup.db"):
-            raise PermissionError("pinned")
+    def _no_sabotage(path, op):
+        return None
 
-    run = _drive_the_boundary_with_unlink_failing(
-        library, store, work_dir, _pin_both_the_sidecar_and_the_backup
-    )
+    def _refuse_confirmation(self, snapshot):
+        raise library.TurnFenceRollbackRefused(
+            "pinned: backup confirmation refused (probe)",
+            reason="backup-unreadable",
+        )
+
+    real_confirm = library._AcquiredDestinations.confirm_the_final_member
+    library._AcquiredDestinations.confirm_the_final_member = _refuse_confirmation
+    try:
+        run = _drive_the_boundary_with_unlink_failing(
+            library, store, work_dir, _no_sabotage
+        )
+    finally:
+        library._AcquiredDestinations.confirm_the_final_member = real_confirm
+
     facts = run["outcome"].facts()
     backup = run["backup"]
-    orphan = backup.with_name(backup.name + "-wal")
+    members = [backup] + [
+        backup.with_name(backup.name + suffix)
+        for suffix in ("-wal", "-shm", "-journal")
+    ]
 
     assert not run["result"]["crash"], f"the boundary crashed: {run['result']['crash']}"
-    assert backup.exists() and orphan.exists(), (
-        "the fixture did not leave both members behind, so this pin measures "
-        f"nothing: {sorted(_family_beside(backup))}"
+    assert not run["unlink_calls"], (
+        f"the boundary called os.unlink {len(run['unlink_calls'])} time(s): "
+        f"{run['unlink_calls']!r}"
+    )
+    assert all(member.exists() for member in members), (
+        "the fixture did not leave every destination member behind, so this "
+        f"pin measures nothing: {sorted(_family_beside(backup))}"
     )
     assert run["result"]["returned"] is None, (
         f"the run reported a backup: {run['result']['returned']!r}"
     )
-    assert run["result"]["reason"] == "backup-destination-residue", (
+    assert run["result"]["reason"] == "backup-unreadable", (
         "residue took the reason from whatever decided the run's fate: "
         f"{run['result']!r}"
     )
 
     reported = sorted(record["path"] for record in facts["residue"])
-    assert reported == sorted([str(backup), str(orphan)]), (
+    assert reported == sorted(str(member) for member in members), (
         "the surviving destination members are not each reported exactly "
-        f"once: {facts['residue']!r}. Two files remain on disk and the "
+        f"once: {facts['residue']!r}. Four files remain on disk and the "
         "operator is told about a different set"
     )
     assert len(facts["residue"]) == len(set(reported)), (
@@ -2080,6 +2157,18 @@ def check_a_cleanup_failure_never_replaces_the_refusal_that_decided_the_run(
     about the final verified-and-durable fact; on this path that fact is false
     three ways, and the sentence was being written by the branch that happened
     to be printing rather than read from the thing that decides it.
+
+    THE PRIMARY REFUSAL IS NOW INJECTED AT CONFIRMATION, NOT AT RELEASE.
+    Pinning ``os.unlink`` no longer produces a refusal — release never deletes
+    anything any more, so a pinned sidecar is reported as residue rather than
+    failing the run. What this pin needs is SOME real refusal deep enough that
+    the staging directory is still unswept when it fires, so
+    ``confirm_the_final_member`` is monkeypatched to refuse directly. By that
+    point ``release_the_sidecars`` has already run — successfully, since it
+    no longer raises — and already reported the three sidecar placeholders as
+    residue, so this run now carries more than the two incidents an earlier
+    version of this pin counted; the count is a fact about how many members
+    happened to be reserved, not the property under test.
     """
     _sandbox_home(tmpdir)
     module, why = _import_verb()
@@ -2105,18 +2194,26 @@ def check_a_cleanup_failure_never_replaces_the_refusal_that_decided_the_run(
                 return None
             return self._real.rmtree(path, *args, **kwargs)
 
-    def _pin_the_wal_sidecar(path, op):
-        if op == "unlink" and path.name.endswith("backup.db-wal"):
-            raise PermissionError("pinned sidecar")
+    def _no_sabotage(path, op):
+        return None
+
+    def _refuse_confirmation(self, snapshot):
+        raise library.TurnFenceRollbackRefused(
+            "pinned: backup confirmation refused (probe)",
+            reason="backup-unreadable",
+        )
 
     real_shutil = library.shutil
+    real_confirm = library._AcquiredDestinations.confirm_the_final_member
     library.shutil = _StagingSurvives(real_shutil)
+    library._AcquiredDestinations.confirm_the_final_member = _refuse_confirmation
     try:
         run = _drive_the_boundary_with_unlink_failing(
-            library, store, work_dir, _pin_the_wal_sidecar
+            library, store, work_dir, _no_sabotage
         )
     finally:
         library.shutil = real_shutil
+        library._AcquiredDestinations.confirm_the_final_member = real_confirm
 
     facts = run["outcome"].facts()
     assert not run["result"]["crash"], f"the boundary crashed: {run['result']['crash']}"
@@ -2124,7 +2221,7 @@ def check_a_cleanup_failure_never_replaces_the_refusal_that_decided_the_run(
         f"the run reported a backup: {run['result']['returned']!r}"
     )
 
-    assert run["result"]["reason"] == "backup-destination-residue", (
+    assert run["result"]["reason"] == "backup-unreadable", (
         "a cleanup problem in a finally replaced the refusal that decided this "
         f"run: {run['result']['reason']!r}. The staging sweep is additive — it "
         "never becomes the reason the run failed"
@@ -2135,15 +2232,15 @@ def check_a_cleanup_failure_never_replaces_the_refusal_that_decided_the_run(
     )
 
     incidents = sorted(record["incident"] for record in facts["residue"])
-    assert len(incidents) == len(set(incidents)) and len(incidents) == 2, (
-        "two physical incidents — a pinned sidecar and an un-swept staging "
-        f"directory — are not reported exactly once each: {facts['residue']!r}"
+    assert len(incidents) == len(set(incidents)) and len(incidents) >= 2, (
+        "at least a pinned staging directory and one destination member "
+        f"must each be reported exactly once: {facts['residue']!r}"
     )
     assert any(i.startswith("staging:") for i in incidents), (
         f"the staging directory is not reported: {incidents!r}"
     )
     assert any(i.startswith("destination:") for i in incidents), (
-        f"the pinned sidecar is not reported: {incidents!r}"
+        f"no destination member is reported: {incidents!r}"
     )
 
     assert facts["backup_created"] is False, f"a backup is claimed: {facts!r}"
@@ -2438,9 +2535,18 @@ def check_the_backup_describes_the_prepared_image_not_the_source_path(
     assert backup.is_file(), (
         f"the rehearsal produced no backup: {outcome['reason']!r} {outcome['detail']!r}"
     )
-    assert _family_beside(backup) == {backup.name}, (
-        f"the backup arrived as a family of files: {sorted(_family_beside(backup))}"
-    )
+    # RESERVED SIDECAR PLACEHOLDERS ARE NOW LEFT BEHIND ON PURPOSE. There is
+    # no atomic check-and-delete on this platform, so release no longer
+    # unlinks them -- it reports each as cleanup_required residue instead.
+    # What THIS pin asserts is content provenance, so a leftover placeholder
+    # is fine as long as it is still the empty reservation it always was, not
+    # a hint that something wrote real content to the wrong member.
+    leftover = _family_beside(backup) - {backup.name}
+    for name in leftover:
+        assert (backup.parent / name).stat().st_size == 0, (
+            f"a leftover sidecar member is not the empty reserved placeholder "
+            f"it should still be: {name}"
+        )
 
     conn = sqlite3.connect(str(backup))
     try:
@@ -3372,8 +3478,8 @@ PINS = {
         check_a_residue_claim_names_the_fence_state_that_was_established,
     "check_a_run_that_creates_nothing_reports_no_residue":
         check_a_run_that_creates_nothing_reports_no_residue,
-    "check_a_sidecar_that_cannot_be_released_is_not_a_successful_backup":
-        check_a_sidecar_that_cannot_be_released_is_not_a_successful_backup,
+    "check_a_leftover_reserved_sidecar_does_not_block_a_successful_backup":
+        check_a_leftover_reserved_sidecar_does_not_block_a_successful_backup,
     "check_a_foreign_file_at_a_reserved_sidecar_is_never_deleted":
         check_a_foreign_file_at_a_reserved_sidecar_is_never_deleted,
     "check_a_sidecar_that_vanished_is_not_claimed_as_our_removal":
@@ -3457,7 +3563,7 @@ MAINTENANCE_ONLY = frozenset({
     "check_a_partial_surface_is_refused_whole_and_writes_no_backup",
     "check_a_residue_claim_names_the_fence_state_that_was_established",
     "check_a_run_that_cannot_clean_up_does_not_report_success",
-    "check_a_sidecar_that_cannot_be_released_is_not_a_successful_backup",
+    "check_a_leftover_reserved_sidecar_does_not_block_a_successful_backup",
     "check_a_sidecar_that_vanished_is_not_claimed_as_our_removal",
     "check_a_target_swapped_and_restored_around_any_open_cannot_be_reached",
     "check_a_target_swapped_for_another_valid_store_is_refused",
@@ -3516,10 +3622,10 @@ _APPROVED_BOUNDARY_SURFACE = frozenset({
 #: cannot be re-entered afterwards, so they are outside the claim "this pin's
 #: execution reaches nothing deep". Covering them needs a separate instrument
 #: (a fresh isolated import under the profiler), not a bigger runtime roster.
-_LIBRARY_CODE_OBJECT_COUNT = 82
+_LIBRARY_CODE_OBJECT_COUNT = 80
 
 #: Reported separately, as a STATIC fact, never as the dynamic denominator.
-_IMPORT_TIME_CODE_OBJECT_COUNT = 88
+_IMPORT_TIME_CODE_OBJECT_COUNT = 86
 _IMPORT_TIME_ONLY_BODIES = 6
 
 
@@ -3753,7 +3859,7 @@ def _assert_surface_literals(approved):
 
 
 def test_the_library_surface_partition_is_exact():
-    """79 total, 11 approved, 68 deep -- as literals, and as exact sets.
+    """80 total, 11 approved, 69 deep -- as literals, and as exact sets.
 
     IF THIS FAILS BECAUSE THE COUNT MOVED: a code object appeared in or left the
     library and is unclassified. Add it to the approved list WITH A REASON it is
@@ -3964,7 +4070,7 @@ def test_the_child_the_wal_fixture_runs_is_pinned_by_content():
 
 
 def test_the_import_time_census_is_a_separate_fact():
-    """85 code objects exist; 79 are reachable by a pin. Both, never conflated.
+    """86 code objects exist; 80 are reachable by a pin. Both, never conflated.
 
     The six extra are the module body and five class bodies. They execute at
     IMPORT, before any boundary pin runs, so a pin cannot re-enter them -- they
@@ -5084,85 +5190,79 @@ SOURCE_MUTATIONS = (
             "a late fact erasing an earlier one, in one line",
     ),
     Mutation(
-        pin="check_a_sidecar_that_cannot_be_released_is_not_a_successful_backup",
+        pin="check_a_leftover_reserved_sidecar_does_not_block_a_successful_backup",
         module="hermes_cli/session_fence_rollback.py",
-        find="        try:\n            os.unlink(member)\n"
-             "        except OSError as exc:\n"
-             '            return {"path": str(member), "files": 1,\n'
-             '                    "error": f"{type(exc).__name__}: {exc}"}\n',
-        replace="        try:\n            os.unlink(member)\n"
-                "        except OSError:\n            pass\n",
-        kills_by='a reservation could not be released and the boundary returned a backup report anyway:',
-        why="swallowing the unlink failure is the defect: the reservation is "
-            "still on disk and the run reports a verified, durable backup with "
-            "a stale -wal beside it, which the next reader takes for that "
-            "database's write-ahead log",
+        find="        for suffix in [s for s in self.identities if s]:\n"
+             "            problem = self._release(suffix)\n"
+             "            if problem is not None and outcome is not None:\n"
+             "                outcome.note_residue(\n"
+             "                    describe_residue(\n"
+             "                        problem,\n"
+             '                        obligation="a reserved backup destination",\n'
+             "                        outcome=outcome,\n"
+             "                    ),\n"
+             "                    # Keyed on the MEMBER, not on the layer that\n"
+             "                    # noticed it. The cleanup pass above may report the same\n"
+             "                    # physical file, and one surviving destination is one\n"
+             "                    # incident however many layers see it.\n"
+             '                    incident=f"destination:{problem[\'path\']}",\n'
+             "                )\n",
+        replace="        for suffix in [s for s in self.identities if s]:\n"
+                "            problem = self._release(suffix)\n"
+                "            if problem is not None and outcome is not None:\n"
+                "                outcome.note_residue(\n"
+                "                    describe_residue(\n"
+                "                        problem,\n"
+                '                        obligation="a reserved backup destination",\n'
+                "                        outcome=outcome,\n"
+                "                    ),\n"
+                "                    # Keyed on the MEMBER, not on the layer that\n"
+                "                    # noticed it. The cleanup pass above may report the same\n"
+                "                    # physical file, and one surviving destination is one\n"
+                "                    # incident however many layers see it.\n"
+                '                    incident=f"destination:{problem[\'path\']}",\n'
+                "                )\n"
+                "            if problem is not None:\n"
+                "                raise TurnFenceRollbackRefused(\n"
+                '                    f"pinned: {problem[\'path\']} (probe)",\n'
+                '                    reason="backup-destination-residue",\n'
+                "                )\n",
+        kills_by="an ordinary run with a leftover reserved sidecar did not produce a backup",
+        why="a leftover reserved sidecar is the ORDINARY case now — nothing "
+            "between acquire() and release_the_sidecars() ever removes those "
+            "placeholders. Restoring a refusal on that residue is exactly the "
+            "old behaviour: it blocks a successful backup on the common path",
     ),
     Mutation(
         pin="check_a_foreign_file_at_a_reserved_sidecar_is_never_deleted",
         module="hermes_cli/session_fence_rollback.py",
-        # ALL THREE checks, not just the first two. A second, revalidating
-        # lstat runs immediately before the unlink (closing the
-        # swap-in-the-window hole below the first), and a third, content-seal
-        # check runs after that (closing the same-inode-coincidence hole
-        # neither lstat can) -- and on THIS pin's fixture the sabotage fires
-        # on every lstat, not only the first, so it re-swaps in front of the
-        # later checks too. Removing only the first check left the other two
-        # standing in for it: the pin kept passing, discriminating nothing --
-        # a redundant check reporting coverage it did not have. Removing all
-        # three is what actually restores the "no check at all" state this
-        # pin exists to catch.
-        find="        if (info.st_dev, info.st_ino) != identity:\n"
-             '            return {"path": str(member), "files": 1, "error": "ownership-lost"}\n'
-             "        # A SECOND check, immediately before the unlink. The descriptor closed\n"
-             "        # above no longer pins the inode, and the unlink below still names the\n"
-             "        # file by PATH — POSIX has no call that unlinks \"this exact inode at\n"
-             "        # this name\" atomically, and holding the descriptor open across the\n"
-             "        # unlink is not on the table either: the close has to happen first,\n"
-             "        # which is the same ordering Windows requires. So this does not CLOSE\n"
-             "        # the window between the first check and the unlink — nothing built on\n"
-             "        # unlink-by-path can — it SHRINKS it, from \"close, a comparison and a\n"
-             "        # dict pop\" down to the instant right before the call that destroys\n"
-             "        # the file. A name that changed since the FIRST check is caught here\n"
-             "        # instead of silently unlinked.\n"
+        find="        self._close_handle(suffix)\n"
              "        try:\n"
-             "            revalidated = os.lstat(member)\n"
+             "            os.lstat(member)\n"
              "        except FileNotFoundError:\n"
              "            return None\n"
              "        except OSError as exc:\n"
              '            return {"path": str(member), "files": 1,\n'
              '                    "error": f"{type(exc).__name__}: {exc}"}\n'
-             "        if (revalidated.st_dev, revalidated.st_ino) != identity:\n"
-             '            return {"path": str(member), "files": 1, "error": "ownership-lost"}\n'
-             "        # A THIRD check — of CONTENT, not identity — for the gap neither of the\n"
-             "        # above can close. (st_dev, st_ino) is a small, densely-reused index:\n"
-             "        # if the kernel hands the exact number this suffix's file once had back\n"
-             "        # to an unrelated file created at this name in between, both checks\n"
-             "        # above answer \"still ours\" about a stranger, and the unlink below\n"
-             "        # would delete it. That is a coincidence a well-known name (anything\n"
-             "        # can recreate \"backup.db-wal\") cannot rule out by name alone. The\n"
-             "        # 32-byte marker written into the file at acquisition time is: nothing\n"
-             "        # else was ever shown it, so a file that merely reused the old inode\n"
-             "        # number cannot also happen to contain it. Unlike the descriptor, the\n"
-             "        # marker survives the close, so it needs no path trick the\n"
-             "        # close-before-delete rule (see above) would forbid anyway. Only\n"
-             "        # sidecars carry one — ``seal`` is ``None`` for suffix \"\" and this\n"
-             "        # check is then a no-op, matching the pre-seal behaviour there.\n"
-             "        seal = self._seals.get(suffix)\n"
-             "        if seal is not None:\n"
-             "            try:\n"
-             "                with open(member, \"rb\") as sealed:\n"
-             "                    observed_seal = sealed.read(len(seal))\n"
-             "            except OSError as exc:\n"
-             "                return {\"path\": str(member), \"files\": 1,\n"
-             "                        \"error\": f\"{type(exc).__name__}: {exc}\"}\n"
-             "            if observed_seal != seal:\n"
-             "                return {\"path\": str(member), \"files\": 1, \"error\": \"ownership-lost\"}\n",
-        replace="",
-        kills_by='the run deleted a file it did not create at a name it had merely reserved:',
-        why="releasing a reserved name without checking what it resolves to "
-            "now deletes a file this run never created. Nothing about the "
-            "result would look wrong afterwards, and deletion has no way back",
+             '        return {"path": str(member), "files": 1, "error": "cleanup_required"}\n',
+        replace="        self._close_handle(suffix)\n"
+                "        try:\n"
+                "            os.lstat(member)\n"
+                "        except FileNotFoundError:\n"
+                "            return None\n"
+                "        except OSError as exc:\n"
+                '            return {"path": str(member), "files": 1,\n'
+                '                    "error": f"{type(exc).__name__}: {exc}"}\n'
+                "        try:\n"
+                "            os.unlink(member)\n"
+                "        except OSError:\n"
+                "            pass\n"
+                "        return None\n",
+        kills_by="the boundary called os.unlink",
+        why="reintroducing the unlink is the defect this pin exists to catch: "
+            "releasing a reserved name without checking what it resolves to "
+            "now deletes a file this run never created, foreign or not, and "
+            "deletion has no way back",
     ),
     Mutation(
         pin="check_a_cleanup_failure_never_replaces_the_refusal_that_decided_the_run",
@@ -5186,7 +5286,7 @@ SOURCE_MUTATIONS = (
         find="            for problem in reservation.remove_only_what_we_created():\n",
         replace="            reservation.remove_only_what_we_created()\n"
                 "            for problem in []:\n",
-        kills_by='. Two files remain on disk and the operator is told about a different set',
+        kills_by='. Four files remain on disk and the operator is told about a different set',
         why="the cleanup pass correctly works out which destination it could "
             "not remove and returns it; calling it for effect throws that away, "
             "so a surviving backup.db sits on disk unreported while the layer "
@@ -5196,12 +5296,17 @@ SOURCE_MUTATIONS = (
     Mutation(
         pin="check_a_sidecar_that_vanished_is_not_claimed_as_our_removal",
         module="hermes_cli/session_fence_rollback.py",
-        find="        except FileNotFoundError:\n"
-             "            self.identities.pop(suffix, None)\n"
+        find="        self._close_handle(suffix)\n"
+             "        try:\n"
+             "            os.lstat(member)\n"
+             "        except FileNotFoundError:\n"
              "            return None\n",
-        replace="        except FileNotFoundError:\n"
+        replace="        self._close_handle(suffix)\n"
+                "        try:\n"
+                "            os.lstat(member)\n"
+                "        except FileNotFoundError:\n"
                 '            return {"path": str(member), "error": "vanished"}\n',
-        kills_by='the reservation is gone, which is the state the release wanted, and the run refused anyway:',
+        kills_by='nothing is at',
         why="a reservation that is already gone is the state the release "
             "wanted. Reporting it as an unresolved incident sends the operator "
             "to a directory to remove a file that is not there",
@@ -5285,11 +5390,12 @@ SOURCE_MUTATIONS = (
         module="hermes_cli/session_fence_rollback.py",
         find="            for problem in reservation.remove_only_what_we_created():\n",
         replace="            for problem in []:\n",
-        kills_by='. An operator who retries now hits a collision this run manufactured',
+        kills_by="survived the refusal and is not reported as residue",
         why="the run still refuses, and still refuses for the right reason — "
-            "what it stops doing is removing the half-built destination it "
-            "created before hitting the occupied sibling. The operator who "
-            "retries then collides with a file this run manufactured",
+            "what it stops doing is reading what remove_only_what_we_created "
+            "actually found. The half-built destination this run created "
+            "before hitting the occupied sibling then survives, unreported, "
+            "and an operator has no way to know it is there",
     ),
     Mutation(
         pin="check_the_backup_file_itself_is_flushed_to_the_platter",
