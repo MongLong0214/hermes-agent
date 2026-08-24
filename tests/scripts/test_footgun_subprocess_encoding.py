@@ -232,3 +232,4 @@ class TestFullRepoScan:
                 f"a `# windows-footgun: ok` suppression."
             )
         # All matches are the expected PR #60741 sites — OK on this branch.
+
