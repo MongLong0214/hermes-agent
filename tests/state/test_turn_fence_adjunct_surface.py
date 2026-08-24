@@ -661,15 +661,18 @@ SOURCE_MUTATIONS = (
     Mutation(
         pin="check_the_owner_still_writes_every_adjunct_table_normally",
         module="hermes_state.py",
+        # Re-pointed when the two multi-target admitters were given one shared
+        # root classifier. The seam moved; the blast radius must not. Aimed at
+        # THIS admitter's call rather than at the shared helper, because the
+        # helper also serves the routing writer, and mutating there breaks a
+        # path this pin drives without catching — the row would then die by an
+        # escaping refusal instead of by its own assertion, which is the
+        # harness's definition of a row that proves nothing.
         find=(
-            "        named = next(\n"
-            "            (sid for sid in ids\n"
-            "             if self._session_turn_lease_key_on_conn(conn, sid) "
-            "== granted_root),\n"
-            "            None,\n"
-            "        )\n"
+            "        named, rest = self._classify_by_granted_root("
+            "conn, ids, turn_lease_holder)\n"
         ),
-        replace="        named = None\n",
+        replace="        named, rest = None, list(ids)\n",
         why="without resolving WHICH conversation the caller's grant names, "
             "the borrowed admission treats the holder's own conversation as a "
             "bystander's and refuses the owner — the failure this pin exists "
