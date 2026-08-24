@@ -184,9 +184,14 @@ def q3_who_unlinks(pins) -> None:
     print(f"\nunlink() calls on *backup.db-wal: {len(unlinks)}")
     for stack in unlinks:
         print("   <-", " | ".join(stack[-3:]))
+    # CLASSIFY BY WHAT IS PRESENT, NOT BY WHAT IS ABSENT. The first version of
+    # this excluded any stack mentioning the test file, and the harness's
+    # _SabotagedOs.unlink wrapper lives in that file and sits on EVERY
+    # production call — so production always looked like the hook and the
+    # verdict line said B while the raw stacks said A.
     production = [
         s for s in unlinks
-        if not any("test_sessions_fence_rollback_verb" in frame for frame in s)
+        if any("session_fence_rollback.py" in frame for frame in s)
     ]
     print(f"\nOF THOSE, FROM PRODUCTION (not the test hook): {len(production)}")
     for stack in production:
@@ -201,6 +206,48 @@ def q3_who_unlinks(pins) -> None:
     )
 
 
+
+def q4_inode_reuse() -> None:
+    """Does unlink-then-recreate REUSE the inode number on this filesystem?
+
+    This is the hypothesis the Linux stack points at. ``_release`` closes its
+    descriptor FIRST, then lstats the name and compares ``(st_dev, st_ino)``
+    against what it recorded at acquisition. Closing the descriptor is what
+    lets the inode be recycled: while it was open the number could not be
+    reused, so the comparison meant something; once closed, a different file
+    created at that name can inherit the same number and the comparison
+    silently answers "still ours".
+    """
+    section("Q4  does unlink+recreate reuse the inode number here")
+    tmp = pathlib.Path(tempfile.mkdtemp())
+    target = tmp / "reserve.db-wal"
+
+    handle = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    reserved = os.fstat(handle)
+    print(f"  reserved (descriptor OPEN)  dev={reserved.st_dev} ino={reserved.st_ino}")
+
+    # A: swap while the descriptor is still open.
+    target.unlink()
+    target.write_bytes(b"a stranger, written while our fd is open")
+    while_open = target.lstat()
+    print(f"  stranger while fd OPEN      dev={while_open.st_dev} ino={while_open.st_ino}"
+          f"  SAME_INO={while_open.st_ino == reserved.st_ino}")
+    os.close(handle)
+    target.unlink()
+
+    # B: the shipped order — close first, then swap.
+    handle = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    reserved2 = os.fstat(handle)
+    os.close(handle)
+    target.unlink()
+    target.write_bytes(b"a stranger, written after our fd was closed")
+    after_close = target.lstat()
+    print(f"  reserved2 (before close)    dev={reserved2.st_dev} ino={reserved2.st_ino}")
+    print(f"  stranger after fd CLOSED    dev={after_close.st_dev} ino={after_close.st_ino}"
+          f"  SAME_INO={after_close.st_ino == reserved2.st_ino}")
+    print("\n  IF SAME_INO is True in the closed case, (st_dev, st_ino) does not")
+    print("  identify the file, and _release deletes a stranger believing it is ours.")
+
 def main() -> int:
     print("platform:", sys.platform)
     print("python:", sys.version.split()[0])
@@ -209,7 +256,7 @@ def main() -> int:
         print("PIN FILE ABSENT ON THIS REF:", PIN_FILE)
         return 0
     pins = _load_pins()
-    for step in (q0_wal_support,):
+    for step in (q0_wal_support, q4_inode_reuse):
         try:
             step()
         except BaseException as exc:  # noqa: BLE001
