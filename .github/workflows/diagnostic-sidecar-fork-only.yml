@@ -30,6 +30,7 @@ on:
   push:
     branches:
       - 'diag/**'
+  workflow_dispatch:
 
 permissions:
   contents: read
