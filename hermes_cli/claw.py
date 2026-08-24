@@ -189,16 +189,6 @@ def _warn_if_gateway_running(auto_yes: bool) -> None:
         print_info("Migration cancelled. Stop the gateway and try again.")
         sys.exit(0)
 
-# State files commonly found in OpenClaw workspace directories — listed
-# during cleanup to help the user decide whether to archive
-_WORKSPACE_STATE_GLOBS = (
-    "*/todo.json",
-    "*/sessions/*",
-    "*/memory/*.json",
-    "*/logs/*",
-)
-
-
 def _find_migration_script() -> Path | None:
     """Find the openclaw_to_hermes.py script in known locations."""
     for candidate in [_OPENCLAW_SCRIPT, _OPENCLAW_SCRIPT_INSTALLED]:

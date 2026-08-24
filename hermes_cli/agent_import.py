@@ -78,10 +78,6 @@ _SECRET_KEY_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Files inside the source tree that hold credentials — never read.
-_CREDENTIAL_FILENAMES = (".credentials.json", "auth.json", "credentials.json")
-
-
 def is_secret_key(key: str) -> bool:
     """Return True when an env-var name looks like a credential."""
     return bool(_SECRET_KEY_RE.search(key or ""))

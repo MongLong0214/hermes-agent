@@ -428,15 +428,6 @@ def is_streaming_access_denied_error(exc: BaseException) -> bool:
 #   2. AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY (explicit IAM credentials)
 #   3. AWS_PROFILE (named profile → SSO, assume-role, etc.)
 #   4. Implicit: instance role, ECS task role, Lambda execution role
-_AWS_CREDENTIAL_ENV_VARS = [
-    "AWS_BEARER_TOKEN_BEDROCK",
-    "AWS_ACCESS_KEY_ID",
-    "AWS_PROFILE",
-    # These are checked by boto3's default chain but we list them for
-    # has_aws_credentials() detection:
-    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
-    "AWS_WEB_IDENTITY_TOKEN_FILE",
-]
 
 
 def resolve_aws_auth_env_var(env: Optional[Dict[str, str]] = None) -> Optional[str]:

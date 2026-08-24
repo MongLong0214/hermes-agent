@@ -51,7 +51,6 @@ logger = logging.getLogger(__name__)
 
 # Short timeouts: schtasks occasionally wedges and we don't want to hang forever.
 _SCHTASKS_TIMEOUT_S = 15
-_SCHTASKS_NO_OUTPUT_TIMEOUT_S = 30
 # Patterns in schtasks stderr that mean "fall back to the Startup folder".
 _FALLBACK_PATTERNS = re.compile(
     r"(access is denied|acceso denegado|přístup byl odepřen|schtasks timed out|schtasks produced no output)",

@@ -596,11 +596,6 @@ _AUTH_PATTERNS = [
     "access denied",
 ]
 
-# Anthropic thinking block signature patterns
-_THINKING_SIG_PATTERNS = [
-    "signature",  # Combined with "thinking" check
-]
-
 # Message-string patterns that indicate a provider-side timeout even when
 # the exception type is generic (e.g. RuntimeError from a local shim that
 # wraps a subprocess timeout).  Checked before the type-based transport
