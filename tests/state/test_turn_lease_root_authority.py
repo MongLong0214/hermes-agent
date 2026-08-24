@@ -139,6 +139,50 @@ def _branch_child(db, parent: str, child: str) -> None:
     )
 
 
+def _assert_the_fork_fixture_walks_the_intended_path(db, parent, child) -> None:
+    """Prove the fixture reaches the code it names, before asserting on it.
+
+    This exists because the shipped fixture at
+    ``tests/state/test_turn_lease_affected_set.py:111`` did not. It hands
+    ``model_config=json.dumps({...})`` to ``create_session``, whose insert
+    serializes the value again, so the row stores a JSON *string* — the marker
+    never parses, ``_is_explicit_fork_child_row`` answers False, and the child
+    is not a fork at all. Its own assert passes anyway, because the parent in
+    that fixture is not compression-ended, so the walk stops for an unrelated
+    reason. A green with the marker inert is a green that never reached the
+    predicate under test.
+
+    So all four preconditions are ASSERTED rather than assumed: the stored
+    config parses as an object, the marker is recognised, the child is its own
+    lease root, and the parent really is a compression parent — which is what
+    makes the ancestors join eligible to climb in the first place.
+    """
+    with db._read_ctx() as conn:
+        row = dict(conn.execute(
+            "SELECT id, parent_session_id, source, model_config, end_reason "
+            "FROM sessions WHERE id = ?", (child,),
+        ).fetchone())
+    parsed = json.loads(row["model_config"] or "{}")
+    assert isinstance(parsed, dict), (
+        f"the fixture stored model_config double-encoded "
+        f"({row['model_config']!r}), so the branch marker never parses and this "
+        f"check would pass without ever reaching the predicate it names — hand "
+        f"create_session a dict, not json.dumps(...)"
+    )
+    assert parsed.get("_branched_from") == parent, parsed
+    assert db._is_explicit_fork_child_row(row) is True, (
+        "the row is not recognised as an explicit fork, so it is not a "
+        "separate conversation and there is no gap to exercise"
+    )
+    assert db._session_turn_lease_key(child) == child, (
+        "the fork child does not resolve to its own lease root"
+    )
+    assert db.get_session(parent)["end_reason"] == "compression", (
+        "the parent is not compression-ended, so the ancestors join cannot "
+        "climb and a green here would mean nothing"
+    )
+
+
 def _lease_row(db, session_id):
     row = db.get_session_turn_lease(session_id)
     return None if row is None else dict(row)
@@ -535,7 +579,115 @@ def check_the_three_root_confusions_compose(tmpdir) -> None:
         db.close()
 
 
+def check_a_flag_write_on_a_fork_child_leaves_its_compression_parent_alone(
+    tmpdir,
+) -> None:
+    """B2's other direction: the ANCESTORS walk climbs out of the conversation.
+
+    The descendants leg descends from the named row into children that are not
+    continuations. The ancestors leg has the same hole pointing the other way:
+    it climbs ``child -> parent`` on ``parent.end_reason = 'compression'`` and
+    never asks whether the CHILD is a continuation of that parent. A ``/branch``
+    child of a compression parent satisfies that join, so naming the child walks
+    up into the parent's conversation — a separate lease root that the guard on
+    the named session never checked.
+
+    ``_session_turn_lease_key_on_conn`` refuses to make that climb: it stops at
+    ``_is_explicit_fork_child_row``. The flag writers' own walk did not.
+    """
+    from hermes_state import SessionTurnLeaseLostError
+
+    db = _store(tmpdir)
+    try:
+        _compression_chain(db, "A", "B")
+        _branch_child(db, "A", "C")
+        _assert_the_fork_fixture_walks_the_intended_path(db, "A", "C")
+
+        for name, setter, column in _FLAG_WRITERS:
+            assert not _marked(db, "A", column), f"A starts {name}-marked"
+            assert not _marked(db, "B", column), f"B starts {name}-marked"
+
+            getattr(db, setter)("C", True)
+
+            assert _marked(db, "C", column), (
+                f"set_session_{name}('C', True) did not mark the session it named"
+            )
+            assert not _marked(db, "A", column), (
+                f"set_session_{name}('C', True) marked {name!r} on 'A' — the "
+                f"compression PARENT of an explicit-fork child, and a separate "
+                f"conversation with its own lease root. The guard checked 'C'; "
+                f"the recursive ancestors walk then climbed to 'A' because it "
+                f"tests only parent.end_reason = 'compression' and never asks "
+                f"whether the child it is climbing from is a continuation. "
+                f"_session_turn_lease_key_on_conn stops exactly here, at "
+                f"_is_explicit_fork_child_row; this walk did not."
+            )
+            assert not _marked(db, "B", column), (
+                f"set_session_{name}('C', True) reached 'B', the continuation "
+                f"of the parent's conversation, through 'A'"
+            )
+
+        # The control, as in the descendants direction: with a live owner on
+        # the parent's conversation, naming it directly IS refused.
+        owner = db.try_acquire_session_turn_lease(
+            "A", _holder("owner-of-the-root"), ttl_seconds=600
+        )
+        assert owner, "could not take the lease on the parent conversation"
+        for name, setter, column in _FLAG_WRITERS:
+            with pytest.raises(SessionTurnLeaseLostError):
+                getattr(db, setter)("A", True)
+            assert not _marked(db, "A", column), (
+                f"the refused direct write on 'A' still changed {name!r}"
+            )
+    finally:
+        db.close()
+
+
+def check_neither_lineage_direction_leaves_its_conversation(tmpdir) -> None:
+    """Both walks, in sequence, on one store: down from the parent, up from the fork.
+
+    The two legs live in the same statement and were written as one unit, so a
+    fix to one is not evidence about the other. This drives descendants first
+    and ancestors second and requires the same conversation boundary to hold
+    both ways.
+    """
+    db = _store(tmpdir)
+    try:
+        _compression_chain(db, "A", "B")
+        _branch_child(db, "A", "C")
+        _assert_the_fork_fixture_walks_the_intended_path(db, "A", "C")
+
+        # DOWN: naming the root must not reach the fork child.
+        db.set_session_archived("A", True)
+        assert _marked(db, "A", "archived") and _marked(db, "B", "archived"), (
+            "the descendants walk no longer flips the compression lineage it "
+            "owns, so this check has stopped measuring the boundary"
+        )
+        assert not _marked(db, "C", "archived"), (
+            "descendants direction: naming root 'A' reached fork child 'C'"
+        )
+
+        # UP: naming the fork child must not reach the root's conversation.
+        db.set_session_hidden("C", True)
+        assert _marked(db, "C", "hidden"), (
+            "the ancestors walk no longer marks the session it names"
+        )
+        assert not _marked(db, "A", "hidden"), (
+            "ancestors direction: naming fork child 'C' reached its "
+            "compression parent 'A'"
+        )
+        assert not _marked(db, "B", "hidden"), (
+            "ancestors direction: naming fork child 'C' reached 'B' via 'A'"
+        )
+    finally:
+        db.close()
+
+
 PINS = {
+    "check_a_flag_write_on_a_fork_child_leaves_its_compression_parent_alone":
+        check_a_flag_write_on_a_fork_child_leaves_its_compression_parent_alone,
+    "check_neither_lineage_direction_leaves_its_conversation":
+        check_neither_lineage_direction_leaves_its_conversation,
     "check_deleting_a_continuation_tip_leaves_the_conversation_acquirable":
         check_deleting_a_continuation_tip_leaves_the_conversation_acquirable,
     "check_a_lineage_flag_write_leaves_an_owned_branch_child_alone":
@@ -551,6 +703,18 @@ PINS = {
 def test_root_authority_property(name, tmp_path):
     """The pin. Each property, asserted against the tree under test."""
     PINS[name](tmp_path)
+
+
+#: The one seam the lineage exclusion lives at, keyed by content.
+_FILTER_CONSTANT = (
+    '    _CONTINUATION_CHILD_FILTER_SQL = (\n'
+    '        "      AND json_extract(COALESCE(child.model_config, \'{}\'),"\n'
+    '        " \'$._branched_from\') IS NULL\\n"\n'
+    '        "      AND json_extract(COALESCE(child.model_config, \'{}\'),"\n'
+    '        " \'$._delegate_from\') IS NULL\\n"\n'
+    '        "      AND COALESCE(child.source, \'\') != \'tool\'\\n"\n'
+    '    )\n'
+)
 
 
 SOURCE_MUTATIONS = (
@@ -572,20 +736,40 @@ SOURCE_MUTATIONS = (
     Mutation(
         pin="check_a_lineage_flag_write_leaves_an_owned_branch_child_alone",
         module="hermes_state.py",
-        find=(
-            '    _CONTINUATION_DESCENDANT_FILTER_SQL = (\n'
-            '        "      AND json_extract(COALESCE(child.model_config, \'{}\'),"\n'
-            '        " \'$._branched_from\') IS NULL\\n"\n'
-            '        "      AND json_extract(COALESCE(child.model_config, \'{}\'),"\n'
-            '        " \'$._delegate_from\') IS NULL\\n"\n'
-            '        "      AND COALESCE(child.source, \'\') != \'tool\'\\n"\n'
-            '    )\n'
-        ),
-        replace='    _CONTINUATION_DESCENDANT_FILTER_SQL = ""\n',
+        find=_FILTER_CONSTANT,
+        replace='    _CONTINUATION_CHILD_FILTER_SQL = ""\n',
         why="without the exclusion the four flag writers' descendants walk "
             "admits branch, delegate and tool children — separate conversations "
             "the guard on the named session never checked",
         kills_by="cleared 'archived' on branch child 'C'",
+    ),
+    # The next two share B2's anchor, deliberately. The exclusion is ONE
+    # constant spliced into both legs of all four writers, so there is one seam
+    # and emptying it regresses every direction at once. What keeps the rows
+    # honest is not a separate anchor but ``kills_by``: each pin must die at ITS
+    # OWN named assertion, so the ancestors row cannot be satisfied by a
+    # descendants failure and vice versa. Which splice is load-bearing where is
+    # held by ``test_the_exclusion_is_spliced_into_both_legs_of_all_four``.
+    Mutation(
+        pin="check_a_flag_write_on_a_fork_child_leaves_its_compression_parent_alone",
+        module="hermes_state.py",
+        find=_FILTER_CONSTANT,
+        replace='    _CONTINUATION_CHILD_FILTER_SQL = ""\n',
+        why="with the exclusion emptied, the ANCESTORS walk climbs from an "
+            "explicit-fork child into its compression parent — a separate "
+            "conversation whose lease root the guard on the named session "
+            "never checked",
+        kills_by="marked 'archived' on 'A'",
+    ),
+    Mutation(
+        pin="check_neither_lineage_direction_leaves_its_conversation",
+        module="hermes_state.py",
+        find=_FILTER_CONSTANT,
+        replace='    _CONTINUATION_CHILD_FILTER_SQL = ""\n',
+        why="the combined pin drives descendants first and ancestors second; "
+            "emptying the shared constant must take out the direction it "
+            "reaches first, which is what its kills_by names",
+        kills_by="naming root 'A' reached fork child 'C'",
     ),
     Mutation(
         pin="check_a_routing_rotation_within_the_granted_root_is_admitted",
@@ -626,6 +810,52 @@ def test_each_pin_dies_when_its_own_guard_is_removed(mutation, tmp_path):
 def test_every_pin_has_a_mutation_that_kills_it():
     """No pin without a killer, and no killer without a pin."""
     assert_every_pin_has_a_killer(PINS, SOURCE_MUTATIONS)
+
+
+def test_the_exclusion_is_spliced_into_both_legs_of_all_four():
+    """Eight splices: two legs each, in four writers.
+
+    The mutation rows share one anchor — the constant — so emptying it takes out
+    every direction at once and no row can prove that a PARTICULAR splice is
+    load-bearing. This holds that separately, by counting.
+
+    Structural rather than behavioural on purpose. A behavioural check for
+    "the ancestors leg of set_session_pinned specifically" would need a fixture
+    per writer per direction, and the thing actually at risk is not the
+    behaviour of one writer — it is somebody adding a fifth flag writer, or
+    re-hand-writing one of these walks, and reproducing the original defect in
+    the copy. Counting catches that; a per-writer behavioural pin would not,
+    because it would not know the fifth writer exists.
+    """
+    source = (REPO_ROOT / "hermes_state.py").read_text(encoding="utf-8")
+    splices = source.count("+ self._CONTINUATION_CHILD_FILTER_SQL")
+    assert splices == 8, (
+        f"expected the lineage exclusion at 8 sites — the ancestors and "
+        f"descendants legs of set_session_archived / _pinned / _hidden / _read "
+        f"— and found {splices}. Either a leg lost its exclusion (the defect "
+        f"this file exists for, restored in one direction), or a writer was "
+        f"added or removed and this count needs re-deriving against it."
+    )
+    ancestors = source.count(
+        "                    JOIN sessions parent ON parent.id = "
+        "child.parent_session_id\n"
+        "                    WHERE parent.end_reason = 'compression'\n"
+        "                \"\"\"\n"
+        "                + self._CONTINUATION_CHILD_FILTER_SQL\n"
+    )
+    descendants = source.count(
+        "                    JOIN sessions child ON child.parent_session_id = "
+        "parent.id\n"
+        "                    WHERE parent.end_reason = 'compression'\n"
+        "                \"\"\"\n"
+        "                + self._CONTINUATION_CHILD_FILTER_SQL\n"
+    )
+    assert (ancestors, descendants) == (4, 4), (
+        f"the exclusion is not on both legs everywhere: {ancestors} ancestors "
+        f"leg(s) and {descendants} descendants leg(s) carry it, expected 4 and "
+        f"4. A count of 8 total can be reached with one direction doubled and "
+        f"the other bare, which is the defect wearing the right total."
+    )
 
 
 def test_every_mutation_row_names_the_assertion_it_dies_at():

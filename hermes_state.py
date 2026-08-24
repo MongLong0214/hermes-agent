@@ -6592,8 +6592,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         "  AND COALESCE({alias}source, '') != 'tool'\n"
     )
 
-    # The same exclusion for a RECURSIVE descent, where the parent varies per
-    # row. ``_NON_CONTINUATION_CHILD_FILTER_SQL`` binds one queried parent id
+    # The same exclusion for a RECURSIVE walk, where the parent varies per row.
+    #
+    # BOTH DIRECTIONS, AND THE NAME SAYS CHILD BECAUSE THE QUESTION IS ABOUT THE
+    # CHILD. The four flag writers walk a lineage twice from the row they were
+    # given: DOWN into children, and UP into parents. The predicate is the same
+    # one either way — "is this child a continuation of that parent" — so it is
+    # keyed on ``child`` and spliced into both legs. Fixing only the descent
+    # would have left the ascent reaching a compression parent from a /branch
+    # child of it, which is the same conversation boundary crossed the other
+    # way, in the same statement.
+    #
+    # ``_NON_CONTINUATION_CHILD_FILTER_SQL`` binds one queried parent id
     # (`!= ?`) and so cannot be used inside a walk; this is the IS NULL form the
     # sibling walks already use for exactly that reason — the compression
     # lineage CTE in ``record_gateway_session_peer`` and the forward walk in
@@ -6610,7 +6620,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     # One constant rather than four copies because the four writers that use it
     # are character-identical today and drifted into this defect together;
     # ``_check_session_flag_write`` gives the same reason for being one helper.
-    _CONTINUATION_DESCENDANT_FILTER_SQL = (
+    _CONTINUATION_CHILD_FILTER_SQL = (
         "      AND json_extract(COALESCE(child.model_config, '{}'),"
         " '$._branched_from') IS NULL\n"
         "      AND json_extract(COALESCE(child.model_config, '{}'),"
@@ -10715,6 +10725,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     JOIN sessions child ON child.id = a.id
                     JOIN sessions parent ON parent.id = child.parent_session_id
                     WHERE parent.end_reason = 'compression'
+                """
+                + self._CONTINUATION_CHILD_FILTER_SQL
+                + """
                   ),
                   descendants(id) AS (
                     SELECT ?
@@ -10725,7 +10738,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     JOIN sessions child ON child.parent_session_id = parent.id
                     WHERE parent.end_reason = 'compression'
                 """
-                + self._CONTINUATION_DESCENDANT_FILTER_SQL
+                + self._CONTINUATION_CHILD_FILTER_SQL
                 + """
                   ),
                   lineage(id) AS (
@@ -10779,6 +10792,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     JOIN sessions child ON child.id = a.id
                     JOIN sessions parent ON parent.id = child.parent_session_id
                     WHERE parent.end_reason = 'compression'
+                """
+                + self._CONTINUATION_CHILD_FILTER_SQL
+                + """
                   ),
                   descendants(id) AS (
                     SELECT ?
@@ -10789,7 +10805,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     JOIN sessions child ON child.parent_session_id = parent.id
                     WHERE parent.end_reason = 'compression'
                 """
-                + self._CONTINUATION_DESCENDANT_FILTER_SQL
+                + self._CONTINUATION_CHILD_FILTER_SQL
                 + """
                   ),
                   lineage(id) AS (
@@ -10845,6 +10861,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     JOIN sessions child ON child.id = a.id
                     JOIN sessions parent ON parent.id = child.parent_session_id
                     WHERE parent.end_reason = 'compression'
+                """
+                + self._CONTINUATION_CHILD_FILTER_SQL
+                + """
                   ),
                   descendants(id) AS (
                     SELECT ?
@@ -10855,7 +10874,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     JOIN sessions child ON child.parent_session_id = parent.id
                     WHERE parent.end_reason = 'compression'
                 """
-                + self._CONTINUATION_DESCENDANT_FILTER_SQL
+                + self._CONTINUATION_CHILD_FILTER_SQL
                 + """
                   ),
                   lineage(id) AS (
@@ -10917,6 +10936,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     JOIN sessions child ON child.id = a.id
                     JOIN sessions parent ON parent.id = child.parent_session_id
                     WHERE parent.end_reason = 'compression'
+                """
+                + self._CONTINUATION_CHILD_FILTER_SQL
+                + """
                   ),
                   descendants(id) AS (
                     SELECT ?
@@ -10927,7 +10949,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     JOIN sessions child ON child.parent_session_id = parent.id
                     WHERE parent.end_reason = 'compression'
                 """
-                + self._CONTINUATION_DESCENDANT_FILTER_SQL
+                + self._CONTINUATION_CHILD_FILTER_SQL
                 + """
                   ),
                   lineage(id) AS (
