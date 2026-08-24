@@ -90,7 +90,21 @@ def mirror_to_session(
             "mirror_source": source_label,
         }
 
-        _append_to_sqlite(session_id, mirror_msg)
+        if not _append_to_sqlite(session_id, mirror_msg):
+            # The write was refused/failed — do not report success. Falling
+            # through to `return True` here (the previous behavior) is
+            # exactly the bug this guards: the message was never persisted
+            # anywhere, so the caller (tools/send_message_tool.py sets
+            # result["mirrored"] from this return value, which is what the
+            # model sees) must be told it did not mirror rather than being
+            # told it did.
+            logger.warning(
+                "Mirror write refused/failed for session %s (from %s); "
+                "not reporting success",
+                session_id,
+                source_label,
+            )
+            return False
 
         logger.debug("Mirror: wrote to session %s (from %s)", session_id, source_label)
         return True
@@ -207,8 +221,17 @@ def _find_session_id(
 
 
 
-def _append_to_sqlite(session_id: str, message: dict) -> None:
-    """Append a message to the SQLite session database."""
+def _append_to_sqlite(session_id: str, message: dict) -> bool:
+    """Append a message to the SQLite session database.
+
+    Returns True only if the write actually landed. A refused/failed write
+    (e.g. the session is closed by compression, a turn lease the caller
+    doesn't hold, a locked database) must come back as False rather than
+    being swallowed here — the caller (mirror_to_session) reports this
+    return value straight to the model as "mirrored: true/false" via
+    tools/send_message_tool.py, so silently eating the exception here turns
+    a real failure into a false "delivered" status.
+    """
     db = None
     try:
         from hermes_state import SessionDB
@@ -218,8 +241,10 @@ def _append_to_sqlite(session_id: str, message: dict) -> None:
             role=message.get("role", "assistant"),
             content=message.get("content"),
         )
+        return True
     except Exception as e:
-        logger.debug("Mirror SQLite write failed: %s", e)
+        logger.warning("Mirror SQLite write failed for session %s: %s", session_id, e)
+        return False
     finally:
         if db is not None:
             db.close()
