@@ -1387,20 +1387,15 @@ class _AcquiredDestinations:
         """
         member = self._member(suffix)
         identity = self.identities.get(suffix)
-        try:
-            info = self._identity_check_target(suffix, member)
-        except FileNotFoundError:
-            self._close_handle(suffix)
+        info = self._identity_check_target(suffix, member)
+        self._close_handle(suffix)
+        if info is None:
             self.identities.pop(suffix, None)
             return None
-        except OSError as exc:
-            self._close_handle(suffix)
-            return {"path": str(member), "files": 1,
-                    "error": f"{type(exc).__name__}: {exc}"}
+        if isinstance(info, dict):
+            return info
         if identity is not None and (info.st_dev, info.st_ino) != identity:
-            self._close_handle(suffix)
             return {"path": str(member), "files": 1, "error": "ownership-lost"}
-        self._close_handle(suffix)
         try:
             os.unlink(member)
         except OSError as exc:
@@ -1418,8 +1413,20 @@ class _AcquiredDestinations:
         in ``acquire`` is what refers to it, so the comparison against
         ``self.identities[suffix]`` is only sound while that descriptor is
         still open.
+
+        Returns the ``lstat`` result, ``None`` if the name is already absent
+        (no agency claimed — somebody else removed it), or a problem dict for
+        any other ``OSError``. Handled here, not re-raised, so the caller can
+        run this and the close in a fixed order without a ``try`` around
+        either call.
         """
-        return os.lstat(member)
+        try:
+            return os.lstat(member)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            return {"path": str(member), "files": 1,
+                    "error": f"{type(exc).__name__}: {exc}"}
 
     def _close_handle(self, suffix: str) -> None:
         """Close this name's descriptor. Call only AFTER the identity check.
