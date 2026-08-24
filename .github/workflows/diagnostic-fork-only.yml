@@ -1,0 +1,255 @@
+name: Diagnostic (fork-only, non-promotable)
+
+# DO NOT MERGE. Fork-CI-only diagnostic harness for CI run 32691109957.
+#
+# This workflow exists to answer three questions on Linux, which is the only
+# place the behaviour under investigation reproduces:
+#
+#   P0  tests/hermes_cli/test_sessions_fence_rollback_verb.py was reported as
+#       "no tests ran". Collect it alone, then run it alone with no per-file
+#       budget, and separate collection failure / import failure / timeout /
+#       genuine test failures.
+#   P1  tests/state/test_turn_fence_rollback.py and
+#       tests/state/test_turn_lease_generation_trigger.py passed every test and
+#       still exited non-zero. Capture the raw termination reason and locate
+#       the stage that produced the 1.
+#   P2  Run the 11 failing files targeted, with the identical worker settings
+#       the real run used (-j 4), on this ref. The same file is pushed to the
+#       comparison-base branch so the two sides differ only by C5's code.
+#
+# It never runs on main and is not part of the CI orchestrator.
+
+on:
+  push:
+    branches:
+      - 'diag/**'
+
+permissions:
+  contents: read
+
+jobs:
+  p0-solo:
+    name: P0 collect + solo run
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install ripgrep (prebuilt binary)
+        run: |
+          set -euo pipefail
+          RG_VERSION=15.1.0
+          RG_SHA256=1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599
+          RG_TARBALL=ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl.tar.gz
+          curl -sSfL --retry 3 --retry-delay 5 -o "$RG_TARBALL" \
+            "https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/${RG_TARBALL}"
+          echo "${RG_SHA256}  ${RG_TARBALL}" | sha256sum -c -
+          tar -xzf "$RG_TARBALL"
+          sudo mv "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl/rg" /usr/local/bin/rg
+          rm -rf "$RG_TARBALL" "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl"
+          rg --version
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          version: "0.9.28"
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python 3.11
+        uses: ./.github/actions/retry
+        with:
+          command: uv python install 3.11
+
+      - name: Install dependencies
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra hindsight --extra parallel-web
+
+      - name: Probe the checkout
+        run: |
+          set +e
+          echo "### commit under test"
+          git rev-parse HEAD
+          echo "### is this a shallow clone?"
+          git rev-parse --is-shallow-repository
+          echo "### how many commits are present?"
+          git rev-list --count HEAD 2>&1
+          echo "### is the tests' pinned BASE_COMMIT present as a tree?"
+          git cat-file -t 261a4efb90d7dbe4e71786861858f721b4ab730c 2>&1
+          echo "cat-file exit=$?"
+          echo "### does the P0 file exist here?"
+          ls -l tests/hermes_cli/test_sessions_fence_rollback_verb.py 2>&1
+          echo "probe done"
+
+      - name: P0 step 1 - collect-only, that file alone, raw
+        run: |
+          set +e
+          source .venv/bin/activate
+          F=tests/hermes_cli/test_sessions_fence_rollback_verb.py
+          if [ ! -f "$F" ]; then
+            echo "P0_FILE_ABSENT_ON_THIS_REF"
+            exit 0
+          fi
+          echo "=== BEGIN RAW --collect-only OUTPUT ==="
+          python -m pytest --collect-only -q "$F"
+          rc=$?
+          echo "=== END RAW --collect-only OUTPUT ==="
+          echo "COLLECT_ONLY_EXIT_CODE=$rc"
+
+      - name: P0 step 2 - run that file alone, no per-file budget
+        run: |
+          set +e
+          F=tests/hermes_cli/test_sessions_fence_rollback_verb.py
+          if [ ! -f "$F" ]; then
+            echo "P0_FILE_ABSENT_ON_THIS_REF"
+            exit 0
+          fi
+          echo "=== BEGIN SOLO RUN (harness env, -j 1, 3000s budget, no retries) ==="
+          scripts/run_tests.sh --files "$F" -j 1 --file-timeout 3000 --file-retries 0
+          rc=$?
+          echo "=== END SOLO RUN ==="
+          echo "SOLO_RUN_EXIT_CODE=$rc"
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+
+  targeted:
+    name: P2 targeted 11 files (-j 4)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install ripgrep (prebuilt binary)
+        run: |
+          set -euo pipefail
+          RG_VERSION=15.1.0
+          RG_SHA256=1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599
+          RG_TARBALL=ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl.tar.gz
+          curl -sSfL --retry 3 --retry-delay 5 -o "$RG_TARBALL" \
+            "https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/${RG_TARBALL}"
+          echo "${RG_SHA256}  ${RG_TARBALL}" | sha256sum -c -
+          tar -xzf "$RG_TARBALL"
+          sudo mv "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl/rg" /usr/local/bin/rg
+          rm -rf "$RG_TARBALL" "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl"
+          rg --version
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          version: "0.9.28"
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python 3.11
+        uses: ./.github/actions/retry
+        with:
+          command: uv python install 3.11
+
+      - name: Install dependencies
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra hindsight --extra parallel-web
+
+      - name: Run the 11 failing files plus the 2 non-zero-exit files
+        run: |
+          set +e
+          # Every path here exists at both compared commits and is byte-identical
+          # at both, so a difference in outcome is a difference in production code.
+          FILES="tests/agent/test_async_token_accounting.py"
+          FILES="$FILES:tests/agent/test_api_content_sidecar.py"
+          FILES="$FILES:tests/gateway/test_pending_queue_spool.py"
+          FILES="$FILES:tests/gateway/test_session_hygiene.py"
+          FILES="$FILES:tests/gateway/test_shutdown_flush.py"
+          FILES="$FILES:tests/gateway/test_session.py"
+          FILES="$FILES:tests/hermes_cli/test_profiles_sidebar_scope.py"
+          FILES="$FILES:tests/plugins/test_a2a_plugin.py"
+          FILES="$FILES:tests/state/test_turn_lease_migration_no_steal.py"
+          FILES="$FILES:tests/state/test_turn_lease_replay_column_writers.py"
+          FILES="$FILES:tests/state/test_turn_lease_writer_census.py"
+          FILES="$FILES:tests/state/test_turn_fence_rollback.py"
+          FILES="$FILES:tests/state/test_turn_lease_generation_trigger.py"
+          echo "=== BEGIN TARGETED RUN ==="
+          scripts/run_tests.sh --files "$FILES" -j 4
+          rc=$?
+          echo "=== END TARGETED RUN ==="
+          echo "TARGETED_EXIT_CODE=$rc"
+        env:
+          HERMES_TEST_WORKERS: 4
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+
+  p1-full-history:
+    name: P1 same two files, full-history checkout
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code with full history
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Install ripgrep (prebuilt binary)
+        run: |
+          set -euo pipefail
+          RG_VERSION=15.1.0
+          RG_SHA256=1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599
+          RG_TARBALL=ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl.tar.gz
+          curl -sSfL --retry 3 --retry-delay 5 -o "$RG_TARBALL" \
+            "https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/${RG_TARBALL}"
+          echo "${RG_SHA256}  ${RG_TARBALL}" | sha256sum -c -
+          tar -xzf "$RG_TARBALL"
+          sudo mv "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl/rg" /usr/local/bin/rg
+          rm -rf "$RG_TARBALL" "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl"
+          rg --version
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          version: "0.9.28"
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python 3.11
+        uses: ./.github/actions/retry
+        with:
+          command: uv python install 3.11
+
+      - name: Install dependencies
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra hindsight --extra parallel-web
+
+      - name: Probe the checkout
+        run: |
+          set +e
+          echo "### is this a shallow clone?"
+          git rev-parse --is-shallow-repository
+          echo "### is the tests' pinned BASE_COMMIT present as a tree now?"
+          git cat-file -t 261a4efb90d7dbe4e71786861858f721b4ab730c 2>&1
+          echo "cat-file exit=$?"
+
+      - name: Run only the two files that exited non-zero
+        run: |
+          set +e
+          F="tests/state/test_turn_fence_rollback.py:tests/state/test_turn_lease_generation_trigger.py"
+          echo "=== BEGIN P1 FULL-HISTORY RUN ==="
+          scripts/run_tests.sh --files "$F" -j 2 --file-retries 0
+          rc=$?
+          echo "=== END P1 FULL-HISTORY RUN ==="
+          echo "P1_FULL_HISTORY_EXIT_CODE=$rc"
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
