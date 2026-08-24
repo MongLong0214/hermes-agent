@@ -1,0 +1,102 @@
+name: Diagnostic sidecar identity (fork-only, non-promotable)
+
+# DO NOT MERGE. Fork-CI-only diagnostic harness.
+#
+# ONE QUESTION: when `check_a_foreign_file_at_a_reserved_sidecar_is_never_deleted`
+# fails on Linux, WHICH CODE PATH deleted the foreign file at the reserved
+# sidecar name? Two candidate answers lead to different seams, and fixing before
+# knowing which one holds sends the change to the wrong place:
+#
+#   A  production's `_AcquiredDestinations._release` unlinked it, meaning the
+#      (st_dev, st_ino) identity check matched when it should not have. That is
+#      a destructive verb deleting a file it did not create.
+#   B  nothing in production unlinked it, and the pin fails for another reason.
+#      Then the defect is in the fixture, not in the verb.
+#
+# Measured on macOS with the same probe, for the comparison:
+#   * every unlink of *backup.db-wal came from the TEST HOOK, never production
+#   * the clean-path -wal at the backup destination is a 0-byte reservation
+#     whose inode is unchanged between acquire and release
+#   * SQLite 3.50.4 there DOES accept `journal_mode=WAL` and does produce a real
+#     -wal beside an open database, so WAL availability is not the difference
+#
+# The probe never asserts and always exits 0. A difference is read off the log,
+# not inferred from a red X — a failing job would only tell us that something
+# went wrong, and the whole point is to learn which of A or B is true.
+#
+# Triggers on `diag/**` pushes only, so the 45-minute main suite does not run.
+
+on:
+  push:
+    branches:
+      - 'diag/**'
+
+permissions:
+  contents: read
+
+jobs:
+  sidecar-identity:
+    name: Who unlinks the reserved sidecar
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          version: "0.9.28"
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python 3.11
+        uses: ./.github/actions/retry
+        with:
+          command: uv python install 3.11
+
+      - name: Install dependencies
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra hindsight --extra parallel-web
+
+      - name: Probe the checkout
+        run: |
+          set +e
+          echo "### commit under test"
+          git rev-parse HEAD
+          echo "### pinned BASE_COMMIT present as an object?"
+          git cat-file -t 261a4efb90d7dbe4e71786861858f721b4ab730c 2>&1
+          echo "cat-file exit=$?"
+
+      - name: The probe - who unlinks the reserved sidecar
+        run: |
+          set +e
+          source .venv/bin/activate
+          echo "=== BEGIN SIDECAR PROBE ==="
+          python scripts/diag_sidecar_probe.py
+          echo "PROBE_EXIT_CODE=$?"
+          echo "=== END SIDECAR PROBE ==="
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+
+      - name: The pin itself, alone, for its raw failure text
+        run: |
+          set +e
+          source .venv/bin/activate
+          echo "=== BEGIN SOLO PIN RUN ==="
+          python -m pytest -p no:randomly -q \
+            "tests/hermes_cli/test_sessions_fence_rollback_verb.py::test_sessions_fence_rollback_verb_property[check_a_foreign_file_at_a_reserved_sidecar_is_never_deleted]" \
+            --tb=long
+          echo "SOLO_PIN_EXIT_CODE=$?"
+          echo "=== END SOLO PIN RUN ==="
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
