@@ -493,7 +493,14 @@ def _human_lines(payload: dict[str, Any]) -> list:
                 "still be installed — check the store before doing anything "
                 "else, and keep the backup."
             )
-        elif rehearsal.get("changed") is None:
+        # `rehearsal and` is the whole guard, and it is not defensive: an
+        # ABSENT rehearsal is `{}`, and `{}.get("changed") is None` is true, so
+        # without it this arm claims a rehearsal for every payload that reaches
+        # it — which is all of them, since nothing in the tree ever publishes
+        # the key. Absent and None are different statements here for the same
+        # reason _emit_refusal spells out for backup_created: rendering a value
+        # is a claim that the step it describes was reached.
+        elif rehearsal and rehearsal.get("changed") is None:
             lines.append(
                 "  The store was not modified. The rehearsal's own commit on a "
                 "disposable copy did not report back, which is a fault in this "
