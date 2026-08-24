@@ -437,10 +437,42 @@ class TestBranchGap3ChunkedPartialCopyCount:
         source = _make_source()
         parent_entry = store.get_or_create_session(source)
         # The committed prefix (first 3 rows, per PartialBatchInsertError
-        # (inserted=3, ...) below) is entirely assistant-role -- zero
-        # user-role rows among what actually landed.
-        store._db.append_message(parent_entry.session_id, role="assistant", content="a1")
-        store._db.append_message(parent_entry.session_id, role="assistant", content="a2")
+        # (inserted=3, ...) below) must be entirely non-user-role -- zero
+        # user-role rows among what actually landed. Three consecutive
+        # ``assistant`` rows would NOT survive to reach the branch copy
+        # logic unchanged: _handle_branch_command loads history via
+        # load_transcript(..., repair_alternation=True), which runs
+        # repair_message_sequence() over the loaded list and merges any
+        # run of consecutive same-role ``assistant`` messages into one
+        # (belt-and-suspenders repair for malformed provider histories --
+        # see agent/agent_runtime_helpers.py). Three plain "a1"/"a2"/"a3"
+        # assistant rows would collapse to a single merged assistant
+        # message before copying, shrinking the 4-row history to 2 rows
+        # and defeating the copied_rows=3 / zero-user-rows setup this
+        # test needs. Using assistant(tool_call) -> tool(result) ->
+        # assistant instead keeps three real rows across the merge (a
+        # ``tool`` row breaks the "consecutive assistant" adjacency the
+        # merge pass looks for), verified directly against
+        # repair_message_sequence() to survive with 0 repairs.
+        store._db.append_message(
+            parent_entry.session_id,
+            role="assistant",
+            content="",
+            tool_calls=[
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "x", "arguments": "{}"},
+                }
+            ],
+        )
+        store._db.append_message(
+            parent_entry.session_id,
+            role="tool",
+            tool_call_id="call_1",
+            tool_name="x",
+            content="tool result 1",
+        )
         store._db.append_message(parent_entry.session_id, role="assistant", content="a3")
         store._db.append_message(parent_entry.session_id, role="user", content="m1")
 
