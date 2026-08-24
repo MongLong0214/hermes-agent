@@ -1375,6 +1375,20 @@ class _AcquiredDestinations:
         from the name and is closed straight away; the NAME's ownership is what
         must survive until the outcome is in.
 
+        IDEMPOTENT PER SUFFIX, the instant a call claims it. ``release_the_
+        sidecars`` raises on the first problem, and the caller's exception
+        handling then runs ``remove_only_what_we_created`` over the SAME
+        reservation — which used to call this method a second time for a
+        suffix the first call had already resolved. That second call's
+        identity check ran with no descriptor left to pin the inode; the
+        first call had already closed it, so the very comparison this method
+        exists to make was unsound the second time it ran. Popping
+        ``self.identities[suffix]`` here, before any I/O, is what makes a
+        second call a no-op instead of a second, unprotected check — the
+        identity dict is already the record of "still owned", so emptying it
+        the moment a suffix is claimed is enough to keep the claim from being
+        made twice.
+
         Three outcomes, each classified from what was observed:
 
         ABSENT     the obligation is met — nothing is at that name. No agency
@@ -1383,10 +1397,15 @@ class _AcquiredDestinations:
         FOREIGN    the name now resolves to a file this run did not create. It
                    is not ours to delete, and deletion has no way back.
         REFUSED    the unlink failed. The reservation is still there and still
-                   ours, and the caller has to be told.
+                   ours, and the caller has to be told — but not by trying
+                   again from here: this suffix is claimed either way, because
+                   a retry from this method would be the same unsound second
+                   check.
         """
+        identity = self.identities.pop(suffix, None)
+        if identity is None:
+            return None
         member = self._member(suffix)
-        identity = self.identities.get(suffix)
         info = self._identity_check_target(suffix, member)
         self._close_handle(suffix)
         if info is None:
@@ -1395,12 +1414,31 @@ class _AcquiredDestinations:
             return info
         if identity is not None and (info.st_dev, info.st_ino) != identity:
             return {"path": str(member), "files": 1, "error": "ownership-lost"}
+        # A SECOND check, immediately before the unlink. The descriptor closed
+        # above no longer pins the inode, and the unlink below still names the
+        # file by PATH — POSIX has no call that unlinks "this exact inode at
+        # this name" atomically, and holding the descriptor open across the
+        # unlink is not on the table either: the close has to happen first,
+        # which is the same ordering Windows requires. So this does not CLOSE
+        # the window between the first check and the unlink — nothing built on
+        # unlink-by-path can — it SHRINKS it, from "close, a comparison and a
+        # dict pop" down to the instant right before the call that destroys
+        # the file. A name that changed since the FIRST check is caught here
+        # instead of silently unlinked.
+        try:
+            revalidated = os.lstat(member)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            return {"path": str(member), "files": 1,
+                    "error": f"{type(exc).__name__}: {exc}"}
+        if (revalidated.st_dev, revalidated.st_ino) != identity:
+            return {"path": str(member), "files": 1, "error": "ownership-lost"}
         try:
             os.unlink(member)
         except OSError as exc:
             return {"path": str(member), "files": 1,
                     "error": f"{type(exc).__name__}: {exc}"}
-        self.identities.pop(suffix, None)
         return None
 
     def _identity_check_target(self, suffix: str, member: Path):
