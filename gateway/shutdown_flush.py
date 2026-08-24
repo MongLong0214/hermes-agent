@@ -304,6 +304,8 @@ def recover_pending_to_db(
     int
         Number of messages recovered.
     """
+    from hermes_state import SessionTurnLeaseLostError, make_turn_lease_holder
+
     flush_dir = _get_flush_dir()
     flush_files = sorted(flush_dir.glob("*.json"))
     if not flush_files:
@@ -347,12 +349,23 @@ def recover_pending_to_db(
                         path,
                     )
                     continue
-                session_db.append_message(
-                    session_id=spooled_sid,
-                    role=message.get("role", "unknown"),
-                    content=message.get("content") or "",
-                    timestamp=message.get("timestamp") or payload.get("ts"),
-                )
+                # Spool recovery runs at gateway start; an agent process may
+                # already own this conversation. Acquire rather than replay
+                # holderless into a live turn — the spool file survives a
+                # refused write and is replayed on the next attempt.
+                with session_db.session_turn_lease(
+                    spooled_sid,
+                    make_turn_lease_holder("shutdown-spool"),
+                    ttl_seconds=30.0,
+                    reload_messages=False,
+                ) as lease:
+                    session_db.append_message(
+                        session_id=lease.session_id,
+                        role=message.get("role", "unknown"),
+                        content=message.get("content") or "",
+                        timestamp=message.get("timestamp") or payload.get("ts"),
+                        turn_lease_holder=lease.token,
+                    )
                 recovered += 1
                 path.unlink(missing_ok=True)
                 continue
@@ -389,14 +402,29 @@ def recover_pending_to_db(
                 )
                 continue
 
-            session_db.append_message(
-                session_id=session_id,
-                role="user",
-                content=text,
-                timestamp=payload.get("ts", int(time.time())),
-            )
+            with session_db.session_turn_lease(
+                session_id,
+                make_turn_lease_holder("shutdown-flush"),
+                ttl_seconds=30.0,
+                reload_messages=False,
+            ) as lease:
+                session_db.append_message(
+                    session_id=lease.session_id,
+                    role="user",
+                    content=text,
+                    timestamp=payload.get("ts", int(time.time())),
+                    turn_lease_holder=lease.token,
+                )
             recovered += 1
             path.unlink(missing_ok=True)
+        except SessionTurnLeaseLostError as exc:
+            # Another process owns this conversation right now. Recovery is
+            # resumable by construction — the spool file is only unlinked on a
+            # landed write — so leave it and let the next drain try again.
+            # Must precede the BaseException handler below, which re-raises.
+            logger.info(
+                "Deferring recovery of %s: %s", path, exc,
+            )
         except BaseException:
             # Shutdown cancellation/interrupt must not strand an owned DB.
             _close_owned_db()

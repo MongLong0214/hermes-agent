@@ -1416,6 +1416,9 @@ def build_turn_context(
                             agent.session_id,
                             _turn_user_msg.get("content"),
                             _api_content,
+                            turn_lease_holder=getattr(
+                                agent, "_active_session_turn_lease_holder", None
+                            ),
                         )
                     except Exception:
                         logger.warning(

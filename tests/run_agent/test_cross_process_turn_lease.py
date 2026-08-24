@@ -8,7 +8,7 @@ import time
 from types import SimpleNamespace
 
 from agent import relay_runtime
-from hermes_state import SessionDB
+from hermes_state import SessionDB, SessionTurnLeaseToken
 from run_agent import AIAgent
 
 
@@ -26,7 +26,14 @@ class _DB:
         on_wait = kwargs.get("on_wait")
         if on_wait is not None and self.acquire_result is False:
             on_wait(0.0)
-        return self.acquire_result
+        # Production returns a SessionTurnLeaseToken (holder + granted epoch)
+        # or None; the double must have the same shape or the caller cannot
+        # tell "acquired" from "timed out".
+        return (
+            SessionTurnLeaseToken(holder, 1, session_id)
+            if self.acquire_result
+            else None
+        )
 
     def resolve_resume_session_id(self, session_id):
         self.events.append(("resolve", session_id))
@@ -87,7 +94,7 @@ def test_run_conversation_acquires_then_reloads_latest_tip(monkeypatch):
         on_wait = kwargs.get("on_wait")
         if on_wait is not None:
             on_wait(0.0)
-        return True
+        return SessionTurnLeaseToken(holder, 1, session_id)
 
     db.acquire_session_turn_lease = acquire_with_wait
 
@@ -143,7 +150,7 @@ def test_run_conversation_acquires_lease_when_session_probe_raises(monkeypatch):
         on_wait = kwargs.get("on_wait")
         if on_wait is not None:
             on_wait(0.0)
-        return True
+        return SessionTurnLeaseToken(holder, 1, session_id)
 
     db.acquire_session_turn_lease = acquire_with_wait
 
@@ -242,7 +249,7 @@ def test_run_conversation_lease_wait_honors_interrupt(monkeypatch):
         agent._interrupt_requested = True
         agent._interrupt_message = "follow-up while waiting"
         assert should_abort()
-        return False
+        return None
 
     db.acquire_session_turn_lease = acquire_with_abort
 
@@ -279,9 +286,9 @@ def test_run_conversation_second_turn_after_lease_wait_abort(monkeypatch):
             agent._interrupt_requested = True
             agent._interrupt_message = "follow-up while waiting"
             assert should_abort()
-            return False
+            return None
         assert not should_abort()
-        return True
+        return SessionTurnLeaseToken(holder, 1, session_id)
 
     db.acquire_session_turn_lease = acquire_then_succeed
 
@@ -528,7 +535,7 @@ def test_run_conversation_exposes_holder_for_fenced_flush(monkeypatch):
         on_wait = kwargs.get("on_wait")
         if on_wait is not None:
             on_wait(0.0)
-        return True
+        return SessionTurnLeaseToken(holder, 1, session_id)
 
     db.acquire_session_turn_lease = acquire_with_wait
 
@@ -606,32 +613,34 @@ def test_flush_messages_to_session_db_fences_stale_holder_on_live_db(tmp_path):
     first.create_session("shared", source="test")
     stale_holder = "pid=1:turn=stale"
     next_holder = "pid=2:turn=next"
-    assert first.try_acquire_session_turn_lease(
+    stale_token = first.try_acquire_session_turn_lease(
         "shared", stale_holder, ttl_seconds=5
     )
+    assert stale_token is not None
 
     agent = _flush_agent(first, "shared")
-    agent._active_session_turn_lease_holder = stale_holder
+    agent._active_session_turn_lease_holder = stale_token
     owned = [{"role": "user", "content": "stale-owned"}]
     assert agent._flush_messages_to_session_db(owned, []) is True
     assert [m["content"] for m in first.get_messages("shared")] == ["stale-owned"]
 
-    first.release_session_turn_lease("shared", stale_holder)
-    assert second.try_acquire_session_turn_lease(
+    first.release_session_turn_lease("shared", stale_token)
+    next_token = second.try_acquire_session_turn_lease(
         "shared", next_holder, ttl_seconds=5
     )
+    assert next_token is not None
 
     late = [{"role": "assistant", "content": "late stale reply"}]
     assert agent._flush_messages_to_session_db(late, []) is False
     assert agent._last_persistence_error_cause == "turn_lease"
     assert [m["content"] for m in second.get_messages("shared")] == ["stale-owned"]
 
-    agent._active_session_turn_lease_holder = next_holder
+    agent._active_session_turn_lease_holder = next_token
     assert agent._flush_messages_to_session_db(late, []) is True
     assert [m["content"] for m in second.get_messages("shared")] == [
         "stale-owned",
         "late stale reply",
     ]
-    second.release_session_turn_lease("shared", next_holder)
+    second.release_session_turn_lease("shared", next_token)
     first.close()
     second.close()

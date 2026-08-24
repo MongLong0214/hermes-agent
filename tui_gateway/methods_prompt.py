@@ -35,6 +35,56 @@ def _message_row_id(msg: dict):
         return None
 
 
+def _durable_target_is_gone(durable: list, target_row_id) -> bool:
+    """True when the row this truncation aims at is no longer durable.
+
+    The request was resolved against the IN-MEMORY history, before anything was
+    held. This is the re-check under the lease, and it is deliberately narrow:
+    the only claim it makes is about the row the client named.
+
+    Narrow because the tempting wider check — "the durable tail grew past what
+    the snapshot knew" — cannot be made safe here. In-memory entries are not
+    all stamped with durable ids (a live turn's rows are not, until a resume
+    reloads them), so "durable has ids the snapshot does not" is the ORDINARY
+    state after any turn, and refusing on it would break every edit that
+    follows one. A missing target is unambiguous: whatever replaced or rewound
+    that row, the address this request carries no longer points at it, and the
+    protocol already has a stale-target answer for exactly that.
+
+    Returns False when the client sent no row id — an ordinal-only request has
+    no durable address to re-check, and the caller upstream already refuses
+    ordinal-only truncation of a durable session.
+
+    Self-contained on builtins: register() rebinds callers onto server globals,
+    so any helper this calls must live in that namespace too.
+    """
+    if target_row_id is None or not isinstance(durable, list) or not durable:
+        # An EMPTY durable read is not evidence. It is what a session with no
+        # active rows looks like, and also what a reader that returned nothing
+        # looks like, and the two are indistinguishable from here — while
+        # "these rows are present and yours is not among them" is unambiguous.
+        # Refusing on emptiness would turn every reader that came back short
+        # into a refused edit. (The empty-transcript case is already gated
+        # upstream by confirm_empty_truncate.)
+        return False
+    try:
+        wanted = int(target_row_id)
+    except (TypeError, ValueError):
+        return False
+    for m in durable:
+        if not isinstance(m, dict):
+            continue
+        # A durable row from get_messages() carries the SQLite rowid as `id`;
+        # a history entry stamped by the conversation loader carries `_row_id`.
+        raw = m.get("_row_id", m.get("row_id", m.get("id")))
+        try:
+            if int(raw) == wanted:
+                return False
+        except (TypeError, ValueError):
+            continue
+    return True
+
+
 def _mem_db_pair_agrees(mem, db_msg) -> bool:
     """True when a live-memory entry plausibly corresponds to a durable row.
 
@@ -236,11 +286,37 @@ def _pending_reaction_notes(session: dict) -> str:
     except Exception:
         return ""
 
+    from hermes_state import SessionTurnLeaseLostError, make_turn_lease_holder
+
     try:
         with _session_db(session) as db:
             if db is None:
                 return ""
-            pending = db.take_unseen_reactions(session_key, author="user")
+            # take_unseen_reactions CONSUMES: it stamps the rows seen, so the
+            # announcement is delivered to exactly one turn. Running it against
+            # a conversation another process owns hands that process's turn the
+            # note and leaves this one with nothing — a lost announcement, not
+            # a duplicated one. Take the lease so the read-and-stamp belongs to
+            # whoever is actually about to build a prompt from it.
+            with db.session_turn_lease(
+                session_key,
+                make_turn_lease_holder("tui-reaction-notes"),
+                ttl_seconds=30.0,
+                reload_messages=False,
+            ) as _rx_lease:
+                pending = db.take_unseen_reactions(
+                    session_key,
+                    author="user",
+                    turn_lease_holder=_rx_lease.token,
+                )
+    except SessionTurnLeaseLostError:
+        # Not an error: the reactions stay unseen and the next turn that can
+        # hold the conversation announces them.
+        logger.info(
+            "Deferring reaction notes for %s: another process owns the turn",
+            session_key,
+        )
+        return ""
     except Exception:
         logger.debug("Failed to read pending reactions", exc_info=True)
         return ""
@@ -656,34 +732,84 @@ def _(rid, params: dict) -> dict:
             # only holds if the handle we check is the one that owns the row.
             with _session_db(session) as db:
                 if db is not None:
+                    from hermes_state import (
+                        SessionTurnLeaseLostError,
+                        make_turn_lease_holder,
+                    )
+
+                    # Fall back to session id when session_key is NULL —
+                    # CLI-origin sessions created before the session_key
+                    # default fix have no key, and replace_messages(None)
+                    # triggers an FK violation.
+                    truncation_key = session.get("session_key") or sid
                     try:
-                        # active_only=True: replace only the live (active=1)
-                        # rows. In-place compaction (#38763) keeps the
-                        # pre-compaction transcript as active=0/compacted=1
-                        # rows under this same session key; a bare
-                        # replace_messages() would DELETE that durable archive
-                        # on every edit/regenerate — the same bug class #80216
-                        # fixed for /retry. On an uncompacted session all rows
-                        # are active=1, so this is behaviorally identical to
-                        # the full replace.
-                        # archive_dropped: a rewind overwrites turns the user
-                        # may not have meant to drop, and this write is the
-                        # last step before they are gone — three reported
-                        # incidents ended here with nothing to restore from
-                        # (#70516, #80763, #82756). Soft-archiving keeps them
-                        # on disk (active=0) and in the FTS index, so a
-                        # mis-aimed cut is recoverable instead of terminal.
-                        # The live transcript is unchanged.
-                        # Fall back to session id when session_key is NULL —
-                        # CLI-origin sessions created before the session_key
-                        # default fix have no key, and replace_messages(None)
-                        # triggers an FK violation.
-                        truncation_key = session.get("session_key") or sid
-                        db.replace_messages(
+                        with db.session_turn_lease(
                             truncation_key,
-                            truncated,
-                            active_only=True,
-                            archive_dropped=True,
+                            make_turn_lease_holder("tui-truncate"),
+                            ttl_seconds=60.0,
+                            reload_messages=True,
+                        ) as lease:
+                            # `truncated` was computed from the IN-MEMORY
+                            # history, before anything was held. Re-check the
+                            # client's durable address against what is on disk
+                            # NOW, under the lease: if the row it names has been
+                            # replaced or rewound by someone else in the
+                            # meantime, this replace would cut a transcript it
+                            # never read.
+                            if _durable_target_is_gone(
+                                lease.messages, target_row_id
+                            ):
+                                logger.warning(
+                                    "prompt.submit: REFUSED truncation of session "
+                                    "%s — row %s is no longer in the durable "
+                                    "transcript (ordinal=%d)",
+                                    sid, target_row_id, ordinal,
+                                )
+                                return _err(
+                                    rid,
+                                    4018,
+                                    "the conversation moved on while this edit "
+                                    "was in flight; reload and retry",
+                                    data=_stale_target_data(
+                                        resolved_ordinal=ordinal
+                                    ),
+                                )
+                            # active_only=True: replace only the live (active=1)
+                            # rows. In-place compaction (#38763) keeps the
+                            # pre-compaction transcript as active=0/compacted=1
+                            # rows under this same session key; a bare
+                            # replace_messages() would DELETE that durable
+                            # archive on every edit/regenerate — the same bug
+                            # class #80216 fixed for /retry. On an uncompacted
+                            # session all rows are active=1, so this is
+                            # behaviorally identical to the full replace.
+                            # archive_dropped: a rewind overwrites turns the
+                            # user may not have meant to drop, and this write is
+                            # the last step before they are gone — three
+                            # reported incidents ended here with nothing to
+                            # restore from (#70516, #80763, #82756).
+                            # Soft-archiving keeps them on disk (active=0) and
+                            # in the FTS index, so a mis-aimed cut is
+                            # recoverable instead of terminal. The live
+                            # transcript is unchanged.
+                            db.replace_messages(
+                                lease.session_id,
+                                truncated,
+                                active_only=True,
+                                archive_dropped=True,
+                                turn_lease_holder=lease.token,
+                            )
+                    except SessionTurnLeaseLostError:
+                        logger.warning(
+                            "prompt.submit: REFUSED truncation of session %s — "
+                            "another process is running a turn on this "
+                            "conversation (ordinal=%d)", sid, ordinal,
+                        )
+                        return _err(
+                            rid,
+                            4009,
+                            "another process is running a turn on this "
+                            "conversation; retry the edit once it finishes",
                         )
                     except Exception as exc:
                         logger.error(
@@ -1551,6 +1677,7 @@ def register(server) -> None:
     for helper in (
         _history_user_indices,
         _message_row_id,
+        _durable_target_is_gone,
         _mem_db_pair_agrees,
         _find_user_turn_by_row_id,
         _load_durable_truncation_history,

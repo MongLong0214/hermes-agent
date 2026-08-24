@@ -2587,6 +2587,12 @@ class APIServerAdapter(BasePlatformAdapter):
         if db is None:
             return False
         try:
+            # Fenced: this writes every column update_session_model writes and
+            # NULLs the assembled prompt. The request is usually NOT the
+            # process running the turn, which is the case the refusal is for;
+            # when it is, turn_grant_kwargs presents that turn's own grant.
+            from hermes_state import turn_grant_kwargs
+
             db.update_session_runtime_lock(
                 session_id,
                 model=model or None,
@@ -2594,6 +2600,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 model_options=runtime_request.get("model_options") or {},
                 route_source=runtime_request.get("route_source") or "",
                 confirmed=bool(runtime_request.get("require_model_lock")),
+                **turn_grant_kwargs(db, session_id),
             )
             return True
         except Exception:

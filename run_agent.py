@@ -4680,7 +4680,16 @@ class AIAgent:
             if getattr(self, "_end_session_on_close", True):
                 session_id = getattr(self, "session_id", None)
                 if session_db and session_id:
-                    session_db.end_session(session_id, "agent_close")
+                    # end_session is fenced now. Reuse this turn's own grant
+                    # when there is one rather than racing the turn against
+                    # itself. See hermes_state.turn_grant_kwargs.
+                    from hermes_state import turn_grant_kwargs
+
+                    session_db.end_session(
+                        session_id,
+                        "agent_close",
+                        **turn_grant_kwargs(session_db, session_id),
+                    )
         except Exception:
             pass
 
@@ -8652,14 +8661,20 @@ class AIAgent:
                             f"this session ({int(elapsed)}s)..."
                         )
 
-                if not _turn_db.acquire_session_turn_lease(
+                # acquire returns a SessionTurnLeaseToken: the holder string
+                # PLUS the generation and conversation root it was granted for.
+                # Carry the grant, not the string — a string alone is scoped to
+                # neither the turn nor the conversation, so it cannot be told
+                # apart from a replay or from a grant for a different session.
+                _durable_token = _turn_db.acquire_session_turn_lease(
                     session_id,
                     _durable_holder,
                     ttl_seconds=_lease_ttl,
                     wait_seconds=1800.0,
                     on_wait=_on_session_turn_lease_wait,
                     should_abort=lambda: getattr(self, "_interrupt_requested", False),
-                ):
+                )
+                if _durable_token is None:
                     if getattr(self, "_interrupt_requested", False):
                         logger.info(
                             "session turn lease wait aborted by interrupt: %s",
@@ -8726,8 +8741,8 @@ class AIAgent:
                 # holder string that never owned the row. Persist paths read
                 # the agent attr so a late flush after reclaim is fenced in
                 # the same SQLite write transaction as the transcript insert.
-                durable_turn_lease = _durable_holder
-                self._active_session_turn_lease_holder = _durable_holder
+                durable_turn_lease = _durable_token
+                self._active_session_turn_lease_holder = _durable_token
                 self._active_session_turn_lease_ttl_seconds = _lease_ttl
                 if _lease_waited:
                     self._emit_status(

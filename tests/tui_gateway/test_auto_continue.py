@@ -18,9 +18,11 @@ time is positive proof the turn never finished. Contract pinned here:
 
 from __future__ import annotations
 
+import contextlib
 import threading
 import time
 import types
+from types import SimpleNamespace
 
 import pytest
 
@@ -203,8 +205,19 @@ def test_older_agent_still_gets_the_post_turn_stamp(emits, turn_env, marker_home
     """An agent whose run_conversation predates turn-start typing keeps the
     original behavior — the row is typed once the turn concludes."""
     stamped: list = []
+    leased: list = []
 
     class _LegacyDB:
+        # The stamp is a context-bearing write (display_kind is read back by
+        # the context pipeline and by the compressor's real-ask
+        # classification), so it now runs under the conversation's turn lease.
+        @contextlib.contextmanager
+        def session_turn_lease(self, session_id, holder, **kwargs):
+            leased.append(session_id)
+            yield SimpleNamespace(
+                token=holder, session_id=session_id, messages=[]
+            )
+
         def set_latest_matching_message_display_kind(self, session_id, **kwargs):
             stamped.append((session_id, kwargs["display_kind"]))
             return True
@@ -226,6 +239,8 @@ def test_older_agent_still_gets_the_post_turn_stamp(emits, turn_env, marker_home
     )
 
     assert stamped == [("session-key", "auto_continue")]
+    # ...and it went through the fence rather than around it.
+    assert leased == ["session-key"]
 
 
 # ── Scheduling decision ────────────────────────────────────────────────

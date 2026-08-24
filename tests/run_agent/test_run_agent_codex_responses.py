@@ -1762,7 +1762,15 @@ def test_mid_turn_compaction_does_not_double_persist_in_place_rows(monkeypatch, 
         # the in_place branch in conversation_compression.py do.
         agent._last_compaction_in_place = True
         compacted = [{"role": "user", "content": "[summary of prior tool-heavy work]"}]
-        agent._session_db.archive_and_compact(agent.session_id, compacted)
+        # Carry the turn owner's grant, as the real in-place branch does: a
+        # holderless compaction under a live owner is now refused.
+        agent._session_db.archive_and_compact(
+            agent.session_id,
+            compacted,
+            turn_lease_holder=getattr(
+                agent, "_active_session_turn_lease_holder", None
+            ),
+        )
         agent._flushed_db_message_ids = set()
         return compacted, "You are Hermes."
 

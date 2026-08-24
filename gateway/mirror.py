@@ -208,16 +208,33 @@ def _find_session_id(
 
 
 def _append_to_sqlite(session_id: str, message: dict) -> None:
-    """Append a message to the SQLite session database."""
+    """Append a message to the SQLite session database.
+
+    Acquires the conversation's turn lease first. The mirror is an ALTERNATE
+    writer — it is not the process running the turn — so appending holderless
+    would interleave a mirrored row into a transcript another process is
+    actively building. Acquiring also gives us the post-acquisition session id,
+    which matters when the owner compressed and rotated the conversation while
+    we waited (the id we were handed can be a closed compression parent).
+    Best-effort as before: a contended or lost lease is logged and dropped
+    rather than written unfenced.
+    """
     db = None
     try:
-        from hermes_state import SessionDB
+        from hermes_state import SessionDB, make_turn_lease_holder
         db = SessionDB()
-        db.append_message(
-            session_id=session_id,
-            role=message.get("role", "assistant"),
-            content=message.get("content"),
-        )
+        with db.session_turn_lease(
+            session_id,
+            make_turn_lease_holder("gateway-mirror"),
+            ttl_seconds=30.0,
+            reload_messages=False,
+        ) as lease:
+            db.append_message(
+                session_id=lease.session_id,
+                role=message.get("role", "assistant"),
+                content=message.get("content"),
+                turn_lease_holder=lease.token,
+            )
     except Exception as e:
         logger.debug("Mirror SQLite write failed: %s", e)
     finally:

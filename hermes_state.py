@@ -19,6 +19,7 @@ import atexit
 import contextlib
 import errno
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -81,6 +82,11 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     FTS_TRIGRAM_SQL,
     LEGACY_FTS_SQL,
     LEGACY_FTS_TRIGRAM_SQL,
+    TURN_FENCE_FUNCTION_NAME,
+    TURN_FENCE_GENERATION,
+    TURN_FENCE_TRIGGERS,
+    TURN_FENCE_TRIGGER_SQL,
+    register_turn_fence_function,
     MAX_FTS5_QUERY_CHARS,
     SCHEMA_SQL,
     SCHEMA_VERSION,
@@ -306,6 +312,26 @@ def _workspace_key_clause(key: str) -> Tuple[str, List[str]]:
         f"(s.git_repo_root = ? OR (COALESCE(s.git_repo_root, '') = '' AND {cwd_clause}))",
         [prefix, *cwd_params],
     )
+
+
+def _routing_entry_session_id(raw) -> Optional[str]:
+    """The session a ``gateway_routing`` entry points at, or None.
+
+    The index is keyed by ``session_key``; the conversation it routes to is
+    named inside the JSON payload. That is why the routing writers' own
+    parameters carry no session id to fence against, and why the fence has
+    to read the payload.
+    """
+    if not raw:
+        return None
+    try:
+        entry = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(entry, dict):
+        return None
+    session_id = entry.get("session_id")
+    return str(session_id) if session_id else None
 
 
 def _collect_delegate_child_ids(conn, parent_ids: List[str]) -> List[str]:
@@ -2505,6 +2531,11 @@ def _connect_repair_durable(db_path: Path) -> sqlite3.Connection:
     schema parses again, which is the point at which the pragmas can stick.
     """
     conn = sqlite3.connect(str(db_path), isolation_level=None)
+    # Repair rewrites `messages` on some strategies, and the generation
+    # triggers refuse a connection that has not registered the marker. Without
+    # this, installing the fence would make the repair path unable to fix the
+    # file it exists to fix.
+    register_turn_fence_function(conn)
     _reapply_durability_barriers(conn)
     return conn
 
@@ -3152,6 +3183,228 @@ class SessionTurnLeaseLostError(RuntimeError):
     """
 
 
+class SessionTurnLeaseToken(str):
+    """A holder string bound to the generation it was granted at.
+
+    ``str`` subclass deliberately: every existing ``turn_lease_holder=`` call
+    site, log line and comparison keeps working, while the epoch rides along so
+    a validator can tell "the holder that owns this lease right now" from "a
+    holder string that owned it one generation ago". A bare ``str`` carries no
+    epoch and is therefore indistinguishable from a replay.
+    """
+
+    __slots__ = ("epoch", "conversation_id")
+
+    def __new__(
+        cls, holder: str, epoch: int, conversation_id: Optional[str] = None
+    ) -> "SessionTurnLeaseToken":
+        obj = super().__new__(cls, holder)
+        obj.epoch = int(epoch)
+        obj.conversation_id = conversation_id
+        return obj
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
+        return (
+            f"SessionTurnLeaseToken({str(self)!r}, epoch={self.epoch}, "
+            f"conversation_id={self.conversation_id!r})"
+        )
+
+
+#: Grants this PROCESS is holding right now, keyed by (db path, conversation
+#: root). Populated on a successful acquire, cleared on release.
+#:
+#: Two jobs, both of which need positive evidence rather than a clock:
+#:
+#: 1. An in-process writer that runs INSIDE a turn (a tool the model called,
+#:    the compressor, a display stamp) must present the turn's own grant. It
+#:    cannot acquire — the turn already holds the lease — so without this it
+#:    would wait out the whole budget and then refuse, on every call.
+#: 2. It is the death signal for :func:`_turn_lease_owner_is_dead`'s successor:
+#:    "the row names this process and nothing here holds it" is proof of
+#:    abandonment that does not consult the clock.
+_LIVE_TURN_GRANTS: Dict[Tuple[str, str], "SessionTurnLeaseToken"] = {}
+_LIVE_TURN_GRANTS_LOCK = threading.Lock()
+
+
+def _live_grant_key(db_path, conversation_root: str) -> Tuple[str, str]:
+    return (str(db_path or ""), str(conversation_root or ""))
+
+
+def _register_live_turn_grant(db_path, token: "SessionTurnLeaseToken") -> None:
+    root = getattr(token, "conversation_id", None)
+    if not root:
+        return
+    with _LIVE_TURN_GRANTS_LOCK:
+        _LIVE_TURN_GRANTS[_live_grant_key(db_path, root)] = token
+
+
+def _unregister_live_turn_grant(db_path, token) -> None:
+    root = getattr(token, "conversation_id", None)
+    if not root:
+        return
+    key = _live_grant_key(db_path, root)
+    with _LIVE_TURN_GRANTS_LOCK:
+        held = _LIVE_TURN_GRANTS.get(key)
+        # Identity, not equality: a superseded grant unwinding late must not
+        # clear the registration of the grant that replaced it.
+        if held is token:
+            _LIVE_TURN_GRANTS.pop(key, None)
+
+
+def live_turn_grant(db_path, conversation_root: str):
+    """The grant THIS process holds on *conversation_root*, or ``None``."""
+    with _LIVE_TURN_GRANTS_LOCK:
+        return _LIVE_TURN_GRANTS.get(_live_grant_key(db_path, conversation_root))
+
+
+def make_turn_lease_holder(purpose: str) -> str:
+    """Compose a structured turn-lease holder string for an alternate writer.
+
+    ``pid=`` is load-bearing for the legacy liveness fallback on rows written
+    before ``owner_pid`` existed; *purpose* names the writer so an operator
+    reading a contended-lease warning can tell the gateway mirror from a
+    /retry rewrite from a shutdown spool drain.
+    """
+    return f"pid={os.getpid()}:turn={purpose}:platform=writer"
+
+
+def turn_grant_kwargs(db, session_id) -> Dict[str, Any]:
+    """``{"turn_lease_holder": grant}`` when THIS process owns *session_id*'s turn.
+
+    Reuse before acquire, written once. Four production sites had already
+    hand-rolled this idiom (the gateway metadata sync, the TUI live persist,
+    the compressor, the ACP adapter) and every one of them carries the same
+    two footnotes, because getting either wrong is silent:
+
+    * the keyword is passed ONLY when there is a grant. Several of these
+      callers hold a duck-typed handle, so an unexpected keyword becomes a
+      ``TypeError`` swallowed by the surrounding ``except`` — a no-persist that
+      looks exactly like a successful write.
+    * ``None`` here is not a failure. It is the ordinary answer on an unowned
+      conversation (fresh sessions, imports, single-writer installs), which the
+      fence admits holderless, and it is also the answer when the owner is
+      ANOTHER process — which the fence refuses. The caller does not have to
+      tell those apart; the admission does.
+
+    ONLY A REAL GRANT IS PRESENTED, and that is a correctness rule rather than
+    a defensive one. ``_authorize_turn_lease_token`` admits a holder by its
+    ``epoch``, its ``conversation_id`` and its string value; anything else
+    fails that check and the write is REFUSED. So presenting a not-a-grant
+    turns an admitted holderless write into a refused one — strictly worse
+    than presenting nothing. Two shapes reach here in practice and both are
+    ``is not None``:
+
+    * a coroutine, when the handle is an ``AsyncSessionDB`` (its
+      ``__getattr__`` turns every method into an ``asyncio.to_thread``
+      forwarder). It is closed here so it cannot surface later as an
+      un-awaited warning; async call sites await ``current_turn_grant``
+      themselves.
+    * a test double, when the handle is a mock. ``getattr`` finds a callable
+      and it returns another mock.
+
+    Both degrade to holderless, which is what a caller holding no grant should
+    present.
+    """
+    reuse = getattr(db, "current_turn_grant", None)
+    if not callable(reuse):
+        return {}
+    try:
+        grant = reuse(session_id)
+    except Exception:
+        logger.debug("current_turn_grant failed for %s", session_id, exc_info=True)
+        return {}
+    if inspect.isawaitable(grant):
+        close = getattr(grant, "close", None)
+        if callable(close):
+            close()
+        logger.debug(
+            "turn_grant_kwargs was handed an async session handle for %s; "
+            "the call site must await current_turn_grant itself",
+            session_id,
+        )
+        return {}
+    if not isinstance(grant, SessionTurnLeaseToken):
+        if grant is not None:
+            logger.debug(
+                "current_turn_grant returned a %s for %s, not a grant; "
+                "writing holderless",
+                type(grant).__name__, session_id,
+            )
+        return {}
+    return {"turn_lease_holder": grant}
+
+
+class SessionTurnLeaseScope:
+    """What is true AFTER the lease was acquired, for one alternate writer.
+
+    A plain class rather than ``SimpleNamespace`` so that ``__slots__`` makes a
+    typo (``scope.session`` for ``scope.session_id``) an ``AttributeError`` at
+    the call site instead of a silent ``None`` that reads as "no session".
+    """
+
+    __slots__ = ("token", "session_id", "messages")
+
+    def __init__(self, token, session_id: str, messages: List[Dict[str, Any]]):
+        self.token = token
+        self.session_id = session_id
+        self.messages = messages
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
+        return (
+            f"SessionTurnLeaseScope(session_id={self.session_id!r}, "
+            f"epoch={getattr(self.token, 'epoch', None)}, "
+            f"messages={len(self.messages)})"
+        )
+
+
+#: A row carried over from a pre-generation store. No grant can match it, so a
+#: writer presenting a token against one fails closed; it recovers by takeover.
+LEGACY_TURN_LEASE_EPOCH = 0
+
+
+def _process_start_time(pid: int) -> Optional[float]:
+    """Process creation time for *pid*, or None when it cannot be established.
+
+    ``(pid, start_time)`` is what turns a PID into an identity. On its own a PID
+    is a recyclable integer: once the owner exits the kernel may hand its number
+    to anything, and a bare ``pid_exists`` would then report a dead owner alive.
+    """
+    if psutil is None or pid <= 0:
+        return None
+    try:
+        return float(psutil.Process(pid).create_time())
+    except Exception:
+        return None
+
+
+def _turn_lease_owner_is_dead(
+    holder: str, owner_pid: Optional[int], owner_pid_start: Optional[float]
+) -> bool:
+    """True only when the recorded owner is PROVABLY gone — PID reuse included.
+
+    Asymmetric with "alive" on purpose: "cannot prove alive" is not "dead".
+    """
+    if owner_pid:
+        pid = int(owner_pid)
+        if pid <= 0 or pid == os.getpid() or psutil is None:
+            return False
+        try:
+            if not psutil.pid_exists(pid):
+                return True
+        except Exception:
+            return False
+        if owner_pid_start is None:
+            return False
+        started = _process_start_time(pid)
+        if started is None:
+            return False
+        # Same number, different process: the owner is gone and its PID was
+        # recycled. Without this a reused PID keeps a dead lease alive forever.
+        return abs(started - float(owner_pid_start)) >= 1.0
+    # No recorded identity (a carried-over row): fall back to the holder string.
+    return _compression_lock_holder_process_is_dead(holder or "")
+
+
 def _connect_tracked_db(path, tracking_path=None, **kwargs):
     """``sqlite3.connect`` that registers the open fd for lock-safety.
 
@@ -3174,17 +3427,27 @@ def _connect_tracked_db(path, tracking_path=None, **kwargs):
             "(byte-probe guard inactive in this install)",
             path,
         )
-        return sqlite3.connect(str(path), **kwargs)
+        conn = sqlite3.connect(str(path), **kwargs)
+        register_turn_fence_function(conn)
+        return conn
 
     # Open through THIS module's sqlite3.connect so callers (and tests) that
     # patch hermes_state.sqlite3.connect keep control of connection creation;
     # the helper still owns tracking.
-    return connect_tracked(
+    conn = connect_tracked(
         path,
         tracking_path=tracking_path,
         connect_fn=sqlite3.connect,
         **kwargs,
     )
+    # THE choke point for the generation barrier: every connection this package
+    # opens comes through here, and the marker has to be registered before the
+    # first statement — `_init_schema` writes `messages` itself, so a
+    # connection that gets it later cannot finish opening the store. Read-only
+    # connections get it too: the cost is one dictionary entry, and a read pool
+    # that silently could not write would be a worse surprise than one that can.
+    register_turn_fence_function(conn)
+    return conn
 
 
 def is_zeroed_state_db(
@@ -4458,6 +4721,78 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 self._warn_fts5_unavailable(exc)
             return False
 
+    @contextmanager
+    def write_transaction(self, patience_s: Optional[float] = None):
+        """This store's CANONICAL write transaction, as a context manager.
+
+        WHO THIS IS FOR, AND WHY IT IS NOT A SECOND DOOR
+            A module that has to interleave reads and writes across a block it
+            controls cannot express itself as ``_execute_write(fn)`` without
+            being rewritten around a callback. ``tools/async_delegation`` is
+            that module: twenty-odd call sites, each ``with _transaction() as
+            conn:``. It used to satisfy that shape by opening its OWN
+            ``sqlite3.connect`` on the same file — which is a second writer on
+            the store, invisible to the generation barrier, and the reason
+            ``async_delegations`` could not be added to
+            ``TURN_FENCE_SURFACE``: the module's own writes would have failed
+            with ``no such function: hermes_turn_fence_generation``.
+
+            The closure that was NOT taken is calling
+            :func:`register_turn_fence_function` on that raw connection. The
+            marker proves "current generation" and nothing else — not the
+            conversation root, not the holder, not the epoch — so registering
+            it on a production writer mints a second admitted door around the
+            token validator. That is the original defect performed on purpose.
+            The connection MOVES instead; the module keeps its transaction
+            shape and loses its private handle.
+
+        SAME TRANSACTION, SAME LOCK, SAME CONNECTION as :meth:`_execute_write`:
+        ``BEGIN IMMEDIATE`` under ``self._lock`` on ``self._conn``, committed on
+        a clean exit and rolled back on any exception. The caller must not
+        commit or roll back.
+
+        THE ONE DIFFERENCE, STATED SO IT IS NOT MISTAKEN FOR AN OVERSIGHT
+            ``_execute_write`` retries a locked write by RE-RUNNING ``fn``. A
+            context manager cannot re-run its caller's block, so the retry here
+            covers ``BEGIN IMMEDIATE`` only. That is where lock contention
+            surfaces — BEGIN IMMEDIATE takes the write lock at statement time,
+            not at commit — so a busy store still waits out its patience budget
+            before anything in the block has run. Errors raised inside the
+            block propagate untouched, which is what a caller holding its own
+            admission decision needs.
+        """
+        if patience_s is None:
+            patience_s = self._WRITE_PATIENCE_S
+        deadline = time.monotonic() + patience_s
+        while True:
+            self._lock.acquire()
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError as exc:
+                self._lock.release()
+                err = str(exc).lower()
+                if ("locked" in err or "busy" in err) and (
+                    self._sleep_before_write_retry(deadline, patience_s)
+                ):
+                    continue
+                raise
+            except BaseException:
+                self._lock.release()
+                raise
+            break
+        try:
+            try:
+                yield self._conn
+            except BaseException:
+                try:
+                    self._conn.rollback()
+                except Exception:
+                    pass
+                raise
+            self._conn.commit()
+        finally:
+            self._lock.release()
+
     def _execute_write(
         self,
         fn: Callable[[sqlite3.Connection], T],
@@ -5081,6 +5416,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         git_repo_root: str = None,
         origin_json: str = None,
         display_name: str = None,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> None:
         """Insert a session row, enriching NULL metadata on conflict.
 
@@ -5116,8 +5453,40 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         ``thread_id``/``display_name``/``origin_json``) are inherited too, so a
         crash before the gateway re-records the peer can't strand the child
         without a recoverable routing mapping (#59527).
+
+        ADMISSION IS PER STATEMENT-ARM, NOT PER METHOD
+            ``update_token_counts`` calls this on EVERY accounted API call to
+            make sure the row exists, and those calls are applied by a
+            background writer that holds no grant and logs its failures instead
+            of raising them. Fencing the whole method therefore does not merely
+            refuse the owner — it silently drops the owner's tokens.
+
+            So admission is required exactly when this call can MOVE a replay
+            column, which is when it carries one. The ``ON CONFLICT`` arms for
+            ``model_config`` and ``system_prompt`` are not COALESCE-only (the
+            first replaces a reset-only document, the second NULLs the prompt
+            when a new hash arrives), so carrying any of ``model`` /
+            ``model_config`` / ``system_prompt`` is the condition. With all
+            three absent every one of those arms degenerates to a no-op on the
+            replay columns and there is nothing to admit.
         """
+        carries_replay_value = any(
+            value is not None
+            for value in (model, model_config, system_prompt)
+        )
+
         def _do(conn):
+            # The ON CONFLICT arms for model_config and system_prompt are NOT
+            # COALESCE-only: they replace a reset-only config and NULL the
+            # prompt when a new hash arrives. Admission is required whenever
+            # this call carries one of them.
+            if carries_replay_value:
+                self._check_turn_lease_guard(
+                    conn,
+                    session_id,
+                    turn_lease_holder,
+                    turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+                )
             system_prompt_hash = self._store_system_prompt(conn, system_prompt)
             conn.execute(
                 """INSERT INTO sessions (
@@ -5273,6 +5642,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         display_name: str = None,
         origin_json: str = None,
         include_compression_ancestors: bool = False,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> None:
         """Persist the gateway routing peer for an existing session row.
 
@@ -5300,6 +5671,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return
 
         def _do(conn):
+            # This rewrites where the conversation's replies are delivered.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             lineage_cte = ""
             target_clause = "WHERE id = ?"
             query_params = []
@@ -5390,16 +5768,33 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         self._execute_write(_do)
 
-    def set_expiry_finalized(self, session_id: str, finalized: bool = True) -> None:
+    def set_expiry_finalized(
+        self,
+        session_id: str,
+        finalized: bool = True,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> None:
         """Mark a gateway session's expiry-finalization flag in state.db.
 
         Mirrors ``SessionEntry.expiry_finalized`` (sessions.json) so the flag
         survives even if the JSON index is pruned or lost (#9006).
+
+        The flag is what stops stale-route recovery resurrecting a session with
+        its full history, so a bystander that clears or sets it decides what a
+        later turn replays.
         """
         if not session_id:
             return
 
         def _do(conn):
+            # expiry_finalized is what stops recovery resurrecting this row.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             conn.execute(
                 "UPDATE sessions SET expiry_finalized = ? WHERE id = ?",
                 (1 if finalized else 0, session_id),
@@ -5410,7 +5805,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     # ── Gateway routing index (replaces sessions.json, #9006 follow-up) ────
 
     def save_gateway_routing_entry(
-        self, session_key: str, entry_json: str, *, scope: str = ""
+        self, session_key: str, entry_json: str, *, scope: str = "",
+        turn_lease_holder=None, turn_lease_ttl_seconds: float = 300.0,
     ) -> None:
         """Upsert one gateway routing entry (session_key -> SessionEntry JSON).
 
@@ -5426,6 +5822,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return
 
         def _do(conn):
+            self._admit_routing_write(
+                conn, [(scope, session_key)], entry_json,
+                turn_lease_holder, turn_lease_ttl_seconds,
+            )
             conn.execute(
                 """INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at)
                    VALUES (?, ?, ?, ?)
@@ -5450,12 +5850,28 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         now = time.time()
 
         def _do(conn):
-            conn.execute("DELETE FROM gateway_routing WHERE scope = ?", (scope,))
+            # A wholesale rewrite of the scope. The entries whose
+            # conversation a live turn owns are KEPT, not replaced.
+            keep = self._owned_routing_keys(conn, scope)
+            if keep:
+                placeholders = ",".join("?" * len(keep))
+                conn.execute(
+                    f"DELETE FROM gateway_routing WHERE scope = ? "
+                    f"AND session_key NOT IN ({placeholders})",
+                    (scope, *sorted(keep)),
+                )
+            else:
+                conn.execute(
+                    "DELETE FROM gateway_routing WHERE scope = ?", (scope,)
+                )
             if entries:
                 conn.executemany(
                     "INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at) "
                     "VALUES (?, ?, ?, ?)",
-                    [(scope, k, v, now) for k, v in entries.items() if k and v],
+                    [
+                        (scope, k, v, now) for k, v in entries.items()
+                        if k and v and k not in keep
+                    ],
                 )
 
         self._execute_write(_do)
@@ -5477,9 +5893,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return
 
         def _do(conn):
+            # A sweep over keys the caller listed: the ones whose
+            # conversation a live turn owns are left in place.
+            keep = self._owned_routing_keys(conn, scope)
             conn.executemany(
                 "DELETE FROM gateway_routing WHERE scope = ? AND session_key = ?",
-                [(scope, k) for k in session_keys],
+                [(scope, k) for k in session_keys if k not in keep],
             )
 
         self._execute_write(_do)
@@ -5561,9 +5980,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return 0
 
         def _do(conn):
+            # Same sweep rule as the sibling above.
+            live = {
+                (scope, key)
+                for scope in {row_scope for row_scope, _ in doomed}
+                for key in self._owned_routing_keys(conn, scope)
+            }
             conn.executemany(
                 "DELETE FROM gateway_routing WHERE scope = ? AND session_key = ?",
-                doomed,
+                [pair for pair in doomed if pair not in live],
             )
 
         self._execute_write(_do)
@@ -5596,9 +6021,31 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         ids = {str(row["id"]) for row in candidates}
         routing_deleted = self._delete_routing_entries_for_sessions(ids)
         deleted = 0
+        holder = make_turn_lease_holder("prune-never-active")
         for session_id in ids:
-            if self.delete_session(session_id, sessions_dir=sessions_dir):
-                deleted += 1
+            # One target per iteration, so unlike prune_sessions this CAN take
+            # the conversation's lease and does. A conversation owned by a live
+            # turn is skipped, not waited on: this runs at startup and the row
+            # is still a candidate on the next pass.
+            try:
+                with self.session_turn_lease(
+                    session_id,
+                    holder,
+                    ttl_seconds=30.0,
+                    wait_seconds=0.0,
+                    reload_messages=False,
+                ) as lease:
+                    if self.delete_session(
+                        lease.session_id,
+                        sessions_dir=sessions_dir,
+                        turn_lease_holder=lease.token,
+                    ):
+                        deleted += 1
+            except SessionTurnLeaseLostError:
+                logger.info(
+                    "prune_never_active_keyed_sessions: %s is owned by a live "
+                    "turn; leaving it for the next pass", session_id,
+                )
         return (deleted, routing_deleted)
 
     def list_gateway_sessions(
@@ -5973,7 +6420,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return records
 
     def adopt_orphaned_gateway_session(
-        self, orphan_id: str, donor_id: str
+        self,
+        orphan_id: str,
+        donor_id: str,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> bool:
         """Stamp *orphan_id* with *donor_id*'s routing identity, retire *donor_id*.
 
@@ -5986,6 +6437,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return False
 
         def _do(conn):
+            # The orphan is the row this caller named, and its routing identity
+            # is what the next turn is dispatched through.
+            self._check_turn_lease_guard(
+                conn,
+                orphan_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
+            # The donor is a SECOND conversation, and adoption RETIRES it. A
+            # grant on the orphan authorizes nothing about it, so the only
+            # admissible state for the donor's root is free.
+            self._refuse_if_any_conversation_is_owned(
+                conn, [donor_id],
+                f"refusing to adopt {orphan_id!r} from {donor_id!r}: "
+                f"the donor is",
+            )
             donor = conn.execute(
                 "SELECT session_key, chat_id, chat_type, thread_id, user_id, "
                 "origin_json, display_name, source FROM sessions WHERE id = ?",
@@ -6099,7 +6566,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ).fetchall()
         return self._session_row_dict(rows[0]) if len(rows) == 1 else None
 
-    def reopen_orphaned_compression_session(self, session_id: str) -> bool:
+    def reopen_orphaned_compression_session(
+        self,
+        session_id: str,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> bool:
         """Reopen a compression parent only when no continuation was published.
 
         Compression publication is atomic in current builds, but older builds
@@ -6112,6 +6584,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return False
 
         def _do(conn):
+            # Un-ending a segment changes what its conversation replays.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             parent = conn.execute(
                 "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
                 (session_id,),
@@ -6195,6 +6674,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         require_compression_lease: bool = True,
         watermark: Optional[int] = None,
         watermark_ceiling: Optional[int] = None,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> None:
         """Atomically close a parent and publish its durable compression child.
 
@@ -6219,6 +6700,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         tail. ``None`` = unbounded (no internal flush happened).
         """
         def _do(conn):
+            # Rotation closes the parent and publishes a child under the SAME
+            # conversation lease key, so the turn fence applies to the parent.
+            # The compression lock is a different lock with a different job.
+            self._check_turn_lease_guard(
+                conn,
+                parent_session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             lock_row = conn.execute(
                 "SELECT holder, expires_at FROM compression_locks WHERE session_id = ?",
                 (parent_session_id,),
@@ -6339,7 +6829,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         self._execute_write(_do)
 
-    def end_session(self, session_id: str, end_reason: str) -> None:
+    def end_session(
+        self,
+        session_id: str,
+        end_reason: str,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> None:
         """Mark a session as ended.
 
         No-ops when the session is already ended. The first end_reason wins:
@@ -6348,8 +6844,24 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         desynced CLI session_id after ``/resume`` or ``/branch``) targets them
         with a different reason. Use ``reopen_session()`` first if you
         intentionally need to re-end a closed session with a new reason.
+
+        FENCED, AND ``'compression'`` IS WHY
+            ``_check_transcript_write_guards`` refuses every append to a row
+            whose ``end_reason`` is ``'compression'``. That rule is enforced
+            against the APPENDER, so an unfenced writer of this column can end
+            a conversation another process is holding a valid grant on, and the
+            owner's next append dies as ``CompressionSessionClosedError``. No
+            shipped caller passes ``'compression'`` from a bystander today —
+            that is a mitigation, one edit wide, not a proof.
         """
         def _do(conn):
+            # end_reason='compression' closes the transcript against its own owner.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             conn.execute(
                 "UPDATE sessions SET ended_at = ?, end_reason = ? "
                 "WHERE id = ? AND ended_at IS NULL",
@@ -6357,13 +6869,33 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
         self._execute_write(_do)
 
-    def reopen_session(self, session_id: str) -> None:
+    def reopen_session(
+        self,
+        session_id: str,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> None:
         """Clear ended_at/end_reason so a session can be resumed.
 
         Before clearing a reset boundary, stabilize markerless legacy reset
         children that still depend on the parent's mutable end_reason.
+
+        Both statements are context-bearing: the second moves the lifecycle
+        pair, and the FIRST ``json_set``s ``_reset_from`` into the children's
+        ``model_config`` — a replay column, on rows this caller never named.
         """
         def _do(conn):
+            # Reopening clears the boundary and stamps the children's model_config.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
+            self._refuse_unless_reached_conversations_are_free(
+                conn, session_id,
+                f"refusing to reopen {session_id!r}: it stamps",
+            )
             placeholders = ",".join("?" for _ in _RESET_END_REASONS)
             # WHERE shape shared with _RESET_CHILD_SQL's fallback arm via
             # _legacy_reset_child_sql so the stamping and the listing
@@ -6385,7 +6917,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._execute_write(_do)
 
     def promote_to_session_reset(
-        self, session_id: str, reason: str = "session_reset"
+        self,
+        session_id: str,
+        reason: str = "session_reset",
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> bool:
         """Durably mark a session as ended by an intentional reset boundary.
 
@@ -6419,6 +6955,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         now = time.time()
 
         def _do(conn):
+            # A reset boundary ends a LIVE row, which is the owner's own row.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             cursor = conn.execute(
                 "UPDATE sessions SET ended_at = ?, end_reason = ? "
                 "WHERE id = ? AND (ended_at IS NULL "
@@ -6430,6 +6973,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         try:
             rows = self._execute_write(_do)
             return bool(rows)
+        except SessionTurnLeaseLostError:
+            # A refusal is a decision, not a failure to write. Swallowing it
+            # into `return False` would tell the caller "already had a
+            # boundary" — the one answer that reads as success.
+            raise
         except Exception:
             return False
 
@@ -6440,6 +6988,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         git_branch: Optional[str] = None,
         git_repo_root: Optional[str] = None,
         replace_git_meta: bool = False,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> Optional[int]:
         """Persist the authoritative cwd and claim a Git metadata generation.
 
@@ -6474,6 +7024,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         repo_root = (git_repo_root or "").strip()
 
         def _do(conn):
+            # cwd and the git pair ride in the assembled prompt.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             current = conn.execute(
                 "SELECT cwd FROM sessions WHERE id = ?", (session_id,)
             ).fetchone()
@@ -6517,6 +7074,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         generation: int,
         git_branch: Optional[str] = None,
         git_repo_root: Optional[str] = None,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> bool:
         """Publish async Git enrichment only while its cwd claim is current."""
         if (
@@ -6544,6 +7103,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         params.extend((session_id, cwd, generation))
 
         def _do(conn):
+            # A generation fence is not a lease: it orders writers, it does not admit them.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             cursor = conn.execute(
                 f"UPDATE sessions SET {', '.join(sets)} "
                 "WHERE id = ? AND cwd = ? "
@@ -6567,10 +7133,24 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         def _do(conn):
             for root, cwd in pairs:
+                # A cwd-keyed repair is a SWEEP — nobody could hold a grant
+                # naming the rows a directory happens to match — so it
+                # resolves its victims first and skips the owned ones.
+                targets = [
+                    row["id"] for row in conn.execute(
+                        "SELECT id FROM sessions "
+                        "WHERE cwd = ? AND COALESCE(git_repo_root, '') = ''",
+                        (cwd,),
+                    ).fetchall()
+                ]
+                targets = self._skip_leased_conversations(conn, targets)[0]
+                if not targets:
+                    continue
+                placeholders = ",".join("?" * len(targets))
                 conn.execute(
-                    "UPDATE sessions SET git_repo_root = ? "
-                    "WHERE cwd = ? AND COALESCE(git_repo_root, '') = ''",
-                    (root, cwd),
+                    f"UPDATE sessions SET git_repo_root = ? "
+                    f"WHERE id IN ({placeholders})",
+                    (root, *targets),
                 )
 
         self._execute_write(_do)
@@ -6580,12 +7160,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         session_id: str,
         cooldown_until: float,
         error: Optional[str] = None,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> None:
         """Persist the active compression-failure cooldown for a session."""
         if not session_id:
             return
 
         def _do(conn):
+            # The cooldown decides whether the owner's next turn may compress.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             conn.execute(
                 "UPDATE sessions SET compression_failure_cooldown_until = ?, "
                 "compression_failure_error = ? WHERE id = ?",
@@ -6680,6 +7269,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self,
         session_id: str,
         snapshot: Dict[str, Any],
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> None:
         """Restore and verify an exact cooldown-row snapshot.
 
@@ -6700,6 +7291,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         error = snapshot.get("error")
 
         def _do(conn):
+            # A rollback writes the same two columns the cooldown does.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             cursor = conn.execute(
                 "UPDATE sessions SET compression_failure_cooldown_until = ?, "
                 "compression_failure_error = ? WHERE id = ?",
@@ -6723,12 +7321,24 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 f"expected={expected!r}, actual={actual!r}"
             )
 
-    def clear_compression_failure_cooldown(self, session_id: str) -> None:
+    def clear_compression_failure_cooldown(
+        self,
+        session_id: str,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> None:
         """Clear any persisted compression-failure cooldown for a session."""
         if not session_id:
             return
 
         def _do(conn):
+            # Clearing the cooldown re-arms compression for somebody else's turn.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             conn.execute(
                 "UPDATE sessions SET compression_failure_cooldown_until = NULL, "
                 "compression_failure_error = NULL WHERE id = ?",
@@ -6767,13 +7377,26 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         except (TypeError, ValueError):
             return 0
 
-    def set_compression_fallback_streak(self, session_id: str, streak: int) -> None:
+    def set_compression_fallback_streak(
+        self,
+        session_id: str,
+        streak: int,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> None:
         """Persist the deterministic-fallback streak for one session."""
         if not session_id:
             return
         normalized = max(0, int(streak))
 
         def _do(conn):
+            # The fallback streak steers the next compression's strategy.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             conn.execute(
                 "UPDATE sessions SET compression_fallback_streak = ? WHERE id = ?",
                 (normalized, session_id),
@@ -6848,13 +7471,26 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         except (TypeError, ValueError):
             return 0
 
-    def set_compression_ineffective_count(self, session_id: str, count: int) -> None:
+    def set_compression_ineffective_count(
+        self,
+        session_id: str,
+        count: int,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> None:
         """Persist the ineffective-compaction strike count for one session."""
         if not session_id:
             return
         normalized = max(0, int(count))
 
         def _do(conn):
+            # The anti-thrash counter decides whether compression runs at all.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             conn.execute(
                 "UPDATE sessions SET compression_ineffective_count = ? WHERE id = ?",
                 (normalized, session_id),
@@ -6934,6 +7570,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         session_id: str,
         holder: str,
         ttl_seconds: float = 300.0,
+        *,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> bool:
         """Try to atomically acquire the compression lock for ``session_id``.
 
@@ -6951,6 +7590,37 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         Implementation: single-transaction DELETE-expired + INSERT-or-IGNORE,
         followed by a SELECT to confirm we got the row. SQLite serialises
         writes, so the whole sequence is atomic against other writers.
+
+        FENCED, AND THE OTHER TWO LOCK METHODS ARE NOT
+            Taking this lock is a decision about somebody else's conversation:
+            ``INSERT OR IGNORE`` is first-writer-wins, so a process holding no
+            grant that gets here first denies the OWNER its compression for the
+            whole lock TTL. Measured before this guard existed, on a live-owned
+            conversation from a second ``SessionDB`` of this same generation::
+
+                {"bystander_acquire": true,
+                 "owner_acquire_after": false,
+                 "lock_holder_final": "BYSTANDER"}
+
+            The generation trigger on ``compression_locks`` does not reach this:
+            it admits every connection this build opens. So the admission is the
+            same one every other writer on the surface takes — root, holder and
+            epoch for the conversation, resolved inside the same transaction as
+            the INSERT.
+
+            :meth:`refresh_compression_lock` and
+            :meth:`release_compression_lock` deliberately stay token-scoped.
+            Their statements carry ``WHERE session_id = ? AND holder = ?``, so
+            the token the caller was handed IS the authority, and requiring a
+            turn grant there would refuse a compressor whose grant rotated
+            mid-compression — a fence on the owner, which is a different
+            failure. See tests/state/test_turn_lease_compression_lock_admission.
+
+            The refusal PROPAGATES rather than becoming ``False``. ``False``
+            means "somebody else holds it", and reporting a lease refusal that
+            way would tell the caller a specific untruth about who is
+            compressing. The compression caller already fails closed on any
+            exception from this method.
         """
         if not session_id:
             return False
@@ -6958,6 +7628,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         expires_at = now + ttl_seconds
 
         def _do(conn):
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             reclaimed_holder = None
             row = conn.execute(
                 "SELECT holder, expires_at FROM compression_locks "
@@ -7094,6 +7770,491 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         with self._read_ctx() as conn:
             return self._session_turn_lease_key_on_conn(conn, session_id)
 
+    _TURN_LEASE_COLUMNS = (
+        "holder, expires_at, epoch, owner_pid, owner_pid_start"
+    )
+
+    def _read_turn_lease_on_conn(self, conn, session_id: str):
+        """Resolve the conversation key and read its lease row on *conn*.
+
+        One reader for every caller so the admission decision cannot drift
+        between the path that refuses a write and the path that grants a lease.
+        Returns ``(conversation_id, row_or_None)``.
+        """
+        conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
+        return conversation_id, conn.execute(
+            f"SELECT {self._TURN_LEASE_COLUMNS} FROM session_turn_leases "
+            f"WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchone()
+
+    def _turn_lease_row_is_free(self, conversation_id: str, row) -> bool:
+        """True when *row* no longer represents an owned conversation.
+
+        There is no clock in here, deliberately. ``expires_at`` says the
+        refresher did not run — a starved thread, a stopped-world GC, a laptop
+        that slept — and reclaiming on it hands a live turn's conversation to a
+        contender. It is kept as a diagnostic column and read by nothing that
+        decides admission; :meth:`force_release_session_turn_lease` is the
+        recovery that replaces it.
+
+        THIS IS A CONTRACT CHANGE, NOT A BUG FIX, AND IT HAS A PRICE
+            The rule this replaced was "expired ⇒ reclaimable", and it was
+            deliberate: it meant every wedged conversation healed itself after
+            one TTL with nobody watching. What is written here is the opposite —
+            a lease is freed only by *positive evidence*, so "cannot prove the
+            owner is gone" now means "stays held", forever, until a person runs
+            :meth:`force_release_session_turn_lease`. Automatic recovery is gone.
+            That is the cost, and it is paid on real hosts:
+
+            * **psutil missing.** ``_turn_lease_owner_is_dead`` answers False for
+              every foreign PID when ``psutil is None``, so on such an install
+              NOTHING is ever provably dead and every crashed turn wedges its
+              conversation permanently. Under the old rule those recovered in
+              one TTL. This is the largest of the three and it is not rare —
+              psutil is an optional dependency (see the Windows/scaffold
+              fallback in ``_compression_lock_holder_process_is_dead``).
+            * **A recycled PID that landed on something long-lived.** The owner
+              is gone, its number was reissued, liveness reads "alive". Held.
+            * **A carried-over row** from a store written before ``owner_pid``
+              existed (the v27 rebuild). With no recorded identity the fallback
+              is the holder string, and a holder that is not parseable as
+              ``pid=<n>`` is liveness-UNKNOWN, which is not liveness-dead, so
+              the row is never free.
+
+            The reason to take that trade anyway: the failure the old rule
+            allowed is silent and unbounded (two writers in one conversation,
+            transcript interleaved or truncated, no error anywhere), and the
+            failure this one allows is loud, local and reversible (one
+            conversation refuses writes and says so). A wedged conversation is
+            recoverable; an interleaved transcript is not.
+
+        WHICH PRODUCTION PATH PRODUCES AN UNPARSEABLE HOLDER
+            None, today, and that was checked rather than assumed: every
+            acquirer in the tree composes its holder through
+            :func:`make_turn_lease_holder` or the identical literal in
+            ``run_agent``'s turn prologue, and both start ``pid=<os.getpid()>``.
+            The same was true at the base commit, so no shipped binary has
+            written one. An unparseable holder therefore means a row edited by
+            hand, or a third-party writer against the same store — which is
+            exactly the case where refusing is right. The paths above that DO
+            occur in production are the first two; the third is listed because
+            it is the one the rule is often described by, and describing the
+            rule by its rarest trigger is how the cost gets underestimated.
+
+        WHAT THE OPERATOR ACTUALLY HAS
+            :meth:`force_release_session_turn_lease` is a Python method with no
+            CLI verb in front of it yet. The refusal messages therefore name it
+            (see :meth:`_check_turn_lease_guard`), because an exit nobody can
+            find is not an exit.
+
+        Every branch below is positive evidence:
+
+        released          holder is empty. The row survives release so the
+                          epoch stays monotonic.
+        provably dead     the recorded (pid, start_time) pair no longer exists,
+                          PID reuse included.
+        ours, unheld      the row names THIS process and nothing in this
+                          process holds the grant. That is a turn that died
+                          without releasing, and it is knowable here and now:
+                          no deadline, no guess. Without this branch the first
+                          rule would wedge such a conversation forever.
+        ours, held        something here holds it. A contender sharing our PID
+                          is still a contender — never free, whatever the
+                          deadline says. This is the case a subprocess cannot
+                          exercise.
+        foreign           alive, or alive-as-far-as-we-can-tell. Never free.
+                          "Cannot prove alive" is not "dead".
+        """
+        if row is None:
+            return True
+        holder = row["holder"] or ""
+        if not holder:
+            return True
+        owner_pid = row["owner_pid"]
+        if _turn_lease_owner_is_dead(
+            holder, owner_pid, row["owner_pid_start"]
+        ):
+            return True
+        if owner_pid and int(owner_pid) == os.getpid():
+            return live_turn_grant(self.db_path, conversation_id) is None
+        return False
+
+    def force_release_session_turn_lease(self, session_id: str) -> bool:
+        """Free a conversation without consulting a clock or the holder.
+
+        The deliberate recovery that replaces expiry. Needed because a lease is
+        now only freed by evidence, and there are rows no evidence can reach: a
+        pre-``owner_pid`` row carried over by the v27 rebuild, or a foreign PID
+        that was recycled into something long-lived so liveness reads as "still
+        there". Without this an operator's only option is editing the database
+        by hand.
+
+        The epoch is KEPT, so the grant this evicts can never be replayed —
+        the next acquisition is a strictly later generation. Returns True when
+        a row was actually freed.
+        """
+        if not session_id:
+            return False
+        freed_root = {}
+
+        def _do(conn):
+            conversation_id, row = self._read_turn_lease_on_conn(conn, session_id)
+            if row is None:
+                return False
+            freed_root["id"] = conversation_id
+            logger.warning(
+                "force-releasing the turn lease on conversation %s "
+                "(holder %r, epoch %s) — this evicts whatever holds it",
+                conversation_id, row["holder"], row["epoch"],
+            )
+            conn.execute(
+                "UPDATE session_turn_leases SET holder = '', expires_at = 0 "
+                "WHERE conversation_id = ?",
+                (conversation_id,),
+            )
+            return True
+
+        freed = bool(self._execute_write(_do))
+        root = freed_root.get("id")
+        if freed and root:
+            # Drop any local registration too, or current_turn_grant would keep
+            # handing out a grant the row no longer honours.
+            with _LIVE_TURN_GRANTS_LOCK:
+                _LIVE_TURN_GRANTS.pop(_live_grant_key(self.db_path, root), None)
+        return freed
+
+    def _skip_leased_conversations(self, conn, session_ids, now=None):
+        """Split *session_ids* into (may_touch, owned) inside a write txn.
+
+        The admission rule for a SWEEP. A sweep spans many conversations, so no
+        single grant a caller could hold authorizes it — ``prune_sessions``
+        selects its own victims from a filter, and the operator running it has
+        no way to name them in advance. The fence therefore has to be per row
+        and inside the sweep's own transaction: a conversation a live turn owns
+        is left alone, everything else is swept. Refusing the whole sweep
+        because one conversation is busy would make routine maintenance
+        unrunnable on a busy host, which is how sweeps end up being run with
+        the fence disabled.
+
+        Deterministic and clock-independent in the part that matters: ownership
+        comes from :meth:`_turn_lease_row_is_free`, the same predicate that
+        decides whether an acquirer may take the lease, so a sweep can never
+        delete a conversation an acquirer would have been refused.
+
+        Callers must run this on the SAME connection (and therefore the same
+        transaction) as the delete, or the answer is a snapshot rather than a
+        decision.
+        """
+        ids = [sid for sid in session_ids if sid]
+        if not ids:
+            return [], []
+        live = conn.execute(
+            "SELECT conversation_id FROM session_turn_leases "
+            "WHERE holder IS NOT NULL AND holder != ''"
+        ).fetchall()
+        if not live:
+            # Nothing owns anything: skip the per-row lineage walk entirely.
+            return list(ids), []
+        when = time.time() if now is None else float(now)
+        owned_roots = set()
+        for row in live:
+            root = row["conversation_id"]
+            lease = conn.execute(
+                f"SELECT {self._TURN_LEASE_COLUMNS} FROM session_turn_leases "
+                f"WHERE conversation_id = ?",
+                (root,),
+            ).fetchone()
+            if not self._turn_lease_row_is_free(root, lease):
+                owned_roots.add(root)
+        if not owned_roots:
+            return list(ids), []
+        allowed, skipped = [], []
+        for sid in ids:
+            # Not `root(sid)`. A sweep that removes `sid` also severs
+            # `parent_session_id` on every direct child of it, and a BRANCH
+            # child is its own lease root — so the row it mutates belongs to a
+            # conversation the victim's own root says nothing about. The
+            # predicate is therefore over the whole REACH of removing `sid`.
+            reached = self._affected_session_ids(conn, [sid])
+            roots = {
+                self._session_turn_lease_key_on_conn(conn, other)
+                for other in reached
+            }
+            (skipped if roots & owned_roots else allowed).append(sid)
+        if skipped:
+            logger.info(
+                "turn lease: sweep skipped %d session(s) whose conversation is "
+                "owned by a live turn: %s",
+                len(skipped),
+                ", ".join(sorted(skipped)[:10]),
+            )
+        return allowed, skipped
+
+    def _refuse_if_any_conversation_is_owned(self, conn, session_ids, because: str):
+        """Raise unless every id in *session_ids* is on a free conversation.
+
+        The counterpart of :meth:`_skip_leased_conversations`, for an operation
+        that named ONE thing. A sweep may skip what it cannot touch because it
+        never promised to touch anything in particular; a delete promised to
+        remove exactly this session and everything it takes with it, and doing
+        half of that is worse than doing none of it.
+
+        Deliberately a separate entry point rather than a flag on the sweep
+        helper: the census derives its "self-fencing sweep" set from calls to
+        that helper, and a refusing caller reading as a sweep would count every
+        one of its call sites as fenced by it.
+        """
+        _allowed, owned = self._skip_leased_conversations(conn, session_ids)
+        if owned:
+            raise SessionTurnLeaseLostError(
+                f"{because}: conversation(s) a live turn owns "
+                f"({', '.join(sorted(owned))})"
+            )
+
+    def _affected_session_ids(self, conn, session_ids) -> List[str]:
+        """Every session row a delete of *session_ids* MUTATES, not just names.
+
+        Admission has to be decided over the statements' reach, and a delete's
+        reach is three things, only the first of which the caller named:
+
+        the named rows      deleted outright, with their messages.
+        the delegate cascade
+                            ``_collect_delegate_child_ids`` walks the
+                            ``_delegate_from`` marker chain, and every row it
+                            finds is deleted outright too.
+        the severed children
+                            the orphaning statement — which sets
+                            ``parent_session_id`` to NULL for every direct
+                            child — runs over the
+                            union of the two above. A COMPRESSION child of a
+                            named row resolves to that row's own root, so the
+                            named grant already covers it; a BRANCH child does
+                            NOT — it is its own lease root, which is precisely
+                            why the guard on the named id never saw it.
+
+        Direct children are enough, and that is a property of the rule rather
+        than an economy: the SET NULL touches one generation, and a grandchild's
+        root is either the child (when the child is a compression parent, and
+        then the child is in this set and its root is compared) or the
+        grandchild itself (a branch of a branch, which nothing here touches).
+
+        Returns the union, sorted, INCLUDING the ids that were passed in — a
+        caller that wants "everything except what my grant covers" filters by
+        root, because id equality is the wrong comparison for a lineage.
+        """
+        seeds = [sid for sid in session_ids if sid]
+        if not seeds:
+            return []
+        doomed = set(seeds) | set(_collect_delegate_child_ids(conn, seeds))
+        ph = ",".join("?" * len(doomed))
+        severed = conn.execute(
+            f"SELECT id FROM sessions WHERE parent_session_id IN ({ph})",
+            sorted(doomed),
+        ).fetchall()
+        return sorted(doomed | {row["id"] for row in severed})
+
+    def _refuse_unless_reached_conversations_are_free(
+        self, conn, session_id: str, because: str
+    ) -> None:
+        """Every root a delete of *session_id* reaches, EXCEPT its own, is free.
+
+        The own-root exemption is not a softening. ``_check_turn_lease_guard``
+        has already decided the named root against the caller's grant; asking
+        for freeness a second time would refuse the owner's own delete of its
+        own compression lineage, because a compression child resolves to that
+        very root. A grant authorizes ONE conversation, so every OTHER root the
+        statements reach has only one admissible state, and it is free.
+        """
+        own_root = self._session_turn_lease_key_on_conn(conn, session_id)
+        reached = [
+            sid for sid in self._affected_session_ids(conn, [session_id])
+            if sid != session_id
+        ]
+        foreign = [
+            other for other in reached
+            if self._session_turn_lease_key_on_conn(conn, other)
+            != own_root
+        ]
+        if foreign:
+            self._refuse_if_any_conversation_is_owned(conn, foreign, because)
+
+    def admit_on_connection(
+        self,
+        conn,
+        session_ids,
+        *,
+        because: str,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> None:
+        """Admission for a writer that holds its OWN transaction on this store.
+
+        WHY THIS EXISTS AND WHY IT IS NOT A SECOND DOOR
+            ``tools/async_delegation`` writes ``async_delegations`` — rows in
+            THIS database, every one of them naming a conversation — through a
+            connection it opened itself. There are two ways to bring such a
+            module inside the fence, and only one of them survives review:
+
+            re-implement    resolve the canonical root and read the lease over
+                            there. That is a SECOND implementation of the
+                            admission rule, and two implementations drift. It
+                            is the shape this method exists to make
+                            unnecessary.
+            borrow          run the canonical helpers against the connection
+                            the caller hands in. Every one of them —
+                            :meth:`_session_turn_lease_key_on_conn`,
+                            :meth:`_read_turn_lease_on_conn`,
+                            :meth:`_authorize_turn_lease_token`,
+                            :meth:`_check_turn_lease_guard` — already takes its
+                            connection as a parameter and touches no other
+                            state than ``self.db_path``. So there is exactly
+                            one rule, and it runs in the caller's transaction.
+
+        THE CALLER'S OBLIGATION, AND IT IS THE WHOLE CONTRACT
+            *conn* must already be inside ``BEGIN IMMEDIATE`` and must be the
+            connection the DML then runs on. Called on a connection outside a
+            transaction, or on a different one, this is a snapshot rather than
+            a decision — the same failure as reading the lease before the write
+            instead of inside it.
+
+        Refuses unless every id in *session_ids* is admitted: the caller's
+        grant for the conversation it names, freeness for every other.
+        """
+        ids = [sid for sid in session_ids if sid]
+        if not ids:
+            return
+        with self._row_factory_on(conn):
+            self._admit_on_connection(
+                conn, ids, because, turn_lease_holder, turn_lease_ttl_seconds
+            )
+
+    @staticmethod
+    @contextmanager
+    def _row_factory_on(conn):
+        """Read this store's rows by NAME on a foreign connection, then restore.
+
+        The helpers index their rows as ``row["holder"]``; a module that opened
+        its own connection has the default tuple factory and every one of them
+        raises ``TypeError: tuple indices must be integers``. Setting it here
+        rather than asking the caller to keeps the borrowed rule self-contained,
+        and restoring it means the caller's own row shape is untouched — that
+        module unpacks tuples positionally two lines later.
+        """
+        previous = conn.row_factory
+        conn.row_factory = sqlite3.Row
+        try:
+            yield
+        finally:
+            conn.row_factory = previous
+
+    def _admit_on_connection(
+        self, conn, ids, because, turn_lease_holder, turn_lease_ttl_seconds
+    ) -> None:
+        granted_root = getattr(turn_lease_holder, "conversation_id", None)
+        named = next(
+            (sid for sid in ids
+             if self._session_turn_lease_key_on_conn(conn, sid) == granted_root),
+            None,
+        )
+        if named is not None:
+            self._check_turn_lease_guard(
+                conn, named, turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
+        rest = [sid for sid in ids if sid != named]
+        if rest:
+            self._refuse_if_any_conversation_is_owned(conn, rest, because)
+
+    def skip_leased_on_connection(self, conn, session_ids) -> List[str]:
+        """The SWEEP counterpart of :meth:`admit_on_connection`.
+
+        Returns the subset of *session_ids* whose conversations are free. Same
+        connection obligation, same predicate an acquirer faces, so a sweep
+        driven from a foreign module can never touch a conversation an acquirer
+        would have been refused.
+        """
+        with self._row_factory_on(conn):
+            return self._skip_leased_conversations(conn, list(session_ids))[0]
+
+    def _routing_affected_session_ids(self, conn, keys, entry_json) -> List[str]:
+        """Every conversation a routing write touches, in both directions.
+
+        The entry being OVERWRITTEN names the conversation whose replies
+        stop arriving; the new entry names the one they start arriving for.
+        A fence that read only the second would let a bystander orphan a
+        live conversation by pointing its key somewhere else.
+        """
+        ids = set()
+        for scope, key in keys:
+            row = conn.execute(
+                "SELECT entry_json FROM gateway_routing "
+                "WHERE scope = ? AND session_key = ?",
+                (scope, key),
+            ).fetchone()
+            existing = _routing_entry_session_id(row["entry_json"] if row else None)
+            if existing:
+                ids.add(existing)
+        incoming = _routing_entry_session_id(entry_json)
+        if incoming:
+            ids.add(incoming)
+        return sorted(ids)
+
+    def _admit_routing_write(
+        self, conn, keys, entry_json, turn_lease_holder, turn_lease_ttl_seconds
+    ) -> None:
+        """Root + holder + epoch for the conversation the grant names; free for the rest.
+
+        Same rule as every other multi-target writer. It is stated here in
+        terms of the payload rather than a parameter because the routing
+        index has no session-id parameter to state it in.
+        """
+        affected = self._routing_affected_session_ids(conn, keys, entry_json)
+        if not affected:
+            return
+        granted_root = getattr(turn_lease_holder, "conversation_id", None)
+        named = next(
+            (sid for sid in affected
+             if self._session_turn_lease_key_on_conn(conn, sid) == granted_root),
+            None,
+        )
+        if named is not None:
+            self._check_turn_lease_guard(
+                conn, named, turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
+        rest = [sid for sid in affected if sid != named]
+        if rest:
+            self._refuse_if_any_conversation_is_owned(
+                conn, rest,
+                f"refusing to write the gateway routing index for "
+                f"{sorted(keys)!r}: it names",
+            )
+
+    def _owned_routing_keys(self, conn, scope: str) -> set:
+        """The ``session_key``s in *scope* whose conversation a live turn owns.
+
+        A wholesale index rewrite is a SWEEP — the gateway rebuilds the
+        whole scope on startup and nobody could have held a grant naming
+        those keys — so the owned entries are KEPT rather than the pass
+        being refused.
+        """
+        rows = conn.execute(
+            "SELECT session_key, entry_json FROM gateway_routing WHERE scope = ?",
+            (scope,),
+        ).fetchall()
+        by_session: Dict[str, List[str]] = {}
+        for row in rows:
+            sid = _routing_entry_session_id(row["entry_json"])
+            if sid:
+                by_session.setdefault(sid, []).append(row["session_key"])
+        if not by_session:
+            return set()
+        _allowed, owned = self._skip_leased_conversations(
+            conn, sorted(by_session)
+        )
+        return {key for sid in owned for key in by_session[sid]}
+
     def try_acquire_session_turn_lease(
         self,
         session_id: str,
@@ -7101,51 +8262,57 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         *,
         ttl_seconds: float = 300.0,
         patience_s: Optional[float] = None,
-    ) -> bool:
+    ) -> Optional[SessionTurnLeaseToken]:
         """Atomically acquire the cross-process turn lease for a conversation.
 
-        Compression rotates a session into child segments, so the durable key
-        is the lineage root rather than the current segment id. The walk and
-        INSERT share one write transaction. Expired leases and leases whose
-        structured local holder PID is known dead are reclaimed in that same
-        transaction.
+        Returns a :class:`SessionTurnLeaseToken` — a truthy ``str`` carrying the
+        granted epoch — or ``None`` when the conversation is already owned.
+
+        Compression rotates a session into child segments, so the durable key is
+        the lineage root rather than the current segment id. The walk and the
+        write share one transaction.
+
+        Every grant BUMPS the epoch, and the row is upserted rather than
+        deleted-and-reinserted, so the counter survives release: re-acquiring
+        under the SAME holder string yields a different generation, which is
+        what makes the earlier grant unusable.
         """
         if not session_id or not holder:
-            return False
+            return None
         now = time.time()
         expires_at = now + max(0.1, float(ttl_seconds))
+        my_pid = os.getpid()
+        my_start = _process_start_time(my_pid)
 
         def _do(conn):
-            conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
-            row = conn.execute(
-                "SELECT holder, expires_at FROM session_turn_leases "
-                "WHERE conversation_id = ?",
-                (conversation_id,),
-            ).fetchone()
-            if row is not None:
-                current_holder = row["holder"]
-                if (
-                    float(row["expires_at"]) <= now
-                    or _compression_lock_holder_process_is_dead(current_holder)
-                ):
-                    conn.execute(
-                        "DELETE FROM session_turn_leases "
-                        "WHERE conversation_id = ? AND holder = ?",
-                        (conversation_id, current_holder),
-                    )
+            conversation_id, row = self._read_turn_lease_on_conn(conn, session_id)
+            if row is None:
+                conn.execute(
+                    "INSERT INTO session_turn_leases "
+                    "(conversation_id, holder, acquired_at, expires_at, epoch, "
+                    "owner_pid, owner_pid_start) VALUES (?, ?, ?, ?, 1, ?, ?)",
+                    (conversation_id, holder, now, expires_at, my_pid, my_start),
+                )
+                return SessionTurnLeaseToken(holder, 1, conversation_id)
+            if not self._turn_lease_row_is_free(conversation_id, row):
+                return None
+            epoch = int(row["epoch"] or 0) + 1
             conn.execute(
-                "INSERT OR IGNORE INTO session_turn_leases "
-                "(conversation_id, holder, acquired_at, expires_at) "
-                "VALUES (?, ?, ?, ?)",
-                (conversation_id, holder, now, expires_at),
+                "UPDATE session_turn_leases SET holder = ?, acquired_at = ?, "
+                "expires_at = ?, epoch = ?, owner_pid = ?, owner_pid_start = ? "
+                "WHERE conversation_id = ?",
+                (holder, now, expires_at, epoch, my_pid, my_start, conversation_id),
             )
-            owner = conn.execute(
-                "SELECT holder FROM session_turn_leases WHERE conversation_id = ?",
-                (conversation_id,),
-            ).fetchone()
-            return owner is not None and owner["holder"] == holder
+            return SessionTurnLeaseToken(holder, epoch, conversation_id)
 
-        return bool(self._execute_write(_do, patience_s=patience_s))
+        token = self._execute_write(_do, patience_s=patience_s)
+        if token is not None:
+            # AFTER the write commits, never inside _do: _execute_write can
+            # retry the callback, and a registration left behind by an attempt
+            # that never landed would make this process look like the owner of
+            # a row it does not hold.
+            _register_live_turn_grant(self.db_path, token)
+        return token
 
     def acquire_session_turn_lease(
         self,
@@ -7159,8 +8326,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         wait_notice_interval_seconds: float = 15.0,
         should_abort=None,
         acquire_patience_s: float = 0.5,
-    ) -> bool:
+    ) -> Optional[SessionTurnLeaseToken]:
         """Wait for a cross-process turn lease without holding a SQLite lock.
+
+        Returns the granted :class:`SessionTurnLeaseToken`, or ``None`` when the
+        wait times out or ``should_abort()`` fires.
 
         ``on_wait(elapsed_seconds)`` is best-effort: invoked when the first
         attempt fails (elapsed ~0) and again about every
@@ -7179,20 +8349,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if should_abort is not None:
                 try:
                     if should_abort():
-                        return False
+                        return None
                 except Exception:
                     logger.debug(
                         "session turn lease should_abort callback failed",
                         exc_info=True,
                     )
             try:
-                if self.try_acquire_session_turn_lease(
+                token = self.try_acquire_session_turn_lease(
                     session_id,
                     holder,
                     ttl_seconds=ttl_seconds,
                     patience_s=acquire_patience_s,
-                ):
-                    return True
+                )
+                if token is not None:
+                    return token
             except sqlite3.Error as exc:
                 # Long holder transactions (compression publish, large
                 # flushes) can exhaust a single write-patience budget.
@@ -7202,7 +8373,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             now = time.monotonic()
             remaining = deadline - now
             if remaining <= 0:
-                return False
+                return None
             if wait_started is None:
                 wait_started = now
             if on_wait is not None and (
@@ -7220,43 +8391,333 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 last_notice_at = now
             time.sleep(min(max(0.01, float(poll_interval_seconds)), remaining))
 
+    def _authorize_turn_lease_token(self, conn, session_id: str, token):
+        """Resolve the target's canonical root and check the grant against it.
+
+        Returns ``(conversation_id, epoch)`` for a grant that is genuinely the
+        current owner of the target conversation, or ``None`` when it is not.
+
+        The root comparison is the point. Holder and epoch order acquisitions
+        WITHIN one conversation and say nothing across conversations — and a
+        first grant is epoch 1 in every conversation, so on the common path the
+        epoch discriminates nothing at all. Both sides of the comparison are
+        canonical roots resolved in THIS transaction: the caller's session id is
+        mutable input and is never authority on its own, and the grant's root is
+        immutable because it was stamped when the lease was issued.
+        """
+        conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
+        epoch = self._turn_lease_epoch_of(token)
+        granted_root = getattr(token, "conversation_id", None)
+        if epoch is None or granted_root is None:
+            return None
+        if granted_root != conversation_id:
+            return None
+        row = conn.execute(
+            f"SELECT {self._TURN_LEASE_COLUMNS} FROM session_turn_leases "
+            f"WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchone()
+        if (
+            row is None
+            or row["holder"] != str(token)
+            or int(row["epoch"] or 0) != epoch
+            or epoch == LEGACY_TURN_LEASE_EPOCH
+        ):
+            return None
+        return conversation_id, epoch
+
+    @staticmethod
+    def _turn_lease_epoch_of(holder) -> Optional[int]:
+        """Generation carried by a presented holder; None for a bare string."""
+        epoch = getattr(holder, "epoch", None)
+        return int(epoch) if isinstance(epoch, int) else None
+
     def refresh_session_turn_lease(
         self,
         session_id: str,
-        holder: str,
+        holder,
         *,
         ttl_seconds: float = 300.0,
     ) -> bool:
-        """Extend a turn lease only while ``holder`` still owns it."""
+        """Extend a lease only while *holder* still owns it AT ITS GENERATION.
+
+        A superseded grant — same holder string, older epoch — must not be able
+        to extend the current owner's deadline.
+        """
         if not session_id or not holder:
+            return False
+        epoch = self._turn_lease_epoch_of(holder)
+        if epoch is None:
+            logger.warning(
+                "refresh_session_turn_lease got an unversioned holder for %s; "
+                "refusing (a bare string cannot be told apart from a replay)",
+                session_id,
+            )
             return False
         expires_at = time.time() + max(0.1, float(ttl_seconds))
 
         def _do(conn):
-            conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
+            authorized = self._authorize_turn_lease_token(conn, session_id, holder)
+            if authorized is None:
+                return False
+            conversation_id, granted_epoch = authorized
             cursor = conn.execute(
                 "UPDATE session_turn_leases SET expires_at = ? "
-                "WHERE conversation_id = ? AND holder = ?",
-                (expires_at, conversation_id, holder),
+                "WHERE conversation_id = ? AND holder = ? AND epoch = ?",
+                (expires_at, conversation_id, str(holder), granted_epoch),
             )
             return cursor.rowcount > 0
 
         return bool(self._execute_write(_do))
 
-    def release_session_turn_lease(self, session_id: str, holder: str) -> None:
-        """Release a turn lease iff ``holder`` still owns it; idempotent."""
+    def release_session_turn_lease(self, session_id: str, holder) -> None:
+        """Release a lease iff *holder* still owns it at its generation.
+
+        The row is KEPT (``holder = ''``) rather than deleted, so the epoch
+        stays monotonic. Deleting it would let the counter restart at 1 and make
+        an already-released grant valid again.
+        """
         if not session_id or not holder:
+            return
+        epoch = self._turn_lease_epoch_of(holder)
+        if epoch is None:
+            logger.warning(
+                "release_session_turn_lease got an unversioned holder for %s; "
+                "refusing", session_id,
+            )
             return
 
         def _do(conn):
-            conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
+            # Release is a destructive authority transfer: it makes the
+            # conversation acquirable by anyone. Deriving it from the mutable
+            # session id the caller passed lets a grant for one conversation
+            # free a different one.
+            authorized = self._authorize_turn_lease_token(conn, session_id, holder)
+            if authorized is None:
+                logger.debug(
+                    "release_session_turn_lease refused: grant does not own "
+                    "the conversation %s resolves to", session_id,
+                )
+                return
+            conversation_id, granted_epoch = authorized
             conn.execute(
-                "DELETE FROM session_turn_leases "
-                "WHERE conversation_id = ? AND holder = ?",
-                (conversation_id, holder),
+                "UPDATE session_turn_leases SET holder = '', expires_at = 0 "
+                "WHERE conversation_id = ? AND holder = ? AND epoch = ?",
+                (conversation_id, str(holder), granted_epoch),
             )
 
         self._execute_write(_do)
+        # After the row is free, never before: an in-process writer that reads
+        # the registry between the two would present a grant the DB has already
+        # released and be refused for the wrong reason.
+        _unregister_live_turn_grant(self.db_path, holder)
+
+    def current_turn_grant(self, session_id: str):
+        """This process's live grant for *session_id*'s conversation, or None.
+
+        For a writer that runs INSIDE a turn this process is already running —
+        a tool the model called, the compressor, a post-turn display stamp.
+        Such a writer must PRESENT the turn's grant; acquiring is impossible
+        (the turn holds the lease) and waiting for it would deadlock the turn
+        against itself. A writer that gets ``None`` here is genuinely an
+        alternate writer and should take :meth:`session_turn_lease`.
+        """
+        if not session_id:
+            return None
+        try:
+            root = self._session_turn_lease_key(session_id)
+        except Exception:
+            logger.debug(
+                "current_turn_grant: lease-key walk failed for %s",
+                session_id, exc_info=True,
+            )
+            return None
+        return live_turn_grant(self.db_path, root)
+
+    def get_session_turn_lease(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Current lease row for the conversation *session_id* belongs to.
+
+        Diagnostic helper. ``None`` when nothing ever leased the conversation;
+        a dict with ``holder = ''`` once it has been released.
+        """
+        if not session_id:
+            return None
+        with self._read_ctx() as conn:
+            conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
+            row = conn.execute(
+                "SELECT conversation_id, acquired_at, "
+                f"{self._TURN_LEASE_COLUMNS} FROM session_turn_leases "
+                "WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    #: How long an ALTERNATE writer waits for the turn lease before giving up.
+    #: Short on purpose: every alternate writer either has its own retry queue
+    #: (gateway transcript append), keeps its input on disk (shutdown spool),
+    #: surfaces the failure to a human (/retry, /undo, the CLI verbs), or is a
+    #: background sweep that can run on the next tick. Blocking a gateway thread
+    #: for the agent's full turn is worse than deferring the write. One class
+    #: attribute rather than a number copied into forty call sites.
+    ALTERNATE_WRITER_LEASE_WAIT_S = 10.0
+
+    @contextlib.contextmanager
+    def session_turn_lease(
+        self,
+        session_id: str,
+        holder: str,
+        *,
+        ttl_seconds: float = 60.0,
+        wait_seconds: Optional[float] = None,
+        poll_interval_seconds: float = 0.05,
+        reload_messages: bool = True,
+    ):
+        """Acquire the turn lease, hand back a POST-ACQUISITION view, release.
+
+        For every writer that is not the agent turn owner — gateway transcript
+        append and mirror, /retry and /undo, ACP persist, shutdown spool
+        recovery, the CLI session verbs, TUI branch/fork/model-switch. They have
+        to acquire rather than write holderless, and — the part that call sites
+        keep getting wrong — they must not act on the snapshot they were holding
+        while they waited. Whoever owned the conversation may have appended to
+        it, or compressed and rotated it onto a new session id.
+
+        So the yielded object carries what is true AFTER acquisition:
+
+        ``token``       the grant to present as ``turn_lease_holder=``
+        ``session_id``  the live id, re-resolved through the compression chain
+        ``messages``    the transcript as of acquisition (``reload_messages``)
+
+        A caller that keeps using its own pre-acquisition variables is still
+        broken; the census only proves it presents a grant. Consuming these is
+        checked separately.
+
+        Fail-closed in three places, none of which are logged-and-continued:
+
+        * acquisition timeout raises :class:`SessionTurnLeaseLostError`;
+        * a failed ``resolve_resume_session_id`` propagates — silently yielding
+          the caller's original id turns "I do not know where this conversation
+          lives" into "it lives exactly where you thought";
+        * a failed transcript reload propagates — an empty list is a valid
+          history, so swallowing the error presents *deletion* as a view.
+
+        In all three the caller never enters the body, so its input is still
+        in hand and still retryable.
+        """
+        token = self.acquire_session_turn_lease(
+            session_id,
+            holder,
+            ttl_seconds=ttl_seconds,
+            wait_seconds=(
+                self.ALTERNATE_WRITER_LEASE_WAIT_S
+                if wait_seconds is None
+                else wait_seconds
+            ),
+            poll_interval_seconds=poll_interval_seconds,
+        )
+        if token is None:
+            raise SessionTurnLeaseLostError(
+                f"Could not acquire the session turn lease for {session_id!r} "
+                f"as {holder!r}; refusing to write unfenced"
+            )
+        try:
+            resolved = self.resolve_resume_session_id(session_id)
+            live_session_id = resolved or session_id
+            messages: List[Dict[str, Any]] = (
+                self.get_messages(live_session_id) if reload_messages else []
+            )
+            yield SessionTurnLeaseScope(
+                token=token, session_id=live_session_id, messages=messages
+            )
+        finally:
+            self.release_session_turn_lease(session_id, token)
+
+    @contextlib.contextmanager
+    def offline_rebuild(self, *, reason: str):
+        """Rebuild THIS store wholesale, offline, on the canonical transaction.
+
+        The one entry point for a writer whose job is to reconstruct a store
+        rather than to take a turn in a conversation — session recovery and the
+        page-level lost_and_found salvage lane. It exists because those two had
+        a real tension and resolved it the wrong way: they opened the
+        destination a SECOND time with a bare ``sqlite3.connect`` and wrote it
+        from there, which the store refuses, because a handle that registered
+        nothing is exactly what an old binary is.
+
+        WHY NOT ``register_turn_fence_function`` ON THE RAW HANDLE
+            Because that is the defect, performed on purpose. The marker proves
+            "current generation" and nothing else — not the canonical root, not
+            the holder, not the monotonic epoch — so minting it on a production
+            writer opens a second admitted door around the token validator. The
+            barrier's question was never "is this connection marked" but "who
+            may mint the marker". A rebuild answers it by not needing a second
+            connection at all.
+
+        WHAT THIS GATE PROMISES
+            * Every write inside the block runs through :meth:`_execute_write`,
+              on the connection the token validator sits on. There is no second
+              door to admit.
+            * It is FAIL-CLOSED on ownership: if any conversation in this store
+              is owned by a live turn, the block is never entered and nothing is
+              written. A rebuild rewrites rows wholesale — session identity,
+              parent lineage, titles, the transcript — so running one against a
+              conversation somebody is mid-turn on is a silent interleave that
+              no per-row token could make safe. There is no "skip the busy ones"
+              variant on offer: :meth:`_skip_leased_conversations` is for a
+              sweep that never promised to touch anything in particular, and a
+              rebuild promised to reproduce the whole store.
+            * Foreign keys are relaxed for the duration and restored after.
+              Salvage inserts children before it can prove their parents exist
+              — that ordering is the entire point of reconstruction — and the
+              caller must not have to reach past this API to get it.
+
+        The refusal names the owned conversations, because the operator's next
+        move is to end those turns or run
+        :meth:`force_release_session_turn_lease`, and a refusal that does not
+        say which ones sends them hunting.
+        """
+        def _owned_conversations(conn) -> List[str]:
+            """Every conversation in this store a live turn owns.
+
+            The predicate is :meth:`_turn_lease_row_is_free`, the same one that
+            decides whether an acquirer may take the lease and the same one
+            :meth:`_skip_leased_conversations` runs per row — so a rebuild can
+            never proceed over a conversation an acquirer would have been
+            refused. Read directly off the lease table rather than off
+            ``sessions`` because a live row whose session is exactly what the
+            rebuild is about to recreate must still stop it.
+            """
+            owned: List[str] = []
+            for row in conn.execute(
+                "SELECT conversation_id FROM session_turn_leases "
+                "WHERE holder IS NOT NULL AND holder != ''"
+            ).fetchall():
+                root = row["conversation_id"]
+                lease = conn.execute(
+                    f"SELECT {self._TURN_LEASE_COLUMNS} FROM "
+                    f"session_turn_leases WHERE conversation_id = ?",
+                    (root,),
+                ).fetchone()
+                if not self._turn_lease_row_is_free(root, lease):
+                    owned.append(root)
+            return owned
+
+        owned = self._execute_write(_owned_conversations)
+        if owned:
+            raise SessionTurnLeaseLostError(
+                f"refusing an offline rebuild ({reason}) of {self.db_path}: "
+                f"conversation(s) a live turn owns ({', '.join(sorted(owned))})"
+            )
+        with self._lock:
+            self._conn.execute("PRAGMA foreign_keys=OFF")
+        try:
+            yield self
+        finally:
+            with self._lock:
+                try:
+                    self._conn.execute("PRAGMA foreign_keys=ON")
+                except Exception:  # pragma: no cover - closed mid-rebuild
+                    pass
 
     def get_compression_lock_holder(self, session_id: str) -> Optional[str]:
         """Return the current (non-expired) holder for ``session_id``, or None.
@@ -7282,6 +8743,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         *,
         description: Optional[str] = None,
         provenance: Optional[ActivityProvenance] = None,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> None:
         """Stamp durable mid-turn session activity (observation-only).
 
@@ -7306,6 +8769,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         prov = normalize_activity_provenance(provenance).value
 
         def _do(conn):
+            # The activity label is what the session list and resume banner read.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             conn.execute(
                 "UPDATE sessions SET "
                 "last_activity_at = ?, "
@@ -7322,7 +8792,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # (the next due window retries naturally).
         self._execute_write(_do, patience_s=self._ACTIVITY_WRITE_PATIENCE_S)
 
-    def clear_session_activity_labels(self, session_id: str) -> None:
+    def clear_session_activity_labels(
+        self,
+        session_id: str,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> None:
         """Clear mid-turn activity labels after a turn ends.
 
         Keeps ``last_activity_at`` intact so idle / watchdog clocks stay
@@ -7360,6 +8835,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 return
 
         def _do(conn):
+            # Clearing the label is a write into the same column the heartbeat owns.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             conn.execute(
                 "UPDATE sessions SET "
                 "last_activity_description = ?, "
@@ -7390,17 +8872,39 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         session_id: str,
         model_config_json: str,
         model: Optional[str] = None,
+        *,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> None:
         """Update model_config and optionally model for an existing session.
 
         Uses COALESCE so that passing model=None leaves the stored model
         column unchanged.  Routes through _execute_write for the standard
         BEGIN IMMEDIATE + jitter-retry + lock guarantee.
+
+        Fenced like a transcript mutation because it writes two of the columns
+        the next turn replays under. Its two production callers
+        (``gateway/run.py`` ``_sync_session_model_from_agent`` and
+        ``tui_gateway/server.py`` ``_persist_live_session_runtime``) are
+        read-modify-writes — ``get_session`` for the current ``model_config``,
+        merge in memory, write the whole thing back — and nothing about that
+        sequence is atomic against another process's turn. There is no grant
+        such a caller could hold that would make the stale write correct, so
+        while somebody owns the conversation the write is refused.
         """
+        # Refuse before the barrier below spends anything (update_session_meta).
+        self._refuse_before_side_effects(session_id, turn_lease_holder)
         # Barrier against queued token deltas — see update_session_model.
         self.flush_token_counts()
 
         def _do(conn):
+            # model and model_config are replayed by the next turn.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             conn.execute(
                 "UPDATE sessions SET model_config = ?, model = COALESCE(?, model) WHERE id = ?",
                 (model_config_json, model, session_id),
@@ -7408,10 +8912,37 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._execute_write(_do)
 
     def update_system_prompt(
-        self, session_id: str, system_prompt: Optional[str]
+        self,
+        session_id: str,
+        system_prompt: Optional[str],
+        *,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> None:
-        """Store the full assembled system prompt snapshot."""
+        """Store the full assembled system prompt snapshot.
+
+        Fenced. The snapshot is not metadata about the conversation — it is the
+        first thing the next turn sends, so replacing it changes what the model
+        sees as surely as changing ``model`` does. ``TURN_FENCE_SURFACE``'s
+        declaration names it in as many words, and the base-binary probe that
+        motivated the surface ran this exact method against a conversation this
+        generation held the lease on, unrefused.
+
+        Its production callers are the agent's own turn
+        (``agent/conversation_loop``, ``agent/conversation_compression``) and
+        the TUI's live persist, all of which run INSIDE a turn this process
+        owns. They present that turn's grant via ``current_turn_grant``; a
+        writer that gets ``None`` there is genuinely an alternate writer, and
+        holderless writes stay legal on an unowned conversation.
+        """
         def _do(conn):
+            # The prompt snapshot is what the next turn resumes from.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             system_prompt_hash = self._store_system_prompt(conn, system_prompt)
             conn.execute(
                 "UPDATE sessions "
@@ -7422,7 +8953,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._execute_write(_do)
 
     def update_session_model(
-        self, session_id: str, model: str, provider: Optional[str] = None
+        self,
+        session_id: str,
+        model: str,
+        provider: Optional[str] = None,
+        *,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> None:
         """Update the model for a session after a mid-session switch.
 
@@ -7440,6 +8977,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         actually serves it instead of the config.yaml primary provider
         (#79536). Callers without provider knowledge leave any stored
         provider untouched.
+
+        FENCED, because every column it writes is model context
+            ``model``, ``model_config``, ``system_prompt`` and
+            ``system_prompt_hash`` are what the next turn replays under. The
+            trigger on ``("sessions", "UPDATE")`` locks out an older BINARY; it
+            has nothing to say about a second writer in this generation. So
+            without this a process could switch the model out from under a turn
+            another process was running, and — because the write also nulls the
+            assembled system prompt — delete the prompt that turn is replaying
+            under, with nothing refused and nothing logged.
+
+            Holderless writes stay legal on an unowned conversation, which is
+            every single-writer install, every fresh session and every import.
         """
         # This write bypasses the token queue, so deltas enqueued before the
         # switch must land first: a still-queued first delta carries the
@@ -7447,9 +8997,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # first_accounted_route overwrite in update_token_counts (row sees
         # api_call_count == 0 + a route mismatch) and resurrect the old
         # model/provider. Flushing here restores the pre-queue ordering.
+        #
+        # ...and the flush is a side effect, so admission has to be asked first
+        # or a REFUSED switch has already spent the queue. See
+        # _refuse_before_side_effects; the guard inside _do stays the authority.
+        # Refuse before the barrier below spends anything (update_session_model).
+        self._refuse_before_side_effects(session_id, turn_lease_holder)
         self.flush_token_counts()
 
         def _do(conn):
+            # The columns below are what the next turn replays under.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             # Use the shared merge discipline so lineage markers like
             # _branched_from / _delegate_from survive. browser_model_lock
             # is deleted via a None patch value (same semantics as the
@@ -7521,7 +9084,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return json.dumps(config) if config else None
 
     def patch_session_model_config(
-        self, session_id: str, patch: Dict[str, Any]
+        self,
+        session_id: str,
+        patch: Dict[str, Any],
+        *,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> None:
         """Merge ``patch`` into a session's model_config JSON atomically.
 
@@ -7530,11 +9098,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         callers that need to update model_config *without* rewriting the
         transcript (the transcript-coupled path is ``archive_and_compact``'s
         ``model_config_patch``, which shares the same merge helper).
+
+        Fenced for the same reason ``update_session_model`` is: it writes one of
+        the columns the next turn replays under, and the /model commit path
+        calls it immediately after that method. Leaving it open would reopen
+        the same hole one method over.
         """
         if not session_id or not patch:
             return
 
         def _do(conn):
+            # model_config is replayed by the next turn.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             merged = self._merge_model_config_json(conn, session_id, patch)
             if merged is _MODEL_CONFIG_ROW_MISSING:
                 return
@@ -7572,12 +9152,28 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         model_options: Optional[Dict[str, Any]] = None,
         route_source: Optional[str] = None,
         confirmed: bool = False,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> None:
         """Persist a Browser / API client runtime lock without clobbering lineage markers.
 
         Merges ``browser_model_lock`` into the existing ``model_config`` JSON so
         ``_branched_from`` / ``_delegate_from`` survive. Nulls ``system_prompt``
         so cached ``Model:`` / ``Provider:`` footers cannot lie after a switch.
+
+        FENCED, and this is the method the previous fence was bypassable
+        through. Its statement writes ``model_config``, ``model``,
+        ``system_prompt`` and ``system_prompt_hash`` — every column
+        ``update_session_model`` writes — and it had zero admission calls while
+        that method had one. A fence the adjacent method walks around is not a
+        fence; the only difference between the two was which one somebody had
+        looked at.
+
+        The one production caller is ``gateway/platforms/api_server``, on a
+        request that carries a runtime lock. That request is very often not the
+        process running the turn, which is the case the refusal is for; when it
+        IS this process, ``current_turn_grant`` hands back the turn's own grant
+        and the write lands.
         """
         lock = {
             "provider": provider or "",
@@ -7589,6 +9185,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         }
 
         def _do(conn):
+            # This rewrites the whole route the next turn replays under.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             merged = self._merge_model_config_json(
                 conn, session_id, {"browser_model_lock": lock}
             )
@@ -7606,7 +9209,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             self._delete_unreferenced_system_prompts(conn)
         self._execute_write(_do)
 
-    def set_session_yolo(self, session_id: str, enabled: bool) -> None:
+    def set_session_yolo(
+        self,
+        session_id: str,
+        enabled: bool,
+        *,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> None:
         """Persist the per-session YOLO bypass flag into ``model_config``.
 
         Merges ``yolo_mode`` into the existing ``model_config`` JSON (same
@@ -7617,11 +9227,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         process. No-op when the session row doesn't exist yet; the
         creation-time ``model_config`` carries the flag for ``--yolo``
         launches.
+
+        Fenced for the same reason ``patch_session_model_config`` is: the merge
+        is a read-modify-write on ``model_config``, which is one column and is
+        replayed whole. A merge performed against a snapshot the owner has
+        since replaced writes the old document back with one key changed.
         """
         if not session_id:
             return
 
         def _do(conn):
+            # The yolo flag rides in model_config, which the next turn replays.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             merged = self._merge_model_config_json(
                 conn, session_id, {"yolo_mode": bool(enabled)}
             )
@@ -7711,6 +9333,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         provider: str,
         base_url: str,
         billing_mode: Optional[str] = None,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> None:
         """Unconditionally update the billing provider/base_url for a session.
 
@@ -7721,11 +9345,26 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         Also nulls ``system_prompt`` so the cached snapshot (which embeds a
         stale ``Model:`` / ``Provider:`` header) is rebuilt — matching the
         behavior of ``update_session_model`` (see #48173, #48248).
+
+        Fenced because of that second half. The billing columns are
+        bookkeeping the provider never sees; the two prompt columns it NULLs on
+        the way past are exactly what the running turn resumes from, and a
+        method belongs on the fence surface for what it can reach, not for what
+        it is named after.
         """
+        # Refuse before the barrier below spends anything (update_session_billing_route).
+        self._refuse_before_side_effects(session_id, turn_lease_holder)
         # Barrier against queued token deltas — see update_session_model.
         self.flush_token_counts()
 
         def _do(conn):
+            # Nulling the prompt snapshot changes what the next turn replays.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             conn.execute(
                 """UPDATE sessions SET
                    billing_provider = ?,
@@ -8033,6 +9672,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         billing_mode: Optional[str] = None,
         api_call_count: int = 0,
         absolute: bool = False,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> None:
         """Update token counters and backfill model if not already set.
 
@@ -8047,7 +9688,26 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # 0 rows.  Under concurrent load (cron + kanban + delegate_task) the
         # initial create_session() may have failed due to SQLite locking.
         # INSERT OR IGNORE is cheap and idempotent.
-        self._insert_session_row(session_id, "unknown", model=model)
+        #
+        # Carrying `model` makes this a replay-column write, so it is admitted
+        # (see _insert_session_row). A refusal is a decision about the ROUTE
+        # and must not cost the accounting: retry the ensure WITHOUT the route,
+        # which cannot move a replay column and therefore needs no admission.
+        # The alternative is losing the delta, and the background writer's
+        # contract turns a lost delta into a log line nobody reads.
+        try:
+            self._insert_session_row(
+                session_id, "unknown", model=model,
+                turn_lease_holder=turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
+        except SessionTurnLeaseLostError:
+            logger.debug(
+                "token accounting: not recording the route for %s — the "
+                "conversation is owned by another writer; the counters still "
+                "land", session_id,
+            )
+            self._insert_session_row(session_id, "unknown")
         if absolute:
             sql = """UPDATE sessions SET
                    input_tokens = ?,
@@ -8095,25 +9755,37 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             or cache_write_tokens or reasoning_tokens or api_call_count
             or estimated_cost_usd or actual_cost_usd
         )
-        params = (
-            input_tokens,
-            output_tokens,
-            cache_read_tokens,
-            cache_write_tokens,
-            reasoning_tokens,
-            estimated_cost_usd,
-            actual_cost_usd,
-            actual_cost_usd,
-            cost_status,
-            cost_source,
-            pricing_version,
-            billing_provider if has_accounted_usage else None,
-            billing_base_url if has_accounted_usage else None,
-            billing_mode if has_accounted_usage else None,
-            model if has_accounted_usage else None,
-            api_call_count,
-            session_id,
-        )
+        def _params(route_admitted: bool):
+            """The counter deltas, with the ROUTE bound only when admitted.
+
+            ``model = COALESCE(model, ?)`` is a NULL backfill, and a backfill
+            cannot move a route that is already set — but it CAN write one that
+            is not, and NULL -> a bystander's model is exactly the change this
+            fence exists to stop on a bare gateway row. Binding the parameter
+            to NULL when the route write was refused makes that assignment a
+            provable no-op while every accumulator in the same statement still
+            lands.
+            """
+            carry = has_accounted_usage and route_admitted
+            return (
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+                reasoning_tokens,
+                estimated_cost_usd,
+                actual_cost_usd,
+                actual_cost_usd,
+                cost_status,
+                cost_source,
+                pricing_version,
+                billing_provider if carry else None,
+                billing_base_url if carry else None,
+                billing_mode if carry else None,
+                model if carry else None,
+                api_call_count,
+                session_id,
+            )
         # Per-model usage attribution.  ``update_token_counts`` is the single
         # chokepoint every per-API-call delta flows through (CLI, gateway, cron,
         # delegated runs — see conversation_loop / codex_runtime), and each call
@@ -8153,7 +9825,31 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 and bool(billing_provider)
                 and (existing_model != model or existing_provider != billing_provider)
             )
-            if first_accounted_route:
+            # Every route-bearing assignment in this transaction — the bare
+            # overwrite below and the COALESCE backfill in `sql` — is decided
+            # once, here.
+            route_admitted = True
+            if has_accounted_usage and (model or billing_provider):
+                try:
+                    self._check_turn_lease_guard(
+                        conn,
+                        session_id,
+                        turn_lease_holder,
+                        turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+                    )
+                except SessionTurnLeaseLostError:
+                    # A refusal here is a decision about the ROUTE, not a failure of
+                    # the accounting. The counter arm still runs: a dropped delta
+                    # cannot be reconstructed, and this writer's callers log their
+                    # failures instead of raising them, so aborting the whole
+                    # transaction would make the loss silent.
+                    logger.debug(
+                        "token accounting: not recording the route for %s — "
+                        "the conversation is owned by another writer; the "
+                        "counters still land", session_id,
+                    )
+                    route_admitted = False
+            if first_accounted_route and route_admitted:
                 conn.execute(
                     """UPDATE sessions
                        SET model = ?, billing_provider = ?,
@@ -8161,7 +9857,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                        WHERE id = ?""",
                     (model, billing_provider, billing_base_url, billing_mode, session_id),
                 )
-            conn.execute(sql, params)
+            conn.execute(sql, _params(route_admitted))
             if record_model_usage:
                 self._record_model_usage(
                     conn,
@@ -8378,6 +10074,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                   )
             """, (cutoff,)).fetchall()
             ids = [r[0] if isinstance(r, (tuple, list)) else r["id"] for r in rows]
+            # A ghost is still a row inside somebody's conversation.
+            ids = self._skip_leased_conversations(conn, ids)[0]
             if ids:
                 placeholders = ",".join("?" * len(ids))
                 conn.execute(
@@ -8403,14 +10101,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         cutoff = time.time() - 604800  # 7 days
 
-        def _do(conn):
-            now = time.time()
-            result = conn.execute(
-                """
-                UPDATE sessions
-                SET ended_at = ?,
-                    end_reason = 'orphaned_compression'
-                WHERE api_call_count = 0
+        # The predicate, written once. It selects the victims and then, over
+        # exactly the ids the sweep is still allowed to touch, applies the
+        # close — rather than being a single set-based UPDATE that decides and
+        # writes in one statement with nowhere to put an admission.
+        _ORPHAN_PREDICATE = """
+                  api_call_count = 0
                   AND end_reason IS NULL
                   AND ended_at IS NULL
                   AND started_at < ?
@@ -8425,8 +10121,32 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                       SELECT 1 FROM messages m
                       WHERE m.session_id = sessions.id
                   )
+        """
+
+        def _do(conn):
+            now = time.time()
+            orphans = [
+                row["id"] for row in conn.execute(
+                    f"SELECT id FROM sessions WHERE {_ORPHAN_PREDICATE}",
+                    (cutoff,),
+                ).fetchall()
+            ]
+            # Repair is a SWEEP: its victims come from a predicate, so nobody
+            # could have held a grant naming them. Owned conversations are
+            # skipped in THIS transaction rather than failing the pass.
+            orphans = self._skip_leased_conversations(conn, orphans)[0]
+            if not orphans:
+                return 0
+            placeholders = ",".join("?" * len(orphans))
+            result = conn.execute(
+                f"""
+                UPDATE sessions
+                SET ended_at = ?,
+                    end_reason = 'orphaned_compression'
+                WHERE id IN ({placeholders})
+                  AND {_ORPHAN_PREDICATE}
                 """,
-                (now, cutoff),
+                (now, *orphans, cutoff),
             )
             return result.rowcount
 
@@ -8622,6 +10342,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         title: str,
         *,
         source: str,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> bool:
         """Write a title, enforcing provenance precedence.
 
@@ -8642,6 +10364,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         new_rank = self._title_rank(source) if not is_user else None
 
         def _do(conn):
+            self._check_session_flag_write(
+                conn, session_id, turn_lease_holder, turn_lease_ttl_seconds
+            )
             current = conn.execute(
                 "SELECT title, title_source FROM sessions WHERE id = ?",
                 (session_id,),
@@ -8702,7 +10427,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         rowcount = self._execute_write(_do)
         return rowcount > 0
 
-    def set_session_title(self, session_id: str, title: str) -> bool:
+    def set_session_title(
+        self,
+        session_id: str,
+        title: str,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> bool:
         """Set or update a session's title on the user's behalf.
 
         Returns True if session was found and title was set.
@@ -8714,7 +10445,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         the result. Automatic callers must use :meth:`set_auto_title`.
         """
         return self._set_session_title(
-            session_id, title, source=self.TITLE_SOURCE_USER
+            session_id, title, source=self.TITLE_SOURCE_USER,
+            turn_lease_holder=turn_lease_holder,
+            turn_lease_ttl_seconds=turn_lease_ttl_seconds,
         )
 
     def set_auto_title(self, session_id: str, title: str, *, source: str) -> bool:
@@ -8759,7 +10492,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return None
         return row["title_source"]
 
-    def set_session_title_source(self, session_id: str, source: str) -> bool:
+    def set_session_title_source(
+        self,
+        session_id: str,
+        source: str,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> bool:
         """Overwrite a title's provenance without touching the title text.
 
         Used when a title is carried across a session boundary (compression
@@ -8770,6 +10509,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             raise ValueError(f"invalid title source: {source!r}")
 
         def _do(conn):
+            self._check_session_flag_write(
+                conn, session_id, turn_lease_holder, turn_lease_ttl_seconds
+            )
             cursor = conn.execute(
                 "UPDATE sessions SET title_source = ? "
                 "WHERE id = ? AND title IS NOT NULL",
@@ -8779,7 +10521,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return self._execute_write(_do) > 0
 
-    def set_session_archived(self, session_id: str, archived: bool) -> bool:
+    def set_session_archived(
+        self,
+        session_id: str,
+        archived: bool,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> bool:
         """Archive or unarchive a session.
 
         Archived sessions are hidden from the default session list but keep all
@@ -8790,6 +10538,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         Returns True when at least one row was updated.
         """
         def _do(conn):
+            self._check_session_flag_write(
+                conn, session_id, turn_lease_holder, turn_lease_ttl_seconds
+            )
             cursor = conn.execute(
                 """
                 WITH RECURSIVE
@@ -8829,7 +10580,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         rowcount = self._execute_write(_do)
         return rowcount > 0
 
-    def set_session_pinned(self, session_id: str, pinned: bool) -> bool:
+    def set_session_pinned(
+        self,
+        session_id: str,
+        pinned: bool,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> bool:
         """Pin or unpin a session (and its whole compression lineage).
 
         ``pinned`` is a durable "keep" flag: pinned sessions are exempt from
@@ -8842,6 +10599,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         least one row changed.
         """
         def _do(conn):
+            self._check_session_flag_write(
+                conn, session_id, turn_lease_holder, turn_lease_ttl_seconds
+            )
             cursor = conn.execute(
                 """
                 WITH RECURSIVE
@@ -8881,7 +10641,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         rowcount = self._execute_write(_do)
         return rowcount > 0
 
-    def set_session_hidden(self, session_id: str, hidden: bool) -> bool:
+    def set_session_hidden(
+        self,
+        session_id: str,
+        hidden: bool,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> bool:
         """Hide or unhide a session (and its whole compression lineage).
 
         ``hidden`` is a generic "don't show in the global Sessions sidebar"
@@ -8896,6 +10662,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         changed.
         """
         def _do(conn):
+            self._check_session_flag_write(
+                conn, session_id, turn_lease_holder, turn_lease_ttl_seconds
+            )
             cursor = conn.execute(
                 """
                 WITH RECURSIVE
@@ -8935,7 +10704,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         rowcount = self._execute_write(_do)
         return rowcount > 0
 
-    def set_session_read(self, session_id: str, read: bool = True) -> bool:
+    def set_session_read(
+        self,
+        session_id: str,
+        read: bool = True,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> bool:
         """Mark a session read or unread (and its whole compression lineage).
 
         Read state is a watermark, not a flag: ``last_read_at`` records when
@@ -8956,6 +10731,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         holds. Returns True when at least one row changed.
         """
         def _do(conn):
+            self._check_session_flag_write(
+                conn, session_id, turn_lease_holder, turn_lease_ttl_seconds
+            )
             cursor = conn.execute(
                 """
                 WITH RECURSIVE
@@ -9703,6 +11481,165 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         )
         return None
 
+    def _refuse_before_side_effects(self, session_id: str, turn_lease_holder) -> None:
+        """Refuse a fenced write BEFORE its pre-transaction side effects.
+
+        ADVISORY, NEVER AUTHORITY. This reads outside the write transaction, so
+        its answer can be stale by the time the write would run.
+        :meth:`_check_turn_lease_guard` inside ``BEGIN IMMEDIATE`` remains the
+        only thing that admits anything; this can only refuse earlier. It is
+        deliberately incapable of admitting: returning normally means "no
+        finding", not "authorized".
+
+        WHY IT HAS TO EXIST
+            Three fenced methods run ``flush_token_counts()`` before their
+            write transaction, and they have to: a delta enqueued before a
+            model switch carries the PRE-switch route, and applying it after
+            the UPDATE trips ``update_token_counts``'s ``first_accounted_route``
+            branch and resurrects the old model. The flush cannot move inside
+            ``_do`` either — it drains a background writer that takes the write
+            lock itself, so an open ``BEGIN IMMEDIATE`` would deadlock against
+            it.
+
+            With the barrier before the guard, a REFUSED call had already
+            applied the queued deltas to the database and drained the in-process
+            queue. Measured: DB usage 0 -> 9, queue 1 -> 0, switch refused. A
+            caller that catches the refusal and reports "nothing happened" is
+            wrong twice, and the spent deltas were spent under the very route
+            the switch was refused from changing.
+
+        THE ONE COST, STATED
+            A lease released between this read and the write turns an
+            admissible call into a refused one. The window is a few
+            microseconds and it means a turn just ended; the alternative is
+            spending a caller's accounting on every refusal, which is not a
+            window but a certainty.
+        """
+        if not session_id:
+            return
+        try:
+            with self._read_ctx() as conn:
+                if turn_lease_holder:
+                    if self._authorize_turn_lease_token(
+                        conn, session_id, turn_lease_holder
+                    ) is not None:
+                        return
+                    detail = (
+                        f"Session turn lease lost; refusing context write "
+                        f"for {session_id!r}"
+                    )
+                else:
+                    conversation_id, lease = self._read_turn_lease_on_conn(
+                        conn, session_id
+                    )
+                    if lease is None or self._turn_lease_row_is_free(
+                        conversation_id, lease
+                    ):
+                        return
+                    detail = (
+                        f"Session turn lease held by {lease['holder']!r} "
+                        f"(epoch {lease['epoch']}); refusing unfenced write "
+                        f"for {session_id!r}"
+                    )
+        except sqlite3.Error:
+            # Cannot tell from out here. Say nothing: the in-transaction guard
+            # still runs and is the authority. A read failure must not admit
+            # what that guard would refuse, and it does not — it only forgoes
+            # refusing early, which costs the side effects and nothing else.
+            return
+        raise SessionTurnLeaseLostError(detail)
+
+    def _check_turn_lease_guard(
+        self,
+        conn,
+        session_id: str,
+        turn_lease_holder,
+        *,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> None:
+        """Admission for one context-bearing mutation, INSIDE the write txn.
+
+        Separated from the transcript-append guard so that every mutator can
+        reach the same decision — appends are not the only writes that change
+        what the next turn replays, and a rule only the append path can call
+        is a rule the other writers do not have.
+        """
+        if not turn_lease_holder:
+            # Admission when NOTHING is presented. This branch did not exist:
+            # the check was `if turn_lease_holder:`, so a writer that presented
+            # nothing was admitted unconditionally — including while another
+            # process demonstrably owned the conversation. Holderless writes
+            # stay legal on an unowned conversation (fresh sessions, imports,
+            # branch copies, single-writer installs); they are refused the
+            # moment a live owner exists.
+            conversation_id, lease = self._read_turn_lease_on_conn(conn, session_id)
+            if lease is not None and not self._turn_lease_row_is_free(
+                conversation_id, lease
+            ):
+                raise SessionTurnLeaseLostError(
+                    f"Session turn lease held by {lease['holder']!r} "
+                    f"(epoch {lease['epoch']}); refusing unfenced write for "
+                    f"{session_id!r}. A lease is now freed only by evidence — "
+                    f"the holder releasing, or the owner being provably gone — "
+                    f"so a crashed owner this host cannot probe stays held "
+                    f"until SessionDB.force_release_session_turn_lease("
+                    f"{session_id!r}) is run."
+                )
+        else:
+            authorized = self._authorize_turn_lease_token(
+                conn, session_id, turn_lease_holder
+            )
+            if authorized is None:
+                raise SessionTurnLeaseLostError(
+                    f"Session turn lease lost; refusing transcript write "
+                    f"for {session_id!r}"
+                )
+            conversation_id, _granted_epoch = authorized
+            lease = conn.execute(
+                f"SELECT {self._TURN_LEASE_COLUMNS} FROM session_turn_leases "
+                f"WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+            now = time.time()
+            if float(lease["expires_at"]) <= now:
+                # Expiry makes the row reclaimable; it does not prove that a
+                # takeover occurred. BEGIN IMMEDIATE serializes this renewal
+                # with acquisition, so a still-matching owner can recover from
+                # a starved refresher without weakening the foreign-holder fence.
+                conn.execute(
+                    "UPDATE session_turn_leases SET expires_at = ? "
+                    "WHERE conversation_id = ? AND holder = ? AND epoch = ?",
+                    (
+                        now + max(0.1, float(turn_lease_ttl_seconds)),
+                        conversation_id,
+                        str(turn_lease_holder),
+                        _granted_epoch,
+                    ),
+                )
+
+    def _check_session_flag_write(
+        self, conn, session_id, turn_lease_holder, turn_lease_ttl_seconds
+    ) -> None:
+        """Admission for the list-facing flags and the title pair.
+
+        These do not move a replay column, and it would be easy to call
+        them exempt on that ground. They are not, for one reason that is
+        checkable: ``archived`` is read by ``prune_sessions`` and
+        ``count_empty_sessions`` as a DO-NOT-COLLECT marker, so clearing it
+        on a live conversation hands that conversation to the next sweep.
+        A write that decides what a later delete may remove is a write
+        about the transcript, one step removed.
+
+        One helper rather than six copies so the six cannot drift, and so
+        there is a single seam a mutation row can name.
+        """
+        self._check_turn_lease_guard(
+            conn,
+            session_id,
+            turn_lease_holder,
+            turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+        )
+
     def _check_transcript_write_guards(
         self,
         conn,
@@ -9728,33 +11665,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # symptom family — turns dying as session_persistence_failed while a
         # slow provider summary held the lease (#74568, #77386), including
         # stale locks from dead PIDs blocking writes for the full TTL.
-        if turn_lease_holder:
-            conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
-            lease = conn.execute(
-                "SELECT holder, expires_at FROM session_turn_leases "
-                "WHERE conversation_id = ?",
-                (conversation_id,),
-            ).fetchone()
-            if lease is None or lease["holder"] != turn_lease_holder:
-                raise SessionTurnLeaseLostError(
-                    f"Session turn lease lost; refusing transcript write "
-                    f"for {session_id!r}"
-                )
-            now = time.time()
-            if float(lease["expires_at"]) <= now:
-                # Expiry makes the row reclaimable; it does not prove that a
-                # takeover occurred. BEGIN IMMEDIATE serializes this renewal
-                # with acquisition, so a still-matching owner can recover from
-                # a starved refresher without weakening the foreign-holder fence.
-                conn.execute(
-                    "UPDATE session_turn_leases SET expires_at = ? "
-                    "WHERE conversation_id = ? AND holder = ?",
-                    (
-                        now + max(0.1, float(turn_lease_ttl_seconds)),
-                        conversation_id,
-                        turn_lease_holder,
-                    ),
-                )
+        self._check_turn_lease_guard(
+            conn,
+            session_id,
+            turn_lease_holder,
+            turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+        )
         session = conn.execute(
             "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
             (session_id,),
@@ -10039,6 +11955,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     def set_latest_matching_message_display_kind(
         self, session_id: str, *, role: str, content: str, display_kind: str,
         display_metadata: Optional[Dict[str, Any]] = None,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> bool:
         """Stamp presentation metadata on this turn's freshly persisted row.
 
@@ -10046,11 +11964,35 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         CLI synthetic inputs call this immediately after their serial turn has
         flushed, preserving producer provenance without classifying by content
         during transcript rendering.
+
+        THAT LAST PARAGRAPH IS TRUE AND IT IS NOT THE WHOLE WRITE
+            ``display_metadata`` is the column reactions live in —
+            :data:`REACTIONS_METADATA_KEY` is a key inside it, chosen so
+            reactions survive rewind and compaction with the row — and the
+            statement below REPLACES the column rather than merging into it,
+            with the parameter defaulting to ``None`` (encoded: NULL).
+
+            So a stamp on a row carrying an unconsumed reaction deletes that
+            reaction, and the announcement the next turn was going to make is
+            gone with no error anywhere. That is model context, however the
+            write is described, and it takes the same admission as any other.
+            The one production call site already holds a grant; this closes the
+            mutator, which is what a second caller reaches.
         """
         if not session_id or not content or not display_kind:
             return False
 
         def _do(conn):
+            # display_metadata is where reactions live, and this statement
+            # REPLACES the column. A holderless stamp therefore deletes a
+            # pending announcement, which is model context however the
+            # docstring describes the write.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             row = conn.execute(
                 "SELECT id FROM messages WHERE session_id = ? AND role = ? "
                 "AND content = ? AND active = 1 ORDER BY id DESC LIMIT 1",
@@ -10082,6 +12024,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         emoji: Optional[str],
         *,
         author: str = "user",
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> Optional[List[Dict[str, Any]]]:
         """Set (or with ``emoji=None`` clear) *author*'s reaction on one message.
 
@@ -10094,6 +12038,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return None
 
         def _do(conn):
+            # A reaction PRODUCES consume-once model context:
+            # take_unseen_reactions injects it into exactly one later turn. So
+            # it is fenced like any other transcript mutation — including the
+            # row lookup, which must not resolve against a transcript that
+            # moves before the update lands.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             row = conn.execute(
                 "SELECT display_metadata FROM messages WHERE id = ? AND session_id = ?",
                 (message_row_id, session_id),
@@ -10160,7 +12115,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return [r for r in reactions if isinstance(r, dict)] if isinstance(reactions, list) else []
 
     def take_unseen_reactions(
-        self, session_id: str, *, author: str = "user"
+        self,
+        session_id: str,
+        *,
+        author: str = "user",
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> List[Dict[str, Any]]:
         """Return *author*'s not-yet-surfaced reactions and mark them seen.
 
@@ -10172,6 +12132,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return []
 
         def _do(conn):
+            # CONSUMPTION, not a read: the seen stamp means the announcement is
+            # delivered to exactly one turn. Taking it against a conversation
+            # somebody else owns hands their turn the note and leaves this one
+            # with nothing.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             rows = conn.execute(
                 "SELECT id, role, content, display_metadata FROM messages "
                 "WHERE session_id = ? AND active = 1 AND display_metadata IS NOT NULL "
@@ -10377,6 +12347,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         messages: List[Dict[str, Any]],
         active_only: bool = False,
         archive_dropped: bool = False,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> None:
         """Atomically replace the stored messages for a session.
 
@@ -10416,6 +12388,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         active_clause = " AND active = 1" if active_only else ""
 
         def _do(conn):
+            # /retry, /undo and /compress rewrite the transcript wholesale.
+            # Doing that under another process's turn is strictly worse than
+            # an interleaved append: it DELETEs or archives rows the owner is
+            # still building on. Fence it in the same transaction.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             session = conn.execute(
                 "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
                 (session_id,),
@@ -10496,6 +12478,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         model_config_patch: Optional[Dict[str, Any]] = None,
         watermark: Optional[int] = None,
         lock_holder: Optional[str] = None,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> int:
         """Non-destructive in-place compaction for a single durable session id.
 
@@ -10542,6 +12526,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
 
         def _do(conn):
+            # The compression lock stops two COMPRESSIONS colliding; it says
+            # nothing about who owns the TURN. A compaction rewrites the whole
+            # live history, so it takes the turn fence as well.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             if lock_holder is not None:
                 lock_row = conn.execute(
                     "SELECT holder, expires_at FROM compression_locks "
@@ -10651,7 +12644,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return cols
 
     def set_latest_user_api_content(
-        self, session_id: str, content: Any, api_content: str
+        self,
+        session_id: str,
+        content: Any,
+        api_content: str,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> int:
         """Backfill the ``api_content`` sidecar onto the newest ACTIVE user row.
 
@@ -10670,6 +12668,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         encoded = self._encode_content(content)
 
         def _do(conn):
+            # api_content IS the context: it is the exact bytes replayed to the
+            # provider. Rewriting it under a foreign owner silently changes
+            # what their next turn sends.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             cursor = conn.execute(
                 "UPDATE messages SET api_content = ? WHERE id = ("
                 "SELECT id FROM messages "
@@ -11489,7 +13496,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     # =========================================================================
 
     def rewind_to_message(
-        self, session_id: str, target_message_id: int
+        self,
+        session_id: str,
+        target_message_id: int,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> Dict[str, Any]:
         """Soft-delete all messages with id >= ``target_message_id`` in *session_id*.
 
@@ -11540,6 +13551,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         rewound: List[int] = []
 
         def _do(conn):
+            # /undo truncates the live transcript. Under a foreign owner that
+            # deletes the turn they are mid-way through building.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             cursor = conn.execute(
                 "SELECT id FROM messages "
                 "WHERE session_id = ? AND id >= ? AND active = 1",
@@ -11575,7 +13594,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             "new_head_id": new_head_id,
         }
 
-    def restore_rewound(self, session_id: str, since_message_id: int) -> int:
+    def restore_rewound(
+        self,
+        session_id: str,
+        since_message_id: int,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> int:
         """Mark inactive messages with id >= *since_message_id* active again.
 
         Returns the number of rows flipped back to ``active=1``.
@@ -11583,6 +13608,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         slash command in v1.
         """
         def _do(conn):
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             cursor = conn.execute(
                 "SELECT id FROM messages "
                 "WHERE session_id = ? AND id >= ? AND active = 0",
@@ -11889,9 +13920,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 continue
         return lineage if session_id in lineage else [session_id]
 
-    def clear_messages(self, session_id: str) -> None:
+    def clear_messages(
+        self,
+        session_id: str,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> None:
         """Delete all messages for a session and reset its counters."""
         def _do(conn):
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             conn.execute(
                 "DELETE FROM messages WHERE session_id = ?", (session_id,)
             )
@@ -11950,6 +13992,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         session_id: str,
         sessions_dir: Optional[Path] = None,
         expected_delete_ids: Optional[List[str]] = None,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> bool:
         """Delete a session and all its messages.
 
@@ -11973,11 +14017,38 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         )
 
         def _do(conn):
+            # Deletion is the most complete way to change what a later turn
+            # replays, so it takes the same admission as every other
+            # context-bearing mutation — in this transaction, not at whichever
+            # call sites happened to remember.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             cursor = conn.execute(
                 "SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (session_id,)
             )
             if cursor.fetchone() is None:
                 return False
+            # The rows this delete REACHES are separate conversations with
+            # separate leases — a grant on the parent authorizes nothing about
+            # them. Guarding only session_id fences the row the operator named
+            # and none of the rows it takes with it: the delegate cascade it
+            # deletes outright, and the direct children whose parent reference
+            # the SET NULL below severs. A branch child is its own lease root,
+            # so that statement was reaching into a live-owned conversation
+            # with no admission anywhere.
+            #
+            # Refuse rather than skip, unlike a sweep: the operator named one
+            # session, and a delete that removes the parent while leaving a
+            # live delegate behind is a partially applied destructive change.
+            # A sweep has no such contract to keep, which is why it may skip.
+            self._refuse_unless_reached_conversations_are_free(
+                conn, session_id,
+                f"refusing to delete {session_id!r}: it reaches",
+            )
             if expected_ids is not None:
                 actual_ids = {
                     session_id,
@@ -12008,6 +14079,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self,
         session_id: str,
         sessions_dir: Optional[Path] = None,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
     ) -> bool:
         """Delete *session_id* only when it never gained resumable content.
 
@@ -12022,8 +14095,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         children (delegate subagent runs) are preserved — a parent that
         spawned work is not "empty" even if its own transcript never
         flushed. Returns True if the session was deleted.
+
+        Emptiness is not an exemption from admission. This method carried none
+        at all, and the id it is handed by the CLI rotation path is routinely a
+        compression continuation, whose lease root is the PARENT — a
+        conversation a live turn can own while this row still looks disposable.
         """
         def _do(conn):
+            # An empty row is still a row inside somebody's conversation.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             cursor = conn.execute(
                 """
                 DELETE FROM sessions
@@ -12098,6 +14183,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 unique_ids,
             )
             existing = [row["id"] for row in cursor.fetchall()]
+            # Bulk delete is a SWEEP: the ids come from a multi-select in the
+            # dashboard, so no single grant a caller could hold covers them.
+            # Conversations a live turn owns are skipped rather than failing
+            # the whole batch.
+            existing, _owned = self._skip_leased_conversations(conn, existing)
             if not existing:
                 return 0
 
@@ -12196,6 +14286,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "AND archived = 0"
             )
             session_ids = {row["id"] for row in cursor.fetchall()}
+            # GC is a SWEEP — same rule as prune: skip the conversations a
+            # live turn owns rather than refusing the pass.
+            session_ids = set(
+                self._skip_leased_conversations(conn, sorted(session_ids))[0]
+            )
 
             if not session_ids:
                 return 0
@@ -12590,6 +14685,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 f"SELECT s.id FROM sessions s WHERE {where}", where_params
             )
             session_ids = {row["id"] for row in cursor.fetchall()}
+            # Prune is a SWEEP: its victims come from a filter, so nobody could
+            # have held a grant naming them. Owned conversations are skipped in
+            # THIS transaction using the same freeness predicate an acquirer
+            # faces, so prune can never delete a conversation an acquirer would
+            # have been refused.
+            session_ids = set(
+                self._skip_leased_conversations(conn, sorted(session_ids))[0]
+            )
 
             if not session_ids:
                 return 0
@@ -12652,15 +14755,29 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         def _find_affected(conn) -> List[int]:
             cursor = conn.execute(
-                "SELECT id, content FROM messages "
+                "SELECT id, session_id, content FROM messages "
                 "WHERE role = 'assistant' AND tool_calls IS NOT NULL AND tool_calls != ''"
             )
-            affected: List[int] = []
+            candidates: List[Tuple[int, str]] = []
             for row in cursor.fetchall():
                 content = row["content"]
                 if isinstance(content, str) and _STALE_TOOL_CALL_MARKER_RE.fullmatch(content.strip()):
-                    affected.append(row["id"])
-            return affected
+                    candidates.append((row["id"], row["session_id"]))
+            if not candidates:
+                return []
+            # This clears `content` IN PLACE across every session, so it is a
+            # SWEEP over conversations nobody named. Rows belonging to a
+            # conversation a live turn owns are left for the next pass: the
+            # repair is idempotent and already applied in memory on every
+            # load, so deferring it costs nothing.
+            allowed, _owned = self._skip_leased_conversations(
+                conn, sorted({sid for _rid, sid in candidates if sid})
+            )
+            allowed_sessions = set(allowed)
+            return [
+                rid for rid, sid in candidates
+                if not sid or sid in allowed_sessions
+            ]
 
         with self._read_ctx() as conn:
             affected_ids = _find_affected(conn)
@@ -12784,14 +14901,27 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return 0
 
         def _do(conn):
-            cursor = conn.execute(
-                "UPDATE sessions SET source = 'kanban' "
-                "WHERE source = 'cli' AND (cwd = ? OR cwd LIKE ? ESCAPE '\\')",
-                (prefix, _escape_like(prefix) + "/%"),
-            )
-            # Read rowcount before set_meta reuses this cursor for its INSERT,
-            # which would otherwise overwrite it with the meta write's count.
-            retagged = cursor.rowcount or 0
+            # A cwd-prefix retag is a SWEEP, same rule as backfill_repo_roots.
+            targets = [
+                row["id"] for row in conn.execute(
+                    "SELECT id FROM sessions "
+                    "WHERE source = 'cli' AND (cwd = ? OR cwd LIKE ? ESCAPE '\\')",
+                    (prefix, _escape_like(prefix) + "/%"),
+                ).fetchall()
+            ]
+            targets = self._skip_leased_conversations(conn, targets)[0]
+            cursor = conn.cursor()
+            retagged = 0
+            if targets:
+                placeholders = ",".join("?" * len(targets))
+                cursor.execute(
+                    f"UPDATE sessions SET source = 'kanban' "
+                    f"WHERE id IN ({placeholders})",
+                    targets,
+                )
+                # Read rowcount before set_meta reuses this cursor for its INSERT,
+                # which would otherwise overwrite it with the meta write's count.
+                retagged = cursor.rowcount or 0
             self.set_meta(gate, "1", cursor=cursor)
             return retagged
 
@@ -13566,13 +15696,26 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     # The CLI writes "pending" then poll-waits for terminal state. The gateway
     # watcher transitions pending→running→{completed,failed}.
 
-    def request_handoff(self, session_id: str, platform: str) -> bool:
+    def request_handoff(
+        self,
+        session_id: str,
+        platform: str,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> bool:
         """Mark a session as pending handoff to the given platform.
 
         Returns True if the row was found and not already in flight; False if
         the session is already in a non-terminal handoff state.
         """
         def _do(conn):
+            # Handoff state decides which platform drives this conversation next.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             cur = conn.execute(
                 "UPDATE sessions "
                 "SET handoff_state = 'pending', "
@@ -13626,9 +15769,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         except Exception:
             return []
 
-    def claim_handoff(self, session_id: str) -> bool:
+    def claim_handoff(
+        self,
+        session_id: str,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> bool:
         """Atomically transition pending → running. Returns True if claimed."""
         def _do(conn):
+            # Claiming a handoff takes the conversation onto another platform.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             cur = conn.execute(
                 "UPDATE sessions SET handoff_state = 'running' "
                 "WHERE id = ? AND handoff_state = 'pending'",
@@ -13637,9 +15792,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return cur.rowcount > 0
         return self._execute_write(_do)
 
-    def complete_handoff(self, session_id: str) -> None:
+    def complete_handoff(
+        self,
+        session_id: str,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> None:
         """Mark a handoff as completed."""
         def _do(conn):
+            # Completing a handoff releases the conversation to its new driver.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             conn.execute(
                 "UPDATE sessions SET handoff_state = 'completed', "
                 "handoff_error = NULL WHERE id = ?",
@@ -13647,9 +15814,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
         self._execute_write(_do)
 
-    def fail_handoff(self, session_id: str, error: str) -> None:
+    def fail_handoff(
+        self,
+        session_id: str,
+        error: str,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> None:
         """Mark a handoff as failed and record the reason."""
         def _do(conn):
+            # Failing a handoff writes the error the other platform reads.
+            self._check_turn_lease_guard(
+                conn,
+                session_id,
+                turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
             conn.execute(
                 "UPDATE sessions SET handoff_state = 'failed', "
                 "handoff_error = ? WHERE id = ?",

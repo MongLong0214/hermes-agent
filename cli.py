@@ -23,6 +23,7 @@ except ModuleNotFoundError:
     # means UTF-8 stdio setup is skipped on Windows; POSIX is unaffected.
     pass
 
+import contextlib
 import logging
 import copy
 import os
@@ -8707,11 +8708,29 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "api_mode": result.api_mode or None,
         }
         try:
-            db.update_session_model(sid, result.new_model)
+            # Both writes are fenced: model / model_config / system_prompt are
+            # what the next turn replays under. Reuse before acquire — a switch
+            # issued INSIDE a turn this process is running must present the
+            # turn's own grant, and `current_turn_grant` is None when nothing
+            # here owns the conversation, which is the case the fence admits
+            # holderless.
+            #
+            # The grant is passed ONLY when there is one. With no live grant
+            # the call is byte-identical to what it was, which matters because
+            # `db` here is duck-typed: the CLI is driven with stand-in objects
+            # that implement update_session_model(sid, model) and nothing else,
+            # and an unexpected keyword would land in the `except Exception`
+            # below as a silent no-persist.
+            _grant = None
+            _reuse = getattr(db, "current_turn_grant", None)
+            if callable(_reuse):
+                _grant = _reuse(sid)
+            _fence = {"turn_lease_holder": _grant} if _grant is not None else {}
+            db.update_session_model(sid, result.new_model, **_fence)
             db.patch_session_model_config(sid, {
                 "gateway_runtime": route,
                 **route,
-            })
+            }, **_fence)
         except Exception:
             logger.debug(
                 "Failed to persist model switch to session DB", exc_info=True
@@ -10238,11 +10257,24 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     self.session_id, limit=max(turns_undone, 10)
                 )
                 if recents:
+                    from hermes_state import make_turn_lease_holder
+
                     target_idx = min(turns_undone - 1, len(recents) - 1)
                     target_id = recents[target_idx]["id"]
-                    result = self._session_db.rewind_to_message(
-                        self.session_id, target_id
-                    )
+                    # /undo truncates the durable transcript. When a gateway
+                    # or another CLI owns this conversation's turn, take the
+                    # lease rather than soft-deleting rows out from under it.
+                    with self._session_db.session_turn_lease(
+                        self.session_id,
+                        make_turn_lease_holder("cli-undo"),
+                        ttl_seconds=60.0,
+                        reload_messages=False,
+                    ) as lease:
+                        result = self._session_db.rewind_to_message(
+                            lease.session_id,
+                            target_id,
+                            turn_lease_holder=lease.token,
+                        )
                     rewound_rows = result.get("rewound_count", 0)
                     # Prefer the DB's decoded target text for the prefill —
                     # it's the canonical persisted copy.
@@ -13171,7 +13203,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if db is None or not session_key or session_key == "default":
             return
         try:
-            db.set_session_yolo(session_key, enabled)
+            # Fenced: the flag rides in model_config, which the next turn
+            # replays whole. /yolo can be typed mid-turn — present the grant.
+            from hermes_state import turn_grant_kwargs
+
+            db.set_session_yolo(
+                session_key, enabled,
+                **turn_grant_kwargs(db, session_key),
+            )
         except Exception:
             pass
 
@@ -13272,7 +13311,75 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return
 
         original_count = len(self.conversation_history)
-        with self._busy_command("Compressing context...", blocks_input=False):
+
+        # PRE-DISPATCH FENCE (blocker (g)).
+        #
+        # The turn fence is enforced at ROTATION -- publish_compression_child --
+        # which runs after `_compress_context` has already called the provider.
+        # So on a conversation another process owns, the sequence was:
+        # summarise (real tokens, real latency) -> publish -> refused. The work
+        # is spent to produce a value that cannot be stored, and the failure
+        # arrives at the end, which is where a caller is most likely to write
+        # something else instead.
+        #
+        # Reuse before acquire, in that order. A /compress issued INSIDE a turn
+        # this process is running must present the turn's own grant: acquiring
+        # there waits for itself and then refuses, on every in-turn call. That
+        # is `current_turn_grant`, the same shape tools/react_to_message_tool.py
+        # uses.
+        _fence = contextlib.ExitStack()
+        _db = getattr(self, "_session_db", None)
+        if _db is not None and self.session_id:
+            from hermes_state import (
+                SessionTurnLeaseLostError as _CompressLeaseLost,
+                make_turn_lease_holder as _compress_lease_holder,
+            )
+            if _db.current_turn_grant(self.session_id) is None:
+                try:
+                    _scope = _fence.enter_context(_db.session_turn_lease(
+                        self.session_id,
+                        _compress_lease_holder("cli-manual-compress"),
+                        ttl_seconds=300.0,
+                        # NOT the class-wide ALTERNATE_WRITER_LEASE_WAIT_S of
+                        # 10s. This call site has a human waiting at a prompt
+                        # with no output, and /compress is idempotent and
+                        # retryable, so ten seconds of silence reads as a hang
+                        # and buys nothing a retry does not. Long enough to ride
+                        # out a gateway mirror's write, short enough to answer.
+                        wait_seconds=2.0,
+                        reload_messages=False,
+                    ))
+                except _CompressLeaseLost:
+                    print(
+                        "(._.) Another process is running a turn on this "
+                        "conversation, so /compress would summarise it and "
+                        "then be refused when it tried to store the result. "
+                        "Nothing was sent to the model. Try again once that "
+                        "turn finishes, or free the conversation with "
+                        "SessionDB.force_release_session_turn_lease() if you "
+                        "know the owner is gone."
+                    )
+                    return
+                # What is true AFTER acquisition. Compressing the in-memory
+                # history against a conversation that rotated while we waited
+                # would summarise a transcript that is no longer the live one
+                # and publish the child onto the wrong segment. There is no
+                # recovery here that is better than not doing it: the caller
+                # still has its input.
+                if _scope.session_id != self.session_id:
+                    _fence.close()
+                    print(
+                        "(._.) This conversation rotated onto "
+                        f"{_scope.session_id} while /compress waited for the "
+                        "lease, so the history in this session is no longer "
+                        "the live one. Nothing was sent to the model; "
+                        "run /compress again."
+                    )
+                    return
+
+        with _fence, self._busy_command(
+            "Compressing context...", blocks_input=False
+        ):
             try:
                 from agent.model_metadata import estimate_request_tokens_rough
                 from agent.manual_compression_feedback import summarize_manual_compression
@@ -20695,12 +20802,39 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 if getattr(self, '_delete_session_on_exit', False):
                     try:
                         from hermes_constants import get_hermes_home as _ghh
+                        from hermes_state import (
+                            SessionTurnLeaseLostError as _LeaseLostError,
+                            make_turn_lease_holder as _make_lease_holder,
+                        )
                         _sessions_dir = _ghh() / "sessions"
                         _sid = self.agent.session_id
-                        if self._session_db.delete_session(_sid, sessions_dir=_sessions_dir):
-                            _cprint(f"  {_DIM}✓ Session {_escape(_sid)} deleted{_RST}")
+                        try:
+                            # A gateway/ACP writer can still be persisting a turn
+                            # into this conversation; deleting under it destroys a
+                            # transcript mid-write. The lease fences the delete —
+                            # the id stays the one the operator asked to drop.
+                            with self._session_db.session_turn_lease(
+                                _sid,
+                                _make_lease_holder("cli-exit-delete"),
+                                ttl_seconds=30.0,
+                                reload_messages=False,
+                            ) as _lease:
+                                _deleted = self._session_db.delete_session(
+                                    _sid,
+                                    sessions_dir=_sessions_dir,
+                                    turn_lease_holder=_lease.token,
+                                )
+                        except _LeaseLostError:
+                            _cprint(
+                                f"  {_DIM}✗ Session {_escape(_sid)} not deleted — "
+                                f"another process is running a turn on this "
+                                f"conversation{_RST}"
+                            )
                         else:
-                            _cprint(f"  {_DIM}✗ Session {_escape(_sid)} not found for deletion{_RST}")
+                            if _deleted:
+                                _cprint(f"  {_DIM}✓ Session {_escape(_sid)} deleted{_RST}")
+                            else:
+                                _cprint(f"  {_DIM}✗ Session {_escape(_sid)} not found for deletion{_RST}")
                     except (Exception, KeyboardInterrupt) as e:
                         logger.debug("Could not delete session on exit: %s", e)
             # Plugin hook: on_session_end — safety net for interrupted exits.

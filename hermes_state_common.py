@@ -302,7 +302,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
     )
 
 
-SCHEMA_VERSION = 26
+SCHEMA_VERSION = 27
 
 
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
@@ -476,11 +476,25 @@ CREATE TABLE IF NOT EXISTS compression_locks (
     expires_at REAL NOT NULL
 );
 
+-- The row OUTLIVES release: releasing sets ``holder = ''`` and KEEPS ``epoch``.
+-- That is what makes the generation monotonic across release/re-acquire, which
+-- is what stops a holder string from being replayed — the same string can own
+-- generation N and be stale at N+1.
+--
+-- ``epoch`` is NOT NULL with NO DEFAULT on purpose: a build that predates the
+-- generation writes four columns, and that INSERT must fail rather than land a
+-- row no current writer can validate.
+--
+-- ``owner_pid`` / ``owner_pid_start`` record WHICH process holds it, so who is
+-- alive is a question about the OS rather than about the clock.
 CREATE TABLE IF NOT EXISTS session_turn_leases (
     conversation_id TEXT PRIMARY KEY,
     holder TEXT NOT NULL,
     acquired_at REAL NOT NULL,
-    expires_at REAL NOT NULL
+    expires_at REAL NOT NULL,
+    epoch INTEGER NOT NULL,
+    owner_pid INTEGER,
+    owner_pid_start REAL
 );
 
 CREATE TABLE IF NOT EXISTS async_delegations (
@@ -501,7 +515,19 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     owner_started_at INTEGER,
     task_json TEXT,
     delivery_claim TEXT,
-    delivery_claimed_at REAL
+    delivery_claimed_at REAL,
+    -- Raw api_server session id (X-Hermes-Session-Id) of the ORIGINATING
+    -- request — the wake self-post target. Without it, completions recovered
+    -- after a process restart are unroutable on api_server (the in-memory
+    -- record that carried it is gone).
+    --
+    -- Declared HERE rather than ALTERed in by tools/async_delegation, which is
+    -- where it used to live. That module no longer opens a connection of its
+    -- own — its writes run on SessionDB's transaction so the generation
+    -- barrier can cover `async_delegations` — and a module with no connection
+    -- has no place to run DDL. SCHEMA_SQL is the single source of truth for
+    -- the shape, and _reconcile_columns ADDs this to a store that predates it.
+    origin_session_id TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
@@ -774,3 +800,161 @@ AFTER UPDATE OF content, tool_name, tool_calls ON messages BEGIN
     );
 END;
 """
+
+
+# ---------------------------------------------------------------------------
+# Turn-fence generation barrier
+# ---------------------------------------------------------------------------
+#
+# Blocker (b). Every other part of the turn fence lives in Python: a process
+# running an older build of this package does not execute any of it, and the
+# schema has nothing to say about a holderless `INSERT INTO messages`. The base
+# binary at 261a4efb can open a store this generation created, append to a
+# conversation this generation holds the lease on, and be told nothing.
+#
+# The one thing both binaries share is the database file. A trigger on
+# `messages` whose body calls an application-defined function makes "did this
+# connection register the function" a precondition of the STATEMENT: SQLite
+# resolves the trigger program when it prepares the write, so a connection that
+# did not register it fails with `no such function` before a row is touched.
+# Registration happens in this package's connect path, so "this generation" is
+# exactly the set of processes allowed to write the transcript.
+#
+# THE CEILING, STATED SO NOBODY MISTAKES IT FOR A SECURITY BOUNDARY
+#   It stops an OLD BINARY. It does not stop an adversary, and it is not meant
+#   to: anything with a write handle to the file can `DROP TRIGGER
+#   hermes_turn_fence_messages_insert`, or register a function of the same name
+#   and be admitted. Both are one statement. What the trigger buys is that
+#   neither happens BY ACCIDENT — an old build does not drop triggers it has
+#   never heard of, and does not register a function that did not exist when it
+#   was written. It converts silent transcript interleaving into a loud
+#   OperationalError at the writer.
+#
+# THE ROLLBACK COST
+#   Downgrading is no longer partial. Once a store has these triggers, a binary
+#   from before this change cannot write `messages` AT ALL — not the transcript,
+#   and not `_init_schema`'s `UPDATE messages SET active = 1 WHERE active IS
+#   NULL`, so it cannot even complete a writable open. Recovering an old binary
+#   on a v27 store means dropping the three triggers by hand. That is the price
+#   of the guarantee and it should be weighed before shipping, not after: the
+#   alternative on offer was a fence that an old build walks straight past.
+TURN_FENCE_FUNCTION_NAME = "hermes_turn_fence_generation"
+
+#: Bumped only when an older build must be locked out again. The value is
+#: returned to the trigger and otherwise unused — presence of the function, not
+#: its result, is what admits the write.
+TURN_FENCE_GENERATION = 1
+
+#: Every ``(table, operation)`` the barrier covers.
+#:
+#: `messages` alone was not enough and the gap was not theoretical: the exact
+#: binary at the base commit ran end_session, update_session_model,
+#: update_system_prompt, set_session_title, patch_session_model_config,
+#: promote_to_session_reset and create_session against a conversation this
+#: generation held the lease on, unrefused, because not one of them touches the
+#: transcript. The model, the system prompt, the title and the end state all
+#: live in `sessions`, and the next turn replays under all four.
+#:
+#: `session_turn_leases` is here because a writer that can free the fence can
+#: defeat it. It is fenced for DELETE as well as INSERT/UPDATE even though no
+#: code path deletes a lease row: the surface is about what a FOREIGN writer
+#: can do, and "we never do it" is not "it cannot be done".
+#:
+#: THE FIVE ADJUNCT TABLES, AND WHY `messages` + `sessions` WAS STILL TOO NARROW
+#: A foreign `sqlite3.connect` with no generation function, against a store this
+#: generation created while a conversation was LIVE-OWNED, wrote every one of
+#: them unrefused. The one that is not bookkeeping:
+#:
+#:     owner prompt BEFORE : "THE PROMPT THE TURN IS REPLAYING"  hash 4e9cbc79…
+#:     owner prompt AFTER  : None                                hash 4e9cbc79…
+#:
+#: `DELETE FROM system_prompts` names neither `sessions` nor `messages`, so no
+#: trigger prepared against it. It removes the BYTES and leaves
+#: `sessions.system_prompt_hash` pointing at them — this schema DECLARES that
+#: reference, and a raw connection has `PRAGMA foreign_keys` off — so the next
+#: turn resolves its prompt through the LEFT JOIN, gets NULL, and resumes with
+#: no system prompt. Nothing raises anywhere. That is a provider-visible context
+#: integrity defect, not a residual.
+#:
+#: `session_model_usage` carries the accounting the turn is billed and routed
+#: on; `gateway_routing` decides which conversation a platform reply lands in;
+#: `compression_locks` is the publication authority for a compression segment;
+#: `async_delegations.delivery_state` / `delivery_claim` decide who may deliver
+#: a subagent's result back into a turn. Each one is written INSIDE a
+#: transaction that consults the turn-lease admission, which is the property the
+#: derivation is keyed on — see below.
+#:
+#: `async_delegations` is on this list ONLY because `tools/async_delegation`
+#: stopped opening its own connection. While it held one, adding the table here
+#: broke that module's own writes with `no such function:
+#: hermes_turn_fence_generation` — the trigger correctly reporting a writer
+#: outside the generation it claimed. The fix was to move the connection onto
+#: SessionDB.write_transaction, NOT to register the marker on the raw handle:
+#: the marker proves "current generation" and nothing else — not root, not
+#: holder, not epoch — so minting it in a production writer opens a second
+#: admitted door around the token validator.
+#:
+#: This is a DECLARATION, not the decision. tests/state/test_turn_fence_surface
+#: derives the same set from source — every table production writes inside a
+#: transaction that consults the canonical turn-lease admission, seeded on the
+#: refusal `SessionTurnLeaseLostError` rather than on any table name — and fails
+#: when the two differ in either direction. The list is checked; it is not
+#: maintained by hand and trusted.
+TURN_FENCE_SURFACE = tuple(
+    (table, operation)
+    for table in (
+        "messages",
+        "sessions",
+        "session_turn_leases",
+        "system_prompts",
+        "session_model_usage",
+        "gateway_routing",
+        "compression_locks",
+        "async_delegations",
+    )
+    # ALL THREE, on every table, always. The surface is about what a FOREIGN
+    # writer can do, and "no code path of ours deletes a lease row" is not "a
+    # lease row cannot be deleted": a fence keyed per operation is a fence with
+    # the other doors open.
+    for operation in ("INSERT", "UPDATE", "DELETE")
+)
+
+
+def turn_fence_trigger_name(table: str, operation: str) -> str:
+    """The trigger that fences one ``(table, operation)`` pair."""
+    return f"hermes_turn_fence_{table}_{operation.lower()}"
+
+
+TURN_FENCE_TRIGGERS = tuple(
+    turn_fence_trigger_name(table, operation)
+    for table, operation in TURN_FENCE_SURFACE
+)
+
+TURN_FENCE_TRIGGER_SQL = "\n".join(
+    f"CREATE TRIGGER IF NOT EXISTS "
+    f"{turn_fence_trigger_name(table, operation)}\n"
+    f"BEFORE {operation} ON {table} BEGIN\n"
+    f"    SELECT {TURN_FENCE_FUNCTION_NAME}();\n"
+    f"END;\n"
+    for table, operation in TURN_FENCE_SURFACE
+)
+
+
+def register_turn_fence_function(conn) -> None:
+    """Register the generation marker on *conn*; never raises.
+
+    Called on EVERY connection this package opens, read-only ones included, and
+    before any schema work — ``_init_schema`` itself writes ``messages``, so a
+    connection that gets the function later cannot finish opening the store.
+
+    Failure is swallowed on purpose. ``create_function`` is missing only on a
+    Python whose sqlite3 module is stripped, and on such a host the triggers
+    cannot have been created either (the same connection would have failed to
+    write them), so nothing is being weakened that was ever in place.
+    """
+    try:
+        conn.create_function(
+            TURN_FENCE_FUNCTION_NAME, 0, lambda: TURN_FENCE_GENERATION
+        )
+    except Exception:  # pragma: no cover - stripped sqlite3 build
+        pass

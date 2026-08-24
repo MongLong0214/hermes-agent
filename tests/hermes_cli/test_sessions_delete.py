@@ -1,4 +1,6 @@
+import contextlib
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,6 +15,15 @@ def test_sessions_delete_accepts_unique_id_prefix(monkeypatch, capsys):
         def resolve_session_id(self, session_id):
             captured["resolved_from"] = session_id
             return "20260315_092437_c9a6ff"
+
+        # `sessions delete` now takes the conversation's turn lease around the
+        # delete, so the stub has to offer one. Recording the id it was asked to
+        # lease is the point: leasing a DIFFERENT conversation than the one being
+        # deleted would fence nothing, and this is the only place that shows it.
+        @contextlib.contextmanager
+        def session_turn_lease(self, session_id, holder, **kwargs):
+            captured["leased"] = session_id
+            yield SimpleNamespace(token=holder, session_id=session_id, messages=[])
 
         def delete_session(self, session_id, **kwargs):
             captured["deleted"] = session_id
@@ -33,6 +44,7 @@ def test_sessions_delete_accepts_unique_id_prefix(monkeypatch, capsys):
     output = capsys.readouterr().out
     assert captured == {
         "resolved_from": "20260315_092437_c9a6",
+        "leased": "20260315_092437_c9a6ff",
         "deleted": "20260315_092437_c9a6ff",
         "closed": True,
     }

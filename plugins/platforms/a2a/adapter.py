@@ -838,11 +838,30 @@ class A2AAdapter(BasePlatformAdapter):
         db = self._profile_state_db(profile)
         if not db or not os.path.exists(db) or not session_id:
             return
+        # Routed through SessionDB rather than a raw handle, and NOT by
+        # registering the generation marker on one.
+        #
+        # The marker only says "current generation". It says nothing about the
+        # conversation root, the holder, or the epoch, so it is not authority to
+        # mutate a live-owned conversation — and the whole point of the barrier
+        # is that whoever can mint the marker walks past it. Minting it on a raw
+        # production writer would open a second admitted door around the token
+        # validator, which is the original defect performed deliberately.
+        # SessionDB is the one minter; going through it is the only way this
+        # write is on the right side of that line.
+        #
+        # What this does NOT claim: `set_session_title` is not turn-lease
+        # guarded (it writes no transcript row, so it is outside the derived
+        # context-bearing set). This change moves the write onto the canonical
+        # transaction; it does not give the title a fence it never had.
         try:
-            con = sqlite3.connect(db, timeout=5)
-            con.execute("UPDATE sessions SET title = ? WHERE id = ?", (title, session_id))
-            con.commit()
-            con.close()
+            from hermes_state import SessionDB
+
+            store = SessionDB(db)
+            try:
+                store.set_session_title(session_id, title)
+            finally:
+                store.close()
         except Exception:
             logger.debug("A2A: could not title forwarded session", exc_info=True)
 
