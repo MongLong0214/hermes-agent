@@ -4959,7 +4959,16 @@ SOURCE_MUTATIONS = (
              '        reason=DISQUALIFICATION_REASONS["unknown"],\n'
              '    )\n',
         replace="    return None\n",
-        kills_by="the verb SUCCEEDED in place on the",
+        # A LEFTOVER RESERVED SIDECAR NOW MAKES EVERY RUN'S CLI EXIT CODE
+        # NON-ZERO, EVEN A COMMITTED ONE -- there is no atomic check-and-
+        # delete on this platform, so a reserved placeholder always survives
+        # release and the CLI reports `ok: false, reason: residue-not-
+        # removed`. That masks THIS mutation from the `rc not in (0, None)`
+        # assertion: rc is non-zero either way. The very next assertion still
+        # catches it, and more precisely — `changed` is a direct claim that
+        # the DDL actually ran, which is exactly what this mutation lets
+        # happen on the "offline-authority-unknown" (ordinary, idle) target.
+        kills_by="refusal claims it changed the store",
         why="SECOND CONJUNCT: NO in-place run succeeds. The other row collapses "
             "the four reasons into one, which leaves every target still "
             "refused; this one lets an ordinary idle store through, which is "

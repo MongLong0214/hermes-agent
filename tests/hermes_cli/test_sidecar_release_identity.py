@@ -585,7 +585,7 @@ SOURCE_MUTATIONS = (
         replace=_REINTRODUCE_UNLINK_REPLACE,
         why=_REINTRODUCE_UNLINK_WHY + ", including a stranger's file that "
             "arrived in the close-to-check window",
-        kills_by="the swapped-in stranger did not survive the release",
+        kills_by="the release called os.unlink",
     ),
     Mutation(
         pin="check_a_same_inode_swap_after_close_is_never_deleted",
