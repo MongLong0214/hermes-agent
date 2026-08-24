@@ -1387,22 +1387,20 @@ class _AcquiredDestinations:
         """
         member = self._member(suffix)
         identity = self.identities.get(suffix)
-        handle = self.handles.pop(suffix, None)
-        if handle is not None:
-            try:
-                os.close(handle)
-            except OSError:  # pragma: no cover - already closed
-                pass
         try:
-            info = os.lstat(member)
+            info = self._identity_check_target(suffix, member)
         except FileNotFoundError:
+            self._close_handle(suffix)
             self.identities.pop(suffix, None)
             return None
         except OSError as exc:
+            self._close_handle(suffix)
             return {"path": str(member), "files": 1,
                     "error": f"{type(exc).__name__}: {exc}"}
         if identity is not None and (info.st_dev, info.st_ino) != identity:
+            self._close_handle(suffix)
             return {"path": str(member), "files": 1, "error": "ownership-lost"}
+        self._close_handle(suffix)
         try:
             os.unlink(member)
         except OSError as exc:
@@ -1410,6 +1408,34 @@ class _AcquiredDestinations:
                     "error": f"{type(exc).__name__}: {exc}"}
         self.identities.pop(suffix, None)
         return None
+
+    def _identity_check_target(self, suffix: str, member: Path):
+        """``lstat`` *member* while this run's descriptor still pins the inode.
+
+        Must be called before ``_close_handle``. An inode NUMBER is not an
+        identity — it is an index the kernel is free to hand to the next file
+        created at this name once nothing refers to it. The descriptor opened
+        in ``acquire`` is what refers to it, so the comparison against
+        ``self.identities[suffix]`` is only sound while that descriptor is
+        still open.
+        """
+        return os.lstat(member)
+
+    def _close_handle(self, suffix: str) -> None:
+        """Close this name's descriptor. Call only AFTER the identity check.
+
+        The descriptor is a different resource from the name — closing it
+        does not by itself give up the name's ownership — but it must not
+        happen before ``_identity_check_target`` or the inode number it just
+        released may already belong to a stranger's file by the time the
+        comparison runs.
+        """
+        handle = self.handles.pop(suffix, None)
+        if handle is not None:
+            try:
+                os.close(handle)
+            except OSError:  # pragma: no cover - already closed
+                pass
 
     def close(self) -> None:
         for suffix in list(self.handles):
