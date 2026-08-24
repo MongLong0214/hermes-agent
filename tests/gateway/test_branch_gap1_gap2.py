@@ -25,6 +25,7 @@ trace (not even a log line) and the command still returns its normal
 from __future__ import annotations
 
 import logging
+import sqlite3
 import unittest.mock as mock
 
 import pytest
@@ -33,7 +34,7 @@ from agent.i18n import t
 from gateway.config import GatewayConfig, Platform
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource, SessionStore
-from hermes_state import AsyncSessionDB, PartialBatchInsertError
+from hermes_state import AsyncSessionDB, PartialBatchInsertError, SessionDB
 
 
 @pytest.fixture()
@@ -404,8 +405,174 @@ class TestBranchGap3ChunkedPartialCopyCount:
             f"partial copy (2/3 landed) was reported with the same harsh "
             f"note as a total failure: {result!r}"
         )
-        milder_note = t("gateway.branch.incomplete_copy_partial", count=2)
+        # The note's saved-count must be driven by copied_rows (the real
+        # committed count, 3) -- NOT by re-deriving a user-only msg_count
+        # from the committed prefix (which happens to be 2 here, since only
+        # 2 of the 3 committed rows are user-role). Asserting count=2 here
+        # was itself the gap-A bug baked into the test: it locked in
+        # "report the user-filtered count" as correct behavior, when the
+        # actually-durable count is 3.
+        milder_note = t("gateway.branch.incomplete_copy_partial", count=3)
         assert milder_note in result, (
-            f"expected the milder partial-copy note {milder_note!r} in the "
-            f"response, got: {result!r}"
+            f"expected the milder partial-copy note to report the real "
+            f"committed row count (3, from copied_rows) rather than the "
+            f"re-derived user-only msg_count (2), got: {result!r}"
         )
+
+    @pytest.mark.asyncio
+    async def test_partial_copy_with_zero_user_rows_among_committed_is_still_partial(
+        self, store, caplog
+    ):
+        """A committed chunk made entirely of non-user rows must still be
+        classified as a partial success (not a total failure), and the
+        note's saved-count must be the real committed count.
+
+        Before the gap-A fix, ``copy_partial``/``copy_total_failure`` were
+        decided from ``msg_count`` (re-filtered to user-role rows only from
+        the committed prefix), not from ``copied_rows`` (the real committed
+        count). If the committed prefix happens to contain zero user-role
+        rows, msg_count comes out 0 even though rows really landed -- and
+        the old code misreported that as a total failure.
+        """
+        source = _make_source()
+        parent_entry = store.get_or_create_session(source)
+        # The committed prefix (first 3 rows, per PartialBatchInsertError
+        # (inserted=3, ...) below) is entirely assistant-role -- zero
+        # user-role rows among what actually landed.
+        store._db.append_message(parent_entry.session_id, role="assistant", content="a1")
+        store._db.append_message(parent_entry.session_id, role="assistant", content="a2")
+        store._db.append_message(parent_entry.session_id, role="assistant", content="a3")
+        store._db.append_message(parent_entry.session_id, role="user", content="m1")
+
+        runner = _make_branch_runner(store)
+
+        real_create_session = store._db.create_session
+        captured: dict[str, str] = {}
+
+        def _capture_create(session_id, source, **kwargs):
+            captured["id"] = session_id
+            return real_create_session(session_id, source, **kwargs)
+
+        def _partial_copy(*args, **kwargs):
+            raise PartialBatchInsertError(3, RuntimeError("simulated later-chunk failure"))
+
+        with mock.patch.object(
+            store._db, "create_session", side_effect=_capture_create
+        ), mock.patch.object(
+            store._db, "append_messages_batch", side_effect=_partial_copy
+        ):
+            with caplog.at_level(logging.ERROR, logger="gateway.run"):
+                result = await runner._handle_branch_command(_make_event("/branch zerouserbranch"))
+
+        new_session_id = captured["id"]
+        assert new_session_id, "create_session was never called"
+
+        # 3 rows actually committed (all assistant-role) -- must be
+        # reported as a partial success using the milder note, NOT the
+        # harsh total-failure note.
+        harsh_note = t("gateway.branch.incomplete_copy")
+        assert harsh_note not in result, (
+            f"3 rows actually committed (copied_rows=3) but were reported "
+            f"with the harsh total-failure note, as if nothing landed: "
+            f"{result!r}"
+        )
+        milder_note = t("gateway.branch.incomplete_copy_partial", count=3)
+        assert milder_note in result, (
+            f"expected the milder partial-copy note reporting the real "
+            f"committed count (3), got: {result!r}"
+        )
+        assert new_session_id in result
+
+
+class TestBranchGap5RealChunkedCopyPersistence:
+    """The partial-copy count must reflect what is REALLY durable in the
+    child session's DB, proven end-to-end -- not just whatever count a
+    mocked ``append_messages_batch``/``PartialBatchInsertError`` happens to
+    claim. A real (non-mocked) chunk boundary against a real (temp) SQLite
+    DB closes a gap a fully-mocked test can't: an implementation that just
+    trusts the claimed ``inserted`` count without it actually matching what
+    landed would still pass a mocked-exception test, but not this one.
+    """
+
+    @pytest.mark.asyncio
+    async def test_real_second_chunk_failure_persists_exactly_the_first_chunk(
+        self, store, caplog
+    ):
+        source = _make_source()
+        parent_entry = store.get_or_create_session(source)
+
+        # Real chunk size used by the production code (see
+        # gateway/slash_commands.py's append_messages_batch(..., chunk_rows=500)
+        # call). Two full chunks worth + a partial third chunk's start, so
+        # the failure below lands inside the SECOND real chunk.
+        chunk_rows = 500
+        total = chunk_rows + 251
+        # Alternating user/assistant roles -- load_transcript() runs
+        # repair_message_sequence() over the loaded history, which collapses
+        # consecutive same-role rows as alternation violations. A history of
+        # all-user rows would get merged down to a single turn before the
+        # branch copy ever sees it, defeating the >500-row real-chunk setup
+        # this test needs.
+        history_msgs = [
+            {"role": "user" if i % 2 == 0 else "assistant", "content": f"m{i}"}
+            for i in range(total)
+        ]
+        # Real (unchunked) write to seed the parent's history -- fixture
+        # setup, not the mechanism under test.
+        store._db.append_messages_batch(parent_entry.session_id, history_msgs)
+
+        real_insert = SessionDB._insert_message_rows
+        calls = {"n": 0}
+
+        def flaky_insert(self_db, conn, session_id, messages):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise sqlite3.OperationalError("simulated real second-chunk failure")
+            return real_insert(self_db, conn, session_id, messages)
+
+        runner = _make_branch_runner(store)
+
+        real_create_session = store._db.create_session
+        captured: dict[str, str] = {}
+
+        def _capture_create(session_id, source, **kwargs):
+            captured["id"] = session_id
+            return real_create_session(session_id, source, **kwargs)
+
+        with mock.patch.object(
+            store._db, "create_session", side_effect=_capture_create
+        ), mock.patch.object(
+            SessionDB, "_insert_message_rows", flaky_insert
+        ):
+            with caplog.at_level(logging.ERROR, logger="gateway.run"):
+                result = await runner._handle_branch_command(_make_event("/branch realchunk"))
+
+        new_session_id = captured["id"]
+        assert new_session_id, "create_session was never called"
+
+        # (a) the child DB's ACTUAL durable row count -- queried directly
+        # from state.db, not trusted from whatever the exception claims --
+        # must be exactly the first real chunk (chunk_rows rows). Nothing
+        # here mocks append_messages_batch itself; the failure is injected
+        # one layer below inside a real transaction, so a broken
+        # implementation that just trusts a claimed count without it
+        # actually being backed by real commits cannot pass this by luck.
+        real_row_count = len(store._db.get_messages(new_session_id))
+        assert real_row_count == chunk_rows, (
+            f"expected exactly the first real chunk ({chunk_rows} rows) to "
+            f"be durably committed to the child session's DB, found "
+            f"{real_row_count}"
+        )
+
+        # (b) the response text must reflect that REAL count.
+        milder_note = t("gateway.branch.incomplete_copy_partial", count=chunk_rows)
+        assert milder_note in result, (
+            f"expected the response to report the real committed count "
+            f"({chunk_rows}), got: {result!r}"
+        )
+        harsh_note = t("gateway.branch.incomplete_copy")
+        assert harsh_note not in result, (
+            f"{chunk_rows} rows actually committed but were reported with "
+            f"the harsh total-failure note: {result!r}"
+        )
+        assert new_session_id in result

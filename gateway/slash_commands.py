@@ -5248,21 +5248,27 @@ class GatewaySlashCommandsMixin:
         # copy_ok/title_ok can each fail independently -- append an honest
         # note rather than silently returning the same full-success text
         # (same "build a note, append it" shape as the /new title-note path
-        # above). A copy failure that still landed some rows (msg_count > 0,
-        # e.g. a later chunk's post-commit maintenance hiccup after earlier
-        # chunks committed) gets milder wording than one that landed
-        # nothing -- both are real, but "did not complete" reads as "your
-        # data is gone", which is only true in the zero-rows case.
-        copy_partial = not copy_ok and msg_count > 0
-        copy_total_failure = not copy_ok and msg_count == 0
+        # above). Driven by copied_rows (the real committed row count), NOT
+        # msg_count: msg_count re-filters the committed prefix down to
+        # user-role rows only, so a committed chunk made entirely of
+        # assistant/tool rows would zero it out and misreport a real
+        # partial copy (rows really sitting in the child DB) as a total
+        # failure. A copy failure that still landed some rows
+        # (copied_rows > 0, e.g. a later chunk's post-commit maintenance
+        # hiccup after earlier chunks committed) gets milder wording than
+        # one that landed nothing -- both are real, but "did not complete"
+        # reads as "your data is gone", which is only true in the
+        # zero-rows case.
+        copy_partial = not copy_ok and copied_rows > 0
+        copy_total_failure = not copy_ok and copied_rows == 0
         if copy_total_failure and not title_ok:
             result += t("gateway.branch.incomplete_copy_and_title")
         elif copy_total_failure:
             result += t("gateway.branch.incomplete_copy")
         elif copy_partial and not title_ok:
-            result += t("gateway.branch.incomplete_copy_partial_and_title", count=msg_count)
+            result += t("gateway.branch.incomplete_copy_partial_and_title", count=copied_rows)
         elif copy_partial:
-            result += t("gateway.branch.incomplete_copy_partial", count=msg_count)
+            result += t("gateway.branch.incomplete_copy_partial", count=copied_rows)
         elif not title_ok:
             result += t("gateway.branch.incomplete_title")
         return result
