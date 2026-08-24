@@ -5114,8 +5114,20 @@ class GatewaySlashCommandsMixin:
             # about it. Check the actual outcome before reporting it.
             try:
                 row_exists = await self._session_db.get_session(new_session_id)
-            except Exception:
-                row_exists = None
+            except Exception as confirm_err:
+                # get_session() raising here is NOT the same as it cleanly
+                # returning None/not-found -- it means we could not confirm
+                # anything either way. Reporting create_failed would repeat
+                # the exact lie this check exists to prevent, just one level
+                # deeper (a row that actually exists reported as absent).
+                # Propagate distinctly instead of guessing.
+                logger.error(
+                    "Failed to create branch session: %s; could not confirm "
+                    "whether the row was actually committed either "
+                    "(get_session raised %r)",
+                    e, confirm_err,
+                )
+                raise
             if not row_exists:
                 logger.error("Failed to create branch session: %s", e)
                 return t("gateway.branch.create_failed", error=e)
@@ -5156,14 +5168,28 @@ class GatewaySlashCommandsMixin:
                 ],
                 chunk_rows=500,
             )
-        except Exception:
-            pass  # Best-effort copy
+        except Exception as copy_err:
+            # Still best-effort (see #23254) -- a failed copy still yields a
+            # usable (partial) branch, so we don't fail the whole command
+            # over it. But a bare `pass` here left zero trace, so a copy
+            # failure was indistinguishable from a full success. Record it.
+            logger.error(
+                "Failed to copy history to branch %s: %r -- branch will be "
+                "created with a partial/empty history",
+                new_session_id, copy_err,
+            )
 
         # Set title
         try:
             await self._session_db.set_session_title(new_session_id, branch_title)
-        except Exception:
-            pass
+        except Exception as title_err:
+            # Same reasoning as the history-copy step above: best-effort,
+            # but must not be silent.
+            logger.error(
+                "Failed to set title %r on branch %s: %r -- branch will be "
+                "left untitled",
+                branch_title, new_session_id, title_err,
+            )
 
         # Switch the session store entry to the new session
         new_entry = await self.async_session_store.switch_session(session_key, new_session_id)
