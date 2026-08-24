@@ -3511,15 +3511,15 @@ _APPROVED_BOUNDARY_SURFACE = frozenset({
 })
 
 #: The BOUNDARY RUNTIME denominator: live descriptor roots plus their nested
-#: closures. 60 named + 21 nested. The module body and the five class bodies are
+#: closures. 61 named + 21 nested. The module body and the five class bodies are
 #: deliberately NOT here -- they execute at import, before any pin runs, and
 #: cannot be re-entered afterwards, so they are outside the claim "this pin's
 #: execution reaches nothing deep". Covering them needs a separate instrument
 #: (a fresh isolated import under the profiler), not a bigger runtime roster.
-_LIBRARY_CODE_OBJECT_COUNT = 81
+_LIBRARY_CODE_OBJECT_COUNT = 82
 
 #: Reported separately, as a STATIC fact, never as the dynamic denominator.
-_IMPORT_TIME_CODE_OBJECT_COUNT = 87
+_IMPORT_TIME_CODE_OBJECT_COUNT = 88
 _IMPORT_TIME_ONLY_BODIES = 6
 
 
@@ -5101,16 +5101,18 @@ SOURCE_MUTATIONS = (
     Mutation(
         pin="check_a_foreign_file_at_a_reserved_sidecar_is_never_deleted",
         module="hermes_cli/session_fence_rollback.py",
-        # BOTH checks, not just the first. A second, revalidating lstat now
-        # runs immediately before the unlink (closing the swap-in-the-window
-        # hole below this one) — and on THIS pin's fixture the sabotage fires
-        # on every lstat, not only the first, so it re-swaps in front of that
-        # second check too. Removing only the first check left the second one
-        # standing in for it: the pin kept passing, discriminating nothing —
-        # a redundant check reporting coverage it did not have. Removing both
-        # is what actually restores the "no check at all" state this pin
-        # exists to catch.
-        find="        if identity is not None and (info.st_dev, info.st_ino) != identity:\n"
+        # ALL THREE checks, not just the first two. A second, revalidating
+        # lstat runs immediately before the unlink (closing the
+        # swap-in-the-window hole below the first), and a third, content-seal
+        # check runs after that (closing the same-inode-coincidence hole
+        # neither lstat can) -- and on THIS pin's fixture the sabotage fires
+        # on every lstat, not only the first, so it re-swaps in front of the
+        # later checks too. Removing only the first check left the other two
+        # standing in for it: the pin kept passing, discriminating nothing --
+        # a redundant check reporting coverage it did not have. Removing all
+        # three is what actually restores the "no check at all" state this
+        # pin exists to catch.
+        find="        if (info.st_dev, info.st_ino) != identity:\n"
              '            return {"path": str(member), "files": 1, "error": "ownership-lost"}\n'
              "        # A SECOND check, immediately before the unlink. The descriptor closed\n"
              "        # above no longer pins the inode, and the unlink below still names the\n"
@@ -5131,7 +5133,31 @@ SOURCE_MUTATIONS = (
              '            return {"path": str(member), "files": 1,\n'
              '                    "error": f"{type(exc).__name__}: {exc}"}\n'
              "        if (revalidated.st_dev, revalidated.st_ino) != identity:\n"
-             '            return {"path": str(member), "files": 1, "error": "ownership-lost"}\n',
+             '            return {"path": str(member), "files": 1, "error": "ownership-lost"}\n'
+             "        # A THIRD check — of CONTENT, not identity — for the gap neither of the\n"
+             "        # above can close. (st_dev, st_ino) is a small, densely-reused index:\n"
+             "        # if the kernel hands the exact number this suffix's file once had back\n"
+             "        # to an unrelated file created at this name in between, both checks\n"
+             "        # above answer \"still ours\" about a stranger, and the unlink below\n"
+             "        # would delete it. That is a coincidence a well-known name (anything\n"
+             "        # can recreate \"backup.db-wal\") cannot rule out by name alone. The\n"
+             "        # 32-byte marker written into the file at acquisition time is: nothing\n"
+             "        # else was ever shown it, so a file that merely reused the old inode\n"
+             "        # number cannot also happen to contain it. Unlike the descriptor, the\n"
+             "        # marker survives the close, so it needs no path trick the\n"
+             "        # close-before-delete rule (see above) would forbid anyway. Only\n"
+             "        # sidecars carry one — ``seal`` is ``None`` for suffix \"\" and this\n"
+             "        # check is then a no-op, matching the pre-seal behaviour there.\n"
+             "        seal = self._seals.get(suffix)\n"
+             "        if seal is not None:\n"
+             "            try:\n"
+             "                with open(member, \"rb\") as sealed:\n"
+             "                    observed_seal = sealed.read(len(seal))\n"
+             "            except OSError as exc:\n"
+             "                return {\"path\": str(member), \"files\": 1,\n"
+             "                        \"error\": f\"{type(exc).__name__}: {exc}\"}\n"
+             "            if observed_seal != seal:\n"
+             "                return {\"path\": str(member), \"files\": 1, \"error\": \"ownership-lost\"}\n",
         replace="",
         kills_by='the run deleted a file it did not create at a name it had merely reserved:',
         why="releasing a reserved name without checking what it resolves to "

@@ -396,6 +396,192 @@ def check_a_swap_between_the_identity_check_and_the_unlink_is_still_caught(
         reservation.close()
 
 
+def check_a_base_exception_mid_release_leaves_the_suffix_claimed(tmpdir) -> None:
+    """A ``BaseException`` raised inside ``_release``'s work must not look resolved.
+
+    ``_release`` used to pop ``self.identities[suffix]`` as its very first
+    statement, before any of the lstat/compare/close/unlink work that decides
+    whether the name was actually handed back. A ``BaseException`` (a
+    ``KeyboardInterrupt`` is the real-world case, not a hypothetical one)
+    raised anywhere in that work left the suffix already gone from
+    ``self.identities`` — looking "resolved" to ``remove_only_what_we_created``,
+    which finds what still needs handling by iterating that very dict — while
+    nothing was actually released: the file may still be on disk, unlinked or
+    not, and the run reports nothing wrong.
+
+    FAKE-OS PROBE: a real reservation, a real ``_release`` call, with
+    ``os.unlink`` replaced by a stand-in that raises ``KeyboardInterrupt`` for
+    the member under test instead of performing the unlink — squarely inside
+    the identity-check-to-unlink work the pop is supposed to guard until an
+    outcome is known.
+    """
+    import hermes_cli.session_fence_rollback as sfr
+    from hermes_cli.session_fence_rollback import _AcquiredDestinations
+
+    where = pathlib.Path(tmpdir)
+    backup = where / "backup.db"
+    reservation = _AcquiredDestinations(backup)
+    reservation.acquire()
+    try:
+        suffix = "-wal"
+        member = reservation._member(suffix)
+        real_os = os
+
+        class _InterruptingOS:
+            """Forwards everything except the unlink of the member under test."""
+
+            def __getattr__(self, name):
+                return getattr(real_os, name)
+
+            def unlink(self, path, *args, **kwargs):
+                if pathlib.Path(path) == member:
+                    raise KeyboardInterrupt("simulated interrupt mid-release")
+                return real_os.unlink(path, *args, **kwargs)
+
+        had_lib_os = hasattr(sfr, "os")
+        previous_lib_os = getattr(sfr, "os", None)
+        sfr.os = _InterruptingOS()
+        interrupted = False
+        try:
+            reservation._release(suffix)
+        except KeyboardInterrupt:
+            interrupted = True
+        finally:
+            if had_lib_os:
+                sfr.os = previous_lib_os
+            else:
+                del sfr.os
+
+        assert interrupted, (
+            "the stand-in unlink did not raise, so this probe measures "
+            "nothing about what happens when a BaseException interrupts "
+            "the release"
+        )
+        assert member.exists(), (
+            "the member was removed even though the interrupt fired instead "
+            "of the unlink completing — the stand-in is not measuring the "
+            "window it claims to"
+        )
+        assert suffix in reservation.identities, (
+            f"a BaseException raised mid-release popped {suffix!r} out of "
+            f"self.identities anyway, so the suffix looks resolved to "
+            f"remove_only_what_we_created even though nothing was released "
+            f"and the file is still on disk. Outer cleanup iterates "
+            f"self.identities to find what still needs handling and will "
+            f"silently skip this suffix."
+        )
+    finally:
+        reservation.identities.clear()
+        reservation.close()
+
+
+def check_a_same_inode_swap_after_close_is_not_authorised_by_dev_ino_alone(
+    tmpdir,
+) -> None:
+    """A coincidental (st_dev, st_ino) match after close is not proof of identity.
+
+    sol's counterexample: the TOCTOU mitigation (a second ``lstat`` right
+    before the ``unlink``) narrows a DIFFERENT-inode swap, but nothing about
+    comparing ``(st_dev, st_ino)`` can distinguish "still our file" from "the
+    OS coincidentally handed our just-freed inode NUMBER back to an unrelated
+    file created at this name" — an inode number is a small, densely-reused
+    index, not an identity, the moment nothing pins it. Both checks in
+    ``_resolve_release`` run AFTER the descriptor that pinned the number is
+    still open for the first one and closed for the second; the ABA case is a
+    stranger's file that, by coincidence, satisfies the second comparison too.
+
+    FAKE-OS PROBE: swaps the real file for a stranger's at the moment the
+    descriptor closes (same technique as the existing swap pin), and ALSO
+    makes the post-close ``lstat`` report the ORIGINAL (st_dev, st_ino) for
+    that path — simulating the coincidence a real kernel could in principle
+    produce by recycling the freed inode number, which this test environment's
+    filesystem does not do on demand. The safety property under test is
+    unaffected by whether the coincidence is real or simulated: whatever
+    authorises the unlink must not be fooled by it.
+    """
+    import hermes_cli.session_fence_rollback as sfr
+    from hermes_cli.session_fence_rollback import _AcquiredDestinations
+
+    where = pathlib.Path(tmpdir)
+    backup = where / "backup.db"
+    reservation = _AcquiredDestinations(backup)
+    reservation.acquire()
+    try:
+        suffix = "-wal"
+        member = reservation._member(suffix)
+        identity = reservation.identities[suffix]
+        wal_handle = reservation.handles[suffix]
+        stranger = b"a different file that reused the just-freed inode number"
+
+        real_os = os
+        real_close = os.close
+        swapped = {"done": False}
+
+        class _FakeStat:
+            """Reports the recorded identity while forwarding everything else."""
+
+            def __init__(self, dev, ino, real_result):
+                self.st_dev = dev
+                self.st_ino = ino
+                self._real = real_result
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        class _SameInodeCoincidenceOS:
+            def __getattr__(self, name):
+                return getattr(real_os, name)
+
+            def close(self, handle, *args, **kwargs):
+                result = real_close(handle, *args, **kwargs)
+                if handle == wal_handle:
+                    # THE WINDOW: our descriptor is gone, so the inode number
+                    # it pinned is now free. A real stranger's file lands at
+                    # the well-known name right here.
+                    member.unlink()
+                    member.write_bytes(stranger)
+                    swapped["done"] = True
+                return result
+
+            def lstat(self, path, *args, **kwargs):
+                real_result = real_os.lstat(path, *args, **kwargs)
+                if pathlib.Path(path) == member and swapped["done"]:
+                    # simulating the coincidence: the kernel handed the
+                    # stranger's file the exact (st_dev, st_ino) this run's
+                    # descriptor used to pin.
+                    return _FakeStat(identity[0], identity[1], real_result)
+                return real_result
+
+        had_lib_os = hasattr(sfr, "os")
+        previous_lib_os = getattr(sfr, "os", None)
+        sfr.os = _SameInodeCoincidenceOS()
+        try:
+            problem = reservation._release(suffix)
+        finally:
+            if had_lib_os:
+                sfr.os = previous_lib_os
+            else:
+                del sfr.os
+
+        assert swapped["done"], (
+            "the stand-in close never swapped in the stranger's file, so this "
+            "probe measures nothing"
+        )
+        assert member.exists() and member.read_bytes() == stranger, (
+            f"the swapped-in stranger did not survive the release: "
+            f"exists={member.exists()!r}. A (st_dev, st_ino) match that was "
+            f"only a coincidence of inode-number reuse authorised deleting a "
+            f"file this run never created.\n  release() returned: {problem!r}"
+        )
+        assert problem is not None and problem.get("error") == "ownership-lost", (
+            f"the release did not report the coincidental match as a lost "
+            f"ownership: {problem!r}"
+        )
+    finally:
+        reservation.identities.clear()
+        reservation.close()
+
+
 PINS = {
     "check_the_identity_check_runs_while_the_descriptor_still_pins_the_inode":
         check_the_identity_check_runs_while_the_descriptor_still_pins_the_inode,
@@ -403,6 +589,10 @@ PINS = {
         check_a_double_release_never_checks_identity_with_the_descriptor_already_closed,
     "check_a_swap_between_the_identity_check_and_the_unlink_is_still_caught":
         check_a_swap_between_the_identity_check_and_the_unlink_is_still_caught,
+    "check_a_base_exception_mid_release_leaves_the_suffix_claimed":
+        check_a_base_exception_mid_release_leaves_the_suffix_claimed,
+    "check_a_same_inode_swap_after_close_is_not_authorised_by_dev_ino_alone":
+        check_a_same_inode_swap_after_close_is_not_authorised_by_dev_ino_alone,
 }
 
 
@@ -433,28 +623,106 @@ SOURCE_MUTATIONS = (
         pin="check_a_double_release_never_checks_identity_with_the_descriptor_already_closed",
         module="hermes_cli/session_fence_rollback.py",
         find=(
-            "        identity = self.identities.pop(suffix, None)\n"
-            "        if identity is None:\n"
+            "        if suffix not in self.identities:\n"
             "            return None\n"
+            "        identity = self.identities[suffix]\n"
             "        member = self._member(suffix)\n"
+            "        problem = self._resolve_release(suffix, member, identity)\n"
+            "        self.identities.pop(suffix, None)\n"
+            "        return problem\n"
         ),
         replace=(
             "        identity = self.identities.get(suffix)\n"
             "        member = self._member(suffix)\n"
+            "        return self._resolve_release(suffix, member, identity)\n"
         ),
-        why="claiming the suffix by popping it out of self.identities the "
-            "instant _release is entered is what makes a second call for the "
-            "same suffix a no-op. Reverting to a plain .get() lets the "
-            "exception-cleanup path (remove_only_what_we_created) re-run the "
-            "identity check for a suffix release_the_sidecars already closed "
-            "the descriptor for — an lstat with nothing left pinning the "
-            "inode, the exact state the earlier close-after-check fix was "
-            "supposed to make unreachable",
+        why="checking presence once and popping only after the outcome is "
+            "known is what makes a SECOND call for an already-resolved "
+            "suffix a no-op. Reverting to a bare .get() with no presence "
+            "check and no pop lets the exception-cleanup path "
+            "(remove_only_what_we_created) re-run the identity check for a "
+            "suffix release_the_sidecars already closed the descriptor for "
+            "— an lstat with nothing left pinning the inode, the exact "
+            "state the earlier close-after-check fix was supposed to make "
+            "unreachable",
         kills_by="then re-entered _release for a suffix release_the_sidecars had ALREADY resolved",
+    ),
+    Mutation(
+        pin="check_a_base_exception_mid_release_leaves_the_suffix_claimed",
+        module="hermes_cli/session_fence_rollback.py",
+        find=(
+            "        if suffix not in self.identities:\n"
+            "            return None\n"
+            "        identity = self.identities[suffix]\n"
+            "        member = self._member(suffix)\n"
+            "        problem = self._resolve_release(suffix, member, identity)\n"
+            "        self.identities.pop(suffix, None)\n"
+            "        return problem\n"
+        ),
+        replace=(
+            "        identity = self.identities.pop(suffix, None)\n"
+            "        if identity is None:\n"
+            "            return None\n"
+            "        member = self._member(suffix)\n"
+            "        return self._resolve_release(suffix, member, identity)\n"
+        ),
+        why="popping the suffix out of self.identities BEFORE the "
+            "lstat/compare/close/unlink work runs is the exact hole this "
+            "row exists to catch: a BaseException raised anywhere in that "
+            "work (a KeyboardInterrupt is the real case) then leaves the "
+            "suffix already gone from self.identities, looking resolved to "
+            "remove_only_what_we_created even though nothing was released "
+            "and the file is still on disk",
+        kills_by="a BaseException raised mid-release popped",
+    ),
+    Mutation(
+        pin="check_a_same_inode_swap_after_close_is_not_authorised_by_dev_ino_alone",
+        module="hermes_cli/session_fence_rollback.py",
+        find=(
+            "        # A THIRD check — of CONTENT, not identity — for the gap neither of the\n"
+            "        # above can close. (st_dev, st_ino) is a small, densely-reused index:\n"
+            "        # if the kernel hands the exact number this suffix's file once had back\n"
+            "        # to an unrelated file created at this name in between, both checks\n"
+            "        # above answer \"still ours\" about a stranger, and the unlink below\n"
+            "        # would delete it. That is a coincidence a well-known name (anything\n"
+            "        # can recreate \"backup.db-wal\") cannot rule out by name alone. The\n"
+            "        # 32-byte marker written into the file at acquisition time is: nothing\n"
+            "        # else was ever shown it, so a file that merely reused the old inode\n"
+            "        # number cannot also happen to contain it. Unlike the descriptor, the\n"
+            "        # marker survives the close, so it needs no path trick the\n"
+            "        # close-before-delete rule (see above) would forbid anyway. Only\n"
+            "        # sidecars carry one — ``seal`` is ``None`` for suffix \"\" and this\n"
+            "        # check is then a no-op, matching the pre-seal behaviour there.\n"
+            "        seal = self._seals.get(suffix)\n"
+            "        if seal is not None:\n"
+            "            try:\n"
+            "                with open(member, \"rb\") as sealed:\n"
+            "                    observed_seal = sealed.read(len(seal))\n"
+            "            except OSError as exc:\n"
+            "                return {\"path\": str(member), \"files\": 1,\n"
+            "                        \"error\": f\"{type(exc).__name__}: {exc}\"}\n"
+            "            if observed_seal != seal:\n"
+            "                return {\"path\": str(member), \"files\": 1, \"error\": \"ownership-lost\"}\n"
+        ),
+        replace="",
+        why="the content seal is the only check that survives a coincidental "
+            "(st_dev, st_ino) match after the descriptor closes -- removing "
+            "it restores the state where a stranger's file that happens to "
+            "reuse this run's just-freed inode number at the well-known "
+            "sidecar name is indistinguishable from the file this run "
+            "created, and the unlink below deletes it",
+        kills_by="A (st_dev, st_ino) match that was only a coincidence of inode-number reuse authorised deleting",
     ),
     Mutation(
         pin="check_a_swap_between_the_identity_check_and_the_unlink_is_still_caught",
         module="hermes_cli/session_fence_rollback.py",
+        # BOTH the second (dev/ino) check AND the third (content-seal) check,
+        # not just the second. The seal check runs immediately after this one
+        # and independently catches the same swap by content, since the
+        # stranger's bytes never carry the seal either — leaving it in place
+        # would let it stand in for the check this row targets, discriminating
+        # nothing (the same "redundant check" shape the sidecar file's own
+        # foreign-file mutation was widened for).
         find=(
             "        # A SECOND check, immediately before the unlink. The descriptor closed\n"
             "        # above no longer pins the inode, and the unlink below still names the\n"
@@ -476,14 +744,39 @@ SOURCE_MUTATIONS = (
             "                    \"error\": f\"{type(exc).__name__}: {exc}\"}\n"
             "        if (revalidated.st_dev, revalidated.st_ino) != identity:\n"
             "            return {\"path\": str(member), \"files\": 1, \"error\": \"ownership-lost\"}\n"
+            "        # A THIRD check — of CONTENT, not identity — for the gap neither of the\n"
+            "        # above can close. (st_dev, st_ino) is a small, densely-reused index:\n"
+            "        # if the kernel hands the exact number this suffix's file once had back\n"
+            "        # to an unrelated file created at this name in between, both checks\n"
+            "        # above answer \"still ours\" about a stranger, and the unlink below\n"
+            "        # would delete it. That is a coincidence a well-known name (anything\n"
+            "        # can recreate \"backup.db-wal\") cannot rule out by name alone. The\n"
+            "        # 32-byte marker written into the file at acquisition time is: nothing\n"
+            "        # else was ever shown it, so a file that merely reused the old inode\n"
+            "        # number cannot also happen to contain it. Unlike the descriptor, the\n"
+            "        # marker survives the close, so it needs no path trick the\n"
+            "        # close-before-delete rule (see above) would forbid anyway. Only\n"
+            "        # sidecars carry one — ``seal`` is ``None`` for suffix \"\" and this\n"
+            "        # check is then a no-op, matching the pre-seal behaviour there.\n"
+            "        seal = self._seals.get(suffix)\n"
+            "        if seal is not None:\n"
+            "            try:\n"
+            "                with open(member, \"rb\") as sealed:\n"
+            "                    observed_seal = sealed.read(len(seal))\n"
+            "            except OSError as exc:\n"
+            "                return {\"path\": str(member), \"files\": 1,\n"
+            "                        \"error\": f\"{type(exc).__name__}: {exc}\"}\n"
+            "            if observed_seal != seal:\n"
+            "                return {\"path\": str(member), \"files\": 1, \"error\": \"ownership-lost\"}\n"
         ),
         replace="",
-        why="the second, immediately-before-the-unlink identity check is the "
-            "only thing standing in the window between the (single, "
-            "fd-pinned) first check and the unlink-by-path. Removing it "
-            "restores the shape sol's probe found: a name swapped after the "
-            "first check and before the unlink is deleted without a second "
-            "look, because nothing looks a second time",
+        why="the second, immediately-before-the-unlink identity check and the "
+            "third, content-seal check are the only things standing in the "
+            "window between the (single, fd-pinned) first check and the "
+            "unlink-by-path. Removing both restores the shape sol's probe "
+            "found: a name swapped after the first check and before the "
+            "unlink is deleted without a second look, because nothing looks "
+            "again",
         kills_by="the swapped-in stranger did not survive the release",
     ),
 )

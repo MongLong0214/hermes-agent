@@ -1249,6 +1249,12 @@ class _AcquiredDestinations:
         self.handles: dict[str, int] = {}
         self.identities: dict[str, tuple] = {}
         self.identities_at_acquisition: dict[str, tuple] = {}
+        #: A per-sidecar random marker, written into the file at ACQUIRE time
+        #: and checked again immediately before the release unlinks it. See
+        #: the SEAL comment in ``_resolve_release`` for why (st_dev, st_ino)
+        #: alone is not enough. Never set for suffix "" — that member holds
+        #: the real backup content, not a placeholder.
+        self._seals: dict[str, bytes] = {}
 
     def _member(self, suffix: str) -> Path:
         return self.backup_path.with_name(self.backup_path.name + suffix)
@@ -1288,6 +1294,19 @@ class _AcquiredDestinations:
             # Kept past release, because the identity of the file this run
             # created is what any later cleanup has to match against.
             self.identities_at_acquisition[suffix] = (info.st_dev, info.st_ino)
+            if suffix:
+                # SIDECARS ONLY — suffix "" gets real backup bytes later and
+                # must not be touched here. A 32-byte value nothing else has
+                # ever seen, written once, right after the exclusive create:
+                # this is the "name no other process can predict or recreate"
+                # the release checks for, done as content instead of as a
+                # path, because a path-based version of it would need the
+                # descriptor to stay open across the close-then-delete
+                # sequence Windows requires — which is exactly what is not on
+                # the table (see ``_resolve_release``).
+                seal = os.urandom(32)
+                os.write(handle, seal)
+                self._seals[suffix] = seal
 
     def write_the_main_member_from(self, snapshot: Path) -> None:
         """Stream *snapshot* through the descriptor this object created.
@@ -1362,32 +1381,43 @@ class _AcquiredDestinations:
     def _release(self, suffix: str):
         """Hand back one reserved NAME. Returns the problem, or ``None``.
 
-        OWNERSHIP IS DROPPED ONLY WHEN THE RELEASE HAS SUCCEEDED. It used to be
-        discarded first — the handle and the recorded identity popped, then the
-        ``lstat``, the identity comparison and the ``unlink`` each swallowed on
-        failure. By the time anything went wrong there was nothing left to
-        report with and nothing to retry from, so a pinned sidecar produced a
-        silent success with the file still on disk.
+        OWNERSHIP IS DROPPED ONLY WHEN THE RELEASE HAS SUCCEEDED — OR FAILED
+        WITH A REPORTED PROBLEM. It used to be discarded FIRST, as this
+        method's very first statement, before the ``lstat``, the identity
+        comparison, the close and the ``unlink`` that decide whether anything
+        was actually handed back. That made an ordinary second call a safe
+        no-op (see IDEMPOTENT PER SUFFIX below), but it also meant a
+        ``BaseException`` — a ``KeyboardInterrupt`` is the real case, not a
+        hypothetical one — raised anywhere in that work left the suffix
+        already gone from ``self.identities``. Nothing downstream can tell
+        the difference between "resolved" and "vanished mid-resolution":
+        ``remove_only_what_we_created`` finds what still needs handling by
+        iterating this very dict, so a suffix missing from it looks done. The
+        handle may still be open, the file may still be on disk, and the run
+        reports nothing wrong.
 
-        That is the same error as snapshotting presence before the sweep and
-        re-emitting it: state that governs an operation released before the
-        operation's result is known. The descriptor is a different resource
-        from the name and is closed straight away; the NAME's ownership is what
-        must survive until the outcome is in.
+        So presence is now checked WITHOUT removing (``suffix in
+        self.identities``), the actual work runs in ``_resolve_release`` with
+        the entry still present the whole time, and the pop happens here,
+        once, ONLY after that call returns — which it cannot do without
+        having reached a real outcome. A ``BaseException`` escaping
+        ``_resolve_release`` propagates straight through this method before
+        the pop line, leaving the suffix exactly where an interrupted release
+        left it: still claimed, still visible to whatever iterates
+        ``self.identities`` looking for unfinished business.
 
-        IDEMPOTENT PER SUFFIX, the instant a call claims it. ``release_the_
+        IDEMPOTENT PER SUFFIX, the instant a call resolves it. ``release_the_
         sidecars`` raises on the first problem, and the caller's exception
         handling then runs ``remove_only_what_we_created`` over the SAME
         reservation — which used to call this method a second time for a
         suffix the first call had already resolved. That second call's
         identity check ran with no descriptor left to pin the inode; the
         first call had already closed it, so the very comparison this method
-        exists to make was unsound the second time it ran. Popping
-        ``self.identities[suffix]`` here, before any I/O, is what makes a
-        second call a no-op instead of a second, unprotected check — the
-        identity dict is already the record of "still owned", so emptying it
-        the moment a suffix is claimed is enough to keep the claim from being
-        made twice.
+        exists to make was unsound the second time it ran. The presence check
+        plus the pop on the way out are what make a second, ORDINARY call a
+        no-op instead of a second, unprotected check — the identity dict is
+        already the record of "still owned", so emptying it once a suffix's
+        outcome is known is enough to keep the claim from being made twice.
 
         Three outcomes, each classified from what was observed:
 
@@ -1402,17 +1432,30 @@ class _AcquiredDestinations:
                    a retry from this method would be the same unsound second
                    check.
         """
-        identity = self.identities.pop(suffix, None)
-        if identity is None:
+        if suffix not in self.identities:
             return None
+        identity = self.identities[suffix]
         member = self._member(suffix)
+        problem = self._resolve_release(suffix, member, identity)
+        self.identities.pop(suffix, None)
+        return problem
+
+    def _resolve_release(self, suffix: str, member: Path, identity: tuple):
+        """Do the actual lstat/compare/close/unlink work for ``_release``.
+
+        Deliberately does not touch ``self.identities`` — that dict's entry
+        for *suffix* must still say "claimed" for as long as this call is on
+        the stack, INCLUDING while a ``BaseException`` unwinds out of it. Only
+        the caller (``_release``) pops it, and only once this returns a real
+        outcome.
+        """
         info = self._identity_check_target(suffix, member)
         self._close_handle(suffix)
         if info is None:
             return None
         if isinstance(info, dict):
             return info
-        if identity is not None and (info.st_dev, info.st_ino) != identity:
+        if (info.st_dev, info.st_ino) != identity:
             return {"path": str(member), "files": 1, "error": "ownership-lost"}
         # A SECOND check, immediately before the unlink. The descriptor closed
         # above no longer pins the inode, and the unlink below still names the
@@ -1434,6 +1477,30 @@ class _AcquiredDestinations:
                     "error": f"{type(exc).__name__}: {exc}"}
         if (revalidated.st_dev, revalidated.st_ino) != identity:
             return {"path": str(member), "files": 1, "error": "ownership-lost"}
+        # A THIRD check — of CONTENT, not identity — for the gap neither of the
+        # above can close. (st_dev, st_ino) is a small, densely-reused index:
+        # if the kernel hands the exact number this suffix's file once had back
+        # to an unrelated file created at this name in between, both checks
+        # above answer "still ours" about a stranger, and the unlink below
+        # would delete it. That is a coincidence a well-known name (anything
+        # can recreate "backup.db-wal") cannot rule out by name alone. The
+        # 32-byte marker written into the file at acquisition time is: nothing
+        # else was ever shown it, so a file that merely reused the old inode
+        # number cannot also happen to contain it. Unlike the descriptor, the
+        # marker survives the close, so it needs no path trick the
+        # close-before-delete rule (see above) would forbid anyway. Only
+        # sidecars carry one — ``seal`` is ``None`` for suffix "" and this
+        # check is then a no-op, matching the pre-seal behaviour there.
+        seal = self._seals.get(suffix)
+        if seal is not None:
+            try:
+                with open(member, "rb") as sealed:
+                    observed_seal = sealed.read(len(seal))
+            except OSError as exc:
+                return {"path": str(member), "files": 1,
+                        "error": f"{type(exc).__name__}: {exc}"}
+            if observed_seal != seal:
+                return {"path": str(member), "files": 1, "error": "ownership-lost"}
         try:
             os.unlink(member)
         except OSError as exc:
