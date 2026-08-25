@@ -68,6 +68,7 @@ import contextlib
 import logging
 import os
 import sqlite3
+import sys
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -323,8 +324,14 @@ class _TrackingMixin:
         # polymorphic close hook and the native-close guarantee below.  Plain
         # ``connect_tracked`` handles intentionally have no serial lock; they
         # retain their existing tracking-only contract.
-        serial_lock = None
-        if getattr(self, "_hermes_serial_lock", None) is not None:
+        serial_lock = getattr(self, "_hermes_serial_lock", None)
+        hermes_state_module = sys.modules.get("hermes_state")
+        serialized_mixin = getattr(
+            hermes_state_module, "_SerializedConnectionMixin", None
+        )
+        if serial_lock is not None or (
+            serialized_mixin is not None and serialized_mixin in type(self).__mro__
+        ):
             # Keep the exact lock contract in hermes_state's canonical
             # validator.  This local import avoids making the safe-read
             # module depend on hermes_state during import-time discovery.
