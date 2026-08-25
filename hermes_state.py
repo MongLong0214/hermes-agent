@@ -5370,6 +5370,54 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._insert_session_row(session_id, source, **kwargs)
         return session_id
 
+    def create_imported_session(
+        self,
+        session_id: str,
+        source: str,
+        messages: List[Dict[str, Any]],
+        *,
+        cwd: str = None,
+        origin_json: str = None,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> str:
+        """Create a new imported session and its transcript atomically.
+
+        Foreign imports must not expose a prefix transcript: the session row,
+        every parsed message, and their counters either commit together or are
+        all rolled back.  Unlike :meth:`create_session`, an occupied id is an
+        error rather than an opportunity to enrich an existing session.
+        """
+        def _do(conn):
+            # Imports acquire against an absent id before creating its session
+            # row, so the admission check has to precede the strict insert.
+            self._check_transcript_write_guards(
+                conn,
+                session_id,
+                None,
+                turn_lease_holder=turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
+            conn.execute(
+                """INSERT INTO sessions (id, source, cwd, origin_json, started_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (session_id, source, cwd, origin_json, time.time()),
+            )
+            inserted, tool_calls_total = self._insert_message_rows(
+                conn, session_id, messages
+            )
+            conn.execute(
+                """UPDATE sessions
+                   SET message_count = ?, tool_call_count = ?
+                   WHERE id = ?""",
+                (inserted, tool_calls_total, session_id),
+            )
+            return session_id
+
+        return self._execute_write(
+            _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
+        )
+
     def record_gateway_session_peer(
         self,
         session_id: str,
