@@ -479,10 +479,7 @@ class ComputeHost:
                 hermes_undo.on_user_message_appended(session["session_key"])
             except Exception:
                 pass
-            try:
-                server._persist_branch_seed(session)
-            except Exception:
-                pass
+            server._persist_branch_seed(session)
             text = frame.get("text") if "text" in frame else frame.get("prompt", "")
             server._run_prompt_submit(
                 request_id,

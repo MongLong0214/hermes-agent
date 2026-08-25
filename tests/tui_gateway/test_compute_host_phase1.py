@@ -305,3 +305,80 @@ def test_shutdown_drain_sleep_never_overshoots_the_reserve(monkeypatch):
     assert events == ["finalize:idle:compute_host_sigterm"]
     assert slept, "the drain loop should have ticked at least once"
     assert sum(slept) <= drain_budget + 1e-6
+
+
+def test_compute_host_partial_branch_seed_emits_error_without_running_turn(
+    monkeypatch, tmp_path
+):
+    import sqlite3
+
+    from hermes_state import SessionDB
+
+    sid = "compute-partial-branch"
+    session_key = "compute-partial-branch-key"
+    seed = [
+        {
+            "role": "user" if index % 2 == 0 else "assistant",
+            "content": f"compute-seed-{index:04d}",
+            "timestamp": 1_700_000_000.0 + index,
+        }
+        for index in range(501)
+    ]
+    session = {
+        "agent": None,
+        "session_key": session_key,
+        "parent_session_id": "parent-key",
+        "history": seed,
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "running": False,
+    }
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("parent-key", source="tui")
+    db.create_session(session_key, source="tui", parent_session_id="parent-key")
+    real_insert = SessionDB._insert_message_rows
+    insert_calls = {"count": 0}
+
+    def flaky_insert(self_db, conn, branch_key, messages):
+        insert_calls["count"] += 1
+        if insert_calls["count"] == 2:
+            raise sqlite3.OperationalError("forced compute-host suffix failure")
+        return real_insert(self_db, conn, branch_key, messages)
+
+    monkeypatch.setattr(SessionDB, "_insert_message_rows", flaky_insert)
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: None)
+    turn_calls = []
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *_args, **_kwargs: turn_calls.append("run_prompt_submit"),
+    )
+    monkeypatch.setattr(server, "_session_info", lambda *_args, **_kwargs: {})
+    server._sessions[sid] = session
+    out = io.StringIO()
+    host = ComputeHost(stdout=out, heartbeat_secs=0)
+    try:
+        host._run_real_turn(
+            {
+                "type": "turn.start",
+                "sid": sid,
+                "request_id": "compute-partial-seed",
+                "text": "must not run",
+            }
+        )
+
+        frames = _json_lines(out)
+        errors = [frame for frame in frames if frame.get("type") == "turn.error"]
+        assert len(errors) == 1
+        assert errors[0]["reason"] == "exception"
+        assert "500 row(s) committed" in errors[0]["message"]
+        assert not any(frame.get("type") == "turn.end" for frame in frames)
+        assert turn_calls == []
+        assert session["running"] is False
+        assert session["inflight_turn"] is None
+        assert len(db.get_messages(session_key)) == 500
+    finally:
+        host.close()
+        server._sessions.pop(sid, None)
+        db.close()

@@ -3079,8 +3079,18 @@ def _persist_branch_seed(session: dict) -> None:
         return
     with session["history_lock"]:
         seed = [dict(msg) for msg in (session.get("history") or [])]
+        inserted = session.get("_branch_seed_inserted", 0)
+        if (
+            isinstance(inserted, bool)
+            or not isinstance(inserted, int)
+            or inserted < 0
+            or inserted > len(seed)
+        ):
+            raise RuntimeError("invalid committed branch-seed prefix")
     if not seed:
         return
+    from hermes_state import PartialBatchInsertError
+
     with _session_db(session) as db:
         if db is None:
             return
@@ -3113,15 +3123,24 @@ def _persist_branch_seed(session: dict) -> None:
                         # branch's copied history would all appear authored "now".
                         "timestamp": msg.get("timestamp"),
                     }
-                    for msg in seed
+                    for msg in seed[inserted:]
                 ],
                 chunk_rows=500,
             )
-            session["_branch_seed_persisted"] = True
+            with session["history_lock"]:
+                session["_branch_seed_persisted"] = True
+                session.pop("_branch_seed_inserted", None)
+        except PartialBatchInsertError as exc:
+            committed = inserted + exc.inserted
+            if committed < inserted or committed > len(seed):
+                raise RuntimeError("invalid partial branch-seed insert count") from exc
+            with session["history_lock"]:
+                session["_branch_seed_inserted"] = committed
+            raise
         except Exception as exc:
             from hermes_state import is_disk_full_error
 
-            if is_disk_full_error(exc):
+            if inserted or is_disk_full_error(exc):
                 raise
             logger.debug("branch seed persist failed", exc_info=True)
 

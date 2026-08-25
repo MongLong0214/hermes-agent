@@ -18660,6 +18660,47 @@ def _branched_assistant(db, session_key):
     )
 
 
+def _long_branch_seed(length=1001):
+    seed = [
+        {
+            "role": "user" if index % 2 == 0 else "assistant",
+            "content": f"ordered-seed-{index:04d}",
+            "timestamp": 1_700_000_000.0 + index,
+        }
+        for index in range(length)
+    ]
+    seed[499].update(
+        reasoning=BRANCH_REASONING,
+        reasoning_content=BRANCH_REASONING_CONTENT,
+        reasoning_details=BRANCH_REASONING_DETAILS,
+        codex_reasoning_items=BRANCH_CODEX_REASONING_ITEMS,
+        codex_message_items=BRANCH_CODEX_MESSAGE_ITEMS,
+    )
+    seed[500].update(
+        display_kind="personality_switch",
+        display_metadata={"label": "suffix marker"},
+    )
+    return seed
+
+
+def _fail_second_branch_seed_chunk(monkeypatch):
+    import sqlite3
+
+    from hermes_state import SessionDB
+
+    real_insert = SessionDB._insert_message_rows
+    calls = {"count": 0}
+
+    def flaky_insert(self_db, conn, session_id, messages):
+        calls["count"] += 1
+        if calls["count"] == 2:
+            raise sqlite3.OperationalError("forced second branch-seed chunk failure")
+        return real_insert(self_db, conn, session_id, messages)
+
+    monkeypatch.setattr(SessionDB, "_insert_message_rows", flaky_insert)
+    return real_insert, calls
+
+
 def test_persist_branch_seed_keeps_reasoning_fields(monkeypatch, tmp_path):
     """The seed write must carry the parent's reasoning fields.
 
@@ -18695,6 +18736,114 @@ def test_persist_branch_seed_keeps_reasoning_fields(monkeypatch, tmp_path):
         )
         assert session["_branch_seed_persisted"] is True
     finally:
+        db.close()
+
+
+def test_persist_branch_seed_partial_retry_appends_only_suffix(monkeypatch, tmp_path):
+    from hermes_state import PartialBatchInsertError, SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    seed = _long_branch_seed()
+    session = _session(
+        session_key="branch-key",
+        parent_session_id="parent-key",
+        history=seed,
+    )
+    real_insert, calls = _fail_second_branch_seed_chunk(monkeypatch)
+    try:
+        db.create_session("parent-key", source="tui")
+        db.create_session(
+            "branch-key", source="tui", parent_session_id="parent-key"
+        )
+        monkeypatch.setattr(server, "_get_db", lambda: db)
+
+        with pytest.raises(PartialBatchInsertError) as excinfo:
+            server._persist_branch_seed(session)
+
+        assert excinfo.value.inserted == 500
+        assert calls["count"] == 2
+        first_attempt = db.get_messages_as_conversation("branch-key")
+        assert [msg["content"] for msg in first_attempt] == [
+            msg["content"] for msg in seed[:500]
+        ]
+        assert session.get("_branch_seed_persisted") is not True
+        assert session["_branch_seed_inserted"] == 500
+
+        monkeypatch.setattr(SessionDB, "_insert_message_rows", real_insert)
+        server._persist_branch_seed(session)
+
+        final = db.get_messages_as_conversation("branch-key")
+        final_contents = [msg["content"] for msg in final]
+        assert final_contents == [msg["content"] for msg in seed]
+        assert len(final) == len(seed) == 1001
+        assert len(set(final_contents)) == len(final_contents)
+        assert final[499]["reasoning"] == BRANCH_REASONING
+        assert final[499]["reasoning_content"] == BRANCH_REASONING_CONTENT
+        assert final[499]["reasoning_details"] == BRANCH_REASONING_DETAILS
+        assert final[499]["codex_reasoning_items"] == BRANCH_CODEX_REASONING_ITEMS
+        assert final[499]["codex_message_items"] == BRANCH_CODEX_MESSAGE_ITEMS
+        assert final[500]["display_kind"] == "personality_switch"
+        assert final[500]["display_metadata"] == {"label": "suffix marker"}
+        assert [msg["timestamp"] for msg in final] == [
+            msg["timestamp"] for msg in seed
+        ]
+        assert session["_branch_seed_persisted"] is True
+        assert "_branch_seed_inserted" not in session
+    finally:
+        db.close()
+
+
+def test_prompt_submit_partial_branch_seed_aborts_before_turn(monkeypatch, tmp_path):
+    from hermes_state import SessionDB
+
+    sid = "inline-partial-branch"
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session = _session(
+        session_key="inline-branch-key",
+        parent_session_id="parent-key",
+        history=_long_branch_seed(501),
+    )
+    calls = []
+    _fail_second_branch_seed_chunk(monkeypatch)
+    try:
+        db.create_session("parent-key", source="tui")
+        db.create_session(
+            "inline-branch-key", source="tui", parent_session_id="parent-key"
+        )
+        server._sessions[sid] = session
+        monkeypatch.setattr(server, "_get_db", lambda: db)
+        monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *_args: None)
+        monkeypatch.setattr(server, "_session_uses_compute_host", lambda *_args: False)
+        monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: None)
+        monkeypatch.setattr(
+            server,
+            "_start_agent_build",
+            lambda *_args: calls.append("start_agent_build"),
+        )
+        monkeypatch.setattr(server, "_wait_agent_for_prompt", lambda *_args: None)
+        monkeypatch.setattr(
+            server,
+            "_run_prompt_submit",
+            lambda *_args, **_kwargs: calls.append("run_prompt_submit"),
+        )
+        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+
+        response = server.handle_request(
+            {
+                "id": "partial-seed-submit",
+                "method": "prompt.submit",
+                "params": {"session_id": sid, "text": "must not run"},
+            }
+        )
+
+        assert response is not None
+        assert response.get("error", {}).get("code") == 5071
+        assert calls == []
+        assert session["running"] is False
+        assert session["inflight_turn"] is None
+        assert len(db.get_messages("inline-branch-key")) == 500
+    finally:
+        server._sessions.pop(sid, None)
         db.close()
 
 
