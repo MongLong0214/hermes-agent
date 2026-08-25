@@ -478,7 +478,13 @@ def _persist_session_title(
     attempt_fn = getattr(type(session_db), "set_auto_title_for_attempt", None)
 
     def _set(candidate):
-        if attempt_bound and callable(attempt_fn):
+        if attempt_bound:
+            if not callable(attempt_fn):
+                logger.debug(
+                    "Skipping %s title: attempt-bound persistence is unavailable",
+                    source,
+                )
+                return None
             if not attempt_fn(
                 session_db,
                 session_id,

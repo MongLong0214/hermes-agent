@@ -15,6 +15,21 @@ from agent.title_generator import (
 from hermes_state import SessionDB
 
 
+class AttemptAwareTitleStore(MagicMock):
+    """Mock store whose attempt writes take the production CAS route."""
+
+    def set_auto_title_for_attempt(
+        self,
+        originating_session_id,
+        title,
+        *,
+        source,
+        expected_title,
+        expected_source,
+    ):
+        return self.set_auto_title(originating_session_id, title, source=source)
+
+
 class TestGenerateTitle:
     """Unit tests for generate_title()."""
 
@@ -189,7 +204,7 @@ class TestAutoTitleSession:
         assert seen == []
 
     def test_invokes_title_callback_after_setting_title(self):
-        db = MagicMock()
+        db = AttemptAwareTitleStore()
         db.get_session_title_source.return_value = None
         db.set_auto_title.return_value = True
         seen = []
@@ -435,7 +450,7 @@ class TestAutoTitleDuplicateHandling:
         assert db.get_session_title("sess-1") == "hi #2"
 
     def test_dedupes_duplicate_title_via_lineage(self):
-        db = MagicMock()
+        db = AttemptAwareTitleStore()
         db.get_session_title_source.return_value = None
         # Atomic write path: collision raises ValueError, retry persists.
         db.set_auto_title.side_effect = [ValueError("in use"), True]
@@ -736,6 +751,109 @@ class TestTitleAttemptEligibility:
         assert child_row["title"] == "Fix title worker compression race safely"
         assert child_row["title_source"] == SessionDB.TITLE_SOURCE_LLM
         assert derived_title != child_row["title"]
+
+    def test_paused_worker_fails_closed_without_attempt_cas(
+        self, tmp_path, monkeypatch
+    ):
+        """A missing CAS seam must not reopen the compression-ended parent."""
+        db = SessionDB(tmp_path / "state.db")
+        parent = "cas-unavailable-parent"
+        child = "cas-unavailable-child"
+        db.create_session(session_id=parent, source="cli")
+        threads = self._capture_threads(monkeypatch)
+        generation_started = threading.Event()
+        release_generation = threading.Event()
+
+        def _generate(_message, **_kwargs):
+            generation_started.set()
+            assert release_generation.wait(timeout=10), "title worker was not released"
+            return "CAS seam must not fall back"
+
+        monkeypatch.delattr(SessionDB, "set_auto_title_for_attempt")
+        with patch.object(
+            db, "set_auto_title", wraps=db.set_auto_title
+        ) as set_auto_title, patch(
+            "agent.title_generator.generate_title", side_effect=_generate
+        ), patch(
+            "agent.title_generator._auto_title_enabled", return_value=True
+        ):
+            maybe_auto_title(db, parent, "protect ended parent", [])
+            assert generation_started.wait(timeout=10), "title worker never started"
+            # The instant title is legitimately written with the ordinary
+            # setter; only the paused attempt-bound worker is forbidden from it.
+            set_auto_title.reset_mock()
+
+            db.publish_compression_child(
+                parent_session_id=parent,
+                child_session_id=child,
+                source="cli",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": "[CONTEXT COMPACTION] durable handoff",
+                    }
+                ],
+                system_prompt="sys",
+                require_compression_lease=False,
+            )
+            release_generation.set()
+            self._join_threads(threads)
+
+        assert db.get_session(parent)["title"] is None
+        set_auto_title.assert_not_called()
+
+    def test_paused_worker_follows_inherited_branch_marker_to_live_child(
+        self, tmp_path, monkeypatch
+    ):
+        """A compression child inherits ancestry without becoming a branch child."""
+        db = SessionDB(tmp_path / "state.db")
+        root = "lineage-root"
+        parent = "branched-parent"
+        child = "branched-parent-compression-child"
+        db.create_session(session_id=root, source="cli")
+        db.create_session(
+            session_id=parent,
+            source="cli",
+            parent_session_id=root,
+            model_config={"_branched_from": root},
+        )
+        threads = self._capture_threads(monkeypatch)
+        generation_started = threading.Event()
+        release_generation = threading.Event()
+
+        def _generate(_message, **_kwargs):
+            generation_started.set()
+            assert release_generation.wait(timeout=10), "title worker was not released"
+            return "Upgrade inherited branch lineage"
+
+        with patch(
+            "agent.title_generator.generate_title", side_effect=_generate
+        ), patch(
+            "agent.title_generator._auto_title_enabled", return_value=True
+        ):
+            maybe_auto_title(db, parent, "title a branched conversation", [])
+            assert generation_started.wait(timeout=10), "title worker never started"
+
+            db.publish_compression_child(
+                parent_session_id=parent,
+                child_session_id=child,
+                source="cli",
+                model_config={"_branched_from": root},
+                messages=[
+                    {
+                        "role": "user",
+                        "content": "[CONTEXT COMPACTION] durable handoff",
+                    }
+                ],
+                system_prompt="sys",
+                require_compression_lease=False,
+            )
+            release_generation.set()
+            self._join_threads(threads)
+
+        assert db.get_session(parent)["title"] is None
+        assert db.get_session(child)["title"] == "Upgrade inherited branch lineage"
+        assert db.get_session(child)["title_source"] == SessionDB.TITLE_SOURCE_LLM
 
     @pytest.mark.parametrize(
         ("replacement", "replacement_source"),

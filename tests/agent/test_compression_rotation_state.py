@@ -1104,3 +1104,56 @@ class TestCompressionTitlePublicationTransaction:
         assert parent_row["title_source"] is None
         assert sentinel_row["title"] == "Unrelated sentinel title"
         assert sentinel_row["title_source"] == SessionDB.TITLE_SOURCE_USER
+
+
+class TestInPlaceCompactionDurableBoundary:
+    def test_prompt_failure_after_in_place_commit_resets_file_read_dedup(
+        self, tmp_path: Path
+    ):
+        """A durable compacted transcript cannot retain an obsolete read stub."""
+        from tools.file_tools import read_file_tool, reset_file_dedup
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        session_id = "IN_PLACE_DEDUP_BOUNDARY"
+        db.create_session(session_id, source="cli")
+        agent = _build_agent_with_db(db, session_id, platform="cli")
+        agent.compression_in_place = True
+        events = []
+        agent.event_callback = lambda name, payload: events.append((name, payload))
+
+        task_id = "in-place-dedup-boundary"
+        read_path = tmp_path / "context.txt"
+        read_path.write_text("the durable file content\n", encoding="utf-8")
+        reset_file_dedup(task_id)
+        first_read = json.loads(read_file_tool(str(read_path), task_id=task_id))
+        stale_read = json.loads(read_file_tool(str(read_path), task_id=task_id))
+        assert "the durable file content" in first_read["content"]
+        assert stale_read["status"] == "unchanged"
+
+        with patch.object(
+            db,
+            "update_system_prompt",
+            side_effect=RuntimeError("simulated prompt publication failure"),
+        ):
+            returned, _ = agent._compress_context(
+                _msgs(),
+                "sys",
+                approx_tokens=120_000,
+                task_id=task_id,
+            )
+
+        reread_after_compaction = json.loads(
+            read_file_tool(str(read_path), task_id=task_id)
+        )
+        persisted = db.get_messages_as_conversation(session_id)
+        assert "the durable file content" in reread_after_compaction["content"]
+        assert [message["content"] for message in persisted] == [
+            "[CONTEXT COMPACTION] summary",
+            "tail",
+        ]
+        assert [message["content"] for message in returned] == [
+            "[CONTEXT COMPACTION] summary",
+            "tail",
+        ]
+        assert agent._last_compaction_in_place is True
+        assert not any(name == "session:compress" for name, _payload in events)

@@ -8917,15 +8917,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     JOIN sessions AS child ON child.parent_session_id = parent.id
                     WHERE parent.id = ?
                       AND parent.end_reason = 'compression'
-                      AND json_extract(COALESCE(child.model_config, '{}'),
-                                       '$._branched_from') IS NULL
-                      AND json_extract(COALESCE(child.model_config, '{}'),
-                                       '$._delegate_from') IS NULL
+                      AND COALESCE(json_extract(COALESCE(child.model_config, '{}'),
+                                                '$._branched_from'), '') != ?
+                      AND COALESCE(json_extract(COALESCE(child.model_config, '{}'),
+                                                '$._delegate_from'), '') != ?
                       AND COALESCE(child.source, '') != 'tool'
                     ORDER BY child.started_at ASC, child.id ASC
                     LIMIT 2
                     """,
-                    (current,),
+                    (current, current, current),
                 ).fetchall()
                 if len(children) != 1:
                     return None

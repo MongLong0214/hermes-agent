@@ -3390,6 +3390,11 @@ def compress_context(
             agent._cached_system_prompt = new_system_prompt
 
         _session_commit_succeeded = False
+        # A transcript rewrite can become durable before every later piece of
+        # session publication succeeds. Keep that boundary separate from the
+        # final-success flag: post-compaction read dedup must be reset as soon
+        # as the original transcript is no longer the live one.
+        _transcript_boundary_committed = not agent._session_db
         split_status = "not_applicable"
         if agent._session_db:
             split_status = "pending"
@@ -3541,6 +3546,7 @@ def compress_context(
                         watermark=_commit_watermark,
                         lock_holder=_lock_holder,
                     )
+                    _transcript_boundary_committed = True
                     split_status = "in_place_committed"
                     # Reset the flush identity set so the next turn's appends are
                     # diffed against the COMPACTED transcript: the compacted dicts
@@ -3683,6 +3689,7 @@ def compress_context(
                         ),
                         watermark_ceiling=_foreign_tail_ceiling,
                     )
+                    _transcript_boundary_committed = True
                     agent.session_id = new_session_id
                     try:
                         from gateway.session_context import set_current_session_id
@@ -3776,17 +3783,29 @@ def compress_context(
                         agent.context_compressor.compression_count = (
                             _compressor_attempt_snapshot["compression_count"]
                         )
-                split_status = (
-                    "aborted"
-                    if locals().get("old_session_id") is None and not in_place
-                    else "failed_not_indexed"
-                )
+                if in_place and _transcript_boundary_committed:
+                    # archive_and_compact() already replaced the live
+                    # transcript. A subsequent prompt-write failure is not a
+                    # rollback and must not be reported as an unindexed split.
+                    split_status = "in_place_prompt_failed"
+                else:
+                    split_status = (
+                        "aborted"
+                        if locals().get("old_session_id") is None and not in_place
+                        else "failed_not_indexed"
+                    )
                 # If the rotation rolled back to the parent (orphan-avoidance
                 # above), agent.session_id is the still-indexed parent and
                 # old_session_id was cleared — so this is recovery, not an
                 # un-indexed orphan. Otherwise an earlier step failed before the
                 # child was created and the warning's original meaning holds.
-                if locals().get("old_session_id") is None and not in_place:
+                if in_place and _transcript_boundary_committed:
+                    logger.warning(
+                        "In-place compression transcript committed but system "
+                        "prompt publication failed: %s",
+                        e,
+                    )
+                elif locals().get("old_session_id") is None and not in_place:
                     logger.warning(
                         "Compression rotation aborted and rolled back to the "
                         "parent session (%s): %s", agent.session_id or "?", e,
@@ -3941,27 +3960,25 @@ def compress_context(
                 else:
                     agent.context_compressor._verify_compaction_cleared_threshold = True
 
-            # Clear the file-read dedup cache.  After compression the original
-            # read content is summarised away — if the model re-reads the same
-            # file it needs the full content, not a "file unchanged" stub.
-            try:
-                from tools.file_tools import reset_file_dedup
-                reset_file_dedup(task_id)
-            except Exception:
-                pass
-            # Same for the skill_view repeat-view dedup: a post-compression
-            # re-view must return the full skill content again.
-            try:
-                from tools.skills_tool import reset_skill_view_dedup
-                reset_skill_view_dedup(task_id)
-            except Exception:
-                pass
-
             logger.info(
                 "context compression done: session=%s messages=%d->%d rough_tokens=~%s awaiting_real_usage=true",
                 agent.session_id or "none", _pre_msg_count, len(compressed),
                 f"{_compressed_est:,}",
             )
+        # Clear repeat-view state whenever the transcript boundary itself was
+        # committed, even if a later publication step failed. The referenced
+        # content was compacted away and must not be replaced by a stale stub.
+        if _transcript_boundary_committed:
+            try:
+                from tools.file_tools import reset_file_dedup
+                reset_file_dedup(task_id)
+            except Exception:
+                pass
+            try:
+                from tools.skills_tool import reset_skill_view_dedup
+                reset_skill_view_dedup(task_id)
+            except Exception:
+                pass
         _commit_status = "committed" if split_status in {"not_applicable", "in_place_committed", "rotated_committed"} else "aborted"
         _emit_compression_attempt_telemetry(
             agent,
