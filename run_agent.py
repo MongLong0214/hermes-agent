@@ -8503,6 +8503,29 @@ class AIAgent:
         moa_config: Optional[dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
+        session_db = getattr(self, "_session_db", None)
+        schema_guard = getattr(type(session_db), "ensure_compatible_schema", None)
+        if callable(schema_guard):
+            from hermes_state import IncompatibleSchemaError
+
+            try:
+                schema_guard(session_db)
+            except IncompatibleSchemaError:
+                return {
+                    "final_response": (
+                        "⚠️ State database is newer than this running Hermes process. "
+                        "Restart the process, then send your message again."
+                    ),
+                    "messages": list(conversation_history or []),
+                    "api_calls": 0,
+                    "completed": False,
+                    "failed": True,
+                    "error": "state_store_schema_incompatible",
+                    "failure_reason": "state_store_schema_incompatible",
+                    "turn_exit_reason": "state_store_schema_incompatible",
+                    "restart_required": True,
+                }
+
         # A review deliberately shares this agent's session_id for prompt-cache
         # parity. Fence review startup or interrupt an admitted request, then
         # await that request's exit before opening any live-turn Relay or task

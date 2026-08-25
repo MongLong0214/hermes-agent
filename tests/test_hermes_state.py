@@ -11,7 +11,12 @@ import pytest
 
 import hermes_state
 from agent.session_activity import ActivityProvenance
-from hermes_state import SCHEMA_SQL, SCHEMA_VERSION, SessionDB
+from hermes_state import (
+    IncompatibleSchemaError,
+    SCHEMA_SQL,
+    SCHEMA_VERSION,
+    SessionDB,
+)
 
 
 class _NoFtsCursor(sqlite3.Cursor):
@@ -1732,6 +1737,51 @@ class TestSchemaInit:
                     f"Column {col_name} declared in SCHEMA_SQL for {table_name} "
                     f"but missing from live DB. Live columns: {live_cols}"
                 )
+
+
+class TestIncompatibleSchemaVersion:
+    @staticmethod
+    def _snapshot(path):
+        """Capture every persistent object and row before a rejected open."""
+        with sqlite3.connect(path) as conn:
+            return {
+                "dump": tuple(conn.iterdump()),
+                "triggers": tuple(
+                    conn.execute(
+                        "SELECT name, tbl_name, sql FROM sqlite_master "
+                        "WHERE type = 'trigger' ORDER BY name"
+                    ).fetchall()
+                ),
+            }
+
+    def test_future_schema_open_refuses_without_mutating_store(
+        self, tmp_path, monkeypatch
+    ):
+        """A newer state DB is never initialized, reconciled, or restamped."""
+        db_path = tmp_path / "future-schema.db"
+        current = SessionDB(db_path=db_path)
+        try:
+            current.create_session("sentinel", source="cli")
+        finally:
+            current.close()
+
+        future_version = SCHEMA_VERSION + 1
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "UPDATE schema_version SET version = ?", (future_version,)
+            )
+        before = self._snapshot(db_path)
+
+        init_schema = mock.Mock(side_effect=AssertionError("schema init ran"))
+        monkeypatch.setattr(SessionDB, "_init_schema", init_schema)
+
+        with pytest.raises(IncompatibleSchemaError) as raised:
+            SessionDB(db_path=db_path)
+
+        assert raised.value.database_version == future_version
+        assert raised.value.supported_version == SCHEMA_VERSION
+        init_schema.assert_not_called()
+        assert self._snapshot(db_path) == before
 
 
 class TestReconcileColumnsErrorHandling:

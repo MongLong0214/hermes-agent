@@ -171,6 +171,18 @@ class SessionExportTooLargeError(ValueError):
         )
 
 
+class IncompatibleSchemaError(RuntimeError):
+    """The state DB was upgraded beyond this runtime's supported schema."""
+
+    def __init__(self, database_version: int, supported_version: int):
+        self.database_version = database_version
+        self.supported_version = supported_version
+        super().__init__(
+            "state database schema version "
+            f"{database_version} is newer than supported version {supported_version}"
+        )
+
+
 _COMPRESSION_LOCK_HOLDER_PID_RE = re.compile(r"(?:^|:)pid=(\d+)(?::|$)")
 
 
@@ -3976,6 +3988,36 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         except Exception:
             logger.debug("Could not close a SessionDB connection", exc_info=True)
 
+    def ensure_compatible_schema(self) -> None:
+        """Fail closed when the open store has a newer schema than this code.
+
+        This query intentionally runs before writable-open setup and may be
+        called again at a turn boundary. A long-lived connection otherwise
+        keeps running old code after a sibling runtime upgrades the shared DB.
+        An absent ``schema_version`` table is an uninitialized store, which the
+        ordinary schema initializer owns.
+        """
+        with self._lock:
+            try:
+                row = self._conn.execute(
+                    "SELECT version FROM schema_version LIMIT 1"
+                ).fetchone()
+            except sqlite3.OperationalError as exc:
+                if "no such table: schema_version" in str(exc).lower():
+                    return
+                raise
+
+            if row is None:
+                return
+            database_version = (
+                row["version"] if isinstance(row, sqlite3.Row) else row[0]
+            )
+            if int(database_version) > SCHEMA_VERSION:
+                raise IncompatibleSchemaError(
+                    database_version=int(database_version),
+                    supported_version=SCHEMA_VERSION,
+                )
+
     def __init__(self, db_path: Path = None, read_only: bool = False):
         self.db_path = db_path or _default_db_path()
         # Fail hard (before any connection/pragma/mkdir) if a pytest-context
@@ -4094,6 +4136,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     isolation_level=None,
                 )
                 self._conn.row_factory = sqlite3.Row
+                self.ensure_compatible_schema()
                 # FTS capability flags normally come from writable schema
                 # initialisation. Probe existing virtual tables with SELECTs
                 # only so read-only search keeps its FTS and trigram paths.
@@ -4180,6 +4223,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     isolation_level=None,
                 )
                 self._conn.row_factory = sqlite3.Row
+                self.ensure_compatible_schema()
                 self._wal_active = (
                     apply_wal_with_fallback(self._conn, db_label="state.db") == "wal"
                 )
