@@ -36,12 +36,16 @@ Concurrency contract
 --------------------
 The registry is not advisory bookkeeping -- it is the guard, so the
 check and the byte read must be **atomic with respect to connection
-lifecycle**. ``_live_lock`` is therefore held across three critical sections,
-each of which spans the syscall *and* the registry mutation:
+lifecycle**. ``_live_lock`` is therefore held across the two critical
+sections that can create a raw-descriptor race:
 
 * open + register (:func:`connect_tracked`)
-* close + unregister (:meth:`TrackedConnection.close`)
 * check + ``open``/``read``/``close`` (:func:`read_header_bytes_preopen`)
+
+Successful close unregisters only afterwards. This is conservatively safe:
+the registry can briefly report a closed descriptor as live, but can never
+report a live descriptor as absent. It must not hold ``_live_lock`` while a
+serialized connection waits for its own lock.
 
 Without that, a thread could pass the "no live connection" check, a second
 thread could open a connection and take a write lock, and the first thread's
@@ -107,7 +111,13 @@ def _canonical_db_path(conn: sqlite3.Connection) -> Optional[str]:
     byte-probed and therefore need no tracking.
     """
     try:
-        row = conn.execute("PRAGMA database_list").fetchone()
+        # ``connect_tracked`` holds _live_lock while it establishes the
+        # registration.  Bypass an optional connection wrapper here: taking a
+        # per-connection serial lock while holding _live_lock reverses the
+        # callback-reachable serial -> live order.  This first-open probe runs
+        # before Hermes registers Python UDFs on the connection.
+        cursor = sqlite3.Connection.execute(conn, "PRAGMA database_list")
+        row = sqlite3.Cursor.fetchone(cursor)
     except sqlite3.Error:
         return None
     if not row or len(row) < 3:
@@ -152,16 +162,31 @@ class _TrackingMixin:
     _hermes_tracked_path: str | None = None
 
     def close(self) -> None:  # type: ignore[misc]
+        path = getattr(self, "_hermes_tracked_path", None)
+        # Do not take _live_lock before this call.  A serialized Connection
+        # may wait for its per-connection RLock here, while Python callbacks
+        # from an in-flight SQLite operation legitimately ask the registry a
+        # serial -> live question.  Holding live -> serial would deadlock.
+        #
+        # The entry remains tracked until after close succeeds, so the guard
+        # is conservative during the small post-close window: a raw probe can
+        # be refused too long, but it can never be allowed while the FD lives.
+        # A failure deliberately leaves the attribute and count untouched.
+        super().close()  # type: ignore[misc]
+        if path is None:
+            return
         with _live_lock:
-            path = getattr(self, "_hermes_tracked_path", None)
-            # Close first; untrack only once the descriptor is actually gone.
-            # Untracking before a failing close (e.g. cross-thread
-            # ProgrammingError) leaves the FD open while the byte-probe
-            # guard thinks nothing is live — see #75629.
-            super().close()  # type: ignore[misc]
-            if path is not None:
-                self._hermes_tracked_path = None
-                untrack_connection(path)
+            # Two concurrent/double close calls can both observe ``path``
+            # before SQLite closes.  Only the first successful closer gets to
+            # consume this connection's tracking count.
+            if getattr(self, "_hermes_tracked_path", None) != path:
+                return
+            self._hermes_tracked_path = None
+            remaining = _live_connections.get(path, 0) - 1
+            if remaining > 0:
+                _live_connections[path] = remaining
+            else:
+                _live_connections.pop(path, None)
 
 
 class TrackedConnection(_TrackingMixin, sqlite3.Connection):
@@ -173,11 +198,13 @@ class TrackedConnection(_TrackingMixin, sqlite3.Connection):
     method every close path must go through — keeps the registry from
     drifting upward and permanently disabling byte-probes.
 
-    The real ``close()`` and the unregister happen together under
-    ``_live_lock`` so a concurrent probe can never observe "no live
-    connection" while this descriptor is still open. Unregister runs only
-    after ``close()`` succeeds; a raising close leaves the connection
-    tracked so the byte-probe guard keeps refusing.
+    Unregister runs only after ``close()`` succeeds; a raising close leaves
+    the connection tracked so the byte-probe guard keeps refusing. There is
+    deliberately no ``_live_lock`` around the SQLite close: a serialized
+    close may wait for the per-connection lock, and callback code acquires
+    those locks in the opposite (serial -> live) order. The brief window after
+    a successful close remains conservatively tracked, so a probe can never
+    observe "no live connection" while the descriptor is still open.
 
     Note ``with conn:`` does NOT close a sqlite3 connection (it only commits or
     rolls back), so this hook is not fired spuriously by transaction scopes.
@@ -245,6 +272,12 @@ def connect_tracked(
     with _live_lock:
         conn = opener(str(path), **kwargs)
         try:
+            if not isinstance(conn, sqlite3.Connection):
+                raise UntrackableConnectionError(
+                    "SQLite opener returned "
+                    f"{type(conn).__name__}, not a sqlite3.Connection; "
+                    "byte-probe safety cannot be tracked"
+                )
             resolved = (
                 _key(tracking_path)
                 if tracking_path is not None
