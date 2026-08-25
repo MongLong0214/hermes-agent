@@ -3767,6 +3767,15 @@ def compress_context(
                                 "_proactive_prune_rearm_tokens"
                             ]
                         )
+                    # ``compress()`` counts its completed summary before the
+                    # durable rotation publishes. This attempt never crossed
+                    # that boundary, so retain its aborted telemetry but do
+                    # not leave the live parent claiming a compression it did
+                    # not commit.
+                    if "compression_count" in _compressor_attempt_snapshot:
+                        agent.context_compressor.compression_count = (
+                            _compressor_attempt_snapshot["compression_count"]
+                        )
                 split_status = (
                     "aborted"
                     if locals().get("old_session_id") is None and not in_place
@@ -3793,6 +3802,9 @@ def compress_context(
         _is_boundary = bool(_old_sid) or in_place
         _context_engine_boundary_committed = _session_commit_succeeded and (
             bool(_old_sid) or compacted_in_place
+        )
+        _compression_boundary_committed = (
+            not agent._session_db or _session_commit_succeeded
         )
         _boundary_parent = _old_sid or agent.session_id or ""
 
@@ -3864,20 +3876,21 @@ def compress_context(
         # not just CLI stdout. _emit_status still _vprints for the CLI, and
         # storing it on _compression_warning lets replay_compression_warning
         # re-deliver it once a late-bound gateway status_callback is wired (#36908).
-        _cc = agent.context_compressor.compression_count
-        if _cc >= 2:
-            _cc_msg = (
-                f"{agent.log_prefix}⚠️  Session compressed {_cc} times — "
-                f"accuracy may degrade. Consider /new to start fresh."
-            )
-            agent._compression_warning = _cc_msg
-            agent._emit_status(_cc_msg)
+        if _compression_boundary_committed:
+            _cc = agent.context_compressor.compression_count
+            if _cc >= 2:
+                _cc_msg = (
+                    f"{agent.log_prefix}⚠️  Session compressed {_cc} times — "
+                    f"accuracy may degrade. Consider /new to start fresh."
+                )
+                agent._compression_warning = _cc_msg
+                agent._emit_status(_cc_msg)
 
         # Emit session:compress event so hooks (e.g. MemPalace sync) can ingest
         # the completed old session before its details are lost. In in-place mode
         # there is no old id (same session); ``in_place=True`` tells hooks the
         # transcript was compacted on the same id rather than rotated.
-        if getattr(agent, "event_callback", None):
+        if _compression_boundary_committed and getattr(agent, "event_callback", None):
             try:
                 agent.event_callback("session:compress", {
                     "platform": agent.platform or "",
@@ -3896,58 +3909,59 @@ def compress_context(
         agent._last_compression_attempt_in_place = compacted_in_place
         agent._last_compaction_in_place = compacted_in_place
 
-        # Keep the post-compression rough estimate for diagnostics, but do not
-        # treat it as provider-reported prompt usage. Schema-heavy rough estimates
-        # can remain above threshold even after the next real API request fits.
-        _compressed_est = estimate_request_tokens_rough(
-            compressed,
-            system_prompt=new_system_prompt or "",
-            tools=agent.tools or None,
-        )
-        agent.context_compressor.last_compression_rough_tokens = _compressed_est
-        agent.context_compressor.last_prompt_tokens = -1
-        agent.context_compressor.last_completion_tokens = 0
-        agent.context_compressor.awaiting_real_usage_after_compression = True
-        # Arm the effectiveness verdict only after a completed rewrite crosses
-        # the full compaction boundary. Exceptions, aborts, and no-op attempts
-        # leave this false, so unrelated later usage cannot be charged to an
-        # attempt that never changed the transcript.
-        if _compression_made_progress:
-            record_boundary = getattr(
-                type(agent.context_compressor),
-                "record_completed_compaction",
-                None,
+        if _compression_boundary_committed:
+            # Keep the post-compression rough estimate for diagnostics, but do not
+            # treat it as provider-reported prompt usage. Schema-heavy rough estimates
+            # can remain above threshold even after the next real API request fits.
+            _compressed_est = estimate_request_tokens_rough(
+                compressed,
+                system_prompt=new_system_prompt or "",
+                tools=agent.tools or None,
             )
-            if callable(record_boundary):
-                record_boundary(
-                    agent.context_compressor,
-                    used_fallback=_compression_used_fallback,
-                    feasibility_skip=_compression_feasibility_skip,
+            agent.context_compressor.last_compression_rough_tokens = _compressed_est
+            agent.context_compressor.last_prompt_tokens = -1
+            agent.context_compressor.last_completion_tokens = 0
+            agent.context_compressor.awaiting_real_usage_after_compression = True
+            # Arm the effectiveness verdict only after a completed rewrite crosses
+            # the full compaction boundary. Exceptions, aborts, and no-op attempts
+            # leave this false, so unrelated later usage cannot be charged to an
+            # attempt that never changed the transcript.
+            if _compression_made_progress:
+                record_boundary = getattr(
+                    type(agent.context_compressor),
+                    "record_completed_compaction",
+                    None,
                 )
-            else:
-                agent.context_compressor._verify_compaction_cleared_threshold = True
+                if callable(record_boundary):
+                    record_boundary(
+                        agent.context_compressor,
+                        used_fallback=_compression_used_fallback,
+                        feasibility_skip=_compression_feasibility_skip,
+                    )
+                else:
+                    agent.context_compressor._verify_compaction_cleared_threshold = True
 
-        # Clear the file-read dedup cache.  After compression the original
-        # read content is summarised away — if the model re-reads the same
-        # file it needs the full content, not a "file unchanged" stub.
-        try:
-            from tools.file_tools import reset_file_dedup
-            reset_file_dedup(task_id)
-        except Exception:
-            pass
-        # Same for the skill_view repeat-view dedup: a post-compression
-        # re-view must return the full skill content again.
-        try:
-            from tools.skills_tool import reset_skill_view_dedup
-            reset_skill_view_dedup(task_id)
-        except Exception:
-            pass
+            # Clear the file-read dedup cache.  After compression the original
+            # read content is summarised away — if the model re-reads the same
+            # file it needs the full content, not a "file unchanged" stub.
+            try:
+                from tools.file_tools import reset_file_dedup
+                reset_file_dedup(task_id)
+            except Exception:
+                pass
+            # Same for the skill_view repeat-view dedup: a post-compression
+            # re-view must return the full skill content again.
+            try:
+                from tools.skills_tool import reset_skill_view_dedup
+                reset_skill_view_dedup(task_id)
+            except Exception:
+                pass
 
-        logger.info(
-            "context compression done: session=%s messages=%d->%d rough_tokens=~%s awaiting_real_usage=true",
-            agent.session_id or "none", _pre_msg_count, len(compressed),
-            f"{_compressed_est:,}",
-        )
+            logger.info(
+                "context compression done: session=%s messages=%d->%d rough_tokens=~%s awaiting_real_usage=true",
+                agent.session_id or "none", _pre_msg_count, len(compressed),
+                f"{_compressed_est:,}",
+            )
         _commit_status = "committed" if split_status in {"not_applicable", "in_place_committed", "rotated_committed"} else "aborted"
         _emit_compression_attempt_telemetry(
             agent,

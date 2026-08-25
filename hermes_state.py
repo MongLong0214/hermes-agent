@@ -8867,6 +8867,143 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             raise ValueError(f"invalid automatic title source: {source!r}")
         return self._set_session_title(session_id, title, source=source)
 
+    def set_auto_title_for_attempt(
+        self,
+        originating_session_id: str,
+        title: str,
+        *,
+        source: str,
+        expected_title: Optional[str],
+        expected_source: Optional[str],
+    ) -> bool:
+        """Conditionally persist a background title on its live attempt target.
+
+        An automatic title worker can outlive compression of the segment that
+        started it.  Resolve that segment's live compression continuation and
+        require the derived title captured by the originating attempt in the
+        SAME transaction as the LLM upgrade.  This leaves a worker that races a
+        manual title, another LLM result, or a non-compression close with no
+        target it may safely mutate.
+        """
+        if source not in (self.TITLE_SOURCE_DERIVED, self.TITLE_SOURCE_LLM):
+            raise ValueError(f"invalid automatic title source: {source!r}")
+        title = self.sanitize_title(title)
+        if not title:
+            return False
+        if expected_title is None:
+            if expected_source is not None:
+                return False
+        elif expected_source != self.TITLE_SOURCE_DERIVED:
+            return False
+
+        def _resolve_live_target(conn) -> Optional[str]:
+            current = originating_session_id
+            seen = {current} if current else set()
+            for _ in range(100):
+                row = conn.execute(
+                    "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
+                    (current,),
+                ).fetchone()
+                if row is None:
+                    return None
+                if row["ended_at"] is None:
+                    return current
+                if row["end_reason"] != "compression":
+                    return None
+                children = conn.execute(
+                    """
+                    SELECT child.id
+                    FROM sessions AS parent
+                    JOIN sessions AS child ON child.parent_session_id = parent.id
+                    WHERE parent.id = ?
+                      AND parent.end_reason = 'compression'
+                      AND json_extract(COALESCE(child.model_config, '{}'),
+                                       '$._branched_from') IS NULL
+                      AND json_extract(COALESCE(child.model_config, '{}'),
+                                       '$._delegate_from') IS NULL
+                      AND COALESCE(child.source, '') != 'tool'
+                    ORDER BY child.started_at ASC, child.id ASC
+                    LIMIT 2
+                    """,
+                    (current,),
+                ).fetchall()
+                if len(children) != 1:
+                    return None
+                child_id = children[0]["id"]
+                if not child_id or child_id in seen:
+                    return None
+                seen.add(child_id)
+                current = child_id
+            return None
+
+        def _do(conn):
+            target_id = _resolve_live_target(conn)
+            if target_id is None:
+                return 0
+            current = conn.execute(
+                "SELECT title, title_source, ended_at FROM sessions WHERE id = ?",
+                (target_id,),
+            ).fetchone()
+            if current is None or current["ended_at"] is not None:
+                return 0
+            if expected_title is None:
+                # A collision-declined instant title can still title an active
+                # origin later, but it has no derived identity to carry across
+                # a compression boundary.
+                if (
+                    target_id != originating_session_id
+                    or current["title"] is not None
+                    or current["title_source"] is not None
+                ):
+                    return 0
+            elif (
+                current["title"] != expected_title
+                or current["title_source"] != expected_source
+            ):
+                return 0
+
+            if (
+                current["title"] is not None
+                and self._title_rank(current["title_source"])
+                >= self._title_rank(source)
+            ):
+                return 0
+
+            conflict = conn.execute(
+                "SELECT id FROM sessions WHERE title = ? AND id != ?",
+                (title, target_id),
+            ).fetchone()
+            if conflict:
+                conflict_id = conflict["id"]
+                if self._is_compression_ancestor(
+                    conn, ancestor_id=conflict_id, descendant_id=target_id
+                ):
+                    conn.execute(
+                        "UPDATE sessions SET title = NULL, title_source = NULL "
+                        "WHERE id = ?",
+                        (conflict_id,),
+                    )
+                else:
+                    raise ValueError(
+                        f"Title '{title}' is already in use by session {conflict_id}"
+                    )
+
+            cursor = conn.execute(
+                "UPDATE sessions SET title = ?, title_source = ? "
+                "WHERE id = ? AND ended_at IS NULL AND title IS ? "
+                "AND title_source IS ?",
+                (
+                    title,
+                    source,
+                    target_id,
+                    current["title"],
+                    current["title_source"],
+                ),
+            )
+            return cursor.rowcount
+
+        return bool(self._execute_write(_do))
+
     def set_auto_title_if_empty(self, session_id: str, title: str) -> bool:
         """Back-compat shim: set an LLM title only if nothing better exists.
 

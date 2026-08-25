@@ -290,6 +290,7 @@ class TestMaybeAutoTitle:
                 main_runtime=None,
                 title_callback=None,
                 runtime_validator=None,
+                expected_derived_title="hello",
             )
 
     def test_writes_instant_title_before_the_model_runs(self, tmp_path):
@@ -681,6 +682,102 @@ class TestTitleAttemptEligibility:
 
         assert threads == []
         generate_title.assert_not_called()
+
+    def test_paused_worker_upgrades_only_live_compression_child(
+        self, tmp_path, monkeypatch
+    ):
+        """A generation finishing after rotation cannot retitle its ended parent."""
+        db = SessionDB(tmp_path / "state.db")
+        parent = "title-worker-parent"
+        child = "title-worker-child"
+        user_message = "fix title worker compression race"
+        db.create_session(session_id=parent, source="cli")
+        threads = self._capture_threads(monkeypatch)
+        generation_started = threading.Event()
+        release_generation = threading.Event()
+
+        def _generate(_message, **_kwargs):
+            generation_started.set()
+            assert release_generation.wait(timeout=10), "title worker was not released"
+            return "Fix title worker compression race safely"
+
+        with patch(
+            "agent.title_generator.generate_title", side_effect=_generate
+        ), patch(
+            "agent.title_generator._auto_title_enabled", return_value=True
+        ):
+            maybe_auto_title(db, parent, user_message, [])
+            derived_title = db.get_session_title(parent)
+            assert db.get_session_title_source(parent) == SessionDB.TITLE_SOURCE_DERIVED
+            assert generation_started.wait(timeout=10), "title worker never started"
+
+            db.publish_compression_child(
+                parent_session_id=parent,
+                child_session_id=child,
+                source="cli",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": "[CONTEXT COMPACTION] durable handoff",
+                    }
+                ],
+                system_prompt="sys",
+                require_compression_lease=False,
+            )
+            release_generation.set()
+            self._join_threads(threads)
+
+        parent_row = db.get_session(parent)
+        child_row = db.get_session(child)
+        assert parent_row["ended_at"] is not None
+        assert parent_row["end_reason"] == "compression"
+        assert parent_row["title"] is None
+        assert parent_row["title_source"] is None
+        assert child_row["title"] == "Fix title worker compression race safely"
+        assert child_row["title_source"] == SessionDB.TITLE_SOURCE_LLM
+        assert derived_title != child_row["title"]
+
+    @pytest.mark.parametrize(
+        ("replacement", "replacement_source"),
+        [
+            ("Manual title wins", SessionDB.TITLE_SOURCE_USER),
+            ("Concurrent LLM title wins", SessionDB.TITLE_SOURCE_LLM),
+        ],
+    )
+    def test_stale_worker_refuses_changed_title_provenance(
+        self, tmp_path, monkeypatch, replacement, replacement_source
+    ):
+        """A worker captures derived provenance, not permission to overwrite."""
+        db = SessionDB(tmp_path / "state.db")
+        session_id = f"stale-title-{replacement_source}"
+        db.create_session(session_id=session_id, source="cli")
+        threads = self._capture_threads(monkeypatch)
+        generation_started = threading.Event()
+        release_generation = threading.Event()
+
+        def _generate(_message, **_kwargs):
+            generation_started.set()
+            assert release_generation.wait(timeout=10), "title worker was not released"
+            return "Stale LLM title must not win"
+
+        with patch(
+            "agent.title_generator.generate_title", side_effect=_generate
+        ), patch(
+            "agent.title_generator._auto_title_enabled", return_value=True
+        ):
+            maybe_auto_title(db, session_id, "resolve stale title race", [])
+            assert generation_started.wait(timeout=10), "title worker never started"
+            if replacement_source == SessionDB.TITLE_SOURCE_USER:
+                db.set_session_title(session_id, replacement)
+            else:
+                db.set_auto_title(
+                    session_id, replacement, source=SessionDB.TITLE_SOURCE_LLM
+                )
+            release_generation.set()
+            self._join_threads(threads)
+
+        assert db.get_session_title(session_id) == replacement
+        assert db.get_session_title_source(session_id) == replacement_source
 
     @pytest.mark.parametrize("compression_child", [False, True])
     def test_fresh_untitled_same_attempt_upgrades(

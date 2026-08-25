@@ -852,6 +852,62 @@ class TestCompressionTitlePublicationTransaction:
             ).fetchall()
         return [row["id"] for row in rows]
 
+    def test_aborted_title_publication_restores_count_without_success_event(
+        self, tmp_path: Path
+    ):
+        """A real caller rollback cannot advertise an uncommitted compression."""
+        db = SessionDB(db_path=tmp_path / "state.db")
+        parent = "PARENT_ABORTED_COUNT"
+        title = "Derived title with late publication failure"
+        db.create_session(parent, source="cli")
+        db.set_auto_title(parent, title, source=SessionDB.TITLE_SOURCE_DERIVED)
+        agent = _build_agent_with_db(db, parent, platform="cli")
+        compressor = _bound_context_compressor(db, parent)
+        compressor.compression_count = 3
+
+        def _successful_compress(*_args, **_kwargs):
+            compressor.compression_count += 1
+            compressor._last_compression_made_progress = True
+            return [
+                {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
+                {"role": "user", "content": "tail"},
+            ]
+
+        compressor.compress = _successful_compress
+        agent.context_compressor = compressor
+        success_events = []
+        agent.event_callback = lambda name, payload: success_events.append((name, payload))
+        db._execute_write(
+            lambda conn: conn.execute(
+                """
+                CREATE TEMP TRIGGER c5_s6_aborted_count_title_transfer
+                BEFORE UPDATE OF title ON sessions
+                WHEN OLD.id = 'PARENT_ABORTED_COUNT'
+                  AND OLD.title IS 'Derived title with late publication failure'
+                  AND EXISTS (
+                      SELECT 1 FROM sessions AS child
+                      WHERE child.parent_session_id = OLD.id
+                  )
+                BEGIN
+                    SELECT RAISE(ABORT, 'c5_s6_aborted_count_title_transfer');
+                END
+                """
+            )
+        )
+
+        original = _msgs()
+        returned, _ = agent._compress_context(original, "sys", approx_tokens=120_000)
+
+        parent_row = db.get_session(parent)
+        assert returned is original
+        assert agent.session_id == parent
+        assert db.find_live_compression_child(parent) is None
+        assert parent_row["ended_at"] is None
+        assert parent_row["title"] == title
+        assert compressor.compression_count == 3
+        assert compressor.awaiting_real_usage_after_compression is False
+        assert success_events == []
+
     def test_title_transfer_failure_after_child_publish_aborts_atomically(
         self, tmp_path: Path, caplog
     ):
