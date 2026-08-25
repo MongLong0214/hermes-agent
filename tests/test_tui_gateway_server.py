@@ -19907,3 +19907,565 @@ def test_workspace_move_rehomes_running_session(monkeypatch, tmp_path):
     assert captured["row_update"] == (target, str(new_cwd))
     assert live["cwd"] == str(new_cwd)
     assert live.get("explicit_cwd") is True
+
+
+def test_session_branch_mid_turn_reuses_parent_agent_connection(monkeypatch, tmp_path):
+    """session.branch, invoked while the parent's own turn is in flight, must
+    reuse the running agent's already-open profile SessionDB connection
+    instead of opening a competing one (R-3).
+
+    A second `SessionDB` bound to the same state.db file contends for
+    SQLite's real file-level write lock against the caller's OWN in-flight
+    turn: two distinct connection objects can't tell they share this
+    process, so the contended write times out and — per hermes_state.py's
+    `_execute_write` — is reported as "another Hermes process held the
+    state.db write lock", misattributing this process's own turn to a
+    foreign one. Reusing `agent._session_db` (the same fallback pattern
+    already used elsewhere in this module for the model-switch marker)
+    avoids opening that second connection at all.
+    """
+    import sqlite3
+
+    profile_home = tmp_path / "profiles" / "mlperf"
+    profile_home.mkdir(parents=True)
+    seen: dict = {"fresh_db_calls": 0}
+
+    class FreshProfileDB:
+        """Stands in for the SECOND connection `_session_db()` would open —
+        exactly the connection that would race the parent's own in-flight
+        turn for the real SQLite write lock."""
+
+        def __init__(self, db_path=None):
+            seen["fresh_db_opened"] = True
+
+        def create_session(self, *a, **k):
+            seen["fresh_db_calls"] += 1
+            # The real failure text hermes_state.py's `_execute_write` emits
+            # once write-patience is exhausted contending against a SECOND
+            # connection to the same file — verbatim, not invented, so this
+            # test is grounded in the actual production misattribution.
+            raise sqlite3.OperationalError(
+                "database is locked (another Hermes process held the "
+                "state.db write lock for over 20s -- likely a long "
+                "maintenance operation such as VACUUM, a large WAL "
+                "checkpoint, or an older pre-update process; the database "
+                "itself is healthy)"
+            )
+
+        def get_session_title(self, _key):
+            return "parent"
+
+        session_turn_lease = _stub_session_turn_lease
+
+        def close(self):
+            pass
+
+    class AgentOwnDB:
+        """Stands in for the connection the parent's OWN in-flight turn
+        already holds open (`agent._session_db`) — reusing it must resolve
+        the write in-process instead of racing a fresh connection."""
+
+        def get_session_title(self, _key):
+            return "parent"
+
+        def get_next_title_in_lineage(self, current):
+            return f"{current} (branch)"
+
+        def create_session(self, new_key, **kwargs):
+            seen["created"] = new_key
+            seen["parent"] = kwargs.get("parent_session_id")
+
+        def append_messages_batch(self, session_id, messages, **kwargs):
+            seen.setdefault("msgs", [])
+            for m in messages:
+                seen["msgs"].append(dict(m, session_id=session_id))
+            return list(range(1, len(messages) + 1))
+
+        def set_session_title(self, key, title):
+            seen["title"] = (key, title)
+            return True
+
+        def get_session(self, key):
+            return {"id": key, "cwd": str(tmp_path)}
+
+        def update_session_cwd(self, *a, **k):
+            return None
+
+        session_turn_lease = _stub_session_turn_lease
+
+    class ParentAgent:
+        def __init__(self):
+            self._session_db = AgentOwnDB()
+
+    class ChildAgent:
+        """Returned by the mocked `_make_agent` for the branched session's
+        own (unrelated) agent build — mirrors the existing branch tests'
+        `FakeAgent`, deliberately WITHOUT a `_session_db` attribute."""
+
+        def __init__(self):
+            self.model = "test-model"
+            self.session_id = None
+
+    parent = {
+        "session_key": "parent-key",
+        "history": [{"role": "user", "content": "hi"}],
+        "history_lock": threading.Lock(),
+        "running": True,  # the caller's own turn is in flight
+        "cols": 80,
+        "profile_home": str(profile_home),
+        "source": "tui",
+        "agent": ParentAgent(),
+        "created_at": 1.0,
+        "last_active": 1.0,
+        "cwd": str(tmp_path),
+    }
+    server._sessions["parent"] = parent
+    monkeypatch.setattr(
+        server,
+        "_get_db",
+        lambda: (_ for _ in ()).throw(AssertionError("must not touch the shared launch db")),
+    )
+    monkeypatch.setattr("hermes_state.SessionDB", FreshProfileDB)
+    monkeypatch.setattr(server, "_claim_active_session_slot", lambda *a, **k: (None, None))
+    monkeypatch.setattr(server, "_make_agent", lambda *a, **k: ChildAgent())
+    monkeypatch.setattr(server, "_set_session_context", lambda *a, **k: {})
+    monkeypatch.setattr(server, "_clear_session_context", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
+    monkeypatch.setattr(server, "_session_cwd", lambda s: str(tmp_path))
+    monkeypatch.setattr(server, "_register_session_cwd", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_attach_worker", lambda *a, **k: None)
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.branch",
+                "params": {"session_id": "parent", "name": "forked"},
+            }
+        )
+        assert "result" in resp, resp
+        # The branch must go through the parent's OWN open connection —
+        # never opening (or writing through) a second, competing one.
+        assert seen.get("fresh_db_calls", 0) == 0, (
+            "session.branch opened/used a competing SessionDB connection "
+            f"instead of reusing agent._session_db: {resp}"
+        )
+        assert seen.get("created")
+        assert seen.get("parent") == "parent-key"
+    finally:
+        for k in list(server._sessions):
+            server._sessions.pop(k, None)
+
+
+def test_prompt_submit_retries_branch_seed_in_timestamp_order(monkeypatch, tmp_path):
+    """A branch-seed retry driven by a real ``prompt.submit`` must persist
+    the seed in TIMESTAMP order, not in whatever order it happens to sit in
+    ``session["history"]`` (R-4).
+
+    ``_persist_branch_seed`` retries on every submit until it succeeds (see
+    the unset ``_branch_seed_persisted`` check). By the time of a later
+    retry, ``session["history"]`` can already hold this branch's OWN newer
+    turn ahead of the parent's (chronologically earlier) seed messages in
+    LIST order -- exactly the shape a reconcile/append artifact produces
+    once a deferred seed keeps failing past the branch's first turn.
+    ``append_messages_batch`` inserts strictly in list order, and
+    ``hermes_state.get_messages`` reads back strictly by AUTOINCREMENT id
+    (insertion order, not chronology) -- so an unsorted retry commits the
+    parent's earlier-in-time history AFTER the branch's own already-newer
+    turn, permanently corrupting the transcript's replayed/displayed order.
+    """
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    # The branch row's parent_session_id is a real FK -- the parent row
+    # must exist before _ensure_session_db_row can create the branch's own
+    # row inside prompt.submit's normal (unrelated) first step.
+    db.create_session("parent-key", source="tui")
+
+    class _NoThread:
+        """The async agent-run continuation is irrelevant here: the seed
+        retry runs synchronously, before prompt.submit even schedules it."""
+
+        def __init__(self, target=None, daemon=None, name=None):
+            self._target = target
+
+        def start(self):
+            pass
+
+    # session["history"] at retry time: this branch's OWN turn-1 exchange
+    # (newer timestamps) sits BEFORE the parent's seed (older timestamps)
+    # in LIST order -- the shape a reconcile/append artifact produces once
+    # a deferred seed retry runs after the branch's own first turn.
+    history = [
+        {"role": "user", "content": "branch turn 1", "timestamp": 2000.0},
+        {"role": "assistant", "content": "branch turn 1 reply", "timestamp": 2001.0},
+        {"role": "user", "content": "parent question", "timestamp": 1000.0},
+        {"role": "assistant", "content": "parent answer", "timestamp": 1001.0},
+    ]
+    session = _session(
+        session_key="branch-key",
+        parent_session_id="parent-key",
+        history=history,
+    )
+    server._sessions["retry-sid"] = session
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    monkeypatch.setattr(server, "_claim_active_session_slot", lambda *a, **k: (None, None))
+    monkeypatch.setattr(server, "_start_agent_build", lambda sid, session: None)
+    monkeypatch.setattr(server.threading, "Thread", _NoThread)
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {"session_id": "retry-sid", "text": "branch turn 2"},
+            }
+        )
+        assert (resp.get("result") or {}).get("status") == "streaming", resp
+
+        rows = db.get_messages("branch-key")
+        contents = [r["content"] for r in rows]
+        assert contents.index("parent question") < contents.index("branch turn 1"), (
+            "the retried branch seed landed AFTER this branch's own turn 1 "
+            f"instead of before it (row order: {contents})"
+        )
+        assert contents.index("parent answer") < contents.index("branch turn 1")
+    finally:
+        server._sessions.pop("retry-sid", None)
+        db.close()
+
+
+def test_profile_scoped_agent_build_fails_loudly_when_profile_db_unopenable(
+    monkeypatch, tmp_path
+):
+    """A profile-scoped rebuild that can't open ITS OWN profile's state.db
+    must fail the build (surfacing agent_error), not silently fall through
+    with ``session_db=None`` (R-3).
+
+    ``_make_agent``'s own default (``session_db if session_db is not None
+    else _get_db()``) exists so a NON-profile session can use the shared
+    launch db. But the build here is scoped to a profile — falling through
+    to that same default reuses the LAUNCH profile's (a different profile's)
+    db handle as if it were this profile's, and every turn from here on
+    mis-persists into the wrong profile's state.db instead of the build
+    failing where the real error is.
+    """
+    import threading
+    import uuid
+
+    profile_home = tmp_path / "profiles" / "wrongprofile"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "default"))
+
+    class _UnopenableSessionDB:
+        def __init__(self, *a, **k):
+            raise RuntimeError("simulated: profile state.db unopenable")
+
+    monkeypatch.setattr("hermes_state.SessionDB", _UnopenableSessionDB)
+
+    make_agent_calls = []
+    monkeypatch.setattr(
+        server,
+        "_make_agent",
+        lambda *a, **k: make_agent_calls.append(k) or pytest.fail(
+            "_make_agent must not be called once the profile's own db "
+            "failed to open — that's exactly when its session_db=None "
+            "default falls back to the launch (wrong) profile's db"
+        ),
+    )
+    monkeypatch.setattr("tui_gateway.entry.ensure_mcp_discovery_started", lambda: None)
+    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
+    monkeypatch.setattr(server, "_SlashWorker", lambda *args: None)
+    monkeypatch.setattr(server, "_attach_worker", lambda *args: None)
+    monkeypatch.setattr(server, "_config_model_target", lambda: ("", ""))
+    monkeypatch.setattr(server, "_start_notification_poller", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_schedule_mcp_late_refresh", lambda *a, **k: None)
+    events = []
+    monkeypatch.setattr(server, "_emit", lambda *a, **k: events.append((a, k)))
+
+    ready = threading.Event()
+    sid = f"test-wrongdb-sid-{uuid.uuid4().hex[:8]}"
+    session = {
+        "agent_ready": ready,
+        "session_key": f"test-wrongdb-key-{uuid.uuid4().hex[:8]}",
+        "profile_home": str(profile_home),
+    }
+
+    server._sessions[sid] = session
+    try:
+        server._start_agent_build(sid, session)
+        assert ready.wait(timeout=15), "agent_ready never set after failed build"
+        assert not make_agent_calls
+        assert session.get("agent_error"), (
+            "a profile db open failure must surface as agent_error, not "
+            "silently proceed to build an agent against the wrong profile's db"
+        )
+    finally:
+        server._sessions.pop(sid, None)
+
+
+def test_sess_nowait_rejects_a_session_flagged_closing(monkeypatch):
+    """``_sess_nowait`` (and therefore ``_sess``/``_sess_building``, which
+    both resolve through it) must not hand back a session that a concurrent
+    close has already flagged ``_closing`` (R-3).
+
+    ``_pop_session_by_id`` sets ``_closing`` and pops the session from
+    ``_sessions`` under ``_sessions_lock`` in the same critical section, but
+    ``_sess_nowait`` reads ``_sessions`` WITHOUT taking that lock — so a
+    caller mid-way through an ordinary handler (``image.attach``,
+    ``session.info``, ``session.branch``, ...) can resolve the very session
+    object a concurrent ``session.close`` is mid-teardown on, and keep
+    operating on it (e.g. a since-``.close()``'d agent) instead of getting a
+    clean "session not found". This reproduces under ordinary UI usage: a
+    user closes a session tab while another operation on it is in flight, not
+    just adversarially. Only 3 call sites in this file already re-check
+    ``_closing`` (the prompt-drain, prompt-submit and thread-start
+    checkpoints) — the common resolver every OTHER handler funnels through
+    never did.
+    """
+    server._sessions["closing-sid"] = {
+        "session_key": "closing-key",
+        "_closing": True,
+        "history_lock": threading.Lock(),
+    }
+    try:
+        s, err = server._sess_nowait({"session_id": "closing-sid"}, "rid-1")
+        assert s is None, (
+            "_sess_nowait handed back a session already flagged _closing by "
+            "a concurrent teardown instead of treating it as gone"
+        )
+        assert err is not None
+    finally:
+        server._sessions.pop("closing-sid", None)
+
+
+def test_coerce_seed_history_preserves_timestamp_for_ordering(monkeypatch, tmp_path):
+    """R-4 must fix the REAL path: session.create's ``messages`` param goes
+    through ``_coerce_seed_history`` before it ever reaches
+    ``_persist_branch_seed``. The client echoes back the same
+    ``{"text": ..., "timestamp": ...}`` shape ``_history_to_messages`` sent it
+    (the display projection), out of chronological order relative to list
+    position (e.g. a "fork from message N" client feature). If
+    ``_coerce_seed_history`` drops ``timestamp``, every seed message lands in
+    ``session["history"]`` with no ordering signal, and the sort added to
+    ``_persist_branch_seed`` for R-4 becomes a no-op on this path (a stable
+    sort over an all-zero key changes nothing) even though a unit test that
+    hand-builds ``session["history"]`` with timestamps already in place
+    would pass.
+    """
+    from hermes_state import SessionDB
+
+    # The raw wire payload for session.create's "messages" param: shaped like
+    # _history_to_messages' output (role/text/timestamp), and NOT in
+    # chronological order by list position -- the parent's earlier message
+    # sits after the later one in the list, exactly the shape a "fork from
+    # message N" / reorder-on-the-client artifact produces.
+    raw_messages = [
+        {"role": "assistant", "text": "parent answer", "timestamp": 1001.0},
+        {"role": "user", "text": "parent question", "timestamp": 1000.0},
+    ]
+
+    history = server._coerce_seed_history(raw_messages)
+    assert history[0].get("timestamp") == 1000.0 or history[1].get("timestamp") == 1000.0, (
+        "the coerced seed history must retain each message's timestamp so "
+        "_persist_branch_seed's sort has an ordering signal to sort by "
+        f"(coerced: {history})"
+    )
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("parent-key", source="tui")
+    db.create_session("branch-key", source="tui")
+    session = _session(
+        session_key="branch-key",
+        parent_session_id="parent-key",
+        history=history,
+    )
+    try:
+        monkeypatch.setattr(server, "_get_db", lambda: db)
+        server._persist_branch_seed(session)
+
+        rows = db.get_messages("branch-key")
+        contents = [r["content"] for r in rows]
+        assert contents.index("parent question") < contents.index("parent answer"), (
+            "the branch seed built from session.create's real messages param "
+            f"landed out of chronological order (row order: {contents})"
+        )
+    finally:
+        db.close()
+
+
+def test_session_branch_rechecks_closing_after_concurrent_close(monkeypatch, tmp_path):
+    """session.branch must not keep using the parent's agent/db handle once a
+    concurrent session.close has flagged the session ``_closing`` (R-3/R-4
+    gap left after ``_sess_nowait``'s own fix).
+
+    ``_sess_nowait`` only re-checks ``_closing`` under ``_sessions_lock`` at
+    the single instant it looks the session up; the lock is released the
+    moment it returns a handle. ``session.branch`` runs on the RPC thread
+    pool (``_LONG_HANDLERS``) and can sit in ``_sess()``'s ``_wait_agent``
+    wait for a while — plenty of room for a REAL concurrent ``session.close``
+    (a user closing the tab while the branch is in flight, ordinary usage,
+    not adversarial) to pop + tear the session down in between. Without a
+    recheck at the point of use, the handler goes on to call
+    ``create_session``/``append_messages_batch`` against the parent's own
+    ``agent._session_db`` — the very connection a real ``close`` would have
+    already closed — producing a low-level "closed database" crash instead
+    of the clean "session not found" every other close-race checkpoint in
+    this file already gives (prompt-drain, prompt-submit, thread-start).
+
+    This test creates GENUINE thread interleaving: the handler runs on its
+    own real thread and actually blocks inside ``_wait_agent``'s
+    ``Event.wait()``; the main thread only proceeds to pop/mark-closed the
+    session once it has observed (via a second, independent Event) that the
+    handler thread is really parked there — not a hand-set ``_closing`` flag
+    on an otherwise-idle dict.
+    """
+    import sqlite3
+
+    profile_home = tmp_path / "profiles" / "mlperf"
+    profile_home.mkdir(parents=True)
+    seen: dict = {}
+
+    class AgentOwnDB:
+        """The parent's own already-open profile connection. ``closed``
+        flips true at the moment the test's simulated concurrent close would
+        have really closed it (mirrors ``agent.close()`` -> sqlite conn
+        close in production)."""
+
+        def __init__(self):
+            self.closed = False
+
+        def get_session_title(self, _key):
+            return "parent"
+
+        def get_next_title_in_lineage(self, current):
+            return f"{current} (branch)"
+
+        def create_session(self, new_key, **kwargs):
+            if self.closed:
+                raise sqlite3.ProgrammingError(
+                    "Cannot operate on a closed database."
+                )
+            seen["created"] = new_key
+            seen["parent"] = kwargs.get("parent_session_id")
+
+        def append_messages_batch(self, session_id, messages, **kwargs):
+            if self.closed:
+                raise sqlite3.ProgrammingError(
+                    "Cannot operate on a closed database."
+                )
+            seen.setdefault("msgs", [])
+            for m in messages:
+                seen["msgs"].append(dict(m, session_id=session_id))
+            return list(range(1, len(messages) + 1))
+
+        def set_session_title(self, key, title):
+            if self.closed:
+                raise sqlite3.ProgrammingError(
+                    "Cannot operate on a closed database."
+                )
+            seen["title"] = (key, title)
+            return True
+
+    class ParentAgent:
+        def __init__(self, db):
+            self._session_db = db
+
+    class _SignalingReadyEvent:
+        """Stands in for ``session["agent_ready"]``. Records, via a SEPARATE
+        real ``Event``, the instant a waiter genuinely parks in ``.wait()``
+        so the main thread can interleave a real concurrent close exactly
+        there — not before the handler thread has actually reached it."""
+
+        def __init__(self):
+            self._real = threading.Event()
+            self.waiter_parked = threading.Event()
+
+        def is_set(self):
+            return self._real.is_set()
+
+        def wait(self, timeout=None):
+            self.waiter_parked.set()
+            return self._real.wait(timeout=timeout)
+
+        def set(self):
+            self._real.set()
+
+    own_db = AgentOwnDB()
+    parent = {
+        "session_key": "parent-key",
+        "history": [{"role": "user", "content": "hi"}],
+        "history_lock": threading.Lock(),
+        "running": False,
+        "cols": 80,
+        "profile_home": str(profile_home),
+        "source": "tui",
+        "agent": ParentAgent(own_db),
+        "created_at": 1.0,
+        "last_active": 1.0,
+        "cwd": str(tmp_path),
+        # Pre-armed so _start_agent_build's lock section short-circuits
+        # without spawning a real build thread; _wait_agent then genuinely
+        # blocks on our signaling event below, exactly like a slow deferred
+        # build the branch call arrived mid-way through.
+        "agent_build_started": True,
+        "agent_ready": _SignalingReadyEvent(),
+    }
+    server._sessions["parent"] = parent
+    monkeypatch.setattr(
+        server,
+        "_get_db",
+        lambda: (_ for _ in ()).throw(AssertionError("must not touch the shared launch db")),
+    )
+    monkeypatch.setattr(
+        "hermes_state.SessionDB",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("must not open a fresh profile db — reuse agent._session_db")
+        ),
+    )
+    monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
+
+    result_holder: list = []
+
+    def _run_branch():
+        result_holder.append(
+            server.handle_request(
+                {
+                    "id": "1",
+                    "method": "session.branch",
+                    "params": {"session_id": "parent", "name": "forked"},
+                }
+            )
+        )
+
+    handler_thread = threading.Thread(target=_run_branch, daemon=True)
+    try:
+        handler_thread.start()
+        assert parent["agent_ready"].waiter_parked.wait(timeout=5), (
+            "session.branch never reached _wait_agent — test setup didn't "
+            "create the interleave window it needs"
+        )
+        # A REAL concurrent close: same atomic pop+flag production uses.
+        popped = server._pop_session_by_id("parent")
+        assert popped is parent
+        # Mirrors agent.close() actually closing the sqlite connection the
+        # branch handler is still holding a reference to.
+        own_db.closed = True
+        # Let the handler's _wait_agent wake up and continue past its wait.
+        parent["agent_ready"].set()
+        handler_thread.join(timeout=5)
+        assert not handler_thread.is_alive(), "session.branch handler hung"
+        assert result_holder, "session.branch produced no response"
+        resp = result_holder[0]
+        error = (resp or {}).get("error") or {}
+        assert error.get("code") == 4001, (
+            "session.branch must reject with a clean 'session not found' "
+            "once _wait_agent returns into an already-_closing session, "
+            f"instead of touching the torn-down agent/db handle: {resp}"
+        )
+        assert "created" not in seen, (
+            "session.branch called create_session on the parent's own "
+            "connection AFTER a concurrent close had already torn it down "
+            f"— it must recheck _closing before touching it: {resp}"
+        )
+    finally:
+        for k in list(server._sessions):
+            server._sessions.pop(k, None)
