@@ -5068,6 +5068,7 @@ class GatewaySlashCommandsMixin:
         # list_sessions_rich() keeps the branch visible in /resume and
         # /sessions even after the parent is reopened and re-ended with a
         # different end_reason (e.g. tui_shutdown overwriting 'branched').
+        creation_error = None
         try:
             await self._session_db.create_session(
                 session_id=new_session_id,
@@ -5102,42 +5103,121 @@ class GatewaySlashCommandsMixin:
                 display_name=current_entry.display_name,
             )
         except Exception as e:
+            creation_error = e
             logger.error("Failed to create branch session: %s", e)
-            return t("gateway.branch.create_failed", error=e)
+
+        # Generated IDs are not ownership proof: create_session enriches rows on
+        # conflict. Only this exact row with both durable lineage markers belongs
+        # to the branch operation.
+        try:
+            expected_child = await self._session_db.get_session(new_session_id)
+        except Exception as e:
+            logger.error("Failed to verify generated branch session: %s", e)
+            return t("gateway.branch.switch_failed")
+        if expected_child is None:
+            return t(
+                "gateway.branch.create_failed",
+                error=creation_error or "branch session was not published",
+            )
+
+        try:
+            import json as _json
+
+            raw_model_config = expected_child.get("model_config")
+            branch_model_config = (
+                _json.loads(raw_model_config)
+                if isinstance(raw_model_config, str)
+                else raw_model_config
+            )
+        except (TypeError, ValueError):
+            branch_model_config = None
+        if (
+            expected_child.get("parent_session_id") != parent_session_id
+            or not isinstance(branch_model_config, dict)
+            or branch_model_config.get("_branched_from") != parent_session_id
+        ):
+            logger.error(
+                "Generated branch session has mismatched provenance: %s",
+                new_session_id,
+            )
+            return t(
+                "gateway.branch.create_failed",
+                error=creation_error or "generated session ID collision",
+            )
 
         # Copy conversation history to the new session in bounded-chunk
         # transactions (see #23254): one txn per row was the removed
         # write-amplification pattern, and a history can be hundreds of rows.
         # Best-effort like the old loop — a failed copy still yields a
         # usable (partial) branch.
+        from hermes_state import SessionTurnLeaseLostError
+
+        branch_rows = [
+            {
+                "role": msg.get("role", "user"),
+                "content": msg.get("content"),
+                "tool_name": msg.get("tool_name") or msg.get("name"),
+                "tool_calls": msg.get("tool_calls"),
+                "tool_call_id": msg.get("tool_call_id"),
+                "finish_reason": msg.get("finish_reason"),
+                "reasoning": msg.get("reasoning"),
+                "reasoning_content": msg.get("reasoning_content"),
+                "reasoning_details": msg.get("reasoning_details"),
+                "codex_reasoning_items": msg.get("codex_reasoning_items"),
+                "codex_message_items": msg.get("codex_message_items"),
+                # Keep the api_content sidecar so the branch's first turn
+                # replays the parent's exact wire bytes (warm provider
+                # prompt cache) instead of a full cold prefill.
+                "api_content": extract_api_content_sidecar(msg),
+                "timestamp": msg.get("timestamp"),
+            }
+            for msg in history
+        ]
+
+        # The new child is its own lease root — an explicit fork breaks the
+        # compression-parent walk in _session_turn_lease_key_on_conn, so its
+        # own id IS the conversation_id. Holding the lease here (and passing
+        # it through to append_messages_batch) fences the seed against any
+        # other writer that might learn this id before switch_session() below
+        # publishes it as the canonical route.
+        sync_db = getattr(self._session_db, "_db", self._session_db)
+        branch_lease_holder = f"pid={os.getpid()}:turn=branch-seed:session={new_session_id}"
+
+        def _seed_branch_history() -> None:
+            if not sync_db.try_acquire_session_turn_lease(
+                new_session_id, branch_lease_holder, ttl_seconds=30.0,
+            ):
+                raise SessionTurnLeaseLostError(
+                    f"Could not acquire the branch-seed turn lease for {new_session_id!r}"
+                )
+            try:
+                sync_db.append_messages_batch(
+                    new_session_id,
+                    branch_rows,
+                    turn_lease_holder=branch_lease_holder,
+                    chunk_rows=500,
+                )
+            finally:
+                sync_db.release_session_turn_lease(new_session_id, branch_lease_holder)
+
         try:
-            await self._session_db.append_messages_batch(
-                new_session_id,
-                [
-                    {
-                        "role": msg.get("role", "user"),
-                        "content": msg.get("content"),
-                        "tool_name": msg.get("tool_name") or msg.get("name"),
-                        "tool_calls": msg.get("tool_calls"),
-                        "tool_call_id": msg.get("tool_call_id"),
-                        "finish_reason": msg.get("finish_reason"),
-                        "reasoning": msg.get("reasoning"),
-                        "reasoning_content": msg.get("reasoning_content"),
-                        "reasoning_details": msg.get("reasoning_details"),
-                        "codex_reasoning_items": msg.get("codex_reasoning_items"),
-                        "codex_message_items": msg.get("codex_message_items"),
-                        # Keep the api_content sidecar so the branch's first turn
-                        # replays the parent's exact wire bytes (warm provider
-                        # prompt cache) instead of a full cold prefill.
-                        "api_content": extract_api_content_sidecar(msg),
-                        "timestamp": msg.get("timestamp"),
-                    }
-                    for msg in history
-                ],
-                chunk_rows=500,
-            )
-        except Exception:
-            pass  # Best-effort copy
+            # Off the event loop, matching the AsyncSessionDB contract this
+            # call used to go through — acquisition can wait on another writer.
+            await asyncio.to_thread(_seed_branch_history)
+        except SessionTurnLeaseLostError as e:
+            logger.error("Branch history copy refused by the turn lease: %s", e)
+        except Exception as e:
+            logger.error("Branch history copy failed after session creation: %s", e)
+
+        # Copy chunks commit independently, so the durable child is the only
+        # truthful source for the outward count after either success or a
+        # later-chunk exception.
+        try:
+            durable_branch_rows = await self._session_db.get_messages(new_session_id)
+        except Exception as e:
+            logger.error("Failed to recount committed branch history: %s", e)
+            return t("gateway.branch.switch_failed")
+        msg_count = sum(row.get("role") == "user" for row in durable_branch_rows)
 
         # Set title
         try:
@@ -5154,7 +5234,6 @@ class GatewaySlashCommandsMixin:
         # Evict any cached agent for this session
         self._evict_cached_agent(session_key)
 
-        msg_count = len([m for m in history if m.get("role") == "user"])
         key = "gateway.branch.branched_one" if msg_count == 1 else "gateway.branch.branched_many"
         return t(key, title=branch_title, count=msg_count, parent=parent_session_id, new=new_session_id)
 
