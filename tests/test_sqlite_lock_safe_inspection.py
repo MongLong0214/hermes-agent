@@ -29,6 +29,7 @@ import pytest
 from hermes_cli.sqlite_safe_read import (
     file_length_matches_header,
     has_live_connection,
+    offline_file_access,
     page_count_bytes,
     read_header_bytes_preopen,
     track_connection,
@@ -162,42 +163,109 @@ def test_tracking_registry_does_not_leak_across_close_paths(tmp_path, clean_regi
     assert not has_live_connection(db)
 
 
-def test_failed_close_keeps_connection_tracked(tmp_path, clean_registry):
-    """A raising close must not release the registry (#75629).
+def test_custom_close_error_cleans_native_handle_before_untracking(
+    tmp_path, clean_registry
+):
+    """A custom close error stays primary after serialized native cleanup."""
+    import hermes_cli.sqlite_safe_read as sqlite_safe_read
+    from hermes_state import _connect_tracked_db
 
-    Untracking before ``super().close()`` leaves the descriptor open while
-    ``has_live_connection`` reports false, so the byte-probe guard permits
-    ``open``/``close`` on a live database — cancelling POSIX advisory locks.
-    """
-    from hermes_cli.sqlite_safe_read import connect_tracked
+    class CustomCloseError(RuntimeError):
+        pass
+
+    close_calls: list[sqlite3.Connection] = []
+    hook_live_states: list[bool] = []
+    lock_ownership: list[bool] = []
+    primary_error = CustomCloseError("custom close failed")
 
     class ControllableConnection(sqlite3.Connection):
         def close(self):
-            if getattr(self, "_hermes_fail_close", False):
-                raise sqlite3.ProgrammingError(
-                    "SQLite objects created in a thread can only be used in "
-                    "that same thread"
-                )
-            return super().close()
+            close_calls.append(self)
+            hook_live_states.append(has_live_connection(db))
+            lock_ownership.append(self._hermes_serial_lock._is_owned())
+            raise primary_error
 
     db = tmp_path / "state.db"
     _make_db(db, "WAL")
 
-    conn = connect_tracked(db, factory=ControllableConnection)
-    assert has_live_connection(db)
-    assert read_header_bytes_preopen(db, length=16) is None
+    conn = _connect_tracked_db(
+        db,
+        factory=ControllableConnection,
+        isolation_level=None,
+        check_same_thread=False,
+    )
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        assert has_live_connection(db)
+        assert read_header_bytes_preopen(db, length=16) is None
 
-    conn._hermes_fail_close = True
-    with pytest.raises(sqlite3.ProgrammingError):
+        with pytest.raises(CustomCloseError, match="custom close failed") as raised:
+            conn.close()
+
+        assert raised.value is primary_error
+        assert close_calls == [conn]
+        assert hook_live_states == [True]
+        assert lock_ownership == [True]
+        with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+            sqlite3.Connection.execute(conn, "SELECT 1")
+        assert not has_live_connection(db)
+        assert read_header_bytes_preopen(db, length=16) is not None
+        with offline_file_access(db, what="post-close inspection"):
+            pass
+
+        # Native closure and registry consumption are both idempotent; the
+        # arbitrary polymorphic hook is not called again.
+        conn.close()
+        assert close_calls == [conn]
+        with sqlite_safe_read._live_lock:
+            assert sqlite_safe_read._live_connections == {}
+            assert sqlite_safe_read._pending_unresolved_opens == 0
+    finally:
+        try:
+            sqlite3.Connection.close(conn)
+        except sqlite3.Error:
+            pass
+
+
+def test_native_close_failure_keeps_connection_tracked(tmp_path, clean_registry):
+    """A real native close failure retains conservative tracking."""
+    import hermes_cli.sqlite_safe_read as sqlite_safe_read
+    from hermes_state import _connect_tracked_db
+
+    db = tmp_path / "state.db"
+    _make_db(db, "WAL")
+    conn = _connect_tracked_db(db, isolation_level=None)
+    try:
+        errors: list[BaseException] = []
+
+        def close_from_wrong_thread() -> None:
+            try:
+                conn.close()
+            except BaseException as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(target=close_from_wrong_thread)
+        worker.start()
+        worker.join(2)
+        assert not worker.is_alive()
+        assert len(errors) == 1
+        assert isinstance(errors[0], sqlite3.ProgrammingError)
+        assert "same thread" in str(errors[0])
+        assert isinstance(
+            getattr(errors[0], "_hermes_cleanup_error", None),
+            sqlite3.ProgrammingError,
+        )
+        assert has_live_connection(db)
+        assert read_header_bytes_preopen(db, length=16) is None
+    finally:
+        # The owning thread can complete the native close and release tracking.
         conn.close()
 
-    assert has_live_connection(db), "failed close must leave the registry entry"
-    assert read_header_bytes_preopen(db, length=16) is None
-
-    conn._hermes_fail_close = False
-    conn.close()
     assert not has_live_connection(db)
     assert read_header_bytes_preopen(db, length=16) is not None
+    with sqlite_safe_read._live_lock:
+        assert sqlite_safe_read._live_connections == {}
+        assert sqlite_safe_read._pending_unresolved_opens == 0
 
 
 def test_probe_and_connect_do_not_race(tmp_path, clean_registry, monkeypatch):

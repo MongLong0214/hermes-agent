@@ -309,33 +309,110 @@ class _TrackingMixin:
     """Untrack-on-close behaviour, mixable into any Connection subclass."""
 
     _hermes_tracked_path: str | None = None
+    _hermes_close_hook_invoked = False
+    _hermes_tracking_close_active = False
+    _hermes_native_close_complete = False
 
     def close(self) -> None:  # type: ignore[misc]
-        path = getattr(self, "_hermes_tracked_path", None)
         # Do not take _live_lock before this call.  A serialized Connection
         # may wait for its per-connection RLock here, while Python callbacks
         # from an in-flight SQLite operation legitimately ask the registry a
         # serial -> live question.  Holding live -> serial would deadlock.
         #
-        # The entry remains tracked until after close succeeds, so the guard
-        # is conservative during the small post-close window: a raw probe can
-        # be refused too long, but it can never be allowed while the FD lives.
-        # A failure deliberately leaves the attribute and count untouched.
-        super().close()  # type: ignore[misc]
-        if path is None:
-            return
-        with _live_lock:
-            # Two concurrent/double close calls can both observe ``path``
-            # before SQLite closes.  Only the first successful closer gets to
-            # consume this connection's tracking count.
-            if getattr(self, "_hermes_tracked_path", None) != path:
+        # A serialized handle must keep that lock through both the caller's
+        # polymorphic close hook and the native-close guarantee below.  Plain
+        # ``connect_tracked`` handles intentionally have no serial lock; they
+        # retain their existing tracking-only contract.
+        serial_lock = getattr(self, "_hermes_serial_lock", None)
+        if serial_lock is not None:
+            if getattr(serial_lock, "owner", None) is not self:
+                raise UntrackableConnectionError(
+                    "SQLite connection close lost its owner-bound serial lock"
+                )
+            close_boundary = serial_lock
+        else:
+            close_boundary = contextlib.nullcontext()
+
+        released_path = None
+        primary_error = None
+        native_error = None
+        native_closed = False
+        with close_boundary:
+            # Revalidate after waiting: a custom factory must not swap a
+            # trusted owner-bound lock between the call boundary and SQLite.
+            if serial_lock is not None and (
+                getattr(self, "_hermes_serial_lock", None) is not serial_lock
+                or getattr(serial_lock, "owner", None) is not self
+            ):
+                raise UntrackableConnectionError(
+                    "SQLite connection close lost its owner-bound serial lock"
+                )
+            if getattr(self, "_hermes_native_close_complete", False):
                 return
-            self._hermes_tracked_path = None
-            remaining = _live_connections.get(path, 0) - 1
-            if remaining > 0:
-                _live_connections[path] = remaining
-            else:
-                _live_connections.pop(path, None)
+            if getattr(self, "_hermes_tracking_close_active", False):
+                # A custom close hook can re-enter ``self.close()``.  The
+                # outer call still owns native closure and tracking release.
+                return
+
+            self._hermes_tracking_close_active = True
+            try:
+                path = getattr(self, "_hermes_tracked_path", None)
+                if not getattr(self, "_hermes_close_hook_invoked", False):
+                    # Preserve the caller's polymorphic close behaviour once.
+                    # Its MRO can include the serialized close wrapper, which
+                    # re-enters this owner-bound RLock safely.
+                    self._hermes_close_hook_invoked = True
+                    try:
+                        super().close()  # type: ignore[misc]
+                    except BaseException as exc:
+                        primary_error = exc
+
+                # Do not trust a subclass hook to have closed the descriptor.
+                # CPython's actual repeated-close behaviour is authoritative:
+                # an error is kept rather than guessed away.
+                try:
+                    sqlite3.Connection.close(self)
+                except BaseException as exc:
+                    native_error = exc
+                    if primary_error is not None:
+                        try:
+                            sqlite3.Connection.execute(self, "SELECT 1")
+                        except sqlite3.ProgrammingError as probe_error:
+                            native_closed = "closed" in str(probe_error).lower()
+                        except BaseException:
+                            pass
+                else:
+                    native_closed = True
+
+                if native_closed:
+                    self._hermes_native_close_complete = True
+                    if path is not None:
+                        self._hermes_tracked_path = None
+                        released_path = path
+                elif primary_error is not None and native_error is not None:
+                    # Keep the custom-hook error primary, but leave callers a
+                    # diagnostic for the native cleanup that could not be
+                    # guaranteed.  Tracking deliberately remains conservative.
+                    try:
+                        setattr(primary_error, "_hermes_cleanup_error", native_error)
+                    except BaseException:
+                        logger.debug("SQLite close cleanup diagnostic unavailable", exc_info=True)
+            finally:
+                self._hermes_tracking_close_active = False
+
+        # Registry removal is intentionally after the serialized close and
+        # never overlaps it: serial -> live is permitted; live -> serial is
+        # not.  A raw probe may be refused in this brief interval, never
+        # admitted while a descriptor is live.
+        if released_path is not None:
+            with _live_lock:
+                _decrement_count(_live_connections, released_path)
+
+        if primary_error is not None:
+            raise primary_error
+        if native_error is not None:
+            # A non-primary native-close failure leaves the path registered.
+            raise native_error
 
 
 class TrackedConnection(_TrackingMixin, sqlite3.Connection):
@@ -347,13 +424,15 @@ class TrackedConnection(_TrackingMixin, sqlite3.Connection):
     method every close path must go through — keeps the registry from
     drifting upward and permanently disabling byte-probes.
 
-    Unregister runs only after ``close()`` succeeds; a raising close leaves
-    the connection tracked so the byte-probe guard keeps refusing. There is
-    deliberately no ``_live_lock`` around the SQLite close: a serialized
-    close may wait for the per-connection lock, and callback code acquires
-    those locks in the opposite (serial -> live) order. The brief window after
-    a successful close remains conservatively tracked, so a probe can never
-    observe "no live connection" while the descriptor is still open.
+    Unregister runs only after a direct native close succeeds (or an already
+    closed handle is independently proved after a custom-hook error); a
+    failure leaves the connection tracked so the byte-probe guard keeps
+    refusing. There is deliberately no ``_live_lock`` around the SQLite
+    close: a serialized close may wait for the per-connection lock, and
+    callback code acquires those locks in the opposite (serial -> live) order.
+    The brief window after a successful close remains conservatively tracked,
+    so a probe can never observe "no live connection" while the descriptor is
+    still open.
 
     Note ``with conn:`` does NOT close a sqlite3 connection (it only commits or
     rolls back), so this hook is not fired spuriously by transaction scopes.

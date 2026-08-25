@@ -173,26 +173,28 @@ def test_tracking_close_never_holds_live_lock_while_waiting_for_serial_lock(
     tmp_path, monkeypatch
 ):
     """A re-entrant callback can query tracking while another thread closes."""
-    import hermes_state
-
     path = tmp_path / "state.db"
     conn = _connect_tracked_db(path, check_same_thread=False)
     serial_close_entered = threading.Event()
+    close_attempting = threading.Event()
     close_finished = threading.Event()
     query_finished = threading.Event()
     errors: list[BaseException] = []
-    original_close = hermes_state._SerializedConnectionMixin.close
+    serial_lock = conn._hermes_serial_lock
+    original_acquire = type(serial_lock).acquire
 
-    def observed_close(self):
-        # Tracking.close() reaches this only after its own implementation has
-        # made its lock-order decision.
-        serial_close_entered.set()
-        return original_close(self)
+    def observed_acquire(self, *args, **kwargs):
+        # The tracking boundary itself now waits for this lock, before either
+        # the polymorphic close hook or direct native close can run.
+        if self is serial_lock and close_attempting.is_set():
+            serial_close_entered.set()
+        return original_acquire(self, *args, **kwargs)
 
-    monkeypatch.setattr(hermes_state._SerializedConnectionMixin, "close", observed_close)
+    monkeypatch.setattr(type(serial_lock), "acquire", observed_acquire)
 
     def close_in_worker() -> None:
         try:
+            close_attempting.set()
             conn.close()
         except BaseException as exc:
             errors.append(exc)
@@ -228,6 +230,122 @@ def test_tracking_close_never_holds_live_lock_while_waiting_for_serial_lock(
     assert not query.is_alive()
     assert not errors
     assert not has_live_connection(path)
+
+
+def test_serialized_custom_close_hook_runs_under_its_owner_lock(tmp_path):
+    """The compatibility hook shares the serial boundary with native close."""
+    lock_ownership: list[bool] = []
+
+    class NoOpClose(sqlite3.Connection):
+        def close(self):
+            lock_ownership.append(self._hermes_serial_lock._is_owned())
+
+    connection = _connect_tracked_db(
+        tmp_path / "serialized-custom-close.db",
+        factory=NoOpClose,
+        isolation_level=None,
+        check_same_thread=False,
+    )
+    connection.execute("BEGIN IMMEDIATE")
+    connection.close()
+
+    assert lock_ownership == [True]
+    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+        sqlite3.Connection.execute(connection, "SELECT 1")
+
+
+def test_custom_noop_close_keeps_tracking_until_native_handle_is_closed(tmp_path):
+    """A custom close hook cannot release raw access while its handle is live."""
+    import hermes_cli.sqlite_safe_read as sqlite_safe_read
+
+    database = tmp_path / "custom-noop-close.db"
+    close_calls: list[sqlite3.Connection] = []
+
+    class NoOpClose(sqlite3.Connection):
+        def close(self):
+            close_calls.append(self)
+
+    with sqlite_safe_read._live_lock:
+        baseline_counts = dict(sqlite_safe_read._live_connections)
+        baseline_pending = sqlite_safe_read._pending_unresolved_opens
+
+    connection = connect_tracked(
+        database,
+        factory=NoOpClose,
+        isolation_level=None,
+    )
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        assert has_live_connection(database)
+        assert read_header_bytes_preopen(database, length=16) is None
+
+        connection.close()
+
+        # The factory contract remains polymorphic, but a non-raising no-op
+        # must not make this live SQLite descriptor disappear from the guard.
+        assert close_calls == [connection]
+        with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+            sqlite3.Connection.execute(connection, "SELECT 1")
+        assert not has_live_connection(database)
+        assert read_header_bytes_preopen(database, length=16) is not None
+        with offline_file_access(database, what="post-close regression"):
+            pass
+
+        # A completed close is idempotent: neither the custom hook nor the
+        # registry count is consumed again.
+        connection.close()
+        assert close_calls == [connection]
+        with sqlite_safe_read._live_lock:
+            assert sqlite_safe_read._live_connections == baseline_counts
+            assert sqlite_safe_read._pending_unresolved_opens == baseline_pending
+    finally:
+        try:
+            sqlite3.Connection.close(connection)
+        except sqlite3.Error:
+            pass
+
+
+def test_custom_close_error_stays_primary_after_native_cleanup(tmp_path):
+    """A raising compatibility hook cannot leave a closed handle registered."""
+    import hermes_cli.sqlite_safe_read as sqlite_safe_read
+
+    database = tmp_path / "custom-raising-close.db"
+    close_calls: list[sqlite3.Connection] = []
+
+    class CustomCloseError(RuntimeError):
+        pass
+
+    class RaisingClose(sqlite3.Connection):
+        def close(self):
+            close_calls.append(self)
+            raise CustomCloseError("custom close failed")
+
+    with sqlite_safe_read._live_lock:
+        baseline_counts = dict(sqlite_safe_read._live_connections)
+        baseline_pending = sqlite_safe_read._pending_unresolved_opens
+
+    connection = connect_tracked(database, factory=RaisingClose, isolation_level=None)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        with pytest.raises(CustomCloseError, match="custom close failed") as raised:
+            connection.close()
+
+        assert close_calls == [connection]
+        assert getattr(raised.value, "_hermes_cleanup_error", None) is None
+        with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+            sqlite3.Connection.execute(connection, "SELECT 1")
+        assert not has_live_connection(database)
+
+        connection.close()
+        assert close_calls == [connection]
+        with sqlite_safe_read._live_lock:
+            assert sqlite_safe_read._live_connections == baseline_counts
+            assert sqlite_safe_read._pending_unresolved_opens == baseline_pending
+    finally:
+        try:
+            sqlite3.Connection.close(connection)
+        except sqlite3.Error:
+            pass
 
 
 def test_execute_shortcut_and_cursor_iteration_remain_serialized(tmp_path):
