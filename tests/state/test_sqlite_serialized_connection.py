@@ -305,6 +305,119 @@ def test_custom_noop_close_keeps_tracking_until_native_handle_is_closed(tmp_path
             pass
 
 
+def test_close_rejects_owner_spoof_before_any_close_boundary(tmp_path):
+    """A post-open owner spoof cannot authorize custom or native close."""
+    _run_sqlite_child(
+        """
+        import pathlib
+        import sqlite3
+        import sys
+        import threading
+
+        import hermes_cli.sqlite_safe_read as sqlite_safe_read
+        from hermes_cli.sqlite_safe_read import (
+            UntrackableConnectionError,
+            has_live_connection,
+            read_header_bytes_preopen,
+        )
+        from hermes_state import SQLiteSerializationError, _connect_tracked_db
+
+        database = pathlib.Path(sys.argv[1]) / "owner-spoof-close.db"
+        close_calls = []
+        spoof_entered = threading.Event()
+        failures = []
+
+        class NoOpClose(sqlite3.Connection):
+            def close(self):
+                close_calls.append(self)
+
+        class OwnerLookalike:
+            def __init__(self, owner):
+                self.owner = owner
+
+            def __enter__(self):
+                spoof_entered.set()
+                return self
+
+            def __exit__(self, *_exc_info):
+                return False
+
+        with sqlite_safe_read._live_lock:
+            baseline_counts = dict(sqlite_safe_read._live_connections)
+            baseline_pending = sqlite_safe_read._pending_unresolved_opens
+
+        connection = _connect_tracked_db(
+            database,
+            factory=NoOpClose,
+            check_same_thread=False,
+        )
+        genuine_lock = connection._hermes_serial_lock
+        genuine_lock.acquire()
+        genuine_held = True
+        worker = None
+        try:
+            spoof = OwnerLookalike(connection)
+            assert spoof.owner is connection
+            assert type(spoof) is not type(genuine_lock)
+            connection._hermes_serial_lock = spoof
+
+            def close_worker():
+                try:
+                    connection.close()
+                except BaseException as exc:
+                    failures.append(exc)
+
+            worker = threading.Thread(target=close_worker, daemon=True)
+            worker.start()
+            worker.join(1)
+            assert not worker.is_alive(), "spoofed close did not fail promptly"
+            assert len(failures) == 1
+            assert isinstance(failures[0], (SQLiteSerializationError, UntrackableConnectionError))
+            assert not spoof_entered.is_set(), "close entered the owner-spoofed lock"
+            assert close_calls == [], "close reached the custom hook under a spoof"
+
+            assert sqlite3.Connection.execute(connection, "SELECT 1").fetchone() == (1,)
+            assert has_live_connection(database)
+            assert read_header_bytes_preopen(database, length=16) is None
+
+            connection._hermes_serial_lock = genuine_lock
+            assert connection._hermes_serial_lock is genuine_lock
+            genuine_lock.release()
+            genuine_held = False
+            connection.close()
+            assert close_calls == [connection]
+
+            try:
+                sqlite3.Connection.execute(connection, "SELECT 1")
+            except sqlite3.ProgrammingError:
+                pass
+            else:
+                raise AssertionError("native SQLite handle remained usable after close")
+            assert not has_live_connection(database)
+            assert read_header_bytes_preopen(database, length=16) is not None
+
+            connection.close()
+            assert close_calls == [connection]
+            with sqlite_safe_read._live_lock:
+                assert sqlite_safe_read._live_connections == baseline_counts
+                assert sqlite_safe_read._pending_unresolved_opens == baseline_pending
+        finally:
+            if connection._hermes_serial_lock is not genuine_lock:
+                connection._hermes_serial_lock = genuine_lock
+            if genuine_held:
+                genuine_lock.release()
+            if worker is not None:
+                worker.join(2)
+            try:
+                sqlite3.Connection.close(connection)
+            except sqlite3.Error:
+                pass
+        """,
+        tmp_path,
+        timeout=8,
+    )
+
+
 def test_custom_close_error_stays_primary_after_native_cleanup(tmp_path):
     """A raising compatibility hook cannot leave a closed handle registered."""
     import hermes_cli.sqlite_safe_read as sqlite_safe_read

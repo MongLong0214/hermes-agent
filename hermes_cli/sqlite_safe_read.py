@@ -323,12 +323,14 @@ class _TrackingMixin:
         # polymorphic close hook and the native-close guarantee below.  Plain
         # ``connect_tracked`` handles intentionally have no serial lock; they
         # retain their existing tracking-only contract.
-        serial_lock = getattr(self, "_hermes_serial_lock", None)
-        if serial_lock is not None:
-            if getattr(serial_lock, "owner", None) is not self:
-                raise UntrackableConnectionError(
-                    "SQLite connection close lost its owner-bound serial lock"
-                )
+        serial_lock = None
+        if getattr(self, "_hermes_serial_lock", None) is not None:
+            # Keep the exact lock contract in hermes_state's canonical
+            # validator.  This local import avoids making the safe-read
+            # module depend on hermes_state during import-time discovery.
+            from hermes_state import _serial_lock_for_connection
+
+            serial_lock = _serial_lock_for_connection(self)
             close_boundary = serial_lock
         else:
             close_boundary = contextlib.nullcontext()
@@ -340,13 +342,12 @@ class _TrackingMixin:
         with close_boundary:
             # Revalidate after waiting: a custom factory must not swap a
             # trusted owner-bound lock between the call boundary and SQLite.
-            if serial_lock is not None and (
-                getattr(self, "_hermes_serial_lock", None) is not serial_lock
-                or getattr(serial_lock, "owner", None) is not self
-            ):
-                raise UntrackableConnectionError(
-                    "SQLite connection close lost its owner-bound serial lock"
-                )
+            if serial_lock is not None:
+                acquired_lock = _serial_lock_for_connection(self)
+                if acquired_lock is not serial_lock:
+                    raise UntrackableConnectionError(
+                        "SQLite connection close changed its owner-bound serial lock"
+                    )
             if getattr(self, "_hermes_native_close_complete", False):
                 return
             if getattr(self, "_hermes_tracking_close_active", False):
