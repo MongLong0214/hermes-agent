@@ -15,9 +15,12 @@ import pytest
 import hermes_state
 from hermes_state import SessionDB, _connect_tracked_db
 from hermes_cli.sqlite_safe_read import (
+    LiveConnectionError,
     UntrackableConnectionError,
     connect_tracked,
     has_live_connection,
+    offline_file_access,
+    read_header_bytes_preopen,
 )
 
 SQLiteSerializationError = getattr(
@@ -138,10 +141,11 @@ def test_administrative_connection_entries_wait_for_connection_serial_lock(tmp_p
                 ]
             )
         if hasattr(conn, "autocommit"):
+            autocommit_target = conn.autocommit
             calls.append(
                 (
                     "autocommit set",
-                    lambda: setattr(conn, "autocommit", conn.autocommit),
+                    lambda: setattr(conn, "autocommit", autocommit_target),
                 )
             )
 
@@ -958,6 +962,168 @@ def test_pending_open_globally_refuses_forced_raw_probes_and_cleans_nested_failu
     assert sqlite_safe_read.read_header_bytes_preopen(nested_outer, length=16) is not None
 
 
+def test_file_prefix_is_literal_except_for_explicit_string_sqlite_uris(
+    tmp_path, monkeypatch
+):
+    """Filesystem access never mistakes a legal ``file:`` name for a URI."""
+    import hermes_cli.sqlite_safe_read as sqlite_safe_read
+
+    monkeypatch.chdir(tmp_path)
+    raw_literal = Path("file:raw-literal.db")
+    raw_uri_target = Path("raw-literal.db")
+    raw_literal.write_bytes(b"literal raw file")
+    raw_uri_target.write_bytes(b"wrong URI target")
+
+    # Every raw public seam treats either spelling as the literal POSIX name.
+    assert read_header_bytes_preopen(raw_literal, length=32) == b"literal raw file"
+    assert read_header_bytes_preopen(str(raw_literal), length=32) == b"literal raw file"
+    sqlite_safe_read.track_connection(raw_literal)
+    try:
+        assert has_live_connection(raw_literal)
+        assert has_live_connection(str(raw_literal))
+        for spelling in (raw_literal, str(raw_literal)):
+            assert read_header_bytes_preopen(spelling, length=32) is None
+            with pytest.raises(LiveConnectionError, match="connection is open"):
+                with offline_file_access(spelling):
+                    pass
+    finally:
+        sqlite_safe_read.untrack_connection(raw_literal)
+
+    # The default and explicit uri=False requests open and track the literal
+    # name; a Path stays literal even when SQLite URI processing is enabled.
+    for name, spelling, kwargs in (
+        ("file:literal-default.db", "file:literal-default.db", {}),
+        ("file:literal-false.db", "file:literal-false.db", {"uri": False}),
+        ("file:literal-path.db", Path("file:literal-path.db"), {"uri": True}),
+    ):
+        literal = Path(name)
+        wrong_target = Path(name.removeprefix("file:"))
+        wrong_connection = sqlite3.connect(wrong_target)
+        wrong_connection.execute("CREATE TABLE marker(value)")
+        wrong_connection.close()
+        connection = connect_tracked(spelling, **kwargs)
+        try:
+            actual = sqlite3.Connection.execute(
+                connection, "PRAGMA database_list"
+            ).fetchone()[2]
+            assert actual == str(literal.resolve())
+            connection.execute("CREATE TABLE literal_marker(value)")
+            assert has_live_connection(literal)
+            assert has_live_connection(str(literal))
+            assert read_header_bytes_preopen(literal, length=16) is None
+            assert read_header_bytes_preopen(wrong_target, length=16) == b"SQLite format 3\x00"
+        finally:
+            connection.close()
+        assert read_header_bytes_preopen(literal, length=16) == b"SQLite format 3\x00"
+
+    # In contrast, a string request with uri=True retains its SQLite URI
+    # query/path semantics and is guarded under the real on-disk path.
+    uri_target = tmp_path / "uri-target.db"
+    uri = f"file:{uri_target}?mode=rwc"
+    connection = connect_tracked(uri, tracking_path=uri_target, uri=True)
+    try:
+        assert sqlite3.Connection.execute(
+            connection, "PRAGMA database_list"
+        ).fetchone()[2] == str(uri_target.resolve())
+        assert has_live_connection(uri_target)
+        assert read_header_bytes_preopen(uri_target, length=16) is None
+    finally:
+        connection.close()
+
+    memory_target = tmp_path / "shared-memory-target"
+    memory_uri = f"file:{memory_target}?mode=memory&cache=shared"
+    memory_connection = connect_tracked(memory_uri, uri=True)
+    try:
+        assert sqlite3.Connection.execute(
+            memory_connection, "PRAGMA database_list"
+        ).fetchone()[2] == ""
+        assert not memory_target.exists()
+    finally:
+        memory_connection.close()
+
+    plain_memory_connection = connect_tracked(":memory:")
+    try:
+        assert sqlite3.Connection.execute(
+            plain_memory_connection, "PRAGMA database_list"
+        ).fetchone()[2] == ""
+    finally:
+        plain_memory_connection.close()
+
+
+def test_offline_file_access_refuses_same_thread_connect_before_opener(
+    tmp_path,
+):
+    """The raw-access guard fails closed without re-entering SQLite opening."""
+    import hermes_cli.sqlite_safe_read as sqlite_safe_read
+
+    database = tmp_path / "offline-reentry.db"
+    seed = sqlite3.connect(database)
+    seed.execute("CREATE TABLE marker(value)")
+    seed.close()
+    opener_calls: list[tuple[object, dict]] = []
+
+    def forbidden_opener(*args, **kwargs):
+        opener_calls.append((args, kwargs))
+        raise AssertionError("offline guard must reject before invoking an opener")
+
+    with offline_file_access(database, what="same-thread regression"):
+        with sqlite_safe_read._live_lock:
+            before_counts = dict(sqlite_safe_read._live_connections)
+            before_pending = sqlite_safe_read._pending_unresolved_opens
+        with pytest.raises(LiveConnectionError, match="offline file access"):
+            connect_tracked(database, connect_fn=forbidden_opener)
+        assert not opener_calls
+        with sqlite_safe_read._live_lock:
+            assert sqlite_safe_read._live_connections == before_counts
+            assert sqlite_safe_read._pending_unresolved_opens == before_pending
+        assert not has_live_connection(database)
+        with open(database, "rb") as handle:
+            assert handle.read(16) == b"SQLite format 3\x00"
+
+        # Nested raw guards remain honest, and a different thread waits on
+        # the existing lifecycle lock instead of entering SQLite mid-access.
+        with offline_file_access(database, what="nested same-thread regression"):
+            with pytest.raises(LiveConnectionError, match="offline file access"):
+                connect_tracked(database, connect_fn=forbidden_opener)
+
+        other_started = threading.Event()
+        other_opened = threading.Event()
+        other_failures: list[BaseException] = []
+        opened: list[sqlite3.Connection] = []
+
+        def open_elsewhere() -> None:
+            other_started.set()
+            try:
+                opened.append(connect_tracked(database, check_same_thread=False))
+                other_opened.set()
+            except BaseException as exc:
+                other_failures.append(exc)
+
+        worker = threading.Thread(target=open_elsewhere, daemon=True)
+        worker.start()
+        assert other_started.wait(2)
+        assert not other_opened.wait(0.2), "other thread entered SQLite during raw access"
+
+    assert other_opened.wait(2)
+    worker.join(2)
+    try:
+        assert not worker.is_alive()
+        assert not other_failures
+        assert len(opened) == 1
+    finally:
+        for connection in opened:
+            connection.close()
+
+    # Exception cleanup and nested depth restoration leave a later open live.
+    with pytest.raises(RuntimeError, match="nested cleanup"):
+        with offline_file_access(database, what="exception cleanup"):
+            with offline_file_access(database, what="nested exception cleanup"):
+                raise RuntimeError("nested cleanup")
+    connection = connect_tracked(database)
+    connection.close()
+    assert not has_live_connection(database)
+
+
 def test_raw_probe_opens_the_single_resolved_spelling_after_symlink_retarget(
     tmp_path, monkeypatch
 ):
@@ -1026,6 +1192,31 @@ def test_unresolved_file_backed_identity_fails_closed_with_direct_native_close(t
                 pass
 
 
+def test_old_autocommit_helper_shape_can_mask_an_unwrapped_setter():
+    """A serialized getter can make the former setter assertion pass alone."""
+    setter_called = threading.Event()
+
+    class GetterOnlySerialized:
+        _hermes_serial_lock = threading.RLock()
+
+        @property
+        def autocommit(self):
+            with self._hermes_serial_lock:
+                return True
+
+        @autocommit.setter
+        def autocommit(self, _value):
+            # Deliberately unwrapped: this is the defect the old callable hid.
+            setter_called.set()
+
+    connection = GetterOnlySerialized()
+    _assert_waits_for_serial_lock(
+        connection,
+        lambda: setattr(connection, "autocommit", connection.autocommit),
+    )
+    assert setter_called.is_set()
+
+
 def test_autocommit_surface_is_always_mro_dominant_and_native_setter_waits(
     tmp_path,
 ):
@@ -1058,9 +1249,10 @@ def test_autocommit_surface_is_always_mro_dominant_and_native_setter_waits(
             tmp_path / "native-autocommit.db", check_same_thread=False
         )
         try:
+            autocommit_target = connection.autocommit
             _assert_waits_for_serial_lock(
                 connection,
-                lambda: setattr(connection, "autocommit", connection.autocommit),
+                lambda: setattr(connection, "autocommit", autocommit_target),
             )
         finally:
             connection.close()

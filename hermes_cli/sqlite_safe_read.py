@@ -83,6 +83,10 @@ _HEADER_PAGE_COUNT_OFFSET = 28
 
 # Guards BOTH the registry and the lifecycle syscalls it describes.
 _live_lock = threading.RLock()
+# ``offline_file_access`` is caller-controlled raw I/O.  Its owner must not
+# re-enter ``connect_tracked`` through this re-entrant lifecycle lock: that
+# would let an opener reach SQLite before the raw descriptor is closed.
+_offline_file_access_state = threading.local()
 # canonical path -> number of live connections opened by this process
 _live_connections: dict[str, int] = {}
 # Every open owns one pending count before it calls an opener.  Until SQLite
@@ -100,6 +104,10 @@ class UntrackableConnectionError(RuntimeError):
     """
 
 
+class LiveConnectionError(RuntimeError):
+    """A raw file operation conflicts with a live or pending connection."""
+
+
 @dataclass(frozen=True)
 class _DatabaseIdentity:
     """The only three useful outcomes of identifying SQLite's ``main`` DB."""
@@ -111,6 +119,8 @@ class _DatabaseIdentity:
 _FILE_IDENTITY = "file"
 _MEMORY_IDENTITY = "memory/unnamed"
 _UNRESOLVED_IDENTITY = "unresolved"
+_FILESYSTEM_IDENTITY_MODE = "filesystem"
+_SQLITE_URI_IDENTITY_MODE = "sqlite_uri"
 
 
 def _key(path: Path | str) -> str:
@@ -129,25 +139,29 @@ def _file_identity(path: Path | str) -> _DatabaseIdentity:
         return _DatabaseIdentity(_UNRESOLVED_IDENTITY)
 
 
-def _requested_database_identity(path: Path | str) -> _DatabaseIdentity:
-    """Classify a requested SQLite target without opening it.
+def _database_identity(
+    path: Path | str,
+    *,
+    mode: str,
+) -> _DatabaseIdentity:
+    """Classify a target without opening it in its explicit interpretation mode.
 
-    A plain local path and a file URI both carry a filesystem assertion.  The
-    URI itself remains the opener argument when it carries SQLite semantics
-    such as ``mode=ro``; its physical component is still checked against the
-    post-open identity.  ``:memory:`` and unnamed URI memory databases cannot
-    be raw-probed, so they intentionally have no file key.
+    Filesystem callers never infer URI syntax from a ``file:`` prefix: that is
+    a legal POSIX filename.  ``sqlite_uri`` is reserved for a real
+    ``sqlite3.connect`` request whose caller supplied a string URI with
+    ``uri=True``.  URI requests retain their SQLite query/memory semantics,
+    while every other spelling is a literal filesystem path.
     """
+    if mode == _FILESYSTEM_IDENTITY_MODE:
+        return _file_identity(path)
+    if mode != _SQLITE_URI_IDENTITY_MODE:  # pragma: no cover - internal invariant
+        raise ValueError(f"unknown SQLite identity mode: {mode}")
+    if not isinstance(path, str) or not path.startswith("file:"):
+        return _file_identity(path)
     try:
-        path_str = os.fspath(path)
-    except TypeError:
+        parsed = urlsplit(path)
+    except ValueError:
         return _DatabaseIdentity(_UNRESOLVED_IDENTITY)
-    if path_str in ("", ":memory:"):
-        return _DatabaseIdentity(_MEMORY_IDENTITY)
-    if not path_str.startswith("file:"):
-        return _file_identity(path_str)
-
-    parsed = urlsplit(path_str)
     if parsed.scheme != "file":
         return _DatabaseIdentity(_UNRESOLVED_IDENTITY)
     # SQLite file URIs with a non-local authority have no filesystem spelling
@@ -161,13 +175,9 @@ def _requested_database_identity(path: Path | str) -> _DatabaseIdentity:
     return _file_identity(candidate)
 
 
-def _is_plain_local_request(path: Path | str) -> bool:
-    """Whether the default opener can safely receive a resolved spelling."""
-    try:
-        path_str = os.fspath(path)
-    except TypeError:
-        return False
-    return bool(path_str) and path_str != ":memory:" and not path_str.startswith("file:")
+def _offline_file_access_depth() -> int:
+    """The nesting depth of caller-controlled raw access in this thread."""
+    return getattr(_offline_file_access_state, "depth", 0)
 
 
 def _increment_count(counts: dict[str, int], key: str) -> None:
@@ -200,7 +210,11 @@ def _publish_or_finish_pending_open(identity: _DatabaseIdentity) -> None:
         _pending_unresolved_opens -= 1
 
 
-def _post_open_database_identity(conn: sqlite3.Connection) -> _DatabaseIdentity:
+def _post_open_database_identity(
+    conn: sqlite3.Connection,
+    *,
+    mode: str,
+) -> _DatabaseIdentity:
     """Return SQLite's authoritative post-open identity, never an inference."""
     try:
         # This bypasses an optional connection wrapper.  It runs before the
@@ -218,12 +232,12 @@ def _post_open_database_identity(conn: sqlite3.Connection) -> _DatabaseIdentity:
         return _DatabaseIdentity(_MEMORY_IDENTITY)
     if not isinstance(path_str, str):
         return _DatabaseIdentity(_UNRESOLVED_IDENTITY)
-    return _file_identity(path_str)
+    return _database_identity(path_str, mode=mode)
 
 
 def _canonical_db_path(conn: sqlite3.Connection) -> Optional[str]:
     """Compatibility helper for callers that only need a known file path."""
-    identity = _post_open_database_identity(conn)
+    identity = _post_open_database_identity(conn, mode=_FILESYSTEM_IDENTITY_MODE)
     return identity.path if identity.kind == _FILE_IDENTITY else None
 
 
@@ -282,7 +296,7 @@ def untrack_connection(path: Path | str) -> None:
 
 def has_live_connection(path: Path | str) -> bool:
     """Whether *path* has a live handle or any opener lacks an identity."""
-    identity = _requested_database_identity(path)
+    identity = _database_identity(path, mode=_FILESYSTEM_IDENTITY_MODE)
     with _live_lock:
         return _pending_unresolved_opens > 0 or (
             identity.kind == _FILE_IDENTITY
@@ -404,11 +418,25 @@ def connect_tracked(
     :class:`UntrackableConnectionError` is raised rather than handing back a
     connection whose database has quietly lost byte-probe protection.
     """
+    if _offline_file_access_depth():
+        raise LiveConnectionError(
+            "Refusing to open a SQLite connection while offline file access is "
+            "active in this thread."
+        )
     opener = connect_fn if connect_fn is not None else sqlite3.connect
     kwargs["factory"] = _tracking_factory(kwargs.get("factory", sqlite3.Connection))
-    requested_identity = _requested_database_identity(path)
+    identity_mode = (
+        _SQLITE_URI_IDENTITY_MODE
+        if isinstance(path, str) and path.startswith("file:") and bool(kwargs.get("uri"))
+        else _FILESYSTEM_IDENTITY_MODE
+    )
+    requested_identity = (
+        _DatabaseIdentity(_MEMORY_IDENTITY)
+        if isinstance(path, str) and path in ("", ":memory:")
+        else _database_identity(path, mode=identity_mode)
+    )
     tracking_identity = (
-        _requested_database_identity(tracking_path)
+        _database_identity(tracking_path, mode=identity_mode)
         if tracking_path is not None
         else None
     )
@@ -417,7 +445,7 @@ def connect_tracked(
         connect_fn is None
         and requested_identity.kind == _FILE_IDENTITY
         and requested_identity.path is not None
-        and _is_plain_local_request(path)
+        and identity_mode == _FILESYSTEM_IDENTITY_MODE
     ):
         # Resolve once before default opening.  This spelling is also what a
         # later raw probe uses, so an alias retarget cannot change one side.
@@ -435,7 +463,7 @@ def connect_tracked(
                 f"{type(conn).__name__}, not a sqlite3.Connection; "
                 "byte-probe safety cannot be tracked"
             )
-        actual_identity = _post_open_database_identity(conn)
+        actual_identity = _post_open_database_identity(conn, mode=identity_mode)
         _require_matching_identity(
             requested_identity,
             tracking_identity,
@@ -585,7 +613,7 @@ def read_header_bytes_preopen(
     never bypasses a global unresolved opener: that opener may turn out to own
     this file under a spelling no path registry can predict.
     """
-    identity = _requested_database_identity(path)
+    identity = _database_identity(path, mode=_FILESYSTEM_IDENTITY_MODE)
     if identity.kind != _FILE_IDENTITY or identity.path is None:
         return None
     with _live_lock:
@@ -607,10 +635,6 @@ def read_header_bytes_preopen(
             return None
 
 
-class LiveConnectionError(RuntimeError):
-    """A raw file operation was attempted on a database with live connections."""
-
-
 @contextlib.contextmanager
 def offline_file_access(path: Path | str, *, what: str = "read"):
     """Hold the connection-lifecycle lock across a raw read of a database file.
@@ -630,7 +654,7 @@ def offline_file_access(path: Path | str, *, what: str = "read"):
     The lock is only held for the duration of the raw I/O; it never spans
     caller work on an open connection, so it does not serialise database use.
     """
-    identity = _requested_database_identity(path)
+    identity = _database_identity(path, mode=_FILESYSTEM_IDENTITY_MODE)
     if identity.kind != _FILE_IDENTITY or identity.path is None:
         raise LiveConnectionError(
             f"Refusing to {what} {path}: its filesystem identity cannot be "
@@ -644,4 +668,12 @@ def offline_file_access(path: Path | str, *, what: str = "read"):
                 "connection's POSIX advisory locks. Close all database "
                 "handles (stop the gateway/dashboard) and retry."
             )
-        yield
+        previous_depth = _offline_file_access_depth()
+        _offline_file_access_state.depth = previous_depth + 1
+        try:
+            yield
+        finally:
+            if previous_depth:
+                _offline_file_access_state.depth = previous_depth
+            else:
+                del _offline_file_access_state.depth
