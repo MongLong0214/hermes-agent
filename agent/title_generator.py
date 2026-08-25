@@ -722,6 +722,15 @@ def maybe_auto_title(
     if not session_db or not session_id or not user_message:
         return
 
+    title_getter = getattr(session_db, "get_session_title", None)
+    if callable(title_getter):
+        try:
+            if str(title_getter(session_id) or "").strip():
+                return
+        except Exception:
+            logger.debug("Title check failed for %s", session_id, exc_info=True)
+            return
+
     # Count the real questions behind us to detect the opening turn.
     # ``conversation_history`` is the state BEFORE this turn's message is
     # appended when called from the turn prologue, and after it when called

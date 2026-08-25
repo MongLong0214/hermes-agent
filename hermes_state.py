@@ -6308,9 +6308,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     ) -> None:
         """Atomically close a parent and publish its durable compression child.
 
-        The parent closure, child row, and compacted handoff become visible in
-        one transaction. Readers can therefore observe either the live parent or
-        a complete child, never an ended parent with a missing/empty child.
+        The parent closure, child row, compacted handoff, and any carried title
+        with its provenance become visible in one transaction. Readers can
+        therefore observe either the live parent or a complete child, never an
+        ended parent with a missing/empty child or split title identity.
 
         Concurrent-append safety (#75316): when *watermark* is provided (the
         parent's :meth:`get_active_message_watermark` captured at compression
@@ -6343,7 +6344,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     f"Compression lease lost before publication: {parent_session_id}"
                 )
             parent = conn.execute(
-                """SELECT ended_at, cwd, git_branch, git_repo_root,
+                """SELECT ended_at, title, title_source, cwd, git_branch, git_repo_root,
                           user_id, session_key, chat_id, chat_type,
                           thread_id, display_name, origin_json, profile_name
                    FROM sessions WHERE id = ?""",
@@ -6437,6 +6438,35 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
                 (total_messages, total_tool_calls, child_session_id),
             )
+            if parent["title"] is not None:
+                cleared = conn.execute(
+                    "UPDATE sessions SET title = NULL, title_source = NULL "
+                    "WHERE id = ? AND title IS ? AND title_source IS ?",
+                    (
+                        parent_session_id,
+                        parent["title"],
+                        parent["title_source"],
+                    ),
+                )
+                if cleared.rowcount != 1:
+                    raise RuntimeError(
+                        f"Compression parent title changed during publication: "
+                        f"{parent_session_id}"
+                    )
+                assigned = conn.execute(
+                    "UPDATE sessions SET title = ?, title_source = ? "
+                    "WHERE id = ? AND title IS NULL AND title_source IS NULL",
+                    (
+                        parent["title"],
+                        parent["title_source"],
+                        child_session_id,
+                    ),
+                )
+                if assigned.rowcount != 1:
+                    raise RuntimeError(
+                        f"Compression child title changed during publication: "
+                        f"{child_session_id}"
+                    )
             updated = conn.execute(
                 "UPDATE sessions SET ended_at = ?, end_reason = 'compression' "
                 "WHERE id = ? AND ended_at IS NULL",
