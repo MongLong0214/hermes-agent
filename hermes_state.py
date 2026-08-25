@@ -20,6 +20,7 @@ import contextlib
 import errno
 import hashlib
 import inspect
+import itertools
 import json
 import logging
 import os
@@ -3402,28 +3403,59 @@ class SQLiteSerializationError(sqlite3.ProgrammingError):
     """An SQLite handle could not be kept inside Hermes' serial boundary."""
 
 
-_SERIAL_LOCK_TYPE = type(threading.RLock())
-_trusted_serial_locks: weakref.WeakSet = weakref.WeakSet()
+_serial_lock_ranks = itertools.count()
 
 
-def _new_serial_lock() -> threading.RLock:
-    """Create an RLock whose provenance is known to this serialization layer."""
-    lock = threading.RLock()
-    _trusted_serial_locks.add(lock)
-    return lock
+class _ConnectionSerialLock:
+    """A sealed re-entrant lock bound to one exact SQLite connection."""
+
+    __slots__ = ("_lock", "_owner", "_rank", "_sealed")
+
+    def __init__(self, owner: sqlite3.Connection):
+        object.__setattr__(self, "_lock", threading.RLock())
+        object.__setattr__(self, "_owner", owner)
+        object.__setattr__(self, "_rank", next(_serial_lock_ranks))
+        object.__setattr__(self, "_sealed", True)
+
+    def __setattr__(self, _name, _value):
+        if getattr(self, "_sealed", False):
+            raise AttributeError("Hermes connection serial locks are sealed")
+        object.__setattr__(self, _name, _value)
+
+    @property
+    def owner(self) -> sqlite3.Connection:
+        return self._owner
+
+    @property
+    def rank(self) -> int:
+        return self._rank
+
+    def acquire(self, *args, **kwargs):
+        return self._lock.acquire(*args, **kwargs)
+
+    def release(self) -> None:
+        self._lock.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self.release()
+
+    def _is_owned(self) -> bool:
+        return self._lock._is_owned()
+
+    def _recursion_count(self) -> int:
+        return self._lock._recursion_count()
 
 
-def _is_trusted_serial_lock(lock) -> bool:
-    """Only layer-created real RLocks may protect a SQLite handle."""
-    return isinstance(lock, _SERIAL_LOCK_TYPE) and lock in _trusted_serial_locks
-
-
-def _serial_lock_for_connection(conn: sqlite3.Connection) -> threading.RLock:
-    """Return the connection lock or refuse an escaped/unserializable handle."""
+def _serial_lock_for_connection(conn: sqlite3.Connection) -> _ConnectionSerialLock:
+    """Return only this connection's exact layer-owned serialization lock."""
     lock = getattr(conn, "_hermes_serial_lock", None)
-    if not _is_trusted_serial_lock(lock):
+    if type(lock) is not _ConnectionSerialLock or lock.owner is not conn:
         raise SQLiteSerializationError(
-            f"SQLite connection {type(conn).__name__} has no trusted Hermes serial lock"
+            f"SQLite connection {type(conn).__name__} has no owner-bound Hermes serial lock"
         )
     return lock
 
@@ -3495,28 +3527,28 @@ def _serialized_cursor_factory(factory: type) -> type:
     return cached
 
 
-def _close_unserializable_handle(handle) -> None:
-    """Close a rejected handle without trusting dynamic SQLite mixins."""
+def _close_rejected_handle_at_boundary(handle, primary_error: BaseException) -> None:
+    """Attach a direct-cleanup diagnostic without replacing the primary error."""
+    from hermes_cli.sqlite_safe_read import close_rejected_handle_once
+
+    cleanup_error = close_rejected_handle_once(handle)
+    if cleanup_error is None:
+        return
     try:
-        if isinstance(handle, sqlite3.Connection):
-            sqlite3.Connection.close(handle)
-        else:
-            handle.close()
+        setattr(primary_error, "_hermes_cleanup_error", cleanup_error)
     except Exception:
-        pass
+        logger.debug("rejected SQLite handle cleanup also failed", exc_info=True)
 
 
 def _ensure_serialized_cursor(cursor, connection: sqlite3.Connection):
     """Validate and, for Python subclasses, retrofit a returned cursor."""
     if not isinstance(cursor, sqlite3.Cursor):
-        _close_unserializable_handle(cursor)
         raise SQLiteSerializationError(
             "Connection.cursor() returned "
             f"{type(cursor).__name__}, not a sqlite3.Cursor; refusing an "
             "unserializable SQLite handle"
         )
     if cursor.connection is not connection:
-        _close_unserializable_handle(cursor)
         raise SQLiteSerializationError(
             "Connection.cursor() returned a cursor owned by another connection; "
             "refusing an unserialized SQLite handle"
@@ -3525,18 +3557,13 @@ def _ensure_serialized_cursor(cursor, connection: sqlite3.Connection):
         try:
             cursor.__class__ = _serialized_cursor_factory(type(cursor))
         except (AttributeError, TypeError) as exc:
-            _close_unserializable_handle(cursor)
             raise SQLiteSerializationError(
                 f"cursor factory {type(cursor).__name__} cannot be serialized "
                 "without changing its behaviour"
             ) from exc
-    try:
-        _require_serialization_mixin_dominance(
-            type(cursor), _SerializedCursorMixin, "cursor"
-        )
-    except BaseException:
-        _close_unserializable_handle(cursor)
-        raise
+    _require_serialization_mixin_dominance(
+        type(cursor), _SerializedCursorMixin, "cursor"
+    )
     return cursor
 
 
@@ -3545,7 +3572,6 @@ class _SerializedBlob:
 
     def __init__(self, blob, connection: sqlite3.Connection):
         if not isinstance(blob, sqlite3.Blob):
-            _close_unserializable_handle(blob)
             raise SQLiteSerializationError(
                 "Connection.blobopen() returned "
                 f"{type(blob).__name__}, not a sqlite3.Blob; refusing an "
@@ -3613,27 +3639,28 @@ class _SerializedBlob:
 class _SerializedIterator:
     """Serialize lazy SQLite iterators such as ``Connection.iterdump()``."""
 
-    def __init__(self, iterator, lock):
+    def __init__(self, iterator, connection: sqlite3.Connection):
         self._iterator = iterator
-        self._lock = lock
+        self._connection = connection
 
     def __iter__(self):
+        _serial_lock_for_connection(self._connection)
         return self
 
     def __next__(self):
-        with self._lock:
+        with _serial_lock_for_connection(self._connection):
             return next(self._iterator)
 
     def close(self):
-        with self._lock:
+        with _serial_lock_for_connection(self._connection):
             return self._iterator.close()
 
     def send(self, *args, **kwargs):
-        with self._lock:
+        with _serial_lock_for_connection(self._connection):
             return self._iterator.send(*args, **kwargs)
 
     def throw(self, *args, **kwargs):
-        with self._lock:
+        with _serial_lock_for_connection(self._connection):
             return self._iterator.throw(*args, **kwargs)
 
 
@@ -3690,7 +3717,7 @@ class _SerializedConnectionMixin:
     """
 
     def __init__(self, *args, **kwargs):
-        self._hermes_serial_lock = _new_serial_lock()
+        self._hermes_serial_lock = _ConnectionSerialLock(self)
         super().__init__(*args, **kwargs)
 
     def cursor(self, *args, **kwargs):
@@ -3718,7 +3745,11 @@ class _SerializedConnectionMixin:
             else:
                 # Preserve native argument errors for base Connection.cursor().
                 cursor = super().cursor(*args, **kwargs)
-            return _ensure_serialized_cursor(cursor, self)
+            try:
+                return _ensure_serialized_cursor(cursor, self)
+            except BaseException as exc:
+                _close_rejected_handle_at_boundary(cursor, exc)
+                raise
 
     # execute/executemany/executescript are implemented HERE in Python, routed
     # through self.cursor(), instead of delegating to the C shortcuts: on
@@ -3763,13 +3794,18 @@ class _SerializedConnectionMixin:
 
     def blobopen(self, *args, **kwargs):
         with _serial_lock_for_connection(self):
-            return _SerializedBlob(super().blobopen(*args, **kwargs), self)
+            blob = super().blobopen(*args, **kwargs)
+            try:
+                return _SerializedBlob(blob, self)
+            except BaseException as exc:
+                _close_rejected_handle_at_boundary(blob, exc)
+                raise
 
     def iterdump(self, *args, **kwargs):
         with _serial_lock_for_connection(self):
             return _SerializedIterator(
                 super().iterdump(*args, **kwargs),
-                _serial_lock_for_connection(self),
+                self,
             )
 
     @property
@@ -3814,7 +3850,7 @@ class _SerializedConnectionMixin:
             locks.append(target_lock)
         # A stable total order avoids source->destination / destination->source
         # ABBA.  The source==destination case acquires its single RLock once.
-        ordered_locks = sorted(locks, key=id)
+        ordered_locks = sorted(locks, key=lambda lock: lock.rank)
         _reject_reentrant_lock_order_inversion(ordered_locks)
         with contextlib.ExitStack() as stack:
             for lock in ordered_locks:
@@ -3822,23 +3858,46 @@ class _SerializedConnectionMixin:
             return super().backup(*args, **kwargs)
 
 
-_SERIALIZED_CONNECTION_METHODS = {
-    "cursor",
-    "execute",
-    "executemany",
-    "executescript",
-    "commit",
-    "rollback",
-    "close",
-    "__enter__",
-    "__exit__",
-    "blobopen",
-    "iterdump",
-    "backup",
-    "in_transaction",
-    "isolation_level",
-    "total_changes",
-}
+# One declarative denominator for every connection surface that enters SQLite.
+# ``always`` wrappers are written on the mixin above; ``if_native`` wrappers
+# are installed below only when this CPython exposes the native descriptor.
+# The same table drives installation, MRO dominance, and wrapper assertions so
+# a feature property cannot be wrapped without also being validated.
+_CONNECTION_SERIAL_SURFACES = (
+    ("cursor", "method", "always"),
+    ("execute", "method", "always"),
+    ("executemany", "method", "always"),
+    ("executescript", "method", "always"),
+    ("commit", "method", "always"),
+    ("rollback", "method", "always"),
+    ("close", "method", "always"),
+    ("__enter__", "method", "always"),
+    ("__exit__", "method", "always"),
+    ("blobopen", "method", "always"),
+    ("iterdump", "method", "always"),
+    ("backup", "method", "always"),
+    ("in_transaction", "property", "always"),
+    ("isolation_level", "property", "always"),
+    ("total_changes", "property", "always"),
+    # Keep this in the MRO denominator on 3.11 as well.  The native descriptor
+    # arrived later, but a preceding custom descriptor is still a bypass.
+    ("autocommit", "property", "if_native"),
+    ("create_function", "method", "if_native"),
+    ("create_aggregate", "method", "if_native"),
+    ("create_collation", "method", "if_native"),
+    ("create_window_function", "method", "if_native"),
+    ("set_authorizer", "method", "if_native"),
+    ("set_progress_handler", "method", "if_native"),
+    ("set_trace_callback", "method", "if_native"),
+    ("enable_load_extension", "method", "if_native"),
+    ("load_extension", "method", "if_native"),
+    ("serialize", "method", "if_native"),
+    ("deserialize", "method", "if_native"),
+    ("getlimit", "method", "if_native"),
+    ("setlimit", "method", "if_native"),
+    ("getconfig", "method", "if_native"),
+    ("setconfig", "method", "if_native"),
+)
 _SERIALIZED_CURSOR_METHODS = {
     "execute",
     "executemany",
@@ -3858,13 +3917,13 @@ def _serialization_mixin_dominates(cls: type, mixin: type) -> bool:
         index = cls.__mro__.index(mixin)
     except ValueError:
         return False
-    methods = (
-        _SERIALIZED_CONNECTION_METHODS
-        if mixin is _SerializedConnectionMixin
-        else _SERIALIZED_CURSOR_METHODS
-    )
     for parent in cls.__mro__[:index]:
-        for name in methods:
+        surfaces = (
+            _CONNECTION_SERIAL_SURFACES
+            if mixin is _SerializedConnectionMixin
+            else ((name, "method", "always") for name in _SERIALIZED_CURSOR_METHODS)
+        )
+        for name, _kind, _installer in surfaces:
             if name not in parent.__dict__:
                 continue
             # Tracking's close() deliberately delegates to the next MRO entry
@@ -3905,7 +3964,11 @@ def _serialized_shortcut(connection, name: str, *args, **kwargs):
     cursor = getattr(super(_SerializedConnectionMixin, connection), name)(
         *args, **kwargs
     )
-    return _ensure_serialized_cursor(cursor, connection)
+    try:
+        return _ensure_serialized_cursor(cursor, connection)
+    except BaseException as exc:
+        _close_rejected_handle_at_boundary(cursor, exc)
+        raise
 
 
 def _valid_backup_target(args, kwargs):
@@ -3922,9 +3985,9 @@ def _reject_reentrant_lock_order_inversion(ordered_locks) -> None:
     owned = [lock for lock in ordered_locks if lock._is_owned()]
     if not owned:
         return
-    highest_owned = max(owned, key=id)
+    highest_owned = max(owned, key=lambda lock: lock.rank)
     for lock in ordered_locks:
-        if id(lock) < id(highest_owned) and not lock._is_owned():
+        if lock.rank < highest_owned.rank and not lock._is_owned():
             raise SQLiteSerializationError(
                 "SQLite backup cannot acquire lower-ranked destination lock "
                 "while this thread owns a higher-ranked source lock"
@@ -3943,38 +4006,43 @@ def _serialized_forwarding_method(name: str):
     return method
 
 
-for _serialized_method_name in (
-    "create_function",
-    "create_aggregate",
-    "create_collation",
-    "create_window_function",
-    "set_authorizer",
-    "set_progress_handler",
-    "set_trace_callback",
-    "enable_load_extension",
-    "load_extension",
-    "serialize",
-    "deserialize",
-    "getlimit",
-    "setlimit",
-    "getconfig",
-    "setconfig",
-):
-    if hasattr(sqlite3.Connection, _serialized_method_name):
-        _SERIALIZED_CONNECTION_METHODS.add(_serialized_method_name)
-        setattr(
-            _SerializedConnectionMixin,
-            _serialized_method_name,
-            _serialized_forwarding_method(_serialized_method_name),
-        )
+def _install_connection_serial_surfaces() -> None:
+    """Install every feature-detected wrapper declared by the surface table."""
+    for name, kind, installer in _CONNECTION_SERIAL_SURFACES:
+        if installer != "if_native" or not hasattr(sqlite3.Connection, name):
+            continue
+        if kind == "method":
+            setattr(
+                _SerializedConnectionMixin,
+                name,
+                _serialized_forwarding_method(name),
+            )
+        else:
+            setattr(
+                _SerializedConnectionMixin,
+                name,
+                property(
+                    lambda self, name=name: _serialized_connection_property_get(
+                        self, name
+                    ),
+                    lambda self, value, name=name: _serialized_connection_property_set(
+                        self, name, value
+                    ),
+                ),
+            )
 
-if hasattr(sqlite3.Connection, "autocommit"):
-    _SerializedConnectionMixin.autocommit = property(
-        lambda self: _serialized_connection_property_get(self, "autocommit"),
-        lambda self, value: _serialized_connection_property_set(
-            self, "autocommit", value
-        ),
-    )
+
+def _assert_connection_serial_surface_wrappers() -> None:
+    """Keep the table and mixin installation from silently drifting apart."""
+    for name, _kind, installer in _CONNECTION_SERIAL_SURFACES:
+        if installer == "if_native" and not hasattr(sqlite3.Connection, name):
+            continue
+        if name not in _SerializedConnectionMixin.__dict__:
+            raise RuntimeError(f"missing SQLite serialization wrapper for {name}")
+
+
+_install_connection_serial_surfaces()
+_assert_connection_serial_surface_wrappers()
 
 
 class _SerializedConnection(_SerializedConnectionMixin, sqlite3.Connection):
@@ -4006,42 +4074,35 @@ def _serialized_connection_factory(factory: type) -> type:
 def _ensure_serialized_connection(conn):
     """Validate the opener's *actual* connection before exposing it."""
     if not isinstance(conn, sqlite3.Connection):
-        _close_unserializable_handle(conn)
         raise SQLiteSerializationError(
             "SQLite opener returned "
             f"{type(conn).__name__}, not a sqlite3.Connection; refusing an "
             "unserializable connection"
         )
     if not isinstance(conn, _SerializedConnectionMixin):
+        existing_lock = getattr(conn, "_hermes_serial_lock", None)
+        if existing_lock is not None:
+            raise SQLiteSerializationError(
+                f"SQLite connection {type(conn).__name__} has a pre-existing "
+                "non-layer serial lock"
+            )
         try:
             conn.__class__ = _serialized_connection_factory(type(conn))
         except (AttributeError, TypeError) as exc:
-            _close_unserializable_handle(conn)
             raise SQLiteSerializationError(
                 f"SQLite opener substituted {type(conn).__name__}, which cannot "
                 "be serialized without changing its behaviour"
             ) from exc
-    try:
-        _require_serialization_mixin_dominance(
-            type(conn), _SerializedConnectionMixin, "connection"
-        )
-    except BaseException:
-        _close_unserializable_handle(conn)
-        raise
-    lock = getattr(conn, "_hermes_serial_lock", None)
-    if lock is None:
         try:
-            conn._hermes_serial_lock = _new_serial_lock()
+            conn._hermes_serial_lock = _ConnectionSerialLock(conn)
         except (AttributeError, TypeError) as exc:
-            _close_unserializable_handle(conn)
             raise SQLiteSerializationError(
                 f"SQLite connection {type(conn).__name__} cannot store its serial lock"
             ) from exc
-    elif not _is_trusted_serial_lock(lock):
-        _close_unserializable_handle(conn)
-        raise SQLiteSerializationError(
-            f"SQLite connection {type(conn).__name__} has an untrusted Hermes serial lock"
-        )
+    _require_serialization_mixin_dominance(
+        type(conn), _SerializedConnectionMixin, "connection"
+    )
+    _serial_lock_for_connection(conn)
     return conn
 
 
@@ -4082,15 +4143,27 @@ def _connect_tracked_db(path, tracking_path=None, **kwargs):
             conn = _ensure_serialized_connection(conn)
             register_turn_fence_function(conn)
             return conn
-        except BaseException:
-            _close_unserializable_handle(conn)
+        except BaseException as exc:
+            # This stripped-install boundary owns its one raw connection.
+            try:
+                sqlite3.Connection.close(conn)
+            except BaseException as cleanup_error:
+                try:
+                    setattr(exc, "_hermes_cleanup_error", cleanup_error)
+                except Exception:
+                    logger.debug("rejected SQLite fallback cleanup also failed", exc_info=True)
             raise
 
     # Open through THIS module's sqlite3.connect so callers (and tests) that
     # patch hermes_state.sqlite3.connect keep control of connection creation;
     # the helper still owns tracking.
     def _serialized_opener(*open_args, **open_kwargs):
-        return _ensure_serialized_connection(sqlite3.connect(*open_args, **open_kwargs))
+        opened = sqlite3.connect(*open_args, **open_kwargs)
+        try:
+            return _ensure_serialized_connection(opened)
+        except BaseException as exc:
+            _close_rejected_handle_at_boundary(opened, exc)
+            raise
 
     try:
         conn = connect_tracked(
@@ -4105,7 +4178,7 @@ def _connect_tracked_db(path, tracking_path=None, **kwargs):
         # factory ignored or defeated the requested serialized class.
         raise UntrackableConnectionError(
             f"connection to {path} cannot release its tracking entry because "
-            "the actual SQLite handle cannot be safely serialized (trusted "
+            "the actual SQLite handle cannot be safely serialized (owner-bound "
             "serial-lock and MRO validation failed closed)"
         ) from exc
     # THE choke point for the generation barrier: every connection this package
@@ -4122,13 +4195,16 @@ def _connect_tracked_db(path, tracking_path=None, **kwargs):
         conn = _ensure_serialized_connection(conn)
         register_turn_fence_function(conn)
         return conn
-    except BaseException:
+    except BaseException as exc:
         # This connection is already tracked; use its safe dynamic close so
         # the live registry is consumed after SQLite has closed successfully.
         try:
             conn.close()
-        except Exception:
-            pass
+        except BaseException as cleanup_error:
+            try:
+                setattr(exc, "_hermes_cleanup_error", cleanup_error)
+            except Exception:
+                logger.debug("tracked SQLite post-open cleanup also failed", exc_info=True)
         raise
 
 

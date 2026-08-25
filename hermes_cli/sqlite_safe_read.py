@@ -34,13 +34,12 @@ The rules
 
 Concurrency contract
 --------------------
-The registry is not advisory bookkeeping -- it is the guard, so the
-check and the byte read must be **atomic with respect to connection
-lifecycle**. ``_live_lock`` is therefore held across the two critical
-sections that can create a raw-descriptor race:
-
-* open + register (:func:`connect_tracked`)
-* check + ``open``/``read``/``close`` (:func:`read_header_bytes_preopen`)
+The registry is not advisory bookkeeping -- it is the guard.  Every tracked
+open first reserves one global unresolved-open count under ``_live_lock``;
+the arbitrary opener and SQLite identity lookup run outside that mutex.  The
+actual file identity is published atomically with consumption of that count.
+While any count remains, raw descriptor access refuses globally.  The raw
+check and ``open``/``read``/``close`` stay together under ``_live_lock``.
 
 Successful close unregisters only afterwards. This is conservatively safe:
 the registry can briefly report a closed descriptor as live, but can never
@@ -50,8 +49,8 @@ serialized connection waits for its own lock.
 Without that, a thread could pass the "no live connection" check, a second
 thread could open a connection and take a write lock, and the first thread's
 ``close()`` would then cancel it -- reintroducing the exact bug this module
-exists to prevent. The lock is never held while a caller *uses* a connection,
-only across these transitions, so it does not serialise database work.
+exists to prevent. The lock is never held while a caller *uses* a connection
+or while an arbitrary opener runs, so it does not serialise database work.
 
 Path identity
 -------------
@@ -70,9 +69,10 @@ import logging
 import os
 import sqlite3
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -81,15 +81,15 @@ SQLITE_HEADER_MAGIC = b"SQLite format 3\x00"
 # Offset of the 4-byte big-endian page-count field in the SQLite header.
 _HEADER_PAGE_COUNT_OFFSET = 28
 
-# Guards BOTH the registry and the lifecycle syscalls it describes. Reentrant
-# because connect_tracked -> _canonical_db_path -> ... stays on one thread.
+# Guards BOTH the registry and the lifecycle syscalls it describes.
 _live_lock = threading.RLock()
 # canonical path -> number of live connections opened by this process
 _live_connections: dict[str, int] = {}
-# canonical path -> number of openers currently creating a connection.  A
-# reservation is conservatively treated as live so raw byte probes cannot open
-# and close the file in the creation window.
-_opening_connections: dict[str, int] = {}
+# Every open owns one pending count before it calls an opener.  Until SQLite
+# tells us the actual database identity, a path reservation is not safe: a
+# custom opener may redirect it, and a symlink may change beneath it.  Raw
+# descriptor access therefore refuses globally while this is nonzero.
+_pending_unresolved_opens = 0
 
 
 class UntrackableConnectionError(RuntimeError):
@@ -100,6 +100,19 @@ class UntrackableConnectionError(RuntimeError):
     """
 
 
+@dataclass(frozen=True)
+class _DatabaseIdentity:
+    """The only three useful outcomes of identifying SQLite's ``main`` DB."""
+
+    kind: str
+    path: str | None = None
+
+
+_FILE_IDENTITY = "file"
+_MEMORY_IDENTITY = "memory/unnamed"
+_UNRESOLVED_IDENTITY = "unresolved"
+
+
 def _key(path: Path | str) -> str:
     """Canonicalise a *filesystem* path for use as a registry key."""
     try:
@@ -108,19 +121,53 @@ def _key(path: Path | str) -> str:
         return str(path)
 
 
-def _reservation_key(path: Path | str) -> Optional[str]:
-    """Best-effort canonical identity available before SQLite opens *path*."""
-    path_str = os.fspath(path)
-    if path_str.startswith("file:"):
-        parsed = urlsplit(path_str)
-        if parsed.scheme == "file":
-            candidate = unquote(parsed.path)
-            if candidate in ("", ":memory:"):
-                return None
-            return _key(candidate)
-    if path_str == ":memory:":
-        return None
-    return _key(path_str)
+def _file_identity(path: Path | str) -> _DatabaseIdentity:
+    """Resolve one filesystem spelling, or explicitly report no authority."""
+    try:
+        return _DatabaseIdentity(_FILE_IDENTITY, str(Path(path).resolve()))
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return _DatabaseIdentity(_UNRESOLVED_IDENTITY)
+
+
+def _requested_database_identity(path: Path | str) -> _DatabaseIdentity:
+    """Classify a requested SQLite target without opening it.
+
+    A plain local path and a file URI both carry a filesystem assertion.  The
+    URI itself remains the opener argument when it carries SQLite semantics
+    such as ``mode=ro``; its physical component is still checked against the
+    post-open identity.  ``:memory:`` and unnamed URI memory databases cannot
+    be raw-probed, so they intentionally have no file key.
+    """
+    try:
+        path_str = os.fspath(path)
+    except TypeError:
+        return _DatabaseIdentity(_UNRESOLVED_IDENTITY)
+    if path_str in ("", ":memory:"):
+        return _DatabaseIdentity(_MEMORY_IDENTITY)
+    if not path_str.startswith("file:"):
+        return _file_identity(path_str)
+
+    parsed = urlsplit(path_str)
+    if parsed.scheme != "file":
+        return _DatabaseIdentity(_UNRESOLVED_IDENTITY)
+    # SQLite file URIs with a non-local authority have no filesystem spelling
+    # this layer can authoritatively guard.
+    if parsed.netloc not in ("", "localhost"):
+        return _DatabaseIdentity(_UNRESOLVED_IDENTITY)
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    candidate = unquote(parsed.path)
+    if candidate in ("", ":memory:") or query.get("mode") == ["memory"]:
+        return _DatabaseIdentity(_MEMORY_IDENTITY)
+    return _file_identity(candidate)
+
+
+def _is_plain_local_request(path: Path | str) -> bool:
+    """Whether the default opener can safely receive a resolved spelling."""
+    try:
+        path_str = os.fspath(path)
+    except TypeError:
+        return False
+    return bool(path_str) and path_str != ":memory:" and not path_str.startswith("file:")
 
 
 def _increment_count(counts: dict[str, int], key: str) -> None:
@@ -135,55 +182,80 @@ def _decrement_count(counts: dict[str, int], key: str) -> None:
         counts.pop(key, None)
 
 
-def _is_live_or_opening_locked(key: str) -> bool:
-    return key in _live_connections or key in _opening_connections
-
-
-def _reserve_opening(key: Optional[str]) -> None:
-    if key is None:
-        return
+def _begin_pending_open() -> None:
+    """Reserve exactly one unresolved-open slot before an arbitrary opener."""
+    global _pending_unresolved_opens
     with _live_lock:
-        _increment_count(_opening_connections, key)
+        _pending_unresolved_opens += 1
 
 
-def _release_opening(key: Optional[str]) -> None:
-    if key is None:
-        return
+def _publish_or_finish_pending_open(identity: _DatabaseIdentity) -> None:
+    """Publish a file identity, if any, and consume this call's pending slot."""
+    global _pending_unresolved_opens
     with _live_lock:
-        _decrement_count(_opening_connections, key)
+        if identity.kind == _FILE_IDENTITY and identity.path is not None:
+            _increment_count(_live_connections, identity.path)
+        if _pending_unresolved_opens <= 0:  # pragma: no cover - internal invariant
+            raise RuntimeError("SQLite unresolved-open accounting underflow")
+        _pending_unresolved_opens -= 1
 
 
-def _register_and_consume_opening(reserved: Optional[str], resolved: str) -> None:
-    """Publish a live handle and consume exactly its reservation atomically."""
-    with _live_lock:
-        _increment_count(_live_connections, resolved)
-        if reserved is not None:
-            _decrement_count(_opening_connections, reserved)
-
-
-def _canonical_db_path(conn: sqlite3.Connection) -> Optional[str]:
-    """The on-disk path of ``main``, as SQLite itself reports it.
-
-    Immune to the caller's spelling (``file:`` URIs, relative paths, symlinks).
-    Returns ``None`` for in-memory or unnamed databases, which cannot be
-    byte-probed and therefore need no tracking.
-    """
+def _post_open_database_identity(conn: sqlite3.Connection) -> _DatabaseIdentity:
+    """Return SQLite's authoritative post-open identity, never an inference."""
     try:
-        # ``connect_tracked`` holds _live_lock while it establishes the
-        # registration.  Bypass an optional connection wrapper here: taking a
-        # per-connection serial lock while holding _live_lock reverses the
-        # callback-reachable serial -> live order.  This first-open probe runs
-        # before Hermes registers Python UDFs on the connection.
+        # This bypasses an optional connection wrapper.  It runs before the
+        # handle is registered and never under _live_lock, preserving the
+        # serial -> live callback order.
         cursor = sqlite3.Connection.execute(conn, "PRAGMA database_list")
         row = sqlite3.Cursor.fetchone(cursor)
     except sqlite3.Error:
-        return None
+        # An authorizer denial is unresolved, not evidence of an in-memory DB.
+        return _DatabaseIdentity(_UNRESOLVED_IDENTITY)
     if not row or len(row) < 3:
-        return None
+        return _DatabaseIdentity(_UNRESOLVED_IDENTITY)
     path_str = row[2]
     if not path_str:
-        return None
-    return _key(path_str)
+        return _DatabaseIdentity(_MEMORY_IDENTITY)
+    if not isinstance(path_str, str):
+        return _DatabaseIdentity(_UNRESOLVED_IDENTITY)
+    return _file_identity(path_str)
+
+
+def _canonical_db_path(conn: sqlite3.Connection) -> Optional[str]:
+    """Compatibility helper for callers that only need a known file path."""
+    identity = _post_open_database_identity(conn)
+    return identity.path if identity.kind == _FILE_IDENTITY else None
+
+
+def _require_matching_identity(
+    requested: _DatabaseIdentity,
+    tracking: _DatabaseIdentity | None,
+    actual: _DatabaseIdentity,
+) -> None:
+    """Reject anything that cannot prove the opened file is the requested one."""
+    if actual.kind == _UNRESOLVED_IDENTITY:
+        raise UntrackableConnectionError(
+            "SQLite database identity is unresolved after open; refusing to expose "
+            "a possibly file-backed connection without byte-probe protection"
+        )
+    for label, expected in (("requested", requested), ("tracking", tracking)):
+        if expected is None:
+            continue
+        if expected.kind == _UNRESOLVED_IDENTITY:
+            raise UntrackableConnectionError(
+                f"{label} SQLite database identity cannot be resolved before open"
+            )
+        if expected.kind != actual.kind:
+            raise UntrackableConnectionError(
+                f"{label} SQLite database identity does not match the opened database"
+            )
+        if (
+            expected.kind == _FILE_IDENTITY
+            and expected.path != actual.path
+        ):
+            raise UntrackableConnectionError(
+                f"{label} SQLite database identity does not match the opened database"
+            )
 
 
 def track_connection(path: Path | str) -> None:
@@ -209,9 +281,14 @@ def untrack_connection(path: Path | str) -> None:
 
 
 def has_live_connection(path: Path | str) -> bool:
-    """Whether *path* has a live handle or an opener in progress."""
+    """Whether *path* has a live handle or any opener lacks an identity."""
+    identity = _requested_database_identity(path)
     with _live_lock:
-        return _is_live_or_opening_locked(_key(path))
+        return _pending_unresolved_opens > 0 or (
+            identity.kind == _FILE_IDENTITY
+            and identity.path is not None
+            and identity.path in _live_connections
+        )
 
 
 class _TrackingMixin:
@@ -305,14 +382,16 @@ def connect_tracked(
     byte-probed (``state.db``, ``kanban.db``). The registration is released
     automatically on ``close()``.
 
-    A counted reservation is created under ``_live_lock`` before the opener
+    An unresolved-open count is created under ``_live_lock`` before the opener
     runs.  The opener, SQLite validation, retrofit, and rejected-handle cleanup
-    run outside that mutex; raw probes treat the reservation as live until it
-    is atomically exchanged for the registered connection.
+    run outside that mutex.  Raw probes refuse globally until SQLite reports
+    the actual identity, which is then published atomically with consumption of
+    this call's pending count.
 
     The registry key is the canonical path reported by ``PRAGMA
-    database_list`` -- not *path*, which may be a ``file:`` URI. Pass
-    ``tracking_path`` to override when the caller already knows the real path.
+    database_list`` -- not *path*, which may be a ``file:`` URI.
+    ``tracking_path`` is an identity assertion: it and the normal request must
+    both agree with SQLite's post-open path.
 
     ``connect_fn`` lets a caller supply its own opener (defaults to
     :func:`sqlite3.connect`), so a module that owns the connection — and any
@@ -327,39 +406,58 @@ def connect_tracked(
     """
     opener = connect_fn if connect_fn is not None else sqlite3.connect
     kwargs["factory"] = _tracking_factory(kwargs.get("factory", sqlite3.Connection))
-    reserved = _reservation_key(tracking_path if tracking_path is not None else path)
-    reservation_pending = reserved is not None
-    _reserve_opening(reserved)
+    requested_identity = _requested_database_identity(path)
+    tracking_identity = (
+        _requested_database_identity(tracking_path)
+        if tracking_path is not None
+        else None
+    )
+    open_path = str(path)
+    if (
+        connect_fn is None
+        and requested_identity.kind == _FILE_IDENTITY
+        and requested_identity.path is not None
+        and _is_plain_local_request(path)
+    ):
+        # Resolve once before default opening.  This spelling is also what a
+        # later raw probe uses, so an alias retarget cannot change one side.
+        open_path = requested_identity.path
+
+    _begin_pending_open()
+    pending_open = True
     conn = None
     try:
         # Never hold _live_lock while calling arbitrary opener code or SQLite.
-        conn = opener(str(path), **kwargs)
+        conn = opener(open_path, **kwargs)
         if not isinstance(conn, sqlite3.Connection):
             raise UntrackableConnectionError(
                 "SQLite opener returned "
                 f"{type(conn).__name__}, not a sqlite3.Connection; "
                 "byte-probe safety cannot be tracked"
             )
-        resolved = (
-            _key(tracking_path)
-            if tracking_path is not None
-            else _canonical_db_path(conn)
+        actual_identity = _post_open_database_identity(conn)
+        _require_matching_identity(
+            requested_identity,
+            tracking_identity,
+            actual_identity,
         )
-        if resolved is None:
-            # In-memory / unnamed: nothing on disk to byte-probe.
-            return conn
-        if not isinstance(conn, _TrackingMixin):
-            # The opener substituted its own factory and discarded ours (test
-            # doubles simulating FTS5-less runtimes do this). Retag outside
-            # _live_lock so no path can wait on custom class machinery there.
-            conn = _retrofit_tracking(conn, resolved)
-        conn._hermes_tracked_path = resolved
-        _register_and_consume_opening(reserved, resolved)
-        reservation_pending = False
+        if actual_identity.kind == _FILE_IDENTITY:
+            assert actual_identity.path is not None  # narrowed by the identity tag
+            if not isinstance(conn, _TrackingMixin):
+                # The opener substituted its own factory and discarded ours
+                # (test doubles simulating FTS5-less runtimes do this). Retag
+                # outside _live_lock so no path can wait on custom class
+                # machinery there.
+                conn = _retrofit_tracking(conn, actual_identity.path)
+            conn._hermes_tracked_path = actual_identity.path
+        # The success transition publishes a file identity (or only consumes a
+        # memory/unnamed open) under the lifecycle mutex.
+        _publish_or_finish_pending_open(actual_identity)
+        pending_open = False
         return conn
     except BaseException as exc:
         if conn is not None:
-            cleanup_error = _close_rejected_handle(conn)
+            cleanup_error = close_rejected_handle_once(conn)
             if cleanup_error is not None:
                 # Preserve the validation/open failure as primary while keeping
                 # the cleanup failure available for diagnostics.
@@ -369,15 +467,22 @@ def connect_tracked(
                     logger.debug("rejected SQLite opener cleanup also failed", exc_info=True)
         raise
     finally:
-        if reservation_pending:
-            _release_opening(reserved)
+        if pending_open:
+            # Cleanup above happens before this transition.  Each nested or
+            # concurrent call owns one slot, so a failure cannot erase another
+            # opener's protection.
+            _publish_or_finish_pending_open(_DatabaseIdentity(_MEMORY_IDENTITY))
 
 
-def _close_rejected_handle(handle) -> Optional[BaseException]:
-    """Best-effort, exactly-once cleanup without dynamic tracking dispatch."""
+def close_rejected_handle_once(handle) -> Optional[BaseException]:
+    """Directly close one rejected actual resource without trusting overrides."""
     try:
         if isinstance(handle, sqlite3.Connection):
             sqlite3.Connection.close(handle)
+        elif isinstance(handle, sqlite3.Cursor):
+            sqlite3.Cursor.close(handle)
+        elif hasattr(sqlite3, "Blob") and isinstance(handle, sqlite3.Blob):
+            sqlite3.Blob.close(handle)
         else:
             handle.close()
     except BaseException as exc:
@@ -476,18 +581,27 @@ def read_header_bytes_preopen(
     window between deciding "nothing is live" and closing this descriptor.
 
     Set ``force=True`` only for genuinely offline files (quarantined copies,
-    snapshot artifacts, archives) that no live connection can reference.
+    snapshot artifacts, archives) that no live connection can reference.  It
+    never bypasses a global unresolved opener: that opener may turn out to own
+    this file under a spelling no path registry can predict.
     """
+    identity = _requested_database_identity(path)
+    if identity.kind != _FILE_IDENTITY or identity.path is None:
+        return None
     with _live_lock:
-        if not force and _is_live_or_opening_locked(_key(path)):
+        if _pending_unresolved_opens > 0 or (
+            not force and identity.path in _live_connections
+        ):
             logger.debug(
-                "refusing byte-level read of %s: a live connection or opener "
-                "exists in this process and close() would cancel POSIX locks",
+                "refusing byte-level read of %s: a live connection or unresolved "
+                "opener exists in this process and close() would cancel POSIX locks",
                 path,
             )
             return None
         try:
-            with open(path, "rb") as handle:
+            # Open the exact resolved spelling checked above.  Do not reopen a
+            # caller alias after a symlink retarget between check and use.
+            with open(identity.path, "rb") as handle:
                 return handle.read(length)
         except OSError:
             return None
@@ -516,11 +630,17 @@ def offline_file_access(path: Path | str, *, what: str = "read"):
     The lock is only held for the duration of the raw I/O; it never spans
     caller work on an open connection, so it does not serialise database use.
     """
+    identity = _requested_database_identity(path)
+    if identity.kind != _FILE_IDENTITY or identity.path is None:
+        raise LiveConnectionError(
+            f"Refusing to {what} {path}: its filesystem identity cannot be "
+            "authoritatively resolved for safe raw access."
+        )
     with _live_lock:
-        if _is_live_or_opening_locked(_key(path)):
+        if _pending_unresolved_opens > 0 or identity.path in _live_connections:
             raise LiveConnectionError(
-                f"Refusing to {what} {path}: a connection to it is open or "
-                "being created in this process, and raw file access would cancel "
+                f"Refusing to {what} {path}: a connection is open or its identity "
+                "is being resolved in this process, and raw file access would cancel "
                 "connection's POSIX advisory locks. Close all database "
                 "handles (stop the gateway/dashboard) and retry."
             )

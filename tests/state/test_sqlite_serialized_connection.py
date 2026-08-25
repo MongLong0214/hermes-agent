@@ -565,7 +565,7 @@ def test_reentrant_backup_refuses_lower_ranked_destination_before_acquire(tmp_pa
         second = _connect_tracked_db(root / "second.db", check_same_thread=False)
         source, destination = sorted(
             (first, second),
-            key=lambda conn: id(conn._hermes_serial_lock),
+            key=lambda conn: conn._hermes_serial_lock.rank,
             reverse=True,
         )
         seen = []
@@ -690,7 +690,7 @@ def test_pre_mixed_handles_and_untrusted_actual_locks_fail_closed(tmp_path):
     try:
         with pytest.raises(SQLiteSerializationError, match="precedes"):
             conn.cursor()
-        assert PreMixedCursor.close_calls == 1
+        assert PreMixedCursor.close_calls == 0
     finally:
         conn.close()
 
@@ -703,7 +703,7 @@ def test_pre_mixed_handles_and_untrusted_actual_locks_fail_closed(tmp_path):
                 self._hermes_serial_lock = supplied_lock
                 opened.append(self)
 
-        with pytest.raises((UntrackableConnectionError, SQLiteSerializationError), match="trusted"):
+        with pytest.raises((UntrackableConnectionError, SQLiteSerializationError), match="owner-bound"):
             _connect_tracked_db(tmp_path / f"{label}-lock.db", factory=SuppliedLockConnection)
         assert len(opened) == 1
         with pytest.raises(sqlite3.ProgrammingError):
@@ -733,7 +733,7 @@ def test_rejected_arbitrary_opener_result_closes_its_own_resource_once(tmp_path)
     assert rejected.resource.closed
     key = sqlite_safe_read._key(tmp_path / "rejected.db")
     assert key not in sqlite_safe_read._live_connections
-    assert key not in sqlite_safe_read._opening_connections
+    assert sqlite_safe_read._pending_unresolved_opens == 0
 
     class CleanupFailure:
         def close(self):
@@ -878,6 +878,299 @@ def test_opener_reservations_prevent_probe_races_and_live_lock_abba(tmp_path):
         """,
         tmp_path,
     )
+
+
+def test_pending_open_globally_refuses_forced_raw_probes_and_cleans_nested_failures(
+    tmp_path,
+):
+    """A not-yet-identified opener blocks every raw probe, not just its request path."""
+    import hermes_cli.sqlite_safe_read as sqlite_safe_read
+
+    requested = tmp_path / "requested-a.db"
+    opened_elsewhere = tmp_path / "opened-b.db"
+    nested_outer = tmp_path / "nested-outer.db"
+    nested_inner = tmp_path / "nested-inner.db"
+    for database in (requested, opened_elsewhere, nested_outer, nested_inner):
+        sqlite3.connect(database).close()
+
+    entered = threading.Event()
+    release = threading.Event()
+    opened_actual: list[sqlite3.Connection] = []
+    returned: list[sqlite3.Connection] = []
+    failures: list[BaseException] = []
+
+    def redirected_and_paused(_path, **kwargs):
+        connection = sqlite3.connect(opened_elsewhere, **kwargs)
+        opened_actual.append(connection)
+        entered.set()
+        assert release.wait(4)
+        return connection
+
+    def open_in_worker() -> None:
+        try:
+            returned.append(
+                connect_tracked(
+                    requested,
+                    connect_fn=redirected_and_paused,
+                    check_same_thread=False,
+                )
+            )
+        except BaseException as exc:
+            failures.append(exc)
+
+    worker = threading.Thread(target=open_in_worker, daemon=True)
+    worker.start()
+    try:
+        assert entered.wait(2)
+        # Even an explicit force request has no authority to race an opener
+        # whose actual file identity is not known yet.
+        assert (
+            sqlite_safe_read.read_header_bytes_preopen(
+                opened_elsewhere, length=16, force=True
+            )
+            is None
+        )
+    finally:
+        release.set()
+        worker.join(4)
+        for connection in returned:
+            connection.close()
+    assert not worker.is_alive()
+    assert len(failures) == 1
+    assert isinstance(failures[0], UntrackableConnectionError)
+    with pytest.raises(sqlite3.ProgrammingError):
+        sqlite3.Connection.execute(opened_actual[0], "SELECT 1")
+    assert not has_live_connection(requested)
+    assert not has_live_connection(opened_elsewhere)
+
+    def rejected_inner(*_args, **_kwargs):
+        return object()
+
+    def nested_then_fail(*_args, **_kwargs):
+        with pytest.raises(UntrackableConnectionError):
+            connect_tracked(nested_inner, connect_fn=rejected_inner)
+        raise sqlite3.OperationalError("outer opener failed after nested open")
+
+    with pytest.raises(sqlite3.OperationalError, match="outer opener failed"):
+        connect_tracked(nested_outer, connect_fn=nested_then_fail)
+    # A fresh raw read proves both pending counts were consumed; a stale count
+    # must remain conservative and refuse it.
+    assert sqlite_safe_read.read_header_bytes_preopen(nested_outer, length=16) is not None
+
+
+def test_raw_probe_opens_the_single_resolved_spelling_after_symlink_retarget(
+    tmp_path, monkeypatch
+):
+    """The raw read uses the identity checked before an alias can be retargeted."""
+    import builtins
+
+    import hermes_cli.sqlite_safe_read as sqlite_safe_read
+
+    target_b = tmp_path / "target-b.db"
+    target_c = tmp_path / "target-c.db"
+    alias = tmp_path / "requested-alias.db"
+    target_b.write_bytes(b"B identity must be read")
+    target_c.write_bytes(b"C retarget must not be read")
+    alias.symlink_to(target_b)
+
+    real_open = builtins.open
+    retargeted = False
+
+    def retarget_before_open(opened_path, *args, **kwargs):
+        nonlocal retargeted
+        if not retargeted:
+            alias.unlink()
+            alias.symlink_to(target_c)
+            retargeted = True
+        return real_open(opened_path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", retarget_before_open)
+    assert sqlite_safe_read.read_header_bytes_preopen(alias, length=20) == b"B identity must be r"
+    assert retargeted
+
+
+def test_unresolved_file_backed_identity_fails_closed_with_direct_native_close(tmp_path):
+    """An authorizer-denied database_list pragma is unresolved, never memory."""
+    import hermes_cli.sqlite_safe_read as sqlite_safe_read
+
+    captured: list[sqlite3.Connection] = []
+
+    class DenyDatabaseListConnection(sqlite3.Connection):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            captured.append(self)
+
+            def deny_database_list(action, first_argument, *_args):
+                if action == sqlite3.SQLITE_PRAGMA and first_argument == "database_list":
+                    return sqlite3.SQLITE_DENY
+                return sqlite3.SQLITE_OK
+
+            sqlite3.Connection.set_authorizer(self, deny_database_list)
+
+    database = tmp_path / "authorizer-denied.db"
+    try:
+        with pytest.raises(UntrackableConnectionError, match="identity"):
+            connect_tracked(database, factory=DenyDatabaseListConnection)
+        assert len(captured) == 1
+        with pytest.raises(sqlite3.ProgrammingError):
+            sqlite3.Connection.execute(captured[0], "SELECT 1")
+        assert not has_live_connection(database)
+        assert sqlite_safe_read.read_header_bytes_preopen(database, length=16) is not None
+    finally:
+        # The parent RED path returns this handle; leave no descriptor behind
+        # when its expected assertion aborts the test.
+        for connection in captured:
+            try:
+                sqlite3.Connection.close(connection)
+            except sqlite3.Error:
+                pass
+
+
+def test_autocommit_surface_is_always_mro_dominant_and_native_setter_waits(
+    tmp_path,
+):
+    """Autocommit is in the structural denominator even before CPython exposes it."""
+    class AutocommitOnlyOverride:
+        @property
+        def autocommit(self):
+            return "unserialized override"
+
+        @autocommit.setter
+        def autocommit(self, _value):
+            pass
+
+    class BadAutocommit(
+        AutocommitOnlyOverride,
+        hermes_state._SerializedConnectionMixin,
+        sqlite3.Connection,
+    ):
+        pass
+
+    raw = sqlite3.connect(tmp_path / "bad-autocommit.db", factory=BadAutocommit)
+    try:
+        with pytest.raises(SQLiteSerializationError, match="precedes"):
+            hermes_state._ensure_serialized_connection(raw)
+    finally:
+        sqlite3.Connection.close(raw)
+
+    if hasattr(sqlite3.Connection, "autocommit"):
+        connection = _connect_tracked_db(
+            tmp_path / "native-autocommit.db", check_same_thread=False
+        )
+        try:
+            _assert_waits_for_serial_lock(
+                connection,
+                lambda: setattr(connection, "autocommit", connection.autocommit),
+            )
+        finally:
+            connection.close()
+
+
+def test_foreign_layer_lock_swap_fails_before_waiting_on_that_lock(tmp_path):
+    """A connection cannot borrow another serialized connection's lock during a UDF."""
+    _run_sqlite_child(
+        """
+        import pathlib
+        import sqlite3
+        import sys
+        import threading
+
+        from hermes_state import SQLiteSerializationError, _connect_tracked_db
+
+        root = pathlib.Path(sys.argv[1])
+        first = _connect_tracked_db(root / "first.db", check_same_thread=False)
+        second = _connect_tracked_db(root / "second.db", check_same_thread=False)
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        first_done = threading.Event()
+        second_done = threading.Event()
+        failures = []
+
+        def swap_during_real_udf():
+            # Event.wait releases the GIL while SQLite still owns first's native
+            # mutex.  The second entry must reject the borrowed lock before it
+            # tries to acquire the deliberately-held second lock.
+            first._hermes_serial_lock = second._hermes_serial_lock
+            first_entered.set()
+            assert release_first.wait(5)
+            return 1
+
+        def run_first():
+            try:
+                assert first.execute("SELECT swap_during_real_udf()").fetchone() == (1,)
+            except BaseException as exc:
+                failures.append(exc)
+            finally:
+                first_done.set()
+
+        def run_second():
+            try:
+                first.execute("SELECT 2").fetchone()
+            except BaseException as exc:
+                failures.append(exc)
+            finally:
+                second_done.set()
+
+        first.create_function("swap_during_real_udf", 0, swap_during_real_udf)
+        second._hermes_serial_lock.acquire()
+        one = threading.Thread(target=run_first, daemon=True)
+        two = threading.Thread(target=run_second, daemon=True)
+        one.start()
+        assert first_entered.wait(4)
+        two.start()
+        try:
+            assert second_done.wait(1.5), (
+                "competing entry accepted the foreign lock and waited for it"
+            )
+            assert len(failures) == 1
+            assert isinstance(failures[0], SQLiteSerializationError)
+        finally:
+            release_first.set()
+            second._hermes_serial_lock.release()
+            one.join(4)
+            two.join(4)
+            sqlite3.Connection.close(first)
+            second.close()
+        assert first_done.is_set() and second_done.is_set()
+        assert not one.is_alive() and not two.is_alive()
+        print("OWNER-BOUND-SERIAL-LOCK-OK")
+        """,
+        tmp_path,
+    )
+
+
+def test_rejected_premixed_cursor_uses_native_close_without_override(tmp_path):
+    """Rejected Cursor cleanup bypasses a hostile close override exactly once."""
+    retained: list[sqlite3.Cursor] = []
+    override_calls: list[sqlite3.Cursor] = []
+
+    class NoOpCloseCursor(sqlite3.Cursor):
+        def close(self):
+            override_calls.append(self)
+
+    class PreMixedNoOpCursor(NoOpCloseCursor, hermes_state._SerializedCursorMixin):
+        pass
+
+    class RetainingCursorConnection(sqlite3.Connection):
+        def cursor(self, *args, **kwargs):
+            cursor = super().cursor(PreMixedNoOpCursor)
+            retained.append(cursor)
+            return cursor
+
+    connection = _connect_tracked_db(
+        tmp_path / "no-op-close-cursor.db",
+        factory=RetainingCursorConnection,
+        check_same_thread=False,
+    )
+    try:
+        with pytest.raises(SQLiteSerializationError, match="precedes"):
+            connection.cursor()
+        assert not override_calls
+        assert len(retained) == 1
+        with pytest.raises(sqlite3.ProgrammingError):
+            sqlite3.Cursor.execute(retained[0], "SELECT 1")
+    finally:
+        connection.close()
 
 
 def test_interrupt_remains_concurrently_callable(tmp_path):
