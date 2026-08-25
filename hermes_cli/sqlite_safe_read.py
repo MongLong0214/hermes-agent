@@ -72,6 +72,7 @@ import sqlite3
 import threading
 from pathlib import Path
 from typing import Optional
+from urllib.parse import unquote, urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +86,10 @@ _HEADER_PAGE_COUNT_OFFSET = 28
 _live_lock = threading.RLock()
 # canonical path -> number of live connections opened by this process
 _live_connections: dict[str, int] = {}
+# canonical path -> number of openers currently creating a connection.  A
+# reservation is conservatively treated as live so raw byte probes cannot open
+# and close the file in the creation window.
+_opening_connections: dict[str, int] = {}
 
 
 class UntrackableConnectionError(RuntimeError):
@@ -101,6 +106,59 @@ def _key(path: Path | str) -> str:
         return str(Path(path).resolve())
     except OSError:
         return str(path)
+
+
+def _reservation_key(path: Path | str) -> Optional[str]:
+    """Best-effort canonical identity available before SQLite opens *path*."""
+    path_str = os.fspath(path)
+    if path_str.startswith("file:"):
+        parsed = urlsplit(path_str)
+        if parsed.scheme == "file":
+            candidate = unquote(parsed.path)
+            if candidate in ("", ":memory:"):
+                return None
+            return _key(candidate)
+    if path_str == ":memory:":
+        return None
+    return _key(path_str)
+
+
+def _increment_count(counts: dict[str, int], key: str) -> None:
+    counts[key] = counts.get(key, 0) + 1
+
+
+def _decrement_count(counts: dict[str, int], key: str) -> None:
+    remaining = counts.get(key, 0) - 1
+    if remaining > 0:
+        counts[key] = remaining
+    else:
+        counts.pop(key, None)
+
+
+def _is_live_or_opening_locked(key: str) -> bool:
+    return key in _live_connections or key in _opening_connections
+
+
+def _reserve_opening(key: Optional[str]) -> None:
+    if key is None:
+        return
+    with _live_lock:
+        _increment_count(_opening_connections, key)
+
+
+def _release_opening(key: Optional[str]) -> None:
+    if key is None:
+        return
+    with _live_lock:
+        _decrement_count(_opening_connections, key)
+
+
+def _register_and_consume_opening(reserved: Optional[str], resolved: str) -> None:
+    """Publish a live handle and consume exactly its reservation atomically."""
+    with _live_lock:
+        _increment_count(_live_connections, resolved)
+        if reserved is not None:
+            _decrement_count(_opening_connections, reserved)
 
 
 def _canonical_db_path(conn: sqlite3.Connection) -> Optional[str]:
@@ -151,9 +209,9 @@ def untrack_connection(path: Path | str) -> None:
 
 
 def has_live_connection(path: Path | str) -> bool:
-    """Whether this process currently holds any connection to *path*."""
+    """Whether *path* has a live handle or an opener in progress."""
     with _live_lock:
-        return _key(path) in _live_connections
+        return _is_live_or_opening_locked(_key(path))
 
 
 class _TrackingMixin:
@@ -247,9 +305,10 @@ def connect_tracked(
     byte-probed (``state.db``, ``kanban.db``). The registration is released
     automatically on ``close()``.
 
-    The open and the registration happen together under ``_live_lock``, so a
-    concurrent :func:`read_header_bytes_preopen` cannot slip between them and
-    cancel this connection's locks.
+    A counted reservation is created under ``_live_lock`` before the opener
+    runs.  The opener, SQLite validation, retrofit, and rejected-handle cleanup
+    run outside that mutex; raw probes treat the reservation as live until it
+    is atomically exchanged for the registered connection.
 
     The registry key is the canonical path reported by ``PRAGMA
     database_list`` -- not *path*, which may be a ``file:`` URI. Pass
@@ -268,42 +327,62 @@ def connect_tracked(
     """
     opener = connect_fn if connect_fn is not None else sqlite3.connect
     kwargs["factory"] = _tracking_factory(kwargs.get("factory", sqlite3.Connection))
-
-    with _live_lock:
+    reserved = _reservation_key(tracking_path if tracking_path is not None else path)
+    reservation_pending = reserved is not None
+    _reserve_opening(reserved)
+    conn = None
+    try:
+        # Never hold _live_lock while calling arbitrary opener code or SQLite.
         conn = opener(str(path), **kwargs)
-        try:
-            if not isinstance(conn, sqlite3.Connection):
-                raise UntrackableConnectionError(
-                    "SQLite opener returned "
-                    f"{type(conn).__name__}, not a sqlite3.Connection; "
-                    "byte-probe safety cannot be tracked"
-                )
-            resolved = (
-                _key(tracking_path)
-                if tracking_path is not None
-                else _canonical_db_path(conn)
+        if not isinstance(conn, sqlite3.Connection):
+            raise UntrackableConnectionError(
+                "SQLite opener returned "
+                f"{type(conn).__name__}, not a sqlite3.Connection; "
+                "byte-probe safety cannot be tracked"
             )
-            if resolved is None:
-                # In-memory / unnamed: nothing on disk to byte-probe.
-                return conn
-            if not isinstance(conn, _TrackingMixin):
-                # The opener substituted its own factory and discarded ours
-                # (test doubles simulating FTS5-less runtimes do this). Retag
-                # the instance's class with the tracking mixin so close() still
-                # releases the registry entry, rather than handing back a
-                # connection whose database has silently lost probe safety.
-                conn = _retrofit_tracking(conn, resolved)
-            conn._hermes_tracked_path = resolved
-            _live_connections[resolved] = _live_connections.get(resolved, 0) + 1
+        resolved = (
+            _key(tracking_path)
+            if tracking_path is not None
+            else _canonical_db_path(conn)
+        )
+        if resolved is None:
+            # In-memory / unnamed: nothing on disk to byte-probe.
             return conn
-        except Exception:
-            try:
-                # Close via sqlite3 directly: the tracking entry was either
-                # never made or is being unwound here.
-                sqlite3.Connection.close(conn)
-            except Exception:
-                pass
-            raise
+        if not isinstance(conn, _TrackingMixin):
+            # The opener substituted its own factory and discarded ours (test
+            # doubles simulating FTS5-less runtimes do this). Retag outside
+            # _live_lock so no path can wait on custom class machinery there.
+            conn = _retrofit_tracking(conn, resolved)
+        conn._hermes_tracked_path = resolved
+        _register_and_consume_opening(reserved, resolved)
+        reservation_pending = False
+        return conn
+    except BaseException as exc:
+        if conn is not None:
+            cleanup_error = _close_rejected_handle(conn)
+            if cleanup_error is not None:
+                # Preserve the validation/open failure as primary while keeping
+                # the cleanup failure available for diagnostics.
+                try:
+                    setattr(exc, "_hermes_cleanup_error", cleanup_error)
+                except Exception:
+                    logger.debug("rejected SQLite opener cleanup also failed", exc_info=True)
+        raise
+    finally:
+        if reservation_pending:
+            _release_opening(reserved)
+
+
+def _close_rejected_handle(handle) -> Optional[BaseException]:
+    """Best-effort, exactly-once cleanup without dynamic tracking dispatch."""
+    try:
+        if isinstance(handle, sqlite3.Connection):
+            sqlite3.Connection.close(handle)
+        else:
+            handle.close()
+    except BaseException as exc:
+        return exc
+    return None
 
 
 def _retrofit_tracking(conn: sqlite3.Connection, resolved: str) -> sqlite3.Connection:
@@ -400,10 +479,10 @@ def read_header_bytes_preopen(
     snapshot artifacts, archives) that no live connection can reference.
     """
     with _live_lock:
-        if not force and _key(path) in _live_connections:
+        if not force and _is_live_or_opening_locked(_key(path)):
             logger.debug(
-                "refusing byte-level read of %s: a live connection exists in "
-                "this process and close() would cancel its POSIX locks",
+                "refusing byte-level read of %s: a live connection or opener "
+                "exists in this process and close() would cancel POSIX locks",
                 path,
             )
             return None
@@ -438,10 +517,10 @@ def offline_file_access(path: Path | str, *, what: str = "read"):
     caller work on an open connection, so it does not serialise database use.
     """
     with _live_lock:
-        if _key(path) in _live_connections:
+        if _is_live_or_opening_locked(_key(path)):
             raise LiveConnectionError(
-                f"Refusing to {what} {path}: a connection to it is still open "
-                "in this process, and raw file access would cancel that "
+                f"Refusing to {what} {path}: a connection to it is open or "
+                "being created in this process, and raw file access would cancel "
                 "connection's POSIX advisory locks. Close all database "
                 "handles (stop the gateway/dashboard) and retry."
             )

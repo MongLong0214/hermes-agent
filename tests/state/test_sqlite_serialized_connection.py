@@ -398,10 +398,10 @@ def test_blob_surface_waits_for_connection_serial_lock(tmp_path):
 
 
 def test_backup_serializes_both_connections_in_one_total_order(tmp_path):
-    """Reverse backups acquire the same two locks in the same order."""
+    """A serial target is required even when native backup is overridden."""
     class BackupConnection(sqlite3.Connection):
         def backup(self, *args, **kwargs):
-            return "native-backup-result"
+            return ("native-backup-result", self._hermes_serial_lock._recursion_count())
 
     source = _connect_tracked_db(
         tmp_path / "source.db", factory=BackupConnection, check_same_thread=False
@@ -410,35 +410,11 @@ def test_backup_serializes_both_connections_in_one_total_order(tmp_path):
         tmp_path / "target.db", factory=BackupConnection, check_same_thread=False
     )
 
-    class RecordingLock:
-        def __init__(self, name, calls):
-            self.name = name
-            self.calls = calls
-            self.lock = threading.RLock()
-
-        def __enter__(self):
-            self.calls.append(self.name)
-            self.lock.acquire()
-            return self
-
-        def __exit__(self, *exc_info):
-            self.lock.release()
-
     try:
-        calls: list[str] = []
-        source._hermes_serial_lock = RecordingLock("source", calls)
-        target._hermes_serial_lock = RecordingLock("target", calls)
-
-        assert source.backup(target) == "native-backup-result"
-        source_to_target = calls[:]
-        calls.clear()
-        assert target.backup(source) == "native-backup-result"
-        target_to_source = calls[:]
-        assert source_to_target == target_to_source
-        assert set(source_to_target) == {"source", "target"}
-        calls.clear()
-        assert source.backup(source) == "native-backup-result"
-        assert calls == ["source"]
+        assert source.backup(target) == ("native-backup-result", 1)
+        assert target.backup(source) == ("native-backup-result", 1)
+        # Identical locks are acquired exactly once, before native dispatch.
+        assert source.backup(source) == ("native-backup-result", 1)
 
         unsafe = sqlite3.connect(tmp_path / "unsafe-backup.db")
         try:
@@ -449,6 +425,459 @@ def test_backup_serializes_both_connections_in_one_total_order(tmp_path):
     finally:
         source.close()
         target.close()
+
+
+def _exception_shape(call):
+    with pytest.raises(BaseException) as raised:
+        call()
+    return type(raised.value), str(raised.value)
+
+
+def _run_sqlite_child(program: str, tmp_path, *, timeout: float = 12) -> None:
+    """Run a potentially GIL-wide lock regression without risking pytest."""
+    root = Path(__file__).resolve().parents[2]
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(root)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", textwrap.dedent(program), str(tmp_path)],
+            cwd=str(root),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(
+            "serialized SQLite regression child timed out and was killed: "
+            f"stdout={exc.stdout!r} stderr={exc.stderr!r}"
+        )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_native_backup_keyword_target_preserves_native_argument_errors(tmp_path):
+    """Keyword targets lock both real handles without rewriting bad calls."""
+    source = _connect_tracked_db(tmp_path / "source.db", check_same_thread=False)
+    destination = _connect_tracked_db(
+        tmp_path / "destination.db", check_same_thread=False
+    )
+    raw_source = sqlite3.connect(":memory:")
+    raw_destination = sqlite3.connect(":memory:")
+    try:
+        source.execute("CREATE TABLE copied(value TEXT)")
+        source.execute("INSERT INTO copied(value) VALUES ('native target')")
+        source.commit()
+        source.backup(target=destination)
+        assert destination.execute("SELECT value FROM copied").fetchall() == [
+            ("native target",)
+        ]
+        _assert_waits_for_serial_lock(
+            destination, lambda: source.backup(target=destination)
+        )
+
+        malformed = [
+            (lambda conn, target: conn.backup(), lambda conn, target: conn.backup()),
+            (
+                lambda conn, target: conn.backup(target, target=target),
+                lambda conn, target: conn.backup(target, target=target),
+            ),
+            (
+                lambda conn, target: conn.backup(target=None),
+                lambda conn, target: conn.backup(target=None),
+            ),
+            (
+                lambda conn, target: conn.backup(target, unexpected=True),
+                lambda conn, target: conn.backup(target, unexpected=True),
+            ),
+        ]
+        for raw_call, serialized_call in malformed:
+            assert _exception_shape(lambda: raw_call(raw_source, raw_destination)) == _exception_shape(
+                lambda: serialized_call(source, destination)
+            )
+
+    finally:
+        raw_source.close()
+        raw_destination.close()
+        source.close()
+        destination.close()
+
+
+def test_reverse_native_backups_are_timeout_bounded_and_ordered(tmp_path):
+    """Real reverse backups must finish or fail closed, never lock-order hang."""
+    _run_sqlite_child(
+        """
+        import pathlib
+        import sys
+        import sqlite3
+        import threading
+
+        from hermes_state import _connect_tracked_db
+
+        root = pathlib.Path(sys.argv[1])
+        first = _connect_tracked_db(root / "first.db", check_same_thread=False)
+        second = _connect_tracked_db(root / "second.db", check_same_thread=False)
+        first.execute("CREATE TABLE data(value)")
+        first.execute("INSERT INTO data VALUES ('first')")
+        second.execute("CREATE TABLE data(value)")
+        second.execute("INSERT INTO data VALUES ('second')")
+        first.commit()
+        second.commit()
+        barrier = threading.Barrier(2)
+        errors = []
+
+        def copy(source, destination):
+            try:
+                barrier.wait(4)
+                for _ in range(20):
+                    source.backup(target=destination)
+            except sqlite3.Error as exc:
+                errors.append(exc)
+
+        left = threading.Thread(target=copy, args=(first, second), daemon=True)
+        right = threading.Thread(target=copy, args=(second, first), daemon=True)
+        left.start()
+        right.start()
+        left.join(6)
+        right.join(6)
+        assert not left.is_alive() and not right.is_alive()
+        assert all(isinstance(exc, sqlite3.Error) for exc in errors)
+        first.close()
+        second.close()
+        print("NATIVE-BACKUP-ORDER-OK")
+        """,
+        tmp_path,
+    )
+
+
+def test_reentrant_backup_refuses_lower_ranked_destination_before_acquire(tmp_path):
+    """A UDF cannot invert the total order by already owning its source lock."""
+    _run_sqlite_child(
+        """
+        import pathlib
+        import sqlite3
+        import sys
+
+        from hermes_state import _connect_tracked_db
+
+        root = pathlib.Path(sys.argv[1])
+        first = _connect_tracked_db(root / "first.db", check_same_thread=False)
+        second = _connect_tracked_db(root / "second.db", check_same_thread=False)
+        source, destination = sorted(
+            (first, second),
+            key=lambda conn: id(conn._hermes_serial_lock),
+            reverse=True,
+        )
+        seen = []
+
+        def reentrant_backup():
+            try:
+                source.backup(target=destination)
+            except BaseException as exc:
+                seen.append(exc)
+                return 1
+            return 0
+
+        source.create_function("reentrant_backup", 0, reentrant_backup)
+        assert source.execute("SELECT reentrant_backup()").fetchone() == (1,)
+        assert len(seen) == 1
+        assert isinstance(seen[0], sqlite3.ProgrammingError)
+        assert "lower-ranked destination lock" in str(seen[0])
+        first.close()
+        second.close()
+        print("REENTRANT-BACKUP-ORDER-OK")
+        """,
+        tmp_path,
+    )
+
+
+def test_custom_shortcuts_and_every_cursor_result_stay_serialized(tmp_path):
+    """Real custom overrides run once under lock and cannot leak cursors."""
+    class CustomCursor(sqlite3.Cursor):
+        pass
+
+    class CustomConnection(sqlite3.Connection):
+        shortcut_calls: dict[str, int]
+        cursor_calls: list[tuple[tuple, dict]]
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.shortcut_calls = {"execute": 0, "executemany": 0, "executescript": 0}
+            self.cursor_calls = []
+
+        def cursor(self, *args, **kwargs):
+            self.cursor_calls.append((args, kwargs))
+            # Deliberately accepts, ignores, and substitutes any factory.
+            return super().cursor(CustomCursor)
+
+        def execute(self, *args, **kwargs):
+            assert self._hermes_serial_lock._is_owned()
+            self.shortcut_calls["execute"] += 1
+            return self.cursor().execute(*args, **kwargs)
+
+        def executemany(self, *args, **kwargs):
+            assert self._hermes_serial_lock._is_owned()
+            self.shortcut_calls["executemany"] += 1
+            return self.cursor().executemany(*args, **kwargs)
+
+        def executescript(self, *args, **kwargs):
+            assert self._hermes_serial_lock._is_owned()
+            self.shortcut_calls["executescript"] += 1
+            return self.cursor().executescript(*args, **kwargs)
+
+    conn = _connect_tracked_db(
+        tmp_path / "custom.db", factory=CustomConnection, check_same_thread=False
+    )
+    try:
+        conn.execute("CREATE TABLE data(value)")
+        conn.executemany("INSERT INTO data VALUES (?)", [(1,), (2,)])
+        conn.executescript("INSERT INTO data VALUES (3);")
+        assert conn.shortcut_calls == {"execute": 1, "executemany": 1, "executescript": 1}
+
+        for cursor in (
+            conn.cursor(),
+            conn.cursor(CustomCursor),
+            conn.cursor(factory=CustomCursor),
+            conn.cursor(factory=lambda: None),
+        ):
+            assert isinstance(cursor, hermes_state._SerializedCursorMixin)
+            _assert_waits_for_serial_lock(conn, lambda cursor=cursor: cursor.execute("SELECT 1"))
+            cursor.close()
+        assert len(conn.cursor_calls) >= 7
+    finally:
+        conn.close()
+
+
+def test_pre_mixed_handles_and_untrusted_actual_locks_fail_closed(tmp_path):
+    """Mere mixin inheritance or a lookalike lock is never sufficient."""
+    seen_connections = []
+
+    class OverrideConnection(sqlite3.Connection):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            seen_connections.append(self)
+
+        def execute(self, *args, **kwargs):
+            return super().execute(*args, **kwargs)
+
+    class PreMixedConnection(OverrideConnection, hermes_state._SerializedConnectionMixin):
+        pass
+
+    with pytest.raises((UntrackableConnectionError, SQLiteSerializationError)):
+        _connect_tracked_db(tmp_path / "premixed.db", factory=PreMixedConnection)
+    assert len(seen_connections) == 1
+    with pytest.raises(sqlite3.ProgrammingError):
+        sqlite3.Connection.execute(seen_connections[0], "SELECT 1")
+
+    class OverrideCursor(sqlite3.Cursor):
+        close_calls = 0
+
+        def execute(self, *args, **kwargs):
+            return super().execute(*args, **kwargs)
+
+        def close(self):
+            type(self).close_calls += 1
+            return super().close()
+
+    class PreMixedCursor(OverrideCursor, hermes_state._SerializedCursorMixin):
+        pass
+
+    class CursorFactoryConnection(sqlite3.Connection):
+        def cursor(self, *args, **kwargs):
+            return super().cursor(PreMixedCursor)
+
+    conn = _connect_tracked_db(tmp_path / "premixed-cursor.db", factory=CursorFactoryConnection)
+    try:
+        with pytest.raises(SQLiteSerializationError, match="precedes"):
+            conn.cursor()
+        assert PreMixedCursor.close_calls == 1
+    finally:
+        conn.close()
+
+    for label, supplied_lock in (("fake", object()), ("foreign", threading.RLock())):
+        opened = []
+
+        class SuppliedLockConnection(sqlite3.Connection):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self._hermes_serial_lock = supplied_lock
+                opened.append(self)
+
+        with pytest.raises((UntrackableConnectionError, SQLiteSerializationError), match="trusted"):
+            _connect_tracked_db(tmp_path / f"{label}-lock.db", factory=SuppliedLockConnection)
+        assert len(opened) == 1
+        with pytest.raises(sqlite3.ProgrammingError):
+            sqlite3.Connection.execute(opened[0], "SELECT 1")
+
+
+def test_rejected_arbitrary_opener_result_closes_its_own_resource_once(tmp_path):
+    """Rejecting a non-Connection must close its actual resource, not a cast."""
+    import io
+    import hermes_cli.sqlite_safe_read as sqlite_safe_read
+
+    class ResourceOwner:
+        def __init__(self):
+            self.resource = io.BytesIO(b"owned")
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+            self.resource.close()
+
+    rejected = ResourceOwner()
+    with pytest.raises(UntrackableConnectionError, match="not a sqlite3.Connection"):
+        connect_tracked(
+            tmp_path / "rejected.db", connect_fn=lambda *_args, **_kwargs: rejected
+        )
+    assert rejected.close_calls == 1
+    assert rejected.resource.closed
+    key = sqlite_safe_read._key(tmp_path / "rejected.db")
+    assert key not in sqlite_safe_read._live_connections
+    assert key not in sqlite_safe_read._opening_connections
+
+    class CleanupFailure:
+        def close(self):
+            raise OSError("cleanup failed")
+
+    with pytest.raises(UntrackableConnectionError, match="not a sqlite3.Connection") as raised:
+        connect_tracked(
+            tmp_path / "cleanup-failure.db",
+            connect_fn=lambda *_args, **_kwargs: CleanupFailure(),
+        )
+    assert isinstance(getattr(raised.value, "_hermes_cleanup_error", None), OSError)
+
+
+def test_opener_reservations_prevent_probe_races_and_live_lock_abba(tmp_path):
+    """Custom openers run outside live-lock while their path stays busy."""
+    _run_sqlite_child(
+        """
+        import pathlib
+        import sqlite3
+        import sys
+        import threading
+
+        import hermes_cli.sqlite_safe_read as ssr
+        from hermes_state import _connect_tracked_db
+
+        root = pathlib.Path(sys.argv[1])
+        reserved = root / "reserved.db"
+        sqlite3.connect(reserved).close()
+        entered = threading.Event()
+        release = threading.Event()
+        opened = []
+        failures = []
+
+        def paused_opener(path, **kwargs):
+            entered.set()
+            assert release.wait(5)
+            return sqlite3.connect(path, **kwargs)
+
+        def open_paused():
+            try:
+                opened.append(
+                    ssr.connect_tracked(
+                        reserved, connect_fn=paused_opener, check_same_thread=False
+                    )
+                )
+            except BaseException as exc:
+                failures.append(exc)
+
+        worker = threading.Thread(target=open_paused, daemon=True)
+        worker.start()
+        assert entered.wait(3)
+        assert ssr.has_live_connection(reserved)
+        assert ssr.read_header_bytes_preopen(reserved, length=16) is None
+        release.set()
+        worker.join(5)
+        assert not worker.is_alive() and not failures
+        opened.pop().close()
+        assert not ssr.has_live_connection(reserved)
+
+        first_entered = threading.Event()
+        second_entered = threading.Event()
+        two_release = threading.Event()
+        two_opened = []
+
+        def concurrent_opener(path, **kwargs):
+            (first_entered if not first_entered.is_set() else second_entered).set()
+            assert two_release.wait(5)
+            return sqlite3.connect(path, **kwargs)
+
+        workers = [
+            threading.Thread(
+                target=lambda: two_opened.append(
+                    ssr.connect_tracked(
+                        reserved,
+                        connect_fn=concurrent_opener,
+                        check_same_thread=False,
+                    )
+                ),
+                daemon=True,
+            )
+            for _ in range(2)
+        ]
+        for child in workers:
+            child.start()
+        assert first_entered.wait(3) and second_entered.wait(3)
+        assert ssr.has_live_connection(reserved)
+        two_release.set()
+        for child in workers:
+            child.join(5)
+            assert not child.is_alive()
+        while two_opened:
+            two_opened.pop().close()
+        assert not ssr.has_live_connection(reserved)
+
+        existing = _connect_tracked_db(root / "existing.db", check_same_thread=False)
+        callback_entered = threading.Event()
+        opener_entered = threading.Event()
+        errors = []
+
+        def callback():
+            callback_entered.set()
+            assert opener_entered.wait(4)
+            assert ssr.has_live_connection(reserved)
+            return 1
+
+        def consulting_opener(path, **kwargs):
+            opener_entered.set()
+            assert existing.execute("SELECT 7").fetchone() == (7,)
+            return sqlite3.connect(path, **kwargs)
+
+        def run_callback():
+            try:
+                assert existing.execute("SELECT callback()").fetchone() == (1,)
+            except BaseException as exc:
+                errors.append(exc)
+
+        def open_consulting():
+            try:
+                two_opened.append(
+                    ssr.connect_tracked(
+                        reserved,
+                        connect_fn=consulting_opener,
+                        check_same_thread=False,
+                    )
+                )
+            except BaseException as exc:
+                errors.append(exc)
+
+        existing.create_function("callback", 0, callback)
+        query = threading.Thread(target=run_callback, daemon=True)
+        query.start()
+        assert callback_entered.wait(3)
+        opening = threading.Thread(target=open_consulting, daemon=True)
+        opening.start()
+        query.join(6)
+        opening.join(6)
+        assert not query.is_alive() and not opening.is_alive(), "live-lock/serial ABBA"
+        assert not errors, errors
+        two_opened.pop().close()
+        existing.close()
+        print("OPENER-RESERVATION-OK")
+        """,
+        tmp_path,
+    )
 
 
 def test_interrupt_remains_concurrently_callable(tmp_path):
