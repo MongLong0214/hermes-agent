@@ -813,12 +813,12 @@ END;
 # conversation this generation holds the lease on, and be told nothing.
 #
 # The one thing both binaries share is the database file. A trigger on
-# `messages` whose body calls an application-defined function makes "did this
-# connection register the function" a precondition of the STATEMENT: SQLite
-# resolves the trigger program when it prepares the write, so a connection that
-# did not register it fails with `no such function` before a row is touched.
-# Registration happens in this package's connect path, so "this generation" is
-# exactly the set of processes allowed to write the transcript.
+# `messages` whose body compares an application-defined function to the exact
+# installed generation makes generation equality a precondition of the
+# STATEMENT: SQLite resolves the trigger program when it prepares the write, so
+# a missing or stale function fails before a row is touched. Registration
+# happens in this package's connect path, so "this generation" is exactly the
+# set of processes allowed to write the transcript.
 #
 # THE CEILING, STATED SO NOBODY MISTAKES IT FOR A SECURITY BOUNDARY
 #   It stops an OLD BINARY. It does not stop an adversary, and it is not meant
@@ -840,9 +840,8 @@ END;
 #   alternative on offer was a fence that an old build walks straight past.
 TURN_FENCE_FUNCTION_NAME = "hermes_turn_fence_generation"
 
-#: Bumped only when an older build must be locked out again. The value is
-#: returned to the trigger and otherwise unused — presence of the function, not
-#: its result, is what admits the write.
+#: Bumped only when an older build must be locked out again. Every trigger body
+#: embeds this exact value and rejects a connection returning anything else.
 TURN_FENCE_GENERATION = 1
 
 #: Every ``(table, operation)`` the barrier covers.
@@ -930,14 +929,28 @@ TURN_FENCE_TRIGGERS = tuple(
     for table, operation in TURN_FENCE_SURFACE
 )
 
-TURN_FENCE_TRIGGER_SQL = "\n".join(
-    f"CREATE TRIGGER IF NOT EXISTS "
-    f"{turn_fence_trigger_name(table, operation)}\n"
-    f"BEFORE {operation} ON {table} BEGIN\n"
-    f"    SELECT {TURN_FENCE_FUNCTION_NAME}();\n"
-    f"END;\n"
-    for table, operation in TURN_FENCE_SURFACE
-)
+TURN_FENCE_GENERATION_MISMATCH = "hermes_turn_fence_generation_mismatch"
+
+
+def turn_fence_trigger_sql(generation: int) -> str:
+    """Return canonical replacement DDL for one exact fence generation."""
+    if type(generation) is not int or not 0 <= generation <= (1 << 63) - 1:
+        raise ValueError("turn fence generation must be a non-negative SQLite integer")
+    return "\n".join(
+        f"DROP TRIGGER IF EXISTS {turn_fence_trigger_name(table, operation)};\n"
+        f"CREATE TRIGGER {turn_fence_trigger_name(table, operation)}\n"
+        f"BEFORE {operation} ON {table} BEGIN\n"
+        f"    SELECT CASE WHEN\n"
+        f"        typeof({TURN_FENCE_FUNCTION_NAME}()) != 'integer'\n"
+        f"        OR {TURN_FENCE_FUNCTION_NAME}() != {generation}\n"
+        f"        THEN RAISE(ABORT, '{TURN_FENCE_GENERATION_MISMATCH}')\n"
+        f"    END;\n"
+        f"END;\n"
+        for table, operation in TURN_FENCE_SURFACE
+    )
+
+
+TURN_FENCE_TRIGGER_SQL = turn_fence_trigger_sql(TURN_FENCE_GENERATION)
 
 
 def register_turn_fence_function(conn) -> None:

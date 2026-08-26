@@ -172,15 +172,12 @@ class SessionExportTooLargeError(ValueError):
 
 
 class IncompatibleSchemaError(RuntimeError):
-    """The state DB was upgraded beyond this runtime's supported schema."""
+    """The state DB cannot be proven compatible with this runtime."""
 
-    def __init__(self, database_version: int, supported_version: int):
+    def __init__(self, database_version: Optional[int], supported_version: int):
         self.database_version = database_version
         self.supported_version = supported_version
-        super().__init__(
-            "state database schema version "
-            f"{database_version} is newer than supported version {supported_version}"
-        )
+        super().__init__("state database schema is incompatible with this runtime")
 
 
 _COMPRESSION_LOCK_HOLDER_PID_RE = re.compile(r"(?:^|:)pid=(\d+)(?::|$)")
@@ -3988,33 +3985,59 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         except Exception:
             logger.debug("Could not close a SessionDB connection", exc_info=True)
 
-    def ensure_compatible_schema(self) -> None:
-        """Fail closed when the open store has a newer schema than this code.
+    def ensure_compatible_schema(self, *, allow_uninitialized: bool = False) -> None:
+        """Fail closed unless the store has one canonical supported version.
 
         This query intentionally runs before writable-open setup and may be
         called again at a turn boundary. A long-lived connection otherwise
         keeps running old code after a sibling runtime upgrades the shared DB.
-        An absent ``schema_version`` table is an uninitialized store, which the
-        ordinary schema initializer owns.
+        Only a path proven absent before its first writable open may omit the
+        table or row; an existing malformed store must not masquerade as new.
         """
         with self._lock:
             try:
-                row = self._conn.execute(
-                    "SELECT version FROM schema_version LIMIT 1"
-                ).fetchone()
-            except sqlite3.OperationalError as exc:
-                if "no such table: schema_version" in str(exc).lower():
+                rows = self._conn.execute(
+                    "SELECT version, typeof(version) AS storage_type "
+                    "FROM schema_version LIMIT 2"
+                ).fetchall()
+            except sqlite3.Error as exc:
+                if (
+                    allow_uninitialized
+                    and isinstance(exc, sqlite3.OperationalError)
+                    and "no such table: schema_version" in str(exc).lower()
+                ):
                     return
-                raise
-
-            if row is None:
-                return
-            database_version = (
-                row["version"] if isinstance(row, sqlite3.Row) else row[0]
-            )
-            if int(database_version) > SCHEMA_VERSION:
                 raise IncompatibleSchemaError(
-                    database_version=int(database_version),
+                    database_version=None,
+                    supported_version=SCHEMA_VERSION,
+                ) from None
+
+            if not rows and allow_uninitialized:
+                return
+            if len(rows) != 1:
+                raise IncompatibleSchemaError(
+                    database_version=None,
+                    supported_version=SCHEMA_VERSION,
+                )
+
+            row = rows[0]
+            if isinstance(row, sqlite3.Row):
+                database_version = row["version"]
+                storage_type = row["storage_type"]
+            else:
+                database_version, storage_type = row
+            if (
+                storage_type != "integer"
+                or type(database_version) is not int
+                or not 0 <= database_version <= (1 << 63) - 1
+            ):
+                raise IncompatibleSchemaError(
+                    database_version=None,
+                    supported_version=SCHEMA_VERSION,
+                )
+            if database_version > SCHEMA_VERSION:
+                raise IncompatibleSchemaError(
+                    database_version=database_version,
                     supported_version=SCHEMA_VERSION,
                 )
 
@@ -4024,6 +4047,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # process resolved the developer's production state.db — see the
         # live-DB test-isolation guard block near _default_db_path().
         _ensure_test_isolation(self.db_path)
+        database_preexisted = self.db_path.exists()
         self.read_only = read_only
 
         self._lock = threading.Lock()
@@ -4136,7 +4160,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     isolation_level=None,
                 )
                 self._conn.row_factory = sqlite3.Row
-                self.ensure_compatible_schema()
+                self.ensure_compatible_schema(
+                    allow_uninitialized=not database_preexisted
+                )
                 # FTS capability flags normally come from writable schema
                 # initialisation. Probe existing virtual tables with SELECTs
                 # only so read-only search keeps its FTS and trigram paths.
@@ -4223,7 +4249,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     isolation_level=None,
                 )
                 self._conn.row_factory = sqlite3.Row
-                self.ensure_compatible_schema()
+                self.ensure_compatible_schema(
+                    allow_uninitialized=not database_preexisted
+                )
                 self._wal_active = (
                     apply_wal_with_fallback(self._conn, db_label="state.db") == "wal"
                 )

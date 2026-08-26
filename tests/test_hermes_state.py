@@ -1754,6 +1754,118 @@ class TestIncompatibleSchemaVersion:
                 ),
             }
 
+    @staticmethod
+    def _seed_noncanonical_schema_scalar(path, scenario):
+        seeded = SessionDB(db_path=path)
+        seeded.close()
+        if scenario == "read-error":
+            path.write_bytes(b"not a sqlite database")
+            return
+
+        with sqlite3.connect(path) as conn:
+            if scenario == "missing-table":
+                conn.execute("DROP TABLE schema_version")
+            elif scenario == "empty-row":
+                conn.execute("DELETE FROM schema_version")
+            elif scenario == "duplicate-row":
+                conn.execute(
+                    "INSERT INTO schema_version (version) VALUES (?)",
+                    (SCHEMA_VERSION + 1,),
+                )
+            elif scenario == "null":
+                conn.execute("DROP TABLE schema_version")
+                conn.execute("CREATE TABLE schema_version (version INTEGER)")
+                conn.execute("INSERT INTO schema_version (version) VALUES (NULL)")
+            else:
+                value = {
+                    "future": SCHEMA_VERSION + 1,
+                    "real": SCHEMA_VERSION + 0.5,
+                    "negative": -1,
+                    "text": "not-a-version",
+                    "blob": sqlite3.Binary(b"not-a-version"),
+                    "infinity": float("inf"),
+                }[scenario]
+                conn.execute("UPDATE schema_version SET version = ?", (value,))
+
+    @pytest.mark.parametrize(
+        "scenario",
+        (
+            "future",
+            "real",
+            "negative",
+            "text",
+            "blob",
+            "infinity",
+            "null",
+            "duplicate-row",
+            "empty-row",
+            "missing-table",
+            "read-error",
+        ),
+    )
+    def test_existing_store_rejects_noncanonical_schema_scalar_before_setup(
+        self, tmp_path, monkeypatch, scenario
+    ):
+        """Every existing-store scalar failure has one pre-setup classification."""
+        db_path = tmp_path / f"{scenario}.db"
+        self._seed_noncanonical_schema_scalar(db_path, scenario)
+        before_bytes = db_path.read_bytes()
+
+        forbidden = mock.Mock(side_effect=AssertionError("store setup ran"))
+        monkeypatch.setattr(hermes_state, "apply_wal_with_fallback", forbidden)
+        monkeypatch.setattr(hermes_state, "apply_database_pragmas", forbidden)
+        monkeypatch.setattr(hermes_state, "repair_state_db_schema", forbidden)
+        monkeypatch.setattr(SessionDB, "_init_schema", forbidden)
+
+        with pytest.raises(IncompatibleSchemaError) as raised:
+            SessionDB(db_path=db_path)
+
+        assert str(raised.value) == "state database schema is incompatible with this runtime"
+        forbidden.assert_not_called()
+        assert db_path.read_bytes() == before_bytes
+
+    @pytest.mark.parametrize("version", range(SCHEMA_VERSION + 1))
+    def test_every_supported_integer_schema_scalar_remains_compatible(
+        self, tmp_path, version
+    ):
+        """Every supported canonical INTEGER value remains an admitted control."""
+        db = SessionDB(db_path=tmp_path / f"supported-{version}.db")
+        try:
+            db._conn.execute("UPDATE schema_version SET version = ?", (version,))
+            db.ensure_compatible_schema()
+            row = db._conn.execute(
+                "SELECT version, typeof(version) FROM schema_version"
+            ).fetchone()
+            assert tuple(row) == (version, "integer")
+        finally:
+            db.close()
+
+    def test_new_store_initializes_one_canonical_schema_scalar(self, tmp_path):
+        """Only a path absent before open receives uninitialized-store treatment."""
+        db_path = tmp_path / "new-state.db"
+        assert not db_path.exists()
+        db = SessionDB(db_path=db_path)
+        try:
+            rows = db._conn.execute(
+                "SELECT version, typeof(version) FROM schema_version"
+            ).fetchall()
+            assert [tuple(row) for row in rows] == [(SCHEMA_VERSION, "integer")]
+        finally:
+            db.close()
+
+    def test_sqlite_integer_bound_from_bool_has_no_distinct_provenance(self, tmp_path):
+        """SQLite canonical storage cannot distinguish a bound bool from integer 1."""
+        db = SessionDB(db_path=tmp_path / "bool-integer.db")
+        try:
+            db._conn.execute("UPDATE schema_version SET version = ?", (True,))
+            db.ensure_compatible_schema()
+            row = db._conn.execute(
+                "SELECT version, typeof(version) FROM schema_version"
+            ).fetchone()
+            assert tuple(row) == (1, "integer")
+        finally:
+            db.close()
+
     def test_future_schema_open_refuses_without_mutating_store(
         self, tmp_path, monkeypatch
     ):
@@ -1782,6 +1894,90 @@ class TestIncompatibleSchemaVersion:
         assert raised.value.supported_version == SCHEMA_VERSION
         init_schema.assert_not_called()
         assert self._snapshot(db_path) == before
+
+
+class TestTurnFenceGeneration:
+    def test_newer_trigger_generation_rejects_an_already_open_connection(
+        self, tmp_path, monkeypatch
+    ):
+        """Replacing trigger generation invalidates a stale connection before DML."""
+        import hermes_state_common
+
+        store = tmp_path / "state.db"
+        old = SessionDB(db_path=store)
+        sibling = None
+        insert_sql = (
+            "INSERT INTO messages "
+            "(session_id, role, content, timestamp, active) "
+            "VALUES (?, 'assistant', ?, 1.0, 1)"
+        )
+        try:
+            old.create_session("s", source="test")
+            old._conn.execute(insert_sql, ("s", "same-generation"))
+
+            old_generation = hermes_state_common.TURN_FENCE_GENERATION
+            old._conn.create_function(
+                hermes_state_common.TURN_FENCE_FUNCTION_NAME,
+                0,
+                lambda: old_generation,
+            )
+            newer_generation = old_generation + 1
+            monkeypatch.setattr(
+                hermes_state_common,
+                "TURN_FENCE_GENERATION",
+                newer_generation,
+            )
+            sibling = sqlite3.connect(str(store), isolation_level=None)
+            hermes_state_common.register_turn_fence_function(sibling)
+            trigger_sql_factory = getattr(
+                hermes_state_common,
+                "turn_fence_trigger_sql",
+                lambda _generation: hermes_state_common.TURN_FENCE_TRIGGER_SQL,
+            )
+            sibling.executescript(trigger_sql_factory(newer_generation))
+            sibling.execute(insert_sql, ("s", "fresh-generation"))
+
+            before_changes = old._conn.total_changes
+            before_rows = tuple(
+                old._conn.execute(
+                    "SELECT content FROM messages WHERE session_id = ? ORDER BY id",
+                    ("s",),
+                ).fetchall()
+            )
+            with pytest.raises(
+                sqlite3.IntegrityError,
+                match="hermes_turn_fence_generation_mismatch",
+            ):
+                old._conn.execute(insert_sql, ("s", "stale-generation"))
+
+            assert old._conn.total_changes == before_changes
+            assert tuple(
+                old._conn.execute(
+                    "SELECT content FROM messages WHERE session_id = ? ORDER BY id",
+                    ("s",),
+                ).fetchall()
+            ) == before_rows
+            installed = sibling.execute(
+                "SELECT name, sql FROM sqlite_master "
+                "WHERE type = 'trigger' AND name LIKE 'hermes_turn_fence_%' "
+                "ORDER BY name"
+            ).fetchall()
+            assert [row[0] for row in installed] == sorted(
+                hermes_state_common.TURN_FENCE_TRIGGERS
+            )
+            expected_comparison = (
+                f"{hermes_state_common.TURN_FENCE_FUNCTION_NAME}() != "
+                f"{newer_generation}"
+            )
+            assert all(expected_comparison in row[1] for row in installed)
+            assert all(
+                "hermes_turn_fence_generation_mismatch" in row[1]
+                for row in installed
+            )
+        finally:
+            if sibling is not None:
+                sibling.close()
+            old.close()
 
 
 class TestReconcileColumnsErrorHandling:
