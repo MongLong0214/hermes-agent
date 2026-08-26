@@ -3,16 +3,23 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import select
 import sqlite3
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 import hermes_state
-from hermes_state import FTS_STORAGE_VERSION, SCHEMA_VERSION, SessionDB
+from hermes_state import (
+    FTS_STORAGE_VERSION,
+    SCHEMA_VERSION,
+    SQLiteSerializationError,
+    SessionDB,
+)
 from hermes_state_common import (
     TURN_FENCE_FUNCTION_NAME,
     TURN_FENCE_GENERATION,
@@ -658,6 +665,504 @@ def test_partial_recovery_clears_only_unreadable_system_prompt_refs(
         )
     finally:
         conn.close()
+
+
+_OFFLINE_REBUILD_EPOCH_KEY = "_hermes_offline_rebuild_epoch_v1"
+_E2_BARRIER_TIMEOUT_SECONDS = 15
+
+
+def _read_offline_rebuild_marker(path: Path) -> str | None:
+    with sqlite3.connect(str(path)) as conn:
+        row = conn.execute(
+            "SELECT value FROM state_meta WHERE key = ?",
+            (_OFFLINE_REBUILD_EPOCH_KEY,),
+        ).fetchone()
+    return None if row is None else str(row[0])
+
+
+def _make_stale_source_rebuild_marker(path: Path) -> str:
+    root = Path(__file__).resolve().parents[2]
+    program = """
+import os
+import pathlib
+import sys
+
+from hermes_state import SessionDB
+
+marker_key = "_hermes_offline_rebuild_epoch_v1"
+db = SessionDB(db_path=pathlib.Path(sys.argv[1]))
+with db.offline_rebuild(reason="e2 stale recovery source fixture"):
+    marker = db.get_meta(marker_key)
+    assert marker is not None
+    print(marker, flush=True)
+    assert sys.stdin.readline() == "RELEASE\\n"
+    os._exit(0)
+"""
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(root)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    child = subprocess.Popen(
+        [sys.executable, "-c", program, str(path)],
+        cwd=str(root),
+        env=env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert child.stdin is not None
+    assert child.stdout is not None
+    assert child.stderr is not None
+    ready, _, _ = select.select(
+        [child.stdout], [], [], _E2_BARRIER_TIMEOUT_SECONDS
+    )
+    assert ready, "stale-marker child did not publish its live marker"
+    marker = child.stdout.readline().strip()
+    assert marker
+    assert child.poll() is None
+    stdout, stderr = child.communicate(
+        "RELEASE\n", timeout=_E2_BARRIER_TIMEOUT_SECONDS
+    )
+    assert child.returncode == 0, stdout + stderr
+    assert _read_offline_rebuild_marker(path) == marker
+    return marker
+
+
+class _RecoveryBarrier:
+    def __init__(self) -> None:
+        self._arrived = {
+            "canonical": threading.Event(),
+            "state_meta": threading.Event(),
+        }
+        self._released = {
+            "canonical": threading.Event(),
+            "state_meta": threading.Event(),
+        }
+        self.events: dict[str, dict[str, object]] = {}
+
+    def __call__(self, event: dict[str, object]) -> None:
+        table = str(event.get("table", ""))
+        phase = None
+        if table in session_recovery._CANONICAL_TABLES:
+            phase = "canonical"
+        elif table == "state_meta":
+            phase = "state_meta"
+        if phase is None or self._arrived[phase].is_set():
+            return
+        self.events[phase] = dict(event)
+        self._arrived[phase].set()
+        assert self._released[phase].wait(_E2_BARRIER_TIMEOUT_SECONDS), (
+            f"recovery {phase} barrier was not released"
+        )
+
+    def wait(self, phase: str) -> None:
+        assert self._arrived[phase].wait(_E2_BARRIER_TIMEOUT_SECONDS), (
+            f"recovery did not reach the {phase} barrier"
+        )
+
+    def release(self, phase: str) -> None:
+        self._released[phase].set()
+
+    def release_all(self) -> None:
+        for event in self._released.values():
+            event.set()
+
+
+def _run_recovery_contender_child(path: Path) -> tuple[subprocess.Popen[str], dict[str, str]]:
+    root = Path(__file__).resolve().parents[2]
+    program = """
+import json
+import pathlib
+import sys
+
+from hermes_state import SessionDB, SessionTurnLeaseLostError
+
+db = SessionDB(db_path=pathlib.Path(sys.argv[1]))
+try:
+    token = db.try_acquire_session_turn_lease(
+        "e2-source-session",
+        "e2-contender",
+        ttl_seconds=30.0,
+    )
+    lease = "REFUSED" if token is None else "ACQUIRED"
+    try:
+        db.create_session("e2-child-created", "child")
+    except SessionTurnLeaseLostError:
+        write = "REFUSED"
+    else:
+        write = "COMMITTED"
+    print(json.dumps({"lease": lease, "write": write}, sort_keys=True), flush=True)
+    assert sys.stdin.readline() == "RELEASE\\n"
+finally:
+    db.close()
+"""
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(root)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    child = subprocess.Popen(
+        [sys.executable, "-c", program, str(path)],
+        cwd=str(root),
+        env=env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert child.stdin is not None
+    assert child.stdout is not None
+    assert child.stderr is not None
+    ready, _, _ = select.select(
+        [child.stdout], [], [], _E2_BARRIER_TIMEOUT_SECONDS
+    )
+    assert ready, "recovery contender did not report its outcome"
+    line = child.stdout.readline()
+    assert line, "recovery contender exited without an outcome"
+    outcome = json.loads(line)
+    assert set(outcome) == {"lease", "write"}
+    assert child.poll() is None
+    return child, outcome
+
+
+@pytest.mark.parametrize("copy_mode", ["normal", "salvage"])
+def test_state_meta_copy_preserves_destination_offline_rebuild_epoch_and_user_rows(
+    tmp_path: Path,
+    copy_mode: str,
+) -> None:
+    source = tmp_path / f"e2-helper-{copy_mode}-source.db"
+    destination = tmp_path / f"e2-helper-{copy_mode}-destination.db"
+    source_db = SessionDB(db_path=source)
+    try:
+        source_db.set_meta("e2:user", "source-user-value")
+        source_db.set_meta("e2:ordinary", "source-ordinary-value")
+    finally:
+        source_db.close()
+    source_marker = _make_stale_source_rebuild_marker(source)
+
+    source_conn = sqlite3.connect(str(source), isolation_level=None)
+    destination_db = SessionDB(db_path=destination)
+    destination_db.set_meta("e2:user", "destination-before")
+    marker_observations: list[str | None] = []
+    try:
+        with destination_db.offline_rebuild(reason=f"e2 helper {copy_mode}"):
+            destination_marker = _read_offline_rebuild_marker(destination)
+            assert destination_marker is not None
+            assert destination_marker != source_marker
+
+            def observe_progress(event: dict[str, object]) -> None:
+                if event.get("table") != "state_meta":
+                    return
+                marker_observations.append(
+                    _read_offline_rebuild_marker(destination)
+                )
+                assert marker_observations[-1] == destination_marker
+
+            copy_function = (
+                session_recovery._copy_state_meta_salvage
+                if copy_mode == "salvage"
+                else session_recovery._copy_state_meta
+            )
+            source_rows = int(
+                source_conn.execute("SELECT COUNT(*) FROM state_meta").fetchone()[0]
+            )
+            report = copy_function(
+                source_conn,
+                destination_db,
+                chunk_size=1,
+                progress_cb=observe_progress,
+                source_rows=source_rows,
+            )
+
+            assert marker_observations
+            assert _read_offline_rebuild_marker(destination) == destination_marker
+            assert _OFFLINE_REBUILD_EPOCH_KEY in report["excluded_keys"]
+            placeholders = ", ".join("?" for _ in report["excluded_keys"])
+            expected_copied = int(
+                source_conn.execute(
+                    f"SELECT COUNT(*) FROM state_meta WHERE key NOT IN ({placeholders})",
+                    tuple(report["excluded_keys"]),
+                ).fetchone()[0]
+            )
+            assert report["copied_rows"] == expected_copied
+            assert report["status"] == "complete"
+            assert destination_db.get_meta("e2:user") == "source-user-value"
+            assert destination_db.get_meta("e2:ordinary") == "source-ordinary-value"
+            assert source_marker not in json.dumps(report, sort_keys=True)
+
+        assert _read_offline_rebuild_marker(destination) is None
+    finally:
+        source_conn.close()
+        destination_db.close()
+
+
+@pytest.mark.parametrize("copy_mode", ["normal", "salvage"])
+def test_recover_session_database_preserves_destination_offline_rebuild_epoch_and_blocks_child(
+    tmp_path: Path,
+    copy_mode: str,
+) -> None:
+    source = tmp_path / f"e2-caller-{copy_mode}-source.db"
+    output = tmp_path / f"e2-caller-{copy_mode}-output.db"
+    source_db = SessionDB(db_path=source)
+    try:
+        source_db.create_session("e2-source-session", "cli")
+        source_db.set_session_title("e2-source-session", "E2 copied session")
+        source_db.set_meta("e2:user", "source-user-value")
+    finally:
+        source_db.close()
+    source_marker = _make_stale_source_rebuild_marker(source)
+
+    barrier = _RecoveryBarrier()
+    reports: list[dict[str, object]] = []
+    recovery_errors: list[BaseException] = []
+    recovery_done = threading.Event()
+
+    def run_recovery() -> None:
+        try:
+            reports.append(
+                recover_session_database(
+                    source,
+                    output,
+                    work_dir=tmp_path,
+                    chunk_size=1,
+                    progress_cb=barrier,
+                    allow_partial=copy_mode == "salvage",
+                )
+            )
+        except BaseException as exc:
+            recovery_errors.append(exc)
+        finally:
+            recovery_done.set()
+
+    worker = threading.Thread(target=run_recovery, daemon=True)
+    contender = None
+    worker.start()
+    try:
+        barrier.wait("canonical")
+        destination_marker = _read_offline_rebuild_marker(output)
+        assert destination_marker is not None
+        assert destination_marker != source_marker
+        barrier.release("canonical")
+
+        barrier.wait("state_meta")
+        assert _read_offline_rebuild_marker(output) == destination_marker
+        contender, outcome = _run_recovery_contender_child(output)
+        assert outcome == {"lease": "REFUSED", "write": "REFUSED"}
+        with sqlite3.connect(str(output)) as verifier:
+            lease_rows = int(
+                verifier.execute(
+                    "SELECT COUNT(*) FROM session_turn_leases "
+                    "WHERE conversation_id = 'e2-source-session'"
+                ).fetchone()[0]
+            )
+            child_rows = int(
+                verifier.execute(
+                    "SELECT COUNT(*) FROM sessions WHERE id = 'e2-child-created'"
+                ).fetchone()[0]
+            )
+        assert lease_rows == 0
+        assert child_rows == 0
+        assert contender.poll() is None
+        assert _read_offline_rebuild_marker(output) == destination_marker
+
+        barrier.release("state_meta")
+        assert recovery_done.wait(_E2_BARRIER_TIMEOUT_SECONDS), (
+            "recovery did not finish after the state_meta barrier"
+        )
+        worker.join(_E2_BARRIER_TIMEOUT_SECONDS)
+        assert not worker.is_alive()
+        assert not recovery_errors, repr(recovery_errors[0]) if recovery_errors else ""
+        assert len(reports) == 1
+        report = reports[0]
+        assert _read_offline_rebuild_marker(output) is None
+        assert report["copy"]["state_meta"]["status"] == "complete"
+        assert _OFFLINE_REBUILD_EPOCH_KEY in report["copy"]["state_meta"][
+            "excluded_keys"
+        ]
+        assert source_marker not in json.dumps(report, sort_keys=True)
+        with sqlite3.connect(str(output)) as verifier:
+            copied = verifier.execute(
+                "SELECT title FROM sessions WHERE id = 'e2-source-session'"
+            ).fetchone()
+            user_meta = verifier.execute(
+                "SELECT value FROM state_meta WHERE key = 'e2:user'"
+            ).fetchone()
+            child_rows = int(
+                verifier.execute(
+                    "SELECT COUNT(*) FROM sessions WHERE id = 'e2-child-created'"
+                ).fetchone()[0]
+            )
+        assert copied == ("E2 copied session",)
+        assert user_meta == ("source-user-value",)
+        assert child_rows == 0
+    finally:
+        barrier.release_all()
+        worker.join(_E2_BARRIER_TIMEOUT_SECONDS)
+        if contender is not None:
+            assert contender.stdin is not None
+            stdout, stderr = contender.communicate(
+                "RELEASE\n", timeout=_E2_BARRIER_TIMEOUT_SECONDS
+            )
+            assert contender.returncode == 0, stdout + stderr
+
+
+@pytest.mark.parametrize(
+    "epoch_change",
+    ["missing", "malformed", "nonfinite", "foreign"],
+)
+def test_state_meta_copy_fails_closed_before_target_mutation_if_destination_epoch_changes(
+    tmp_path: Path,
+    epoch_change: str,
+) -> None:
+    source = tmp_path / f"e2-generation-{epoch_change}-source.db"
+    source_db = SessionDB(db_path=source)
+    try:
+        source_db.set_meta("e2:user", "source-must-not-land")
+    finally:
+        source_db.close()
+    source_marker = _make_stale_source_rebuild_marker(source)
+    source_conn = sqlite3.connect(str(source), isolation_level=None)
+    source_rows = int(
+        source_conn.execute("SELECT COUNT(*) FROM state_meta").fetchone()[0]
+    )
+
+    control_child = None
+    if epoch_change in {"nonfinite", "foreign"}:
+        control_child = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import sys; print('READY', flush=True); "
+                "assert sys.stdin.readline() == 'RELEASE\\n'",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        assert control_child.stdin is not None
+        assert control_child.stdout is not None
+        ready, _, _ = select.select(
+            [control_child.stdout], [], [], _E2_BARRIER_TIMEOUT_SECONDS
+        )
+        assert ready
+        assert control_child.stdout.readline().strip() == "READY"
+        assert control_child.poll() is None
+
+    try:
+        for copy_mode in ("normal", "salvage"):
+            destination = tmp_path / (
+                f"e2-generation-{epoch_change}-{copy_mode}-destination.db"
+            )
+            destination_db = SessionDB(db_path=destination)
+            destination_db.set_meta("e2:user", "destination-before")
+            destination_db.set_meta("e2:untouched", "must-remain-identical")
+            try:
+                with pytest.raises(
+                    (SQLiteSerializationError, hermes_state.SessionTurnLeaseLostError)
+                ):
+                    with destination_db.offline_rebuild(
+                        reason=f"e2 generation {epoch_change} {copy_mode}"
+                    ):
+                        original_marker = _read_offline_rebuild_marker(destination)
+                        assert original_marker is not None
+                        with sqlite3.connect(str(destination)) as verifier:
+                            before_rows = verifier.execute(
+                                "SELECT key, value FROM state_meta "
+                                "WHERE key != ? ORDER BY key",
+                                (_OFFLINE_REBUILD_EPOCH_KEY,),
+                            ).fetchall()
+
+                        if epoch_change == "missing":
+                            adversarial_marker = None
+                        elif epoch_change == "malformed":
+                            adversarial_marker = "{malformed-e2-marker"
+                        else:
+                            assert control_child is not None
+                            owner_start = hermes_state._process_start_time(
+                                control_child.pid
+                            )
+                            assert owner_start is not None
+                            if epoch_change == "nonfinite":
+                                adversarial_marker = (
+                                    '{"nonce":"e2-nonfinite","owner_pid":'
+                                    f"{control_child.pid},"
+                                    '"owner_pid_start":Infinity,'
+                                    '"reason":"e2-control"}'
+                                )
+                            else:
+                                adversarial_marker = json.dumps(
+                                    {
+                                        "nonce": "e2-foreign",
+                                        "owner_pid": control_child.pid,
+                                        "owner_pid_start": owner_start,
+                                        "reason": "e2-control",
+                                    },
+                                    sort_keys=True,
+                                    separators=(",", ":"),
+                                )
+
+                        with sqlite3.connect(
+                            str(destination), isolation_level=None
+                        ) as adversary:
+                            if adversarial_marker is None:
+                                adversary.execute(
+                                    "DELETE FROM state_meta WHERE key = ?",
+                                    (_OFFLINE_REBUILD_EPOCH_KEY,),
+                                )
+                            else:
+                                adversary.execute(
+                                    "UPDATE state_meta SET value = ? WHERE key = ?",
+                                    (
+                                        adversarial_marker,
+                                        _OFFLINE_REBUILD_EPOCH_KEY,
+                                    ),
+                                )
+
+                        copy_function = (
+                            session_recovery._copy_state_meta_salvage
+                            if copy_mode == "salvage"
+                            else session_recovery._copy_state_meta
+                        )
+                        with pytest.raises(
+                            SQLiteSerializationError,
+                            match=(
+                                "^offline rebuild exclusion changed before its "
+                                "owner released it$"
+                            ),
+                        ) as caught:
+                            copy_function(
+                                source_conn,
+                                destination_db,
+                                chunk_size=1,
+                                progress_cb=None,
+                                source_rows=source_rows,
+                            )
+                        assert str(caught.value) == (
+                            "offline rebuild exclusion changed before its owner "
+                            "released it"
+                        )
+                        assert source_marker not in str(caught.value)
+
+                        with sqlite3.connect(str(destination)) as verifier:
+                            after_rows = verifier.execute(
+                                "SELECT key, value FROM state_meta "
+                                "WHERE key != ? ORDER BY key",
+                                (_OFFLINE_REBUILD_EPOCH_KEY,),
+                            ).fetchall()
+                        assert after_rows == before_rows
+                        assert (
+                            _read_offline_rebuild_marker(destination)
+                            == adversarial_marker
+                        )
+            finally:
+                destination_db.close()
+    finally:
+        source_conn.close()
+        if control_child is not None:
+            assert control_child.stdin is not None
+            stdout, stderr = control_child.communicate(
+                "RELEASE\n", timeout=_E2_BARRIER_TIMEOUT_SECONDS
+            )
+            assert control_child.returncode == 0, stdout + stderr
 
 
 

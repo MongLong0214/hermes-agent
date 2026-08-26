@@ -23,7 +23,9 @@ from typing import Any, Callable, Optional
 from hermes_state import (
     FTS_STORAGE_VERSION,
     SCHEMA_VERSION,
+    SQLiteSerializationError,
     SessionDB,
+    _OFFLINE_REBUILD_EPOCH_KEY,
     _db_opens_cleanly,
 )
 
@@ -48,6 +50,7 @@ _TOPIC_TABLES = (
 # These values describe derived indexes or the schema that owns an optional
 # table. A fresh destination must generate them from its own current schema.
 _GENERATED_META_KEYS = frozenset({
+    _OFFLINE_REBUILD_EPOCH_KEY,
     "fts_storage_version",
     "fts_optimize_available",
     "fts_rebuild_high_water",
@@ -822,6 +825,25 @@ def _copy_state_meta(
         result["error"] = "destination state_meta schema is incomplete"
         return result
 
+    owner_capability = destination_db._offline_rebuild_epoch_capability
+    expected_rebuild_marker = (
+        owner_capability[1] if owner_capability is not None else None
+    )
+
+    def _require_current_rebuild_marker(conn: sqlite3.Connection) -> None:
+        marker_row = conn.execute(
+            "SELECT value FROM state_meta WHERE key = ?",
+            (_OFFLINE_REBUILD_EPOCH_KEY,),
+        ).fetchone()
+        if (
+            expected_rebuild_marker is None
+            or marker_row is None
+            or str(marker_row[0]) != expected_rebuild_marker
+        ):
+            raise SQLiteSerializationError(
+                "offline rebuild exclusion changed before its owner released it"
+            )
+
     placeholders = ", ".join("?" for _ in _GENERATED_META_KEYS)
     filtered_source_rows: Optional[int] = None
     try:
@@ -847,6 +869,7 @@ def _copy_state_meta(
             def _insert_meta_chunk(
                 conn: sqlite3.Connection, chunk=rows
             ) -> None:
+                _require_current_rebuild_marker(conn)
                 conn.executemany(
                     "INSERT OR REPLACE INTO state_meta(key, value) VALUES (?, ?)",
                     chunk,
@@ -860,6 +883,8 @@ def _copy_state_meta(
                     "copied_rows": result["copied_rows"],
                     "source_rows": filtered_source_rows,
                 })
+    except SQLiteSerializationError:
+        raise
     except sqlite3.DatabaseError as exc:
         result["status"] = "partial" if result["copied_rows"] else "failed"
         result["error"] = str(exc)
@@ -945,16 +970,49 @@ def _copy_state_meta_salvage(
     ) -> bool:
         return str(row[columns.index("key")]) not in _GENERATED_META_KEYS
 
-    result = _copy_table_salvage(
-        source,
-        destination_db,
-        "state_meta",
-        chunk_size=chunk_size,
-        progress_cb=progress_cb,
-        source_rows=source_rows,
-        insert_prefix="INSERT OR REPLACE",
-        row_filter=keep_user_meta,
+    owner_capability = destination_db._offline_rebuild_epoch_capability
+    expected_rebuild_marker = (
+        owner_capability[1] if owner_capability is not None else None
     )
+
+    class _RebuildMarkerChanged(RuntimeError):
+        pass
+
+    class _GuardedDestination:
+        def _read_ctx(self):
+            return destination_db._read_ctx()
+
+        def _execute_write(self, operation):
+            def _guarded_operation(conn: sqlite3.Connection):
+                marker_row = conn.execute(
+                    "SELECT value FROM state_meta WHERE key = ?",
+                    (_OFFLINE_REBUILD_EPOCH_KEY,),
+                ).fetchone()
+                if (
+                    expected_rebuild_marker is None
+                    or marker_row is None
+                    or str(marker_row[0]) != expected_rebuild_marker
+                ):
+                    raise _RebuildMarkerChanged
+                return operation(conn)
+
+            return destination_db._execute_write(_guarded_operation)
+
+    try:
+        result = _copy_table_salvage(
+            source,
+            _GuardedDestination(),
+            "state_meta",
+            chunk_size=chunk_size,
+            progress_cb=progress_cb,
+            source_rows=source_rows,
+            insert_prefix="INSERT OR REPLACE",
+            row_filter=keep_user_meta,
+        )
+    except _RebuildMarkerChanged:
+        raise SQLiteSerializationError(
+            "offline rebuild exclusion changed before its owner released it"
+        ) from None
     result["source_meta_rows"] = result.pop("source_rows")
     result["excluded_keys"] = sorted(_GENERATED_META_KEYS)
     return result
