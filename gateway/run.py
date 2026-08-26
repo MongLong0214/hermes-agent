@@ -18993,6 +18993,72 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
+    async def run_bound_existing_turn(
+        self,
+        binding: Any,
+        event: Any,
+        entry: Any,
+    ) -> str:
+        """Run one request-local turn against a pinned existing cache entry."""
+        if (
+            entry.session_key != binding.session_key
+            or entry.session_id != binding.session_id
+        ):
+            raise ValueError("canonical_binding_stale")
+
+        with self._agent_cache_lock:
+            cached = self._agent_cache.get(entry.session_key)
+            if not cached:
+                raise ValueError("canonical_agent_missing")
+            agent = cached[0] if isinstance(cached, tuple) else cached
+            cached_session_id = (
+                cached[3]
+                if isinstance(cached, tuple) and len(cached) > 3
+                else getattr(agent, "session_id", None)
+            )
+            if (
+                cached_session_id != entry.session_id
+                or getattr(agent, "session_id", None) != entry.session_id
+            ):
+                raise ValueError("canonical_agent_missing")
+
+        registry = self._turn_leases
+        generation = self._begin_session_run_generation(entry.session_key)
+        try:
+            lease_token = await registry.acquire(
+                entry.session_id,
+                owner_key=f"canonical:{id(event)}",
+                generation=generation,
+            )
+        except Exception:
+            raise ValueError("canonical_turn_busy") from None
+
+        try:
+            history = await self.async_session_store.load_transcript(entry.session_id)
+            agent_history, _ = _build_gateway_agent_history(history)
+            self._init_cached_agent_for_turn(agent, 0)
+            result = await asyncio.to_thread(
+                agent.run_conversation,
+                event.text,
+                conversation_history=agent_history,
+                task_id=entry.session_id,
+            )
+            if not isinstance(result, dict):
+                raise ValueError("canonical_turn_refused")
+            final_response = result.get("final_response")
+            if (
+                result.get("failed")
+                or result.get("interrupted")
+                or result.get("partial")
+                or result.get("session_id", entry.session_id) != entry.session_id
+                or not isinstance(final_response, str)
+                or not final_response.strip()
+            ):
+                raise ValueError("canonical_turn_refused")
+            return final_response
+        finally:
+            registry.release(lease_token)
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()

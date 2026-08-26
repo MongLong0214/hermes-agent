@@ -1984,6 +1984,85 @@ class APIServerAdapter(BasePlatformAdapter):
                     return candidate
         return None
 
+    async def _handle_canonical_surface_event(self, request: "web.Request"):
+        """Run one authenticated Buzz-shaped event on a bound existing turn."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        from gateway.canonical_surface import (
+            CanonicalIngressEvent,
+            ExistingCanonicalBindingResolver,
+        )
+
+        try:
+            event = CanonicalIngressEvent.from_json_bytes(await request.read())
+        except ValueError:
+            return web.json_response(
+                {
+                    "error": {
+                        "code": "canonical_invalid_request",
+                        "message": "Canonical request rejected.",
+                    }
+                },
+                status=400,
+            )
+
+        runner = self.gateway_runner
+        if runner is None:
+            return web.json_response(
+                {
+                    "error": {
+                        "code": "canonical_unavailable",
+                        "message": "Canonical request unavailable.",
+                    }
+                },
+                status=503,
+            )
+        binding = getattr(runner.config, "canonical_surface_bindings", {}).get(
+            event.binding
+        )
+        if binding is None:
+            return web.json_response(
+                {
+                    "error": {
+                        "code": "canonical_binding_unknown",
+                        "message": "Canonical request rejected.",
+                    }
+                },
+                status=404,
+            )
+
+        try:
+            entry = await asyncio.to_thread(
+                ExistingCanonicalBindingResolver(runner.session_store).resolve,
+                binding,
+                event,
+            )
+            text = await runner.run_bound_existing_turn(binding, event, entry)
+        except ValueError as exc:
+            code = str(exc)
+            status = 403 if code == "canonical_principal_rejected" else 409
+            if code not in {
+                "canonical_principal_rejected",
+                "canonical_binding_stale",
+                "canonical_agent_missing",
+                "canonical_turn_busy",
+                "canonical_turn_refused",
+            }:
+                code = "canonical_turn_refused"
+                status = 409
+            return web.json_response(
+                {
+                    "error": {
+                        "code": code,
+                        "message": "Canonical request rejected.",
+                    }
+                },
+                status=status,
+            )
+        return web.json_response({"event_id": event.event_id, "text": text})
+
     async def _handle_platform_event_callback(self, request: "web.Request") -> "web.Response":
         platform_name = self._normalize_callback_platform(
             request.match_info.get("platform", "")
@@ -2188,6 +2267,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/models", self._handle_models),
             ("GET", "/api/model/options", self._handle_model_options),
             ("GET", "/v1/capabilities", self._handle_capabilities),
+            ("POST", "/v1/canonical-surface/events", self._handle_canonical_surface_event),
             # Authenticated browser-control surface: POST registration
             # mints a short-lived ticket; the controller then opens the WS with
             # that ticket. Both are gated on browser.extension_control.enabled

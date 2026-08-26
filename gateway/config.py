@@ -23,6 +23,69 @@ from utils import is_truthy_value
 logger = logging.getLogger(__name__)
 
 
+def _parse_canonical_surface_bindings(value: Any) -> Dict[str, Any]:
+    """Parse exact server-owned Telegram/Buzz binding records."""
+    from gateway.canonical_surface import CanonicalSurfaceBinding
+
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("canonical_surface_bindings must be a mapping")
+
+    def _string(raw: Any, *, maximum: int = 256, optional: bool = False):
+        if raw is None and optional:
+            return None
+        if not isinstance(raw, str):
+            raise ValueError("canonical surface binding strings are required")
+        cleaned = raw.strip()
+        if not cleaned or len(cleaned) > maximum:
+            raise ValueError("canonical surface binding string is out of bounds")
+        return cleaned
+
+    def _id_list(raw: Any) -> tuple[str, ...]:
+        if not isinstance(raw, list) or not raw:
+            raise ValueError("canonical surface principal lists must be non-empty")
+        parsed = tuple(_string(item) for item in raw)
+        if len(set(parsed)) != len(parsed):
+            raise ValueError("canonical surface principal lists must be unique")
+        return parsed
+
+    parsed: Dict[str, Any] = {}
+    for raw_name, raw_binding in value.items():
+        name = _string(raw_name, maximum=128)
+        if not isinstance(raw_binding, dict) or set(raw_binding) != {
+            "session_key", "session_id", "telegram", "buzz"
+        }:
+            raise ValueError("canonical surface binding schema is invalid")
+        telegram = raw_binding["telegram"]
+        buzz = raw_binding["buzz"]
+        if not isinstance(telegram, dict) or set(telegram) != {
+            "chat_id", "chat_type", "user_id", "thread_id"
+        }:
+            raise ValueError("canonical Telegram binding schema is invalid")
+        if not isinstance(buzz, dict) or set(buzz) != {
+            "author_ids", "channel_ids"
+        }:
+            raise ValueError("canonical Buzz binding schema is invalid")
+        chat_type = _string(telegram["chat_type"], maximum=16)
+        if chat_type not in {"dm", "group", "channel", "thread"}:
+            raise ValueError("canonical Telegram chat type is invalid")
+        if name in parsed:
+            raise ValueError("canonical surface binding names must be unique")
+        parsed[name] = CanonicalSurfaceBinding(
+            name=name,
+            session_key=_string(raw_binding["session_key"], maximum=512),
+            session_id=_string(raw_binding["session_id"]),
+            telegram_chat_id=_string(telegram["chat_id"]),
+            telegram_chat_type=chat_type,
+            telegram_user_id=_string(telegram["user_id"], optional=True),
+            telegram_thread_id=_string(telegram["thread_id"], optional=True),
+            allowed_author_ids=_id_list(buzz["author_ids"]),
+            allowed_channel_ids=_id_list(buzz["channel_ids"]),
+        )
+    return parsed
+
+
 def _coerce_bool(value: Any, default: bool = True) -> bool:
     """Coerce bool-ish config values, preserving a caller-provided default."""
     if value is None:
@@ -1003,6 +1066,10 @@ class GatewayConfig:
     # dict with: name, platform, profile, and optional guild_id/chat_id/thread_id.
     profile_routes: list = field(default_factory=list)
 
+    # Authenticated external-surface aliases pinned to one existing Telegram
+    # routing generation. Request bodies carry only the alias, never targets.
+    canonical_surface_bindings: Dict[str, Any] = field(default_factory=dict)
+
     def __post_init__(self) -> None:
         self.multiplex_profile_allowlist = _normalize_multiplex_profile_allowlist(
             self.multiplex_profile_allowlist
@@ -1131,6 +1198,23 @@ class GatewayConfig:
                 asdict(r) if is_dataclass(r) and not isinstance(r, type) else r
                 for r in self.profile_routes
             ],
+            "canonical_surface_bindings": {
+                name: {
+                    "session_key": binding.session_key,
+                    "session_id": binding.session_id,
+                    "telegram": {
+                        "chat_id": binding.telegram_chat_id,
+                        "chat_type": binding.telegram_chat_type,
+                        "user_id": binding.telegram_user_id,
+                        "thread_id": binding.telegram_thread_id,
+                    },
+                    "buzz": {
+                        "author_ids": list(binding.allowed_author_ids),
+                        "channel_ids": list(binding.allowed_channel_ids),
+                    },
+                }
+                for name, binding in self.canonical_surface_bindings.items()
+            },
         }
     
     @classmethod
@@ -1247,6 +1331,12 @@ class GatewayConfig:
         # Parse profile routes (validated by gateway.profile_routing)
         from gateway.profile_routing import parse_profile_routes
         profile_routes = parse_profile_routes(data.get("profile_routes") or [])
+        canonical_surface_bindings = _parse_canonical_surface_bindings(
+            data.get(
+                "canonical_surface_bindings",
+                nested_gateway.get("canonical_surface_bindings"),
+            )
+        )
 
         return cls(
             platforms=platforms,
@@ -1274,6 +1364,7 @@ class GatewayConfig:
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
             session_store_max_age_days=session_store_max_age_days,
             profile_routes=profile_routes,
+            canonical_surface_bindings=canonical_surface_bindings,
         )
 
     def get_unauthorized_dm_behavior(self, platform: Optional[Platform] = None) -> str:
