@@ -23,6 +23,7 @@ import inspect
 import itertools
 import json
 import logging
+import math
 import os
 import queue
 import random
@@ -4838,6 +4839,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._fts_cjk_loaded = False
         self._fts_cjk_available = False
         self._fts_unavailable_warned = False
+        # Process-local proof that this exact SessionDB instance owns the exact
+        # durable offline-rebuild epoch currently stored in state_meta.
+        self._offline_rebuild_epoch_capability: Optional[Tuple[object, str]] = None
+        self._offline_rebuild_claim_capability: Optional[object] = None
         self._conn = None
         # Async token accounting (see queue_token_counts). The condition
         # guards queue + writer state; it is distinct from self._lock so
@@ -5550,6 +5555,88 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         pass
                     raise
 
+    def _rollback_or_retire_failed_transaction(
+        self,
+        conn: sqlite3.Connection,
+        primary_exc: BaseException,
+        *,
+        diagnostic: str,
+    ) -> None:
+        """Reach a terminal transaction state before releasing ownership locks."""
+        cleanup_exc: Optional[BaseException] = None
+        try:
+            conn.rollback()
+            terminal = not conn.in_transaction
+            if not terminal:
+                cleanup_exc = SQLiteSerializationError(
+                    "SQLite rollback returned with the transaction still active"
+                )
+        except BaseException as rollback_exc:
+            terminal = False
+            cleanup_exc = rollback_exc
+
+        if cleanup_exc is not None:
+            try:
+                setattr(primary_exc, "_hermes_cleanup_error", cleanup_exc)
+                primary_exc.add_note(f"{diagnostic} also failed: {cleanup_exc}")
+            except Exception:
+                logger.debug(
+                    "Could not attach SQLite transaction cleanup diagnostic",
+                    exc_info=True,
+                )
+
+        if terminal:
+            return
+
+        # A foreign thread must never inherit a handle whose owner transaction
+        # could not be rolled back. Poison, detach, and base-close it while the
+        # SessionDB and exact-connection serialization locks are both held.
+        try:
+            conn._hermes_poisoned = True
+            if self._conn is conn:
+                self._conn = None
+            sqlite3.Connection.close(conn)
+        except BaseException as close_exc:
+            try:
+                primary_exc.add_note(
+                    "retiring the SQLite connection after failed rollback also "
+                    f"failed: {close_exc}"
+                )
+            except Exception:
+                logger.debug(
+                    "Could not attach SQLite retirement diagnostic",
+                    exc_info=True,
+                )
+
+    def _assert_offline_rebuild_write_authority(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        claim_capability: Optional[object] = None,
+    ) -> None:
+        """Refuse canonical DML beneath a foreign live rebuild epoch."""
+        row = conn.execute(
+            "SELECT value FROM state_meta WHERE key = ?",
+            (_OFFLINE_REBUILD_EPOCH_KEY,),
+        ).fetchone()
+        if row is None:
+            return
+        marker_value = row["value"]
+        owner_capability = self._offline_rebuild_epoch_capability
+        if owner_capability is not None and owner_capability[1] == marker_value:
+            return
+        if (
+            claim_capability is not None
+            and self._offline_rebuild_claim_capability is claim_capability
+        ):
+            # Only offline_rebuild can hold this opaque instance-local token;
+            # its callback performs live/dead marker adjudication atomically.
+            return
+        raise SessionTurnLeaseLostError(
+            f"refusing a canonical write to {self.db_path}: "
+            "offline rebuild exclusion is held by another SessionDB"
+        )
+
     @contextmanager
     def write_transaction(self, patience_s: Optional[float] = None):
         """This store's CANONICAL write transaction, as a context manager.
@@ -5614,54 +5701,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             break
         try:
             try:
+                self._assert_offline_rebuild_write_authority(conn)
                 yield conn
-            except BaseException:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
+            except BaseException as body_exc:
+                self._rollback_or_retire_failed_transaction(
+                    conn,
+                    body_exc,
+                    diagnostic="rollback after SQLite transaction body failure",
+                )
                 raise
             try:
                 conn.commit()
             except BaseException as commit_exc:
-                try:
-                    conn.rollback()
-                    terminal = not conn.in_transaction
-                except BaseException as rollback_exc:
-                    terminal = False
-                    try:
-                        setattr(commit_exc, "_hermes_cleanup_error", rollback_exc)
-                        commit_exc.add_note(
-                            "rollback after SQLite COMMIT failure also failed: "
-                            f"{rollback_exc}"
-                        )
-                    except Exception:
-                        logger.debug(
-                            "Could not attach SQLite COMMIT cleanup diagnostic",
-                            exc_info=True,
-                        )
-                if not terminal:
-                    # The caller's block has finished but its transaction has
-                    # not.  Poison and detach this exact handle while both
-                    # ownership locks are still held, then close through the C
-                    # base method so an overridden/failed rollback cannot let a
-                    # foreign thread append to or terminate the stranded work.
-                    try:
-                        conn._hermes_poisoned = True
-                        if self._conn is conn:
-                            self._conn = None
-                        sqlite3.Connection.close(conn)
-                    except BaseException as close_exc:
-                        try:
-                            commit_exc.add_note(
-                                "retiring the SQLite connection after failed "
-                                f"rollback also failed: {close_exc}"
-                            )
-                        except Exception:
-                            logger.debug(
-                                "Could not attach SQLite retirement diagnostic",
-                                exc_info=True,
-                            )
+                self._rollback_or_retire_failed_transaction(
+                    conn,
+                    commit_exc,
+                    diagnostic="rollback after SQLite COMMIT failure",
+                )
                 raise
         finally:
             ownership.close()
@@ -5670,6 +5726,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self,
         fn: Callable[[sqlite3.Connection], T],
         patience_s: Optional[float] = None,
+        *,
+        _offline_rebuild_claim_capability: Optional[object] = None,
     ) -> T:
         """Execute a write transaction with BEGIN IMMEDIATE and jitter retry.
 
@@ -5717,13 +5775,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 with self._same_connection_transaction_boundary() as conn:
                     self._begin_immediate_before_deadline(conn, deadline)
                     try:
+                        self._assert_offline_rebuild_write_authority(
+                            conn,
+                            claim_capability=_offline_rebuild_claim_capability,
+                        )
                         result = fn(conn)
                         conn.commit()
-                    except BaseException:
-                        try:
-                            conn.rollback()
-                        except Exception:
-                            pass
+                    except BaseException as write_exc:
+                        self._rollback_or_retire_failed_transaction(
+                            conn,
+                            write_exc,
+                            diagnostic="rollback after SQLite write failure",
+                        )
                         raise
                 # Success — periodic best-effort checkpoint + FTS merge.
                 self._write_count += 1
@@ -9312,7 +9375,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             return SessionTurnLeaseToken(holder, epoch, conversation_id)
 
-        token = self._execute_write(_do, patience_s=patience_s)
+        try:
+            token = self._execute_write(_do, patience_s=patience_s)
+        except SessionTurnLeaseLostError:
+            # The canonical gate rejects a foreign offline-rebuild epoch before
+            # _do can translate that ownership conflict to this API's refusal
+            # value.  _execute_write has already rolled back; preserve the
+            # established try-acquire contract rather than leaking an exception.
+            return None
         if token is not None:
             # AFTER the write commits, never inside _do: _execute_write can
             # retry the callback, and a registration left behind by an attempt
@@ -9710,6 +9780,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     or (
                         not isinstance(owner_pid_start, bool)
                         and isinstance(owner_pid_start, (int, float))
+                        and math.isfinite(owner_pid_start)
                     )
                 )
             )
@@ -9809,7 +9880,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
             return owned
 
-        owned = self._execute_write(_claim_offline_rebuild_epoch)
+        claim_capability = object()
+        self._offline_rebuild_claim_capability = claim_capability
+        try:
+            owned = self._execute_write(
+                _claim_offline_rebuild_epoch,
+                _offline_rebuild_claim_capability=claim_capability,
+            )
+        finally:
+            self._offline_rebuild_claim_capability = None
         if owned:
             raise SessionTurnLeaseLostError(
                 f"refusing an offline rebuild ({reason}) of {self.db_path}: "
@@ -9826,6 +9905,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     "offline rebuild exclusion changed before its owner released it"
                 )
 
+        self._offline_rebuild_epoch_capability = (claim_capability, marker_value)
         primary_exc = None
         try:
             with self._same_connection_transaction_boundary() as conn:
@@ -9856,6 +9936,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         "Could not attach offline rebuild release diagnostic",
                         exc_info=True,
                     )
+            finally:
+                self._offline_rebuild_epoch_capability = None
 
     def get_compression_lock_holder(self, session_id: str) -> Optional[str]:
         """Return the current (non-expired) holder for ``session_id``, or None.
