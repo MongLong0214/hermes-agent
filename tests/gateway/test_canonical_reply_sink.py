@@ -838,6 +838,667 @@ def test_c2_tool_call_before_final_physical_assistant_publishes_exactly_once(mon
     assert len(outcome["leases"].released) == 1
 
 
+def _function_tool_call(
+    call_id: Any,
+    *,
+    name: Any = "status",
+    arguments: Any = "{}",
+    call_type: Any = "function",
+) -> dict[str, Any]:
+    return {
+        "id": call_id,
+        "type": call_type,
+        "function": {"name": name, "arguments": arguments},
+    }
+
+
+@pytest.mark.parametrize(
+    ("new_messages", "final_response"),
+    [
+        pytest.param(
+            [{"role": "tool"}, {"role": "assistant", "content": "done"}],
+            "done",
+            id="orphan-empty-tool-before-final-assistant",
+        ),
+        pytest.param(
+            [
+                {"role": "assistant", "content": "first"},
+                {"role": "tool", "tool_call_id": "ghost", "content": "ghost"},
+                {"role": "assistant", "content": "second"},
+            ],
+            "second",
+            id="terminal-orphan-tool-second-terminal",
+        ),
+        pytest.param(
+            [
+                {"role": "assistant", "content": "first"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [_function_tool_call("c2")],
+                },
+                {"role": "tool", "tool_call_id": "c2", "content": "ready"},
+                {"role": "assistant", "content": "second"},
+            ],
+            "second",
+            id="terminal-valid-tool-chain-second-terminal",
+        ),
+        pytest.param(
+            [
+                {"role": "assistant", "content": "first"},
+                {"role": "user", "content": "injected"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [_function_tool_call("c3")],
+                },
+                {"role": "tool", "tool_call_id": "c3", "content": "ready"},
+                {"role": "assistant", "content": "second"},
+            ],
+            "second",
+            id="terminal-injected-user-valid-tool-chain-second-terminal",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": {"id": "mapping-not-list"},
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "mapping-not-list",
+                    "content": "ready",
+                },
+                {"role": "assistant", "content": "done"},
+            ],
+            "done",
+            id="tool-calls-mapping-not-list",
+        ),
+        pytest.param(
+            [
+                {"role": "assistant", "content": None, "tool_calls": "scalar"},
+                {"role": "assistant", "content": "done"},
+            ],
+            "done",
+            id="tool-calls-string-not-list",
+        ),
+        pytest.param(
+            [
+                {"role": "assistant", "content": None, "tool_calls": []},
+                {"role": "assistant", "content": "done"},
+            ],
+            "done",
+            id="tool-calls-empty-list",
+        ),
+        pytest.param(
+            [
+                {"role": "assistant", "content": None, "tool_calls": [17]},
+                {"role": "assistant", "content": "done"},
+            ],
+            "done",
+            id="tool-call-row-scalar",
+        ),
+        pytest.param(
+            [
+                {"role": "assistant", "content": None, "tool_calls": [{}]},
+                {"role": "assistant", "content": "done"},
+            ],
+            "done",
+            id="tool-call-row-empty",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [_function_tool_call(None)],
+                },
+                {"role": "tool", "tool_call_id": "missing", "content": "ready"},
+                {"role": "assistant", "content": "done"},
+            ],
+            "done",
+            id="tool-call-id-missing",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [_function_tool_call("")],
+                },
+                {"role": "tool", "tool_call_id": "", "content": "ready"},
+                {"role": "assistant", "content": "done"},
+            ],
+            "done",
+            id="tool-call-id-empty",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [_function_tool_call("   ")],
+                },
+                {"role": "tool", "tool_call_id": "   ", "content": "ready"},
+                {"role": "assistant", "content": "done"},
+            ],
+            "done",
+            id="tool-call-id-whitespace",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [_function_tool_call(17)],
+                },
+                {"role": "tool", "tool_call_id": 17, "content": "ready"},
+                {"role": "assistant", "content": "done"},
+            ],
+            "done",
+            id="tool-call-id-non-string",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        _function_tool_call("duplicate"),
+                        _function_tool_call("duplicate", name="other"),
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "duplicate",
+                    "content": "first",
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "duplicate",
+                    "content": "second",
+                },
+                {"role": "assistant", "content": "done"},
+            ],
+            "done",
+            id="duplicate-tool-call-ids",
+        ),
+        pytest.param(
+            [
+                {"role": "tool", "tool_call_id": "orphan", "content": "ready"},
+                {"role": "assistant", "content": "done"},
+            ],
+            "done",
+            id="orphan-tool-result-id",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [_function_tool_call("declared")],
+                },
+                {"role": "tool", "tool_call_id": "other", "content": "ready"},
+                {"role": "assistant", "content": "done"},
+            ],
+            "done",
+            id="mismatched-tool-result-id",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [_function_tool_call("once")],
+                },
+                {"role": "tool", "tool_call_id": "once", "content": "first"},
+                {"role": "tool", "tool_call_id": "once", "content": "second"},
+                {"role": "assistant", "content": "done"},
+            ],
+            "done",
+            id="duplicate-tool-result-id",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [_function_tool_call("declared")],
+                },
+                {"role": "tool", "content": "missing id"},
+                {"role": "assistant", "content": "done"},
+            ],
+            "done",
+            id="missing-tool-result-id",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [_function_tool_call("declared")],
+                },
+                {"role": "tool", "tool_call_id": "   ", "content": "ready"},
+                {"role": "assistant", "content": "done"},
+            ],
+            "done",
+            id="whitespace-tool-result-id",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [_function_tool_call("declared")],
+                },
+                {"role": "assistant", "content": "done"},
+            ],
+            "done",
+            id="missing-tool-result-row",
+        ),
+        pytest.param(
+            [
+                {"role": "tool", "tool_call_id": "early", "content": "early"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [_function_tool_call("declared")],
+                },
+                {"role": "tool", "tool_call_id": "declared", "content": "ready"},
+                {"role": "assistant", "content": "done"},
+            ],
+            "done",
+            id="tool-result-before-tool-calling-assistant",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [_function_tool_call("declared")],
+                },
+                {"role": "tool", "tool_call_id": "declared"},
+                {"role": "assistant", "content": "done"},
+            ],
+            "done",
+            id="tool-result-missing-content",
+        ),
+        pytest.param(
+            [
+                {"role": "assistant", "content": "first"},
+                {"role": "user", "content": "later user"},
+                {"role": "assistant", "content": "second"},
+            ],
+            "second",
+            id="terminal-before-later-user",
+        ),
+        pytest.param(
+            [
+                {"role": "assistant", "content": "first"},
+                {"role": "assistant", "content": "second"},
+            ],
+            "second",
+            id="multiple-terminal-assistants",
+        ),
+        pytest.param(
+            [
+                {"role": "user", "content": "repeated current user"},
+                {"role": "assistant", "content": "done"},
+            ],
+            "done",
+            id="repeated-current-turn-user",
+        ),
+        pytest.param(
+            [
+                {"role": "assistant", "content": "first"},
+                {"role": "user", "content": "post terminal"},
+                {"role": "assistant", "content": "second"},
+            ],
+            "second",
+            id="post-terminal-user",
+        ),
+        pytest.param(
+            [
+                {"role": "assistant", "content": "first"},
+                {"role": "tool", "tool_call_id": "post", "content": "late"},
+                {"role": "assistant", "content": "second"},
+            ],
+            "second",
+            id="post-terminal-tool",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "missing-type",
+                            "function": {"name": "status", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "missing-type",
+                    "content": "ready",
+                },
+                {"role": "assistant", "content": "done"},
+            ],
+            "done",
+            id="tool-call-type-missing",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [_function_tool_call("wrong-type", call_type="custom")],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "wrong-type",
+                    "content": "ready",
+                },
+                {"role": "assistant", "content": "done"},
+            ],
+            "done",
+            id="tool-call-type-invalid",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{"id": "missing-function", "type": "function"}],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "missing-function",
+                    "content": "ready",
+                },
+                {"role": "assistant", "content": "done"},
+            ],
+            "done",
+            id="tool-call-function-missing",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {"id": "scalar-function", "type": "function", "function": "bad"}
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "scalar-function",
+                    "content": "ready",
+                },
+                {"role": "assistant", "content": "done"},
+            ],
+            "done",
+            id="tool-call-function-scalar",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "missing-name",
+                            "type": "function",
+                            "function": {"arguments": "{}"},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "missing-name",
+                    "content": "ready",
+                },
+                {"role": "assistant", "content": "done"},
+            ],
+            "done",
+            id="tool-call-name-missing",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [_function_tool_call("empty-name", name="")],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "empty-name",
+                    "content": "ready",
+                },
+                {"role": "assistant", "content": "done"},
+            ],
+            "done",
+            id="tool-call-name-empty",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [_function_tool_call("non-string-name", name=17)],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "non-string-name",
+                    "content": "ready",
+                },
+                {"role": "assistant", "content": "done"},
+            ],
+            "done",
+            id="tool-call-name-non-string",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "missing-arguments",
+                            "type": "function",
+                            "function": {"name": "status"},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "missing-arguments",
+                    "content": "ready",
+                },
+                {"role": "assistant", "content": "done"},
+            ],
+            "done",
+            id="tool-call-arguments-missing",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        _function_tool_call("non-string-arguments", arguments={})
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "non-string-arguments",
+                    "content": "ready",
+                },
+                {"role": "assistant", "content": "done"},
+            ],
+            "done",
+            id="tool-call-arguments-non-string",
+        ),
+        *[
+            pytest.param(
+                [
+                    {"role": invalid_role, "content": "invalid"},
+                    {"role": "assistant", "content": "done"},
+                ],
+                "done",
+                id=f"invalid-role-{label}",
+            )
+            for label, invalid_role in (
+                ("progress", "progress"),
+                ("unknown", "future_delivery_notice_v9"),
+                ("system", "system"),
+                ("none", None),
+                ("mapping", {}),
+                ("integer", 17),
+                ("boolean", False),
+            )
+        ],
+        *[
+            pytest.param(
+                [malformed_row, {"role": "assistant", "content": "done"}],
+                "done",
+                id=f"malformed-row-{label}",
+            )
+            for label, malformed_row in (
+                ("none", None),
+                ("mapping", {}),
+                ("list", []),
+                ("string", "row"),
+                ("integer", 17),
+            )
+        ],
+    ],
+)
+def test_c2_tool_turn_grammar_refuses_ambiguous_or_malformed_current_turn(
+    new_messages, final_response, monkeypatch
+):
+    outcome = asyncio.run(
+        _exercise_endpoint_terminal_tail(
+            monkeypatch,
+            new_messages=new_messages,
+            final_response=final_response,
+            event_id="tool-grammar-refusal",
+        )
+    )
+
+    assert (
+        outcome["status"],
+        outcome["payload"],
+        len(outcome["originating_publications"]),
+    ) == (
+        409,
+        {
+            "error": {
+                "code": "canonical_turn_refused",
+                "message": "Canonical request rejected.",
+            }
+        },
+        0,
+    )
+    assert outcome["cached_publications"] == []
+    assert outcome["fallback_publications"] == []
+    assert outcome["constructor_calls"] == []
+    assert outcome["session_side_effects"] == []
+    assert outcome["session_id"] == "existing-session"
+    assert outcome["callbacks_restored"] is True
+    assert outcome["leases"].acquired == ["existing-session"]
+    assert len(outcome["leases"].released) == 1
+
+
+@pytest.mark.parametrize(
+    ("new_messages", "final_response"),
+    [
+        pytest.param(
+            [{"role": "assistant", "content": "ordinary terminal"}],
+            "ordinary terminal",
+            id="ordinary-user-final-assistant",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [_function_tool_call("single")],
+                },
+                {"role": "tool", "tool_call_id": "single", "content": "ready"},
+                {"role": "assistant", "content": "single-tool terminal"},
+            ],
+            "single-tool terminal",
+            id="single-tool-chain",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        _function_tool_call("first", name="status"),
+                        _function_tool_call("second", name="search"),
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "first", "content": "ready"},
+                {"role": "tool", "tool_call_id": "second", "content": "found"},
+                {"role": "assistant", "content": "multi-tool terminal"},
+            ],
+            "multi-tool terminal",
+            id="multiple-tools-declaration-order",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [_function_tool_call("phase-one")],
+                },
+                {"role": "tool", "tool_call_id": "phase-one", "content": "ready"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [_function_tool_call("phase-two", name="search")],
+                },
+                {"role": "tool", "tool_call_id": "phase-two", "content": "found"},
+                {"role": "assistant", "content": "multi-phase terminal"},
+            ],
+            "multi-phase terminal",
+            id="multiple-tool-phases",
+        ),
+    ],
+)
+def test_c2_tool_turn_grammar_valid_controls_publish_exactly_once(
+    new_messages, final_response, monkeypatch, request
+):
+    event_id = f"tool-grammar-valid-{request.node.callspec.id}"
+    outcome = asyncio.run(
+        _exercise_endpoint_terminal_tail(
+            monkeypatch,
+            new_messages=new_messages,
+            final_response=final_response,
+            event_id=event_id,
+        )
+    )
+
+    assert outcome["status"] == 200
+    assert outcome["payload"] == {"event_id": event_id, "text": final_response}
+    assert outcome["originating_publications"] == [
+        CanonicalTurnResult("ceo", final_response)
+    ]
+    assert outcome["cached_publications"] == []
+    assert outcome["fallback_publications"] == []
+    assert outcome["constructor_calls"] == []
+    assert outcome["session_side_effects"] == []
+    assert outcome["session_id"] == "existing-session"
+    assert outcome["callbacks_restored"] is True
+    assert outcome["leases"].acquired == ["existing-session"]
+    assert len(outcome["leases"].released) == 1
+
+
 def test_c2_r12_existing_only_order_releases_before_same_request_publish(monkeypatch):
     from gateway import canonical_surface
 

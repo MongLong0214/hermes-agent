@@ -19014,7 +19014,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         history_boundary: int,
         expected_session_id: str,
     ) -> Any:
-        """Select exactly one current-turn main-chain terminal assistant."""
+        """Validate one complete current turn and select its terminal assistant."""
         from gateway.canonical_surface import CanonicalTurnResult
 
         if not isinstance(result, dict) or result.get("completed") is not True:
@@ -19058,46 +19058,79 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             raise ValueError("canonical_turn_refused")
 
         turn_messages = messages[history_boundary:]
-        if not all(isinstance(message, dict) for message in turn_messages):
-            raise ValueError("canonical_turn_refused")
-        allowed_roles = {"user", "assistant", "tool"}
-        if not all(
-            isinstance(message.get("role"), str)
-            and message.get("role") in allowed_roles
-            for message in turn_messages
+        if not turn_messages or not all(
+            isinstance(message, dict) for message in turn_messages
         ):
             raise ValueError("canonical_turn_refused")
-        terminal_message = turn_messages[-1]
-        if terminal_message.get("role") != "assistant":
-            raise ValueError("canonical_turn_refused")
-        if terminal_message.get("tool_calls"):
+        if turn_messages[0].get("role") != "user":
             raise ValueError("canonical_turn_refused")
 
-        tool_boundary = max(
-            (
-                index
-                for index, message in enumerate(turn_messages)
-                if message.get("role") == "tool" or message.get("tool_calls")
-            ),
-            default=-1,
-        )
-        candidates = [
-            message
-            for index, message in enumerate(turn_messages)
-            if index > tool_boundary
-            and message.get("role") == "assistant"
-            and not message.get("tool_calls")
-            and isinstance(message.get("content"), str)
-            and message["content"].strip()
-        ]
-        if len(candidates) != 1 or candidates[0] is not terminal_message:
+        pending_tool_ids: set[str] = set()
+        terminal_message = None
+        for index, message in enumerate(turn_messages[1:], start=1):
+            role = message.get("role")
+            if role == "assistant":
+                if terminal_message is not None or pending_tool_ids:
+                    raise ValueError("canonical_turn_refused")
+                if "tool_calls" in message:
+                    tool_calls = message["tool_calls"]
+                    if not isinstance(tool_calls, list) or not tool_calls:
+                        raise ValueError("canonical_turn_refused")
+                    declared_ids: list[str] = []
+                    for tool_call in tool_calls:
+                        if not isinstance(tool_call, dict):
+                            raise ValueError("canonical_turn_refused")
+                        call_id = tool_call.get("id")
+                        function = tool_call.get("function")
+                        if (
+                            not isinstance(call_id, str)
+                            or not call_id.strip()
+                            or call_id in declared_ids
+                            or tool_call.get("type") != "function"
+                            or not isinstance(function, dict)
+                            or not isinstance(function.get("name"), str)
+                            or not function["name"].strip()
+                            or not isinstance(function.get("arguments"), str)
+                        ):
+                            raise ValueError("canonical_turn_refused")
+                        declared_ids.append(call_id)
+                    pending_tool_ids = set(declared_ids)
+                    continue
+
+                content = message.get("content")
+                if (
+                    not isinstance(content, str)
+                    or not content.strip()
+                    or content != final_response
+                    or index != len(turn_messages) - 1
+                ):
+                    raise ValueError("canonical_turn_refused")
+                terminal_message = message
+                continue
+
+            if role == "tool":
+                tool_call_id = message.get("tool_call_id")
+                if (
+                    terminal_message is not None
+                    or not pending_tool_ids
+                    or "content" not in message
+                    or not isinstance(tool_call_id, str)
+                    or not tool_call_id.strip()
+                    or tool_call_id not in pending_tool_ids
+                ):
+                    raise ValueError("canonical_turn_refused")
+                pending_tool_ids.remove(tool_call_id)
+                continue
+
+            # The current user is consumed only at the boundary. Unknown,
+            # historical-only, malformed, and scalar roles fail closed too.
             raise ValueError("canonical_turn_refused")
-        terminal_text = candidates[0]["content"]
-        if terminal_text != final_response:
+
+        if terminal_message is None or pending_tool_ids:
             raise ValueError("canonical_turn_refused")
         return CanonicalTurnResult(
             binding_name=binding_name,
-            terminal_text=terminal_text,
+            terminal_text=final_response,
         )
 
     async def run_bound_existing_turn(
