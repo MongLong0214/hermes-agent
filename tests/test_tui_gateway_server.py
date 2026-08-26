@@ -18793,6 +18793,61 @@ def test_persist_branch_seed_partial_retry_appends_only_suffix(monkeypatch, tmp_
         db.close()
 
 
+@pytest.mark.parametrize("malformed_count", [True, "1"], ids=["bool", "non-int"])
+def test_persist_branch_seed_rejects_malformed_partial_count_without_skipping_seed(
+    monkeypatch, malformed_count
+):
+    from hermes_state import PartialBatchInsertError
+
+    class MalformedPartialDb:
+        def __init__(self):
+            self.attempts = 0
+            self.batches = []
+            self.durable = []
+
+        def append_messages_batch(self, _key, messages, *, chunk_rows):
+            assert chunk_rows == 500
+            self.attempts += 1
+            batch = [dict(message) for message in messages]
+            self.batches.append(batch)
+            if self.attempts == 1:
+                raise PartialBatchInsertError(
+                    malformed_count, RuntimeError("malformed partial count")
+                )
+            self.durable.extend(batch)
+
+    seed = [{"role": "user", "content": "must-not-be-skipped"}]
+    session = _session(
+        session_key="branch-key",
+        parent_session_id="parent-key",
+        history=seed,
+    )
+    db = MalformedPartialDb()
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+
+    try:
+        server._persist_branch_seed(session)
+    except Exception as exc:
+        first_error = exc
+    else:
+        raise AssertionError("malformed partial count must fail closed")
+
+    server._persist_branch_seed(session)
+
+    assert [message["content"] for message in db.durable] == [
+        "must-not-be-skipped"
+    ], (
+        "a malformed count advanced the retry offset, omitted the sole seed row, "
+        "and allowed a false persisted marker"
+    )
+    assert [len(batch) for batch in db.batches] == [1, 1]
+    assert session["_branch_seed_persisted"] is True
+    assert "_branch_seed_inserted" not in session
+    assert type(first_error) is RuntimeError
+    assert str(first_error) == "invalid partial branch-seed insert count"
+    assert isinstance(first_error.__cause__, PartialBatchInsertError)
+
+
 def test_prompt_submit_partial_branch_seed_aborts_before_turn(monkeypatch, tmp_path):
     from hermes_state import SessionDB
 

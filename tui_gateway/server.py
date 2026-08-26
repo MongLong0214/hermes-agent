@@ -3131,9 +3131,15 @@ def _persist_branch_seed(session: dict) -> None:
                 session["_branch_seed_persisted"] = True
                 session.pop("_branch_seed_inserted", None)
         except PartialBatchInsertError as exc:
-            committed = inserted + exc.inserted
-            if committed < inserted or committed > len(seed):
+            partial_inserted = exc.inserted
+            remaining = len(seed) - inserted
+            if (
+                type(partial_inserted) is not int
+                or partial_inserted < 0
+                or partial_inserted > remaining
+            ):
                 raise RuntimeError("invalid partial branch-seed insert count") from exc
+            committed = inserted + partial_inserted
             with session["history_lock"]:
                 session["_branch_seed_inserted"] = committed
             raise
