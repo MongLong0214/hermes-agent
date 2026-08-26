@@ -1,6 +1,7 @@
 """Tests for agent/insights.py — InsightsEngine analytics and reporting."""
 
 import sqlite3
+import threading
 import time
 import pytest
 
@@ -247,6 +248,94 @@ class TestInsightsEmpty:
 # =========================================================================
 
 class TestInsightsPopulated:
+
+    def test_insights_never_reads_foreign_uncommitted_session(
+        self, db, monkeypatch
+    ):
+        db.create_session("committed", source="cli", model="committed-model")
+        engine = InsightsEngine(db)
+        serial_lock = db._conn._hermes_serial_lock
+        original_acquire = type(serial_lock).acquire
+        reader_threads: set[int] = set()
+        owner_ready = threading.Event()
+        acquire_observed = threading.Event()
+        release_probe = threading.Event()
+        report_done = threading.Event()
+        statuses: list[str] = []
+        reports: list[dict] = []
+        failures: list[BaseException] = []
+
+        def observed_acquire(lock, *args, **kwargs):
+            is_report_read = (
+                lock is serial_lock
+                and threading.get_ident() in reader_threads
+                and not statuses
+            )
+            if not is_report_read:
+                return original_acquire(lock, *args, **kwargs)
+
+            acquired = original_acquire(lock, blocking=False)
+            statuses.append("acquired" if acquired else "blocked")
+            acquire_observed.set()
+            if acquired:
+                assert release_probe.wait(2), "owner did not release R11 probe"
+                return True
+            return original_acquire(lock, *args, **kwargs)
+
+        monkeypatch.setattr(type(serial_lock), "acquire", observed_acquire)
+
+        def generate_report() -> None:
+            reader_threads.add(threading.get_ident())
+            assert owner_ready.wait(2), "R11 owner transaction never opened"
+            try:
+                reports.append(engine.generate(days=30))
+            except BaseException as exc:
+                failures.append(exc)
+            finally:
+                report_done.set()
+
+        reporter = threading.Thread(target=generate_report, daemon=True)
+        reporter.start()
+
+        class RollBackOwner(Exception):
+            pass
+
+        try:
+            def insert_uncommitted(conn):
+                conn.execute(
+                    "INSERT INTO sessions (id, source, model, started_at) "
+                    "VALUES ('uncommitted', 'foreign', 'transient-model', ?)",
+                    (time.time(),),
+                )
+                owner_ready.set()
+                assert acquire_observed.wait(2), (
+                    "InsightsEngine never reached the shared connection"
+                )
+                release_probe.set()
+                if statuses == ["acquired"]:
+                    assert report_done.wait(2), (
+                        "unprotected InsightsEngine read did not finish"
+                    )
+                raise RollBackOwner()
+
+            with pytest.raises(RollBackOwner):
+                db._execute_write(insert_uncommitted)
+
+            assert report_done.wait(2), "InsightsEngine did not finish after rollback"
+            reporter.join(2)
+            assert not reporter.is_alive()
+            assert not failures
+            assert statuses == ["blocked"]
+            assert len(reports) == 1
+            assert reports[0]["overview"]["total_sessions"] == 1
+            assert [row["platform"] for row in reports[0]["platforms"]] == ["cli"]
+            assert db._conn.execute(
+                "SELECT 1 FROM sessions WHERE id = 'uncommitted'"
+            ).fetchone() is None
+        finally:
+            release_probe.set()
+            owner_ready.set()
+            reporter.join(2)
 
 
     def test_overview_token_totals(self, populated_db):

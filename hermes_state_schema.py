@@ -448,23 +448,24 @@ class SessionSchemaMixin:
             + f"DELETE FROM state_meta WHERE key = '{FTS_STALE_KEY}';"
             + "COMMIT;"
         )
-        try:
-            cursor.executescript(recovery_sql)
-        except sqlite3.DatabaseError as exc:
+        with self._same_connection_transaction_boundary() as conn:
             try:
-                self._conn.rollback()
-            except sqlite3.Error:
-                pass
-            # Stale indexes must remain detached even on SQLite builds whose
-            # DDL transaction behavior differs.
-            self._drop_all_fts_triggers(cursor)
-            self._conn.commit()
-            logger.error(
-                "Automatic rebuild of stale FTS indexes failed (%s); "
-                "canonical writes remain enabled with FTS detached.",
-                exc,
-            )
-            return False
+                cursor.executescript(recovery_sql)
+            except sqlite3.DatabaseError as exc:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                # Stale indexes must remain detached even on SQLite builds whose
+                # DDL transaction behavior differs.
+                self._drop_all_fts_triggers(cursor)
+                conn.commit()
+                logger.error(
+                    "Automatic rebuild of stale FTS indexes failed (%s); "
+                    "canonical writes remain enabled with FTS detached.",
+                    exc,
+                )
+                return False
 
         self._fts_stale = False
         self._fts_enabled = True

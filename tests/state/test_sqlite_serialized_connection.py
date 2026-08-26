@@ -28,6 +28,52 @@ SQLiteSerializationError = getattr(
 )
 
 
+class _ForeignAcquireProbe:
+    """Observe one foreign attempt against the real connection serial lock."""
+
+    def __init__(self, monkeypatch, connection):
+        self._lock = connection._hermes_serial_lock
+        self._foreign_threads: set[int] = set()
+        self._status: list[str] = []
+        self._observed = threading.Event()
+        self._release = threading.Event()
+        original_acquire = type(self._lock).acquire
+
+        def observed_acquire(lock, *args, **kwargs):
+            is_foreign_probe = (
+                lock is self._lock
+                and threading.get_ident() in self._foreign_threads
+                and not self._status
+            )
+            if not is_foreign_probe:
+                return original_acquire(lock, *args, **kwargs)
+
+            # A non-blocking attempt gives a deterministic state result: on the
+            # broken boundary the foreign thread owns the real lock immediately;
+            # on the corrected boundary it must take the normal blocking path.
+            acquired = original_acquire(lock, blocking=False)
+            self._status.append("acquired" if acquired else "blocked")
+            self._observed.set()
+            if acquired:
+                if not self._release.wait(2):
+                    raise AssertionError("owner did not release the foreign probe")
+                return True
+            return original_acquire(lock, *args, **kwargs)
+
+        monkeypatch.setattr(type(self._lock), "acquire", observed_acquire)
+
+    def register_current_thread(self) -> None:
+        self._foreign_threads.add(threading.get_ident())
+
+    def await_status(self) -> str:
+        assert self._observed.wait(2), "foreign thread never reached serial acquire"
+        assert len(self._status) == 1
+        return self._status[0]
+
+    def release(self) -> None:
+        self._release.set()
+
+
 def _assert_waits_for_serial_lock(conn, call, expected_exception=None) -> None:
     """Prove ``call`` cannot enter SQLite while another thread owns the lock."""
     started = threading.Event()
@@ -1811,6 +1857,731 @@ def test_every_connection_and_cursor_shortcut_waits_for_the_serial_lock(tmp_path
         another.close()
     finally:
         conn.close()
+
+
+class TestSQLiteTransactionInterference:
+    def test_execute_write_excludes_foreign_connection_execute_until_commit(
+        self, tmp_path, monkeypatch
+    ):
+        db = SessionDB(db_path=tmp_path / "r1.db")
+        probe = _ForeignAcquireProbe(monkeypatch, db._conn)
+        start_foreign = threading.Event()
+        foreign_done = threading.Event()
+        foreign_values: list[str] = []
+        failures: list[BaseException] = []
+        statuses: list[str] = []
+        trace: list[str] = []
+
+        db._execute_write(
+            lambda conn: conn.execute(
+                "INSERT INTO state_meta(key, value) VALUES ('r1', 'before')"
+            )
+        )
+        db._conn.set_trace_callback(lambda sql: trace.append(" ".join(sql.split())))
+
+        def foreign_read() -> None:
+            probe.register_current_thread()
+            assert start_foreign.wait(2), "owner never opened R1 transaction"
+            try:
+                row = db._conn.execute(
+                    "SELECT value FROM state_meta WHERE key = 'r1'"
+                ).fetchone()
+                foreign_values.append(row[0])
+            except BaseException as exc:
+                failures.append(exc)
+            finally:
+                foreign_done.set()
+
+        worker = threading.Thread(target=foreign_read, daemon=True)
+        worker.start()
+        try:
+            def owner_write(conn):
+                conn.execute("UPDATE state_meta SET value = 'committed' WHERE key = 'r1'")
+                start_foreign.set()
+                statuses.append(probe.await_status())
+                probe.release()
+
+            db._execute_write(owner_write)
+            assert foreign_done.wait(2), "foreign SELECT did not finish after owner commit"
+            worker.join(2)
+            assert not worker.is_alive()
+            assert not failures
+            assert statuses == ["blocked"]
+            assert foreign_values == ["committed"]
+            commit_index = next(i for i, sql in enumerate(trace) if sql == "COMMIT")
+            select_index = next(
+                i for i, sql in enumerate(trace)
+                if sql == "SELECT value FROM state_meta WHERE key = 'r1'"
+            )
+            assert commit_index < select_index
+        finally:
+            probe.release()
+            start_foreign.set()
+            worker.join(2)
+            db._conn.set_trace_callback(None)
+            db.close()
+
+    def test_execute_write_does_not_commit_foreign_dml(self, tmp_path, monkeypatch):
+        db = SessionDB(db_path=tmp_path / "r3.db")
+        probe = _ForeignAcquireProbe(monkeypatch, db._conn)
+        start_foreign = threading.Event()
+        foreign_done = threading.Event()
+        failures: list[BaseException] = []
+        statuses: list[str] = []
+        trace: list[str] = []
+        db._conn.set_trace_callback(lambda sql: trace.append(" ".join(sql.split())))
+
+        def foreign_write() -> None:
+            probe.register_current_thread()
+            assert start_foreign.wait(2), "owner never opened R3 transaction"
+            try:
+                db._conn.execute(
+                    "INSERT INTO state_meta(key, value) VALUES ('r3-foreign', 'B')"
+                )
+            except BaseException as exc:
+                failures.append(exc)
+            finally:
+                foreign_done.set()
+
+        worker = threading.Thread(target=foreign_write, daemon=True)
+        worker.start()
+        try:
+            def owner_write(conn):
+                conn.execute(
+                    "INSERT INTO state_meta(key, value) VALUES ('r3-owner', 'A')"
+                )
+                start_foreign.set()
+                statuses.append(probe.await_status())
+                probe.release()
+
+            db._execute_write(owner_write)
+            assert foreign_done.wait(2), "foreign DML did not finish after owner commit"
+            worker.join(2)
+            assert not worker.is_alive()
+            assert not failures
+            assert statuses == ["blocked"]
+            commit_index = next(i for i, sql in enumerate(trace) if sql == "COMMIT")
+            foreign_index = next(
+                i for i, sql in enumerate(trace)
+                if "VALUES ('r3-foreign', 'B')" in sql
+            )
+            assert commit_index < foreign_index
+            assert db._conn.execute(
+                "SELECT value FROM state_meta WHERE key = 'r3-foreign'"
+            ).fetchone()[0] == "B"
+        finally:
+            probe.release()
+            start_foreign.set()
+            worker.join(2)
+            db._conn.set_trace_callback(None)
+            db.close()
+
+    def test_write_transaction_rejects_foreign_rollback_theft(
+        self, tmp_path, monkeypatch
+    ):
+        db = SessionDB(db_path=tmp_path / "r2.db")
+        probe = _ForeignAcquireProbe(monkeypatch, db._conn)
+        start_foreign = threading.Event()
+        foreign_done = threading.Event()
+        failures: list[BaseException] = []
+        statuses: list[str] = []
+
+        def foreign_rollback() -> None:
+            probe.register_current_thread()
+            assert start_foreign.wait(2), "owner never opened R2 transaction"
+            try:
+                db._conn.rollback()
+            except BaseException as exc:
+                failures.append(exc)
+            finally:
+                foreign_done.set()
+
+        worker = threading.Thread(target=foreign_rollback, daemon=True)
+        worker.start()
+        try:
+            with db.write_transaction() as conn:
+                conn.execute(
+                    "INSERT INTO state_meta(key, value) VALUES ('r2-owner', 'A')"
+                )
+                start_foreign.set()
+                statuses.append(probe.await_status())
+                probe.release()
+
+            assert foreign_done.wait(2), "foreign rollback did not finish"
+            worker.join(2)
+            assert not worker.is_alive()
+            assert not failures
+            assert statuses == ["blocked"]
+            assert db._conn.execute(
+                "SELECT value FROM state_meta WHERE key = 'r2-owner'"
+            ).fetchone()[0] == "A"
+        finally:
+            probe.release()
+            start_foreign.set()
+            worker.join(2)
+            db.close()
+
+    def test_write_transaction_busy_retry_does_not_retain_python_locks(
+        self, tmp_path, monkeypatch
+    ):
+        db = SessionDB(db_path=tmp_path / "r6.db")
+        blocker_held = threading.Event()
+        release_blocker = threading.Event()
+        blocker_released = threading.Event()
+        blocker_failures: list[BaseException] = []
+        availability: list[tuple[bool, bool]] = []
+        owned_in_body: list[bool] = []
+
+        def hold_external_write_lock() -> None:
+            connection = sqlite3.connect(
+                db.db_path,
+                isolation_level=None,
+                check_same_thread=False,
+            )
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                blocker_held.set()
+                assert release_blocker.wait(5), "retry path did not release blocker"
+                connection.rollback()
+            except BaseException as exc:
+                blocker_failures.append(exc)
+            finally:
+                connection.close()
+                blocker_released.set()
+
+        blocker = threading.Thread(target=hold_external_write_lock, daemon=True)
+        blocker.start()
+        assert blocker_held.wait(2), "external SQLite writer never acquired file lock"
+
+        def release_during_retry(_deadline, _patience_s):
+            db_lock_available = db._lock.acquire(blocking=False)
+            if db_lock_available:
+                db._lock.release()
+            serial_lock_available = db._conn._hermes_serial_lock.acquire(blocking=False)
+            if serial_lock_available:
+                db._conn._hermes_serial_lock.release()
+            availability.append((db_lock_available, serial_lock_available))
+            release_blocker.set()
+            assert blocker_released.wait(2), "external SQLite writer did not release"
+            return True
+
+        monkeypatch.setattr(db, "_sleep_before_write_retry", release_during_retry)
+        try:
+            with db.write_transaction(patience_s=2) as conn:
+                owned_in_body.append(conn._hermes_serial_lock._is_owned())
+                conn.execute(
+                    "INSERT INTO state_meta(key, value) VALUES ('r6', 'committed')"
+                )
+
+            blocker.join(2)
+            assert not blocker.is_alive()
+            assert not blocker_failures
+            assert availability == [(True, True)]
+            assert owned_in_body == [True]
+            assert db.get_meta("r6") == "committed"
+        finally:
+            release_blocker.set()
+            blocker.join(2)
+            db.close()
+
+    def test_transaction_acquisition_busy_timeout_is_bounded_and_restored_before_retry(
+        self, tmp_path, monkeypatch
+    ):
+        db = SessionDB(db_path=tmp_path / "busy-deadline.db")
+        conn = db._conn
+        assert conn is not None
+        conn.execute("PRAGMA busy_timeout=1000")
+        original_execute = type(conn).execute
+        events: list[tuple[str, int, bool, bool]] = []
+
+        def busy_begin(connection, sql, *args, **kwargs):
+            if " ".join(sql.split()).upper() == "BEGIN IMMEDIATE":
+                timeout_ms = original_execute(
+                    connection, "PRAGMA busy_timeout"
+                ).fetchone()[0]
+                events.append(
+                    (
+                        "begin",
+                        timeout_ms,
+                        db._lock._is_owned(),
+                        conn._hermes_serial_lock._is_owned(),
+                    )
+                )
+                raise sqlite3.OperationalError("database is locked")
+            return original_execute(connection, sql, *args, **kwargs)
+
+        def refuse_retry(_deadline, _patience_s):
+            timeout_ms = original_execute(conn, "PRAGMA busy_timeout").fetchone()[0]
+            events.append(
+                (
+                    "retry",
+                    timeout_ms,
+                    db._lock._is_owned(),
+                    conn._hermes_serial_lock._is_owned(),
+                )
+            )
+            return False
+
+        monkeypatch.setattr(hermes_state.time, "monotonic", lambda: 100.0)
+        monkeypatch.setattr(type(conn), "execute", busy_begin)
+        monkeypatch.setattr(db, "_sleep_before_write_retry", refuse_retry)
+
+        try:
+            with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+                db._execute_write(lambda _conn: pytest.fail("write body ran"), patience_s=0.5)
+            with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+                with db.write_transaction(patience_s=0.5):
+                    pytest.fail("transaction body ran")
+
+            assert events == [
+                ("begin", 500, True, True),
+                ("retry", 1000, False, False),
+                ("begin", 500, True, True),
+                ("retry", 1000, False, False),
+            ]
+            assert original_execute(conn, "PRAGMA busy_timeout").fetchone()[0] == 1000
+        finally:
+            db.close()
+
+    def test_manual_fail_open_root_holds_one_connection_boundary(
+        self, tmp_path, monkeypatch
+    ):
+        db = SessionDB(db_path=tmp_path / "r7.db")
+        probe = _ForeignAcquireProbe(monkeypatch, db._conn)
+        start_foreign = threading.Event()
+        foreign_done = threading.Event()
+        failures: list[BaseException] = []
+        statuses: list[str] = []
+        original_drop = db._drop_all_fts_triggers
+
+        def foreign_rollback() -> None:
+            probe.register_current_thread()
+            assert start_foreign.wait(2), "T3 never wrote its stale marker"
+            try:
+                db._conn.rollback()
+            except BaseException as exc:
+                failures.append(exc)
+            finally:
+                foreign_done.set()
+
+        def observed_drop(cursor) -> None:
+            start_foreign.set()
+            statuses.append(probe.await_status())
+            probe.release()
+            original_drop(cursor)
+
+        monkeypatch.setattr(db, "_drop_all_fts_triggers", observed_drop)
+        worker = threading.Thread(target=foreign_rollback, daemon=True)
+        worker.start()
+        try:
+            db._fts_enabled = True
+            assert db._enter_fts_fail_open(
+                sqlite3.DatabaseError("database disk image is malformed")
+            ) is True
+            assert foreign_done.wait(2), "foreign T3 rollback did not finish"
+            worker.join(2)
+            assert not worker.is_alive()
+            assert not failures
+            assert statuses == ["blocked"]
+            assert db.get_meta(hermes_state.FTS_STALE_KEY) == "1"
+        finally:
+            probe.release()
+            start_foreign.set()
+            worker.join(2)
+            db.close()
+
+    def test_stale_fts_script_root_uses_same_boundary(self, tmp_path, monkeypatch):
+        db = SessionDB(db_path=tmp_path / "r8.db")
+        probe = _ForeignAcquireProbe(monkeypatch, db._conn)
+        start_foreign = threading.Event()
+        foreign_done = threading.Event()
+        failures: list[BaseException] = []
+        statuses: list[str] = []
+        foreign_values: list[str | None] = []
+        real_cursor = db._conn.cursor()
+
+        class ControlledRealCursor:
+            def execute(self, *args, **kwargs):
+                return real_cursor.execute(*args, **kwargs)
+
+            def executescript(self, _recovery_sql):
+                db._conn.execute("BEGIN IMMEDIATE")
+                db._conn.execute(
+                    "INSERT INTO state_meta(key, value) VALUES ('r8-probe', 'pending')"
+                )
+                start_foreign.set()
+                statuses.append(probe.await_status())
+                probe.release()
+                raise sqlite3.DatabaseError("controlled stale FTS script failure")
+
+        def foreign_read() -> None:
+            probe.register_current_thread()
+            assert start_foreign.wait(2), "T4 never opened its script transaction"
+            try:
+                row = db._conn.execute(
+                    "SELECT value FROM state_meta WHERE key = 'r8-probe'"
+                ).fetchone()
+                foreign_values.append(None if row is None else row[0])
+            except BaseException as exc:
+                failures.append(exc)
+            finally:
+                foreign_done.set()
+
+        worker = threading.Thread(target=foreign_read, daemon=True)
+        worker.start()
+        try:
+            assert db._recover_stale_fts(ControlledRealCursor(), legacy=False) is False
+            assert foreign_done.wait(2), "foreign T4 read did not finish"
+            worker.join(2)
+            assert not worker.is_alive()
+            assert not failures
+            assert statuses == ["blocked"]
+            assert foreign_values == [None]
+        finally:
+            probe.release()
+            start_foreign.set()
+            worker.join(2)
+            real_cursor.close()
+            db.close()
+
+    def test_offline_rebuild_hides_foreign_keys_epoch_from_same_connection(
+        self, tmp_path, monkeypatch
+    ):
+        db = SessionDB(db_path=tmp_path / "r9.db")
+        probe = _ForeignAcquireProbe(monkeypatch, db._conn)
+        start_foreign = threading.Event()
+        foreign_done = threading.Event()
+        failures: list[BaseException] = []
+        statuses: list[str] = []
+        foreign_keys: list[int] = []
+
+        def foreign_read() -> None:
+            probe.register_current_thread()
+            assert start_foreign.wait(2), "offline epoch never disabled foreign keys"
+            try:
+                foreign_keys.append(
+                    db._conn.execute("PRAGMA foreign_keys").fetchone()[0]
+                )
+            except BaseException as exc:
+                failures.append(exc)
+            finally:
+                foreign_done.set()
+
+        worker = threading.Thread(target=foreign_read, daemon=True)
+        worker.start()
+        try:
+            with db.offline_rebuild(reason="R9 same-connection epoch"):
+                db._execute_write(
+                    lambda conn: conn.execute(
+                        "INSERT INTO state_meta(key, value) VALUES ('r9', 'nested')"
+                    )
+                )
+                start_foreign.set()
+                statuses.append(probe.await_status())
+                probe.release()
+
+            assert foreign_done.wait(2), "foreign PRAGMA did not finish after epoch"
+            worker.join(2)
+            assert not worker.is_alive()
+            assert not failures
+            assert statuses == ["blocked"]
+            assert foreign_keys == [1]
+            assert db.get_meta("r9") == "nested"
+        finally:
+            probe.release()
+            start_foreign.set()
+            worker.join(2)
+            db.close()
+
+    def test_separate_wal_read_connection_keeps_committed_read_concurrency(
+        self, tmp_path
+    ):
+        db = SessionDB(db_path=tmp_path / "r12.db")
+        owner_ready = threading.Event()
+        release_owner = threading.Event()
+        owner_done = threading.Event()
+        reader_done = threading.Event()
+        owner_failures: list[BaseException] = []
+        reader_failures: list[BaseException] = []
+        borrowed_is_distinct: list[bool] = []
+        observed_values: list[str] = []
+
+        class RollBackOwner(Exception):
+            pass
+
+        # Exercise the real WAL path even when the test interpreter is on a
+        # SQLite patch that production correctly degrades to DELETE mode. This
+        # database is disposable; prove WAL actually took effect before opening
+        # the independent read connection.
+        writer_conn = db._conn
+        assert writer_conn is not None
+        journal_mode = writer_conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+        assert journal_mode.lower() == "wal"
+        db._wal_active = True
+        db._execute_write(
+            lambda conn: conn.execute(
+                "INSERT INTO state_meta(key, value) VALUES ('r12', 'committed')"
+            )
+        )
+
+        def hold_uncommitted_writer() -> None:
+            try:
+                def temporary_update(conn):
+                    conn.execute(
+                        "UPDATE state_meta SET value = 'uncommitted' "
+                        "WHERE key = 'r12'"
+                    )
+                    owner_ready.set()
+                    assert release_owner.wait(5), "R12 reader never finished"
+                    raise RollBackOwner()
+
+                with pytest.raises(RollBackOwner):
+                    db._execute_write(temporary_update)
+            except BaseException as exc:
+                owner_failures.append(exc)
+            finally:
+                owner_done.set()
+
+        def read_committed_value() -> None:
+            assert owner_ready.wait(2), "R12 owner transaction never opened"
+            try:
+                with db._read_ctx() as conn:
+                    assert conn is not None
+                    borrowed_is_distinct.append(conn is not db._conn)
+                    observed_values.append(
+                        conn.execute(
+                            "SELECT value FROM state_meta WHERE key = 'r12'"
+                        ).fetchone()[0]
+                    )
+            except BaseException as exc:
+                reader_failures.append(exc)
+            finally:
+                reader_done.set()
+
+        owner = threading.Thread(target=hold_uncommitted_writer, daemon=True)
+        reader = threading.Thread(target=read_committed_value, daemon=True)
+        owner.start()
+        try:
+            assert owner_ready.wait(2), "R12 owner transaction never opened"
+            assert db._wal_active is True
+            reader.start()
+            read_finished_while_writer_open = reader_done.wait(2)
+            release_owner.set()
+            assert owner_done.wait(2), "R12 owner transaction did not roll back"
+            owner.join(2)
+            reader.join(2)
+            assert read_finished_while_writer_open, (
+                "separate WAL read waited for the writer transaction"
+            )
+            assert not owner.is_alive()
+            assert not reader.is_alive()
+            assert not owner_failures
+            assert not reader_failures
+            assert borrowed_is_distinct == [True]
+            assert observed_values == ["committed"]
+            assert db.get_meta("r12") == "committed"
+        finally:
+            release_owner.set()
+            owner.join(2)
+            if reader.ident is not None:
+                reader.join(2)
+            db.close()
+
+    def test_connection_transaction_lock_order_is_single_and_stable(
+        self, tmp_path, monkeypatch
+    ):
+        db = SessionDB(db_path=tmp_path / "r13.db")
+        serial_lock = db._conn._hermes_serial_lock
+        events: list[str] = []
+        original_session_lock = db._lock
+        original_serial_acquire = type(serial_lock).acquire
+        original_serial_release = type(serial_lock).release
+
+        class ObservedRLock:
+            def acquire(self, *args, **kwargs):
+                outermost = not original_session_lock._is_owned()
+                acquired = original_session_lock.acquire(*args, **kwargs)
+                if acquired and outermost:
+                    events.append("session.acquire")
+                return acquired
+
+            def release(self):
+                outermost = original_session_lock._recursion_count() == 1
+                if outermost:
+                    events.append("session.release")
+                return original_session_lock.release()
+
+            def __enter__(self):
+                self.acquire()
+                return self
+
+            def __exit__(self, *_exc_info):
+                self.release()
+
+        def observed_serial_acquire(lock, *args, **kwargs):
+            outermost = lock is serial_lock and not lock._is_owned()
+            acquired = original_serial_acquire(lock, *args, **kwargs)
+            if acquired and outermost:
+                events.append("connection.acquire")
+            return acquired
+
+        def observed_serial_release(lock):
+            outermost = lock is serial_lock and lock._recursion_count() == 1
+            if outermost:
+                events.append("connection.release")
+            return original_serial_release(lock)
+
+        db._lock = ObservedRLock()
+        monkeypatch.setattr(type(serial_lock), "acquire", observed_serial_acquire)
+        monkeypatch.setattr(type(serial_lock), "release", observed_serial_release)
+
+        def assert_root_order(call, *, expected_roots=1):
+            events.clear()
+            call()
+            assert events.count("session.acquire") == expected_roots
+            assert events.count("session.release") == expected_roots
+            roots = 0
+            session_owned = False
+            connection_owned = False
+            for event in events:
+                if event == "session.acquire":
+                    assert not connection_owned, events
+                    session_owned = True
+                elif event == "connection.acquire":
+                    if session_owned:
+                        roots += 1
+                    connection_owned = True
+                elif event == "connection.release":
+                    connection_owned = False
+                elif event == "session.release":
+                    assert not connection_owned, events
+                    session_owned = False
+            assert roots == expected_roots, events
+            assert not session_owned and not connection_owned
+
+        try:
+            def run_t1():
+                with db.write_transaction() as conn:
+                    conn.execute(
+                        "INSERT INTO state_meta(key, value) VALUES ('r13-t1', 'ok')"
+                    )
+
+            def run_t2():
+                db._execute_write(
+                    lambda conn: conn.execute(
+                        "INSERT INTO state_meta(key, value) VALUES ('r13-t2', 'ok')"
+                    )
+                )
+
+            def run_t3():
+                db._fts_enabled = True
+                assert db._enter_fts_fail_open(
+                    sqlite3.DatabaseError("database disk image is malformed")
+                ) is True
+
+            def run_e1():
+                with db.offline_rebuild(reason="R13 lock order"):
+                    db._execute_write(
+                        lambda conn: conn.execute(
+                            "INSERT INTO state_meta(key, value) "
+                            "VALUES ('r13-e1-t2', 'ok')"
+                        )
+                    )
+
+            assert_root_order(run_t1)
+            assert_root_order(run_t2)
+            t4_cursor = db._conn.cursor()
+            try:
+                assert_root_order(
+                    lambda: db._recover_stale_fts(t4_cursor, legacy=False)
+                )
+            finally:
+                t4_cursor.close()
+            assert_root_order(run_t3)
+            # One outer T2 preflight plus one E1 epoch. The nested E1→T2 call
+            # re-enters both locks and therefore adds no second outer pair.
+            assert_root_order(run_e1, expected_roots=2)
+        finally:
+            db._lock = original_session_lock
+            db.close()
+
+    def test_transaction_boundary_is_reentrant_for_owner_cursor_and_callback(
+        self, tmp_path
+    ):
+        db = SessionDB(db_path=tmp_path / "r4.db")
+        owned_during_callback: list[bool] = []
+
+        try:
+            def owner_write(conn):
+                serial_owned = conn._hermes_serial_lock._is_owned()
+                owned_during_callback.append(serial_owned)
+                assert serial_owned, "transaction root did not retain the connection lock"
+                assert conn.execute("SELECT 1").fetchone()[0] == 1
+                cursor = conn.cursor()
+                try:
+                    cursor.execute("SELECT 2")
+                    assert cursor.fetchone()[0] == 2
+                finally:
+                    cursor.close()
+                assert db.get_meta("r4-missing") is None
+                conn.execute(
+                    "INSERT INTO state_meta(key, value) VALUES ('r4', 'owner')"
+                )
+
+            db._execute_write(owner_write)
+            assert owned_during_callback == [True]
+            assert db.get_meta("r4") == "owner"
+        finally:
+            db.close()
+
+    def test_transaction_boundary_releases_both_locks_on_baseexception(self, tmp_path):
+        db = SessionDB(db_path=tmp_path / "r5.db")
+        owned_during_callback: list[bool] = []
+        worker_done = threading.Event()
+        failures: list[BaseException] = []
+
+        class FatalBoundaryExit(BaseException):
+            pass
+
+        try:
+            def fail_owner(conn):
+                owned_during_callback.append(conn._hermes_serial_lock._is_owned())
+                conn.execute(
+                    "INSERT INTO state_meta(key, value) VALUES ('r5-rolled-back', 'x')"
+                )
+                raise FatalBoundaryExit()
+
+            with pytest.raises(FatalBoundaryExit):
+                db._execute_write(fail_owner)
+
+            def second_owner() -> None:
+                try:
+                    db._execute_write(
+                        lambda conn: conn.execute(
+                            "INSERT INTO state_meta(key, value) "
+                            "VALUES ('r5-committed', 'ok')"
+                        )
+                    )
+                except BaseException as exc:
+                    failures.append(exc)
+                finally:
+                    worker_done.set()
+
+            worker = threading.Thread(target=second_owner, daemon=True)
+            worker.start()
+            assert worker_done.wait(2), "both Python locks were stranded"
+            worker.join(2)
+            assert not worker.is_alive()
+            assert not failures
+            assert owned_during_callback == [True]
+            assert db._conn.execute(
+                "SELECT value FROM state_meta WHERE key = 'r5-rolled-back'"
+            ).fetchone() is None
+            assert db._conn.execute(
+                "SELECT value FROM state_meta WHERE key = 'r5-committed'"
+            ).fetchone()[0] == "ok"
+        finally:
+            db.close()
 
 
 def test_udf_callback_stress_is_timeout_bounded_in_a_subprocess(tmp_path):

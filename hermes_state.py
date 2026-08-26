@@ -4749,7 +4749,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         _ensure_test_isolation(self.db_path)
         self.read_only = read_only
 
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         # Read-path split (WAL only): recall/browse queries borrow a
         # read-only connection from a bounded pool so they never queue
         # behind writer flushes on self._lock. See _read_ctx().
@@ -5487,6 +5487,61 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return False
 
     @contextmanager
+    def _same_connection_transaction_boundary(self):
+        """Hold SessionDB ownership then one exact serialized connection."""
+        # The order is load-bearing: SessionDB ownership always precedes the
+        # per-connection SQLite boundary, and context-manager unwinding releases
+        # them in reverse order on success, Exception, and BaseException.
+        with self._lock:
+            conn = self._conn
+            if conn is None:
+                raise SQLiteSerializationError(
+                    "SessionDB has no connection for a transaction boundary"
+                )
+            with _serial_lock_for_connection(conn):
+                if self._conn is not conn:
+                    raise SQLiteSerializationError(
+                        "SessionDB connection changed while entering a transaction boundary"
+                    )
+                yield conn
+
+    @staticmethod
+    def _begin_immediate_before_deadline(
+        conn: sqlite3.Connection, deadline: float
+    ) -> None:
+        """Acquire a write transaction without outwaiting the caller's deadline."""
+        row = conn.execute("PRAGMA busy_timeout").fetchone()
+        previous_timeout_ms = int(row[0]) if row and row[0] is not None else 0
+        remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+        bounded_timeout_ms = min(previous_timeout_ms, remaining_ms)
+        timeout_changed = bounded_timeout_ms != previous_timeout_ms
+        if timeout_changed:
+            conn.execute(f"PRAGMA busy_timeout={bounded_timeout_ms}")
+
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except BaseException as begin_exc:
+            if timeout_changed:
+                try:
+                    conn.execute(f"PRAGMA busy_timeout={previous_timeout_ms}")
+                except Exception as restore_exc:
+                    begin_exc.add_note(
+                        "failed to restore SQLite busy_timeout after transaction "
+                        f"acquisition failed: {restore_exc}"
+                    )
+            raise
+        else:
+            if timeout_changed:
+                try:
+                    conn.execute(f"PRAGMA busy_timeout={previous_timeout_ms}")
+                except BaseException:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    raise
+
+    @contextmanager
     def write_transaction(self, patience_s: Optional[float] = None):
         """This store's CANONICAL write transaction, as a context manager.
 
@@ -5530,11 +5585,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             patience_s = self._WRITE_PATIENCE_S
         deadline = time.monotonic() + patience_s
         while True:
-            self._lock.acquire()
+            ownership = contextlib.ExitStack()
             try:
-                self._conn.execute("BEGIN IMMEDIATE")
+                conn = ownership.enter_context(
+                    self._same_connection_transaction_boundary()
+                )
+                self._begin_immediate_before_deadline(conn, deadline)
             except sqlite3.OperationalError as exc:
-                self._lock.release()
+                ownership.close()
                 err = str(exc).lower()
                 if ("locked" in err or "busy" in err) and (
                     self._sleep_before_write_retry(deadline, patience_s)
@@ -5542,21 +5600,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     continue
                 raise
             except BaseException:
-                self._lock.release()
+                ownership.close()
                 raise
             break
         try:
             try:
-                yield self._conn
+                yield conn
             except BaseException:
                 try:
-                    self._conn.rollback()
+                    conn.rollback()
                 except Exception:
                     pass
                 raise
-            self._conn.commit()
+            conn.commit()
         finally:
-            self._lock.release()
+            ownership.close()
 
     def _execute_write(
         self,
@@ -5606,14 +5664,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         while True:
             try:
-                with self._lock:
-                    self._conn.execute("BEGIN IMMEDIATE")
+                with self._same_connection_transaction_boundary() as conn:
+                    self._begin_immediate_before_deadline(conn, deadline)
                     try:
-                        result = fn(self._conn)
-                        self._conn.commit()
+                        result = fn(conn)
+                        conn.commit()
                     except BaseException:
                         try:
-                            self._conn.rollback()
+                            conn.rollback()
                         except Exception:
                             pass
                         raise
@@ -5984,30 +6042,30 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return False
 
         try:
-            with self._lock:
-                self._conn.execute("BEGIN IMMEDIATE")
+            with self._same_connection_transaction_boundary() as conn:
+                conn.execute("BEGIN IMMEDIATE")
                 try:
-                    self._conn.execute(
+                    conn.execute(
                         "INSERT INTO state_meta (key, value) VALUES (?, '1') "
                         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                         (FTS_STALE_KEY,),
                     )
-                    cjk_triggers_present = self._conn.execute(
+                    cjk_triggers_present = conn.execute(
                         "SELECT 1 FROM sqlite_master WHERE type = 'trigger' "
                         f"AND name IN ({','.join('?' for _ in _FTS_CJK_TRIGGERS)}) "
                         "LIMIT 1",
                         _FTS_CJK_TRIGGERS,
                     ).fetchone()
                     if cjk_triggers_present:
-                        self._conn.execute(
+                        conn.execute(
                             "INSERT INTO state_meta (key, value) VALUES (?, '1') "
                             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                             (FTS_CJK_STALE_KEY,),
                         )
-                    self._drop_all_fts_triggers(self._conn.cursor())
-                    self._conn.commit()
+                    self._drop_all_fts_triggers(conn.cursor())
+                    conn.commit()
                 except BaseException:
-                    self._conn.rollback()
+                    conn.rollback()
                     raise
         except sqlite3.Error as detach_exc:
             logger.error(
@@ -9646,14 +9704,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 f"refusing an offline rebuild ({reason}) of {self.db_path}: "
                 f"conversation(s) a live turn owns ({', '.join(sorted(owned))})"
             )
-        with self._lock:
-            self._conn.execute("PRAGMA foreign_keys=OFF")
-        try:
-            yield self
-        finally:
-            with self._lock:
+        with self._same_connection_transaction_boundary() as conn:
+            conn.execute("PRAGMA foreign_keys=OFF")
+            try:
+                yield self
+            finally:
                 try:
-                    self._conn.execute("PRAGMA foreign_keys=ON")
+                    conn.execute("PRAGMA foreign_keys=ON")
                 except Exception:  # pragma: no cover - closed mid-rebuild
                     pass
 
@@ -9757,11 +9814,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # No-op fast path: skip the transaction when there is nothing to
         # clear. Read-only, no write lock.
         try:
-            row = self._conn.execute(
-                "SELECT last_activity_description, last_activity_provenance "
-                "FROM sessions WHERE id = ?",
-                (session_id,),
-            ).fetchone()
+            with self._read_ctx() as conn:
+                row = conn.execute(
+                    "SELECT last_activity_description, last_activity_provenance "
+                    "FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
         except sqlite3.Error:
             row = None
         if row is not None:
