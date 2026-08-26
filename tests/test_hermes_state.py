@@ -2021,6 +2021,116 @@ class TestListSessionsRich:
         assert activity["last_activity_description"] == ""
         assert activity["last_activity_provenance"] == "unknown"
 
+    def test_clear_session_activity_labels_ignores_foreign_uncommitted_empty_value(
+        self, db, monkeypatch
+    ):
+        db.create_session("r10", "cli")
+        heartbeat = 1_700_000_750.0
+        db.touch_session_activity(
+            "r10",
+            heartbeat,
+            description="compressing context",
+            provenance=ActivityProvenance.AGENT_COMPRESSION,
+        )
+
+        owner_ready = threading.Event()
+        foreign_done = threading.Event()
+        observed = threading.Event()
+        release_probe = threading.Event()
+        foreign_threads: set[int] = set()
+        statuses: list[str] = []
+        failures: list[BaseException] = []
+        original_session_lock = db._lock
+        writer_serial_lock = db._conn._hermes_serial_lock
+        original_serial_acquire = type(writer_serial_lock).acquire
+
+        def observe_first_foreign(name, acquire, *args, **kwargs):
+            if threading.get_ident() not in foreign_threads or statuses:
+                return acquire(*args, **kwargs)
+            acquired = acquire(blocking=False)
+            statuses.append(f"{name}-{'acquired' if acquired else 'blocked'}")
+            observed.set()
+            if acquired:
+                assert release_probe.wait(2), "owner did not release R10 probe"
+                return True
+            return acquire(*args, **kwargs)
+
+        class ObservedRLock:
+            def acquire(self, *args, **kwargs):
+                return observe_first_foreign(
+                    "session", original_session_lock.acquire, *args, **kwargs
+                )
+
+            def release(self):
+                return original_session_lock.release()
+
+            def __enter__(self):
+                self.acquire()
+                return self
+
+            def __exit__(self, *_exc_info):
+                self.release()
+
+        def observed_serial_acquire(lock, *args, **kwargs):
+            if lock is writer_serial_lock:
+                return observe_first_foreign(
+                    "connection",
+                    lambda *a, **kw: original_serial_acquire(lock, *a, **kw),
+                    *args,
+                    **kwargs,
+                )
+            return original_serial_acquire(lock, *args, **kwargs)
+
+        db._lock = ObservedRLock()
+        monkeypatch.setattr(
+            type(writer_serial_lock), "acquire", observed_serial_acquire
+        )
+
+        def clear_labels() -> None:
+            foreign_threads.add(threading.get_ident())
+            assert owner_ready.wait(2), "R10 owner transaction never opened"
+            try:
+                db.clear_session_activity_labels("r10")
+            except BaseException as exc:
+                failures.append(exc)
+            finally:
+                foreign_done.set()
+
+        clearer = threading.Thread(target=clear_labels, daemon=True)
+        clearer.start()
+
+        class RollBackOwner(Exception):
+            pass
+
+        try:
+            def temporary_empty(conn):
+                conn.execute(
+                    "UPDATE sessions SET last_activity_description = '', "
+                    "last_activity_provenance = 'unknown' WHERE id = 'r10'"
+                )
+                owner_ready.set()
+                assert observed.wait(2), "clear path never attempted a protected read"
+                release_probe.set()
+                raise RollBackOwner()
+
+            with pytest.raises(RollBackOwner):
+                db._execute_write(temporary_empty)
+
+            assert foreign_done.wait(2), "committed-state clear did not finish"
+            clearer.join(2)
+            assert not clearer.is_alive()
+            assert not failures
+            assert statuses == ["session-blocked"]
+            row = db.get_session("r10")
+            assert row["last_activity_at"] == heartbeat
+            assert row["last_activity_description"] == ""
+            assert row["last_activity_provenance"] == "unknown"
+        finally:
+            release_probe.set()
+            owner_ready.set()
+            clearer.join(2)
+            db._lock = original_session_lock
+
     def test_last_active_uses_newer_message_over_stale_heartbeat(self, db):
         """Rate-limited heartbeats can lag message writes; last_active must take max."""
         db.create_session("s1", "cli")
