@@ -5633,7 +5633,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # its callback performs live/dead marker adjudication atomically.
             return
         raise SessionTurnLeaseLostError(
-            f"refusing a canonical write to {self.db_path}: "
+            "refusing a canonical write: "
             "offline rebuild exclusion is held by another SessionDB"
         )
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import sqlite3
@@ -2758,6 +2759,42 @@ class TestSQLiteTransactionInterference:
             assert rebuilt["title"] == "rebuilt-after-child-refusal"
         finally:
             rebuild_db.close()
+
+    def test_foreign_offline_rebuild_write_refusal_is_path_free(self, tmp_path):
+        private_home_component = "fixture-private-home"
+        path = tmp_path / private_home_component / "state.db"
+        path.parent.mkdir()
+        owner = SessionDB(db_path=path)
+        non_owner = SessionDB(db_path=path)
+        marker_key = "_hermes_offline_rebuild_epoch_v1"
+        expected_refusal = (
+            "refusing a canonical write: "
+            "offline rebuild exclusion is held by another SessionDB"
+        )
+
+        try:
+            with owner.offline_rebuild(reason="public refusal privacy regression"):
+                marker_value = owner.get_meta(marker_key)
+                assert marker_value is not None
+                marker = json.loads(marker_value)
+
+                with pytest.raises(hermes_state.SessionTurnLeaseLostError) as caught:
+                    non_owner.create_session("privacy-refused", "test")
+
+                refusal = str(caught.value)
+                for private_value in (
+                    str(path.resolve()),
+                    private_home_component,
+                    marker_value,
+                    str(marker["nonce"]),
+                    str(marker["owner_pid"]),
+                    str(marker["owner_pid_start"]),
+                ):
+                    assert private_value not in refusal
+                assert refusal == expected_refusal
+        finally:
+            non_owner.close()
+            owner.close()
 
     def test_offline_rebuild_refuses_child_create_and_update_until_release(
         self, tmp_path
