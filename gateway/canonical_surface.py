@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass
-from typing import Any, Mapping, TYPE_CHECKING
+from typing import Any, Awaitable, Callable, Mapping, Protocol, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from gateway.session import SessionEntry, SessionStore
@@ -24,6 +25,56 @@ def _bounded_string(value: Any, *, maximum: int) -> str:
     if not cleaned or len(cleaned) > maximum:
         raise ValueError("canonical_invalid_request")
     return cleaned
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalTurnResult:
+    """Route-free terminal output from one existing canonical binding turn."""
+
+    binding_name: str
+    terminal_text: str
+
+
+class RequestLocalReplySink(Protocol):
+    """Capability that can publish only to its admitted request origin."""
+
+    async def publish(self, result: CanonicalTurnResult) -> None: ...
+
+
+class _RequestLocalReplySink:
+    __slots__ = ("_lock", "_published", "_publisher")
+
+    def __init__(
+        self,
+        publisher: Callable[[CanonicalTurnResult], Awaitable[None]],
+    ) -> None:
+        self._publisher = publisher
+        self._lock = asyncio.Lock()
+        self._published = False
+
+    async def publish(self, result: CanonicalTurnResult) -> None:
+        async with self._lock:
+            if self._published:
+                raise ValueError("canonical_reply_already_published")
+            self._published = True
+            try:
+                await self._publisher(result)
+            except Exception:
+                raise ValueError("canonical_reply_publish_failed") from None
+
+
+def request_local_reply_sink(
+    publisher: Callable[[CanonicalTurnResult], Awaitable[None]],
+) -> RequestLocalReplySink:
+    """Create an opaque request-local publisher capability."""
+    return _RequestLocalReplySink(publisher)
+
+
+def require_request_local_reply_sink(value: Any) -> RequestLocalReplySink:
+    """Reject absent or caller-shaped sink substitutes."""
+    if not isinstance(value, _RequestLocalReplySink):
+        raise ValueError("canonical_reply_sink_missing")
+    return value
 
 
 @dataclass(frozen=True)

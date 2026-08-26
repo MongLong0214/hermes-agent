@@ -167,6 +167,35 @@ def _reply_anchor_for_event(event) -> str | None:
     return getattr(event, "message_id", None)
 
 
+def request_local_reply_sink_for_event(adapter, event):
+    """Bind one opaque terminal publisher to an admitted Telegram/Buzz event."""
+    from gateway.canonical_surface import CanonicalTurnResult, request_local_reply_sink
+
+    source = getattr(event, "source", None)
+    if _platform_name(getattr(source, "platform", None)) not in {"telegram", "buzz"}:
+        raise ValueError("canonical_reply_sink_missing")
+    chat_id = str(getattr(source, "chat_id", "") or "").strip()
+    if not chat_id:
+        raise ValueError("canonical_reply_sink_missing")
+    reply_to = _reply_anchor_for_event(event)
+    metadata = _thread_metadata_for_source(source, reply_to)
+    frozen_metadata = dict(metadata) if metadata else None
+
+    async def _publish(result: CanonicalTurnResult) -> None:
+        if not isinstance(result, CanonicalTurnResult):
+            raise ValueError("canonical_turn_refused")
+        outcome = await adapter.send(
+            chat_id=chat_id,
+            content=result.terminal_text,
+            reply_to=reply_to,
+            metadata=frozen_metadata,
+        )
+        if getattr(outcome, "success", False) is not True:
+            raise ValueError("canonical_reply_publish_failed")
+
+    return request_local_reply_sink(_publish)
+
+
 def should_send_media_as_audio(platform, ext: str, is_voice: bool = False) -> bool:
     """Return True when a media file should use the platform's audio sender.
 

@@ -78,6 +78,7 @@ class _CachedFakeAgent:
                 "task_id": task_id,
             }
         )
+        self._persist_user_message_idx = len(conversation_history)
         self._db.append_message(task_id, role="user", content=message)
         self._db.append_message(task_id, role="assistant", content="terminal reply")
         return {

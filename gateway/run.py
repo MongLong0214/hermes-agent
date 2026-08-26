@@ -18993,13 +18993,122 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
+    _CANONICAL_NON_SUFFIX_OUTWARD_CALLBACK_ATTRIBUTES = frozenset(
+        {"_on_session_title"}
+    )
+
+    @classmethod
+    def _is_canonical_outward_callback_attribute(cls, name: str) -> bool:
+        """Return whether an agent attribute can emit beyond a canonical request."""
+        return (
+            name == "callback"
+            or name.endswith("_callback")
+            or name in cls._CANONICAL_NON_SUFFIX_OUTWARD_CALLBACK_ATTRIBUTES
+        )
+
+    @staticmethod
+    def _select_canonical_turn_result(
+        result: Any,
+        *,
+        binding_name: Any,
+        history_boundary: int,
+        expected_session_id: str,
+    ) -> Any:
+        """Select exactly one current-turn main-chain terminal assistant."""
+        from gateway.canonical_surface import CanonicalTurnResult
+
+        if not isinstance(result, dict) or result.get("completed") is not True:
+            raise ValueError("canonical_turn_refused")
+        if any(
+            result.get(flag)
+            for flag in (
+                "failed",
+                "partial",
+                "interrupted",
+                "cancelled",
+                "canceled",
+                "error",
+                "already_sent",
+                "response_previewed",
+                "preview",
+                "progress",
+                "stream",
+                "streamed",
+                "streaming",
+                "interim",
+                "final_response_sent",
+                "final_content_delivered",
+            )
+        ):
+            raise ValueError("canonical_turn_refused")
+        if result.get("session_id", expected_session_id) != expected_session_id:
+            raise ValueError("canonical_turn_refused")
+
+        final_response = result.get("final_response")
+        messages = result.get("messages")
+        if (
+            not isinstance(binding_name, str)
+            or not binding_name.strip()
+            or not isinstance(final_response, str)
+            or not final_response.strip()
+            or not isinstance(messages, list)
+            or history_boundary < 0
+            or len(messages) <= history_boundary
+        ):
+            raise ValueError("canonical_turn_refused")
+
+        turn_messages = messages[history_boundary:]
+        if not all(isinstance(message, dict) for message in turn_messages):
+            raise ValueError("canonical_turn_refused")
+        semantic = [
+            message
+            for message in turn_messages
+            if message.get("role") in {"user", "assistant", "tool"}
+        ]
+        if not semantic or semantic[-1].get("role") != "assistant":
+            raise ValueError("canonical_turn_refused")
+        if semantic[-1].get("tool_calls"):
+            raise ValueError("canonical_turn_refused")
+
+        tool_boundary = max(
+            (
+                index
+                for index, message in enumerate(turn_messages)
+                if message.get("role") == "tool" or message.get("tool_calls")
+            ),
+            default=-1,
+        )
+        candidates = [
+            message
+            for index, message in enumerate(turn_messages)
+            if index > tool_boundary
+            and message.get("role") == "assistant"
+            and not message.get("tool_calls")
+            and isinstance(message.get("content"), str)
+            and message["content"].strip()
+        ]
+        if len(candidates) != 1 or candidates[0] is not semantic[-1]:
+            raise ValueError("canonical_turn_refused")
+        terminal_text = candidates[0]["content"]
+        if terminal_text != final_response:
+            raise ValueError("canonical_turn_refused")
+        return CanonicalTurnResult(
+            binding_name=binding_name,
+            terminal_text=terminal_text,
+        )
+
     async def run_bound_existing_turn(
         self,
         binding: Any,
         event: Any,
         entry: Any,
-    ) -> str:
-        """Run one request-local turn against a pinned existing cache entry."""
+        *,
+        reply_sink: Any = None,
+    ) -> Any:
+        """Run one request-local turn and return strict route-free terminal output."""
+        from gateway.canonical_surface import require_request_local_reply_sink
+
+        require_request_local_reply_sink(reply_sink)
         if (
             entry.session_key != binding.session_key
             or entry.session_id != binding.session_id
@@ -19034,28 +19143,50 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             raise ValueError("canonical_turn_busy") from None
 
         try:
-            history = await self.async_session_store.load_transcript(entry.session_id)
-            agent_history, _ = _build_gateway_agent_history(history)
-            self._init_cached_agent_for_turn(agent, 0)
-            result = await asyncio.to_thread(
-                agent.run_conversation,
-                event.text,
-                conversation_history=agent_history,
-                task_id=entry.session_id,
-            )
-            if not isinstance(result, dict):
+            if not bool(getattr(agent, "compression_in_place", True)):
                 raise ValueError("canonical_turn_refused")
-            final_response = result.get("final_response")
-            if (
-                result.get("failed")
-                or result.get("interrupted")
-                or result.get("partial")
-                or result.get("session_id", entry.session_id) != entry.session_id
-                or not isinstance(final_response, str)
-                or not final_response.strip()
-            ):
-                raise ValueError("canonical_turn_refused")
-            return final_response
+            stale_callbacks = {
+                name: value
+                for name, value in vars(agent).items()
+                if self._is_canonical_outward_callback_attribute(name)
+            }
+            try:
+                for name in stale_callbacks:
+                    setattr(agent, name, None)
+                history = await self.async_session_store.load_transcript(
+                    entry.session_id
+                )
+                agent_history, _ = _build_gateway_agent_history(history)
+                self._init_cached_agent_for_turn(agent, 0)
+                result = await asyncio.to_thread(
+                    agent.run_conversation,
+                    event.text,
+                    conversation_history=agent_history,
+                    task_id=entry.session_id,
+                )
+                messages = result.get("messages") if isinstance(result, dict) else None
+                history_boundary = getattr(
+                    agent, "_persist_user_message_idx", None
+                )
+                if (
+                    isinstance(history_boundary, bool)
+                    or not isinstance(history_boundary, int)
+                    or not isinstance(messages, list)
+                    or history_boundary < 0
+                    or history_boundary >= len(messages)
+                    or not isinstance(messages[history_boundary], dict)
+                    or messages[history_boundary].get("role") != "user"
+                ):
+                    raise ValueError("canonical_turn_refused")
+                return self._select_canonical_turn_result(
+                    result,
+                    binding_name=binding.name,
+                    history_boundary=history_boundary,
+                    expected_session_id=entry.session_id,
+                )
+            finally:
+                for name, value in stale_callbacks.items():
+                    setattr(agent, name, value)
         finally:
             registry.release(lease_token)
 

@@ -1992,7 +1992,9 @@ class APIServerAdapter(BasePlatformAdapter):
 
         from gateway.canonical_surface import (
             CanonicalIngressEvent,
+            CanonicalTurnResult,
             ExistingCanonicalBindingResolver,
+            request_local_reply_sink,
         )
 
         try:
@@ -2033,13 +2035,30 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=404,
             )
 
+        terminal_readback: list[str] = []
+
+        async def _publish_to_current_request(result: CanonicalTurnResult) -> None:
+            if (
+                not isinstance(result, CanonicalTurnResult)
+                or result.binding_name != binding.name
+            ):
+                raise ValueError("canonical_turn_refused")
+            terminal_readback.append(result.terminal_text)
+
+        reply_sink = request_local_reply_sink(_publish_to_current_request)
         try:
             entry = await asyncio.to_thread(
                 ExistingCanonicalBindingResolver(runner.session_store).resolve,
                 binding,
                 event,
             )
-            text = await runner.run_bound_existing_turn(binding, event, entry)
+            result = await runner.run_bound_existing_turn(
+                binding,
+                event,
+                entry,
+                reply_sink=reply_sink,
+            )
+            await reply_sink.publish(result)
         except ValueError as exc:
             code = str(exc)
             status = 403 if code == "canonical_principal_rejected" else 409
@@ -2061,7 +2080,29 @@ class APIServerAdapter(BasePlatformAdapter):
                 },
                 status=status,
             )
-        return web.json_response({"event_id": event.event_id, "text": text})
+        except Exception:
+            return web.json_response(
+                {
+                    "error": {
+                        "code": "canonical_internal_error",
+                        "message": "Canonical request failed.",
+                    }
+                },
+                status=500,
+            )
+        if len(terminal_readback) != 1:
+            return web.json_response(
+                {
+                    "error": {
+                        "code": "canonical_turn_refused",
+                        "message": "Canonical request rejected.",
+                    }
+                },
+                status=409,
+            )
+        return web.json_response(
+            {"event_id": event.event_id, "text": terminal_readback[0]}
+        )
 
     async def _handle_platform_event_callback(self, request: "web.Request") -> "web.Response":
         platform_name = self._normalize_callback_platform(
