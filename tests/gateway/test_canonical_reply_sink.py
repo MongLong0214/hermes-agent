@@ -614,6 +614,230 @@ def test_c2_r9_progress_preview_stream_and_already_sent_never_publish(payload):
     assert len(leases.released) == 1
 
 
+async def _exercise_endpoint_terminal_tail(
+    monkeypatch,
+    *,
+    new_messages: list[dict[str, Any]],
+    final_response: str,
+    event_id: str,
+):
+    from gateway import canonical_surface
+
+    session_id = "existing-session"
+    agent = _ResultAgent(session_id, new_messages, final_response)
+    cached_publications: list[str] = []
+    stale_clarify = lambda *_args, **_kwargs: cached_publications.append("clarify")
+    stale_title = lambda *_args, **_kwargs: cached_publications.append("title")
+    agent.clarify_callback = stale_clarify
+    agent._on_session_title = stale_title
+
+    runner, leases = _runner_with_agent(
+        agent,
+        history=[
+            {"role": "user", "content": "prior question"},
+            {"role": "assistant", "content": "prior answer"},
+        ],
+    )
+    binding = SimpleNamespace(
+        name="ceo", session_key="binding-key", session_id=session_id
+    )
+    runner.config = SimpleNamespace(canonical_surface_bindings={"ceo": binding})
+    monkeypatch.setattr(
+        canonical_surface.ExistingCanonicalBindingResolver,
+        "resolve",
+        lambda _self, _binding, _event: SimpleNamespace(
+            session_key="binding-key",
+            session_id=session_id,
+        ),
+    )
+
+    constructor_calls: list[str] = []
+
+    def _forbidden_builder(*_args, **_kwargs):
+        constructor_calls.append("build-agent")
+        raise AssertionError("canonical tail refusal must not construct a fallback agent")
+
+    runner._build_agent = _forbidden_builder
+    session_side_effects: list[str] = []
+
+    def _forbidden_session_side_effect(name: str):
+        def _forbidden(*_args, **_kwargs):
+            session_side_effects.append(name)
+            raise AssertionError(f"canonical tail path attempted session side effect: {name}")
+
+        return _forbidden
+
+    for method_name in (
+        "get_or_create_session",
+        "reset_session",
+        "switch_session",
+        "_recover_session_from_db",
+    ):
+        setattr(
+            runner.session_store,
+            method_name,
+            _forbidden_session_side_effect(method_name),
+        )
+
+    originating_publications: list[CanonicalTurnResult] = []
+    real_sink_factory = canonical_surface.request_local_reply_sink
+
+    def _recording_sink_factory(publisher):
+        async def _recording_publish(result):
+            originating_publications.append(result)
+            await publisher(result)
+
+        return real_sink_factory(_recording_publish)
+
+    monkeypatch.setattr(
+        canonical_surface,
+        "request_local_reply_sink",
+        _recording_sink_factory,
+    )
+
+    fallback_publications: list[dict[str, Any]] = []
+
+    async def _record_fallback_publication(*args, **kwargs):
+        fallback_publications.append({"args": args, "kwargs": kwargs})
+        return SimpleNamespace(success=True)
+
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": _API_KEY}))
+    adapter.gateway_runner = runner
+    adapter.send = _record_fallback_publication
+    client = TestClient(TestServer(_api_app(adapter)))
+    await client.start_server()
+    try:
+        response = await client.post(
+            _CANONICAL_ROUTE,
+            headers={"Authorization": f"Bearer {_API_KEY}"},
+            json={
+                "binding": "ceo",
+                "event_id": event_id,
+                "author_id": "buzz-author",
+                "channel_id": "buzz-channel",
+                "text": "exercise terminal tail",
+            },
+        )
+        status = response.status
+        payload = await response.json()
+    finally:
+        await client.close()
+        adapter._response_store.close()
+
+    return {
+        "status": status,
+        "payload": payload,
+        "originating_publications": originating_publications,
+        "cached_publications": cached_publications,
+        "fallback_publications": fallback_publications,
+        "constructor_calls": constructor_calls,
+        "session_side_effects": session_side_effects,
+        "session_id": agent.session_id,
+        "callbacks_restored": (
+            agent.clarify_callback is stale_clarify
+            and agent._on_session_title is stale_title
+        ),
+        "leases": leases,
+    }
+
+
+@pytest.mark.parametrize(
+    "trailing_role",
+    [
+        pytest.param("progress", id="progress"),
+        pytest.param("error", id="error"),
+        pytest.param("fallback", id="fallback"),
+        pytest.param("system", id="system"),
+        pytest.param("unknown", id="unknown"),
+        pytest.param("future_delivery_notice_v9", id="unknown-scalar-spelling"),
+    ],
+)
+def test_c2_trailing_nonsemantic_role_refuses_at_endpoint_without_publication(
+    trailing_role, monkeypatch
+):
+    outcome = asyncio.run(
+        _exercise_endpoint_terminal_tail(
+            monkeypatch,
+            new_messages=[
+                {"role": "assistant", "content": "candidate terminal"},
+                {"role": trailing_role, "content": "unexpected trailing route"},
+            ],
+            final_response="candidate terminal",
+            event_id=f"trailing-{trailing_role}",
+        )
+    )
+
+    assert (
+        outcome["status"],
+        outcome["payload"],
+        len(outcome["originating_publications"]),
+    ) == (
+        409,
+        {
+            "error": {
+                "code": "canonical_turn_refused",
+                "message": "Canonical request rejected.",
+            }
+        },
+        0,
+    )
+    assert outcome["cached_publications"] == []
+    assert outcome["fallback_publications"] == []
+    assert outcome["constructor_calls"] == []
+    assert outcome["session_side_effects"] == []
+    assert outcome["session_id"] == "existing-session"
+    assert outcome["callbacks_restored"] is True
+    assert outcome["leases"].acquired == ["existing-session"]
+    assert len(outcome["leases"].released) == 1
+
+
+def test_c2_tool_call_before_final_physical_assistant_publishes_exactly_once(monkeypatch):
+    outcome = asyncio.run(
+        _exercise_endpoint_terminal_tail(
+            monkeypatch,
+            new_messages=[
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call-status",
+                            "type": "function",
+                            "function": {"name": "status", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-status",
+                    "name": "status",
+                    "content": "ready",
+                },
+                {"role": "assistant", "content": "tool-backed terminal"},
+            ],
+            final_response="tool-backed terminal",
+            event_id="tool-sequence-control",
+        )
+    )
+
+    assert outcome["status"] == 200
+    assert outcome["payload"] == {
+        "event_id": "tool-sequence-control",
+        "text": "tool-backed terminal",
+    }
+    assert outcome["originating_publications"] == [
+        CanonicalTurnResult("ceo", "tool-backed terminal")
+    ]
+    assert outcome["cached_publications"] == []
+    assert outcome["fallback_publications"] == []
+    assert outcome["constructor_calls"] == []
+    assert outcome["session_side_effects"] == []
+    assert outcome["session_id"] == "existing-session"
+    assert outcome["callbacks_restored"] is True
+    assert outcome["leases"].acquired == ["existing-session"]
+    assert len(outcome["leases"].released) == 1
+
+
 def test_c2_r12_existing_only_order_releases_before_same_request_publish(monkeypatch):
     from gateway import canonical_surface
 

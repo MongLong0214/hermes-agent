@@ -19060,14 +19060,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         turn_messages = messages[history_boundary:]
         if not all(isinstance(message, dict) for message in turn_messages):
             raise ValueError("canonical_turn_refused")
-        semantic = [
-            message
+        allowed_roles = {"user", "assistant", "tool"}
+        if not all(
+            isinstance(message.get("role"), str)
+            and message.get("role") in allowed_roles
             for message in turn_messages
-            if message.get("role") in {"user", "assistant", "tool"}
-        ]
-        if not semantic or semantic[-1].get("role") != "assistant":
+        ):
             raise ValueError("canonical_turn_refused")
-        if semantic[-1].get("tool_calls"):
+        terminal_message = turn_messages[-1]
+        if terminal_message.get("role") != "assistant":
+            raise ValueError("canonical_turn_refused")
+        if terminal_message.get("tool_calls"):
             raise ValueError("canonical_turn_refused")
 
         tool_boundary = max(
@@ -19087,7 +19090,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and isinstance(message.get("content"), str)
             and message["content"].strip()
         ]
-        if len(candidates) != 1 or candidates[0] is not semantic[-1]:
+        if len(candidates) != 1 or candidates[0] is not terminal_message:
             raise ValueError("canonical_turn_refused")
         terminal_text = candidates[0]["content"]
         if terminal_text != final_response:
