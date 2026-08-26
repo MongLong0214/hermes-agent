@@ -3355,6 +3355,11 @@ class SessionTurnLeaseScope:
 #: writer presenting a token against one fails closed; it recovers by takeover.
 LEGACY_TURN_LEASE_EPOCH = 0
 
+# A file-scoped maintenance epoch stored in the existing metadata table. The
+# marker is deliberately versioned and internal: it coordinates current
+# SessionDB processes without a schema or public metadata contract change.
+_OFFLINE_REBUILD_EPOCH_KEY = "_hermes_offline_rebuild_epoch_v1"
+
 
 def _process_start_time(pid: int) -> Optional[float]:
     """Process creation time for *pid*, or None when it cannot be established.
@@ -3452,6 +3457,10 @@ class _ConnectionSerialLock:
 
 def _serial_lock_for_connection(conn: sqlite3.Connection) -> _ConnectionSerialLock:
     """Return only this connection's exact layer-owned serialization lock."""
+    if getattr(conn, "_hermes_poisoned", False):
+        raise SQLiteSerializationError(
+            "SQLite connection was retired after transaction cleanup failed"
+        )
     lock = getattr(conn, "_hermes_serial_lock", None)
     if type(lock) is not _ConnectionSerialLock or lock.owner is not conn:
         raise SQLiteSerializationError(
@@ -5612,7 +5621,48 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 except Exception:
                     pass
                 raise
-            conn.commit()
+            try:
+                conn.commit()
+            except BaseException as commit_exc:
+                try:
+                    conn.rollback()
+                    terminal = not conn.in_transaction
+                except BaseException as rollback_exc:
+                    terminal = False
+                    try:
+                        setattr(commit_exc, "_hermes_cleanup_error", rollback_exc)
+                        commit_exc.add_note(
+                            "rollback after SQLite COMMIT failure also failed: "
+                            f"{rollback_exc}"
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Could not attach SQLite COMMIT cleanup diagnostic",
+                            exc_info=True,
+                        )
+                if not terminal:
+                    # The caller's block has finished but its transaction has
+                    # not.  Poison and detach this exact handle while both
+                    # ownership locks are still held, then close through the C
+                    # base method so an overridden/failed rollback cannot let a
+                    # foreign thread append to or terminate the stranded work.
+                    try:
+                        conn._hermes_poisoned = True
+                        if self._conn is conn:
+                            self._conn = None
+                        sqlite3.Connection.close(conn)
+                    except BaseException as close_exc:
+                        try:
+                            commit_exc.add_note(
+                                "retiring the SQLite connection after failed "
+                                f"rollback also failed: {close_exc}"
+                            )
+                        except Exception:
+                            logger.debug(
+                                "Could not attach SQLite retirement diagnostic",
+                                exc_info=True,
+                            )
+                raise
         finally:
             ownership.close()
 
@@ -9236,6 +9286,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         my_start = _process_start_time(my_pid)
 
         def _do(conn):
+            # This check and the lease DML share BEGIN IMMEDIATE. A rebuild
+            # claimant uses the same transaction shape for census + marker, so
+            # exactly one side of the interleaving commits and the loser writes
+            # no lease row.
+            if self._offline_rebuild_epoch_is_active(conn):
+                return None
             conversation_id, row = self._read_turn_lease_on_conn(conn, session_id)
             if row is None:
                 conn.execute(
@@ -9628,6 +9684,49 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 self._scope_release_target(session_id, token), token
             )
 
+    def _offline_rebuild_epoch_is_active(self, conn) -> bool:
+        """Return whether a live/unknown rebuild owns the store; reap dead owners."""
+        row = conn.execute(
+            "SELECT value FROM state_meta WHERE key = ?",
+            (_OFFLINE_REBUILD_EPOCH_KEY,),
+        ).fetchone()
+        if row is None:
+            return False
+        raw = row["value"]
+        try:
+            marker = json.loads(raw)
+            nonce = marker["nonce"]
+            owner_pid = marker["owner_pid"]
+            owner_pid_start = marker["owner_pid_start"]
+            valid = (
+                isinstance(marker, dict)
+                and isinstance(nonce, str)
+                and bool(nonce)
+                and not isinstance(owner_pid, bool)
+                and isinstance(owner_pid, int)
+                and owner_pid > 0
+                and (
+                    owner_pid_start is None
+                    or (
+                        not isinstance(owner_pid_start, bool)
+                        and isinstance(owner_pid_start, (int, float))
+                    )
+                )
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return True
+        if not valid:
+            return True
+
+        holder = f"pid={owner_pid}:offline-rebuild={nonce}"
+        if not _turn_lease_owner_is_dead(holder, owner_pid, owner_pid_start):
+            return True
+        cursor = conn.execute(
+            "DELETE FROM state_meta WHERE key = ? AND value = ?",
+            (_OFFLINE_REBUILD_EPOCH_KEY, raw),
+        )
+        return cursor.rowcount != 1
+
     @contextlib.contextmanager
     def offline_rebuild(self, *, reason: str):
         """Rebuild THIS store wholesale, offline, on the canonical transaction.
@@ -9672,17 +9771,24 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         :meth:`force_release_session_turn_lease`, and a refusal that does not
         say which ones sends them hunting.
         """
-        def _owned_conversations(conn) -> List[str]:
-            """Every conversation in this store a live turn owns.
+        marker_value = json.dumps(
+            {
+                "nonce": os.urandom(16).hex(),
+                "owner_pid": os.getpid(),
+                "owner_pid_start": _process_start_time(os.getpid()),
+                "reason": reason,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
 
-            The predicate is :meth:`_turn_lease_row_is_free`, the same one that
-            decides whether an acquirer may take the lease and the same one
-            :meth:`_skip_leased_conversations` runs per row — so a rebuild can
-            never proceed over a conversation an acquirer would have been
-            refused. Read directly off the lease table rather than off
-            ``sessions`` because a live row whose session is exactly what the
-            rebuild is about to recreate must still stop it.
-            """
+        def _claim_offline_rebuild_epoch(conn) -> List[str]:
+            """Atomically census owners and publish this rebuild's durable epoch."""
+            if self._offline_rebuild_epoch_is_active(conn):
+                raise SessionTurnLeaseLostError(
+                    f"refusing an offline rebuild ({reason}) of {self.db_path}: "
+                    "offline rebuild exclusion is already held"
+                )
             owned: List[str] = []
             for row in conn.execute(
                 "SELECT conversation_id FROM session_turn_leases "
@@ -9696,23 +9802,60 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 ).fetchone()
                 if not self._turn_lease_row_is_free(root, lease):
                     owned.append(root)
+            if not owned:
+                conn.execute(
+                    "INSERT INTO state_meta(key, value) VALUES (?, ?)",
+                    (_OFFLINE_REBUILD_EPOCH_KEY, marker_value),
+                )
             return owned
 
-        owned = self._execute_write(_owned_conversations)
+        owned = self._execute_write(_claim_offline_rebuild_epoch)
         if owned:
             raise SessionTurnLeaseLostError(
                 f"refusing an offline rebuild ({reason}) of {self.db_path}: "
                 f"conversation(s) a live turn owns ({', '.join(sorted(owned))})"
             )
-        with self._same_connection_transaction_boundary() as conn:
-            conn.execute("PRAGMA foreign_keys=OFF")
-            try:
-                yield self
-            finally:
+
+        def _release_offline_rebuild_epoch(conn) -> None:
+            cursor = conn.execute(
+                "DELETE FROM state_meta WHERE key = ? AND value = ?",
+                (_OFFLINE_REBUILD_EPOCH_KEY, marker_value),
+            )
+            if cursor.rowcount != 1:
+                raise SQLiteSerializationError(
+                    "offline rebuild exclusion changed before its owner released it"
+                )
+
+        primary_exc = None
+        try:
+            with self._same_connection_transaction_boundary() as conn:
+                conn.execute("PRAGMA foreign_keys=OFF")
                 try:
-                    conn.execute("PRAGMA foreign_keys=ON")
-                except Exception:  # pragma: no cover - closed mid-rebuild
-                    pass
+                    yield self
+                finally:
+                    try:
+                        conn.execute("PRAGMA foreign_keys=ON")
+                    except Exception:  # pragma: no cover - closed mid-rebuild
+                        pass
+        except BaseException as exc:
+            primary_exc = exc
+            raise
+        finally:
+            try:
+                self._execute_write(_release_offline_rebuild_epoch)
+            except BaseException as release_exc:
+                if primary_exc is None:
+                    raise
+                try:
+                    primary_exc.add_note(
+                        "failed to release offline rebuild exclusion: "
+                        f"{release_exc}"
+                    )
+                except Exception:
+                    logger.debug(
+                        "Could not attach offline rebuild release diagnostic",
+                        exc_info=True,
+                    )
 
     def get_compression_lock_holder(self, session_id: str) -> Optional[str]:
         """Return the current (non-expired) holder for ``session_id``, or None.
