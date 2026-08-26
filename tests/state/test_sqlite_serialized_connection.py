@@ -2236,6 +2236,133 @@ class TestSQLiteTransactionInterference:
             worker.join(2)
             db.close()
 
+    def _assert_owner_exception_rollback_failure_retires_before_foreign_entry(
+        self,
+        tmp_path,
+        monkeypatch,
+        *,
+        use_write_transaction: bool,
+    ) -> None:
+        path = tmp_path / (
+            "body-rollback-fails.db"
+            if use_write_transaction
+            else "callback-rollback-fails.db"
+        )
+        db = SessionDB(db_path=path)
+        conn = db._conn
+        assert conn is not None
+        probe = _ForeignAcquireProbe(monkeypatch, conn)
+        original_rollback = type(conn).rollback
+        rollback_observations: list[tuple[bool, bool, bool]] = []
+        rollback_error = sqlite3.OperationalError("controlled body rollback failure")
+        primary_error = RuntimeError("controlled owner body failure")
+
+        def fail_owner_rollback(connection):
+            if connection is conn and not rollback_observations:
+                rollback_observations.append(
+                    (
+                        db._lock._is_owned(),
+                        conn._hermes_serial_lock._is_owned(),
+                        conn.in_transaction,
+                    )
+                )
+                raise rollback_error
+            return original_rollback(connection)
+
+        monkeypatch.setattr(type(conn), "rollback", fail_owner_rollback)
+        start_foreign = threading.Event()
+        foreign_done = threading.Event()
+        statuses: list[str] = []
+        foreign_errors: list[BaseException] = []
+
+        def foreign_append_and_commit() -> None:
+            probe.register_current_thread()
+            assert start_foreign.wait(2), "failed owner never exposed the contender"
+            for action in (
+                lambda: conn.execute(
+                    "INSERT INTO state_meta(key, value) "
+                    "VALUES ('t2-foreign', 'must-not-commit')"
+                ),
+                conn.commit,
+            ):
+                try:
+                    action()
+                except BaseException as exc:
+                    foreign_errors.append(exc)
+            foreign_done.set()
+
+        def owner_body(owned) -> None:
+            owned.execute(
+                "INSERT INTO state_meta(key, value) "
+                "VALUES ('t2-owner', 'must-roll-back')"
+            )
+            start_foreign.set()
+            statuses.append(probe.await_status())
+            probe.release()
+            raise primary_error
+
+        worker = threading.Thread(target=foreign_append_and_commit, daemon=True)
+        worker.start()
+        try:
+            with pytest.raises(RuntimeError, match="controlled owner body failure") as caught:
+                if use_write_transaction:
+                    with db.write_transaction() as owned:
+                        owner_body(owned)
+                else:
+                    db._execute_write(owner_body)
+
+            assert foreign_done.wait(2), "foreign contender did not finish"
+            worker.join(2)
+            assert not worker.is_alive()
+            with sqlite3.connect(path) as verifier:
+                owner_row = verifier.execute(
+                    "SELECT value FROM state_meta WHERE key = 't2-owner'"
+                ).fetchone()
+                foreign_row = verifier.execute(
+                    "SELECT value FROM state_meta WHERE key = 't2-foreign'"
+                ).fetchone()
+
+            assert owner_row is None, (
+                "the owner's required-to-rollback row leaked through the foreign commit"
+            )
+            assert foreign_row is None, "foreign DML committed on the stranded owner handle"
+            assert len(foreign_errors) == 2
+            assert all(
+                isinstance(exc, SQLiteSerializationError) for exc in foreign_errors
+            )
+            assert caught.value is primary_error
+            assert getattr(caught.value, "_hermes_cleanup_error", None) is rollback_error
+            assert any(
+                "controlled body rollback failure" in note
+                for note in getattr(caught.value, "__notes__", ())
+            )
+            assert rollback_observations == [(True, True, True)]
+            assert statuses == ["blocked"]
+            assert db._conn is None
+        finally:
+            probe.release()
+            start_foreign.set()
+            worker.join(2)
+            db.close()
+
+    def test_write_transaction_body_rollback_failure_retires_before_foreign_commit(
+        self, tmp_path, monkeypatch
+    ):
+        self._assert_owner_exception_rollback_failure_retires_before_foreign_entry(
+            tmp_path,
+            monkeypatch,
+            use_write_transaction=True,
+        )
+
+    def test_execute_write_callback_rollback_failure_retires_before_foreign_commit(
+        self, tmp_path, monkeypatch
+    ):
+        self._assert_owner_exception_rollback_failure_retires_before_foreign_entry(
+            tmp_path,
+            monkeypatch,
+            use_write_transaction=False,
+        )
+
     def test_write_transaction_busy_retry_does_not_retain_python_locks(
         self, tmp_path, monkeypatch
     ):
@@ -2631,6 +2758,195 @@ class TestSQLiteTransactionInterference:
             assert rebuilt["title"] == "rebuilt-after-child-refusal"
         finally:
             rebuild_db.close()
+
+    def test_offline_rebuild_refuses_child_create_and_update_until_release(
+        self, tmp_path
+    ):
+        path = tmp_path / "offline-child-writes.db"
+        rebuild_db = SessionDB(db_path=path)
+        marker_key = "_hermes_offline_rebuild_epoch_v1"
+        rebuild_db.create_session("e4-owned", "test")
+        rebuild_db.set_session_title("e4-owned", "before")
+        root = Path(__file__).resolve().parents[2]
+        program = textwrap.dedent(
+            """
+            import pathlib
+            import sys
+            from hermes_state import SessionDB, SessionTurnLeaseLostError
+
+            db = SessionDB(db_path=pathlib.Path(sys.argv[1]))
+            outcomes = []
+            try:
+                try:
+                    db.create_session("e4-foreign-created", "child")
+                except SessionTurnLeaseLostError:
+                    outcomes.append("CREATE_REFUSED")
+                else:
+                    outcomes.append("CREATE_COMMITTED")
+
+                try:
+                    with db.write_transaction() as conn:
+                        conn.execute(
+                            "UPDATE sessions SET title = 'foreign-update' "
+                            "WHERE id = 'e4-owned'"
+                        )
+                except SessionTurnLeaseLostError:
+                    outcomes.append("UPDATE_REFUSED")
+                else:
+                    outcomes.append("UPDATE_COMMITTED")
+                print("|".join(outcomes))
+            finally:
+                db.close()
+            """
+        )
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(root)
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+
+        try:
+            with rebuild_db.offline_rebuild(reason="gate every ordinary writer"):
+                marker_before = rebuild_db.get_meta(marker_key)
+                assert marker_before is not None
+                result = subprocess.run(
+                    [sys.executable, "-c", program, str(path)],
+                    cwd=str(root),
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                assert result.returncode == 0, result.stdout + result.stderr
+
+                assert rebuild_db.get_session("e4-foreign-created") is None, (
+                    "a non-owner create_session committed during the live rebuild epoch"
+                )
+                owned_before = rebuild_db.get_session("e4-owned")
+                assert owned_before is not None
+                assert owned_before["title"] == "before"
+                assert result.stdout.strip() == "CREATE_REFUSED|UPDATE_REFUSED"
+                assert rebuild_db.get_meta(marker_key) == marker_before
+
+                rebuild_db._execute_write(
+                    lambda conn: conn.execute(
+                        "UPDATE sessions SET title = 'owner-rebuild' "
+                        "WHERE id = 'e4-owned'"
+                    )
+                )
+                assert rebuild_db.get_meta(marker_key) == marker_before
+
+            assert rebuild_db.get_meta(marker_key) is None
+            rebuild_db.create_session("e4-post-release", "test")
+            rebuild_db.set_session_title("e4-owned", "post-release")
+            assert rebuild_db.get_session("e4-post-release") is not None
+            owned_after = rebuild_db.get_session("e4-owned")
+            assert owned_after is not None
+            assert owned_after["title"] == "post-release"
+        finally:
+            rebuild_db.close()
+
+    def test_offline_rebuild_keeps_reads_and_different_store_writes_independent(
+        self, tmp_path
+    ):
+        protected_path = tmp_path / "offline-protected.db"
+        independent_path = tmp_path / "offline-independent.db"
+        owner = SessionDB(db_path=protected_path)
+        reader = SessionDB(db_path=protected_path)
+        independent = SessionDB(db_path=independent_path)
+        marker_key = "_hermes_offline_rebuild_epoch_v1"
+        owner.create_session("e4-readable", "test")
+        independent.create_session("e4-independent", "test")
+        try:
+            with owner.offline_rebuild(reason="store-specific write authority"):
+                marker_value = owner.get_meta(marker_key)
+                assert marker_value is not None
+                readable = reader.get_session("e4-readable")
+                assert readable is not None
+
+                independent.create_session("e4-independent-new", "test")
+                with independent.write_transaction() as conn:
+                    conn.execute(
+                        "UPDATE sessions SET title = 'independent-write' "
+                        "WHERE id = 'e4-independent'"
+                    )
+                changed = independent.get_session("e4-independent")
+                assert changed is not None
+                assert changed["title"] == "independent-write"
+                assert owner.get_meta(marker_key) == marker_value
+
+            assert owner.get_meta(marker_key) is None
+            assert independent.get_session("e4-independent-new") is not None
+        finally:
+            independent.close()
+            reader.close()
+            owner.close()
+
+    def _assert_nonfinite_live_child_marker_is_preserved(
+        self,
+        tmp_path,
+        *,
+        nonfinite_literal: str,
+    ) -> None:
+        path = tmp_path / f"offline-live-{nonfinite_literal.lower()}.db"
+        db = SessionDB(db_path=path)
+        child = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import sys; print('READY', flush=True); sys.stdin.readline()",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        marker_key = "_hermes_offline_rebuild_epoch_v1"
+        marker_value = (
+            '{"nonce":"nonfinite-live","owner_pid":'
+            f"{child.pid},\"owner_pid_start\":{nonfinite_literal},"
+            '"reason":"adversarial-nonfinite"}'
+        )
+        try:
+            assert child.stdout is not None
+            assert child.stdout.readline().strip() == "READY"
+            assert child.poll() is None
+            assert hermes_state._process_start_time(child.pid) is not None
+            with sqlite3.connect(path, isolation_level=None) as fixture:
+                fixture.execute(
+                    "INSERT INTO state_meta(key, value) VALUES (?, ?)",
+                    (marker_key, marker_value),
+                )
+
+            with pytest.raises(
+                hermes_state.SessionTurnLeaseLostError,
+                match="offline rebuild exclusion",
+            ):
+                with db.offline_rebuild(reason="must refuse nonfinite owner identity"):
+                    pytest.fail("non-finite live-owner marker was reaped")
+
+            with sqlite3.connect(path) as verifier:
+                preserved = verifier.execute(
+                    "SELECT value FROM state_meta WHERE key = ?", (marker_key,)
+                ).fetchone()
+            assert preserved == (marker_value,)
+            assert child.poll() is None
+        finally:
+            try:
+                child.communicate("\n", timeout=5)
+            finally:
+                db.close()
+        assert child.returncode == 0
+
+    def test_offline_rebuild_refuses_infinity_live_child_marker(self, tmp_path):
+        self._assert_nonfinite_live_child_marker_is_preserved(
+            tmp_path,
+            nonfinite_literal="Infinity",
+        )
+
+    def test_offline_rebuild_refuses_nan_live_child_marker(self, tmp_path):
+        self._assert_nonfinite_live_child_marker_is_preserved(
+            tmp_path,
+            nonfinite_literal="NaN",
+        )
 
     def test_offline_rebuild_recovers_provably_dead_durable_epoch(self, tmp_path):
         """A crashed rebuild owner cannot strand the reserved marker forever."""
