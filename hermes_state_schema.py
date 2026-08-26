@@ -25,9 +25,13 @@ from hermes_state_common import (
     LEGACY_FTS_TRIGRAM_SQL,
     SCHEMA_SQL,
     SCHEMA_VERSION,
+    TURN_FENCE_GENERATION,
+    TURN_FENCE_GOVERNED_TABLES,
+    TURN_FENCE_OPERATIONS,
     _FTS_CJK_TRIGGERS,
     _FTS_TRIGGERS,
     _ephemeral_child_sql,
+    turn_fence_trigger_definitions,
 )
 
 # Moved methods logged under the "hermes_state" logger before the split;
@@ -819,6 +823,38 @@ class SessionSchemaMixin:
         finally:
             cursor.execute("PRAGMA foreign_keys=ON")
 
+    def _apply_turn_fence_generation_delta(self, cursor: sqlite3.Cursor) -> None:
+        """Atomically install and verify the complete v27 trigger barrier."""
+        definitions = turn_fence_trigger_definitions()
+        if len(definitions) != (
+            len(TURN_FENCE_GOVERNED_TABLES) * len(TURN_FENCE_OPERATIONS)
+        ):
+            raise RuntimeError("turn-fence trigger declaration is incomplete")
+        expected = dict(definitions)
+        cursor.execute("BEGIN")
+        try:
+            for name, _sql in definitions:
+                cursor.execute(f"DROP TRIGGER IF EXISTS {name}")
+            for _name, sql in definitions:
+                cursor.execute(sql)
+            placeholders = ", ".join("?" for _name in expected)
+            rows = cursor.execute(
+                "SELECT name, sql FROM sqlite_master "
+                f"WHERE type = 'trigger' AND name IN ({placeholders})",
+                tuple(expected),
+            ).fetchall()
+            if {row[0]: row[1] for row in rows} != expected:
+                raise RuntimeError("turn-fence trigger verification failed")
+            cursor.execute("DELETE FROM schema_version")
+            cursor.execute(
+                "INSERT INTO schema_version (version) VALUES (?)",
+                (SCHEMA_VERSION,),
+            )
+            self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
+
     def _init_schema(self):
         """Create tables and FTS if they don't exist, reconcile columns.
 
@@ -912,10 +948,7 @@ class SessionSchemaMixin:
         cursor.execute("SELECT version FROM schema_version LIMIT 1")
         row = cursor.fetchone()
         if row is None:
-            cursor.execute(
-                "INSERT INTO schema_version (version) VALUES (?)",
-                (SCHEMA_VERSION,),
-            )
+            current_version = 0
         else:
             current_version = row["version"] if isinstance(row, sqlite3.Row) else row[0]
             # Data migrations that can't be expressed declaratively (row
@@ -1182,13 +1215,13 @@ class SessionSchemaMixin:
             # is the one case we skip (we can't have created the current FTS
             # objects, so claiming the current schema would be a lie).
             if (
-                current_version < SCHEMA_VERSION
+                current_version < TURN_FENCE_GENERATION - 1
                 and fts_migrations_complete
                 and fts5_available
             ):
                 cursor.execute(
                     "UPDATE schema_version SET version = ?",
-                    (SCHEMA_VERSION,),
+                    (TURN_FENCE_GENERATION - 1,),
                 )
 
         # Unique title index — always ensure it exists. Older databases may
@@ -1297,7 +1330,8 @@ class SessionSchemaMixin:
             if getattr(self, "_fts_enabled", False):
                 self._migrate_broad_fts_update_triggers(cursor)
 
-        self._conn.commit()
+        if current_version < SCHEMA_VERSION:
+            self._apply_turn_fence_generation_delta(cursor)
 
     def _backfill_gateway_metadata_from_sessions_json(
         self, cursor: sqlite3.Cursor

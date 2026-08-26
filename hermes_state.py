@@ -84,11 +84,13 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     MAX_FTS5_QUERY_CHARS,
     SCHEMA_SQL,
     SCHEMA_VERSION,
+    TURN_FENCE_GENERATION,
     _PREVIEW_CONTENT_SQL,
     _PREVIEW_HEAD_CHARS,
     _PREVIEW_MAX_CHARS,
     _PREVIEW_SCAFFOLD_WINDOW,
     _PREVIEW_SCAFFOLDED_SQL,
+    register_turn_fence_generation,
 )
 from hermes_state_portability import SessionPortabilityMixin
 from hermes_state_schema import SessionSchemaMixin
@@ -172,6 +174,16 @@ class SessionExportTooLargeError(ValueError):
             f"session '{session_id}' has at least {message_count} active messages; "
             f"safe in-memory export limit is {limit}"
         )
+
+
+class IncompatibleSchemaError(RuntimeError):
+    """The on-disk session state cannot be safely opened by this version."""
+
+    __slots__ = ("code",)
+
+    def __init__(self):
+        super().__init__("Session state is incompatible with this Hermes version.")
+        self.code = "STATE_DB_SCHEMA_INCOMPATIBLE"
 
 
 _COMPRESSION_LOCK_HOLDER_PID_RE = re.compile(r"(?:^|:)pid=(\d+)(?::|$)")
@@ -1575,6 +1587,96 @@ def is_malformed_schema_error(exc: BaseException) -> bool:
     return any(marker in str(exc).lower() for marker in _MALFORMED_SCHEMA_MARKERS)
 
 
+def _validate_schema_version_scalar(conn: sqlite3.Connection) -> int:
+    """Validate the one canonical, SQLite-typed schema-version scalar."""
+    rows = conn.execute(
+        "SELECT version, typeof(version) FROM schema_version"
+    ).fetchall()
+    if len(rows) != 1:
+        raise IncompatibleSchemaError()
+    version, value_type = rows[0]
+    if (
+        value_type != "integer"
+        or type(version) is not int
+        or version < 0
+        or version > (2**63 - 1)
+        or version > SCHEMA_VERSION
+    ):
+        raise IncompatibleSchemaError()
+    return version
+
+
+def _validate_connection_schema(
+    conn: sqlite3.Connection, *, allow_uninitialized_schema: bool = False
+) -> Optional[int]:
+    """SELECT-only compatibility check for a package-owned connection."""
+    try:
+        has_schema_version = conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'schema_version'"
+        ).fetchone() is not None
+        if not has_schema_version:
+            if not allow_uninitialized_schema:
+                raise IncompatibleSchemaError()
+            version = None
+        else:
+            version = _validate_schema_version_scalar(conn)
+        generation, generation_type = conn.execute(
+            "SELECT hermes_turn_fence_generation(), "
+            "typeof(hermes_turn_fence_generation())"
+        ).fetchone()
+    except IncompatibleSchemaError:
+        raise
+    except sqlite3.DatabaseError:
+        raise IncompatibleSchemaError() from None
+    if (
+        generation_type != "integer"
+        or type(generation) is not int
+        or generation != TURN_FENCE_GENERATION
+    ):
+        raise IncompatibleSchemaError()
+    return version
+
+
+def _probe_existing_state_db_schema(
+    db_path: Path, *, allow_malformed_repair: bool
+) -> int:
+    """Read and validate an existing DB before any package write path opens it."""
+    def probe() -> int:
+        conn = sqlite3.connect(
+            f"file:{db_path}?mode=ro",
+            uri=True,
+            isolation_level=None,
+        )
+        try:
+            return _validate_schema_version_scalar(conn)
+        finally:
+            conn.close()
+
+    try:
+        return probe()
+    except IncompatibleSchemaError:
+        raise
+    except sqlite3.DatabaseError as exc:
+        if not (
+            allow_malformed_repair
+            and is_malformed_schema_error(exc)
+        ):
+            raise IncompatibleSchemaError() from None
+        if not _claim_repair_attempt(db_path):
+            raise
+        report = repair_state_db_schema(db_path)
+        if not report.get("repaired"):
+            raise
+
+    try:
+        return probe()
+    except IncompatibleSchemaError:
+        raise
+    except sqlite3.DatabaseError:
+        raise IncompatibleSchemaError() from None
+
+
 # Markers that mean the host filesystem cannot accept another write. Kept as
 # plain substrings so OSError, sqlite3.OperationalError, and wrapped RPC
 # error strings all match the same helper.
@@ -2505,6 +2607,7 @@ def _connect_repair_durable(db_path: Path) -> sqlite3.Connection:
     schema parses again, which is the point at which the pragmas can stick.
     """
     conn = sqlite3.connect(str(db_path), isolation_level=None)
+    register_turn_fence_generation(conn)
     _reapply_durability_barriers(conn)
     return conn
 
@@ -3722,6 +3825,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     def __init__(self, db_path: Path = None, read_only: bool = False):
         self.db_path = db_path or _default_db_path()
+        path_existed_before_connect = self.db_path.exists()
         # Fail hard (before any connection/pragma/mkdir) if a pytest-context
         # process resolved the developer's production state.db — see the
         # live-DB test-isolation guard block near _default_db_path().
@@ -3822,6 +3926,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # must already exist + be initialised (callers guard on
                 # db_path.exists()); a SELECT against an empty file raises and
                 # the caller degrades per-profile.
+                if path_existed_before_connect:
+                    _probe_existing_state_db_schema(
+                        self.db_path, allow_malformed_repair=False
+                    )
                 self._conn = _connect_tracked_db(
                     f"file:{self.db_path}?mode=ro",
                     tracking_path=self.db_path,
@@ -3831,6 +3939,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     isolation_level=None,
                 )
                 self._conn.row_factory = sqlite3.Row
+                register_turn_fence_generation(self._conn)
+                _validate_connection_schema(self._conn)
                 # FTS capability flags normally come from writable schema
                 # initialisation. Probe existing virtual tables with SELECTs
                 # only so read-only search keeps its FTS and trigram paths.
@@ -3902,6 +4012,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # opaquely or risk further damage). Raise with the clear message.
                 if qpath is None and self.db_path.exists() and is_zeroed_state_db(self.db_path):
                     raise sqlite3.DatabaseError(msg)
+                if qpath is not None:
+                    path_existed_before_connect = False
+
+            if path_existed_before_connect:
+                _probe_existing_state_db_schema(
+                    self.db_path, allow_malformed_repair=True
+                )
 
             def _connect_and_init():
                 self._conn = _connect_tracked_db(
@@ -3917,6 +4034,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     isolation_level=None,
                 )
                 self._conn.row_factory = sqlite3.Row
+                register_turn_fence_generation(self._conn)
+                _validate_connection_schema(
+                    self._conn,
+                    allow_uninitialized_schema=not path_existed_before_connect,
+                )
                 self._wal_active = (
                     apply_wal_with_fallback(self._conn, db_label="state.db") == "wal"
                 )
@@ -3963,31 +4085,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                             )
                         )
 
-            try:
-                _connect_and_init_with_lock_patience()
-            except sqlite3.DatabaseError as exc:
-                # The malformed-schema class (e.g. a duplicate sqlite_master
-                # row for messages_fts) fails on the very first statement —
-                # before _init_schema can run — so it can't be caught at the
-                # FTS-rebuild layer. Recover by repairing sqlite_master in
-                # place (backup first; canonical sessions/messages preserved),
-                # then reopen once. This is what lets Desktop/Dashboard
-                # self-heal instead of silently showing "no sessions".
-                if not is_malformed_schema_error(exc) or not _claim_repair_attempt(self.db_path):
-                    raise
-                logger.error(
-                    "state.db schema is malformed (%s) — attempting automatic "
-                    "repair (a backup copy is made first).", exc,
-                )
-                try:
-                    if self._conn is not None:
-                        self._conn.close()
-                except Exception:
-                    pass
-                report = repair_state_db_schema(self.db_path)
-                if not report.get("repaired"):
-                    raise
-                _connect_and_init_with_lock_patience()
+            _connect_and_init_with_lock_patience()
 
             # NOTE: the v23 FTS optimization is OPT-IN (`hermes db optimize`),
             # never auto-started on open. Legacy installs keep their working
@@ -3997,6 +4095,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # an unattended open. (An interrupted optimize resumes when the
             # user re-runs the command.)
             initialization_complete = True
+        except IncompatibleSchemaError:
+            _set_last_init_error(
+                "STATE_DB_SCHEMA_INCOMPATIBLE: "
+                "Session state is incompatible with this Hermes version."
+            )
+            raise
         except Exception as exc:
             # Capture the cause so /resume and friends can surface WHY the
             # session DB is unavailable instead of a bare "Session database
@@ -4016,6 +4120,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if not initialization_complete:
                 conn, self._conn = self._conn, None
                 self._close_connection_quietly(conn)
+
+    def ensure_compatible_schema(self) -> None:
+        """Recheck this open connection without repairing or mutating state."""
+        if self._conn is None:
+            raise IncompatibleSchemaError()
+        _validate_connection_schema(self._conn)
 
     # ── Read-path split ──
 

@@ -127,9 +127,15 @@ def _db_path():
 
 def _connect() -> sqlite3.Connection:
     path = _db_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
+    from hermes_state import SessionDB, _validate_connection_schema
+    from hermes_state_common import register_turn_fence_generation
+
+    bootstrap = SessionDB(db_path=path)
+    bootstrap.close()
     conn = sqlite3.connect(path, timeout=10)
     try:
+        register_turn_fence_generation(conn)
+        _validate_connection_schema(conn)
         _initialize_schema(conn)
     except Exception:
         # A PRAGMA/DDL failure after a successful connect() must not leak the
