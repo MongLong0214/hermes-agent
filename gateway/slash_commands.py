@@ -5219,11 +5219,23 @@ class GatewaySlashCommandsMixin:
             return t("gateway.branch.switch_failed")
         msg_count = sum(row.get("role") == "user" for row in durable_branch_rows)
 
-        # Set title
+        # Set title. Two ways this can fail to land — a raised exception (e.g.
+        # a title collision) and a `False` return (e.g. a lost compare-and-swap
+        # race) — and both must be treated as "did not land": the outward
+        # message must not assert a title that isn't actually on the row.
+        title_failure_reason: str | None = None
         try:
-            await self._session_db.set_session_title(new_session_id, branch_title)
-        except Exception:
-            pass
+            title_applied = await self._session_db.set_session_title(new_session_id, branch_title)
+        except Exception as e:
+            title_applied = False
+            title_failure_reason = str(e)
+        if not title_applied and title_failure_reason is None:
+            title_failure_reason = "title update did not apply"
+        if title_failure_reason is not None:
+            logger.error(
+                "Branch title %r failed to publish for %s (parent %s): %s",
+                branch_title, new_session_id, parent_session_id, title_failure_reason,
+            )
 
         # Switch the session store entry to the new session
         new_entry = await self.async_session_store.switch_session(session_key, new_session_id)
@@ -5233,6 +5245,20 @@ class GatewaySlashCommandsMixin:
 
         # Evict any cached agent for this session
         self._evict_cached_agent(session_key)
+
+        if title_failure_reason is not None:
+            untitled_key = (
+                "gateway.branch.branched_one_untitled"
+                if msg_count == 1
+                else "gateway.branch.branched_many_untitled"
+            )
+            return t(
+                untitled_key, count=msg_count, parent=parent_session_id, new=new_session_id
+            ) + t(
+                "gateway.branch.title_not_set_note",
+                title=branch_title,
+                error=title_failure_reason,
+            )
 
         key = "gateway.branch.branched_one" if msg_count == 1 else "gateway.branch.branched_many"
         return t(key, title=branch_title, count=msg_count, parent=parent_session_id, new=new_session_id)
