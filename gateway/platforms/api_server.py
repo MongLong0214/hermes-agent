@@ -2174,6 +2174,87 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return profile_prefix_middleware
 
+    async def _handle_canonical_surface_event(self, request: "web.Request"):
+        """Serve one authenticated, existing-only canonical event."""
+        auth_error = self._check_auth(request)
+        if auth_error:
+            return auth_error
+        from gateway.canonical_surface import (
+            CanonicalIngressEvent,
+            CanonicalTurnResult,
+            ExistingCanonicalBindingResolver,
+            request_local_reply_sink,
+        )
+
+        try:
+            event = CanonicalIngressEvent.from_json_bytes(await request.read())
+        except ValueError:
+            return web.json_response(
+                {"error": {"code": "canonical_invalid_request", "message": "Canonical request rejected."}},
+                status=400,
+            )
+        runner = self.gateway_runner
+        if runner is None:
+            return web.json_response(
+                {"error": {"code": "canonical_unavailable", "message": "Canonical request unavailable."}},
+                status=503,
+            )
+        binding = getattr(runner.config, "canonical_surface_bindings", {}).get(event.binding)
+        if binding is None:
+            return web.json_response(
+                {"error": {"code": "canonical_binding_unknown", "message": "Canonical request rejected."}},
+                status=404,
+            )
+        terminal_readback: list[str] = []
+
+        async def publish_to_this_request(result: CanonicalTurnResult) -> None:
+            if not isinstance(result, CanonicalTurnResult) or result.binding_name != binding.name:
+                raise ValueError("canonical_turn_refused")
+            terminal_readback.append(result.terminal_text)
+
+        reply_sink = request_local_reply_sink(publish_to_this_request)
+        try:
+            entry = await asyncio.to_thread(
+                ExistingCanonicalBindingResolver(runner.session_store).resolve,
+                binding,
+                event,
+            )
+            result = await runner.run_bound_existing_turn(
+                binding, event, entry, reply_sink=reply_sink
+            )
+            await reply_sink.publish(result)
+        except ValueError as exc:
+            code = str(exc)
+            if code == "canonical_principal_rejected":
+                status = 403
+            else:
+                status = 409
+                if code not in {
+                    "canonical_binding_stale",
+                    "canonical_agent_missing",
+                    "canonical_turn_busy",
+                    "canonical_turn_refused",
+                    "canonical_reply_publish_failed",
+                    "canonical_reply_already_published",
+                    "canonical_reply_sink_missing",
+                }:
+                    code = "canonical_turn_refused"
+            return web.json_response(
+                {"error": {"code": code, "message": "Canonical request rejected."}},
+                status=status,
+            )
+        except Exception:
+            return web.json_response(
+                {"error": {"code": "canonical_internal_error", "message": "Canonical request failed."}},
+                status=500,
+            )
+        if len(terminal_readback) != 1:
+            return web.json_response(
+                {"error": {"code": "canonical_turn_refused", "message": "Canonical request rejected."}},
+                status=409,
+            )
+        return web.json_response({"event_id": event.event_id, "text": terminal_readback[0]})
+
     def _http_route_table(self) -> List[tuple]:
         """Return (method, path, handler) rows registered by ``connect()``.
 
@@ -2187,6 +2268,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/models", self._handle_models),
             ("GET", "/api/model/options", self._handle_model_options),
             ("GET", "/v1/capabilities", self._handle_capabilities),
+            ("POST", "/v1/canonical-surface/events", self._handle_canonical_surface_event),
             # Authenticated browser-control surface: POST registration
             # mints a short-lived ticket; the controller then opens the WS with
             # that ticket. Both are gated on browser.extension_control.enabled
