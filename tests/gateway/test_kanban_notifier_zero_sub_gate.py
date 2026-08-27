@@ -18,6 +18,8 @@ win without that risk.)
 
 import asyncio
 
+import pytest
+
 from unittest.mock import patch
 
 from gateway.config import Platform
@@ -81,5 +83,41 @@ def test_zero_sub_board_is_never_opened_writable(tmp_path, monkeypatch):
 
     spy_connect.assert_not_called()
     assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_probe_failure_falls_back_to_writable_open_and_delivers(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "probe-failure-fallback.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    task_id = _create_completed_task(subscribe=True)
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._kanban_dispatcher_lock_handle = object()
+
+    with patch.object(
+        kb,
+        "count_notify_subs",
+        side_effect=OSError("subscription probe unavailable"),
+    ) as spy_probe, patch.object(kb, "connect", wraps=kb.connect) as spy_connect, patch.object(
+        runner, "_kanban_advance", wraps=runner._kanban_advance
+    ) as spy_advance:
+        await _run_one_notifier_tick(monkeypatch, runner)
+
+    spy_probe.assert_called_once()
+    assert spy_connect.call_count == 2
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["chat_id"] == "chat-1"
+    assert adapter.sent[0]["text"].count(task_id) == 1
+    spy_advance.assert_called_once()
+    assert spy_connect.call_count == spy_advance.call_count + 1
+    assert [call.kwargs.get("board") for call in spy_connect.call_args_list] == [
+        kb.DEFAULT_BOARD,
+        kb.DEFAULT_BOARD,
+    ]
+    assert runner._kanban_sub_fail_counts == {}
 
 
