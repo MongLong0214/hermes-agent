@@ -1,62 +1,9 @@
-"""Lock-safe inspection of SQLite database files.
+"""Fail-closed raw SQLite inspection and connection-lifecycle accounting.
 
-Why this module exists
-----------------------
-POSIX advisory locks are cancelled **process-wide** by ``close()`` on *any*
-file descriptor for that file::
-
-    the close() system call will cancel all POSIX advisory locks on the
-    same file for all threads and all file descriptors in the process
-    -- https://sqlite.org/howtocorrupt.html#_posix_advisory_locks_canceled_by_a_separate_thread_doing_close_
-
-So a bare ``open(db_path, "rb") ... close()`` on a **live** database silently
-drops every lock SQLite holds on it from this process -- including the
-EXCLUSIVE lock a ``VACUUM`` is holding while it rewrites the whole file, and
-the RESERVED lock an in-flight ``BEGIN IMMEDIATE`` is holding. Other processes
-are then free to write into a file that a writer still believes it owns, which
-is the documented route to "database disk image is malformed".
-
-Hermes is exactly the topology this hits: gateway, dispatcher, dashboard,
-TUI, CLI, cron and kanban workers all open the same ``state.db`` /
-``kanban.db``, and several code paths used to byte-probe those files while
-connections were live.
-
-The rules
----------
-1. **Never** ``open()`` a database file that may have live connections in this
-   process. Ask SQLite instead -- :func:`page_count_bytes` reads the same
-   header field via ``PRAGMA``, over the existing connection, taking no new
-   descriptor.
-2. Byte-level probes are only safe **before any connection exists** for that
-   path (first-open validation). Route those through
-   :func:`read_header_bytes_preopen`, which refuses once a connection has been
-   registered for the path.
-
-Concurrency contract
---------------------
-The registry is not advisory bookkeeping -- it is the guard, so the
-check and the byte read must be **atomic with respect to connection
-lifecycle**. ``_live_lock`` is therefore held across three critical sections,
-each of which spans the syscall *and* the registry mutation:
-
-* open + register (:func:`connect_tracked`)
-* close + unregister (:meth:`TrackedConnection.close`)
-* check + ``open``/``read``/``close`` (:func:`read_header_bytes_preopen`)
-
-Without that, a thread could pass the "no live connection" check, a second
-thread could open a connection and take a write lock, and the first thread's
-``close()`` would then cancel it -- reintroducing the exact bug this module
-exists to prevent. The lock is never held while a caller *uses* a connection,
-only across these transitions, so it does not serialise database work.
-
-Path identity
--------------
-Connections are keyed by the **canonical database path**, resolved from
-``PRAGMA database_list`` on the opened connection. The caller's spelling is
-not trustworthy: ``SessionDB``'s read-only path opens
-``file:/…/state.db?mode=ro`` with ``uri=True``, and treating that string as a
-filesystem path yields a key like ``<cwd>/file:/…/state.db?mode=ro`` which no
-later probe of the real ``Path`` can ever match.
+The registry protects only registry state.  It is deliberately never retained
+while a connection opener, SQLite call, serial-lock wait, close hook, or raw
+file descriptor operation runs: reservations make those slow operations safe
+without creating a lifecycle/connection-lock ABBA cycle.
 """
 
 from __future__ import annotations
@@ -65,143 +12,274 @@ import contextlib
 import logging
 import os
 import sqlite3
+import sys
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+from urllib.parse import parse_qs, unquote, urlsplit
 
 logger = logging.getLogger(__name__)
 
 SQLITE_HEADER_MAGIC = b"SQLite format 3\x00"
 
-# Guards BOTH the registry and the lifecycle syscalls it describes. Reentrant
-# because connect_tracked -> _canonical_db_path -> ... stays on one thread.
 _live_lock = threading.RLock()
-# canonical path -> number of live connections opened by this process
 _live_connections: dict[str, int] = {}
+_pending_unresolved_opens = 0
+_raw_file_reservations: dict[str, int] = {}
+_offline_file_access_state = threading.local()
+
+_FILE = "file"
+_MEMORY = "memory"
+_UNRESOLVED = "unresolved"
 
 
 class UntrackableConnectionError(RuntimeError):
-    """A connection to a probe-able database could not be tracked.
+    """A file-backed connection cannot retain the raw-probe safety contract."""
 
-    Raised rather than silently returning an untracked connection: on these
-    paths tracking is part of the correctness contract, not an optimisation.
-    """
+
+class LiveConnectionError(RuntimeError):
+    """Raw access conflicts with an open, pending, or reserved database path."""
+
+
+@dataclass(frozen=True)
+class _DatabaseIdentity:
+    kind: str
+    path: str | None = None
 
 
 def _key(path: Path | str) -> str:
-    """Canonicalise a *filesystem* path for use as a registry key."""
     try:
         return str(Path(path).resolve())
-    except OSError:
+    except (OSError, RuntimeError, TypeError, ValueError):
         return str(path)
 
 
-def _canonical_db_path(conn: sqlite3.Connection) -> Optional[str]:
-    """The on-disk path of ``main``, as SQLite itself reports it.
-
-    Immune to the caller's spelling (``file:`` URIs, relative paths, symlinks).
-    Returns ``None`` for in-memory or unnamed databases, which cannot be
-    byte-probed and therefore need no tracking.
-    """
+def _identity(path: Path | str, *, uri: bool = False) -> _DatabaseIdentity:
+    """Classify a requested location without opening a file descriptor."""
+    if not uri or not isinstance(path, str) or not path.startswith("file:"):
+        return _DatabaseIdentity(_FILE, _key(path))
     try:
-        row = conn.execute("PRAGMA database_list").fetchone()
+        parsed = urlsplit(path)
+    except ValueError:
+        return _DatabaseIdentity(_UNRESOLVED)
+    if parsed.scheme != "file" or parsed.netloc not in ("", "localhost"):
+        return _DatabaseIdentity(_UNRESOLVED)
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    candidate = unquote(parsed.path)
+    if candidate in ("", ":memory:") or query.get("mode") == ["memory"]:
+        return _DatabaseIdentity(_MEMORY)
+    return _DatabaseIdentity(_FILE, _key(candidate))
+
+
+def _increment(counts: dict[str, int], key: str) -> None:
+    counts[key] = counts.get(key, 0) + 1
+
+
+def _decrement(counts: dict[str, int], key: str, *, label: str) -> None:
+    count = counts.get(key, 0)
+    if count <= 0:
+        raise RuntimeError(f"SQLite {label} accounting underflow for {key}")
+    if count == 1:
+        del counts[key]
+    else:
+        counts[key] = count - 1
+
+
+def _begin_pending_open(requested: _DatabaseIdentity) -> None:
+    """Reserve the unknown actual identity before invoking arbitrary code."""
+    global _pending_unresolved_opens
+    with _live_lock:
+        if requested.kind == _FILE and requested.path and _raw_file_reservations.get(requested.path):
+            raise LiveConnectionError(
+                "refusing SQLite open while raw file access owns the database path"
+            )
+        _pending_unresolved_opens += 1
+
+
+def _finish_pending_open(actual: _DatabaseIdentity | None) -> None:
+    global _pending_unresolved_opens
+    with _live_lock:
+        if _pending_unresolved_opens <= 0:
+            raise RuntimeError("SQLite unresolved-open accounting underflow")
+        _pending_unresolved_opens -= 1
+        if actual is not None and actual.kind == _FILE and actual.path:
+            _increment(_live_connections, actual.path)
+
+
+def _post_open_identity(connection: sqlite3.Connection) -> _DatabaseIdentity:
+    """Ask SQLite for the main DB identity outside the registry lock."""
+    try:
+        cursor = sqlite3.Connection.execute(connection, "PRAGMA database_list")
+        row = sqlite3.Cursor.fetchone(cursor)
     except sqlite3.Error:
-        return None
-    if not row or len(row) < 3:
-        return None
-    path_str = row[2]
-    if not path_str:
-        return None
-    return _key(path_str)
+        return _DatabaseIdentity(_UNRESOLVED)
+    if not row or len(row) < 3 or not isinstance(row[2], str):
+        return _DatabaseIdentity(_UNRESOLVED)
+    if not row[2]:
+        return _DatabaseIdentity(_MEMORY)
+    return _DatabaseIdentity(_FILE, _key(row[2]))
+
+
+def _canonical_db_path(connection: sqlite3.Connection) -> Optional[str]:
+    identity = _post_open_identity(connection)
+    return identity.path if identity.kind == _FILE else None
 
 
 def track_connection(path: Path | str) -> None:
-    """Record that this process now holds a connection to *path*.
-
-    Prefer :func:`connect_tracked`; this exists for callers that manage their
-    own connection objects, and for tests.
-    """
     key = _key(path)
     with _live_lock:
-        _live_connections[key] = _live_connections.get(key, 0) + 1
+        _increment(_live_connections, key)
 
 
 def untrack_connection(path: Path | str) -> None:
-    """Record that one connection to *path* has been closed."""
     key = _key(path)
     with _live_lock:
-        remaining = _live_connections.get(key, 0) - 1
-        if remaining > 0:
-            _live_connections[key] = remaining
-        else:
-            _live_connections.pop(key, None)
+        _decrement(_live_connections, key, label="live-connection")
 
 
 def has_live_connection(path: Path | str) -> bool:
-    """Whether this process currently holds any connection to *path*."""
+    key = _key(path)
     with _live_lock:
-        return _key(path) in _live_connections
+        return bool(_pending_unresolved_opens or _live_connections.get(key, 0))
+
+
+def _is_physically_closed(connection: sqlite3.Connection) -> bool:
+    try:
+        cursor = sqlite3.Connection.execute(connection, "SELECT 1")
+        sqlite3.Cursor.fetchone(cursor)
+    except sqlite3.ProgrammingError as exc:
+        # Only SQLite's closed-handle result proves physical retirement.
+        # Thread-affinity and other ProgrammingError cases leave the owner live.
+        return str(exc) == "Cannot operate on a closed database."
+    except sqlite3.Error:
+        return False
+    return False
+
+
+def _attach_cleanup_error(primary: BaseException, cleanup: BaseException) -> None:
+    try:
+        setattr(primary, "_hermes_cleanup_error", cleanup)
+    except Exception:
+        logger.debug("unable to attach rejected SQLite cleanup failure", exc_info=True)
+
+
+def close_rejected_handle_once(handle) -> BaseException | None:
+    """Close an unexposed rejected handle without redispatching a hook twice."""
+    if not isinstance(handle, sqlite3.Connection):
+        return None
+    primary = None
+    try:
+        handle.close()
+    except BaseException as exc:
+        primary = exc
+    if not _is_physically_closed(handle):
+        try:
+            sqlite3.Connection.close(handle)
+        except BaseException as exc:
+            return primary or exc
+    return primary
 
 
 class _TrackingMixin:
-    """Untrack-on-close behaviour, mixable into any Connection subclass."""
+    """Physical-close accounting composed ahead of arbitrary connection classes."""
 
     _hermes_tracked_path: str | None = None
+    _hermes_close_hook_invoked = False
+    _hermes_native_close_complete = False
+    _hermes_tracking_close_active = False
 
     def close(self) -> None:  # type: ignore[misc]
-        with _live_lock:
-            path = getattr(self, "_hermes_tracked_path", None)
-            # Close first; untrack only once the descriptor is actually gone.
-            # Untracking before a failing close (e.g. cross-thread
-            # ProgrammingError) leaves the FD open while the byte-probe
-            # guard thinks nothing is live — see #75629.
-            super().close()  # type: ignore[misc]
-            if path is not None:
-                self._hermes_tracked_path = None
-                untrack_connection(path)
+        if getattr(self, "_hermes_native_close_complete", False):
+            return
+        if getattr(self, "_hermes_tracking_close_active", False):
+            return
+
+        serial_lock = None
+        serial_mixin = getattr(sys.modules.get("hermes_state"), "_SerializedConnectionMixin", None)
+        if getattr(self, "_hermes_serial_lock", None) is not None or (
+            serial_mixin is not None and serial_mixin in type(self).__mro__
+        ):
+            from hermes_state import _serial_lock_for_connection
+
+            serial_lock = _serial_lock_for_connection(self)
+            boundary = serial_lock
+        else:
+            boundary = contextlib.nullcontext()
+
+        primary: BaseException | None = None
+        cleanup: BaseException | None = None
+        with boundary:
+            if serial_lock is not None:
+                from hermes_state import _serial_lock_for_connection
+
+                if _serial_lock_for_connection(self) is not serial_lock:
+                    raise UntrackableConnectionError("connection serial owner changed during close")
+            self._hermes_tracking_close_active = True
+            try:
+                if not getattr(self, "_hermes_close_hook_invoked", False):
+                    self._hermes_close_hook_invoked = True
+                    try:
+                        super().close()  # type: ignore[misc]
+                    except BaseException as exc:
+                        primary = exc
+                # Custom dispatch is allowed one primary failure, but physical
+                # ownership stays here: direct native cleanup must still run
+                # exactly once without redispatching that hook.
+                if not _is_physically_closed(self):
+                    try:
+                        sqlite3.Connection.close(self)
+                    except BaseException as exc:
+                        cleanup = exc
+                if _is_physically_closed(self):
+                    self._hermes_native_close_complete = True
+                    path = getattr(self, "_hermes_tracked_path", None)
+                    if path is not None:
+                        with _live_lock:
+                            _decrement(_live_connections, path, label="live-connection")
+                        self._hermes_tracked_path = None
+            finally:
+                self._hermes_tracking_close_active = False
+
+        if primary is not None:
+            if cleanup is not None:
+                _attach_cleanup_error(primary, cleanup)
+            raise primary
+        if cleanup is not None:
+            raise cleanup
 
 
 class TrackedConnection(_TrackingMixin, sqlite3.Connection):
-    """A ``sqlite3.Connection`` that untracks its path exactly once on close.
-
-    Counting opens is easy; counting closes reliably is not, because callers
-    close connections in many places (and some hand them to
-    ``contextlib.closing``). Putting the decrement on ``close()`` — the one
-    method every close path must go through — keeps the registry from
-    drifting upward and permanently disabling byte-probes.
-
-    The real ``close()`` and the unregister happen together under
-    ``_live_lock`` so a concurrent probe can never observe "no live
-    connection" while this descriptor is still open. Unregister runs only
-    after ``close()`` succeeds; a raising close leaves the connection
-    tracked so the byte-probe guard keeps refusing.
-
-    Note ``with conn:`` does NOT close a sqlite3 connection (it only commits or
-    rolls back), so this hook is not fired spuriously by transaction scopes.
-    """
+    pass
 
 
-_tracked_factory_cache: dict[type, type] = {}
+_tracking_factories: dict[type, type] = {}
 
 
 def _tracking_factory(factory: type) -> type:
-    """Return *factory* augmented with untrack-on-close.
-
-    Callers legitimately supply their own ``Connection`` subclasses (the test
-    suite uses them to simulate FTS5-less or pragma-failing runtimes). Rather
-    than refusing those — or silently leaving them untracked, which would
-    quietly unguard the database — we mix the tracking ``close()`` into the
-    caller's class so tracking is preserved either way.
-    """
     if factory is sqlite3.Connection:
         return TrackedConnection
+    if not isinstance(factory, type) or not issubclass(factory, sqlite3.Connection):
+        return factory
     if issubclass(factory, _TrackingMixin):
         return factory
-    cached = _tracked_factory_cache.get(factory)
-    if cached is None:
-        cached = type(f"Tracked{factory.__name__}", (_TrackingMixin, factory), {})
-        _tracked_factory_cache[factory] = cached
-    return cached
+    mixed = _tracking_factories.get(factory)
+    if mixed is None:
+        mixed = type(f"Tracked{factory.__name__}", (_TrackingMixin, factory), {})
+        _tracking_factories[factory] = mixed
+    return mixed
+
+
+def _retrofit_tracking(connection: sqlite3.Connection) -> sqlite3.Connection:
+    if isinstance(connection, _TrackingMixin):
+        return connection
+    try:
+        connection.__class__ = _tracking_factory(type(connection))
+    except (AttributeError, TypeError) as exc:
+        raise UntrackableConnectionError(
+            "SQLite connection cannot retain physical-close tracking"
+        ) from exc
+    return connection
 
 
 def connect_tracked(
@@ -211,202 +289,110 @@ def connect_tracked(
     connect_fn=None,
     **kwargs,
 ) -> sqlite3.Connection:
-    """``sqlite3.connect`` that registers the connection for the lifetime of the fd.
-
-    Use for any connection to a database whose file might otherwise be
-    byte-probed (``state.db``, ``kanban.db``). The registration is released
-    automatically on ``close()``.
-
-    The open and the registration happen together under ``_live_lock``, so a
-    concurrent :func:`read_header_bytes_preopen` cannot slip between them and
-    cancel this connection's locks.
-
-    The registry key is the canonical path reported by ``PRAGMA
-    database_list`` -- not *path*, which may be a ``file:`` URI. Pass
-    ``tracking_path`` to override when the caller already knows the real path.
-
-    ``connect_fn`` lets a caller supply its own opener (defaults to
-    :func:`sqlite3.connect`), so a module that owns the connection — and any
-    test that patches that module's ``sqlite3.connect`` — keeps control of how
-    the connection is created while this helper owns tracking.
-
-    A caller-supplied ``factory`` is honoured but is transparently augmented
-    with untrack-on-close, so tracking is never silently skipped. If a
-    file-backed connection still cannot be tracked,
-    :class:`UntrackableConnectionError` is raised rather than handing back a
-    connection whose database has quietly lost byte-probe protection.
-    """
+    """Open a tracked connection without holding ``_live_lock`` across SQLite."""
     opener = connect_fn if connect_fn is not None else sqlite3.connect
-    kwargs["factory"] = _tracking_factory(kwargs.get("factory", sqlite3.Connection))
+    # Every tracked cohort opener—direct or callable transfer—must compose the
+    # physical serialization owner before tracking adds its close accounting.
+    # The import is intentionally lazy: ``hermes_state`` calls this helper only
+    # after defining the serialization types, while Kanban reaches it directly.
+    from hermes_state import _ensure_serialized_connection, _serialized_connection_factory
 
-    with _live_lock:
-        conn = opener(str(path), **kwargs)
-        try:
-            resolved = (
-                _key(tracking_path)
-                if tracking_path is not None
-                else _canonical_db_path(conn)
-            )
-            if resolved is None:
-                # In-memory / unnamed: nothing on disk to byte-probe.
-                return conn
-            if not isinstance(conn, _TrackingMixin):
-                # The opener substituted its own factory and discarded ours
-                # (test doubles simulating FTS5-less runtimes do this). Retag
-                # the instance's class with the tracking mixin so close() still
-                # releases the registry entry, rather than handing back a
-                # connection whose database has silently lost probe safety.
-                conn = _retrofit_tracking(conn, resolved)
-            conn._hermes_tracked_path = resolved
-            _live_connections[resolved] = _live_connections.get(resolved, 0) + 1
-            return conn
-        except Exception:
-            try:
-                # Close via sqlite3 directly: the tracking entry was either
-                # never made or is being unwound here.
-                sqlite3.Connection.close(conn)
-            except Exception:
-                pass
-            raise
-
-
-def _retrofit_tracking(conn: sqlite3.Connection, resolved: str) -> sqlite3.Connection:
-    """Give an already-open connection untrack-on-close semantics.
-
-    ``sqlite3.Connection`` subclasses are ordinary Python classes, so the
-    instance's ``__class__`` can be swapped for one that mixes in the tracking
-    ``close()``. Used when an opener ignored the factory we asked for.
-    """
-    cls = type(conn)
-    if issubclass(cls, _TrackingMixin):
-        return conn
+    requested = _identity(path, uri=bool(kwargs.get("uri")))
+    expected = _identity(tracking_path) if tracking_path is not None else requested
+    kwargs["factory"] = _tracking_factory(
+        _serialized_connection_factory(kwargs.get("factory", sqlite3.Connection))
+    )
+    _begin_pending_open(requested)
+    published = False
+    connection = None
     try:
-        conn.__class__ = _tracking_factory(cls)  # type: ignore[assignment]
-        return conn
-    except TypeError as exc:
-        raise UntrackableConnectionError(
-            f"connection to {resolved} uses factory {cls.__name__}, which "
-            "cannot release its tracking entry on close; byte-probe safety "
-            "for this database would be silently lost"
-        ) from exc
+        connection = opener(str(path), **kwargs)
+        if not isinstance(connection, sqlite3.Connection):
+            raise UntrackableConnectionError("SQLite opener returned a non-connection")
+        connection = _ensure_serialized_connection(connection)
+        actual = _post_open_identity(connection)
+        if actual.kind == _UNRESOLVED:
+            raise UntrackableConnectionError("SQLite database identity is unresolved after open")
+        if expected.kind == _FILE and (actual.kind != _FILE or actual.path != expected.path):
+            raise UntrackableConnectionError("SQLite opener resolved a different database path")
+        if actual.kind == _FILE:
+            connection = _retrofit_tracking(connection)
+            connection._hermes_tracked_path = actual.path
+        _finish_pending_open(actual)
+        published = True
+        return connection
+    except BaseException as exc:
+        if connection is not None:
+            cleanup_error = close_rejected_handle_once(connection)
+            if cleanup_error is not None:
+                _attach_cleanup_error(exc, cleanup_error)
+        raise
+    finally:
+        if not published:
+            _finish_pending_open(None)
 
 
-def page_count_bytes(conn: sqlite3.Connection) -> Optional[int]:
-    """Logical database size in bytes, read through *conn*.
-
-    ``page_count * page_size`` is the same quantity the 4-byte header field at
-    offset 28 carries, but reading it via ``PRAGMA`` opens no new file
-    descriptor and therefore cannot cancel this process's POSIX locks.
-
-    Returns ``None`` when the pragmas cannot be read.
-    """
+def page_count_bytes(connection: sqlite3.Connection) -> Optional[int]:
     try:
-        page_count = conn.execute("PRAGMA page_count").fetchone()[0]
-        page_size = conn.execute("PRAGMA page_size").fetchone()[0]
-    except (sqlite3.Error, TypeError, IndexError) as exc:
-        logger.debug("page_count/page_size unavailable: %s", exc)
-        return None
-    try:
+        page_count = connection.execute("PRAGMA page_count").fetchone()[0]
+        page_size = connection.execute("PRAGMA page_size").fetchone()[0]
         return int(page_count) * int(page_size)
-    except (TypeError, ValueError):
+    except (sqlite3.Error, TypeError, IndexError, ValueError):
         return None
 
 
-def file_length_matches_header(conn: sqlite3.Connection) -> Optional[bool]:
-    """Whether the file on disk is at least as long as the header claims.
-
-    Detects the "torn extend" shape (file shorter than its own page count)
-    without ever opening the database file: the header side comes from
-    ``PRAGMA page_count`` over *conn*, and the on-disk side from ``stat()``,
-    which takes no descriptor and cannot break locks.
-
-    Returns ``None`` when the check is not applicable (in-memory database,
-    unreadable pragmas, or a stat failure).
-
-    Note: in WAL mode a freshly committed page may still live in the ``-wal``
-    file, so the main file legitimately lags. Callers must treat this as
-    advisory unless the database is in a rollback journal mode.
-    """
-    path_str = _canonical_db_path(conn)
-    if path_str is None:
-        return None
-
-    logical = page_count_bytes(conn)
-    if not logical:
+def file_length_matches_header(connection: sqlite3.Connection) -> Optional[bool]:
+    path = _canonical_db_path(connection)
+    logical = page_count_bytes(connection)
+    if path is None or not logical:
         return None
     try:
-        actual = os.path.getsize(path_str)
+        return os.path.getsize(path) >= logical
     except OSError:
         return None
-    return actual >= logical
+
+
+def _reserve_raw_access(path: Path | str, *, force: bool) -> str | None:
+    key = _key(path)
+    with _live_lock:
+        unsafe = _pending_unresolved_opens or _live_connections.get(key, 0)
+        if unsafe and not force:
+            return None
+        _increment(_raw_file_reservations, key)
+    return key
+
+
+def _release_raw_access(key: str) -> None:
+    with _live_lock:
+        _decrement(_raw_file_reservations, key, label="raw-file reservation")
 
 
 def read_header_bytes_preopen(
-    path: Path | str,
-    *,
-    length: int = 100,
-    force: bool = False,
+    path: Path | str, *, length: int = 100, force: bool = False
 ) -> Optional[bytes]:
-    """Read the first *length* bytes of *path* -- only when no connection is live.
-
-    This is the ONLY sanctioned byte-level read of a database file, and it is
-    restricted to first-open validation (is this file a real SQLite database,
-    is it zeroed, has it been overwritten by something else). Once any
-    connection to *path* exists in this process, the read is refused and
-    ``None`` is returned, because the ``close()`` would cancel that
-    connection's POSIX locks.
-
-    The registry check and the ``open``/``read``/``close`` are performed
-    together under ``_live_lock``, so a connection cannot be opened in the
-    window between deciding "nothing is live" and closing this descriptor.
-
-    Set ``force=True`` only for genuinely offline files (quarantined copies,
-    snapshot artifacts, archives) that no live connection can reference.
-    """
-    with _live_lock:
-        if not force and _key(path) in _live_connections:
-            logger.debug(
-                "refusing byte-level read of %s: a live connection exists in "
-                "this process and close() would cancel its POSIX locks",
-                path,
-            )
-            return None
+    """Read a header only while a reservation excludes new tracked opens."""
+    reservation = _reserve_raw_access(path, force=force)
+    if reservation is None:
+        return None
+    try:
         try:
             with open(path, "rb") as handle:
                 return handle.read(length)
         except OSError:
             return None
-
-
-class LiveConnectionError(RuntimeError):
-    """A raw file operation was attempted on a database with live connections."""
+    finally:
+        _release_raw_access(reservation)
 
 
 @contextlib.contextmanager
 def offline_file_access(path: Path | str, *, what: str = "read"):
-    """Hold the connection-lifecycle lock across a raw read of a database file.
-
-    Checking :func:`has_live_connection` and *then* doing the raw I/O is a
-    check/use race: a connection can be opened in the window between the two,
-    and the raw ``close()`` will cancel its POSIX advisory locks — the exact
-    failure class the registry exists to prevent. Any multi-step raw access
-    (copying a database plus its ``-wal``/``-shm``/``-journal`` sidecars,
-    hashing a file, moving a bundle aside) must therefore run *inside* this
-    context manager rather than after a bare check.
-
-    While held, :func:`connect_tracked` blocks, so no new connection can
-    appear mid-copy. Raises :class:`LiveConnectionError` if a connection is
-    already live when the guard is entered.
-
-    The lock is only held for the duration of the raw I/O; it never spans
-    caller work on an open connection, so it does not serialise database use.
-    """
-    with _live_lock:
-        if _key(path) in _live_connections:
-            raise LiveConnectionError(
-                f"Refusing to {what} {path}: a connection to it is still open "
-                "in this process, and raw file access would cancel that "
-                "connection's POSIX advisory locks. Close all database "
-                "handles (stop the gateway/dashboard) and retry."
-            )
+    """Reserve raw descriptor access without retaining the lifecycle mutex."""
+    reservation = _reserve_raw_access(path, force=False)
+    if reservation is None:
+        raise LiveConnectionError(
+            f"Refusing to {what} {path}: a connection is live or opening in this process"
+        )
+    try:
         yield
+    finally:
+        _release_raw_access(reservation)
