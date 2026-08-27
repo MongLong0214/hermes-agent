@@ -1571,50 +1571,122 @@ class TestV1SpecRegressionFixes:
         assert "two" not in adapter._agents
 
     def test_forward_to_profile_first_contact_creates_then_resumes_fake_hermes(self, monkeypatch, tmp_path):
-        from plugins.platforms.a2a.adapter import A2AAdapter
+        import sqlite3
+        import sys
+
         from gateway.config import PlatformConfig
+        from hermes_state import SessionDB
+        from plugins.platforms.a2a.adapter import A2AAdapter
 
         profile_home = tmp_path / "profile"
         profile_home.mkdir()
         db = profile_home / "state.db"
-        import sqlite3
-        con = sqlite3.connect(db)
-        con.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, started_at REAL, title TEXT)")
-        con.commit(); con.close()
+        session_db = SessionDB(db_path=db)
+        session_db.close()
 
         fakebin = tmp_path / "bin"
         fakebin.mkdir()
         calls = tmp_path / "calls.jsonl"
         hermes = fakebin / "hermes"
-        hermes.write_text("""#!/usr/bin/env python3
-import json, os, sqlite3, sys, time
+        hermes.write_text("#!" + sys.executable + "\n" + """import json, os, sqlite3, sys, time
+from hermes_state_common import register_turn_fence_generation
 calls = os.environ['FAKE_HERMES_CALLS']
 with open(calls, 'a') as f:
     f.write(json.dumps(sys.argv[1:]) + '\\n')
 home = os.environ['HERMES_HOME']
 con = sqlite3.connect(os.path.join(home, 'state.db'))
+register_turn_fence_generation(con)
 if '--resume' not in sys.argv:
-    con.execute('INSERT INTO sessions (id, source, started_at, title) VALUES (?, ?, ?, ?)', ('sess-1', 'a2a', time.time(), None))
+    session_count = con.execute("SELECT COUNT(*) FROM sessions WHERE source = 'a2a'").fetchone()[0]
+    session_id = f'sess-{session_count + 1}'
+    con.execute('INSERT INTO sessions (id, source, started_at, title) VALUES (?, ?, ?, ?)', (session_id, 'a2a', time.time(), None))
     con.commit()
+con.close()
 print('fake reply')
 """)
         hermes.chmod(0o755)
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
         monkeypatch.setenv("PATH", str(fakebin) + os.pathsep + os.environ.get("PATH", ""))
+        monkeypatch.setenv("PYTHONPATH", repo_root + os.pathsep + os.environ.get("PYTHONPATH", ""))
         monkeypatch.setenv("FAKE_HERMES_CALLS", str(calls))
         monkeypatch.setattr("plugins.platforms.a2a.adapter._profile_home", lambda profile: str(profile_home))
 
-        adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
+        config = PlatformConfig(enabled=True, extra={
             "agents": {"dev": {"profile": "dev", "tenant": "dev", "timeout": 5}}
-        }))
+        })
+        adapter = A2AAdapter(config)
         agent = adapter._agents["dev"]
         reply, state = adapter._forward_to_profile(agent, "peer", "ctx/unsafe value", "hello")
         assert (reply, state) == ("fake reply", protocol.STATE_COMPLETED)
-        reply2, state2 = adapter._forward_to_profile(agent, "peer", "ctx/unsafe value", "again")
+
+        restarted_adapter = A2AAdapter(config)
+        restarted_agent = restarted_adapter._agents["dev"]
+        reply2, state2 = restarted_adapter._forward_to_profile(
+            restarted_agent, "peer", "ctx/unsafe value", "again"
+        )
         assert (reply2, state2) == ("fake reply", protocol.STATE_COMPLETED)
+
         argv_lines = [json.loads(line) for line in calls.read_text().splitlines()]
         assert "--resume" not in argv_lines[0]
-        assert argv_lines[1][argv_lines[1].index("--resume") + 1] == "sess-1"
-        con = sqlite3.connect(db)
-        title = con.execute("SELECT title FROM sessions WHERE id='sess-1'").fetchone()[0]
-        con.close()
-        assert title == "a2a-dev-ctx-unsafe-value"
+        second_resume = (
+            argv_lines[1][argv_lines[1].index("--resume") + 1]
+            if "--resume" in argv_lines[1]
+            else None
+        )
+        with sqlite3.connect(db) as con:
+            sessions = con.execute(
+                "SELECT id, title FROM sessions WHERE source = 'a2a' ORDER BY id"
+            ).fetchall()
+        assert {
+            "second_resume": second_resume,
+            "sessions": sessions,
+        } == {
+            "second_resume": "sess-1",
+            "sessions": [("sess-1", "a2a-dev-ctx-unsafe-value")],
+        }
+
+    @pytest.mark.parametrize("invalid_scalar", ["future", "malformed"])
+    def test_a2a_profile_state_generation_rejects_incompatible_scalar_before_title_mutation(
+        self, monkeypatch, tmp_path, invalid_scalar
+    ):
+        import sqlite3
+
+        from gateway.config import PlatformConfig
+        from hermes_state import SessionDB
+        from hermes_state_common import SCHEMA_VERSION, register_turn_fence_generation
+        from plugins.platforms.a2a.adapter import A2AAdapter
+
+        profile_home = tmp_path / "profile"
+        profile_home.mkdir()
+        db = profile_home / "state.db"
+        session_db = SessionDB(db_path=db)
+        session_db.close()
+
+        schema_value = SCHEMA_VERSION + 1 if invalid_scalar == "future" else "malformed"
+        with sqlite3.connect(db) as con:
+            register_turn_fence_generation(con)
+            con.execute(
+                "INSERT INTO sessions (id, source, started_at, title) VALUES (?, ?, ?, ?)",
+                ("sess-1", "a2a", 1.0, "before"),
+            )
+            con.execute("UPDATE schema_version SET version = ?", (schema_value,))
+            con.commit()
+
+        monkeypatch.setattr(
+            "plugins.platforms.a2a.adapter._profile_home", lambda profile: str(profile_home)
+        )
+        adapter = A2AAdapter(PlatformConfig(enabled=True, extra={}))
+        adapter._title_forward_session("dev", "sess-1", "after")
+
+        with sqlite3.connect(db) as con:
+            title = con.execute(
+                "SELECT title FROM sessions WHERE id = ?", ("sess-1",)
+            ).fetchone()[0]
+            stored_scalar = con.execute(
+                "SELECT version, typeof(version) FROM schema_version"
+            ).fetchone()
+        assert title == "before"
+        assert stored_scalar == (
+            schema_value,
+            "integer" if invalid_scalar == "future" else "text",
+        )

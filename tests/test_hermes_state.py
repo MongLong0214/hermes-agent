@@ -12,6 +12,7 @@ import pytest
 import hermes_state
 from agent.session_activity import ActivityProvenance
 from hermes_state import SCHEMA_SQL, SCHEMA_VERSION, SessionDB
+from hermes_state_common import register_turn_fence_generation
 
 
 class _NoFtsCursor(sqlite3.Cursor):
@@ -104,6 +105,80 @@ def _no_fts_rebuild_throttle(monkeypatch):
 
 
 class TestConnectionLifecycle:
+    def test_schema_version_existing_future_fails_before_package_mutation(
+        self, tmp_path, monkeypatch
+    ):
+        """An existing future store is rejected before SessionDB can write it."""
+        db_path = tmp_path / "future-state.db"
+        seed = sqlite3.connect(str(db_path))
+        seed.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
+        seed.execute(
+            "INSERT INTO schema_version (version) VALUES (?)",
+            (SCHEMA_VERSION + 1,),
+        )
+        seed.commit()
+        seed.close()
+
+        statements = []
+        real_connect = hermes_state._connect_tracked_db
+
+        def trace_connection(*args, **kwargs):
+            conn = real_connect(*args, **kwargs)
+            conn.set_trace_callback(statements.append)
+            return conn
+
+        monkeypatch.setattr(hermes_state, "_connect_tracked_db", trace_connection)
+
+        with pytest.raises(RuntimeError) as raised:
+            SessionDB(db_path=db_path)
+
+        error = raised.value
+        assert isinstance(error, hermes_state.IncompatibleSchemaError)
+        assert error.code == "STATE_DB_SCHEMA_INCOMPATIBLE"
+        assert error.args == ("Session state is incompatible with this Hermes version.",)
+        assert str(error) == "Session state is incompatible with this Hermes version."
+        assert hermes_state.get_last_init_error() == (
+            "STATE_DB_SCHEMA_INCOMPATIBLE: "
+            "Session state is incompatible with this Hermes version."
+        )
+        assert not any(
+            statement.lstrip().upper().startswith(
+                ("PRAGMA", "CREATE", "ALTER", "INSERT", "UPDATE", "DELETE")
+            )
+            for statement in statements
+        )
+
+    @pytest.mark.parametrize(
+        "values",
+        (
+            (),
+            (0, 1),
+            ("text",),
+            (3.5,),
+            (sqlite3.Binary(b"blob"),),
+            (None,),
+            (-1,),
+            (float(2**63),),
+        ),
+    )
+    def test_schema_version_existing_malformed_scalar_is_rejected_read_only(
+        self, tmp_path, values
+    ):
+        """Malformed scalar rows fail closed on a read-only open without repair."""
+        db_path = tmp_path / "invalid-state.db"
+        seed = sqlite3.connect(str(db_path))
+        if values:
+            seed.execute("CREATE TABLE schema_version (version)")
+            seed.executemany(
+                "INSERT INTO schema_version (version) VALUES (?)",
+                [(value,) for value in values],
+            )
+        seed.commit()
+        seed.close()
+
+        with pytest.raises(hermes_state.IncompatibleSchemaError):
+            SessionDB(db_path=db_path, read_only=True)
+
     def test_failed_writable_open_does_not_leak_tracked_connection(
         self, tmp_path, monkeypatch
     ):
@@ -1535,6 +1610,7 @@ class TestSessionTitleIndexRepair:
         session_db.close()
 
         with sqlite3.connect(db_path) as conn:
+            register_turn_fence_generation(conn)
             conn.execute("DROP INDEX idx_sessions_title_unique")
             if duplicate_titles:
                 conn.execute(

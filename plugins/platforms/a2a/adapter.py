@@ -802,49 +802,71 @@ class A2AAdapter(BasePlatformAdapter):
             return None
         return os.path.join(home, "state.db")
 
+    def _open_profile_state(self, db: str) -> sqlite3.Connection:
+        from hermes_state import _validate_connection_schema
+        from hermes_state_common import register_turn_fence_generation
+
+        con = sqlite3.connect(db, timeout=5)
+        try:
+            register_turn_fence_generation(con)
+            _validate_connection_schema(con)
+        except Exception:
+            con.close()
+            raise
+        return con
+
     def _lookup_forward_session(self, profile: str, title: str) -> str:
         db = self._profile_state_db(profile)
         if not db or not os.path.exists(db):
             return ""
+        con = None
         try:
-            con = sqlite3.connect(db, timeout=5)
+            con = self._open_profile_state(db)
             row = con.execute(
                 "SELECT id FROM sessions WHERE title = ? ORDER BY started_at DESC LIMIT 1",
                 (title,),
             ).fetchone()
-            con.close()
             return str(row[0]) if row else ""
         except Exception:
             logger.debug("A2A: could not lookup forwarded session", exc_info=True)
             return ""
+        finally:
+            if con is not None:
+                con.close()
 
     def _latest_a2a_session(self, profile: str, started_after: float) -> str:
         db = self._profile_state_db(profile)
         if not db or not os.path.exists(db):
             return ""
+        con = None
         try:
-            con = sqlite3.connect(db, timeout=5)
+            con = self._open_profile_state(db)
             row = con.execute(
                 "SELECT id FROM sessions WHERE source = 'a2a' AND started_at >= ? ORDER BY started_at DESC LIMIT 1",
                 (started_after - 2.0,),
             ).fetchone()
-            con.close()
             return str(row[0]) if row else ""
         except Exception:
             logger.debug("A2A: could not find latest forwarded session", exc_info=True)
             return ""
+        finally:
+            if con is not None:
+                con.close()
 
     def _title_forward_session(self, profile: str, session_id: str, title: str) -> None:
         db = self._profile_state_db(profile)
         if not db or not os.path.exists(db) or not session_id:
             return
+        con = None
         try:
-            con = sqlite3.connect(db, timeout=5)
+            con = self._open_profile_state(db)
             con.execute("UPDATE sessions SET title = ? WHERE id = ?", (title, session_id))
             con.commit()
-            con.close()
         except Exception:
             logger.debug("A2A: could not title forwarded session", exc_info=True)
+        finally:
+            if con is not None:
+                con.close()
 
     def _forward_to_profile(self, agent: dict, peer: str, context_id: str, framed_text: str) -> tuple[str, str]:
         """Forward a routed A2A task to another local Hermes profile.

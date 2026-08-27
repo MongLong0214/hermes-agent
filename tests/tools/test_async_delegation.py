@@ -65,6 +65,30 @@ def _drain_for(delegation_id, timeout=5.0):
     return None
 
 
+def test_async_connect_registers_generation_before_writing_delegations(
+    tmp_path, monkeypatch
+):
+    """The async raw connection can write only after package registration."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+
+    conn = ad._connect()
+    try:
+        assert conn.execute("SELECT version FROM schema_version").fetchall() == [(27,)]
+        conn.execute(
+            "INSERT INTO async_delegations "
+            "(delegation_id, origin_session, state, dispatched_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("generation-fence", "origin", "pending", 1.0, 1.0),
+        )
+        conn.commit()
+        assert conn.execute(
+            "SELECT delegation_id FROM async_delegations "
+            "WHERE delegation_id = 'generation-fence'"
+        ).fetchone() == ("generation-fence",)
+    finally:
+        conn.close()
+
+
 def test_active_for_session_counts_every_live_delegation_state():
     with ad._records_lock:
         ad._records.update(
@@ -824,4 +848,3 @@ def test_batch_truncation_banner_marks_only_truncated_task():
     banner_pos = text.index("TRUNCATED")
     # The header banner for task 2 appears after task 1's summary.
     assert banner_pos > clean_pos
-
