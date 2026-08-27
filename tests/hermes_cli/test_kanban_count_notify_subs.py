@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+import hermes_cli.sqlite_safe_read as sqlite_safe_read
 
 
 @pytest.fixture
@@ -129,3 +130,49 @@ def test_count_notify_subs_filters_profile_owners(tmp_path):
         notifier_profiles={"default"},
         include_unowned=True,
     ) == 2
+
+
+def test_count_notify_subs_uses_tracked_read_only_connection(tmp_path, monkeypatch):
+    resolved_db_path = (tmp_path / "kanban.db").resolve()
+    kb.init_db(resolved_db_path)
+    conn = kb.connect(resolved_db_path)
+    try:
+        task_id = kb.create_task(conn, title="matching")
+        kb.add_notify_sub(
+            conn, task_id=task_id, platform="tui", chat_id="session-1"
+        )
+    finally:
+        conn.close()
+
+    assert not sqlite_safe_read.has_live_connection(resolved_db_path)
+
+    real_connect_tracked = sqlite_safe_read.connect_tracked
+    tracked_calls = []
+
+    def forwarding_connect(path, **kwargs):
+        tracking_path = kwargs["tracking_path"]
+        connect_fn = kwargs["connect_fn"]
+        tracked_calls.append(
+            {
+                "uri": path,
+                "kwargs": dict(kwargs),
+                "tracking_path": tracking_path,
+                "connect_fn": connect_fn,
+            }
+        )
+        conn = real_connect_tracked(path, **kwargs)
+        assert sqlite_safe_read.has_live_connection(resolved_db_path)
+        return conn
+
+    monkeypatch.setattr(
+        sqlite_safe_read, "connect_tracked", forwarding_connect
+    )
+
+    assert kb.count_notify_subs(db_path=resolved_db_path) == 1
+    assert len(tracked_calls) == 1
+    call = tracked_calls[0]
+    assert call["uri"] == resolved_db_path.as_uri() + "?mode=ro"
+    assert call["kwargs"]["uri"] is True
+    assert call["tracking_path"] == resolved_db_path
+    assert call["connect_fn"] is sqlite3.connect
+    assert not sqlite_safe_read.has_live_connection(resolved_db_path)
