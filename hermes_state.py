@@ -5370,6 +5370,136 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._insert_session_row(session_id, source, **kwargs)
         return session_id
 
+    def create_session_strict(
+        self,
+        session_id: str,
+        source: str,
+        model: str = None,
+        model_config: Dict[str, Any] = None,
+        system_prompt: str = None,
+        user_id: str = None,
+        session_key: Optional[str] = None,
+        chat_id: str = None,
+        chat_type: str = None,
+        thread_id: str = None,
+        parent_session_id: str = None,
+        cwd: str = None,
+        profile_name: str = None,
+        git_repo_root: str = None,
+        origin_json: str = None,
+        display_name: str = None,
+    ) -> bool:
+        """Create a session row iff ``session_id`` is not already taken.
+
+        Same column set as :meth:`create_session`, but a PK collision is
+        refused rather than an opportunity to enrich the existing row — NOT
+        A SINGLE COLUMN on a pre-existing row (foreign or otherwise) is ever
+        written, not even a NULL-only backfill. :meth:`create_session`'s
+        ``ON CONFLICT ... DO UPDATE`` fills NULL routing/origin columns
+        (``session_key``/``chat_id``/``chat_type``/...) on ANY row already
+        occupying the id — including one this caller has no relationship to
+        — before any provenance check downstream ever runs. Callers whose
+        id is only *probabilistically* unique (gateway ``/branch``'s
+        timestamp+random id) must use this instead, so a collision is
+        refused untouched rather than silently repointed.
+
+        Returns ``True`` when the row is freshly created, ``False`` on a PK
+        collision. Every other failure (disk full, etc.) still raises.
+        """
+        def _do(conn):
+            system_prompt_hash = self._store_system_prompt(conn, system_prompt)
+            try:
+                conn.execute(
+                    """INSERT INTO sessions (
+                       id, source, user_id, session_key, chat_id, chat_type, thread_id,
+                       model, model_config, system_prompt, system_prompt_hash,
+                       parent_session_id, cwd, profile_name, git_repo_root,
+                       origin_json, display_name, started_at
+                    )
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        session_id,
+                        source,
+                        user_id,
+                        session_key,
+                        chat_id,
+                        chat_type,
+                        thread_id,
+                        model,
+                        json.dumps(model_config) if model_config else None,
+                        system_prompt_hash,
+                        parent_session_id,
+                        cwd,
+                        profile_name,
+                        git_repo_root,
+                        origin_json,
+                        display_name,
+                        time.time(),
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                return False
+            if system_prompt_hash is not None:
+                self._delete_unreferenced_system_prompts(conn)
+            if parent_session_id:
+                # Backfill from the parent — same shape as
+                # _insert_session_row, but this UPDATE only ever touches the
+                # row we just INSERTed (WHERE id = ? on our own fresh id), so
+                # it can never reach across into an existing/foreign row.
+                conn.execute(
+                    """UPDATE sessions
+                       SET cwd = COALESCE(sessions.cwd,
+                                 (SELECT p.cwd FROM sessions p
+                                   WHERE p.id = sessions.parent_session_id)),
+                           git_repo_root = COALESCE(sessions.git_repo_root,
+                                           (SELECT p.git_repo_root FROM sessions p
+                                             WHERE p.id = sessions.parent_session_id)),
+                           git_branch = COALESCE(sessions.git_branch,
+                                        (SELECT p.git_branch FROM sessions p
+                                          WHERE p.id = sessions.parent_session_id)),
+                           profile_name = COALESCE(sessions.profile_name,
+                                          (SELECT p.profile_name FROM sessions p
+                                            WHERE p.id = sessions.parent_session_id))
+                     WHERE id = ? AND parent_session_id IS NOT NULL""",
+                    (session_id,),
+                )
+                conn.execute(
+                    """UPDATE sessions
+                       SET user_id = COALESCE(sessions.user_id,
+                                     (SELECT p.user_id FROM sessions p
+                                       WHERE p.id = sessions.parent_session_id)),
+                           session_key = COALESCE(sessions.session_key,
+                                         (SELECT p.session_key FROM sessions p
+                                           WHERE p.id = sessions.parent_session_id)),
+                           chat_id = COALESCE(sessions.chat_id,
+                                     (SELECT p.chat_id FROM sessions p
+                                       WHERE p.id = sessions.parent_session_id)),
+                           chat_type = COALESCE(sessions.chat_type,
+                                       (SELECT p.chat_type FROM sessions p
+                                         WHERE p.id = sessions.parent_session_id)),
+                           thread_id = COALESCE(sessions.thread_id,
+                                       (SELECT p.thread_id FROM sessions p
+                                         WHERE p.id = sessions.parent_session_id)),
+                           display_name = COALESCE(sessions.display_name,
+                                          (SELECT p.display_name FROM sessions p
+                                            WHERE p.id = sessions.parent_session_id)),
+                           origin_json = COALESCE(sessions.origin_json,
+                                         (SELECT p.origin_json FROM sessions p
+                                           WHERE p.id = sessions.parent_session_id))
+                     WHERE id = ? AND parent_session_id IS NOT NULL
+                       AND EXISTS (
+                           SELECT 1 FROM sessions p
+                           WHERE p.id = sessions.parent_session_id
+                             AND p.end_reason = 'compression'
+                       )""",
+                    (session_id,),
+                )
+            return True
+
+        return bool(
+            self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+        )
+
     def create_imported_session(
         self,
         session_id: str,

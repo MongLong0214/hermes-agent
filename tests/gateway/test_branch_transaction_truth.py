@@ -297,9 +297,15 @@ async def test_wrong_target_collision_is_never_adopted_or_modified(
     )
 
     real_create = store._db.create_session
+    real_create_strict = store._db.create_session_strict
     collision: dict[str, str] = {}
 
-    def create_foreign_collision(*args, **kwargs):
+    def create_foreign_collision_strict(*args, **kwargs):
+        # Simulate a truly concurrent writer claiming the generated id a
+        # moment before our own strict insert runs: by the time
+        # create_session_strict executes, the id is already occupied by an
+        # unrelated foreign row with its own provenance and no routing
+        # identity of its own (session_key/chat_id/chat_type all NULL).
         candidate_id = kwargs["session_id"]
         collision["id"] = candidate_id
         real_create(
@@ -312,9 +318,11 @@ async def test_wrong_target_collision_is_never_adopted_or_modified(
         store._db.append_message(
             candidate_id, role="user", content="foreign sentinel"
         )
-        return real_create(*args, **kwargs)
+        return real_create_strict(*args, **kwargs)
 
-    monkeypatch.setattr(store._db, "create_session", create_foreign_collision)
+    monkeypatch.setattr(
+        store._db, "create_session_strict", create_foreign_collision_strict
+    )
 
     def forbidden_recovery(*_args, **_kwargs):
         raise AssertionError("branch collision attempted broad recovery")
@@ -350,6 +358,14 @@ async def test_wrong_target_collision_is_never_adopted_or_modified(
         "messages": [
             (message["role"], message["content"]) for message in messages
         ],
+        # The refused branch must never have written a single column onto
+        # the foreign row it collided with — not even a NULL-filling
+        # enrichment of its own routing identity (session_key/chat_id/
+        # chat_type), which is exactly what create_session's ON CONFLICT DO
+        # UPDATE upsert used to do before the provenance check ever ran.
+        "session_key": row["session_key"],
+        "chat_id": row["chat_id"],
+        "chat_type": row["chat_type"],
     } == {
         "result": t(
             "gateway.branch.create_failed",
@@ -360,7 +376,75 @@ async def test_wrong_target_collision_is_never_adopted_or_modified(
         "branch_marker": foreign_parent_id,
         "title": "collision sentinel",
         "messages": [("user", "foreign sentinel")],
+        "session_key": None,
+        "chat_id": None,
+        "chat_type": None,
     }
+
+
+@pytest.mark.anyio
+async def test_parent_read_is_fenced_against_a_concurrent_parent_turn(
+    store, monkeypatch
+):
+    """The parent transcript read must be fenced by the PARENT's own turn
+    lease, not skipped and not fenced on the child instead.
+
+    Without this, a legitimately in-flight parent turn can commit a new
+    message between the read and the copy that the branch then silently
+    never sees — a lost update, not a visible failure. This stands a
+    concurrent writer in for that in-flight turn: it tries to acquire the
+    IDENTICAL parent turn lease while ``/branch``'s own read is in
+    progress. If the read is holder-fenced, the racer's acquire must fail;
+    if the read is unfenced (the pre-fix shape), the racer succeeds.
+    """
+    source = _source()
+    session_key = build_session_key(source)
+    parent = store.get_or_create_session(source)
+    store._db.append_message(parent.session_id, role="user", content="parent-one")
+
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.invoke_hook", lambda *_args, **_kwargs: []
+    )
+    monkeypatch.setattr(
+        "hermes_cli.plugins.fire_pre_command_hook", lambda **_kwargs: None
+    )
+
+    observed: dict[str, object] = {"racer_acquired": None}
+    real_load_transcript = store.load_transcript
+
+    def load_transcript_with_racer(session_id):
+        # Stands in for a genuinely concurrent process's in-flight turn on
+        # the SAME parent, trying to claim the identical lease while
+        # /branch's own fenced read is (supposedly) holding it open.
+        if session_id == parent.session_id and observed["racer_acquired"] is None:
+            observed["racer_acquired"] = store._db.try_acquire_session_turn_lease(
+                parent.session_id, "racer-turn-holder", ttl_seconds=5.0,
+            )
+            if observed["racer_acquired"]:
+                store._db.release_session_turn_lease(
+                    parent.session_id, "racer-turn-holder"
+                )
+        return real_load_transcript(session_id)
+
+    monkeypatch.setattr(store, "load_transcript", load_transcript_with_racer)
+
+    runner = _runner(store)
+    result = await runner._handle_message(_event("/branch racer target"))
+
+    assert observed["racer_acquired"] is False, (
+        "a concurrent writer acquired the parent's turn lease while "
+        "/branch's own transcript read was supposed to hold it — the read "
+        "is not fenced against a concurrent parent turn"
+    )
+    child_id = store.peek_session_id(session_key)
+    assert child_id not in {None, parent.session_id}
+    assert result == t(
+        "gateway.branch.branched_one",
+        title="racer target",
+        count=1,
+        parent=parent.session_id,
+        new=child_id,
+    )
 
 
 @pytest.mark.anyio
@@ -441,7 +525,7 @@ async def test_true_prepublication_failure_preserves_parent_and_sentinel(
         attempted["id"] = kwargs["session_id"]
         raise expected_error
 
-    monkeypatch.setattr(store._db, "create_session", fail_before_create)
+    monkeypatch.setattr(store._db, "create_session_strict", fail_before_create)
     runner = _runner(store)
     result = await runner._handle_message(_event("/branch never published"))
 

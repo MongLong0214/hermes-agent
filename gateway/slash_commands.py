@@ -5016,6 +5016,7 @@ class GatewaySlashCommandsMixin:
         Inspired by Claude Code's /branch command.
         """
         import uuid as _uuid
+        from hermes_state import SessionTurnLeaseLostError
 
         if not self._session_db:
             from hermes_state import format_session_db_unavailable
@@ -5024,9 +5025,40 @@ class GatewaySlashCommandsMixin:
         source = event.source
         session_key = self._session_key_for_source(source)
 
-        # Load the current session and its transcript
+        # Load the current session and its transcript. The read is fenced by
+        # the PARENT's own turn lease — not the child's, and not skipped —
+        # so a legitimate in-flight parent turn can't commit a message
+        # between this read and the copy below that the branch then silently
+        # never sees. Off the event loop: acquisition can wait on the
+        # parent's own running turn.
         current_entry = await self.async_session_store.get_or_create_session(source)
-        history = await self.async_session_store.load_transcript(current_entry.session_id)
+        sync_db = getattr(self._session_db, "_db", self._session_db)
+        parent_lease_holder = f"pid={os.getpid()}:turn=branch-read:session={current_entry.session_id}"
+
+        def _read_parent_transcript_fenced():
+            if not sync_db.acquire_session_turn_lease(
+                current_entry.session_id, parent_lease_holder,
+                ttl_seconds=30.0, wait_seconds=30.0,
+            ):
+                raise SessionTurnLeaseLostError(
+                    f"Could not acquire the parent turn lease for "
+                    f"{current_entry.session_id!r} to branch"
+                )
+            try:
+                return self.session_store.load_transcript(current_entry.session_id)
+            finally:
+                sync_db.release_session_turn_lease(
+                    current_entry.session_id, parent_lease_holder
+                )
+
+        try:
+            history = await asyncio.to_thread(_read_parent_transcript_fenced)
+        except SessionTurnLeaseLostError as e:
+            logger.error("Branch history read refused by the parent's turn lease: %s", e)
+            return t(
+                "gateway.branch.create_failed",
+                error="parent session is busy with another turn — try again in a moment",
+            )
         if not history:
             return t("gateway.branch.no_conversation")
 
@@ -5068,9 +5100,16 @@ class GatewaySlashCommandsMixin:
         # list_sessions_rich() keeps the branch visible in /resume and
         # /sessions even after the parent is reopened and re-ended with a
         # different end_reason (e.g. tui_shutdown overwriting 'branched').
+        #
+        # STRICT insert, not create_session's enrich-on-conflict upsert: a
+        # collision on this generated id must be refused untouched — the old
+        # ON CONFLICT DO UPDATE filled a colliding foreign row's NULL
+        # session_key/chat_id/chat_type with THIS operation's routing
+        # identity before the provenance check below ever ran.
         creation_error = None
+        created = False
         try:
-            await self._session_db.create_session(
+            created = await self._session_db.create_session_strict(
                 session_id=new_session_id,
                 source=source.platform.value if source.platform else "gateway",
                 model=(self.config.get("model", {}) or {}).get("default") if isinstance(self.config, dict) else None,
@@ -5106,40 +5145,18 @@ class GatewaySlashCommandsMixin:
             creation_error = e
             logger.error("Failed to create branch session: %s", e)
 
-        # Generated IDs are not ownership proof: create_session enriches rows on
-        # conflict. Only this exact row with both durable lineage markers belongs
-        # to the branch operation.
-        try:
-            expected_child = await self._session_db.get_session(new_session_id)
-        except Exception as e:
-            logger.error("Failed to verify generated branch session: %s", e)
-            return t("gateway.branch.switch_failed")
-        if expected_child is None:
-            return t(
-                "gateway.branch.create_failed",
-                error=creation_error or "branch session was not published",
-            )
-
-        try:
-            import json as _json
-
-            raw_model_config = expected_child.get("model_config")
-            branch_model_config = (
-                _json.loads(raw_model_config)
-                if isinstance(raw_model_config, str)
-                else raw_model_config
-            )
-        except (TypeError, ValueError):
-            branch_model_config = None
-        if (
-            expected_child.get("parent_session_id") != parent_session_id
-            or not isinstance(branch_model_config, dict)
-            or branch_model_config.get("_branched_from") != parent_session_id
-        ):
-            logger.error(
-                "Generated branch session has mismatched provenance: %s",
-                new_session_id,
-            )
+        # create_session_strict guarantees created=False means NOTHING of
+        # ours landed — a PK collision on the generated id is refused before
+        # a single column is written, so there is no row here to verify
+        # provenance on: the id belongs entirely to whatever already
+        # occupied it, untouched by this operation.
+        if not created:
+            if creation_error is None:
+                logger.error(
+                    "Generated branch session id already exists (collision), "
+                    "refused without writing to it: %s",
+                    new_session_id,
+                )
             return t(
                 "gateway.branch.create_failed",
                 error=creation_error or "generated session ID collision",
@@ -5150,8 +5167,6 @@ class GatewaySlashCommandsMixin:
         # write-amplification pattern, and a history can be hundreds of rows.
         # Best-effort like the old loop — a failed copy still yields a
         # usable (partial) branch.
-        from hermes_state import SessionTurnLeaseLostError
-
         branch_rows = [
             {
                 "role": msg.get("role", "user"),
@@ -5179,8 +5194,8 @@ class GatewaySlashCommandsMixin:
         # own id IS the conversation_id. Holding the lease here (and passing
         # it through to append_messages_batch) fences the seed against any
         # other writer that might learn this id before switch_session() below
-        # publishes it as the canonical route.
-        sync_db = getattr(self._session_db, "_db", self._session_db)
+        # publishes it as the canonical route. ``sync_db`` was already
+        # resolved above for the parent-side fenced read.
         branch_lease_holder = f"pid={os.getpid()}:turn=branch-seed:session={new_session_id}"
 
         def _seed_branch_history() -> None:
