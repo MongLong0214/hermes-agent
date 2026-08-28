@@ -2965,17 +2965,9 @@ def _(rid, params: dict) -> dict:
     session, err = _sess(params, rid)
     if err:
         return err
-    # _sess() may have waited for a deferred agent build while a concurrent
-    # session.close started teardown. Do not touch its agent/db once closing.
-    if session.get("_closing"):
-        return _err(rid, 4001, "session not found")
     # Branch must write into the parent's profile-scoped state.db (app-global
     # remote mode). Using the launch handle would orphan branch rows + history.
-    agent_db = getattr(session.get("agent"), "_session_db", None)
-    db_ctx = (
-        contextlib.nullcontext(agent_db) if agent_db is not None else _session_db(session)
-    )
-    with db_ctx as db:
+    with _session_db(session) as db:
         if db is None:
             return _db_unavailable_error(rid, code=5008)
         old_key = session["session_key"]
