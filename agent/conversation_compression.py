@@ -3390,6 +3390,11 @@ def compress_context(
             agent._cached_system_prompt = new_system_prompt
 
         _session_commit_succeeded = False
+        # A transcript rewrite can become durable before every later piece of
+        # session publication succeeds. Keep that boundary separate from the
+        # final-success flag: post-compaction read dedup must be reset as soon
+        # as the original transcript is no longer the live one.
+        _transcript_boundary_committed = not agent._session_db
         split_status = "not_applicable"
         if agent._session_db:
             split_status = "pending"
@@ -3541,6 +3546,7 @@ def compress_context(
                         watermark=_commit_watermark,
                         lock_holder=_lock_holder,
                     )
+                    _transcript_boundary_committed = True
                     split_status = "in_place_committed"
                     # Reset the flush identity set so the next turn's appends are
                     # diffed against the COMPACTED transcript: the compacted dicts
@@ -3659,7 +3665,6 @@ def compress_context(
                             _profile_for_child = None
                     except Exception:
                         _profile_for_child = None
-                    old_title = agent._session_db.get_session_title(agent.session_id)
                     new_session_id = (
                         f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_"
                         f"{uuid.uuid4().hex[:6]}"
@@ -3684,6 +3689,7 @@ def compress_context(
                         ),
                         watermark_ceiling=_foreign_tail_ceiling,
                     )
+                    _transcript_boundary_committed = True
                     agent.session_id = new_session_id
                     try:
                         from gateway.session_context import set_current_session_id
@@ -3722,53 +3728,6 @@ def compress_context(
                         migrate_loop_to_session(old_session_id, agent.session_id, reason="compression")
                     except Exception as _loop_err:
                         logger.debug("Could not migrate loop on compression: %s", _loop_err)
-                    # Carry the title across the compression boundary unchanged.
-                    #
-                    # This used to renumber ("Fix X" → "Fix X #2") on every
-                    # rotation, which is why a long conversation ended up as
-                    # "Smallville Map Architecture Plan #10" — ten forks of ONE
-                    # session, each looking like a separate piece of work in the
-                    # sidebar. Compression is an internal implementation detail;
-                    # the user's conversation did not change topic, so its name
-                    # must not change either. Uniqueness still holds because
-                    # _set_session_title transfers the title off a hidden
-                    # compression ancestor rather than raising on the conflict.
-                    if old_title:
-                        # Read provenance BEFORE the write: transferring the
-                        # title off a hidden compression ancestor clears the
-                        # ancestor's row, so reading afterwards always returns
-                        # None and the child would be stamped "user" — freezing
-                        # an auto-title that should still be upgradeable.
-                        _src = None
-                        try:
-                            _src = agent._session_db.get_session_title_source(
-                                old_session_id
-                            )
-                        except Exception as _src_err:
-                            logger.debug(
-                                "Could not read title provenance: %s", _src_err
-                            )
-                        try:
-                            agent._session_db.set_session_title(
-                                agent.session_id, old_title
-                            )
-                        except (ValueError, Exception) as e:
-                            logger.debug("Could not propagate title on compression: %s", e)
-                        else:
-                            # set_session_title() records "user"; restore the
-                            # original authority so an inherited auto-title
-                            # stays upgradeable and a manual one stays pinned.
-                            if _src is not None:
-                                try:
-                                    agent._session_db.set_session_title_source(
-                                        agent.session_id, _src
-                                    )
-                                except Exception as _src_err:
-                                    logger.debug(
-                                        "Could not propagate title provenance: %s",
-                                        _src_err,
-                                    )
-
                 # In-place mode still updates/replaces the current row here.
                 # Rotation already published prompt + compacted handoff atomically.
                 if in_place:
@@ -3815,17 +3774,38 @@ def compress_context(
                                 "_proactive_prune_rearm_tokens"
                             ]
                         )
-                split_status = (
-                    "aborted"
-                    if locals().get("old_session_id") is None and not in_place
-                    else "failed_not_indexed"
-                )
+                    # ``compress()`` counts its completed summary before the
+                    # durable rotation publishes. This attempt never crossed
+                    # that boundary, so retain its aborted telemetry but do
+                    # not leave the live parent claiming a compression it did
+                    # not commit.
+                    if "compression_count" in _compressor_attempt_snapshot:
+                        agent.context_compressor.compression_count = (
+                            _compressor_attempt_snapshot["compression_count"]
+                        )
+                if in_place and _transcript_boundary_committed:
+                    # archive_and_compact() already replaced the live
+                    # transcript. A subsequent prompt-write failure is not a
+                    # rollback and must not be reported as an unindexed split.
+                    split_status = "in_place_prompt_failed"
+                else:
+                    split_status = (
+                        "aborted"
+                        if locals().get("old_session_id") is None and not in_place
+                        else "failed_not_indexed"
+                    )
                 # If the rotation rolled back to the parent (orphan-avoidance
                 # above), agent.session_id is the still-indexed parent and
                 # old_session_id was cleared — so this is recovery, not an
                 # un-indexed orphan. Otherwise an earlier step failed before the
                 # child was created and the warning's original meaning holds.
-                if locals().get("old_session_id") is None and not in_place:
+                if in_place and _transcript_boundary_committed:
+                    logger.warning(
+                        "In-place compression transcript committed but system "
+                        "prompt publication failed: %s",
+                        e,
+                    )
+                elif locals().get("old_session_id") is None and not in_place:
                     logger.warning(
                         "Compression rotation aborted and rolled back to the "
                         "parent session (%s): %s", agent.session_id or "?", e,
@@ -3841,6 +3821,9 @@ def compress_context(
         _is_boundary = bool(_old_sid) or in_place
         _context_engine_boundary_committed = _session_commit_succeeded and (
             bool(_old_sid) or compacted_in_place
+        )
+        _compression_boundary_committed = (
+            not agent._session_db or _session_commit_succeeded
         )
         _boundary_parent = _old_sid or agent.session_id or ""
 
@@ -3912,20 +3895,21 @@ def compress_context(
         # not just CLI stdout. _emit_status still _vprints for the CLI, and
         # storing it on _compression_warning lets replay_compression_warning
         # re-deliver it once a late-bound gateway status_callback is wired (#36908).
-        _cc = agent.context_compressor.compression_count
-        if _cc >= 2:
-            _cc_msg = (
-                f"{agent.log_prefix}⚠️  Session compressed {_cc} times — "
-                f"accuracy may degrade. Consider /new to start fresh."
-            )
-            agent._compression_warning = _cc_msg
-            agent._emit_status(_cc_msg)
+        if _compression_boundary_committed:
+            _cc = agent.context_compressor.compression_count
+            if _cc >= 2:
+                _cc_msg = (
+                    f"{agent.log_prefix}⚠️  Session compressed {_cc} times — "
+                    f"accuracy may degrade. Consider /new to start fresh."
+                )
+                agent._compression_warning = _cc_msg
+                agent._emit_status(_cc_msg)
 
         # Emit session:compress event so hooks (e.g. MemPalace sync) can ingest
         # the completed old session before its details are lost. In in-place mode
         # there is no old id (same session); ``in_place=True`` tells hooks the
         # transcript was compacted on the same id rather than rotated.
-        if getattr(agent, "event_callback", None):
+        if _compression_boundary_committed and getattr(agent, "event_callback", None):
             try:
                 agent.event_callback("session:compress", {
                     "platform": agent.platform or "",
@@ -3944,58 +3928,57 @@ def compress_context(
         agent._last_compression_attempt_in_place = compacted_in_place
         agent._last_compaction_in_place = compacted_in_place
 
-        # Keep the post-compression rough estimate for diagnostics, but do not
-        # treat it as provider-reported prompt usage. Schema-heavy rough estimates
-        # can remain above threshold even after the next real API request fits.
-        _compressed_est = estimate_request_tokens_rough(
-            compressed,
-            system_prompt=new_system_prompt or "",
-            tools=agent.tools or None,
-        )
-        agent.context_compressor.last_compression_rough_tokens = _compressed_est
-        agent.context_compressor.last_prompt_tokens = -1
-        agent.context_compressor.last_completion_tokens = 0
-        agent.context_compressor.awaiting_real_usage_after_compression = True
-        # Arm the effectiveness verdict only after a completed rewrite crosses
-        # the full compaction boundary. Exceptions, aborts, and no-op attempts
-        # leave this false, so unrelated later usage cannot be charged to an
-        # attempt that never changed the transcript.
-        if _compression_made_progress:
-            record_boundary = getattr(
-                type(agent.context_compressor),
-                "record_completed_compaction",
-                None,
+        if _compression_boundary_committed:
+            # Keep the post-compression rough estimate for diagnostics, but do not
+            # treat it as provider-reported prompt usage. Schema-heavy rough estimates
+            # can remain above threshold even after the next real API request fits.
+            _compressed_est = estimate_request_tokens_rough(
+                compressed,
+                system_prompt=new_system_prompt or "",
+                tools=agent.tools or None,
             )
-            if callable(record_boundary):
-                record_boundary(
-                    agent.context_compressor,
-                    used_fallback=_compression_used_fallback,
-                    feasibility_skip=_compression_feasibility_skip,
+            agent.context_compressor.last_compression_rough_tokens = _compressed_est
+            agent.context_compressor.last_prompt_tokens = -1
+            agent.context_compressor.last_completion_tokens = 0
+            agent.context_compressor.awaiting_real_usage_after_compression = True
+            # Arm the effectiveness verdict only after a completed rewrite crosses
+            # the full compaction boundary. Exceptions, aborts, and no-op attempts
+            # leave this false, so unrelated later usage cannot be charged to an
+            # attempt that never changed the transcript.
+            if _compression_made_progress:
+                record_boundary = getattr(
+                    type(agent.context_compressor),
+                    "record_completed_compaction",
+                    None,
                 )
-            else:
-                agent.context_compressor._verify_compaction_cleared_threshold = True
+                if callable(record_boundary):
+                    record_boundary(
+                        agent.context_compressor,
+                        used_fallback=_compression_used_fallback,
+                        feasibility_skip=_compression_feasibility_skip,
+                    )
+                else:
+                    agent.context_compressor._verify_compaction_cleared_threshold = True
 
-        # Clear the file-read dedup cache.  After compression the original
-        # read content is summarised away — if the model re-reads the same
-        # file it needs the full content, not a "file unchanged" stub.
-        try:
-            from tools.file_tools import reset_file_dedup
-            reset_file_dedup(task_id)
-        except Exception:
-            pass
-        # Same for the skill_view repeat-view dedup: a post-compression
-        # re-view must return the full skill content again.
-        try:
-            from tools.skills_tool import reset_skill_view_dedup
-            reset_skill_view_dedup(task_id)
-        except Exception:
-            pass
-
-        logger.info(
-            "context compression done: session=%s messages=%d->%d rough_tokens=~%s awaiting_real_usage=true",
-            agent.session_id or "none", _pre_msg_count, len(compressed),
-            f"{_compressed_est:,}",
-        )
+            logger.info(
+                "context compression done: session=%s messages=%d->%d rough_tokens=~%s awaiting_real_usage=true",
+                agent.session_id or "none", _pre_msg_count, len(compressed),
+                f"{_compressed_est:,}",
+            )
+        # Clear repeat-view state whenever the transcript boundary itself was
+        # committed, even if a later publication step failed. The referenced
+        # content was compacted away and must not be replaced by a stale stub.
+        if _transcript_boundary_committed:
+            try:
+                from tools.file_tools import reset_file_dedup
+                reset_file_dedup(task_id)
+            except Exception:
+                pass
+            try:
+                from tools.skills_tool import reset_skill_view_dedup
+                reset_skill_view_dedup(task_id)
+            except Exception:
+                pass
         _commit_status = "committed" if split_status in {"not_applicable", "in_place_committed", "rotated_committed"} else "aborted"
         _emit_compression_attempt_telemetry(
             agent,

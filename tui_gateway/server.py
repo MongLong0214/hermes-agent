@@ -2366,8 +2366,11 @@ def _start_agent_build(sid: str, session: dict) -> None:
                     # below, and a session reaped mid-build) must close it.
                     session_db = SessionDB(db_path=Path(profile_home) / "state.db")
                     owns_db = True
-                except Exception:
+                except Exception as exc:
                     session_db = None
+                    raise RuntimeError(
+                        f"failed to open session db for profile {profile_home!r}: {exc}"
+                    ) from exc
 
             try:
                 from tui_gateway.entry import ensure_mcp_discovery_started
@@ -2532,7 +2535,10 @@ def _start_agent_build(sid: str, session: dict) -> None:
 
 
 def _sess_nowait(params, rid):
-    s = _sessions.get(params.get("session_id") or "")
+    with _sessions_lock:
+        s = _sessions.get(params.get("session_id") or "")
+        if s is not None and s.get("_closing"):
+            s = None
     return (s, None) if s else (None, _err(rid, 4001, "session not found"))
 
 
@@ -3081,6 +3087,11 @@ def _persist_branch_seed(session: dict) -> None:
         seed = [dict(msg) for msg in (session.get("history") or [])]
     if not seed:
         return
+    seed.sort(
+        key=lambda msg: (
+            msg.get("timestamp") if isinstance(msg.get("timestamp"), (int, float)) else 0
+        )
+    )
     with _session_db(session) as db:
         if db is None:
             return
@@ -7817,7 +7828,11 @@ def _coerce_seed_history(value: Any) -> list[dict]:
         if not isinstance(content, str) or not content.strip():
             continue
 
-        history.append({"role": role, "content": content})
+        entry = {"role": role, "content": content}
+        timestamp = item.get("timestamp")
+        if isinstance(timestamp, (int, float)):
+            entry["timestamp"] = timestamp
+        history.append(entry)
 
     return history
 

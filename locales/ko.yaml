@@ -78,6 +78,9 @@ gateway:
     switch_failed:         "분기는 생성되었으나 전환에 실패했습니다."
     branched_one:          "⑂ **{title}**(으)로 분기했습니다 (메시지 {count}개 복사됨)\n원본: `{parent}`\n분기: `{new}`\n원본으로 돌아가려면 `/resume`을 사용하세요."
     branched_many:         "⑂ **{title}**(으)로 분기했습니다 (메시지 {count}개 복사됨)\n원본: `{parent}`\n분기: `{new}`\n원본으로 돌아가려면 `/resume`을 사용하세요."
+    branched_one_untitled: "⑂ Branched ({count} message copied)\nOriginal: `{parent}`\nBranch: `{new}`\nUse `/resume` to switch back to the original."
+    branched_many_untitled: "⑂ Branched ({count} messages copied)\nOriginal: `{parent}`\nBranch: `{new}`\nUse `/resume` to switch back to the original."
+    title_not_set_note: "\n⚠️ Title \"{title}\" was not set: {error}"
 
   commands:
     usage:                 "사용법: `/commands [page]`"

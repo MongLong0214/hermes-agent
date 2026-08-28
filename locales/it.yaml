@@ -78,6 +78,9 @@ gateway:
     switch_failed:         "Ramo creato ma il passaggio ad esso non è riuscito."
     branched_one:          "⑂ Diramato in **{title}** ({count} messaggio copiato)\nOriginale: `{parent}`\nRamo: `{new}`\nUsa `/resume` per tornare all'originale."
     branched_many:         "⑂ Diramato in **{title}** ({count} messaggi copiati)\nOriginale: `{parent}`\nRamo: `{new}`\nUsa `/resume` per tornare all'originale."
+    branched_one_untitled: "⑂ Branched ({count} message copied)\nOriginal: `{parent}`\nBranch: `{new}`\nUse `/resume` to switch back to the original."
+    branched_many_untitled: "⑂ Branched ({count} messages copied)\nOriginal: `{parent}`\nBranch: `{new}`\nUse `/resume` to switch back to the original."
+    title_not_set_note: "\n⚠️ Title \"{title}\" was not set: {error}"
 
   commands:
     usage:                 "Uso: `/commands [page]`"

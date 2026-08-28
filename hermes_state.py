@@ -5370,6 +5370,200 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._insert_session_row(session_id, source, **kwargs)
         return session_id
 
+    def create_session_strict(
+        self,
+        session_id: str,
+        source: str,
+        model: str = None,
+        model_config: Dict[str, Any] = None,
+        system_prompt: str = None,
+        user_id: str = None,
+        session_key: Optional[str] = None,
+        chat_id: str = None,
+        chat_type: str = None,
+        thread_id: str = None,
+        parent_session_id: str = None,
+        cwd: str = None,
+        profile_name: str = None,
+        git_repo_root: str = None,
+        origin_json: str = None,
+        display_name: str = None,
+    ) -> bool:
+        """Create a session row iff ``session_id`` is not already taken.
+
+        Same column set as :meth:`create_session`, but a PK collision is
+        refused rather than an opportunity to enrich the existing row — NOT
+        A SINGLE COLUMN on a pre-existing row (foreign or otherwise) is ever
+        written, not even a NULL-only backfill. :meth:`create_session`'s
+        ``ON CONFLICT ... DO UPDATE`` fills NULL routing/origin columns
+        (``session_key``/``chat_id``/``chat_type``/...) on ANY row already
+        occupying the id — including one this caller has no relationship to
+        — before any provenance check downstream ever runs. Callers whose
+        id is only *probabilistically* unique (gateway ``/branch``'s
+        timestamp+random id) must use this instead, so a collision is
+        refused untouched rather than silently repointed.
+
+        Returns ``True`` when the row is freshly created, ``False`` when
+        ``session_id`` is already taken. Everything else raises.
+
+        The precondition rule: whether the id is taken is decided by a
+        ``SELECT`` that runs BEFORE any write this method makes — before
+        ``_store_system_prompt`` and before the ``INSERT`` — inside the same
+        ``BEGIN IMMEDIATE`` transaction ``_execute_write`` holds under
+        ``self._lock``. That exclusive write lock is held for the entire
+        call, so no other writer can claim the id between the SELECT and
+        the INSERT. So ``False`` means nothing of ours was written, and any
+        ``sqlite3.IntegrityError`` the INSERT itself raises afterward — a
+        foreign-key violation, a turn-fence trigger's ``RAISE(ABORT)``, a
+        UNIQUE violation on some other column — is a genuine failure, not a
+        collision on this id, and propagates untouched.
+        """
+        def _do(conn):
+            # Must be the first statement in _do, before every other write
+            # (including _store_system_prompt): see precondition rule above.
+            row = conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if row is not None:
+                return False
+            system_prompt_hash = self._store_system_prompt(conn, system_prompt)
+            conn.execute(
+                """INSERT INTO sessions (
+                   id, source, user_id, session_key, chat_id, chat_type, thread_id,
+                   model, model_config, system_prompt, system_prompt_hash,
+                   parent_session_id, cwd, profile_name, git_repo_root,
+                   origin_json, display_name, started_at
+                )
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    session_id,
+                    source,
+                    user_id,
+                    session_key,
+                    chat_id,
+                    chat_type,
+                    thread_id,
+                    model,
+                    json.dumps(model_config) if model_config else None,
+                    system_prompt_hash,
+                    parent_session_id,
+                    cwd,
+                    profile_name,
+                    git_repo_root,
+                    origin_json,
+                    display_name,
+                    time.time(),
+                ),
+            )
+            if system_prompt_hash is not None:
+                self._delete_unreferenced_system_prompts(conn)
+            if parent_session_id:
+                # Backfill from the parent — same shape as
+                # _insert_session_row, but this UPDATE only ever touches the
+                # row we just INSERTed (WHERE id = ? on our own fresh id), so
+                # it can never reach across into an existing/foreign row.
+                conn.execute(
+                    """UPDATE sessions
+                       SET cwd = COALESCE(sessions.cwd,
+                                 (SELECT p.cwd FROM sessions p
+                                   WHERE p.id = sessions.parent_session_id)),
+                           git_repo_root = COALESCE(sessions.git_repo_root,
+                                           (SELECT p.git_repo_root FROM sessions p
+                                             WHERE p.id = sessions.parent_session_id)),
+                           git_branch = COALESCE(sessions.git_branch,
+                                        (SELECT p.git_branch FROM sessions p
+                                          WHERE p.id = sessions.parent_session_id)),
+                           profile_name = COALESCE(sessions.profile_name,
+                                          (SELECT p.profile_name FROM sessions p
+                                            WHERE p.id = sessions.parent_session_id))
+                     WHERE id = ? AND parent_session_id IS NOT NULL""",
+                    (session_id,),
+                )
+                conn.execute(
+                    """UPDATE sessions
+                       SET user_id = COALESCE(sessions.user_id,
+                                     (SELECT p.user_id FROM sessions p
+                                       WHERE p.id = sessions.parent_session_id)),
+                           session_key = COALESCE(sessions.session_key,
+                                         (SELECT p.session_key FROM sessions p
+                                           WHERE p.id = sessions.parent_session_id)),
+                           chat_id = COALESCE(sessions.chat_id,
+                                     (SELECT p.chat_id FROM sessions p
+                                       WHERE p.id = sessions.parent_session_id)),
+                           chat_type = COALESCE(sessions.chat_type,
+                                       (SELECT p.chat_type FROM sessions p
+                                         WHERE p.id = sessions.parent_session_id)),
+                           thread_id = COALESCE(sessions.thread_id,
+                                       (SELECT p.thread_id FROM sessions p
+                                         WHERE p.id = sessions.parent_session_id)),
+                           display_name = COALESCE(sessions.display_name,
+                                          (SELECT p.display_name FROM sessions p
+                                            WHERE p.id = sessions.parent_session_id)),
+                           origin_json = COALESCE(sessions.origin_json,
+                                         (SELECT p.origin_json FROM sessions p
+                                           WHERE p.id = sessions.parent_session_id))
+                     WHERE id = ? AND parent_session_id IS NOT NULL
+                       AND EXISTS (
+                           SELECT 1 FROM sessions p
+                           WHERE p.id = sessions.parent_session_id
+                             AND p.end_reason = 'compression'
+                       )""",
+                    (session_id,),
+                )
+            return True
+
+        return bool(
+            self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+        )
+
+    def create_imported_session(
+        self,
+        session_id: str,
+        source: str,
+        messages: List[Dict[str, Any]],
+        *,
+        cwd: str = None,
+        origin_json: str = None,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> str:
+        """Create a new imported session and its transcript atomically.
+
+        Foreign imports must not expose a prefix transcript: the session row,
+        every parsed message, and their counters either commit together or are
+        all rolled back.  Unlike :meth:`create_session`, an occupied id is an
+        error rather than an opportunity to enrich an existing session.
+        """
+        def _do(conn):
+            # Imports acquire against an absent id before creating its session
+            # row, so the admission check has to precede the strict insert.
+            self._check_transcript_write_guards(
+                conn,
+                session_id,
+                None,
+                turn_lease_holder=turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
+            conn.execute(
+                """INSERT INTO sessions (id, source, cwd, origin_json, started_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (session_id, source, cwd, origin_json, time.time()),
+            )
+            inserted, tool_calls_total = self._insert_message_rows(
+                conn, session_id, messages
+            )
+            conn.execute(
+                """UPDATE sessions
+                   SET message_count = ?, tool_call_count = ?
+                   WHERE id = ?""",
+                (inserted, tool_calls_total, session_id),
+            )
+            return session_id
+
+        return self._execute_write(
+            _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
+        )
+
     def record_gateway_session_peer(
         self,
         session_id: str,
@@ -6308,9 +6502,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     ) -> None:
         """Atomically close a parent and publish its durable compression child.
 
-        The parent closure, child row, and compacted handoff become visible in
-        one transaction. Readers can therefore observe either the live parent or
-        a complete child, never an ended parent with a missing/empty child.
+        The parent closure, child row, compacted handoff, and any carried title
+        with its provenance become visible in one transaction. Readers can
+        therefore observe either the live parent or a complete child, never an
+        ended parent with a missing/empty child or split title identity.
 
         Concurrent-append safety (#75316): when *watermark* is provided (the
         parent's :meth:`get_active_message_watermark` captured at compression
@@ -6343,7 +6538,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     f"Compression lease lost before publication: {parent_session_id}"
                 )
             parent = conn.execute(
-                """SELECT ended_at, cwd, git_branch, git_repo_root,
+                """SELECT ended_at, title, title_source, cwd, git_branch, git_repo_root,
                           user_id, session_key, chat_id, chat_type,
                           thread_id, display_name, origin_json, profile_name
                    FROM sessions WHERE id = ?""",
@@ -6437,6 +6632,35 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
                 (total_messages, total_tool_calls, child_session_id),
             )
+            if parent["title"] is not None:
+                cleared = conn.execute(
+                    "UPDATE sessions SET title = NULL, title_source = NULL "
+                    "WHERE id = ? AND title IS ? AND title_source IS ?",
+                    (
+                        parent_session_id,
+                        parent["title"],
+                        parent["title_source"],
+                    ),
+                )
+                if cleared.rowcount != 1:
+                    raise RuntimeError(
+                        f"Compression parent title changed during publication: "
+                        f"{parent_session_id}"
+                    )
+                assigned = conn.execute(
+                    "UPDATE sessions SET title = ?, title_source = ? "
+                    "WHERE id = ? AND title IS NULL AND title_source IS NULL",
+                    (
+                        parent["title"],
+                        parent["title_source"],
+                        child_session_id,
+                    ),
+                )
+                if assigned.rowcount != 1:
+                    raise RuntimeError(
+                        f"Compression child title changed during publication: "
+                        f"{child_session_id}"
+                    )
             updated = conn.execute(
                 "UPDATE sessions SET ended_at = ?, end_reason = 'compression' "
                 "WHERE id = ? AND ended_at IS NULL",
@@ -8836,6 +9060,143 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if source not in (self.TITLE_SOURCE_DERIVED, self.TITLE_SOURCE_LLM):
             raise ValueError(f"invalid automatic title source: {source!r}")
         return self._set_session_title(session_id, title, source=source)
+
+    def set_auto_title_for_attempt(
+        self,
+        originating_session_id: str,
+        title: str,
+        *,
+        source: str,
+        expected_title: Optional[str],
+        expected_source: Optional[str],
+    ) -> bool:
+        """Conditionally persist a background title on its live attempt target.
+
+        An automatic title worker can outlive compression of the segment that
+        started it.  Resolve that segment's live compression continuation and
+        require the derived title captured by the originating attempt in the
+        SAME transaction as the LLM upgrade.  This leaves a worker that races a
+        manual title, another LLM result, or a non-compression close with no
+        target it may safely mutate.
+        """
+        if source not in (self.TITLE_SOURCE_DERIVED, self.TITLE_SOURCE_LLM):
+            raise ValueError(f"invalid automatic title source: {source!r}")
+        title = self.sanitize_title(title)
+        if not title:
+            return False
+        if expected_title is None:
+            if expected_source is not None:
+                return False
+        elif expected_source != self.TITLE_SOURCE_DERIVED:
+            return False
+
+        def _resolve_live_target(conn) -> Optional[str]:
+            current = originating_session_id
+            seen = {current} if current else set()
+            for _ in range(100):
+                row = conn.execute(
+                    "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
+                    (current,),
+                ).fetchone()
+                if row is None:
+                    return None
+                if row["ended_at"] is None:
+                    return current
+                if row["end_reason"] != "compression":
+                    return None
+                children = conn.execute(
+                    """
+                    SELECT child.id
+                    FROM sessions AS parent
+                    JOIN sessions AS child ON child.parent_session_id = parent.id
+                    WHERE parent.id = ?
+                      AND parent.end_reason = 'compression'
+                      AND COALESCE(json_extract(COALESCE(child.model_config, '{}'),
+                                                '$._branched_from'), '') != ?
+                      AND COALESCE(json_extract(COALESCE(child.model_config, '{}'),
+                                                '$._delegate_from'), '') != ?
+                      AND COALESCE(child.source, '') != 'tool'
+                    ORDER BY child.started_at ASC, child.id ASC
+                    LIMIT 2
+                    """,
+                    (current, current, current),
+                ).fetchall()
+                if len(children) != 1:
+                    return None
+                child_id = children[0]["id"]
+                if not child_id or child_id in seen:
+                    return None
+                seen.add(child_id)
+                current = child_id
+            return None
+
+        def _do(conn):
+            target_id = _resolve_live_target(conn)
+            if target_id is None:
+                return 0
+            current = conn.execute(
+                "SELECT title, title_source, ended_at FROM sessions WHERE id = ?",
+                (target_id,),
+            ).fetchone()
+            if current is None or current["ended_at"] is not None:
+                return 0
+            if expected_title is None:
+                # A collision-declined instant title can still title an active
+                # origin later, but it has no derived identity to carry across
+                # a compression boundary.
+                if (
+                    target_id != originating_session_id
+                    or current["title"] is not None
+                    or current["title_source"] is not None
+                ):
+                    return 0
+            elif (
+                current["title"] != expected_title
+                or current["title_source"] != expected_source
+            ):
+                return 0
+
+            if (
+                current["title"] is not None
+                and self._title_rank(current["title_source"])
+                >= self._title_rank(source)
+            ):
+                return 0
+
+            conflict = conn.execute(
+                "SELECT id FROM sessions WHERE title = ? AND id != ?",
+                (title, target_id),
+            ).fetchone()
+            if conflict:
+                conflict_id = conflict["id"]
+                if self._is_compression_ancestor(
+                    conn, ancestor_id=conflict_id, descendant_id=target_id
+                ):
+                    conn.execute(
+                        "UPDATE sessions SET title = NULL, title_source = NULL "
+                        "WHERE id = ?",
+                        (conflict_id,),
+                    )
+                else:
+                    raise ValueError(
+                        f"Title '{title}' is already in use by session {conflict_id}"
+                    )
+
+            cursor = conn.execute(
+                "UPDATE sessions SET title = ?, title_source = ? "
+                "WHERE id = ? AND ended_at IS NULL AND title IS ? "
+                "AND title_source IS ?",
+                (
+                    title,
+                    source,
+                    target_id,
+                    current["title"],
+                    current["title_source"],
+                ),
+            )
+            return cursor.rowcount
+
+        return bool(self._execute_write(_do))
 
     def set_auto_title_if_empty(self, session_id: str, title: str) -> bool:
         """Back-compat shim: set an LLM title only if nothing better exists.

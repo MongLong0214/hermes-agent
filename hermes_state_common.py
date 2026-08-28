@@ -355,6 +355,24 @@ def turn_fence_trigger_definitions() -> tuple[tuple[str, str], ...]:
     )
 
 
+#: Back-compat views over the declaration above, for the offline rollback tool
+#: (hermes_cli/session_fence_rollback*.py) and its tests: they read the fence
+#: surface as (table, operation) pairs / trigger names rather than the
+#: table-list x operation-list split above. Derived, not duplicated — moving
+#: TURN_FENCE_GOVERNED_TABLES or TURN_FENCE_OPERATIONS moves these with it.
+TURN_FENCE_SURFACE = tuple(
+    (table, operation)
+    for table in TURN_FENCE_GOVERNED_TABLES
+    for operation in TURN_FENCE_OPERATIONS
+)
+TURN_FENCE_TRIGGERS = tuple(name for name, _sql in turn_fence_trigger_definitions())
+
+#: The scalar function name each trigger body calls (see
+#: :func:`register_turn_fence_generation` / :func:`turn_fence_trigger_sql`),
+#: named so callers do not re-embed the literal.
+TURN_FENCE_FUNCTION_NAME = "hermes_turn_fence_generation"
+
+
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
 # state_meta key ``fts_storage_version``. The main schema version advances
 # freely on open (so future migrations always land); the FTS *layout* only

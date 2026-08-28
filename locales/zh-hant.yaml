@@ -78,6 +78,9 @@ gateway:
     switch_failed:         "分支已建立，但無法切換到該分支。"
     branched_one:          "⑂ 已分支至 **{title}**（已複製 {count} 則訊息）\n原始：`{parent}`\n分支：`{new}`\n使用 `/resume` 切換回原始工作階段。"
     branched_many:         "⑂ 已分支至 **{title}**（已複製 {count} 則訊息）\n原始：`{parent}`\n分支：`{new}`\n使用 `/resume` 切換回原始工作階段。"
+    branched_one_untitled: "⑂ Branched ({count} message copied)\nOriginal: `{parent}`\nBranch: `{new}`\nUse `/resume` to switch back to the original."
+    branched_many_untitled: "⑂ Branched ({count} messages copied)\nOriginal: `{parent}`\nBranch: `{new}`\nUse `/resume` to switch back to the original."
+    title_not_set_note: "\n⚠️ Title \"{title}\" was not set: {error}"
 
   commands:
     usage:                 "用法：`/commands [page]`"
