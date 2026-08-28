@@ -179,6 +179,15 @@ def test_reset_session_agent_keeps_the_profile_db_binding(
         "-- writes after /tools enable|disable land in the wrong database."
     )
 
+    # This must be a REAL transfer, not a second claim on the same handle: the
+    # outgoing agent's ownership flag must be cleared so a stale reference to
+    # it can never close the handle new_agent is now using.
+    assert old_agent._owns_session_db is False, (
+        "the outgoing agent still claims ownership of a handle the new "
+        "agent now uses — two owners for one db handle."
+    )
+    assert new_agent._owns_session_db is True
+
     # Prove the consequence: write through the rebuilt agent's own binding
     # and check with a raw sqlite3 connection against BOTH files.
     new_agent._session_db.append_message(SESSION_KEY, "user", "post-reset message")

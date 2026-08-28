@@ -5221,9 +5221,17 @@ def _sync_bot_capabilities(sid: str, session: dict) -> None:
             )
         finally:
             _clear_session_context(tokens)
-        if old_db_owned and _transfer_db_to_agent(new_agent, old_db):
-            # Real transfer, not a second claim — see _reset_session_agent.
-            agent._owns_session_db = False
+        if old_db_owned:
+            if _transfer_db_to_agent(new_agent, old_db):
+                # Real transfer, not a second claim — see _reset_session_agent.
+                agent._owns_session_db = False
+            else:
+                # Refused — fail closed exactly like _reset_session_agent's
+                # own refusal branch: new_agent never took this handle, so
+                # close it here rather than leave an ambiguous owner behind.
+                agent._owns_session_db = False
+                with contextlib.suppress(Exception):
+                    old_db.close()
         new_agent._session_title_hint = "Bot Chat"
         session["agent"] = new_agent
         session["config_model_seen"] = _config_model_target()
@@ -6901,14 +6909,53 @@ def _preview_restart_callbacks(parent: str, task_id: str) -> dict:
     }
 
 
-# Bound for _reset_session_agent's wait on an in-flight deferred agent build
-# (session.create's _deferred_session_record / _start_agent_build). Module
-# level so a test can shrink it instead of actually waiting; mirrors
-# _wait_agent's own 30.0 default for the same "RPC needs the real agent" shape.
-_RESET_SESSION_AGENT_BUILD_WAIT_S = 30.0
-
-
 def _reset_session_agent(sid: str, session: dict) -> dict:
+    # A session created moments ago (session.create's deferred build,
+    # _deferred_session_record) can still be mid-construction here:
+    # tools.configure does not wait for agent readiness before calling in.
+    #
+    # When the agent has never been built, there is nothing HERE to reset.
+    # The still-pending _start_agent_build's _build() constructs the FIRST
+    # agent from scratch and reads toolset/MCP config fresh at that point
+    # (_load_enabled_toolsets -> hermes_cli.config.load_config(), cached on
+    # the config file's (mtime, size) and invalidated by the save_config()
+    # tools.configure already ran) — the just-saved config reaches it with no
+    # help from this function. _build() is also already profile-aware, so it
+    # resolves the right state.db on its own. An earlier version of this fix
+    # waited here (bounded) for that build to land instead. On the standalone
+    # stdio TUI, tools.configure is NOT in _LONG_HANDLERS, so it runs on the
+    # single stdin/dispatch thread — that wait could freeze /interrupt,
+    # status requests, and approval responses for its whole duration. Do not
+    # reinstate a wait here; a non-blocking no-op is correct and sufficient.
+    #
+    # Do NOT pop model_override / create_reasoning_override /
+    # create_service_tier_override / one_turn_model_restore on this path.
+    # For a session whose agent has never been built, model_override (etc.)
+    # is not stale conversation-boundary residue from an in-session /model
+    # switch — switching one requires an already-running agent, which does
+    # not exist yet. It IS the composer's initial runtime pin for the
+    # session's first build (see _build()'s "brand-new chat" kw assembly, a
+    # few lines above _make_agent(sid, key, **kw) in _start_agent_build).
+    # Clearing it here would silently drop the user's originally-requested
+    # model the moment they also happen to toggle a tool before that first
+    # build lands.
+    ready = session.get("agent_ready")
+    if session.get("agent") is None:
+        if ready is not None and not ready.is_set():
+            return _lazy_resume_info(_session_cwd(session))
+        # No agent AND no pending build left to arrive: either agent_ready
+        # was never wired (should not happen for a live session — only
+        # _deferred_session_record sets it, always paired with agent=None)
+        # or this session's one and only build already ran and failed
+        # (agent_error set). Retrying the build here would mean resolving
+        # session_db blind all over again — surface the failure instead of
+        # risking the exact profile-db bug this function exists not to
+        # reintroduce.
+        raise RuntimeError(
+            session.get("agent_error")
+            or "session has no agent to reset — its build never completed"
+        )
+
     tokens = _set_session_context(session["session_key"])
     try:
         # This is a conversation-boundary reset: session-scoped runtime
@@ -6925,29 +6972,6 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
         session.pop("create_reasoning_override", None)
         session.pop("create_service_tier_override", None)
         session.pop("one_turn_model_restore", None)
-
-        # A session created moments ago (session.create's deferred build,
-        # _deferred_session_record) can still be mid-construction here:
-        # tools.configure does not wait for agent readiness before calling
-        # in, so session["agent"] may still be None while _start_agent_build's
-        # _build() thread is running. _build() is the one place that already
-        # resolves this session's profile db correctly — wait for that single
-        # build to land instead of racing a second, independent one. This
-        # keeps agent construction at exactly one build (_build()) plus this
-        # function's own rebuild, same as the already-built case; it never
-        # starts a second, competing _build(). A build that never completes
-        # in time raises rather than silently falling through to _make_agent's
-        # _get_db() default — the exact bug this function exists not to
-        # reintroduce.
-        ready = session.get("agent_ready")
-        if session.get("agent") is None and ready is not None and not ready.is_set():
-            if not ready.wait(timeout=_RESET_SESSION_AGENT_BUILD_WAIT_S):
-                raise RuntimeError(
-                    "agent build timed out; tool configuration was saved, but "
-                    "the session's agent was not rebuilt — retry shortly"
-                )
-            if agent_error := session.get("agent_error"):
-                raise RuntimeError(str(agent_error))
 
         # Keep the rebuilt agent on the SAME database the session was already
         # using. _make_agent defaults session_db to the shared launch handle
@@ -6969,14 +6993,28 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
             platform_override=_session_source(session),
             session_db=existing_db,
         )
-        if existing_db_owned and _transfer_db_to_agent(new_agent, existing_db):
-            # Make this a REAL transfer, not a second claim: clear the
-            # outgoing agent's flag so a stale reference to it can never
-            # close the handle the new agent is now using. The outgoing
-            # agent itself is still never explicitly closed here (unchanged
-            # from before this fix) — it is simply dropped once
-            # session["agent"] is reassigned below.
-            old_agent._owns_session_db = False
+        if existing_db_owned:
+            if _transfer_db_to_agent(new_agent, existing_db):
+                # Make this a REAL transfer, not a second claim: clear the
+                # outgoing agent's flag so a stale reference to it can never
+                # close the handle the new agent is now using. The outgoing
+                # agent itself is still never explicitly closed here
+                # (unchanged from before this fix) — it is simply dropped
+                # once session["agent"] is reassigned below.
+                old_agent._owns_session_db = False
+            else:
+                # Refused (e.g. the AC-4 synthetic-agent test seam bypassed
+                # normal construction and new_agent never actually took this
+                # handle) — new_agent is not using it, and old_agent is about
+                # to be dropped without its close() ever being called. Fail
+                # closed rather than leaving an ambiguous owner: close the
+                # handle ourselves while we still hold a reference (same
+                # refusal-handling shape as _build()'s finally block), and
+                # clear old_agent's flag so it can never attempt a stale
+                # double-close if something elsewhere still references it.
+                old_agent._owns_session_db = False
+                with contextlib.suppress(Exception):
+                    existing_db.close()
     finally:
         _clear_session_context(tokens)
     session["agent"] = new_agent
