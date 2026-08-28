@@ -5122,8 +5122,17 @@ def _apply_model_switch(
             session.pop("one_turn_model_restore", None)
 
     # Record the switch as a PER-SESSION override so a later rebuild of THIS
-    # session (e.g. /new via _reset_session_agent, or resume) re-derives the
-    # user's chosen model/provider instead of falling back to global config.
+    # session re-derives the user's chosen model/provider instead of falling
+    # back to global config. The only rebuild that reads it back is resume /
+    # reconnect (_start_agent_build's deferred _build() forwards
+    # session["model_override"] into _make_agent — see the lazy-resume kw
+    # assembly above). /new does NOT go through here: it re-derives via
+    # session.create/_init_session, a fresh session with no override to
+    # inherit. Nor does /tools enable|disable's _reset_session_agent — that
+    # path is the ONE real caller of _reset_session_agent, and it explicitly
+    # pops this override (a deliberate conversation-boundary reset, not a
+    # rebuild that re-derives session pins — see #48055/#23131 in
+    # _reset_session_agent).
     #
     # We deliberately do NOT write process-global env vars (HERMES_MODEL /
     # HERMES_INFERENCE_MODEL / HERMES_TUI_PROVIDER / HERMES_INFERENCE_PROVIDER)
@@ -6893,12 +6902,32 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
         session.pop("create_reasoning_override", None)
         session.pop("create_service_tier_override", None)
         session.pop("one_turn_model_restore", None)
+        # Keep the rebuilt agent on the SAME database the session was already
+        # using. _make_agent defaults session_db to the shared launch handle
+        # (_get_db()) whenever the caller passes None — fine for a launch
+        # session, wrong for a profile one (app-global remote mode), whose
+        # agent was bound to its own profile state.db. Reuse the outgoing
+        # agent's own handle rather than opening a second one: it is already
+        # open, it is exactly the db this session's rows live in (profile or
+        # shared — see _session_db()/_init_session() for the same
+        # profile_home-keyed selection), and reusing it means there is only
+        # ever one handle in play, so there is nothing new to close.
+        old_agent = session.get("agent")
+        existing_db = getattr(old_agent, "_session_db", None)
+        existing_db_owned = bool(getattr(old_agent, "_owns_session_db", False))
         new_agent = _make_agent(
             sid,
             session["session_key"],
             session_id=session["session_key"],
             platform_override=_session_source(session),
+            session_db=existing_db,
         )
+        if existing_db_owned:
+            # The outgoing agent (never explicitly closed here — same as
+            # before this fix) owned this handle; hand ownership to its
+            # replacement so a later session.close() still releases it
+            # instead of leaking the sqlite fds and token-writer thread.
+            _transfer_db_to_agent(new_agent, existing_db)
     finally:
         _clear_session_context(tokens)
     session["agent"] = new_agent
