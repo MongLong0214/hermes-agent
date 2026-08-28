@@ -60,8 +60,11 @@ def mirror_to_session(
     providers (issue #2221). A user-role mirror collapses safely via
     ``repair_message_sequence``'s consecutive-user merge on every provider.
 
-    Returns True if mirrored successfully, False if no matching session or error.
-    All errors are caught -- this is never fatal.
+    Returns True if the message was actually committed to the session's
+    SQLite transcript, False if no matching session was found OR the
+    SQLite append itself was refused (e.g. a lost turn lease, a closed
+    compression session) -- a refused write is never reported as mirrored.
+    All errors are caught -- this is never fatal to the caller.
     """
     try:
         if not session_id:
@@ -90,10 +93,11 @@ def mirror_to_session(
             "mirror_source": source_label,
         }
 
-        _append_to_sqlite(session_id, mirror_msg)
+        append_committed = _append_to_sqlite(session_id, mirror_msg)
 
-        logger.debug("Mirror: wrote to session %s (from %s)", session_id, source_label)
-        return True
+        if append_committed:
+            logger.debug("Mirror: wrote to session %s (from %s)", session_id, source_label)
+        return append_committed
 
     except Exception as e:
         # WARNING with the exception: a silent mirror drop IS the cron
@@ -207,9 +211,17 @@ def _find_session_id(
 
 
 
-def _append_to_sqlite(session_id: str, message: dict) -> None:
-    """Append a message to the SQLite session database."""
+def _append_to_sqlite(session_id: str, message: dict) -> bool:
+    """Append a message to the SQLite session database.
+
+    Returns True only if ``append_message`` actually committed the row.
+    A refused write (e.g. ``SessionTurnLeaseLostError``,
+    ``CompressionSessionClosedError``, or any other exception from the
+    SQLite layer) is logged at debug level and reported back as False --
+    it must never be mistaken by the caller for a successful mirror.
+    """
     db = None
+    append_committed = False
     try:
         from hermes_state import SessionDB
         db = SessionDB()
@@ -218,8 +230,10 @@ def _append_to_sqlite(session_id: str, message: dict) -> None:
             role=message.get("role", "assistant"),
             content=message.get("content"),
         )
+        append_committed = True
     except Exception as e:
         logger.debug("Mirror SQLite write failed: %s", e)
     finally:
         if db is not None:
             db.close()
+    return append_committed

@@ -95,7 +95,7 @@ class TestMirrorToSession:
 
         with patch.object(mirror_mod, "_SESSIONS_DIR", sessions_dir), \
              patch.object(mirror_mod, "_SESSIONS_INDEX", index_file), \
-             patch("gateway.mirror._append_to_sqlite") as mock_sqlite:
+             patch("gateway.mirror._append_to_sqlite", return_value=True) as mock_sqlite:
             result = mirror_to_session(
                 "telegram",
                 "-1001",
@@ -129,4 +129,55 @@ class TestAppendToSqlite:
 
         mock_db.append_message.assert_called_once()
         mock_db.close.assert_called_once()
+
+
+class TestMirrorRefusedWrite:
+    """R-6: a refused mirror write must not be reported as mirrored."""
+
+    def test_refused_write_does_not_report_mirrored_true(self, tmp_path, monkeypatch):
+        """A refused/failed SQLite append must not come back as ``True``.
+
+        ``_append_to_sqlite`` (gateway/mirror.py) wraps its
+        ``SessionDB.append_message`` call in a bare ``except Exception``
+        that only logs at DEBUG and never signals failure to its caller.
+        ``mirror_to_session`` therefore falls through to its unconditional
+        ``return True`` (line 96) even when the write was refused and the
+        message was never persisted anywhere — the caller
+        (``tools/send_message_tool.py:521`` sets ``result["mirrored"] =
+        True`` straight from this return value, which is what the model
+        sees) is told the mirror succeeded when it did not.
+
+        This drives the REAL public entry point ``mirror_to_session`` (not
+        ``_append_to_sqlite`` directly) against a REAL ``SessionDB``
+        backed by a tmp_path SQLite file. Only the deepest dependency,
+        ``SessionDB.append_message`` itself, is patched to raise —
+        standing in for a real refusal a transcript write can hit when it
+        does not hold the lock/lease it needs
+        (``CompressionSessionClosedError``/``SessionTurnLeaseLostError``
+        are the real exception classes ``hermes_state`` raises for exactly
+        this "refused, not owned by the caller" case).
+        """
+        import hermes_state
+
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+
+        def _refuse(self, *args, **kwargs):
+            raise hermes_state.CompressionSessionClosedError("sess_refused")
+
+        monkeypatch.setattr(hermes_state.SessionDB, "append_message", _refuse)
+
+        result = mirror_to_session(
+            "telegram",
+            "12345",
+            "This must not silently vanish",
+            source_label="cli",
+            session_id="sess_refused",
+        )
+
+        assert result is not True, (
+            "mirror_to_session reported the mirror as successful for a "
+            "write that was refused and never persisted — the message "
+            f"was silently dropped instead of the caller being told. "
+            f"got: {result!r}"
+        )
 
