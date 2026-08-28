@@ -152,11 +152,18 @@ class TestMirrorRefusedWrite:
         ``_append_to_sqlite`` directly) against a REAL ``SessionDB``
         backed by a tmp_path SQLite file. Only the deepest dependency,
         ``SessionDB.append_message`` itself, is patched to raise —
-        standing in for a real refusal a transcript write can hit when it
-        does not hold the lock/lease it needs
-        (``CompressionSessionClosedError``/``SessionTurnLeaseLostError``
-        are the real exception classes ``hermes_state`` raises for exactly
-        this "refused, not owned by the caller" case).
+        standing in for a real refusal the SQLite layer can produce on
+        this path. ``CompressionSessionClosedError`` is used because it
+        is a real exception class ``hermes_state`` raises for a session
+        that can no longer accept writes (e.g. closed by compression).
+        ``SessionTurnLeaseLostError`` is NOT a live case here and is
+        deliberately not used: ``_append_to_sqlite`` never passes a
+        ``turn_lease_holder`` to ``append_message``, so the turn-lease
+        fence is not engaged on this path at all -- there is no lock or
+        lease for this call to hold or lose. Any other exception the
+        SQLite layer can raise would exercise the same code path just as
+        well; this one was picked because it is a real, named refusal
+        rather than a synthetic one.
         """
         import hermes_state
 

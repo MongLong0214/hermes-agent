@@ -1731,17 +1731,18 @@ def _maybe_mirror_cron_delivery(
                 job.get("id", "?"), platform_name, chat_id,
             )
         else:
-            # ``mirror_to_session`` returns a plain bool with no reason code,
-            # so a falsy result here is ambiguous between two different
-            # causes: no matching gateway session (the original "cold start"
-            # case this message assumed) OR a real SQLite append refusal
-            # (gateway/mirror.py's ``_append_to_sqlite`` can now report False
-            # for e.g. a closed compression session) -- see its own DEBUG
-            # log for which one actually happened.
+            # ``mirror_to_session`` returns a plain bool with no reason
+            # code, so a falsy result here does not tell us WHY -- it
+            # covers no matching gateway session (the original "cold
+            # start" case this message used to assume), a real SQLite
+            # append refusal, or any other internal exception
+            # ``mirror_to_session`` caught and turned into False. That
+            # list isn't exhaustive and isn't ours to enumerate from out
+            # here, so this message doesn't guess a cause -- see
+            # gateway.mirror's own DEBUG/WARNING logs for the actual reason.
             logger.debug(
                 "Job '%s': delivery mirror not committed for %s:%s "
-                "(no matching gateway session, or the write was refused — "
-                "see gateway.mirror logs for the reason)",
+                "— see gateway.mirror logs for the reason",
                 job.get("id", "?"), platform_name, chat_id,
             )
     except Exception as e:

@@ -23,17 +23,28 @@ _SESSIONS_INDEX = _SESSIONS_DIR / "sessions.json"
 
 
 def _log_safely(log_fn, msg, *args) -> None:
-    """Call a logger method without letting it change the caller's control flow.
+    """Call a logger method without letting an ordinary logging failure
+    change the caller's control flow.
 
     A user- or plugin-installed logging handler/filter can itself raise.
     ``mirror_to_session`` / ``_append_to_sqlite`` return a truthful
     committed/not-committed answer that real callers (cron/scheduler.py,
     tools/send_message_tool.py) branch on -- that answer must never be
-    decided by whether an incidental log line happened to blow up. Every
-    log call on the commit-truth path routes through this one function,
-    so "logging cannot flip the result" is a property of this function
-    (it cannot raise, full stop) rather than something that has to be
-    remembered at each call site.
+    decided by whether an incidental log line happened to blow up.
+
+    Guarantee, precisely: catches ``Exception`` -- an ordinary logging
+    failure (a broken handler, a bad format string, a filter that raises)
+    cannot escape this call. It deliberately does NOT catch
+    ``BaseException`` -- ``SystemExit``, ``KeyboardInterrupt``, and
+    ``GeneratorExit`` still propagate through here, because swallowing an
+    interpreter-exit or Ctrl-C request would be worse than the bug this
+    function fixes.
+
+    This guarantee belongs to the specific call being wrapped, not to
+    ``mirror_to_session``/``_append_to_sqlite`` as a whole: a bare
+    ``logger.debug(...)`` added next to an existing ``_log_safely(...)``
+    call is NOT protected just by proximity -- it has to be routed
+    through this function itself to get the guarantee.
     """
     try:
         log_fn(msg, *args)
@@ -98,7 +109,8 @@ def mirror_to_session(
                 user_id=user_id,
             )
         if not session_id:
-            logger.warning(
+            _log_safely(
+                logger.warning,
                 "Mirror: no session found for %s:%s thread=%s user=%s "
                 "(explicit_id=none, origin-scan bailed)",
                 platform,
@@ -131,8 +143,13 @@ def mirror_to_session(
         # WARNING with the exception: a silent mirror drop IS the cron
         # continuation-amnesia bug (Alice 2026-08-19 — the seed's own
         # deterministic session_id was in hand and the append STILL failed
-        # invisibly at debug level).
-        logger.warning(
+        # invisibly at debug level). Routed through _log_safely so a
+        # misbehaving handler on THIS log call can't make an already-decided
+        # False escape as a raised exception instead -- the function's
+        # documented "always returns a bool" contract must hold even here,
+        # where no committed row is at stake either way.
+        _log_safely(
+            logger.warning,
             "Mirror failed for %s:%s thread=%s user=%s session=%s: %s",
             platform,
             chat_id,
@@ -257,9 +274,11 @@ def _append_to_sqlite(session_id: str, message: dict) -> bool:
     * a ``close()`` failure is cleanup, not commit status -- the row is on
       disk whether or not the connection tears down cleanly -- so it is
       caught and never allowed to propagate;
-    * the debug logging for either failure mode routes through
-      ``_log_safely``, which cannot itself raise (a misbehaving logging
-      handler/filter is a real, reachable fault, not a hypothetical one).
+    * the debug logging for either failure mode is routed through
+      ``_log_safely`` (see its docstring for the precise guarantee: an
+      ordinary logging ``Exception`` cannot escape it, though it is not a
+      blanket "logging near here is always safe" -- only calls that
+      actually go through it are covered).
     """
     db = None
     append_committed = False
