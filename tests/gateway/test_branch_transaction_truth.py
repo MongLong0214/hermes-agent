@@ -168,6 +168,49 @@ def test_create_session_strict_still_reports_real_pk_collision_as_false(store):
     )
 
 
+def test_create_session_strict_propagates_non_pk_unique_violation_not_a_collision(
+    store,
+):
+    """A UNIQUE violation on a DIFFERENT column — NOT the row's own id — must
+    also propagate rather than being misreported as an id collision.
+
+    Real repro, same shape as the FK/fence tests above: add a genuine UNIQUE
+    index on ``sessions.display_name`` (the same pattern production already
+    uses for ``idx_sessions_title_unique`` in hermes_state_schema.py), seed a
+    row that already holds a display_name, then call ``create_session_strict``
+    with a FRESH, non-colliding ``id`` but the SAME display_name. The id
+    itself never collides — only the secondary index does — so a correct
+    implementation must raise, not return ``False``.
+
+    Verified empirically (see create_session_strict's docstring): a real
+    PRIMARY KEY collision on ``sessions.id`` reports
+    ``sqlite_errorname == "SQLITE_CONSTRAINT_PRIMARYKEY"``, while a UNIQUE
+    violation on any OTHER column reports ``"SQLITE_CONSTRAINT_UNIQUE"`` — the
+    two are reliably distinguishable, so only the former may be swallowed.
+    """
+    store._db._conn.execute(
+        "CREATE UNIQUE INDEX idx_display_name_unique_for_test "
+        "ON sessions(display_name) WHERE display_name IS NOT NULL"
+    )
+    assert (
+        store._db.create_session_strict(
+            session_id="display-name-owner",
+            source="test",
+            display_name="shared-display-name",
+        )
+        is True
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="UNIQUE constraint failed"):
+        store._db.create_session_strict(
+            session_id="fresh-id-no-pk-collision",
+            source="test",
+            display_name="shared-display-name",
+        )
+    # The fresh, non-colliding id must not have been left half-written by the
+    # failed insert.
+    assert store._db.get_session("fresh-id-no-pk-collision") is None
+
+
 @pytest.mark.anyio
 async def test_lease_loss_after_first_durable_chunk_reports_committed_truth(
     store, monkeypatch
@@ -550,28 +593,46 @@ async def test_concurrent_branch_calls_on_same_parent_never_alias_the_read_lease
         if session_id == parent.session_id and not parked_once.is_set():
             parked_once.set()
             first_parked.set()
-            release_first.wait(timeout=10.0)
+            # The return value must be checked: a bare, discarded wait()
+            # lets a 10s timeout silently open the gate on its own and the
+            # test would proceed non-deterministically instead of reporting
+            # a synchronization failure. If the release thread recorded its
+            # own failure below, surface that instead of a generic timeout.
+            released = release_first.wait(timeout=10.0)
+            if not released and release_thread_errors:
+                raise release_thread_errors[0]
+            assert released, (
+                "release_first was never set within the timeout — the "
+                "release-gate thread never observed the second call's "
+                "acquisition attempt"
+            )
         return real_load_transcript(session_id)
 
     monkeypatch.setattr(store, "load_transcript", load_transcript_gated)
 
     acquisitions: list[tuple[str, bool]] = []
     real_try_acquire = store._db.try_acquire_session_turn_lease
-    # Signalled the moment the SECOND call makes its own first attempt at
-    # the parent's lease — the first call never calls try_acquire again
-    # once parked in load_transcript_gated, so the first post-park attempt
-    # on the parent's lease is unambiguously the second call's.
+    # Signalled only once the SECOND call's own attempt at the parent's
+    # lease has actually been RESOLVED under real contention — not merely
+    # entered. Signalling before real_try_acquire runs would let the
+    # release thread free the first lease before the second call's actual
+    # DB check executes, so the overlap this test is named for would never
+    # be established and a correct implementation could non-deterministically
+    # fail this test (or, worse, this test could pass without ever proving
+    # a real overlap happened).
     second_attempt_starting = threading.Event()
 
     def recording_try_acquire(session_id, holder, **kwargs):
-        if (
-            session_id == parent.session_id
+        is_parent = session_id == parent.session_id
+        is_second_attempt = (
+            is_parent
             and parked_once.is_set()
             and not second_attempt_starting.is_set()
-        ):
-            second_attempt_starting.set()
+        )
         result = real_try_acquire(session_id, holder, **kwargs)
-        if session_id == parent.session_id:
+        if is_second_attempt:
+            second_attempt_starting.set()
+        if is_parent:
             acquisitions.append((holder, result))
         return result
 
@@ -587,25 +648,51 @@ async def test_concurrent_branch_calls_on_same_parent_never_alias_the_read_lease
     parked = await asyncio.to_thread(first_parked.wait, 10.0)
     assert parked, "the first /branch call never reached its fenced read"
 
-    def release_after_second_attempt_starts():
-        # Release the first lease only once the second call's own
-        # acquisition attempt has genuinely started — not after a fixed
-        # sleep, which a slow CI can outrun: the release would then land
-        # BEFORE the second attempt, so even correct code lets that
-        # attempt succeed uncontested and the test would fail for timing
-        # reasons (or, worse, pass without ever proving a real overlap).
-        started = second_attempt_starting.wait(timeout=10.0)
-        assert started, "the second call's acquisition attempt never started"
-        release_first.set()
+    # A failure inside this daemon thread must reach the main test body: an
+    # un-joined daemon thread's AssertionError only ever prints to stderr
+    # and never fails the test, and (per load_transcript_gated above) it
+    # would ALSO leave release_first unset, silently discarding a real
+    # synchronization failure as a bare 10s timeout.
+    release_thread_errors: list[BaseException] = []
 
-    threading.Thread(
+    def release_after_second_attempt_starts():
+        try:
+            # Release the first lease only once the second call's own
+            # acquisition attempt has been genuinely RESOLVED under
+            # contention — not after a fixed sleep, which a slow CI can
+            # outrun: the release would then land BEFORE the second
+            # attempt, so even correct code lets that attempt succeed
+            # uncontested and the test would fail for timing reasons (or,
+            # worse, pass without ever proving a real overlap).
+            started = second_attempt_starting.wait(timeout=10.0)
+            assert started, "the second call's acquisition attempt never started"
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the main thread below
+            release_thread_errors.append(exc)
+        finally:
+            # Always release, even on failure: a stuck gate would just
+            # convert this thread's failure into an unrelated 10s hang in
+            # load_transcript_gated instead of a reported test failure.
+            release_first.set()
+
+    release_thread = threading.Thread(
         target=release_after_second_attempt_starts, daemon=True
-    ).start()
+    )
+    release_thread.start()
 
     # A second, genuinely concurrent /branch call on the SAME parent while
     # the first call still holds the parent's turn lease.
     await runner._handle_message(_event("/branch second"))
     await first_task
+
+    # Join the release-gate thread so its failure (captured above) is
+    # reported here, in the main test body, instead of silently vanishing
+    # in an un-joined daemon thread.
+    release_thread.join(timeout=10.0)
+    assert not release_thread.is_alive(), (
+        "the release-gate thread never finished"
+    )
+    if release_thread_errors:
+        raise release_thread_errors[0]
 
     holders_used = {holder for holder, _ in acquisitions}
     assert len(holders_used) == 2, (
@@ -694,28 +781,46 @@ async def test_prefix_collision_never_admits_second_branch_as_same_holder_reentr
         if session_id == parent.session_id and not parked_once.is_set():
             parked_once.set()
             first_parked.set()
-            release_first.wait(timeout=10.0)
+            # The return value must be checked: a bare, discarded wait()
+            # lets a 10s timeout silently open the gate on its own and the
+            # test would proceed non-deterministically instead of reporting
+            # a synchronization failure. If the release thread recorded its
+            # own failure below, surface that instead of a generic timeout.
+            released = release_first.wait(timeout=10.0)
+            if not released and release_thread_errors:
+                raise release_thread_errors[0]
+            assert released, (
+                "release_first was never set within the timeout — the "
+                "release-gate thread never observed the second call's "
+                "acquisition attempt"
+            )
         return real_load_transcript(session_id)
 
     monkeypatch.setattr(store, "load_transcript", load_transcript_gated)
 
     acquisitions: list[tuple[str, bool]] = []
     real_try_acquire = store._db.try_acquire_session_turn_lease
-    # Signalled the moment the SECOND call makes its own first attempt at
-    # the parent's lease — the first call never calls try_acquire again
-    # once parked in load_transcript_gated, so the first post-park attempt
-    # on the parent's lease is unambiguously the second call's.
+    # Signalled only once the SECOND call's own attempt at the parent's
+    # lease has actually been RESOLVED under real contention — not merely
+    # entered. Signalling before real_try_acquire runs would let the
+    # release thread free the first lease before the second call's actual
+    # DB check executes, so the overlap this test is named for would never
+    # be established and a correct implementation could non-deterministically
+    # fail this test (or, worse, this test could pass without ever proving
+    # a real overlap happened).
     second_attempt_starting = threading.Event()
 
     def recording_try_acquire(session_id, holder, **kwargs):
-        if (
-            session_id == parent.session_id
+        is_parent = session_id == parent.session_id
+        is_second_attempt = (
+            is_parent
             and parked_once.is_set()
             and not second_attempt_starting.is_set()
-        ):
-            second_attempt_starting.set()
+        )
         result = real_try_acquire(session_id, holder, **kwargs)
-        if session_id == parent.session_id:
+        if is_second_attempt:
+            second_attempt_starting.set()
+        if is_parent:
             acquisitions.append((holder, result))
         return result
 
@@ -731,26 +836,52 @@ async def test_prefix_collision_never_admits_second_branch_as_same_holder_reentr
     parked = await asyncio.to_thread(first_parked.wait, 10.0)
     assert parked, "the first /branch call never reached its fenced read"
 
-    def release_after_second_attempt_starts():
-        # Release the first lease only once the second call's own
-        # acquisition attempt has genuinely started — not after a fixed
-        # sleep, which a slow CI can outrun: the release would then land
-        # BEFORE the second attempt, so even correct code lets that
-        # attempt succeed uncontested and the test would fail for timing
-        # reasons (or, worse, pass without ever proving a real overlap).
-        started = second_attempt_starting.wait(timeout=10.0)
-        assert started, "the second call's acquisition attempt never started"
-        release_first.set()
+    # A failure inside this daemon thread must reach the main test body: an
+    # un-joined daemon thread's AssertionError only ever prints to stderr
+    # and never fails the test, and (per load_transcript_gated above) it
+    # would ALSO leave release_first unset, silently discarding a real
+    # synchronization failure as a bare 10s timeout.
+    release_thread_errors: list[BaseException] = []
 
-    threading.Thread(
+    def release_after_second_attempt_starts():
+        try:
+            # Release the first lease only once the second call's own
+            # acquisition attempt has been genuinely RESOLVED under
+            # contention — not after a fixed sleep, which a slow CI can
+            # outrun: the release would then land BEFORE the second
+            # attempt, so even correct code lets that attempt succeed
+            # uncontested and the test would fail for timing reasons (or,
+            # worse, pass without ever proving a real overlap).
+            started = second_attempt_starting.wait(timeout=10.0)
+            assert started, "the second call's acquisition attempt never started"
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the main thread below
+            release_thread_errors.append(exc)
+        finally:
+            # Always release, even on failure: a stuck gate would just
+            # convert this thread's failure into an unrelated 10s hang in
+            # load_transcript_gated instead of a reported test failure.
+            release_first.set()
+
+    release_thread = threading.Thread(
         target=release_after_second_attempt_starts, daemon=True
-    ).start()
+    )
+    release_thread.start()
 
     # A second, genuinely concurrent /branch call on the SAME parent while
     # the first call still holds the parent's turn lease — scripted onto
     # the second colliding-prefix uuid4.
     await runner._handle_message(_event("/branch second"))
     await first_task
+
+    # Join the release-gate thread so its failure (captured above) is
+    # reported here, in the main test body, instead of silently vanishing
+    # in an un-joined daemon thread.
+    release_thread.join(timeout=10.0)
+    assert not release_thread.is_alive(), (
+        "the release-gate thread never finished"
+    )
+    if release_thread_errors:
+        raise release_thread_errors[0]
 
     assert len(acquisitions) >= 2, (
         f"expected both /branch calls to attempt the parent lease: {acquisitions}"
