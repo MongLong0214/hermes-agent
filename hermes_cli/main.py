@@ -1847,6 +1847,53 @@ def _create_titled_session(title: str) -> Optional[str]:
                 pass
 
 
+def _gateway_routed_session_owner(session_id: str):
+    """Return the live gateway pid serving *session_id*, else ``None``.
+
+    Both halves must hold: the session is in ``gateway_routing`` AND a gateway
+    process is actually alive. A stale routing row for a dead gateway is not a
+    conflict, and refusing on it would lock an operator out of their own session
+    after a crash -- the failure this guard exists to prevent, inverted.
+
+    Never raises. A guard that cannot answer must not block the command: it
+    returns ``None`` (allow) and the pre-existing lease wait remains the
+    backstop, exactly as before this guard existed.
+    """
+    try:
+        import json as _json
+        import re as _re
+        import sqlite3 as _sq
+        import subprocess as _sp
+
+        out = _sp.run(
+            ["launchctl", "list", "ai.hermes.gateway"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+        m = _re.search(r'"PID"\s*=\s*(\d+)', out)
+        if not m:
+            return None
+        pid = int(m.group(1))
+        os.kill(pid, 0)  # raises unless the process is alive
+
+        db = os.path.expanduser("~/.hermes/state.db")
+        if not os.path.exists(db):
+            return None
+        conn = _sq.connect(f"file:{db}?mode=ro", uri=True, timeout=2.0)
+        try:
+            rows = conn.execute("SELECT entry_json FROM gateway_routing").fetchall()
+        finally:
+            conn.close()
+        for (entry,) in rows:
+            try:
+                if _json.loads(entry).get("session_id") == session_id:
+                    return pid
+            except Exception:
+                continue
+        return None
+    except Exception:
+        return None
+
+
 def _resolve_continue_arg(args, *, use_tui: bool) -> None:
     """Resolve ``-c/--continue`` into ``args.resume``.
 
@@ -3005,6 +3052,41 @@ def cmd_chat(args):
 
     # Resolve --continue into --resume with the latest session or by name
     _resolve_continue_arg(args, use_tui=use_tui)
+
+    # A session the gateway is actively routing belongs to the gateway. Attaching
+    # a CLI turn to it does not share the conversation -- it takes the turn lease
+    # the gateway needs, and the platform's message queues behind an 1800s wait
+    # that usually ends in "your message was not processed".
+    #
+    # Measured 2026-08-28: five occurrences in one day, including the owner's own
+    # Telegram messages dropped while a CLI health check held the lease three
+    # seconds ahead of them. The wait is not a queue that eventually serves both
+    # -- it is one writer starving the other, and the starved one is the person
+    # typing into the chat.
+    #
+    # Escape hatch is an env var, not a flag: this path runs before subcommand
+    # parsers are settled, and an operator who really means it can set
+    # HERMES_ALLOW_GATEWAY_SESSION=1 for one invocation.
+    _resume_target = getattr(args, "resume", None)
+    if _resume_target and os.environ.get("HERMES_ALLOW_GATEWAY_SESSION") != "1":
+        _owner = _gateway_routed_session_owner(_resume_target)
+        if _owner:
+            print(
+                f"Refusing to attach: session {_resume_target} is served by the "
+                f"running gateway (pid {_owner}).",
+                file=sys.stderr,
+            )
+            print(
+                "  A CLI turn here takes the turn lease and stalls the "
+                "platform's messages behind a 30-minute wait.",
+                file=sys.stderr,
+            )
+            print(
+                "  Send through the platform, start a separate session, or set "
+                "HERMES_ALLOW_GATEWAY_SESSION=1 to override.",
+                file=sys.stderr,
+            )
+            sys.exit(3)
 
     # --resume @claude / --resume @codex: import a foreign session (Claude
     # Code / Codex CLI) and resume the newly created Hermes session.
