@@ -5404,7 +5404,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         refused untouched rather than silently repointed.
 
         Returns ``True`` when the row is freshly created, ``False`` on a PK
-        collision. Every other failure (disk full, etc.) still raises.
+        collision. Every other failure still raises — including an
+        ``IntegrityError`` that is NOT a collision on this row's own id:
+        a foreign-key violation (e.g. an unknown ``parent_session_id``) or
+        a turn-fence trigger's ``RAISE(ABORT)`` also raise
+        ``sqlite3.IntegrityError`` in this SQLite build, and reporting
+        either of those as "generated session ID collision" would be a
+        false result — and would silently swallow a fence refusal.
+        ``sqlite_errorname`` (stable since Python 3.11, which this
+        project's ``requires-python`` floor guarantees) distinguishes an
+        actual PRIMARY KEY/UNIQUE conflict on the row from every other
+        constraint failure without depending on message text.
         """
         def _do(conn):
             system_prompt_hash = self._store_system_prompt(conn, system_prompt)
@@ -5437,7 +5447,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         time.time(),
                     ),
                 )
-            except sqlite3.IntegrityError:
+            except sqlite3.IntegrityError as exc:
+                # Only a real PRIMARY KEY/UNIQUE conflict on this row's own
+                # id is a "collision" — everything else (FK violation, a
+                # turn-fence trigger's RAISE(ABORT), a CHECK failure, ...)
+                # must propagate untouched. Swallowing those into a bare
+                # ``False`` reports a fence refusal (or a broken FK) to the
+                # caller as "generated session ID collision", which is both
+                # a false result and a lost fence signal.
+                if getattr(exc, "sqlite_errorname", None) not in (
+                    "SQLITE_CONSTRAINT_PRIMARYKEY",
+                    "SQLITE_CONSTRAINT_UNIQUE",
+                ):
+                    raise
                 return False
             if system_prompt_hash is not None:
                 self._delete_unreferenced_system_prompts(conn)
