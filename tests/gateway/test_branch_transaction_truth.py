@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sqlite3
 import threading
 import time
 import uuid
@@ -22,6 +23,7 @@ from hermes_state import (
     SessionDB,
     SessionTurnLeaseLostError,
 )
+from hermes_state_common import TURN_FENCE_GENERATION
 
 
 @pytest.fixture()
@@ -98,6 +100,72 @@ def _runner(store: SessionStore):
 def _branch_marker(row: dict) -> str | None:
     config = json.loads(row["model_config"] or "{}")
     return config.get("_branched_from")
+
+
+def test_create_session_strict_propagates_fk_violation_not_a_collision(store):
+    """An unknown ``parent_session_id`` trips the real
+    ``FOREIGN KEY (parent_session_id) REFERENCES sessions(id)`` constraint
+    (schema in hermes_state_common.py), which raises
+    ``sqlite3.IntegrityError`` — the SAME exception class a PRIMARY KEY
+    collision on ``id`` raises. ``create_session_strict`` must not conflate
+    the two: only a real collision on the row's own id returns ``False``.
+    Everything else must propagate, because gateway/slash_commands.py
+    reports a bare ``False`` (no exception) as "generated session ID
+    collision" — a false result for a broken foreign key.
+    """
+    with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
+        store._db.create_session_strict(
+            session_id="fk-violation-child",
+            source="test",
+            parent_session_id="does-not-exist-anywhere",
+        )
+    # Refused before a single column landed — same guarantee as a real
+    # collision, just via a different, propagating failure.
+    assert store._db.get_session("fk-violation-child") is None
+
+
+def test_create_session_strict_propagates_turn_fence_abort_not_a_collision(store):
+    """A turn-fence trigger's ``RAISE(ABORT)`` also raises
+    ``sqlite3.IntegrityError`` (verified: SQLite reports it as
+    ``SQLITE_CONSTRAINT_TRIGGER``, not a PRIMARY KEY/UNIQUE conflict).
+    Swallowing this into the same bare ``False`` a real collision returns
+    would report a fence refusal to the caller as "generated session ID
+    collision" and silently lose the fence signal entirely.
+
+    Simulated the same way
+    tests/state/test_turn_fence_generation_current_main.py does: override
+    the registered generation scalar on this connection so the governed
+    table's BEFORE INSERT trigger aborts.
+    """
+    store._db._conn.create_function(
+        "hermes_turn_fence_generation", 0, lambda: TURN_FENCE_GENERATION - 1
+    )
+    try:
+        with pytest.raises(
+            sqlite3.IntegrityError, match="generation incompatible"
+        ):
+            store._db.create_session_strict(
+                session_id="fenced-child", source="test"
+            )
+    finally:
+        store._db._conn.create_function(
+            "hermes_turn_fence_generation", 0, lambda: TURN_FENCE_GENERATION
+        )
+    assert store._db.get_session("fenced-child") is None
+
+
+def test_create_session_strict_still_reports_real_pk_collision_as_false(store):
+    """The classification change must leave the actual collision contract
+    unchanged: a real PRIMARY KEY conflict on ``id`` still returns ``False``
+    rather than raising."""
+    assert (
+        store._db.create_session_strict(session_id="dup-strict", source="test")
+        is True
+    )
+    assert (
+        store._db.create_session_strict(session_id="dup-strict", source="test")
+        is False
+    )
 
 
 @pytest.mark.anyio
@@ -489,8 +557,19 @@ async def test_concurrent_branch_calls_on_same_parent_never_alias_the_read_lease
 
     acquisitions: list[tuple[str, bool]] = []
     real_try_acquire = store._db.try_acquire_session_turn_lease
+    # Signalled the moment the SECOND call makes its own first attempt at
+    # the parent's lease — the first call never calls try_acquire again
+    # once parked in load_transcript_gated, so the first post-park attempt
+    # on the parent's lease is unambiguously the second call's.
+    second_attempt_starting = threading.Event()
 
     def recording_try_acquire(session_id, holder, **kwargs):
+        if (
+            session_id == parent.session_id
+            and parked_once.is_set()
+            and not second_attempt_starting.is_set()
+        ):
+            second_attempt_starting.set()
         result = real_try_acquire(session_id, holder, **kwargs)
         if session_id == parent.session_id:
             acquisitions.append((holder, result))
@@ -508,11 +587,20 @@ async def test_concurrent_branch_calls_on_same_parent_never_alias_the_read_lease
     parked = await asyncio.to_thread(first_parked.wait, 10.0)
     assert parked, "the first /branch call never reached its fenced read"
 
-    def release_soon():
-        time.sleep(0.2)
+    def release_after_second_attempt_starts():
+        # Release the first lease only once the second call's own
+        # acquisition attempt has genuinely started — not after a fixed
+        # sleep, which a slow CI can outrun: the release would then land
+        # BEFORE the second attempt, so even correct code lets that
+        # attempt succeed uncontested and the test would fail for timing
+        # reasons (or, worse, pass without ever proving a real overlap).
+        started = second_attempt_starting.wait(timeout=10.0)
+        assert started, "the second call's acquisition attempt never started"
         release_first.set()
 
-    threading.Thread(target=release_soon, daemon=True).start()
+    threading.Thread(
+        target=release_after_second_attempt_starts, daemon=True
+    ).start()
 
     # A second, genuinely concurrent /branch call on the SAME parent while
     # the first call still holds the parent's turn lease.
@@ -613,8 +701,19 @@ async def test_prefix_collision_never_admits_second_branch_as_same_holder_reentr
 
     acquisitions: list[tuple[str, bool]] = []
     real_try_acquire = store._db.try_acquire_session_turn_lease
+    # Signalled the moment the SECOND call makes its own first attempt at
+    # the parent's lease — the first call never calls try_acquire again
+    # once parked in load_transcript_gated, so the first post-park attempt
+    # on the parent's lease is unambiguously the second call's.
+    second_attempt_starting = threading.Event()
 
     def recording_try_acquire(session_id, holder, **kwargs):
+        if (
+            session_id == parent.session_id
+            and parked_once.is_set()
+            and not second_attempt_starting.is_set()
+        ):
+            second_attempt_starting.set()
         result = real_try_acquire(session_id, holder, **kwargs)
         if session_id == parent.session_id:
             acquisitions.append((holder, result))
@@ -632,11 +731,20 @@ async def test_prefix_collision_never_admits_second_branch_as_same_holder_reentr
     parked = await asyncio.to_thread(first_parked.wait, 10.0)
     assert parked, "the first /branch call never reached its fenced read"
 
-    def release_soon():
-        time.sleep(0.2)
+    def release_after_second_attempt_starts():
+        # Release the first lease only once the second call's own
+        # acquisition attempt has genuinely started — not after a fixed
+        # sleep, which a slow CI can outrun: the release would then land
+        # BEFORE the second attempt, so even correct code lets that
+        # attempt succeed uncontested and the test would fail for timing
+        # reasons (or, worse, pass without ever proving a real overlap).
+        started = second_attempt_starting.wait(timeout=10.0)
+        assert started, "the second call's acquisition attempt never started"
         release_first.set()
 
-    threading.Thread(target=release_soon, daemon=True).start()
+    threading.Thread(
+        target=release_after_second_attempt_starts, daemon=True
+    ).start()
 
     # A second, genuinely concurrent /branch call on the SAME parent while
     # the first call still holds the parent's turn lease — scripted onto
@@ -887,4 +995,3 @@ async def test_title_collision_reports_untitled_branch_not_a_titled_one(
         title="taken",
         error=f"Title 'taken' is already in use by session {other_id}",
     )
-
