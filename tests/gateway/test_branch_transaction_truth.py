@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import pathlib
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -18,7 +19,6 @@ from hermes_state import (
     AsyncSessionDB,
     SessionDB,
     SessionTurnLeaseLostError,
-    make_turn_lease_holder,
 )
 from tests.state.lease_mutation_harness import (
     Mutation,
@@ -167,7 +167,8 @@ async def test_lease_loss_after_first_durable_chunk_reports_committed_truth(
             lease = observed["lease"]
             if lease is not None:
                 observed["refusal_type"] = type(exc)
-                lease.__exit__(type(exc), exc, exc.__traceback__)
+                held_session_id, held_holder = lease
+                lease_db.release_session_turn_lease(held_session_id, held_holder)
                 observed["lease"] = None
             raise
 
@@ -185,15 +186,24 @@ async def test_lease_loss_after_first_durable_chunk_reports_committed_truth(
             assert all(message["role"] == "user" for message in durable)
             observed["child_id"] = session_id
             observed["durable_before_refusal"] = len(durable)
-            lease = lease_db.session_turn_lease(
-                session_id,
-                make_turn_lease_holder("branch-truth-regression"),
-                wait_seconds=0.0,
-                ttl_seconds=30.0,
-                reload_messages=False,
+            # Production's own copy holds a live, same-process lease on this
+            # child for the whole seed, so it can never be reclaimed as a
+            # dead PID (see _compression_lock_holder_process_is_dead). Force
+            # it into the past instead and take it over through the normal
+            # expiry path -- the same takeover an actually-different process
+            # would perform after the TTL lapsed.
+            competing_holder = f"pid={os.getpid()}:turn=branch-truth-regression"
+            lease_db._execute_write(
+                lambda conn: conn.execute(
+                    "UPDATE session_turn_leases SET expires_at = 0 "
+                    "WHERE conversation_id = ?",
+                    (session_id,),
+                )
             )
-            lease.__enter__()
-            observed["lease"] = lease
+            assert lease_db.try_acquire_session_turn_lease(
+                session_id, competing_holder, ttl_seconds=30.0,
+            )
+            observed["lease"] = (session_id, competing_holder)
             observed["injected"] = True
         return inserted
 
@@ -251,7 +261,8 @@ async def test_lease_loss_after_first_durable_chunk_reports_committed_truth(
     finally:
         lease = observed["lease"]
         if lease is not None:
-            lease.__exit__(None, None, None)
+            held_session_id, held_holder = lease
+            lease_db.release_session_turn_lease(held_session_id, held_holder)
         lease_db.close()
 
 
