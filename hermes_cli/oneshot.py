@@ -327,8 +327,32 @@ def run_oneshot(
             real_stdout.write("\n")
         real_stdout.flush()
 
-    if (result.get("failed") or result.get("partial")) and not (response or "").strip():
-        return 2
+    # ``result.get("failed")`` must gate the exit code on its own, independent
+    # of whether ``response`` happens to carry text. Some failure paths (e.g.
+    # the turn-lease-timeout guard in run_agent.py) write a friendly
+    # final_response explaining that the user's message was NOT processed —
+    # discarded, not answered. A caller piping ``hermes -z`` in a script has
+    # no way to tell "the agent answered" from "the agent gave up and printed
+    # an apology" unless failed is checked unconditionally here. This mirrors
+    # the sibling `hermes chat -Q` one-shot path (cli.py, ~line 21393:
+    # ``if isinstance(result, dict) and result.get("failed"): _exit_code = 1``),
+    # which already checks failed without gating on response text.
+    #
+    # ``partial`` is deliberately NOT folded into this check. It is set when
+    # the agent loop stopped early for a recoverable reason (e.g. invalid tool
+    # calls) but MAY still have produced a genuinely usable answer — the same
+    # sibling `-Q` path above does not treat partial as a failure either. A
+    # partial result with real text still falls through to the empty-response
+    # check below and, if non-empty, exits 0.
+    if result.get("failed"):
+        error_detail = result.get("error") or "unknown error"
+        real_stderr.write(
+            f"hermes -z: the agent turn failed ({error_detail}); the response "
+            "above, if any, may not reflect a completed answer to your "
+            "message.\n"
+        )
+        real_stderr.flush()
+        return 1
 
     if not (response or "").strip():
         real_stderr.write("hermes -z: no final response was produced; treating the run as failed.\n")
