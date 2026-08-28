@@ -84,7 +84,6 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     MAX_FTS5_QUERY_CHARS,
     SCHEMA_SQL,
     SCHEMA_VERSION,
-    TURN_FENCE_ABORT_MESSAGE,
     TURN_FENCE_GENERATION,
     _PREVIEW_CONTENT_SQL,
     _PREVIEW_HEAD_CHARS,
@@ -5404,136 +5403,58 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         timestamp+random id) must use this instead, so a collision is
         refused untouched rather than silently repointed.
 
-        Returns ``True`` when the row is freshly created, ``False`` on a PK
-        collision. Every other failure still raises — including an
-        ``IntegrityError`` that is NOT a collision on this row's own id:
-        a foreign-key violation (e.g. an unknown ``parent_session_id``), a
-        turn-fence trigger's ``RAISE(ABORT)``, or a UNIQUE violation on some
-        OTHER column (e.g. ``idx_sessions_title_unique`` in
-        hermes_state_schema.py) all also raise ``sqlite3.IntegrityError`` in
-        this SQLite build, and reporting any of those as "generated session
-        ID collision" would be a false result — and, for the fence case,
-        would silently swallow the refusal too.
+        Returns ``True`` when the row is freshly created, ``False`` when
+        ``session_id`` is already taken. Everything else raises.
 
-        The classification does NOT consult ``sqlite_errorname`` or any
-        other error code. It checks the fence FIRST: if the exception's own
-        message carries ``TURN_FENCE_ABORT_MESSAGE`` (the literal this
-        project's ``RAISE(ABORT, ...)`` trigger text uses,
-        hermes_state_common.py), it is re-raised unconditionally — a fence
-        refusal is never a collision, no matter what else is also true.
-
-        Only once the fence marker is absent does existence get consulted:
-        after the INSERT fails, this same connection — inside the same
-        still-open transaction, before it is rolled back or committed —
-        runs a SELECT for a row whose id equals this row's own id. If it
-        exists, the INSERT collided with it: a real, expected id collision.
-        If it does not, whatever raised ``IntegrityError`` was NOT an id
-        collision, and the exception is re-raised untouched.
-
-        Existence alone is NOT sufficient, only necessary, for a real
-        collision: the turn-fence trigger is a ``BEFORE INSERT`` trigger
-        (hermes_state_common.py), so it fires and raises before SQLite ever
-        evaluates the PRIMARY KEY constraint on the row being inserted. If a
-        row with this same id ALREADY exists AND the fence generation is
-        wrong, the fence aborts first, no new row is ever attempted against
-        the PK constraint, and the pre-existing row is still the only one a
-        same-transaction SELECT finds — indistinguishable, by existence
-        alone, from an ordinary PK collision. Checking the fence marker
-        first is what breaks that tie.
-
-        A prior version of this method matched ``exc.sqlite_errorname ==
-        "SQLITE_CONSTRAINT_PRIMARYKEY"`` instead, reasoning that this
-        project's ``requires-python`` floor (3.11) guaranteed the
-        distinction from every other constraint failure. That reasoning is
-        false: ``sqlite_errorname`` reflects extended result codes the
-        *linked SQLite library* supports, not the Python version. SQLite
-        only started reporting ``SQLITE_CONSTRAINT_PRIMARYKEY`` /
-        ``SQLITE_CONSTRAINT_UNIQUE`` as distinct extended codes in SQLite
-        3.7.16 (2013); CPython 3.11's own minimum supported SQLite is only
-        3.7.15, and CPython registers those two constants conditionally on
-        ``SQLITE_VERSION_NUMBER >= 3007016`` (``Modules/_sqlite/module.c``).
-        On an interpreter linked against an older SQLite, a genuine PRIMARY
-        KEY collision surfaces as the plain, undifferentiated
-        ``SQLITE_CONSTRAINT`` — indistinguishable by error code from every
-        other constraint failure on that build — so the errorname check
-        would have raised on a real collision instead of returning
-        ``False``. Existence-checking still consults no error code, on any
-        SQLite version — but, as above, existence alone is exact only once
-        the fence marker has already been ruled out first.
+        The precondition rule: whether the id is taken is decided by a
+        ``SELECT`` that runs BEFORE any write this method makes — before
+        ``_store_system_prompt`` and before the ``INSERT`` — inside the same
+        ``BEGIN IMMEDIATE`` transaction ``_execute_write`` holds under
+        ``self._lock``. That exclusive write lock is held for the entire
+        call, so no other writer can claim the id between the SELECT and
+        the INSERT. So ``False`` means nothing of ours was written, and any
+        ``sqlite3.IntegrityError`` the INSERT itself raises afterward — a
+        foreign-key violation, a turn-fence trigger's ``RAISE(ABORT)``, a
+        UNIQUE violation on some other column — is a genuine failure, not a
+        collision on this id, and propagates untouched.
         """
         def _do(conn):
-            system_prompt_hash = self._store_system_prompt(conn, system_prompt)
-            try:
-                conn.execute(
-                    """INSERT INTO sessions (
-                       id, source, user_id, session_key, chat_id, chat_type, thread_id,
-                       model, model_config, system_prompt, system_prompt_hash,
-                       parent_session_id, cwd, profile_name, git_repo_root,
-                       origin_json, display_name, started_at
-                    )
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        session_id,
-                        source,
-                        user_id,
-                        session_key,
-                        chat_id,
-                        chat_type,
-                        thread_id,
-                        model,
-                        json.dumps(model_config) if model_config else None,
-                        system_prompt_hash,
-                        parent_session_id,
-                        cwd,
-                        profile_name,
-                        git_repo_root,
-                        origin_json,
-                        display_name,
-                        time.time(),
-                    ),
-                )
-            except sqlite3.IntegrityError as exc:
-                # Only a real PRIMARY KEY conflict on THIS row's own id is a
-                # "collision" — everything else (FK violation, a turn-fence
-                # trigger's RAISE(ABORT), a UNIQUE conflict on some OTHER
-                # column such as idx_sessions_title_unique, a CHECK
-                # failure, ...) must propagate untouched. Swallowing those
-                # into a bare ``False`` reports a fence refusal (or a broken
-                # FK, or an unrelated UNIQUE conflict) to the caller as
-                # "generated session ID collision", which is both a false
-                # result and, for the fence case, a lost fence signal.
-                #
-                # The fence is checked FIRST, before existence, and wins
-                # unconditionally. The turn-fence trigger is BEFORE INSERT
-                # (hermes_state_common.py): it fires and raises before
-                # SQLite ever evaluates the PRIMARY KEY constraint on this
-                # row. So when a row with this same id already exists AND
-                # the fence generation is wrong, the fence aborts first — no
-                # new row is ever attempted against the PK constraint — and
-                # the pre-existing row is still the only one a
-                # same-transaction SELECT finds. Existence alone cannot
-                # distinguish that compound case from an ordinary PK
-                # collision; the fence marker can, because it is present in
-                # the exception's own message only when the fence itself
-                # fired. TURN_FENCE_ABORT_MESSAGE is the single definition
-                # this trigger SQL is built from (hermes_state_common.py),
-                # so the two can never say two different things.
-                if TURN_FENCE_ABORT_MESSAGE in str(exc):
-                    raise
-                # Existence is checked only once the fence has been ruled
-                # out. SQLite's default ON CONFLICT ABORT rolls back only
-                # the failed INSERT statement, not the surrounding
-                # transaction, so this same connection can still run a
-                # SELECT here, inside the same still-open transaction. If a
-                # row with this id exists, the INSERT collided with it — a
-                # real id collision. If it does not, the IntegrityError came
-                # from something else entirely and must propagate.
-                exists = conn.execute(
-                    "SELECT 1 FROM sessions WHERE id = ?", (session_id,)
-                ).fetchone()
-                if exists is None:
-                    raise
+            # Must be the first statement in _do, before every other write
+            # (including _store_system_prompt): see precondition rule above.
+            row = conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if row is not None:
                 return False
+            system_prompt_hash = self._store_system_prompt(conn, system_prompt)
+            conn.execute(
+                """INSERT INTO sessions (
+                   id, source, user_id, session_key, chat_id, chat_type, thread_id,
+                   model, model_config, system_prompt, system_prompt_hash,
+                   parent_session_id, cwd, profile_name, git_repo_root,
+                   origin_json, display_name, started_at
+                )
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    session_id,
+                    source,
+                    user_id,
+                    session_key,
+                    chat_id,
+                    chat_type,
+                    thread_id,
+                    model,
+                    json.dumps(model_config) if model_config else None,
+                    system_prompt_hash,
+                    parent_session_id,
+                    cwd,
+                    profile_name,
+                    git_repo_root,
+                    origin_json,
+                    display_name,
+                    time.time(),
+                ),
+            )
             if system_prompt_hash is not None:
                 self._delete_unreferenced_system_prompts(conn)
             if parent_session_id:

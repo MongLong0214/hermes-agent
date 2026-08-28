@@ -160,18 +160,14 @@ def test_create_session_strict_fence_wins_over_a_pre_existing_row_with_same_id(
     """Compound case: a row with this id ALREADY EXISTS **and** the turn-fence
     generation is wrong.
 
-    The fence trigger is ``BEFORE INSERT`` (hermes_state_common.py), so it
-    fires and aborts before SQLite ever evaluates the PRIMARY KEY constraint
-    on the attempted row. No new row is written either way, so the
-    pre-existing same-id row is still the only one visible afterwards — a
-    same-transaction ``SELECT ... WHERE id = ?`` finds it regardless of
-    WHICH failure actually happened. Existence alone cannot distinguish "the
-    INSERT collided with this row" from "the fence refused before the INSERT
-    was even attempted against this row" when both are true at once.
-    Classifying by existence alone would misreport the fence refusal as a
-    real id collision (``False``) and silently swallow it — the exact defect
-    this module exists to prevent. The fence must win: the exception must
-    propagate, not collapse into ``False``.
+    The id-existence check is the FIRST statement ``_do`` runs — before any
+    write, before the governed ``INSERT`` is even attempted. So when a row
+    with this id already exists, ``create_session_strict`` returns ``False``
+    before the fence trigger ever gets a chance to fire: there is no
+    governed INSERT for it to guard, so there is nothing for the fence to
+    refuse and nothing to swallow. The pre-existing row must come back
+    completely unchanged — not just present, but byte-for-byte identical to
+    what it was before the call.
     """
     assert (
         store._db.create_session_strict(
@@ -179,22 +175,62 @@ def test_create_session_strict_fence_wins_over_a_pre_existing_row_with_same_id(
         )
         is True
     )
+    row_before = store._db.get_session("fenced-collision-existing")
     store._db._conn.create_function(
         "hermes_turn_fence_generation", 0, lambda: TURN_FENCE_GENERATION - 1
     )
     try:
-        with pytest.raises(
-            sqlite3.IntegrityError, match="generation incompatible"
-        ):
+        assert (
             store._db.create_session_strict(
                 session_id="fenced-collision-existing", source="test"
             )
+            is False
+        )
     finally:
         store._db._conn.create_function(
             "hermes_turn_fence_generation", 0, lambda: TURN_FENCE_GENERATION
         )
-    # The pre-existing row must be untouched by the refused attempt.
-    assert store._db.get_session("fenced-collision-existing") is not None
+    # The pre-existing row must be completely unchanged by the refused call
+    # — the governed INSERT was never attempted, so there is nothing that
+    # could have touched it.
+    row_after = store._db.get_session("fenced-collision-existing")
+    assert row_after is not None
+    assert dict(row_after) == dict(row_before)
+
+
+def test_create_session_strict_existence_check_precedes_every_write(store):
+    """The id-existence check must be the FIRST statement in ``_do`` —
+    before ``_store_system_prompt``, which writes to the ``system_prompts``
+    table. If the existence check ran after that write (or after any other
+    write), a call carrying a ``system_prompt`` for an id that already
+    exists would land a ``system_prompts`` row before returning ``False``,
+    breaking the contract that ``False`` means nothing of ours was written.
+    """
+    assert (
+        store._db.create_session_strict(
+            session_id="existing-id-for-ordering-check", source="test"
+        )
+        is True
+    )
+    prompts_before = store._db._conn.execute(
+        "SELECT COUNT(*) FROM system_prompts"
+    ).fetchone()[0]
+
+    result = store._db.create_session_strict(
+        session_id="existing-id-for-ordering-check",
+        source="test",
+        system_prompt="a system prompt only this call provides",
+    )
+
+    prompts_after = store._db._conn.execute(
+        "SELECT COUNT(*) FROM system_prompts"
+    ).fetchone()[0]
+    assert result is False
+    assert prompts_after == prompts_before, (
+        "create_session_strict wrote a system_prompts row for an id that "
+        "was already taken — the existence check did not precede every "
+        "write"
+    )
 
 
 def test_create_session_strict_still_reports_real_pk_collision_as_false(store):
