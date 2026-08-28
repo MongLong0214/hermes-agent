@@ -5123,16 +5123,17 @@ def _apply_model_switch(
 
     # Record the switch as a PER-SESSION override so a later rebuild of THIS
     # session re-derives the user's chosen model/provider instead of falling
-    # back to global config. The only rebuild that reads it back is resume /
-    # reconnect (_start_agent_build's deferred _build() forwards
-    # session["model_override"] into _make_agent — see the lazy-resume kw
-    # assembly above). /new does NOT go through here: it re-derives via
-    # session.create/_init_session, a fresh session with no override to
-    # inherit. Nor does /tools enable|disable's _reset_session_agent — that
-    # path is the ONE real caller of _reset_session_agent, and it explicitly
-    # pops this override (a deliberate conversation-boundary reset, not a
-    # rebuild that re-derives session pins — see #48055/#23131 in
-    # _reset_session_agent).
+    # back to global config. Two rebuilds read it back: resume/reconnect
+    # (_start_agent_build's deferred _build() forwards session["model_override"]
+    # into _make_agent — see the lazy-resume kw assembly above) and the
+    # compute-host turn frame (ComputeHost forwards the same session field into
+    # its own _make_agent call — tui_gateway/compute_host.py). /new does NOT go
+    # through here: it re-derives via session.create/_init_session, a fresh
+    # session with no override to inherit. Nor does /tools enable|disable's
+    # _reset_session_agent — that path is the ONE real caller of
+    # _reset_session_agent, and it explicitly pops this override (a deliberate
+    # conversation-boundary reset, not a rebuild that re-derives session pins —
+    # see #48055/#23131 in _reset_session_agent).
     #
     # We deliberately do NOT write process-global env vars (HERMES_MODEL /
     # HERMES_INFERENCE_MODEL / HERMES_TUI_PROVIDER / HERMES_INFERENCE_PROVIDER)
@@ -5198,8 +5199,16 @@ def _sync_bot_capabilities(sid: str, session: dict) -> None:
         return
 
     # Capability surface changed — rebuild the agent in place. Same
-    # session_id/key, so the DB-backed history and (epoch-refreshed) system
-    # prompt carry over; only tool definitions and prompt bytes change.
+    # session_id/key, so the (epoch-refreshed) system prompt carries over; only
+    # tool definitions and prompt bytes change. DB-backed history only carries
+    # over if the rebuilt agent stays bound to the SAME database the outgoing
+    # one was using — _make_agent defaults session_db to the shared launch
+    # handle whenever the caller passes None, which silently rebinds a
+    # profile-scoped Bot Chat (app-global remote mode) to the wrong state.db.
+    # Reuse the outgoing agent's own handle instead of leaving that to chance
+    # (same fix and same reasoning as _reset_session_agent's profile-db bug).
+    old_db = getattr(agent, "_session_db", None)
+    old_db_owned = bool(getattr(agent, "_owns_session_db", False))
     try:
         tokens = _set_session_context(sid, cwd=_session_cwd(session))
         try:
@@ -5208,9 +5217,13 @@ def _sync_bot_capabilities(sid: str, session: dict) -> None:
                 session["session_key"],
                 session_id=session["session_key"],
                 platform_override=_session_source(session),
+                session_db=old_db,
             )
         finally:
             _clear_session_context(tokens)
+        if old_db_owned and _transfer_db_to_agent(new_agent, old_db):
+            # Real transfer, not a second claim — see _reset_session_agent.
+            agent._owns_session_db = False
         new_agent._session_title_hint = "Bot Chat"
         session["agent"] = new_agent
         session["config_model_seen"] = _config_model_target()
@@ -6888,20 +6901,54 @@ def _preview_restart_callbacks(parent: str, task_id: str) -> dict:
     }
 
 
+# Bound for _reset_session_agent's wait on an in-flight deferred agent build
+# (session.create's _deferred_session_record / _start_agent_build). Module
+# level so a test can shrink it instead of actually waiting; mirrors
+# _wait_agent's own 30.0 default for the same "RPC needs the real agent" shape.
+_RESET_SESSION_AGENT_BUILD_WAIT_S = 30.0
+
+
 def _reset_session_agent(sid: str, session: dict) -> dict:
     tokens = _set_session_context(session["session_key"])
     try:
-        # /new is a full conversation boundary: session-scoped runtime
+        # This is a conversation-boundary reset: session-scoped runtime
         # overrides (/model, /reasoning, /fast) do NOT carry forward — the
         # fresh agent re-derives model/provider, reasoning, and service tier
         # from config.yaml (#48055, #23131). Session pins are cleared below so
         # a rebuild can't resurrect them. (Global process state is still never
         # touched — see the cross-session-contamination note in
-        # _apply_model_switch.)
+        # _apply_model_switch.) The ONLY real caller is tools.configure's
+        # /tools enable|disable (methods_tools.py); /new does not reach here —
+        # it re-derives via session.create/_init_session, a brand-new session
+        # with no session pins to clear in the first place.
         session.pop("model_override", None)
         session.pop("create_reasoning_override", None)
         session.pop("create_service_tier_override", None)
         session.pop("one_turn_model_restore", None)
+
+        # A session created moments ago (session.create's deferred build,
+        # _deferred_session_record) can still be mid-construction here:
+        # tools.configure does not wait for agent readiness before calling
+        # in, so session["agent"] may still be None while _start_agent_build's
+        # _build() thread is running. _build() is the one place that already
+        # resolves this session's profile db correctly — wait for that single
+        # build to land instead of racing a second, independent one. This
+        # keeps agent construction at exactly one build (_build()) plus this
+        # function's own rebuild, same as the already-built case; it never
+        # starts a second, competing _build(). A build that never completes
+        # in time raises rather than silently falling through to _make_agent's
+        # _get_db() default — the exact bug this function exists not to
+        # reintroduce.
+        ready = session.get("agent_ready")
+        if session.get("agent") is None and ready is not None and not ready.is_set():
+            if not ready.wait(timeout=_RESET_SESSION_AGENT_BUILD_WAIT_S):
+                raise RuntimeError(
+                    "agent build timed out; tool configuration was saved, but "
+                    "the session's agent was not rebuilt — retry shortly"
+                )
+            if agent_error := session.get("agent_error"):
+                raise RuntimeError(str(agent_error))
+
         # Keep the rebuilt agent on the SAME database the session was already
         # using. _make_agent defaults session_db to the shared launch handle
         # (_get_db()) whenever the caller passes None — fine for a launch
@@ -6911,7 +6958,7 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
         # open, it is exactly the db this session's rows live in (profile or
         # shared — see _session_db()/_init_session() for the same
         # profile_home-keyed selection), and reusing it means there is only
-        # ever one handle in play, so there is nothing new to close.
+        # ever one handle in play.
         old_agent = session.get("agent")
         existing_db = getattr(old_agent, "_session_db", None)
         existing_db_owned = bool(getattr(old_agent, "_owns_session_db", False))
@@ -6922,12 +6969,14 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
             platform_override=_session_source(session),
             session_db=existing_db,
         )
-        if existing_db_owned:
-            # The outgoing agent (never explicitly closed here — same as
-            # before this fix) owned this handle; hand ownership to its
-            # replacement so a later session.close() still releases it
-            # instead of leaking the sqlite fds and token-writer thread.
-            _transfer_db_to_agent(new_agent, existing_db)
+        if existing_db_owned and _transfer_db_to_agent(new_agent, existing_db):
+            # Make this a REAL transfer, not a second claim: clear the
+            # outgoing agent's flag so a stale reference to it can never
+            # close the handle the new agent is now using. The outgoing
+            # agent itself is still never explicitly closed here (unchanged
+            # from before this fix) — it is simply dropped once
+            # session["agent"] is reassigned below.
+            old_agent._owns_session_db = False
     finally:
         _clear_session_context(tokens)
     session["agent"] = new_agent
