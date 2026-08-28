@@ -5413,16 +5413,33 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         this SQLite build, and reporting any of those as "generated session
         ID collision" would be a false result — and, for the fence case,
         would silently swallow the refusal too.
-        ``sqlite_errorname`` (stable since Python 3.11, which this project's
-        ``requires-python`` floor guarantees) distinguishes an actual PRIMARY
-        KEY conflict on this row's own id — reported as
-        ``SQLITE_CONSTRAINT_PRIMARYKEY`` — from every other constraint
-        failure, including a UNIQUE conflict on a *different* column
-        (``SQLITE_CONSTRAINT_UNIQUE``), without depending on message text.
-        Confirmed empirically in this SQLite build: a PK collision on this
-        TEXT PRIMARY KEY rowid table reports ``SQLITE_CONSTRAINT_PRIMARYKEY``
-        and never ``SQLITE_CONSTRAINT_UNIQUE``, so only the former is
-        swallowed here.
+
+        The classification does NOT consult ``sqlite_errorname`` or any
+        other error code. After the INSERT fails, this same connection —
+        inside the same still-open transaction, before it is rolled back or
+        committed — runs a SELECT for a row whose id equals this row's own
+        id. If it exists, the INSERT collided with it: a real, expected id
+        collision. If it does not, whatever raised ``IntegrityError`` was
+        NOT an id collision, and the exception is re-raised untouched.
+
+        A prior version of this method matched ``exc.sqlite_errorname ==
+        "SQLITE_CONSTRAINT_PRIMARYKEY"`` instead, reasoning that this
+        project's ``requires-python`` floor (3.11) guaranteed the
+        distinction from every other constraint failure. That reasoning is
+        false: ``sqlite_errorname`` reflects extended result codes the
+        *linked SQLite library* supports, not the Python version. SQLite
+        only started reporting ``SQLITE_CONSTRAINT_PRIMARYKEY`` /
+        ``SQLITE_CONSTRAINT_UNIQUE`` as distinct extended codes in SQLite
+        3.7.16 (2013); CPython 3.11's own minimum supported SQLite is only
+        3.7.15, and CPython registers those two constants conditionally on
+        ``SQLITE_VERSION_NUMBER >= 3007016`` (``Modules/_sqlite/module.c``).
+        On an interpreter linked against an older SQLite, a genuine PRIMARY
+        KEY collision surfaces as the plain, undifferentiated
+        ``SQLITE_CONSTRAINT`` — indistinguishable by error code from every
+        other constraint failure on that build — so the errorname check
+        would have raised on a real collision instead of returning
+        ``False``. Existence is exact on every SQLite version and consults
+        no error code at all.
         """
         def _do(conn):
             system_prompt_hash = self._store_system_prompt(conn, system_prompt)
@@ -5455,7 +5472,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         time.time(),
                     ),
                 )
-            except sqlite3.IntegrityError as exc:
+            except sqlite3.IntegrityError:
                 # Only a real PRIMARY KEY conflict on THIS row's own id is a
                 # "collision" — everything else (FK violation, a turn-fence
                 # trigger's RAISE(ABORT), a UNIQUE conflict on some OTHER
@@ -5465,14 +5482,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # FK, or an unrelated UNIQUE conflict) to the caller as
                 # "generated session ID collision", which is both a false
                 # result and, for the fence case, a lost fence signal.
-                # SQLITE_CONSTRAINT_UNIQUE is deliberately excluded: it
-                # fires for a UNIQUE index on ANY column, not just id, and
-                # this INSERT never sets ``title`` (the only other UNIQUE
-                # column today) so it can't yet collide there — but only
-                # PRIMARYKEY names id's own conflict.
-                if getattr(exc, "sqlite_errorname", None) != (
-                    "SQLITE_CONSTRAINT_PRIMARYKEY"
-                ):
+                #
+                # Classified by existence, not by error code. SQLite's
+                # default ON CONFLICT ABORT rolls back only the failed
+                # INSERT statement, not the surrounding transaction, so
+                # this same connection can still run a SELECT here, inside
+                # the same still-open transaction. If a row with this id
+                # exists, the INSERT collided with it — a real id
+                # collision. If it does not, the IntegrityError came from
+                # something else entirely and must propagate.
+                exists = conn.execute(
+                    "SELECT 1 FROM sessions WHERE id = ?", (session_id,)
+                ).fetchone()
+                if exists is None:
                     raise
                 return False
             if system_prompt_hash is not None:
