@@ -181,3 +181,40 @@ class TestMirrorRefusedWrite:
             f"got: {result!r}"
         )
 
+
+class TestMirrorCloseFailureAfterCommit:
+    """A close() failure after a successful append must not overturn the commit.
+
+    ``_append_to_sqlite`` sets ``append_committed = True`` right after
+    ``db.append_message`` returns, but its ``finally`` block called
+    ``db.close()`` unguarded. If ``close()`` itself raised, that exception
+    propagated out of ``_append_to_sqlite`` entirely — discarding the
+    already-decided ``True`` — and was caught by ``mirror_to_session``'s
+    outer ``except Exception``, which reported ``False``. That is the
+    same class of lie as the original defect with the sign flipped: the
+    row genuinely committed, but the caller is told it did not. Two of
+    ``mirror_to_session``'s callers (``cron/scheduler.py``'s thread and
+    in-channel seeders) log "did NOT land" on a falsy result — they would
+    say that about a row that landed.
+    """
+
+    def test_close_failure_after_committed_append_still_reports_true(self):
+        mock_db = MagicMock()
+        mock_db.close.side_effect = RuntimeError("close boom")
+
+        with patch("hermes_state.SessionDB", return_value=mock_db):
+            result = mirror_to_session(
+                "telegram",
+                "55555",
+                "Row commits even though close() blows up",
+                source_label="cli",
+                session_id="sess_committed",
+            )
+
+        assert result is True, (
+            "a close() failure after a successful append flipped a "
+            "committed write into a reported failure — the row IS on "
+            f"disk, so the truthful answer is True. got: {result!r}"
+        )
+        mock_db.append_message.assert_called_once()
+

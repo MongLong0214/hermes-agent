@@ -219,6 +219,13 @@ def _append_to_sqlite(session_id: str, message: dict) -> bool:
     ``CompressionSessionClosedError``, or any other exception from the
     SQLite layer) is logged at debug level and reported back as False --
     it must never be mistaken by the caller for a successful mirror.
+
+    ``append_committed`` is decided the instant ``append_message`` returns
+    and must not be overturned by anything that happens afterward. A
+    ``close()`` failure is cleanup, not commit status -- the row is on
+    disk whether or not the connection tears down cleanly -- so it is
+    caught and logged separately rather than allowed to propagate and
+    flip a genuine commit into a reported failure.
     """
     db = None
     append_committed = False
@@ -235,5 +242,8 @@ def _append_to_sqlite(session_id: str, message: dict) -> bool:
         logger.debug("Mirror SQLite write failed: %s", e)
     finally:
         if db is not None:
-            db.close()
+            try:
+                db.close()
+            except Exception as e:
+                logger.debug("Mirror SQLite close failed: %s", e)
     return append_committed
