@@ -27,8 +27,8 @@ THIS IS THE REACHABLE CONTRACT ONLY
     nothing could call, not a statement about behaviour. It has been removed
     from this reduction along with its dedicated pins; the refusal contract
     below is unchanged by the removal, because the engine never ran. The
-    removed engine remains available in this repository's history (see the
-    commit that introduced ``fix(c5): fence-rollback verb joins the
+    removed engine remains recoverable from this repository's object store
+    (commit ``0e7c88685f``, ``fix(c5): fence-rollback verb joins the
     composition with its Family A/B pins``) for whichever future slice
     actually establishes an artifact's offline authority.
 
