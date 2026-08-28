@@ -22,6 +22,25 @@ _SESSIONS_DIR = get_hermes_home() / "sessions"
 _SESSIONS_INDEX = _SESSIONS_DIR / "sessions.json"
 
 
+def _log_safely(log_fn, msg, *args) -> None:
+    """Call a logger method without letting it change the caller's control flow.
+
+    A user- or plugin-installed logging handler/filter can itself raise.
+    ``mirror_to_session`` / ``_append_to_sqlite`` return a truthful
+    committed/not-committed answer that real callers (cron/scheduler.py,
+    tools/send_message_tool.py) branch on -- that answer must never be
+    decided by whether an incidental log line happened to blow up. Every
+    log call on the commit-truth path routes through this one function,
+    so "logging cannot flip the result" is a property of this function
+    (it cannot raise, full stop) rather than something that has to be
+    remembered at each call site.
+    """
+    try:
+        log_fn(msg, *args)
+    except Exception:
+        pass
+
+
 def mirror_to_session(
     platform: str,
     chat_id: str,
@@ -62,8 +81,12 @@ def mirror_to_session(
 
     Returns True if the message was actually committed to the session's
     SQLite transcript, False if no matching session was found OR the
-    SQLite append itself was refused (e.g. a lost turn lease, a closed
-    compression session) -- a refused write is never reported as mirrored.
+    SQLite append itself was refused. Main's mirror path calls
+    ``append_message`` with no ``turn_lease_holder``, so a lost-lease
+    refusal (``SessionTurnLeaseLostError``) cannot happen HERE -- what can
+    refuse is a closed compression session (``CompressionSessionClosedError``)
+    or any other exception the SQLite layer raises (lock contention, a
+    disk error, etc.). A refused write is never reported as mirrored.
     All errors are caught -- this is never fatal to the caller.
     """
     try:
@@ -96,7 +119,12 @@ def mirror_to_session(
         append_committed = _append_to_sqlite(session_id, mirror_msg)
 
         if append_committed:
-            logger.debug("Mirror: wrote to session %s (from %s)", session_id, source_label)
+            _log_safely(
+                logger.debug,
+                "Mirror: wrote to session %s (from %s)",
+                session_id,
+                source_label,
+            )
         return append_committed
 
     except Exception as e:
@@ -214,18 +242,24 @@ def _find_session_id(
 def _append_to_sqlite(session_id: str, message: dict) -> bool:
     """Append a message to the SQLite session database.
 
-    Returns True only if ``append_message`` actually committed the row.
-    A refused write (e.g. ``SessionTurnLeaseLostError``,
-    ``CompressionSessionClosedError``, or any other exception from the
-    SQLite layer) is logged at debug level and reported back as False --
-    it must never be mistaken by the caller for a successful mirror.
+    Returns True only if ``append_message`` actually committed the row. A
+    refused write -- ``CompressionSessionClosedError``, or any other
+    exception from the SQLite layer (this call passes no
+    ``turn_lease_holder``, so ``SessionTurnLeaseLostError`` cannot be
+    raised on this path; the lease fence is simply not engaged here) -- is
+    logged at debug level and reported back as False. It must never be
+    mistaken by the caller for a successful mirror.
 
     ``append_committed`` is decided the instant ``append_message`` returns
-    and must not be overturned by anything that happens afterward. A
-    ``close()`` failure is cleanup, not commit status -- the row is on
-    disk whether or not the connection tears down cleanly -- so it is
-    caught and logged separately rather than allowed to propagate and
-    flip a genuine commit into a reported failure.
+    and must not be overturned by anything that happens afterward.
+    Nothing between that point and the ``return`` may raise:
+
+    * a ``close()`` failure is cleanup, not commit status -- the row is on
+      disk whether or not the connection tears down cleanly -- so it is
+      caught and never allowed to propagate;
+    * the debug logging for either failure mode routes through
+      ``_log_safely``, which cannot itself raise (a misbehaving logging
+      handler/filter is a real, reachable fault, not a hypothetical one).
     """
     db = None
     append_committed = False
@@ -239,11 +273,11 @@ def _append_to_sqlite(session_id: str, message: dict) -> bool:
         )
         append_committed = True
     except Exception as e:
-        logger.debug("Mirror SQLite write failed: %s", e)
+        _log_safely(logger.debug, "Mirror SQLite write failed: %s", e)
     finally:
         if db is not None:
             try:
                 db.close()
             except Exception as e:
-                logger.debug("Mirror SQLite close failed: %s", e)
+                _log_safely(logger.debug, "Mirror SQLite close failed: %s", e)
     return append_committed
