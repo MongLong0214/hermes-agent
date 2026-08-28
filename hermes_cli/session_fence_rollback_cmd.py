@@ -407,8 +407,6 @@ def _emit(payload: dict[str, Any]) -> None:
 
 
 def _human_lines(payload: dict[str, Any]) -> list:
-    from hermes_cli import session_fence_rollback as rollback
-
     if not payload.get("ok"):
         refused = payload.get("refused", {})
         lines = [f"✗ {refused.get('reason')}: {refused.get('detail')}"]
@@ -467,10 +465,10 @@ def _human_lines(payload: dict[str, Any]) -> list:
             )
         else:
             lines.append("  Nothing was changed.")
-        for record in payload.get("residue") or []:
-            # Rendered from the record's own derived fields, so the sentence
-            # and the structured output cannot disagree about one incident.
-            lines.append(rollback.residue_sentence(record))
+        # NO RESIDUE LOOP: residue is only ever noted by the removed
+        # backup/commit engine (`RollbackOutcome.note_residue`), which
+        # nothing on this build's reachable path calls — `payload["residue"]`
+        # is never populated, so there is nothing here to render.
         return lines
     if payload.get("dry_run"):
         return [
