@@ -13771,6 +13771,14 @@ def main():
         help="JSON report path (defaults to <output>.recovery.json)",
     )
 
+    # The one operator path back off the turn-fence generation barrier. Its
+    # arguments live with the command rather than here so that "the target is
+    # required and never defaulted" is a property of a function a test can
+    # build a parser around.
+    from hermes_cli.session_fence_rollback_cmd import add_fence_rollback_parser
+
+    add_fence_rollback_parser(sessions_subparsers)
+
     sessions_subparsers.add_parser("stats", help="Show session store statistics")
 
     sessions_rename = sessions_subparsers.add_parser(
