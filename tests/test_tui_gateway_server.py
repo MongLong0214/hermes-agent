@@ -19955,8 +19955,6 @@ def test_session_branch_mid_turn_reuses_parent_agent_connection(monkeypatch, tmp
         def get_session_title(self, _key):
             return "parent"
 
-        session_turn_lease = _stub_session_turn_lease
-
         def close(self):
             pass
 
@@ -19990,8 +19988,6 @@ def test_session_branch_mid_turn_reuses_parent_agent_connection(monkeypatch, tmp
 
         def update_session_cwd(self, *a, **k):
             return None
-
-        session_turn_lease = _stub_session_turn_lease
 
     class ParentAgent:
         def __init__(self):
