@@ -5406,15 +5406,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         Returns ``True`` when the row is freshly created, ``False`` on a PK
         collision. Every other failure still raises — including an
         ``IntegrityError`` that is NOT a collision on this row's own id:
-        a foreign-key violation (e.g. an unknown ``parent_session_id``) or
-        a turn-fence trigger's ``RAISE(ABORT)`` also raise
-        ``sqlite3.IntegrityError`` in this SQLite build, and reporting
-        either of those as "generated session ID collision" would be a
-        false result — and would silently swallow a fence refusal.
-        ``sqlite_errorname`` (stable since Python 3.11, which this
-        project's ``requires-python`` floor guarantees) distinguishes an
-        actual PRIMARY KEY/UNIQUE conflict on the row from every other
-        constraint failure without depending on message text.
+        a foreign-key violation (e.g. an unknown ``parent_session_id``), a
+        turn-fence trigger's ``RAISE(ABORT)``, or a UNIQUE violation on some
+        OTHER column (e.g. ``idx_sessions_title_unique`` in
+        hermes_state_schema.py) all also raise ``sqlite3.IntegrityError`` in
+        this SQLite build, and reporting any of those as "generated session
+        ID collision" would be a false result — and, for the fence case,
+        would silently swallow the refusal too.
+        ``sqlite_errorname`` (stable since Python 3.11, which this project's
+        ``requires-python`` floor guarantees) distinguishes an actual PRIMARY
+        KEY conflict on this row's own id — reported as
+        ``SQLITE_CONSTRAINT_PRIMARYKEY`` — from every other constraint
+        failure, including a UNIQUE conflict on a *different* column
+        (``SQLITE_CONSTRAINT_UNIQUE``), without depending on message text.
+        Confirmed empirically in this SQLite build: a PK collision on this
+        TEXT PRIMARY KEY rowid table reports ``SQLITE_CONSTRAINT_PRIMARYKEY``
+        and never ``SQLITE_CONSTRAINT_UNIQUE``, so only the former is
+        swallowed here.
         """
         def _do(conn):
             system_prompt_hash = self._store_system_prompt(conn, system_prompt)
@@ -5448,16 +5456,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     ),
                 )
             except sqlite3.IntegrityError as exc:
-                # Only a real PRIMARY KEY/UNIQUE conflict on this row's own
-                # id is a "collision" — everything else (FK violation, a
-                # turn-fence trigger's RAISE(ABORT), a CHECK failure, ...)
-                # must propagate untouched. Swallowing those into a bare
-                # ``False`` reports a fence refusal (or a broken FK) to the
-                # caller as "generated session ID collision", which is both
-                # a false result and a lost fence signal.
-                if getattr(exc, "sqlite_errorname", None) not in (
-                    "SQLITE_CONSTRAINT_PRIMARYKEY",
-                    "SQLITE_CONSTRAINT_UNIQUE",
+                # Only a real PRIMARY KEY conflict on THIS row's own id is a
+                # "collision" — everything else (FK violation, a turn-fence
+                # trigger's RAISE(ABORT), a UNIQUE conflict on some OTHER
+                # column such as idx_sessions_title_unique, a CHECK
+                # failure, ...) must propagate untouched. Swallowing those
+                # into a bare ``False`` reports a fence refusal (or a broken
+                # FK, or an unrelated UNIQUE conflict) to the caller as
+                # "generated session ID collision", which is both a false
+                # result and, for the fence case, a lost fence signal.
+                # SQLITE_CONSTRAINT_UNIQUE is deliberately excluded: it
+                # fires for a UNIQUE index on ANY column, not just id, and
+                # this INSERT never sets ``title`` (the only other UNIQUE
+                # column today) so it can't yet collide there — but only
+                # PRIMARYKEY names id's own conflict.
+                if getattr(exc, "sqlite_errorname", None) != (
+                    "SQLITE_CONSTRAINT_PRIMARYKEY"
                 ):
                     raise
                 return False
