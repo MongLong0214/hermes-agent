@@ -3255,6 +3255,169 @@ class SessionTurnLeaseLostError(RuntimeError):
     """
 
 
+class _SerializedCursor(sqlite3.Cursor):
+    """Cursor whose every SQLite entry runs under the connection's RLock.
+
+    See :class:`_SerializedConnectionMixin` for why this exists. Fetches are
+    wrapped too, not just execute: ``fetchone``/``fetchall`` step the VM and
+    build row objects while HOLDING the GIL, which takes the connection mutex
+    — exactly the GIL-held-mutex-wait leg of the deadlock.
+    """
+
+    def _serial(self):
+        return self.connection._hermes_serial_lock
+
+    def execute(self, *args, **kwargs):
+        with self._serial():
+            return super().execute(*args, **kwargs)
+
+    def executemany(self, *args, **kwargs):
+        with self._serial():
+            return super().executemany(*args, **kwargs)
+
+    def executescript(self, *args, **kwargs):
+        with self._serial():
+            return super().executescript(*args, **kwargs)
+
+    def fetchone(self):
+        with self._serial():
+            return super().fetchone()
+
+    def fetchmany(self, *args, **kwargs):
+        with self._serial():
+            return super().fetchmany(*args, **kwargs)
+
+    def fetchall(self):
+        with self._serial():
+            return super().fetchall()
+
+    def __next__(self):
+        with self._serial():
+            return super().__next__()
+
+    def close(self):
+        with self._serial():
+            return super().close()
+
+
+class _SerializedConnectionMixin:
+    """Serialize every SQLite entry on one connection behind an RLock.
+
+    2026-08-25: the gateway froze solid for 80+ minutes in a textbook ABBA
+    deadlock (thread sample in the incident record). The two legs:
+
+    - thread A inside ``sqlite3_step`` (connection mutex HELD, GIL released)
+      hit a turn-fence trigger, whose ``hermes_turn_fence_generation()`` UDF
+      re-enters Python and must WAIT for the GIL;
+    - thread B HOLDING the GIL called into the same shared connection
+      (``check_same_thread=False``) — cursor-description/bind/fetch paths keep
+      the GIL while taking the connection mutex — and blocked on the mutex A
+      holds.
+
+    Neither can proceed; the whole process (event loop included) stops. The
+    same unsynchronized sharing also segfaults outright under load (repro in
+    the incident record exits SIGSEGV without this lock).
+
+    The fix: at most one thread inside SQLite per connection, enforced here at
+    the connection-factory choke point rather than at call sites — 70+ call
+    sites touch ``self._conn`` and at least one (``clear_session_activity_
+    labels``) provably bypassed the writer lock. Waiting on THIS RLock releases
+    the GIL, so the UDF thread can always finish its callback and release the
+    connection mutex: the cycle cannot form, per-connection locks are
+    sufficient, and the turn-fence semantics stay exactly as shipped.
+
+    ``interrupt()`` is deliberately NOT wrapped: it exists to cancel another
+    thread's in-flight statement, so serializing it behind the very statement
+    it should cancel would defeat it (sqlite3_interrupt is safe without the
+    mutex by design).
+    """
+
+    def __init__(self, *args, **kwargs):
+        self._hermes_serial_lock = threading.RLock()
+        super().__init__(*args, **kwargs)
+
+    def cursor(self, factory=None):
+        with self._hermes_serial_lock:
+            return super().cursor(factory or _SerializedCursor)
+
+    # execute/executemany/executescript are implemented HERE in Python, routed
+    # through self.cursor(), instead of delegating to the C shortcuts: on
+    # Python 3.11 the C implementations build a PLAIN Cursor directly (they do
+    # not call the overridden cursor()), so ``conn.execute(...).fetchall()``
+    # would fetch on an unserialized cursor — the exact GIL-held mutex wait
+    # this mixin exists to prevent. Verified empirically: 3.9 routes through
+    # cursor(), 3.11 does not.
+
+    def execute(self, *args, **kwargs):
+        with self._hermes_serial_lock:
+            return self.cursor().execute(*args, **kwargs)
+
+    def executemany(self, *args, **kwargs):
+        with self._hermes_serial_lock:
+            return self.cursor().executemany(*args, **kwargs)
+
+    def executescript(self, *args, **kwargs):
+        with self._hermes_serial_lock:
+            return self.cursor().executescript(*args, **kwargs)
+
+    def commit(self):
+        with self._hermes_serial_lock:
+            return super().commit()
+
+    def rollback(self):
+        with self._hermes_serial_lock:
+            return super().rollback()
+
+    def close(self):
+        with self._hermes_serial_lock:
+            return super().close()
+
+    def __exit__(self, *exc_info):
+        # ``with conn:`` commits/rolls back on exit — an SQLite entry.
+        with self._hermes_serial_lock:
+            return super().__exit__(*exc_info)
+
+    def create_function(self, *args, **kwargs):
+        with self._hermes_serial_lock:
+            return super().create_function(*args, **kwargs)
+
+    def create_collation(self, *args, **kwargs):
+        with self._hermes_serial_lock:
+            return super().create_collation(*args, **kwargs)
+
+    def create_aggregate(self, *args, **kwargs):
+        with self._hermes_serial_lock:
+            return super().create_aggregate(*args, **kwargs)
+
+    def backup(self, *args, **kwargs):
+        with self._hermes_serial_lock:
+            return super().backup(*args, **kwargs)
+
+
+class _SerializedConnection(_SerializedConnectionMixin, sqlite3.Connection):
+    pass
+
+
+_serialized_factory_cache: dict = {}
+
+
+def _serialized_connection_factory(factory: type) -> type:
+    """Mix serialization into *factory* (mirrors ``_tracking_factory``)."""
+    if factory is sqlite3.Connection:
+        return _SerializedConnection
+    if issubclass(factory, _SerializedConnectionMixin):
+        return factory
+    cached = _serialized_factory_cache.get(factory)
+    if cached is None:
+        cached = type(
+            f"Serialized{factory.__name__}",
+            (_SerializedConnectionMixin, factory),
+            {},
+        )
+        _serialized_factory_cache[factory] = cached
+    return cached
+
+
 def _connect_tracked_db(path, tracking_path=None, **kwargs):
     """``sqlite3.connect`` that registers the open fd for lock-safety.
 
@@ -3269,6 +3432,13 @@ def _connect_tracked_db(path, tracking_path=None, **kwargs):
     connect would disable the guard for the lifetime of that connection,
     which is precisely the failure mode this module exists to prevent.
     """
+    # Serialize every connection this package opens (see
+    # _SerializedConnectionMixin): the turn-fence UDF re-enters Python from
+    # inside sqlite3_step, and an unsynchronized shared connection turns that
+    # into a GIL/connection-mutex ABBA deadlock or a segfault.
+    kwargs["factory"] = _serialized_connection_factory(
+        kwargs.get("factory", sqlite3.Connection)
+    )
     try:
         from hermes_cli.sqlite_safe_read import connect_tracked
     except ImportError:
