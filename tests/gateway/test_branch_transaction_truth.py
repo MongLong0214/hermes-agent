@@ -6,6 +6,8 @@ import asyncio
 import json
 import os
 import pathlib
+import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -445,6 +447,109 @@ async def test_parent_read_is_fenced_against_a_concurrent_parent_turn(
         parent=parent.session_id,
         new=child_id,
     )
+
+
+@pytest.mark.anyio
+async def test_concurrent_branch_calls_on_same_parent_never_alias_the_read_lease(
+    store, monkeypatch
+):
+    """Two /branch calls on the SAME parent, truly overlapping in one
+    process, must never mint the IDENTICAL parent-read turn-lease holder.
+
+    The pre-fix holder was built from pid + a static "branch-read" literal +
+    the parent's own session id only — identical for any two concurrent
+    /branch calls on the same parent (same process, same pid).
+    ``try_acquire_session_turn_lease`` treats a second acquire by an
+    ALREADY-HELD holder as a legitimate re-entrant success
+    (hermes_state.py), so an aliased holder let the second call's release
+    delete the first call's still-in-progress lease — a normal turn could
+    then acquire the parent lease while the first call's read was still
+    running. This drives two REAL, concurrent ``_handle_branch_command``
+    calls (not a hand-written distinct string, unlike the racer test above)
+    and inspects the actual holder values + outcomes recorded by the real
+    ``try_acquire_session_turn_lease``.
+    """
+    source = _source()
+    parent = store.get_or_create_session(source)
+    store._db.append_message(parent.session_id, role="user", content="parent-one")
+
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.invoke_hook", lambda *_args, **_kwargs: []
+    )
+    monkeypatch.setattr(
+        "hermes_cli.plugins.fire_pre_command_hook", lambda **_kwargs: None
+    )
+
+    real_load_transcript = store.load_transcript
+    first_parked = threading.Event()
+    release_first = threading.Event()
+    parked_once = threading.Event()
+
+    def load_transcript_gated(session_id):
+        # Only the FIRST call's read parks here — it stands in for a
+        # genuinely long-running parent read still holding its lease while
+        # the SECOND call's own acquisition attempt overlaps it.
+        if session_id == parent.session_id and not parked_once.is_set():
+            parked_once.set()
+            first_parked.set()
+            release_first.wait(timeout=10.0)
+        return real_load_transcript(session_id)
+
+    monkeypatch.setattr(store, "load_transcript", load_transcript_gated)
+
+    acquisitions: list[tuple[str, bool]] = []
+    real_try_acquire = store._db.try_acquire_session_turn_lease
+
+    def recording_try_acquire(session_id, holder, **kwargs):
+        result = real_try_acquire(session_id, holder, **kwargs)
+        if session_id == parent.session_id:
+            acquisitions.append((holder, result))
+        return result
+
+    monkeypatch.setattr(
+        store._db, "try_acquire_session_turn_lease", recording_try_acquire
+    )
+
+    runner = _runner(store)
+
+    first_task = asyncio.create_task(
+        runner._handle_message(_event("/branch first"))
+    )
+    parked = await asyncio.to_thread(first_parked.wait, 10.0)
+    assert parked, "the first /branch call never reached its fenced read"
+
+    def release_soon():
+        time.sleep(0.2)
+        release_first.set()
+
+    threading.Thread(target=release_soon, daemon=True).start()
+
+    # A second, genuinely concurrent /branch call on the SAME parent while
+    # the first call still holds the parent's turn lease.
+    await runner._handle_message(_event("/branch second"))
+    await first_task
+
+    holders_used = {holder for holder, _ in acquisitions}
+    assert len(holders_used) == 2, (
+        "the two concurrent /branch calls on the SAME parent minted the "
+        f"IDENTICAL turn-lease holder — aliasing reproduced: {acquisitions}"
+    )
+    first_holder = acquisitions[0][0]
+    assert acquisitions[0][1] is True, (
+        f"the first call's own acquisition unexpectedly failed: {acquisitions}"
+    )
+    second_calls = [a for a in acquisitions if a[0] != first_holder]
+    assert second_calls, "the second call never attempted its own acquisition"
+    # The second call's initial attempt overlapped the first call's still-
+    # held lease and must have been refused — not silently granted, which
+    # is exactly what an aliased (identical) holder would have done.
+    assert second_calls[0][1] is False, (
+        "the second call's initial acquisition attempt succeeded while the "
+        f"first call still held the parent's turn lease: {acquisitions}"
+    )
+    # And the first call's lease must have survived the second call's own
+    # release (of ITS OWN, distinct holder) — proven here by the first call
+    # completing its fenced read/branch successfully at all.
 
 
 @pytest.mark.anyio

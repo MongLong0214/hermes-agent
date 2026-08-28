@@ -5033,7 +5033,18 @@ class GatewaySlashCommandsMixin:
         # parent's own running turn.
         current_entry = await self.async_session_store.get_or_create_session(source)
         sync_db = getattr(self._session_db, "_db", self._session_db)
-        parent_lease_holder = f"pid={os.getpid()}:turn=branch-read:session={current_entry.session_id}"
+        # A per-call nonce, not just pid+parent id: two concurrent /branch
+        # calls on the SAME parent (same pid, same session id) would
+        # otherwise mint the IDENTICAL holder string. try_acquire_session_
+        # turn_lease treats a second acquire by an already-held holder as a
+        # legitimate re-entrant success (hermes_state.py), so an aliased
+        # holder lets a second call's release delete the FIRST call's lease
+        # out from under its still-in-progress read — the same convention
+        # run_agent.py's relay_turn_id already uses for its own holder.
+        parent_lease_holder = (
+            f"pid={os.getpid()}:turn=branch-read-{_uuid.uuid4().hex[:8]}"
+            f":session={current_entry.session_id}"
+        )
 
         def _read_parent_transcript_fenced():
             if not sync_db.acquire_session_turn_lease(
