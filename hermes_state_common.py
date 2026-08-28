@@ -325,6 +325,17 @@ def register_turn_fence_generation(conn) -> None:
     )
 
 
+#: The literal ``RAISE(ABORT, ...)`` message the governed-table triggers
+#: raise on a generation mismatch. This repository defines this string — it
+#: is not a locale-dependent SQLite message and does not depend on extended
+#: result codes being available, so it is present verbatim in the exception
+#: text on every SQLite version. Single definition: both the trigger SQL
+#: (below) and create_session_strict's post-failure classification
+#: (hermes_state.py) reference this one constant so the two can never drift
+#: apart.
+TURN_FENCE_ABORT_MESSAGE = "state DB generation incompatible"
+
+
 def turn_fence_trigger_name(table: str, operation: str) -> str:
     return f"turn_fence_{table}_{operation.lower()}"
 
@@ -338,7 +349,7 @@ def turn_fence_trigger_sql(table: str, operation: str) -> str:
         "SELECT CASE "
         "WHEN typeof(hermes_turn_fence_generation()) != 'integer' "
         f"OR hermes_turn_fence_generation() != {TURN_FENCE_GENERATION} "
-        "THEN RAISE(ABORT, 'state DB generation incompatible') "
+        f"THEN RAISE(ABORT, '{TURN_FENCE_ABORT_MESSAGE}') "
         "END; "
         "END"
     )

@@ -84,6 +84,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     MAX_FTS5_QUERY_CHARS,
     SCHEMA_SQL,
     SCHEMA_VERSION,
+    TURN_FENCE_ABORT_MESSAGE,
     TURN_FENCE_GENERATION,
     _PREVIEW_CONTENT_SQL,
     _PREVIEW_HEAD_CHARS,
@@ -5415,12 +5416,30 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         would silently swallow the refusal too.
 
         The classification does NOT consult ``sqlite_errorname`` or any
-        other error code. After the INSERT fails, this same connection —
-        inside the same still-open transaction, before it is rolled back or
-        committed — runs a SELECT for a row whose id equals this row's own
-        id. If it exists, the INSERT collided with it: a real, expected id
-        collision. If it does not, whatever raised ``IntegrityError`` was
-        NOT an id collision, and the exception is re-raised untouched.
+        other error code. It checks the fence FIRST: if the exception's own
+        message carries ``TURN_FENCE_ABORT_MESSAGE`` (the literal this
+        project's ``RAISE(ABORT, ...)`` trigger text uses,
+        hermes_state_common.py), it is re-raised unconditionally — a fence
+        refusal is never a collision, no matter what else is also true.
+
+        Only once the fence marker is absent does existence get consulted:
+        after the INSERT fails, this same connection — inside the same
+        still-open transaction, before it is rolled back or committed —
+        runs a SELECT for a row whose id equals this row's own id. If it
+        exists, the INSERT collided with it: a real, expected id collision.
+        If it does not, whatever raised ``IntegrityError`` was NOT an id
+        collision, and the exception is re-raised untouched.
+
+        Existence alone is NOT sufficient, only necessary, for a real
+        collision: the turn-fence trigger is a ``BEFORE INSERT`` trigger
+        (hermes_state_common.py), so it fires and raises before SQLite ever
+        evaluates the PRIMARY KEY constraint on the row being inserted. If a
+        row with this same id ALREADY exists AND the fence generation is
+        wrong, the fence aborts first, no new row is ever attempted against
+        the PK constraint, and the pre-existing row is still the only one a
+        same-transaction SELECT finds — indistinguishable, by existence
+        alone, from an ordinary PK collision. Checking the fence marker
+        first is what breaks that tie.
 
         A prior version of this method matched ``exc.sqlite_errorname ==
         "SQLITE_CONSTRAINT_PRIMARYKEY"`` instead, reasoning that this
@@ -5438,8 +5457,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         ``SQLITE_CONSTRAINT`` — indistinguishable by error code from every
         other constraint failure on that build — so the errorname check
         would have raised on a real collision instead of returning
-        ``False``. Existence is exact on every SQLite version and consults
-        no error code at all.
+        ``False``. Existence-checking still consults no error code, on any
+        SQLite version — but, as above, existence alone is exact only once
+        the fence marker has already been ruled out first.
         """
         def _do(conn):
             system_prompt_hash = self._store_system_prompt(conn, system_prompt)
@@ -5472,7 +5492,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         time.time(),
                     ),
                 )
-            except sqlite3.IntegrityError:
+            except sqlite3.IntegrityError as exc:
                 # Only a real PRIMARY KEY conflict on THIS row's own id is a
                 # "collision" — everything else (FK violation, a turn-fence
                 # trigger's RAISE(ABORT), a UNIQUE conflict on some OTHER
@@ -5483,14 +5503,31 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # "generated session ID collision", which is both a false
                 # result and, for the fence case, a lost fence signal.
                 #
-                # Classified by existence, not by error code. SQLite's
-                # default ON CONFLICT ABORT rolls back only the failed
-                # INSERT statement, not the surrounding transaction, so
-                # this same connection can still run a SELECT here, inside
-                # the same still-open transaction. If a row with this id
-                # exists, the INSERT collided with it — a real id
-                # collision. If it does not, the IntegrityError came from
-                # something else entirely and must propagate.
+                # The fence is checked FIRST, before existence, and wins
+                # unconditionally. The turn-fence trigger is BEFORE INSERT
+                # (hermes_state_common.py): it fires and raises before
+                # SQLite ever evaluates the PRIMARY KEY constraint on this
+                # row. So when a row with this same id already exists AND
+                # the fence generation is wrong, the fence aborts first — no
+                # new row is ever attempted against the PK constraint — and
+                # the pre-existing row is still the only one a
+                # same-transaction SELECT finds. Existence alone cannot
+                # distinguish that compound case from an ordinary PK
+                # collision; the fence marker can, because it is present in
+                # the exception's own message only when the fence itself
+                # fired. TURN_FENCE_ABORT_MESSAGE is the single definition
+                # this trigger SQL is built from (hermes_state_common.py),
+                # so the two can never say two different things.
+                if TURN_FENCE_ABORT_MESSAGE in str(exc):
+                    raise
+                # Existence is checked only once the fence has been ruled
+                # out. SQLite's default ON CONFLICT ABORT rolls back only
+                # the failed INSERT statement, not the surrounding
+                # transaction, so this same connection can still run a
+                # SELECT here, inside the same still-open transaction. If a
+                # row with this id exists, the INSERT collided with it — a
+                # real id collision. If it does not, the IntegrityError came
+                # from something else entirely and must propagate.
                 exists = conn.execute(
                     "SELECT 1 FROM sessions WHERE id = ?", (session_id,)
                 ).fetchone()
