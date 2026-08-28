@@ -1743,8 +1743,3 @@ def _moa_caches_isolated():
     yield
     moa._preset_cache.clear()
     moa._runtime_cache.clear()
-
-
-from tests.git_mutation_guard import (  # noqa: E402,F401
-    _d5_git_mutation_containment_guard,
-)
