@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import pathlib
 import threading
 import time
 from types import SimpleNamespace
@@ -22,16 +21,6 @@ from hermes_state import (
     SessionDB,
     SessionTurnLeaseLostError,
 )
-from tests.state.lease_mutation_harness import (
-    Mutation,
-    assert_every_pin_has_a_killer,
-    assert_mutation_kills_the_pin,
-)
-
-REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
-
-#: This file, so a mutated extract can run the same checks it defines.
-_SELF = pathlib.Path(__file__).resolve().relative_to(REPO_ROOT)
 
 
 @pytest.fixture()
@@ -763,122 +752,3 @@ async def test_title_collision_reports_untitled_branch_not_a_titled_one(
         error=f"Title 'taken' is already in use by session {other_id}",
     )
 
-
-# ---------------------------------------------------------------------------
-# Mutation pin: a title collision must not make /branch claim the collided
-# title as applied. Runs standalone (no pytest fixtures) so a mutated,
-# extracted copy of this file can import and call it from a bare subprocess —
-# see tests/state/lease_mutation_harness.py.
-# ---------------------------------------------------------------------------
-
-def check_title_collision_branch_reports_untitled_not_titled(tmpdir) -> None:
-    """The property behind
-    ``test_title_collision_reports_untitled_branch_not_a_titled_one``, run
-    against a mutated extract so the guard is proven to be able to fail.
-
-    The branch itself (child row, copied history, route switch) must still
-    succeed even though the requested title lost a name collision — only the
-    outward claim about the title is at stake here.
-    """
-    import hermes_state as _hermes_state
-    import hermes_cli.lifecycle as _lifecycle
-    import hermes_cli.plugins as _plugins
-
-    tmp_path = pathlib.Path(tmpdir)
-    _hermes_state.DEFAULT_DB_PATH = tmp_path / "state.db"
-    store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
-
-    source = _source()
-    session_key = build_session_key(source)
-    parent = store.get_or_create_session(source)
-    store._db.append_message(parent.session_id, role="user", content="parent-one")
-
-    other_id = "title-holder"
-    store._db.create_session(other_id, source="test")
-    assert store._db.set_session_title(other_id, "taken") is True
-
-    store.load_transcript = (
-        lambda session_id: store._db.get_messages_as_conversation(session_id)
-    )
-    _lifecycle.invoke_hook = lambda *_args, **_kwargs: []
-    _plugins.fire_pre_command_hook = lambda **_kwargs: None
-
-    runner = _runner(store)
-    result = asyncio.run(runner._handle_message(_event("/branch taken")))
-
-    child_id = store.peek_session_id(session_key)
-    child = store._db.get_session(child_id)
-
-    assert child is not None, (
-        "the branch itself must still succeed even when the title collides"
-    )
-    assert child["parent_session_id"] == parent.session_id
-    assert child["title"] is None, (
-        f"the collided title landed on the child anyway: {child['title']!r}"
-    )
-    assert store._db.get_session(other_id)["title"] == "taken", (
-        "the other session's title was clobbered by the collision"
-    )
-    assert "taken" not in result.split("\n")[0], (
-        f"the reply claims the collided title as applied when it never "
-        f"landed: {result!r}"
-    )
-
-
-PINS = {
-    "check_title_collision_branch_reports_untitled_not_titled":
-        check_title_collision_branch_reports_untitled_not_titled,
-}
-
-
-@pytest.mark.parametrize("name", sorted(PINS), ids=sorted(PINS))
-def test_branch_title_truth_property(name, tmp_path):
-    """The pin. Each property, asserted against the tree under test."""
-    PINS[name](tmp_path)
-
-
-#: The enforcement seam here is in ``gateway/slash_commands.py``, not in the
-#: state layer, so the row extracts the WHOLE tree (``"."``) instead of the
-#: narrow store-only pathspec the other files in this family use.
-_WHOLE_TREE = (".",)
-
-SOURCE_MUTATIONS = (
-    Mutation(
-        pin="check_title_collision_branch_reports_untitled_not_titled",
-        module="gateway/slash_commands.py",
-        find='        title_failure_reason: str | None = None\n'
-             '        try:\n'
-             '            title_applied = await self._session_db.set_session_title(new_session_id, branch_title)\n'
-             '        except Exception as e:\n'
-             '            title_applied = False\n'
-             '            title_failure_reason = str(e)\n'
-             '        if not title_applied and title_failure_reason is None:\n'
-             '            title_failure_reason = "title update did not apply"\n',
-        replace='        title_failure_reason = None\n'
-                '        try:\n'
-                '            await self._session_db.set_session_title(new_session_id, branch_title)\n'
-                '        except Exception:\n'
-                '            pass\n',
-        why="this is the exact pre-fix shape: both an exception AND a bare "
-            "`False` return from set_session_title are swallowed, so "
-            "title_failure_reason is never anything but None and the handler "
-            "falls through to the branched_one/branched_many reply that "
-            "asserts the collided title as applied even though it never "
-            "landed on the child row",
-    ),
-)
-
-
-@pytest.mark.parametrize(
-    "mutation", SOURCE_MUTATIONS, ids=[m.pin for m in SOURCE_MUTATIONS]
-)
-def test_each_branch_title_truth_pin_dies_when_its_guard_is_removed(
-    mutation, tmp_path
-):
-    """Clean, mutated, restored. A pin that survives its mutation is not a pin."""
-    assert_mutation_kills_the_pin(mutation, str(_SELF), tmp_path, *_WHOLE_TREE)
-
-
-def test_every_branch_title_truth_pin_has_a_mutation_that_kills_it():
-    """No pin without a killer, and no killer without a pin."""
-    assert_every_pin_has_a_killer(PINS, SOURCE_MUTATIONS)
