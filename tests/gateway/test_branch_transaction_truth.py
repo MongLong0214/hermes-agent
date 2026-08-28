@@ -7,6 +7,7 @@ import json
 import os
 import threading
 import time
+import uuid
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -539,6 +540,141 @@ async def test_concurrent_branch_calls_on_same_parent_never_alias_the_read_lease
     # And the first call's lease must have survived the second call's own
     # release (of ITS OWN, distinct holder) — proven here by the first call
     # completing its fenced read/branch successfully at all.
+
+
+@pytest.mark.anyio
+async def test_prefix_collision_never_admits_second_branch_as_same_holder_reentry(
+    store, monkeypatch
+):
+    """A truncated (e.g. 8-hex-char) lease-holder nonce must never be
+    reintroduced: on a prefix collision it silently admits a second,
+    genuinely concurrent ``/branch`` call as the FIRST call's own
+    same-holder reentry.
+
+    The aliasing test above checks real random uuid4 values and merely
+    asserts the two minted holders differ — with real randomness that
+    passes even under an 8-hex-char truncation, since two random 32-bit
+    prefixes essentially never collide in a test run. It cannot catch a
+    re-truncation. This test manufactures the collision directly: two
+    DISTINCT full uuid4 values that share their first 8 hex characters,
+    scripted onto the exact two /branch calls under test. With a full-hex
+    holder the two lease-holder strings must still differ despite the
+    shared prefix, and the second call's acquisition attempt — genuinely
+    overlapping the first call's still-held lease — must be refused, not
+    silently admitted as the first call's own reentry.
+    """
+    source = _source()
+    parent = store.get_or_create_session(source)
+    store._db.append_message(parent.session_id, role="user", content="parent-one")
+
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.invoke_hook", lambda *_args, **_kwargs: []
+    )
+    monkeypatch.setattr(
+        "hermes_cli.plugins.fire_pre_command_hook", lambda **_kwargs: None
+    )
+
+    # Two distinct full uuid4 values sharing an 8-hex-char prefix — exactly
+    # what an 8-hex-char truncation would collapse into ONE identical
+    # holder string.
+    shared_prefix = "deadbeef"
+    colliding_uuids = [
+        uuid.UUID(hex=shared_prefix + "0" * 24),
+        uuid.UUID(hex=shared_prefix + "1" * 24),
+    ]
+    assert colliding_uuids[0].hex[:8] == colliding_uuids[1].hex[:8] == shared_prefix
+    assert colliding_uuids[0].hex != colliding_uuids[1].hex
+
+    real_uuid4 = uuid.uuid4
+    minted = iter(colliding_uuids)
+
+    def scripted_uuid4():
+        nxt = next(minted, None)
+        return nxt if nxt is not None else real_uuid4()
+
+    monkeypatch.setattr(uuid, "uuid4", scripted_uuid4)
+
+    real_load_transcript = store.load_transcript
+    first_parked = threading.Event()
+    release_first = threading.Event()
+    parked_once = threading.Event()
+
+    def load_transcript_gated(session_id):
+        # Only the FIRST call's read parks here — it stands in for a
+        # genuinely long-running parent read still holding its lease while
+        # the SECOND call's own acquisition attempt overlaps it.
+        if session_id == parent.session_id and not parked_once.is_set():
+            parked_once.set()
+            first_parked.set()
+            release_first.wait(timeout=10.0)
+        return real_load_transcript(session_id)
+
+    monkeypatch.setattr(store, "load_transcript", load_transcript_gated)
+
+    acquisitions: list[tuple[str, bool]] = []
+    real_try_acquire = store._db.try_acquire_session_turn_lease
+
+    def recording_try_acquire(session_id, holder, **kwargs):
+        result = real_try_acquire(session_id, holder, **kwargs)
+        if session_id == parent.session_id:
+            acquisitions.append((holder, result))
+        return result
+
+    monkeypatch.setattr(
+        store._db, "try_acquire_session_turn_lease", recording_try_acquire
+    )
+
+    runner = _runner(store)
+
+    first_task = asyncio.create_task(
+        runner._handle_message(_event("/branch first"))
+    )
+    parked = await asyncio.to_thread(first_parked.wait, 10.0)
+    assert parked, "the first /branch call never reached its fenced read"
+
+    def release_soon():
+        time.sleep(0.2)
+        release_first.set()
+
+    threading.Thread(target=release_soon, daemon=True).start()
+
+    # A second, genuinely concurrent /branch call on the SAME parent while
+    # the first call still holds the parent's turn lease — scripted onto
+    # the second colliding-prefix uuid4.
+    await runner._handle_message(_event("/branch second"))
+    await first_task
+
+    assert len(acquisitions) >= 2, (
+        f"expected both /branch calls to attempt the parent lease: {acquisitions}"
+    )
+    first_holder, first_result = acquisitions[0]
+    assert first_result is True, (
+        f"the first call's own acquisition unexpectedly failed: {acquisitions}"
+    )
+    assert colliding_uuids[0].hex in first_holder, (
+        f"the first call's holder was not built from the scripted full "
+        f"uuid4: {acquisitions}"
+    )
+
+    second_calls = [a for a in acquisitions if a[0] != first_holder]
+    assert second_calls, (
+        "the second call's holder was IDENTICAL to the first call's "
+        "despite two DISTINCT full uuid4 values — an 8-hex-char "
+        f"truncation was reintroduced and aliased the two: {acquisitions}"
+    )
+    assert colliding_uuids[1].hex in second_calls[0][0], (
+        f"the second call's holder was not built from the scripted full "
+        f"uuid4: {acquisitions}"
+    )
+    # The second call's initial attempt genuinely overlapped the first
+    # call's still-held lease and must have been refused — not silently
+    # granted, which is exactly what an aliased (identical) holder would
+    # have done.
+    assert second_calls[0][1] is False, (
+        "the second call's initial acquisition attempt succeeded while the "
+        "first call still held the parent's turn lease — a truncated "
+        f"holder would silently admit this as same-holder reentry: {acquisitions}"
+    )
 
 
 @pytest.mark.anyio

@@ -5042,7 +5042,7 @@ class GatewaySlashCommandsMixin:
         # out from under its still-in-progress read — the same convention
         # run_agent.py's relay_turn_id already uses for its own holder.
         parent_lease_holder = (
-            f"pid={os.getpid()}:turn=branch-read-{_uuid.uuid4().hex[:8]}"
+            f"pid={os.getpid()}:turn=branch-read-{_uuid.uuid4().hex}"
             f":session={current_entry.session_id}"
         )
 
