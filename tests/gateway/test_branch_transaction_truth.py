@@ -154,6 +154,49 @@ def test_create_session_strict_propagates_turn_fence_abort_not_a_collision(store
     assert store._db.get_session("fenced-child") is None
 
 
+def test_create_session_strict_fence_wins_over_a_pre_existing_row_with_same_id(
+    store,
+):
+    """Compound case: a row with this id ALREADY EXISTS **and** the turn-fence
+    generation is wrong.
+
+    The fence trigger is ``BEFORE INSERT`` (hermes_state_common.py), so it
+    fires and aborts before SQLite ever evaluates the PRIMARY KEY constraint
+    on the attempted row. No new row is written either way, so the
+    pre-existing same-id row is still the only one visible afterwards — a
+    same-transaction ``SELECT ... WHERE id = ?`` finds it regardless of
+    WHICH failure actually happened. Existence alone cannot distinguish "the
+    INSERT collided with this row" from "the fence refused before the INSERT
+    was even attempted against this row" when both are true at once.
+    Classifying by existence alone would misreport the fence refusal as a
+    real id collision (``False``) and silently swallow it — the exact defect
+    this module exists to prevent. The fence must win: the exception must
+    propagate, not collapse into ``False``.
+    """
+    assert (
+        store._db.create_session_strict(
+            session_id="fenced-collision-existing", source="test"
+        )
+        is True
+    )
+    store._db._conn.create_function(
+        "hermes_turn_fence_generation", 0, lambda: TURN_FENCE_GENERATION - 1
+    )
+    try:
+        with pytest.raises(
+            sqlite3.IntegrityError, match="generation incompatible"
+        ):
+            store._db.create_session_strict(
+                session_id="fenced-collision-existing", source="test"
+            )
+    finally:
+        store._db._conn.create_function(
+            "hermes_turn_fence_generation", 0, lambda: TURN_FENCE_GENERATION
+        )
+    # The pre-existing row must be untouched by the refused attempt.
+    assert store._db.get_session("fenced-collision-existing") is not None
+
+
 def test_create_session_strict_still_reports_real_pk_collision_as_false(store):
     """The classification change must leave the actual collision contract
     unchanged: a real PRIMARY KEY conflict on ``id`` still returns ``False``
