@@ -65,11 +65,24 @@ def test_gateway_routed_session_owner_reads_state_db_from_hermes_home(
         assert command == ["launchctl", "list", "ai.hermes.gateway"]
         return SimpleNamespace(stdout='"PID" = 4242;')
 
+    from gateway import status as gateway_status
+
+    pid_probe_calls = []
+
+    def fake_pid_exists(pid):
+        pid_probe_calls.append(pid)
+        return True
+
+    def fail_if_kill_called(*_args):
+        pytest.fail("os.kill must not be used for gateway PID liveness")
+
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(subprocess, "run", fake_run)
-    monkeypatch.setattr(main_mod.os, "kill", lambda pid, signal: None)
+    monkeypatch.setattr(gateway_status, "_pid_exists", fake_pid_exists)
+    monkeypatch.setattr(main_mod.os, "kill", fail_if_kill_called)
 
     assert main_mod._gateway_routed_session_owner("routed-session") == 4242
+    assert pid_probe_calls == [4242]
 
 
 def test_main_sessions_stats_help_builds_full_parser_with_rollback_registration(monkeypatch):

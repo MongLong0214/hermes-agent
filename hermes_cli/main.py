@@ -1873,7 +1873,9 @@ def _gateway_routed_session_owner(session_id: str):
         if not m:
             return None
         pid = int(m.group(1))
-        os.kill(pid, 0)  # raises unless the process is alive
+        import gateway.status as _gateway_status
+        if not _gateway_status._pid_exists(pid):
+            return None
 
         db = get_hermes_home() / "state.db"
         if not db.exists():
