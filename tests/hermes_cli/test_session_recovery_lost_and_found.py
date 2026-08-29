@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from hermes_state import SessionDB
+from hermes_state import SessionDB, register_turn_fence_generation
 from hermes_cli import session_recovery
 from hermes_cli.session_lost_and_found import (
     classify_lost_and_found_row,
@@ -482,6 +482,11 @@ def test_mapper_rebuilds_sessiondb_from_synthetic_lost_and_found(
     lf_conn = sqlite3.connect(str(lf_path), isolation_level=None)
     dest = sqlite3.connect(str(output), isolation_level=None)
     try:
+        # ``output`` was created via SessionDB then closed, same as the real
+        # lost-and-found salvage path in session_recovery.py: this reopen
+        # needs its own hermes_turn_fence_generation() registration or the
+        # turn-fence triggers on the canonical tables reject the first write.
+        register_turn_fence_generation(dest)
         dest.execute("PRAGMA foreign_keys=OFF")
         mapping = map_lost_and_found_rows(lf_conn, dest)
         stubbing = stub_missing_parent_sessions(dest)

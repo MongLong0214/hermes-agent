@@ -12,7 +12,12 @@ from types import SimpleNamespace
 import pytest
 
 import hermes_state
-from hermes_state import FTS_STORAGE_VERSION, SCHEMA_VERSION, SessionDB
+from hermes_state import (
+    FTS_STORAGE_VERSION,
+    SCHEMA_VERSION,
+    SessionDB,
+    register_turn_fence_generation,
+)
 from hermes_cli import session_recovery
 from hermes_cli.session_recovery import (
     SessionRecoverySafetyError,
@@ -426,6 +431,10 @@ def test_partial_recovery_keeps_messages_when_sessions_are_unsalvageable(
     # sessions unrecoverable, messages intact — the reported shape.
     conn = sqlite3.connect(str(source), isolation_level=None)
     try:
+        # The source was built via SessionDB, whose turn-fence triggers on
+        # `sessions` need hermes_turn_fence_generation() registered on
+        # whichever connection issues the DELETE that simulates corruption.
+        register_turn_fence_generation(conn)
         conn.execute("DELETE FROM sessions")
     finally:
         conn.close()
@@ -646,6 +655,97 @@ def test_partial_recovery_clears_only_unreadable_system_prompt_refs(
         )
     finally:
         conn.close()
+
+
+def test_recover_exact_path_copies_rows_into_a_real_v27_store(
+    tmp_path: Path,
+) -> None:
+    """The exact (non-``--allow-partial``) path must copy into a real store.
+
+    Regression: the destination is opened with a bare ``sqlite3.connect()``
+    after the initializing ``SessionDB`` handle is closed. A v27 store's
+    canonical tables (``sessions``, ``messages``, ...) carry BEFORE INSERT/
+    UPDATE/DELETE turn-fence triggers that call ``hermes_turn_fence_
+    generation()`` — a UDF only ever registered on the connection that
+    created it. Reopening raw and never re-registering it makes the very
+    first insert into any canonical table fail with
+    ``OperationalError: no such function: hermes_turn_fence_generation``,
+    which ``_copy_table`` swallows per-table as ``status: "failed"``. Every
+    row must instead land, exactly.
+    """
+    source = tmp_path / "healthy-source.db"
+    output = tmp_path / "healthy-recovered.db"
+    expected = _make_source(source)
+
+    report = recover_session_database(source, output, work_dir=tmp_path, chunk_size=4)
+
+    for table in ("sessions", "messages"):
+        assert report["copy"][table]["status"] == "complete", report["copy"][table]
+        assert "error" not in report["copy"][table], report["copy"][table]
+
+    assert report["complete"] is True
+    assert report["partial"] is False
+    assert report["verified"] is True
+
+    with sqlite3.connect(str(output)) as verify:
+        verify.row_factory = sqlite3.Row
+        session_count = verify.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+        message_count = verify.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    assert session_count == expected["sessions"]
+    assert message_count == expected["messages"]
+
+
+def test_recover_into_destination_without_fence_triggers_still_works(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fix must not depend on the destination having fence triggers.
+
+    Simulates an older-shaped destination schema (canonical tables present,
+    turn-fence trigger barrier never installed) by disabling the delta that
+    installs it while ``recover_session_database`` builds the destination.
+    ``register_turn_fence_generation`` is harmless either way — it only
+    registers a scalar function, and nothing in the destination references
+    it when there are no triggers to call it — so recovery must still
+    succeed.
+    """
+    def _stamp_schema_version_without_triggers(self, cursor) -> None:
+        # Stamp schema_version as the real delta does, but skip installing
+        # the turn-fence triggers themselves — reproducing the shape of an
+        # older store that is otherwise fully migrated.
+        cursor.execute("DELETE FROM schema_version")
+        cursor.execute(
+            "INSERT INTO schema_version (version) VALUES (?)",
+            (hermes_state.SCHEMA_VERSION,),
+        )
+        self._conn.commit()
+
+    monkeypatch.setattr(
+        hermes_state.SessionDB,
+        "_apply_turn_fence_generation_delta",
+        _stamp_schema_version_without_triggers,
+    )
+
+    source = tmp_path / "healthy-source-notriggers.db"
+    output = tmp_path / "healthy-recovered-notriggers.db"
+    expected = _make_source(source)
+
+    report = recover_session_database(source, output, work_dir=tmp_path, chunk_size=4)
+
+    with sqlite3.connect(str(output)) as verify:
+        trigger_count = verify.execute(
+            "SELECT COUNT(*) FROM sqlite_master "
+            "WHERE type = 'trigger' AND name LIKE 'turn_fence_%'"
+        ).fetchone()[0]
+        session_count = verify.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+        message_count = verify.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+
+    assert trigger_count == 0, "fixture must genuinely lack the fence triggers"
+    assert report["copy"]["sessions"]["status"] == "complete", report["copy"]["sessions"]
+    assert report["copy"]["messages"]["status"] == "complete", report["copy"]["messages"]
+    assert report["complete"] is True
+    assert report["verified"] is True
+    assert session_count == expected["sessions"]
+    assert message_count == expected["messages"]
 
 
 

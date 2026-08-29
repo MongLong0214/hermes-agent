@@ -25,6 +25,7 @@ from hermes_state import (
     SCHEMA_VERSION,
     SessionDB,
     _db_opens_cleanly,
+    register_turn_fence_generation,
 )
 
 
@@ -75,6 +76,42 @@ class SessionRecoverySafetyError(SessionRecoveryError):
 
 class SessionRecoverySourceError(SessionRecoveryError):
     """Raised when the source cannot provide the required canonical tables."""
+
+
+class SessionRecoveryDestinationError(SessionRecoveryError):
+    """Raised when the destination connection itself is defective.
+
+    Distinct from :class:`SessionRecoverySourceError`: this means the
+    recovery TOOL failed to set up its own destination connection, not that
+    the source database has corrupted rows. ``_copy_table`` /
+    ``_copy_table_salvage`` swallow ``sqlite3.DatabaseError`` per table and
+    report it as row-level salvage loss, which is correct for genuine source
+    corruption but actively misleading for a defect in this tool — an
+    operator reading "no such function: hermes_turn_fence_generation" as a
+    per-table failure has no way to tell it apart from a damaged b-tree.
+    ``_require_destination_fenced`` below fails fast and loud instead, before
+    any per-table copy gets a chance to misreport it.
+    """
+
+
+def _require_destination_fenced(destination: sqlite3.Connection) -> None:
+    """Fail loudly if ``destination`` cannot satisfy its own turn-fence
+    triggers, before any table copy runs and swallows that as row loss.
+
+    A destination that already has ``hermes_turn_fence_generation()``
+    registered (or genuinely has no turn-fence triggers to call it) passes
+    silently; this does not require triggers to be present.
+    """
+    try:
+        destination.execute("SELECT hermes_turn_fence_generation()")
+    except sqlite3.OperationalError as exc:
+        if "no such function" in str(exc):
+            raise SessionRecoveryDestinationError(
+                "Recovery destination connection cannot satisfy its own "
+                "turn-fence trigger barrier (a defect in the recovery tool, "
+                f"not source corruption): {exc}"
+            ) from exc
+        raise
 
 
 def _sidecar_path(db_path: Path, suffix: str) -> Path:
@@ -1440,6 +1477,20 @@ def _recover_via_lost_and_found(
         str(output), isolation_level=None, timeout=1.0
     )
     try:
+        # The store's turn-fence triggers on the canonical tables call
+        # hermes_turn_fence_generation(), a UDF that only the connection which
+        # created it knows. SessionDB.close() above tore that connection down,
+        # so this bare reopen must re-register the scalar itself or the first
+        # INSERT into a governed table raises "no such function". This is safe
+        # here (unlike minting the marker on a live production writer): the
+        # output path can never already exist (_validate_paths refuses to
+        # reuse one) and it is never swapped over a running gateway, so there
+        # is no concurrent turn-lease holder this recovery-only connection
+        # could bypass. session_turn_leases (the table that check guards) is
+        # also not part of _CANONICAL_TABLES, so no lease row ever reaches
+        # this database.
+        register_turn_fence_generation(destination_conn)
+        _require_destination_fenced(destination_conn)
         destination_conn.execute("PRAGMA foreign_keys=OFF")
         mapping = map_lost_and_found_rows(lf_conn, destination_conn)
         stubbing = stub_missing_parent_sessions(destination_conn)
@@ -1609,6 +1660,14 @@ def recover_session_database(
                 isolation_level=None,
                 timeout=1.0,
             )
+            # See the matching comment in _recover_via_lost_and_found: this
+            # bare reopen needs its own hermes_turn_fence_generation() UDF or
+            # the first INSERT into a turn-fence-governed canonical table
+            # raises "no such function". Safe here for the same reason —
+            # ``output`` is a brand-new, never-installed file with no
+            # concurrent writers and no session_turn_leases rows.
+            register_turn_fence_generation(destination_conn)
+            _require_destination_fenced(destination_conn)
             destination_conn.execute("PRAGMA foreign_keys=OFF")
 
             copy_report: dict[str, dict[str, Any]] = {}
