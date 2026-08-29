@@ -2665,6 +2665,7 @@ from gateway.turn_lease import (
     DEFAULT_LEASE_WAIT,
     SessionTurnLeaseRegistry,
     TurnLeaseTimeoutError,
+    TurnLeaseToken,
 )
 from gateway.session_state import (
     SERVICE_TIER_UNSET as _SERVICE_TIER_UNSET,
@@ -18198,6 +18199,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
 
+        event._gateway_turn_lease_token = None
         try:
             try:
                 _agent_result = await self._handle_message_with_agent(
@@ -18230,32 +18232,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("post-turn hook failed: %s", _goal_exc)
             return _agent_result
         finally:
-            # MoA one-shot restore must run on EVERY exit path, not just
-            # success. The restore data lives on the per-turn event object
-            # (_moa_restore_override), which is discarded once the event goes
-            # out of scope — so if _handle_message_with_agent raises, a restore
-            # in the try block would be skipped and the MoA override would leak
-            # permanently (every later message silently fans out through MoA).
-            # Putting it in finally guarantees the revert on success, exception,
-            # and interrupt alike.
-            self._restore_moa_one_shot(event, _quick_key)
-            self._restore_pending_one_turn_model_override(_quick_key)
-            # Normal completion/exception/interrupt owns and clears this exact
-            # durable marker.  SIGKILL/OOM skips finally, leaving the marker for
-            # the next unclean startup's recovery pass.
-            await self._clear_durable_active_turn(event)
-            # Unconditional release covers every exit path. _release_running_agent_state
-            # is idempotent (pop-on-absent is harmless) and, called without a
-            # run_generation guard, always clears the slot regardless of which
-            # generation it holds. This evicts the zombie left when session_reset
-            # bumps the generation (N -> N+1) mid-flight: gen-N's guarded release
-            # inside _run_agent returns False, and the old sentinel-only check here
-            # missed the leftover real agent — locking the session out forever (#28686).
-            self._release_running_agent_state(_quick_key)
-            # Turn lease (#64934): release THIS turn's lease token — keyed by
-            # (routing key, run generation) so this unwind can only ever free
-            # the lease its own turn acquired, never a newer turn's.
-            self._release_turn_lease(_quick_key, _run_generation)
+            try:
+                # MoA one-shot restore must run on EVERY exit path, not just
+                # success. The restore data lives on the per-turn event object
+                # (_moa_restore_override), which is discarded once the event goes
+                # out of scope — so if _handle_message_with_agent raises, a restore
+                # in the try block would be skipped and the MoA override would leak
+                # permanently (every later message silently fans out through MoA).
+                # Putting it in finally guarantees the revert on success, exception,
+                # and interrupt alike.
+                self._restore_moa_one_shot(event, _quick_key)
+                self._restore_pending_one_turn_model_override(_quick_key)
+                try:
+                    # Normal completion/exception/interrupt owns and clears this exact
+                    # durable marker. SIGKILL/OOM skips finally, leaving the marker for
+                    # the next unclean startup's recovery pass.
+                    await self._clear_durable_active_turn(event)
+                finally:
+                    # _release_running_agent_state is synchronous and idempotent.
+                    self._release_running_agent_state(_quick_key)
+            finally:
+                # This synchronous, event-owned release has no await boundary, so a
+                # repeated cancellation during durable cleanup cannot skip it.
+                self._release_turn_lease(
+                    _quick_key,
+                    _run_generation,
+                    token=getattr(event, "_gateway_turn_lease_token", None),
+                )
 
     def _restore_moa_one_shot(self, event: "MessageEvent", quick_key: str) -> None:
         """Revert a ``/moa <prompt>`` one-shot model override after its turn.
@@ -19535,6 +19538,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._clear_session_env(_session_env_tokens)
                 raise
             if _lease_token is not None:
+                # The event is the per-turn authority. Capture its exact token
+                # before publishing the mutable shared compatibility slot.
+                event._gateway_turn_lease_token = _lease_token
                 _lease_state = self._session_state(_quick_key).turn
                 _lease_state.lease_token = _lease_token
                 _lease_state.lease_generation = run_generation
@@ -20143,7 +20149,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             # the fresh child still serializes
                                             # against this turn (#64934).
                                             self._rebind_turn_lease(
-                                                _quick_key, run_generation, _hyg_new_sid
+                                                _quick_key,
+                                                run_generation,
+                                                _hyg_new_sid,
+                                                token=getattr(
+                                                    event,
+                                                    "_gateway_turn_lease_token",
+                                                    None,
+                                                ),
                                             )
                                             await self.async_session_store._save()
                                             await asyncio.to_thread(
@@ -20661,7 +20674,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # serialization boundary must move with it or an alias
                     # key resolving the fresh child could interleave (#64934).
                     self._rebind_turn_lease(
-                        _quick_key, run_generation, session_entry.session_id
+                        _quick_key,
+                        run_generation,
+                        session_entry.session_id,
+                        token=getattr(event, "_gateway_turn_lease_token", None),
                     )
                     await self.async_session_store._save()
                     await self.async_session_store._record_gateway_session_peer(
@@ -26792,60 +26808,122 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._persist_active_agents()
         return True
 
-    def _release_turn_lease(self, session_key: str, run_generation: int) -> bool:
+    def _release_turn_lease(
+        self,
+        session_key: str,
+        run_generation: int,
+        *,
+        token: Optional[TurnLeaseToken] = None,
+    ) -> bool:
         """Release the turn lease acquired by (``session_key``, ``run_generation``).
 
         Companion to the acquisition in ``_handle_message_with_agent``
-        (#64934). The token map is keyed by (routing key, run generation), so
-        this can only ever free the lease its own turn acquired — a stale
-        unwind whose generation was bumped by /stop or /new pops ITS token,
-        and the registry's identity check refuses it if a newer turn already
-        holds the lease. Idempotent and safe for bare test runners built via
+        (#64934). ``state.turn.lease_token``/``lease_generation`` is a SINGLE
+        shared slot per routing key — a second concurrent turn on the same
+        key (a stale unwind, or a fresh turn after /new landing on the same
+        key before the first turn unwound) overwrites it unconditionally.
+        When that happens the first turn's own token is gone from the slot,
+        and looking it up there would either release the WRONG (newer)
+        lease or, with the old generation guard, silently orphan the first
+        turn's own lease forever (no TTL ever reclaims it).
+
+        ``token``, when given, is this call's own lease token — stashed on
+        the per-turn event at acquire time, so it is never shared and can
+        never be clobbered by another turn. It is released directly via
+        ``registry.release()``, which is itself identity-checked (only frees
+        the lease if this token is still its current holder). The shared
+        slot is cleared too, but ONLY if it still points at this same token —
+        never a newer turn's.
+
+        With no ``token``, falls back to the previous generation-checked
+        shared-slot lookup unchanged, for any caller that has no event to
+        stash a token on.
+
+        Idempotent and safe for bare test runners built via
         ``object.__new__`` (getattr defaults).
         """
         if not session_key:
             return False
         registry = getattr(self, "_turn_leases", None)
+        if registry is None:
+            return False
+        if token is not None:
+            if token.owner_key != session_key or token.generation != run_generation:
+                return False
+            state = self._peek_session_state(session_key)
+            try:
+                released = registry.release(token)
+            except Exception:
+                logger.debug("Failed to release turn lease", exc_info=True)
+                return False
+            if not released:
+                return False
+            if state is not None:
+                turn = state.turn
+                if turn.lease_token is token:
+                    turn.lease_token = None
+                    turn.lease_generation = None
+            return True
+
         state = self._peek_session_state(session_key)
-        if state is None or registry is None:
+        if state is not None:
+            turn = state.turn
+            if turn.lease_token is None or turn.lease_generation != run_generation:
+                return False
+            resolved_token = turn.lease_token
+            try:
+                released = registry.release(resolved_token)
+            except Exception:
+                logger.debug("Failed to release turn lease", exc_info=True)
+                return False
+            if not released:
+                return False
+            if turn.lease_token is resolved_token:
+                turn.lease_token = None
+                turn.lease_generation = None
+            return True
+
+        legacy_tokens = getattr(self, "_turn_lease_tokens", None)
+        if not isinstance(legacy_tokens, dict):
             return False
-        turn = state.turn
-        if turn.lease_token is None or turn.lease_generation != run_generation:
+        legacy_key = (session_key, run_generation)
+        resolved_token = legacy_tokens.get(legacy_key)
+        if resolved_token is None:
             return False
-        token = turn.lease_token
-        turn.lease_token = None
-        turn.lease_generation = None
         try:
-            return registry.release(token)
+            released = registry.release(resolved_token)
         except Exception:
             logger.debug("Failed to release turn lease", exc_info=True)
             return False
+        if not released:
+            return False
+        if legacy_tokens.get(legacy_key) is resolved_token:
+            legacy_tokens.pop(legacy_key, None)
+        return True
 
     def _rebind_turn_lease(
-        self, session_key: str, run_generation: int, new_session_id: str
+        self,
+        session_key: str,
+        run_generation: int,
+        new_session_id: str,
+        *,
+        token: Optional[TurnLeaseToken],
     ) -> bool:
-        """Follow a mid-turn session_id rotation with the held turn lease.
-
-        Compression (session-hygiene pre-compression or the agent's own
-        compressor) can rotate ``session_entry.session_id`` while this turn
-        is in flight. The turn's flush targets the NEW id, so the
-        serialization boundary must follow it — otherwise an alias routing
-        key resolving the new id (topic tip-walk onto the fresh child) could
-        start a concurrent turn the lease never sees (#64934 rotation-alias
-        window). Call at every site that reassigns session_entry.session_id
-        mid-turn. Fail-open no-op when there is no held token.
-        """
-        if not session_key or not new_session_id:
+        """Follow a mid-turn session_id rotation with this event's held lease."""
+        if (
+            not session_key
+            or not new_session_id
+            or token is None
+            or token.released
+            or token.owner_key != session_key
+            or token.generation != run_generation
+        ):
             return False
         registry = getattr(self, "_turn_leases", None)
-        state = self._peek_session_state(session_key)
-        if state is None or registry is None:
-            return False
-        turn = state.turn
-        if turn.lease_token is None or turn.lease_generation != run_generation:
+        if registry is None:
             return False
         try:
-            return registry.rebind(turn.lease_token, new_session_id)
+            return registry.rebind(token, new_session_id)
         except Exception:
             logger.debug("Failed to rebind turn lease", exc_info=True)
             return False

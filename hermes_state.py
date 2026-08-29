@@ -7638,16 +7638,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         (conversation_id, current_holder),
                     )
             conn.execute(
-                "INSERT OR IGNORE INTO session_turn_leases "
+                "INSERT INTO session_turn_leases "
                 "(conversation_id, holder, acquired_at, expires_at) "
-                "VALUES (?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(conversation_id) DO NOTHING",
                 (conversation_id, holder, now, expires_at),
             )
             owner = conn.execute(
                 "SELECT holder FROM session_turn_leases WHERE conversation_id = ?",
                 (conversation_id,),
             ).fetchone()
-            return owner is not None and owner["holder"] == holder
+            if owner is None:
+                raise sqlite3.DatabaseError(
+                    "SESSION_TURN_LEASE_ACQUIRE_INSERT_MISSING"
+                )
+            return owner["holder"] == holder
 
         return bool(self._execute_write(_do, patience_s=patience_s))
 

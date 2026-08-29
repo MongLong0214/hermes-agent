@@ -12,11 +12,19 @@ from types import SimpleNamespace
 import pytest
 
 import hermes_state
-from hermes_state import FTS_STORAGE_VERSION, SCHEMA_VERSION, SessionDB
+from hermes_state import (
+    FTS_STORAGE_VERSION,
+    SCHEMA_VERSION,
+    SessionDB,
+    register_turn_fence_generation,
+)
 from hermes_cli import session_recovery
 from hermes_cli.session_recovery import (
+    SessionRecoveryDestinationError,
     SessionRecoverySafetyError,
     SessionRecoverySourceError,
+    _is_current_turn_fence_generation,
+    _require_destination_fenced,
     inspect_session_database,
     recover_session_database,
 )
@@ -426,6 +434,10 @@ def test_partial_recovery_keeps_messages_when_sessions_are_unsalvageable(
     # sessions unrecoverable, messages intact — the reported shape.
     conn = sqlite3.connect(str(source), isolation_level=None)
     try:
+        # The source was built via SessionDB, whose turn-fence triggers on
+        # `sessions` need hermes_turn_fence_generation() registered on
+        # whichever connection issues the DELETE that simulates corruption.
+        register_turn_fence_generation(conn)
         conn.execute("DELETE FROM sessions")
     finally:
         conn.close()
@@ -646,6 +658,300 @@ def test_partial_recovery_clears_only_unreadable_system_prompt_refs(
         )
     finally:
         conn.close()
+
+
+def test_recover_exact_path_copies_rows_into_a_real_v27_store(
+    tmp_path: Path,
+) -> None:
+    """The exact (non-``--allow-partial``) path must copy into a real store.
+
+    Regression: the destination is opened with a bare ``sqlite3.connect()``
+    after the initializing ``SessionDB`` handle is closed. A v27 store's
+    canonical tables (``sessions``, ``messages``, ...) carry BEFORE INSERT/
+    UPDATE/DELETE turn-fence triggers that call ``hermes_turn_fence_
+    generation()`` — a UDF only ever registered on the connection that
+    created it. Reopening raw and never re-registering it makes the very
+    first insert into any canonical table fail with
+    ``OperationalError: no such function: hermes_turn_fence_generation``,
+    which ``_copy_table`` swallows per-table as ``status: "failed"``. Every
+    row must instead land, exactly.
+    """
+    source = tmp_path / "healthy-source.db"
+    output = tmp_path / "healthy-recovered.db"
+    expected = _make_source(source)
+
+    report = recover_session_database(source, output, work_dir=tmp_path, chunk_size=4)
+
+    for table in ("sessions", "messages"):
+        assert report["copy"][table]["status"] == "complete", report["copy"][table]
+        assert "error" not in report["copy"][table], report["copy"][table]
+
+    assert report["complete"] is True
+    assert report["partial"] is False
+    assert report["verified"] is True
+    assert report["output"] == str(output)
+    assert ".hermes-session-recovery-" not in json.dumps(report)
+    assert output.exists()
+    for suffix in ("-wal", "-shm", "-journal"):
+        assert not os.path.lexists(output.with_name(output.name + suffix))
+
+    with sqlite3.connect(str(output)) as verify:
+        verify.row_factory = sqlite3.Row
+        session_count = verify.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+        message_count = verify.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    assert session_count == expected["sessions"]
+    assert message_count == expected["messages"]
+
+
+def test_recover_into_destination_without_fence_triggers_still_works(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fix must not depend on the destination having fence triggers.
+
+    Simulates an older-shaped destination schema (canonical tables present,
+    turn-fence trigger barrier never installed) by disabling the delta that
+    installs it while ``recover_session_database`` builds the destination.
+    ``register_turn_fence_generation`` is harmless either way — it only
+    registers a scalar function, and nothing in the destination references
+    it when there are no triggers to call it — so recovery must still
+    succeed.
+    """
+    def _stamp_schema_version_without_triggers(self, cursor) -> None:
+        # Stamp schema_version as the real delta does, but skip installing
+        # the turn-fence triggers themselves — reproducing the shape of an
+        # older store that is otherwise fully migrated.
+        cursor.execute("DELETE FROM schema_version")
+        cursor.execute(
+            "INSERT INTO schema_version (version) VALUES (?)",
+            (hermes_state.SCHEMA_VERSION,),
+        )
+        self._conn.commit()
+
+    monkeypatch.setattr(
+        hermes_state.SessionDB,
+        "_apply_turn_fence_generation_delta",
+        _stamp_schema_version_without_triggers,
+    )
+
+    source = tmp_path / "healthy-source-notriggers.db"
+    output = tmp_path / "healthy-recovered-notriggers.db"
+    expected = _make_source(source)
+
+    report = recover_session_database(source, output, work_dir=tmp_path, chunk_size=4)
+
+    with sqlite3.connect(str(output)) as verify:
+        trigger_count = verify.execute(
+            "SELECT COUNT(*) FROM sqlite_master "
+            "WHERE type = 'trigger' AND name LIKE 'turn_fence_%'"
+        ).fetchone()[0]
+        session_count = verify.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+        message_count = verify.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+
+    assert trigger_count == 0, "fixture must genuinely lack the fence triggers"
+    assert report["copy"]["sessions"]["status"] == "complete", report["copy"]["sessions"]
+    assert report["copy"]["messages"]["status"] == "complete", report["copy"]["messages"]
+    assert report["complete"] is True
+    assert report["verified"] is True
+    assert session_count == expected["sessions"]
+    assert message_count == expected["messages"]
+
+
+def test_destination_fence_probe_rejects_bool_even_with_integer_sqlite_type(
+) -> None:
+    """SQLite considers bool an integer, but the recovery fence must not."""
+
+    assert not _is_current_turn_fence_generation(True, "integer")
+    assert _is_current_turn_fence_generation(hermes_state.TURN_FENCE_GENERATION, "integer")
+
+
+@pytest.mark.parametrize(
+    "fault",
+    (
+        "no-registration",
+        "registration-raises",
+        "stale-int",
+        "string",
+        "bytes",
+        "float",
+        "none",
+        "bool",
+        "udf-raises",
+    ),
+)
+def test_exact_recovery_destination_fence_failures_leave_no_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+) -> None:
+    source = tmp_path / "source.db"
+    output = tmp_path / "recovered.db"
+    _make_source(source)
+    source_hash = _sha256(source)
+
+    def register_fault(conn: sqlite3.Connection) -> None:
+        if fault == "no-registration":
+            return
+        if fault == "registration-raises":
+            raise sqlite3.OperationalError("private setup failure")
+        values = {
+            "stale-int": hermes_state.TURN_FENCE_GENERATION - 1,
+            "string": "27",
+            "bytes": b"27",
+            "float": 27.0,
+            "none": None,
+            "bool": True,
+        }
+        if fault == "udf-raises":
+            def raises_generation() -> None:
+                raise RuntimeError("private callback failure")
+
+            callback = raises_generation
+        else:
+            callback = lambda: values[fault]
+        conn.create_function("hermes_turn_fence_generation", 0, callback)
+
+    monkeypatch.setattr(session_recovery, "register_turn_fence_generation", register_fault)
+    if fault == "bool":
+        monkeypatch.setattr(
+            session_recovery,
+            "_is_current_turn_fence_generation",
+            lambda _value, _sqlite_type: False,
+        )
+
+    with pytest.raises(SessionRecoveryDestinationError) as excinfo:
+        recover_session_database(source, output, work_dir=tmp_path)
+
+    assert str(excinfo.value) == (
+        "Recovery destination turn-fence setup is unavailable or incompatible."
+    )
+    assert _sha256(source) == source_hash
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        assert not os.path.lexists(output.with_name(output.name + suffix))
+
+
+def test_sessions_recover_cli_maps_destination_error_without_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from hermes_cli.sessions_cmd import cmd_sessions
+
+    source = tmp_path / "source.db"
+    output = tmp_path / "recovered.db"
+    _make_source(source)
+    source_hash = _sha256(source)
+
+    def fail_destination_setup(_connection: sqlite3.Connection) -> None:
+        raise sqlite3.OperationalError("private setup failure")
+
+    monkeypatch.setattr(
+        session_recovery,
+        "register_turn_fence_generation",
+        fail_destination_setup,
+    )
+
+    args = SimpleNamespace(
+        sessions_action="recover",
+        source=source,
+        output=output,
+        inspect_only=False,
+        allow_partial=False,
+        report=None,
+        work_dir=tmp_path,
+        chunk_size=4,
+    )
+    assert cmd_sessions(args) == 1
+
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out.splitlines() == [
+        "Recovering canonical session data into a new database…",
+        "Error: session recovery failed: "
+        "Recovery destination turn-fence setup is unavailable or incompatible.",
+        "The supplied source database was not replaced or deleted.",
+    ]
+    for forbidden in ("✓", "Partial recovery", "BEST-EFFORT", "Recovery report"):
+        assert forbidden not in captured.out
+    assert "private setup failure" not in captured.out
+
+    report_path = output.with_name(output.name + ".recovery.json")
+    assert not report_path.exists()
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        assert not os.path.lexists(output.with_name(output.name + suffix))
+    assert _sha256(source) == source_hash
+
+
+@pytest.mark.parametrize("target", ("main", "wal", "shm", "journal"))
+def test_recovery_publication_collision_preserves_existing_sentinel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target: str,
+) -> None:
+    source = tmp_path / "source.db"
+    output = tmp_path / "recovered.db"
+    _make_source(source)
+    source_hash = _sha256(source)
+    sentinel = output.with_name(
+        output.name if target == "main" else f"{output.name}-{target}"
+    )
+    sentinel_bytes = f"sentinel-{target}".encode()
+    sentinel_identity: tuple[int, int] | None = None
+
+    def insert_competitor(_candidate: Path, _final: Path) -> None:
+        nonlocal sentinel_identity
+        sentinel.write_bytes(sentinel_bytes)
+        created = sentinel.stat()
+        sentinel_identity = (created.st_dev, created.st_ino)
+
+    monkeypatch.setattr(
+        session_recovery,
+        "_publication_barrier",
+        insert_competitor,
+    )
+
+    with pytest.raises(SessionRecoverySafetyError):
+        recover_session_database(source, output, work_dir=tmp_path)
+
+    sentinel_stat = sentinel.stat()
+    assert sentinel_identity is not None
+    assert sentinel.read_bytes() == sentinel_bytes
+    assert (sentinel_stat.st_dev, sentinel_stat.st_ino) == sentinel_identity
+    assert not output.exists() or target == "main"
+    assert _sha256(source) == source_hash
+
+
+def test_recovery_publication_refuses_substituted_stage_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.db"
+    output = tmp_path / "recovered.db"
+    _make_source(source)
+    source_hash = _sha256(source)
+    replacement_bytes = b"substituted stage candidate"
+    replacement: Path | None = None
+    replacement_identity: tuple[int, int] | None = None
+
+    def substitute(candidate: Path, _final: Path) -> None:
+        nonlocal replacement, replacement_identity
+        candidate.unlink()
+        candidate.write_bytes(replacement_bytes)
+        replacement = candidate
+        created = candidate.stat()
+        replacement_identity = (created.st_dev, created.st_ino)
+
+    monkeypatch.setattr(session_recovery, "_publication_barrier", substitute)
+
+    with pytest.raises(SessionRecoverySafetyError):
+        recover_session_database(source, output, work_dir=tmp_path)
+
+    assert replacement is not None
+    assert replacement_identity is not None
+    assert replacement.read_bytes() == replacement_bytes
+    current = replacement.stat()
+    assert (current.st_dev, current.st_ino) == replacement_identity
+    assert not output.exists()
+    assert _sha256(source) == source_hash
 
 
 

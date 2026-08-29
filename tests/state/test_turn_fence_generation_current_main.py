@@ -20,7 +20,9 @@ class _FailAfterOneTurnFenceTriggerCursor(sqlite3.Cursor):
         return super().execute(sql, parameters)
 
 
-class _FailAfterOneTurnFenceTriggerConnection(sqlite3.Connection):
+class _FailAfterOneTurnFenceTriggerConnection(
+    hermes_state._SerializedConnectionMixin, sqlite3.Connection
+):
     def cursor(self, factory=None):
         return super().cursor(factory or _FailAfterOneTurnFenceTriggerCursor)
 

@@ -8,13 +8,16 @@ b-tree/schema header bytes), not mocked cursor exceptions.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import shutil
 import sqlite3
 from pathlib import Path
 
 import pytest
 
-from hermes_state import SessionDB
+from hermes_state import SessionDB, register_turn_fence_generation
 from hermes_cli import session_recovery
 from hermes_cli.session_lost_and_found import (
     classify_lost_and_found_row,
@@ -23,6 +26,7 @@ from hermes_cli.session_lost_and_found import (
     stub_missing_parent_sessions,
 )
 from hermes_cli.session_recovery import (
+    SessionRecoveryDestinationError,
     SessionRecoverySafetyError,
     SessionRecoverySourceError,
     _probe_populated_edge,
@@ -233,6 +237,87 @@ def test_unreadable_schema_without_cli_names_the_sqlite3_requirement(
     assert not output.exists()
 
 
+@pytest.mark.parametrize(
+    "fault",
+    (
+        "no-registration",
+        "registration-raises",
+        "stale-int",
+        "string",
+        "bytes",
+        "float",
+        "none",
+        "bool",
+        "udf-raises",
+    ),
+)
+def test_lost_and_found_destination_fence_failures_leave_no_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+) -> None:
+    source = tmp_path / "schemaless.db"
+    output = tmp_path / "recovered.db"
+    _make_schema_unreadable_source(source)
+    source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+    schema_ref = tmp_path / "schema-ref.db"
+    SessionDB(db_path=schema_ref).close()
+
+    import hermes_cli.session_lost_and_found as laf
+
+    monkeypatch.setattr(laf, "find_sqlite3_cli", lambda: "synthetic-sqlite3")
+
+    def run_synthetic_recover(
+        _snapshot: Path,
+        lost_and_found: Path,
+        _sqlite3_bin: str,
+    ) -> dict[str, str]:
+        _make_synthetic_lost_and_found(lost_and_found, schema_ref)
+        return {"mode": "synthetic"}
+
+    monkeypatch.setattr(laf, "run_cli_lost_and_found_recover", run_synthetic_recover)
+
+    def register_fault(conn: sqlite3.Connection) -> None:
+        if fault == "no-registration":
+            return
+        if fault == "registration-raises":
+            raise sqlite3.OperationalError("private setup failure")
+        values = {
+            "stale-int": 26,
+            "string": "27",
+            "bytes": b"27",
+            "float": 27.0,
+            "none": None,
+            "bool": True,
+        }
+        if fault == "udf-raises":
+            def raises_generation() -> None:
+                raise RuntimeError("private callback failure")
+
+            callback = raises_generation
+        else:
+            callback = lambda: values[fault]
+        conn.create_function("hermes_turn_fence_generation", 0, callback)
+
+    monkeypatch.setattr(session_recovery, "register_turn_fence_generation", register_fault)
+    if fault == "bool":
+        monkeypatch.setattr(
+            session_recovery,
+            "_is_current_turn_fence_generation",
+            lambda _value, _sqlite_type: False,
+        )
+
+    with pytest.raises(SessionRecoveryDestinationError) as excinfo:
+        recover_session_database(source, output, work_dir=tmp_path, allow_partial=True)
+
+    assert str(excinfo.value) == (
+        "Recovery destination turn-fence setup is unavailable or incompatible."
+    )
+    assert hashlib.sha256(source.read_bytes()).hexdigest() == source_hash
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        assert not (output.with_name(output.name + suffix)).exists()
+
+
 @pytest.mark.skipif(
     not HAVE_SQLITE3_CLI,
     reason="sqlite3 CLI not on PATH; .recover is a shell-only feature",
@@ -270,6 +355,11 @@ def test_lost_and_found_lane_recovers_schema_unreadable_source(
         "BEST-EFFORT" in warning
         for warning in report["verification"]["warnings"]
     )
+    assert report["output"] == str(output)
+    assert ".hermes-session-recovery-" not in json.dumps(report)
+    assert output.exists()
+    for suffix in ("-wal", "-shm", "-journal"):
+        assert not os.path.lexists(output.with_name(output.name + suffix))
 
     conn = sqlite3.connect(str(output))
     try:
@@ -482,6 +572,11 @@ def test_mapper_rebuilds_sessiondb_from_synthetic_lost_and_found(
     lf_conn = sqlite3.connect(str(lf_path), isolation_level=None)
     dest = sqlite3.connect(str(output), isolation_level=None)
     try:
+        # ``output`` was created via SessionDB then closed, same as the real
+        # lost-and-found salvage path in session_recovery.py: this reopen
+        # needs its own hermes_turn_fence_generation() registration or the
+        # turn-fence triggers on the canonical tables reject the first write.
+        register_turn_fence_generation(dest)
         dest.execute("PRAGMA foreign_keys=OFF")
         mapping = map_lost_and_found_rows(lf_conn, dest)
         stubbing = stub_missing_parent_sessions(dest)
