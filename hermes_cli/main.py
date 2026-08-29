@@ -1847,6 +1847,62 @@ def _create_titled_session(title: str) -> Optional[str]:
                 pass
 
 
+def _gateway_routed_session_owner(session_id: str):
+    """Return the live gateway pid serving *session_id*, else ``None``.
+
+    Both halves must hold: the session is in ``gateway_routing`` AND a gateway
+    process is actually alive. A stale routing row for a dead gateway is not a
+    conflict, and refusing on it would lock an operator out of their own session
+    after a crash -- the failure this guard exists to prevent, inverted.
+
+    Never raises. A guard that cannot answer must not block the command: it
+    returns ``None`` (allow) and the pre-existing lease wait remains the
+    backstop, exactly as before this guard existed.
+    """
+    try:
+        import json as _json
+        import re as _re
+        import sqlite3 as _sq
+        import subprocess as _sp
+
+        out = _sp.run(
+            ["launchctl", "list", "ai.hermes.gateway"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+        m = _re.search(r'"PID"\s*=\s*(\d+)', out)
+        if not m:
+            return None
+        pid = int(m.group(1))
+        os.kill(pid, 0)  # raises unless the process is alive
+
+        db = get_hermes_home() / "state.db"
+        if not db.exists():
+            return None
+        conn = _sq.connect(f"file:{db}?mode=ro", uri=True, timeout=2.0)
+        try:
+            rows = conn.execute("SELECT entry_json FROM gateway_routing").fetchall()
+        finally:
+            conn.close()
+        for (entry,) in rows:
+            try:
+                if _json.loads(entry).get("session_id") == session_id:
+                    return pid
+            except Exception:
+                continue
+        return None
+    except Exception:
+        return None
+
+
+def _refuse_gateway_routed_session_attach(session_id: str) -> None:
+    if _gateway_routed_session_owner(session_id) is not None:
+        print(
+            "Refusing to attach to a session currently served by the gateway.",
+            file=sys.stderr,
+        )
+        sys.exit(3)
+
+
 def _resolve_continue_arg(args, *, use_tui: bool) -> None:
     """Resolve ``-c/--continue`` into ``args.resume``.
 
@@ -3005,6 +3061,10 @@ def cmd_chat(args):
 
     # Resolve --continue into --resume with the latest session or by name
     _resolve_continue_arg(args, use_tui=use_tui)
+
+    _resume_target = getattr(args, "resume", None)
+    if _resume_target:
+        _refuse_gateway_routed_session_attach(_resume_target)
 
     # --resume @claude / --resume @codex: import a foreign session (Claude
     # Code / Codex CLI) and resume the newly created Hermes session.

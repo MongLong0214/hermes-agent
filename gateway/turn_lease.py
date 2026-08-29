@@ -209,7 +209,8 @@ class SessionTurnLeaseRegistry:
         token = TurnLeaseToken(session_id, owner_key, int(generation))
         lease = self._get_or_create(session_id)
 
-        if lease.lock.locked():
+        _contended = lease.lock.locked()
+        if _contended:
             holder = lease.holder
             logger.warning(
                 "turn lease contention on session %s: routing key %s (gen %s) "
@@ -231,37 +232,49 @@ class SessionTurnLeaseRegistry:
         # same session. Count even apparently-uncontended acquires: wait_for()
         # may schedule them before the underlying lock coroutine runs.
         lease.pending_acquires += 1
+        acquired = False
+        fully_published = False
         try:
-            await asyncio.wait_for(lease.lock.acquire(), timeout=wait)
-        except asyncio.TimeoutError:
-            holder = lease.holder
-            logger.error(
-                "turn lease wait timed out after %.0fs on session %s "
-                "(waiter: routing key %s gen %s; holder: routing key %s "
-                "gen %s) — failing closed: refusing to run this turn "
-                "UNSERIALIZED against the still-held lease",
-                wait,
-                session_id,
-                owner_key,
-                generation,
-                holder.owner_key if holder else "?",
-                holder.generation if holder else "?",
-            )
-            raise TurnLeaseTimeoutError(
-                session_id,
-                owner_key=owner_key,
-                generation=generation,
-                wait_seconds=wait,
-            ) from None
+            try:
+                await asyncio.wait_for(lease.lock.acquire(), timeout=wait)
+            except asyncio.TimeoutError:
+                holder = lease.holder
+                logger.error(
+                    "turn lease wait timed out after %.0fs on session %s "
+                    "(waiter: routing key %s gen %s; holder: routing key %s "
+                    "gen %s) — failing closed: refusing to run this turn "
+                    "UNSERIALIZED against the still-held lease",
+                    wait,
+                    session_id,
+                    owner_key,
+                    generation,
+                    holder.owner_key if holder else "?",
+                    holder.generation if holder else "?",
+                )
+                raise TurnLeaseTimeoutError(
+                    session_id,
+                    owner_key=owner_key,
+                    generation=generation,
+                    wait_seconds=wait,
+                ) from None
+
+            acquired = True
+            lease.holder = token
+            lease.acquired_at = time.time()
+            lease.last_used = lease.acquired_at
+            fully_published = True
+            return token
+        except BaseException:
+            if acquired and not fully_published:
+                if lease.holder is token:
+                    lease.holder = None
+                lease.acquired_at = 0.0
+                lease.last_used = time.time()
+                if lease.lock.locked():
+                    lease.lock.release()
+            raise
         finally:
             lease.pending_acquires -= 1
-
-        # The lock is held and there is no await before holder publication, so
-        # the lease cannot become evictable after the pending count is cleared.
-        lease.holder = token
-        lease.acquired_at = time.time()
-        lease.last_used = lease.acquired_at
-        return token
 
     def rebind(self, token: Optional[TurnLeaseToken], new_session_id: str) -> bool:
         """Alias a HELD lease onto ``new_session_id`` after mid-turn rotation.
@@ -277,9 +290,7 @@ class SessionTurnLeaseRegistry:
         Mechanism: the SAME ``_SessionLease`` object is registered under the
         new id (the old mapping stays until it goes idle and is evicted), so
         acquirers on either id serialize against one lock — no lock state is
-        moved, no asyncio internals are touched. Only the current holder can
-        rebind (identity-checked like release), and the token follows to the
-        new id so release frees the shared object.
+        moved and the token keeps its acquisition identity.
 
         Edge: if the new id already has a live lease of its own (another
         turn is running on the target session), the two serialization
@@ -318,35 +329,32 @@ class SessionTurnLeaseRegistry:
 
         self._leases[new_session_id] = lease
         lease.last_used = time.time()
-        token.session_id = new_session_id
         return True
 
     def release(self, token: Optional[TurnLeaseToken]) -> bool:
-        """Release ``token``'s lease. Idempotent; ownership-checked.
+        """Release ``token``'s lease transactionally and identity-checked.
 
-        Returns True only when this exact token was the current holder and
-        the lock was freed. A re-release or a stale token whose slot has
-        since been granted to a newer turn are both safe no-ops — a stale
-        unwind can never release a newer turn's lease.
+        Lifecycle state changes only after the synchronous lock release succeeds,
+        so a release failure leaves the exact token and holder retryable.
         """
         if token is None or token.released:
             return False
-        token.released = True
         lease = self._leases.get(token.session_id)
-        if lease is None:
+        if lease is None or lease.holder is not token:
+            if lease is not None:
+                logger.debug(
+                    "turn lease release skipped on session %s: token (key %s "
+                    "gen %s) is not the current holder",
+                    token.session_id,
+                    token.owner_key,
+                    token.generation,
+                )
             return False
-        if lease.holder is not token:
-            logger.debug(
-                "turn lease release skipped on session %s: token (key %s "
-                "gen %s) is not the current holder",
-                token.session_id,
-                token.owner_key,
-                token.generation,
-            )
-            return False
+
+        released_at = time.time()
+        lease.lock.release()
         lease.holder = None
         lease.acquired_at = 0.0
-        lease.last_used = time.time()
-        if lease.lock.locked():
-            lease.lock.release()
+        lease.last_used = released_at
+        token.released = True
         return True

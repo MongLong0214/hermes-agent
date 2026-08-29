@@ -24,7 +24,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from gateway.turn_lease import SessionTurnLeaseRegistry, TurnLeaseTimeoutError
+from gateway.turn_lease import (
+    SessionTurnLeaseRegistry,
+    TurnLeaseTimeoutError,
+    TurnLeaseToken,
+)
 
 
 def _run(coro):
@@ -130,8 +134,7 @@ def test_timeout_fails_closed_instead_of_authorizing_an_unserialized_turn():
     _run(scenario())
 
 
-@pytest.mark.asyncio
-async def test_agent_path_propagates_timed_out_lease_before_loading_transcript(
+def test_agent_path_propagates_timed_out_lease_before_loading_transcript(
     monkeypatch, tmp_path
 ):
     """The agent path propagates timeout before transcript work can begin.
@@ -140,38 +143,41 @@ async def test_agent_path_propagates_timed_out_lease_before_loading_transcript(
     transcript loading and agent execution must not start: both would operate
     without the per-session serialization guarantee.
     """
-    from tests.gateway.test_42039_duplicate_user_message import (
-        _bootstrap,
-        _event,
-        _source,
-    )
 
-    runner = _bootstrap(monkeypatch, tmp_path)
-    runner._turn_leases = SessionTurnLeaseRegistry()
-    holder = await runner._turn_leases.acquire(
-        "sess-dedup", owner_key="holder-key", generation=1, timeout=1
-    )
-    assert holder is not None
-    monkeypatch.setenv("HERMES_TURN_LEASE_TIMEOUT", "0.02")
+    async def scenario():
+        from tests.gateway.test_42039_duplicate_user_message import (
+            _bootstrap,
+            _event,
+            _source,
+        )
 
-    runner.session_store.load_transcript.side_effect = AssertionError(
-        "transcript must not load after a turn-lease timeout"
-    )
-    runner._run_agent = pytest.fail
+        runner = _bootstrap(monkeypatch, tmp_path)
+        runner._turn_leases = SessionTurnLeaseRegistry()
+        holder = await runner._turn_leases.acquire(
+            "sess-dedup", owner_key="holder-key", generation=1, timeout=1
+        )
+        assert holder is not None
+        monkeypatch.setenv("HERMES_TURN_LEASE_TIMEOUT", "0.02")
 
-    try:
-        with pytest.raises(TurnLeaseTimeoutError):
-            await runner._handle_message_with_agent(
-                _event(), _source(), "agent:main:telegram:group:-1001:12345", 1
-            )
-    finally:
-        assert runner._turn_leases.release(holder) is True
+        runner.session_store.load_transcript.side_effect = AssertionError(
+            "transcript must not load after a turn-lease timeout"
+        )
+        runner._run_agent = pytest.fail
 
-    runner.session_store.load_transcript.assert_not_called()
+        try:
+            with pytest.raises(TurnLeaseTimeoutError):
+                await runner._handle_message_with_agent(
+                    _event(), _source(), "agent:main:telegram:group:-1001:12345", 1
+                )
+        finally:
+            assert runner._turn_leases.release(holder) is True
+
+        runner.session_store.load_transcript.assert_not_called()
+
+    _run(scenario())
 
 
-@pytest.mark.asyncio
-async def test_full_dispatch_rejects_lease_timeout_without_running_goal_hook(
+def test_full_dispatch_rejects_lease_timeout_without_running_goal_hook(
     monkeypatch, tmp_path
 ):
     """A lease rejection is not a completed turn for `/goal` evaluation.
@@ -179,37 +185,43 @@ async def test_full_dispatch_rejects_lease_timeout_without_running_goal_hook(
     The lease wait also has its own clock: a short lease budget must reject
     promptly even while the normal agent inactivity timeout remains long.
     """
-    from tests.gateway.test_42039_duplicate_user_message import _bootstrap, _event
 
-    runner = _bootstrap(monkeypatch, tmp_path)
-    runner._turn_leases = SessionTurnLeaseRegistry()
-    holder = await runner._turn_leases.acquire(
-        "sess-dedup", owner_key="holder-key", generation=1, timeout=1
-    )
-    assert holder is not None
-    monkeypatch.setenv("HERMES_AGENT_TIMEOUT", "5")
-    monkeypatch.setenv("HERMES_TURN_LEASE_TIMEOUT", "0.02")
+    async def scenario():
+        from tests.gateway.test_42039_duplicate_user_message import _bootstrap, _event
 
-    runner.session_store.load_transcript.side_effect = AssertionError(
-        "transcript must not load after a turn-lease timeout"
-    )
-    session_env_tokens = object()
-    runner._set_session_env = MagicMock(return_value=session_env_tokens)
-    runner._clear_session_env = MagicMock()
-    runner._run_agent = pytest.fail
-    runner._post_turn_goal_continuation = AsyncMock()
+        runner = _bootstrap(monkeypatch, tmp_path)
+        runner._turn_leases = SessionTurnLeaseRegistry()
+        holder = await runner._turn_leases.acquire(
+            "sess-dedup", owner_key="holder-key", generation=1, timeout=1
+        )
+        assert holder is not None
+        monkeypatch.setenv("HERMES_AGENT_TIMEOUT", "5")
+        monkeypatch.setenv("HERMES_TURN_LEASE_TIMEOUT", "0.02")
 
-    try:
-        response = await asyncio.wait_for(runner._handle_message(_event()), timeout=1)
-    finally:
-        assert runner._turn_leases.release(holder) is True
+        runner.session_store.load_transcript.side_effect = AssertionError(
+            "transcript must not load after a turn-lease timeout"
+        )
+        session_env_tokens = object()
+        runner._set_session_env = MagicMock(return_value=session_env_tokens)
+        runner._clear_session_env = MagicMock()
+        runner._run_agent = pytest.fail
+        runner._post_turn_goal_continuation = AsyncMock()
 
-    assert isinstance(response, str)
-    assert "not processed" in response.lower()
-    assert "resend" in response.lower()
-    runner.session_store.load_transcript.assert_not_called()
-    runner._clear_session_env.assert_called_once_with(session_env_tokens)
-    runner._post_turn_goal_continuation.assert_not_awaited()
+        try:
+            response = await asyncio.wait_for(
+                runner._handle_message(_event()), timeout=1
+            )
+        finally:
+            assert runner._turn_leases.release(holder) is True
+
+        assert isinstance(response, str)
+        assert "not processed" in response.lower()
+        assert "resend" in response.lower()
+        runner.session_store.load_transcript.assert_not_called()
+        runner._clear_session_env.assert_called_once_with(session_env_tokens)
+        runner._post_turn_goal_continuation.assert_not_awaited()
+
+    _run(scenario())
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +266,57 @@ class _GatedLock:
 
     def release(self):
         self._lock.release()
+
+
+class _HolderPublicationFault(BaseException):
+    pass
+
+
+class _FaultingPublicationLease:
+    """Lease double that faults exactly while its holder is unpublished."""
+
+    def __init__(self):
+        self.lock = asyncio.Lock()
+        self._holder = None
+        self.acquired_at = 0.0
+        self.last_used = 0.0
+        self.pending_acquires = 0
+        self.fail_publication = True
+
+    @property
+    def holder(self):
+        return self._holder
+
+    @holder.setter
+    def holder(self, token):
+        if token is not None and self.fail_publication:
+            raise _HolderPublicationFault()
+        self._holder = token
+
+
+def test_acquire_fault_before_holder_publication_releases_unpublished_lock():
+    async def scenario():
+        registry = SessionTurnLeaseRegistry()
+        lease = _FaultingPublicationLease()
+        registry._leases["sess-unpublished"] = lease
+
+        with pytest.raises(_HolderPublicationFault):
+            await registry.acquire(
+                "sess-unpublished", owner_key="key-a", generation=1, timeout=1
+            )
+
+        assert lease.holder is None
+        assert lease.pending_acquires == 0
+        assert not lease.lock.locked()
+
+        lease.fail_publication = False
+        token = await registry.acquire(
+            "sess-unpublished", owner_key="key-b", generation=2, timeout=1
+        )
+        assert token is not None
+        assert registry.release(token) is True
+
+    _run(scenario())
 
 
 def test_registry_does_not_evict_lease_during_waiter_handoff():
@@ -396,7 +459,8 @@ def test_rebind_moves_serialization_to_new_session_id():
         registry = SessionTurnLeaseRegistry()
         token = await registry.acquire("parent", owner_key="key-a", generation=1, timeout=5)
         assert registry.rebind(token, "child") is True
-        assert token is not None and token.session_id == "child"
+        assert token is not None and token.session_id == "parent"
+        assert registry._leases["child"] is registry._leases["parent"]
 
         # Alias key resolving the fresh child id serializes behind the holder.
         waiter = asyncio.create_task(
@@ -453,6 +517,84 @@ def test_rebind_does_not_replace_target_during_waiter_handoff():
 # ---------------------------------------------------------------------------
 
 
+class _FailOnceReleaseLock:
+    """Real lock wrapper whose first release raises without unlocking."""
+
+    def __init__(self, lock):
+        self._lock = lock
+        self._fail = True
+
+    async def acquire(self):
+        return await self._lock.acquire()
+
+    def locked(self):
+        return self._lock.locked()
+
+    def release(self):
+        if self._fail:
+            self._fail = False
+            raise RuntimeError("injected release failure")
+        self._lock.release()
+
+
+def test_release_failure_preserves_slot_token_and_holder_for_retry():
+    from gateway.run import GatewayRunner
+
+    async def scenario():
+        runner = object.__new__(GatewayRunner)
+        registry = SessionTurnLeaseRegistry()
+        runner._turn_leases = registry
+        session_key = "key-release"
+        token = await registry.acquire(
+            "sess-release", owner_key=session_key, generation=1, timeout=1
+        )
+        assert token is not None
+        state = runner._session_state(session_key).turn
+        state.lease_token = token
+        state.lease_generation = 1
+        lease = registry._leases["sess-release"]
+        lease.lock = _FailOnceReleaseLock(lease.lock)
+
+        assert runner._release_turn_lease(session_key, 1, token=token) is False
+        assert state.lease_token is token
+        assert state.lease_generation == 1
+        assert token.released is False
+        assert lease.holder is token
+        assert lease.lock.locked()
+
+        assert runner._release_turn_lease(session_key, 1, token=token) is True
+        assert state.lease_token is None
+        assert state.lease_generation is None
+        assert token.released is True
+        assert lease.holder is None
+        assert not lease.lock.locked()
+
+    _run(scenario())
+
+
+def test_wrong_token_and_same_holder_aba_never_release_successor():
+    async def scenario():
+        registry = SessionTurnLeaseRegistry()
+        first = await registry.acquire(
+            "sess-aba", owner_key="key-a", generation=1, timeout=1
+        )
+        foreign = TurnLeaseToken("sess-aba", "key-a", 1)
+
+        assert registry.release(foreign) is False
+        assert foreign.released is False
+        assert registry._leases["sess-aba"].holder is first
+        assert registry.release(first) is True
+
+        successor = await registry.acquire(
+            "sess-aba", owner_key="key-a", generation=1, timeout=1
+        )
+        assert registry.release(first) is False
+        assert registry._leases["sess-aba"].holder is successor
+        assert registry.release(successor) is True
+
+    _run(scenario())
+
+
 def test_runner_release_turn_lease_is_token_scoped_and_bare_safe():
     from gateway.run import GatewayRunner
 
@@ -476,5 +618,184 @@ def test_runner_release_turn_lease_is_token_scoped_and_bare_safe():
         assert runner._release_turn_lease("key-a", 1) is False
         # Empty key guard.
         assert runner._release_turn_lease("", 1) is False
+
+    _run(scenario())
+
+
+def test_full_dispatch_releases_event_token_after_same_key_slot_overwrite(
+    monkeypatch, tmp_path
+):
+    """A real dispatch finalizer retires A without disturbing overwritten B."""
+    from tests.gateway.test_42039_duplicate_user_message import _bootstrap, _event
+
+    async def scenario():
+        runner = _bootstrap(monkeypatch, tmp_path)
+        registry = SessionTurnLeaseRegistry()
+        runner._turn_leases = registry
+        generations = iter((1, 2))
+        runner._begin_session_run_generation = lambda _key: next(generations)
+        # Simulate only the concurrent same-key dispatch under test: A's
+        # sentinel must not route B through the normal busy-message branch.
+        runner._is_session_running = lambda session_key: False
+        runner._claim_active_session_slot = lambda *_args: (None, None)
+        runner._release_running_agent_state = lambda *_args: True
+        runner._run_post_turn_hooks = AsyncMock()
+        runner._clear_durable_active_turn = AsyncMock()
+
+        a_acquired = asyncio.Event()
+        b_published = asyncio.Event()
+        allow_a_exit = asyncio.Event()
+        allow_b_exit = asyncio.Event()
+        tokens = {}
+
+        async def acquire_then_block(event, _source, session_key, generation):
+            session_id = "sess-old" if generation == 1 else "sess-new"
+            token = await registry.acquire(
+                session_id, owner_key=session_key, generation=generation, timeout=1
+            )
+            assert token is not None
+            event._gateway_turn_lease_token = token
+            turn = runner._session_state(session_key).turn
+            turn.lease_token = token
+            turn.lease_generation = generation
+            tokens[generation] = token
+            if generation == 1:
+                a_acquired.set()
+                await allow_a_exit.wait()
+            else:
+                b_published.set()
+                await allow_b_exit.wait()
+            return str(generation)
+
+        runner._handle_message_with_agent = acquire_then_block
+        task_a = asyncio.create_task(runner._handle_message(_event()))
+        await asyncio.wait_for(a_acquired.wait(), timeout=1)
+        task_b = asyncio.create_task(runner._handle_message(_event()))
+        await asyncio.wait_for(b_published.wait(), timeout=1)
+
+        allow_a_exit.set()
+        assert await asyncio.wait_for(task_a, timeout=1) == "1"
+
+        state = runner._session_state("agent:main:telegram:group:-1001:12345")
+        assert registry._leases["sess-old"].holder is None
+        assert state.turn.lease_token is tokens[2]
+        assert state.turn.lease_generation == 2
+        assert registry._leases["sess-new"].holder is tokens[2]
+
+        allow_b_exit.set()
+        assert await asyncio.wait_for(task_b, timeout=1) == "2"
+        assert registry._leases["sess-new"].holder is None
+
+    _run(scenario())
+
+
+def test_agent_result_rotation_rebinds_event_token_after_slot_overwrite(
+    monkeypatch, tmp_path
+):
+    """The real agent-result rotation follows A's event-owned lease, not B's slot."""
+    from tests.gateway.test_42039_duplicate_user_message import (
+        _bootstrap,
+        _event,
+        _source,
+    )
+
+    async def scenario():
+        runner = _bootstrap(monkeypatch, tmp_path)
+        registry = SessionTurnLeaseRegistry()
+        runner._turn_leases = registry
+        session_key = "agent:main:telegram:group:-1001:12345"
+        entry = runner.session_store.get_or_create_session.return_value
+        entry.session_id = "sess-parent"
+        async_store = runner.async_session_store
+        async_store.get_or_create_session = AsyncMock(return_value=entry)
+        event = _event()
+        tokens = {}
+
+        async def run_agent(**_kwargs):
+            token_a = event._gateway_turn_lease_token
+            tokens["a"] = token_a
+            token_b = await registry.acquire(
+                "sess-other", owner_key=session_key, generation=2, timeout=1
+            )
+            assert token_b is not None
+            tokens["b"] = token_b
+            turn = runner._session_state(session_key).turn
+            turn.lease_token = token_b
+            turn.lease_generation = 2
+            return {
+                "final_response": "ok",
+                "messages": [],
+                "tools": [],
+                "history_offset": 0,
+                "last_prompt_tokens": 0,
+                "session_id": "sess-child",
+            }
+
+        async def save_barrier():
+            assert registry._leases["sess-child"] is registry._leases["sess-parent"]
+            assert registry._leases["sess-child"].holder is tokens["a"]
+            turn = runner._session_state(session_key).turn
+            assert turn.lease_token is tokens["b"]
+            assert turn.lease_generation == 2
+
+        runner._run_agent = run_agent
+        async_store._save = AsyncMock(side_effect=save_barrier)
+        result = await runner._handle_message_with_agent(
+            event, _source(), session_key, 1
+        )
+        assert result == "ok"
+        assert registry.release(tokens["a"]) is True
+        assert registry.release(tokens["b"]) is True
+
+    _run(scenario())
+
+
+def test_repeated_cancellation_during_durable_cleanup_still_releases_turn_lease(
+    monkeypatch, tmp_path
+):
+    """A second cancellation cannot skip the no-await event-token release."""
+    from tests.gateway.test_42039_duplicate_user_message import _bootstrap, _event
+
+    async def scenario():
+        runner = _bootstrap(monkeypatch, tmp_path)
+        registry = SessionTurnLeaseRegistry()
+        runner._turn_leases = registry
+        runner._claim_active_session_slot = lambda *_args: (None, None)
+        runner._release_running_agent_state = lambda *_args: True
+        entry = runner.session_store.get_or_create_session.return_value
+        async_store = runner.async_session_store
+        async_store.get_or_create_session = AsyncMock(return_value=entry)
+        acquired = asyncio.Event()
+        cleanup_entered = asyncio.Event()
+        never = asyncio.Event()
+        event = _event()
+
+        async def mark_after_real_acquire(marked_event, _session_key):
+            assert marked_event._gateway_turn_lease_token is not None
+            acquired.set()
+            await never.wait()
+
+        async def block_durable_cleanup(_event):
+            cleanup_entered.set()
+            await never.wait()
+
+        runner._mark_durable_active_turn = mark_after_real_acquire
+        runner._clear_durable_active_turn = block_durable_cleanup
+        task = asyncio.create_task(runner._handle_message(event))
+        await asyncio.wait_for(acquired.wait(), timeout=1)
+        token = event._gateway_turn_lease_token
+        assert token is not None
+
+        task.cancel()
+        await asyncio.wait_for(cleanup_entered.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        state = runner._session_state("agent:main:telegram:group:-1001:12345").turn
+        assert token.released is True
+        assert registry._leases[entry.session_id].holder is None
+        assert state.lease_token is None
+        assert state.lease_generation is None
 
     _run(scenario())

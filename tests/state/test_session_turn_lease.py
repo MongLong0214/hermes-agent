@@ -71,6 +71,58 @@ def test_turn_lease_is_scoped_to_conversation_root(tmp_path):
     db.release_session_turn_lease("child", root_holder)
 
 
+def test_turn_lease_only_ignores_conversation_id_conflict(tmp_path):
+    """A different UNIQUE constraint must not become ordinary contention."""
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("conversation-a", source="test")
+    db.create_session("conversation-b", source="test")
+    db._conn.execute(
+        "CREATE UNIQUE INDEX session_turn_leases_holder_unique_for_test "
+        "ON session_turn_leases(holder)"
+    )
+
+    holder = f"pid={os.getpid()}:turn=shared"
+    assert db.try_acquire_session_turn_lease(
+        "conversation-a", holder, ttl_seconds=5
+    )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        db.try_acquire_session_turn_lease(
+            "conversation-b", holder, ttl_seconds=5
+        )
+
+    rows = db._conn.execute(
+        "SELECT conversation_id, holder FROM session_turn_leases "
+        "ORDER BY conversation_id"
+    ).fetchall()
+    assert [tuple(row) for row in rows] == [("conversation-a", holder)]
+
+
+def test_turn_lease_raises_when_insert_is_ignored_without_owner(tmp_path):
+    """A silent insert refusal must not be reported as contention."""
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("conversation", source="test")
+    db._conn.execute(
+        """CREATE TRIGGER session_turn_leases_ignore_insert_for_test
+        BEFORE INSERT ON session_turn_leases
+        BEGIN
+            SELECT RAISE(IGNORE);
+        END"""
+    )
+
+    holder = f"pid={os.getpid()}:turn=ignored"
+    with pytest.raises(sqlite3.DatabaseError) as exc_info:
+        db.try_acquire_session_turn_lease(
+            "conversation", holder, ttl_seconds=5
+        )
+
+    assert str(exc_info.value) == "SESSION_TURN_LEASE_ACQUIRE_INSERT_MISSING"
+    assert db._conn.execute(
+        "SELECT 1 FROM session_turn_leases WHERE conversation_id = ?",
+        ("conversation",),
+    ).fetchone() is None
+
+
 def test_turn_lease_does_not_serialize_delegate_child_with_parent(tmp_path):
     """Only compression continuation segments share a conversation lease."""
     db = SessionDB(tmp_path / "state.db")

@@ -12,11 +12,16 @@ The recovery path deliberately avoids in-place repair:
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import json
 import os
 import shutil
 import sqlite3
+import stat
+import sys
 import tempfile
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -24,7 +29,9 @@ from hermes_state import (
     FTS_STORAGE_VERSION,
     SCHEMA_VERSION,
     SessionDB,
+    TURN_FENCE_GENERATION,
     _db_opens_cleanly,
+    register_turn_fence_generation,
 )
 
 
@@ -77,8 +84,278 @@ class SessionRecoverySourceError(SessionRecoveryError):
     """Raised when the source cannot provide the required canonical tables."""
 
 
+class SessionRecoveryDestinationError(SessionRecoveryError):
+    """Raised when the destination connection itself is defective.
+
+    Distinct from :class:`SessionRecoverySourceError`: this means the
+    recovery TOOL failed to set up its own destination connection, not that
+    the source database has corrupted rows. ``_copy_table`` /
+    ``_copy_table_salvage`` swallow ``sqlite3.DatabaseError`` per table and
+    report it as row-level salvage loss, which is correct for genuine source
+    corruption but actively misleading for a defect in this tool — an
+    operator reading "no such function: hermes_turn_fence_generation" as a
+    per-table failure has no way to tell it apart from a damaged b-tree.
+    ``_require_destination_fenced`` below fails fast and loud instead, before
+    any per-table copy gets a chance to misreport it.
+    """
+
+
+_DESTINATION_FENCE_ERROR = (
+    "Recovery destination turn-fence setup is unavailable or incompatible."
+)
+
+
+def _is_current_turn_fence_generation(value: Any, sqlite_type: Any) -> bool:
+    """Return whether a probed scalar has the exact expected SQLite shape."""
+
+    return (
+        sqlite_type == "integer"
+        and type(value) is int
+        and value == TURN_FENCE_GENERATION
+    )
+
+
+def _require_destination_fenced(destination: sqlite3.Connection) -> None:
+    """Fail loudly if ``destination`` cannot satisfy its own turn-fence
+    triggers, before any table copy runs and swallows that as row loss.
+
+    A destination that already has ``hermes_turn_fence_generation()``
+    registered (or genuinely has no turn-fence triggers to call it) passes
+    silently; this does not require triggers to be present.
+    """
+    try:
+        register_turn_fence_generation(destination)
+        row = destination.execute(
+            "SELECT hermes_turn_fence_generation(), "
+            "typeof(hermes_turn_fence_generation())"
+        ).fetchone()
+    except sqlite3.Error:
+        raise SessionRecoveryDestinationError(_DESTINATION_FENCE_ERROR) from None
+    if row is None or not _is_current_turn_fence_generation(row[0], row[1]):
+        raise SessionRecoveryDestinationError(_DESTINATION_FENCE_ERROR) from None
+
+
 def _sidecar_path(db_path: Path, suffix: str) -> Path:
     return db_path if not suffix else db_path.with_name(db_path.name + suffix)
+
+
+_DESTINATION_STAGE_ERROR = "Recovery destination staging or publication failed."
+_DESTINATION_COLLISION_ERROR = "Recovery output already exists or changed during publication."
+_DESTINATION_STAGE_CHANGED_ERROR = "Recovery staging candidate changed before publication."
+
+
+def _identity_from_stat(result: os.stat_result) -> tuple[int, int, int, int]:
+    return (
+        int(result.st_dev),
+        int(result.st_ino),
+        stat.S_IFMT(result.st_mode),
+        int(result.st_nlink),
+    )
+
+
+def _path_identity(path: Path) -> tuple[int, int, int, int]:
+    return _identity_from_stat(os.lstat(path))
+
+
+@dataclass
+class _DestinationStage:
+    directory: Path
+    candidate: Path
+    directory_identity: tuple[int, int, int, int]
+    children: dict[str, tuple[int, int, int, int]] = field(default_factory=dict)
+
+
+def _create_destination_stage(output: Path) -> _DestinationStage:
+    """Make a private candidate directory beside the requested destination."""
+
+    try:
+        directory = Path(
+            tempfile.mkdtemp(prefix=".hermes-session-recovery-", dir=output.parent)
+        )
+        os.chmod(directory, 0o700)
+        if os.stat(directory).st_dev != os.stat(output.parent).st_dev:
+            raise OSError(errno.EXDEV, "staging and destination differ")
+        return _DestinationStage(
+            directory=directory,
+            candidate=directory / output.name,
+            directory_identity=_path_identity(directory),
+        )
+    except OSError:
+        raise SessionRecoveryDestinationError(_DESTINATION_STAGE_ERROR) from None
+
+
+def _stage_child_identity(stage: _DestinationStage, path: Path) -> None:
+    """Record one candidate child, rejecting substitution or hard-linking."""
+
+    try:
+        identity = _path_identity(path)
+    except OSError:
+        raise SessionRecoveryDestinationError(_DESTINATION_STAGE_ERROR) from None
+    if not stat.S_ISREG(identity[2]) or identity[3] != 1:
+        raise SessionRecoverySafetyError(_DESTINATION_STAGE_CHANGED_ERROR)
+    prior = stage.children.get(path.name)
+    if prior is not None and prior != identity:
+        raise SessionRecoverySafetyError(_DESTINATION_STAGE_CHANGED_ERROR)
+    stage.children[path.name] = identity
+
+
+def _refresh_stage_children(stage: _DestinationStage, *, require_main: bool = False) -> None:
+    for suffix in _SIDECAR_SUFFIXES:
+        child = _sidecar_path(stage.candidate, suffix)
+        if os.path.lexists(child):
+            _stage_child_identity(stage, child)
+    if require_main and stage.candidate.name not in stage.children:
+        raise SessionRecoverySafetyError(_DESTINATION_STAGE_CHANGED_ERROR)
+
+
+def _stage_directory_is_owned(stage: _DestinationStage) -> bool:
+    try:
+        return _path_identity(stage.directory) == stage.directory_identity
+    except OSError:
+        return False
+
+
+def _cleanup_destination_stage(stage: _DestinationStage) -> None:
+    """Remove only captured candidate children and an unchanged empty stage."""
+
+    if not _stage_directory_is_owned(stage):
+        return
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        directory_fd = os.open(stage.directory, flags)
+    except OSError:
+        return
+    try:
+        if _identity_from_stat(os.fstat(directory_fd)) != stage.directory_identity:
+            return
+        for name, expected in tuple(stage.children.items()):
+            try:
+                current = _identity_from_stat(
+                    os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                )
+            except OSError:
+                continue
+            if current != expected:
+                continue
+            try:
+                os.unlink(name, dir_fd=directory_fd)
+            except OSError:
+                continue
+        try:
+            empty = not os.listdir(directory_fd)
+        except OSError:
+            return
+    finally:
+        os.close(directory_fd)
+    if not empty or not _stage_directory_is_owned(stage):
+        return
+    parent_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        parent_fd = os.open(stage.directory.parent, parent_flags)
+    except OSError:
+        return
+    try:
+        if _identity_from_stat(
+            os.stat(stage.directory.name, dir_fd=parent_fd, follow_symlinks=False)
+        ) != stage.directory_identity:
+            return
+        os.rmdir(stage.directory.name, dir_fd=parent_fd)
+    except OSError:
+        return
+    finally:
+        os.close(parent_fd)
+
+
+def _fsync_path(path: Path, *, directory: bool = False) -> None:
+    flags = os.O_RDONLY
+    if directory:
+        flags |= getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _seal_staged_database(stage: _DestinationStage) -> None:
+    """Collapse WAL state and seal the candidate before it enters public space."""
+
+    _refresh_stage_children(stage, require_main=True)
+    try:
+        connection = sqlite3.connect(str(stage.candidate), isolation_level=None)
+        try:
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            journal_mode = connection.execute("PRAGMA journal_mode=DELETE").fetchone()
+            if journal_mode is None or str(journal_mode[0]).lower() != "delete":
+                raise sqlite3.DatabaseError("journal mode was not sealed")
+        finally:
+            connection.close()
+        if _db_opens_cleanly(stage.candidate) is not None:
+            raise sqlite3.DatabaseError("staged database health probe failed")
+        for suffix in ("-wal", "-shm", "-journal"):
+            if os.path.lexists(_sidecar_path(stage.candidate, suffix)):
+                raise sqlite3.DatabaseError("staged sidecar remains")
+        _refresh_stage_children(stage, require_main=True)
+        _fsync_path(stage.candidate)
+        _fsync_path(stage.directory, directory=True)
+    except (OSError, sqlite3.Error):
+        raise SessionRecoveryDestinationError(_DESTINATION_STAGE_ERROR) from None
+
+
+def _publication_barrier(_candidate: Path, _output: Path) -> None:
+    """A testable boundary immediately before the exclusive native rename."""
+
+
+def _native_no_replace_publish(source: Path, destination: Path) -> None:
+    """Use the platform's native exclusive rename; never emulate it."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == "darwin":
+        rename = libc.renameatx_np
+        rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        rename.restype = ctypes.c_int
+        result = rename(-2, os.fsencode(source), -2, os.fsencode(destination), 0x00000004)
+    elif sys.platform.startswith("linux"):
+        try:
+            rename = libc.renameat2
+        except AttributeError as exc:
+            raise OSError(errno.ENOTSUP, "renameat2 unavailable") from exc
+        rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        rename.restype = ctypes.c_int
+        result = rename(-100, os.fsencode(source), -100, os.fsencode(destination), 1)
+    else:
+        raise OSError(errno.ENOTSUP, "no native no-replace rename")
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+
+
+def _publish_staged_database(stage: _DestinationStage, output: Path) -> None:
+    """Publish a sealed candidate exactly once without replacing a competitor."""
+
+    _refresh_stage_children(stage, require_main=True)
+    expected = stage.children[stage.candidate.name]
+    if _path_identity(stage.candidate) != expected:
+        raise SessionRecoverySafetyError(_DESTINATION_STAGE_CHANGED_ERROR)
+    if any(os.path.lexists(_sidecar_path(output, suffix)) for suffix in _SIDECAR_SUFFIXES):
+        raise SessionRecoverySafetyError(_DESTINATION_COLLISION_ERROR)
+    _publication_barrier(stage.candidate, output)
+    if _path_identity(stage.candidate) != expected:
+        raise SessionRecoverySafetyError(_DESTINATION_STAGE_CHANGED_ERROR)
+    if any(os.path.lexists(_sidecar_path(output, suffix)) for suffix in _SIDECAR_SUFFIXES):
+        raise SessionRecoverySafetyError(_DESTINATION_COLLISION_ERROR)
+    try:
+        _native_no_replace_publish(stage.candidate, output)
+    except OSError:
+        raise SessionRecoverySafetyError(_DESTINATION_COLLISION_ERROR) from None
+    try:
+        if _path_identity(output) != expected or os.path.lexists(stage.candidate):
+            raise SessionRecoveryDestinationError(_DESTINATION_STAGE_ERROR)
+        _fsync_path(output.parent, directory=True)
+    except OSError:
+        raise SessionRecoveryDestinationError(_DESTINATION_STAGE_ERROR) from None
 
 
 def _resolved_output_path(path: Path) -> Path:
@@ -1389,6 +1666,7 @@ def _recover_via_lost_and_found(
     source: Path,
     snapshot_source: Path,
     snapshot_dir: Path,
+    stage: _DestinationStage,
     output: Path,
     inspection: dict[str, Any],
     disk_space: dict[str, Any],
@@ -1432,14 +1710,28 @@ def _recover_via_lost_and_found(
             + f", and page-level .recover salvage failed: {exc}"
         ) from exc
 
-    destination_db = SessionDB(db_path=output)
+    destination_db = SessionDB(db_path=stage.candidate)
+    _refresh_stage_children(stage, require_main=True)
     destination_db.close()
 
     lf_conn = sqlite3.connect(str(lf_path), isolation_level=None)
     destination_conn = sqlite3.connect(
-        str(output), isolation_level=None, timeout=1.0
+        str(stage.candidate), isolation_level=None, timeout=1.0
     )
     try:
+        # The store's turn-fence triggers on the canonical tables call
+        # hermes_turn_fence_generation(), a UDF that only the connection which
+        # created it knows. SessionDB.close() above tore that connection down,
+        # so this bare reopen must re-register the scalar itself or the first
+        # INSERT into a governed table raises "no such function". This is safe
+        # here (unlike minting the marker on a live production writer): the
+        # output path can never already exist (_validate_paths refuses to
+        # reuse one) and it is never swapped over a running gateway, so there
+        # is no concurrent turn-lease holder this recovery-only connection
+        # could bypass. session_turn_leases (the table that check guards) is
+        # also not part of _CANONICAL_TABLES, so no lease row ever reaches
+        # this database.
+        _require_destination_fenced(destination_conn)
         destination_conn.execute("PRAGMA foreign_keys=OFF")
         mapping = map_lost_and_found_rows(lf_conn, destination_conn)
         stubbing = stub_missing_parent_sessions(destination_conn)
@@ -1448,6 +1740,7 @@ def _recover_via_lost_and_found(
     finally:
         lf_conn.close()
         destination_conn.close()
+    _refresh_stage_children(stage, require_main=True)
 
     copy_report: dict[str, dict[str, Any]] = {
         table: {
@@ -1464,7 +1757,7 @@ def _recover_via_lost_and_found(
     }
 
     verification = _verify_recovered_database(
-        output,
+        stage.candidate,
         expected_counts={"sessions": None, "messages": None},
         copy_report=copy_report,
         allow_partial=True,
@@ -1556,6 +1849,7 @@ def recover_session_database(
     assert output is not None
     disk_space = _disk_space_preflight(source, work_root, output.parent)
 
+    stage: Optional[_DestinationStage] = None
     temp_dir, snapshot_source, inspection = _snapshot_and_inspect(source, work_root)
     try:
         if not inspection.get("recoverable") and not allow_partial:
@@ -1575,16 +1869,22 @@ def recover_session_database(
                 # SQL-level salvage is impossible without readable table
                 # schemas. Fall back to page-level lost_and_found salvage via
                 # the sqlite3 CLI's .recover (a shell-only feature).
-                return _recover_via_lost_and_found(
+                stage = _create_destination_stage(output)
+                report = _recover_via_lost_and_found(
                     source=source,
                     snapshot_source=snapshot_source,
                     snapshot_dir=Path(temp_dir.name),
+                    stage=stage,
                     output=output,
                     inspection=inspection,
                     disk_space=disk_space,
                     missing_required=missing_required,
                 )
+                _seal_staged_database(stage)
+                _publish_staged_database(stage, output)
+                return report
 
+        stage = _create_destination_stage(output)
         source_conn = sqlite3.connect(
             str(snapshot_source),
             isolation_level=None,
@@ -1598,17 +1898,19 @@ def recover_session_database(
                 inspection["tables"][table].get("available") for table in _TOPIC_TABLES
             )
 
-            destination_db = SessionDB(db_path=output)
+            destination_db = SessionDB(db_path=stage.candidate)
             if has_topic_tables:
                 destination_db.apply_telegram_topic_migration()
+            _refresh_stage_children(stage, require_main=True)
             destination_db.close()
             destination_db = None
 
             destination_conn = sqlite3.connect(
-                str(output),
+                str(stage.candidate),
                 isolation_level=None,
                 timeout=1.0,
             )
+            _require_destination_fenced(destination_conn)
             destination_conn.execute("PRAGMA foreign_keys=OFF")
 
             copy_report: dict[str, dict[str, Any]] = {}
@@ -1674,9 +1976,10 @@ def recover_session_database(
                 destination_conn.close()
             if destination_db is not None:
                 destination_db.close()
+        _refresh_stage_children(stage, require_main=True)
 
         verification = _verify_recovered_database(
-            output,
+            stage.candidate,
             expected_counts={
                 table: inspection["tables"][table].get("rows")
                 for table in _CANONICAL_TABLES
@@ -1694,7 +1997,7 @@ def recover_session_database(
             )
             verification["complete"] = False
 
-        return {
+        report = {
             "operation": "recover",
             "allow_partial": allow_partial,
             "source": str(source),
@@ -1718,7 +2021,12 @@ def recover_session_database(
             "verified": bool(verification.get("healthy") and source_unchanged),
             "installed": False,
         }
+        _seal_staged_database(stage)
+        _publish_staged_database(stage, output)
+        return report
     finally:
+        if stage is not None:
+            _cleanup_destination_stage(stage)
         temp_dir.cleanup()
 
 

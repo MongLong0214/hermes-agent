@@ -10,6 +10,7 @@ module-level constants live in hermes_state_common.
 
 import logging
 import json
+import re
 import sqlite3
 from typing import Dict, Optional
 
@@ -44,7 +45,7 @@ _READ_PROBE_STATEMENTS: Optional[tuple] = None
 
 
 def schema_read_probe_statements() -> tuple:
-    """SELECT statements that fail iff a live store is behind SCHEMA_SQL.
+    """SELECT statements that fail iff a database is behind SCHEMA_SQL.
 
     Read-only opens skip ``_reconcile_columns()`` by design (no DDL against
     another profile's live DB), so a store created before a schema addition
@@ -823,6 +824,370 @@ class SessionSchemaMixin:
         finally:
             cursor.execute("PRAGMA foreign_keys=ON")
 
+    def _session_turn_lease_epoch_rebuild_checkpoint(self, stage: str) -> None:
+        """Test seam for deterministic rollback probes of the legacy rebuild."""
+        del stage
+
+    def _heal_session_turn_leases_legacy_epoch(self, cursor: sqlite3.Cursor) -> None:
+        """Remove the legacy ``epoch`` column from ``session_turn_leases``.
+
+        Legacy ``session_turn_leases`` tables can carry ``epoch INTEGER NOT
+        NULL`` with no ``DEFAULT`` alongside nullable ``owner_pid`` and
+        ``owner_pid_start`` fields.  The acquisition ``INSERT OR IGNORE``
+        does not populate ``epoch``, so SQLite rejects the row and ``OR
+        IGNORE`` suppresses the NOT NULL violation.  No lease row is created,
+        the following owner lookup finds no row, and acquisition returns
+        False.
+
+        No version-gated migration covers this table, so a database can report
+        ``schema_version == SCHEMA_VERSION`` while retaining the legacy table
+        shape.  The heal therefore runs unconditionally on every open, like
+        :meth:`_heal_gateway_routing_pk` and
+        :meth:`_heal_session_model_usage_pk` above.
+
+        ``owner_pid`` and ``owner_pid_start`` are deliberately preserved.
+        They are nullable and do not cause the rejected insert; removing them
+        would add DDL surface without repairing the legacy failure shape.
+        """
+        try:
+            rows = cursor.execute(
+                'PRAGMA table_info("session_turn_leases")'
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return
+        if not rows:
+            # Table doesn't exist yet -- SCHEMA_SQL above just created it
+            # correctly (4 columns, no epoch).
+            return
+
+        def _col(row, idx, name):
+            return row[idx] if isinstance(row, (tuple, list)) else row[name]
+
+        live_cols = {_col(r, 1, "name") for r in rows}
+        if "epoch" not in live_cols:
+            return  # Already the shape hermes_state_common.py declares.
+
+        # DDL is authorized only for the complete legacy failure shape.  A
+        # same-named epoch column can be a later extension with a valid
+        # default, different primary key, or otherwise unknown ownership; do
+        # not destructively reinterpret it as the one historical defect.
+        proven_legacy_descriptor = (
+            ("conversation_id", "TEXT", 0, None, 1),
+            ("holder", "TEXT", 1, None, 0),
+            ("acquired_at", "REAL", 1, None, 0),
+            ("expires_at", "REAL", 1, None, 0),
+            ("epoch", "INTEGER", 1, None, 0),
+            ("owner_pid", "INTEGER", 0, None, 0),
+            ("owner_pid_start", "REAL", 0, None, 0),
+        )
+        live_descriptor = tuple(
+            (
+                _col(row, 1, "name"),
+                _col(row, 2, "type"),
+                _col(row, 3, "notnull"),
+                _col(row, 4, "dflt_value"),
+                _col(row, 5, "pk"),
+            )
+            for row in rows
+        )
+        proven_legacy_table_sql = (
+            "CREATE TABLE session_turn_leases ( "
+            "conversation_id TEXT PRIMARY KEY, holder TEXT NOT NULL, "
+            "acquired_at REAL NOT NULL, expires_at REAL NOT NULL, "
+            "epoch INTEGER NOT NULL, owner_pid INTEGER, owner_pid_start REAL )"
+        )
+        table_row = cursor.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            ("session_turn_leases",),
+        ).fetchone()
+        table_sql = _col(table_row, 0, "sql") if table_row is not None else None
+        if (
+            live_descriptor != proven_legacy_descriptor
+            or not isinstance(table_sql, str)
+            or " ".join(table_sql.split()) != proven_legacy_table_sql
+        ):
+            raise sqlite3.DatabaseError(
+                "SESSION_TURN_LEASE_EPOCH_HEAL_REFUSED: "
+                "session_turn_leases does not match the proven legacy descriptor"
+            )
+
+        logger.info(
+            "session_turn_leases has legacy NOT NULL 'epoch' column with no "
+            "DEFAULT; every acquire has been silently failing on this "
+            "store (INSERT OR IGNORE swallows the NOT NULL violation). "
+            "Dropping the column."
+        )
+
+        if sqlite3.sqlite_version_info >= (3, 35, 0):
+            # DROP COLUMN (SQLite >= 3.35, released 2021-03-12; the
+            # interpreter this repo runs under is 3.50.4) is an in-place
+            # schema edit: unlike a rename+rebuild it does not touch the
+            # table's identity, so the three turn-fence triggers already
+            # attached to session_turn_leases (it is in
+            # TURN_FENCE_GOVERNED_TABLES) are untouched -- nothing to
+            # reinstall, nothing to verify, no schema_version bookkeeping
+            # to disturb. None of those triggers' bodies reference `epoch`
+            # (turn_fence_trigger_sql() only ever calls
+            # hermes_turn_fence_generation(), see hermes_state_common.py),
+            # so SQLite's "column used by a trigger/view" restriction on
+            # DROP COLUMN does not apply here -- verified empirically
+            # (governed table with all three triggers attached, DROP
+            # COLUMN succeeds and the triggers keep firing) before this
+            # was written; see tests/state/test_session_turn_lease_epoch_heal.py.
+            def _epoch_is_still_present() -> bool:
+                return any(
+                    _col(row, 1, "name") == "epoch"
+                    for row in cursor.execute(
+                        'PRAGMA table_info("session_turn_leases")'
+                    ).fetchall()
+                )
+
+            try:
+                cursor.execute(
+                    'ALTER TABLE "session_turn_leases" DROP COLUMN "epoch"'
+                )
+            except sqlite3.OperationalError as exc:
+                # Lock/busy failures must reach the outer open-time patience
+                # loop unchanged.  A real DDL blocker is a durable unsafe
+                # state: refuse the open rather than logging and continuing.
+                if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+                    raise
+                if _epoch_is_still_present():
+                    raise sqlite3.DatabaseError(
+                        "SESSION_TURN_LEASE_EPOCH_HEAL_DROP_FAILED: "
+                        "SQLite could not remove legacy session_turn_leases.epoch"
+                    ) from exc
+                raise
+            if _epoch_is_still_present():
+                raise sqlite3.DatabaseError(
+                    "SESSION_TURN_LEASE_EPOCH_HEAL_INCOMPLETE: "
+                    "session_turn_leases.epoch remains after DROP COLUMN"
+                )
+            return
+
+        # SQLite < 3.35 lacks DROP COLUMN.  The preflight snapshot itself is
+        # destructive authority: a connection that adds an object after an
+        # unlocked census but before RENAME would have that object carried to
+        # the legacy table then deleted without replay.  Take the write lock
+        # first, then authoritatively revalidate the descriptor, table DDL,
+        # and every replayable/dependent schema object before any mutation.
+        projection = (
+            "conversation_id, holder, acquired_at, expires_at, "
+            "owner_pid, owner_pid_start"
+        )
+        cursor.execute("BEGIN IMMEDIATE")
+        try:
+            rows = cursor.execute(
+                'PRAGMA table_info("session_turn_leases")'
+            ).fetchall()
+            live_cols = {_col(r, 1, "name") for r in rows}
+            if "epoch" not in live_cols:
+                # Another writer completed the repair before this transaction
+                # acquired its lock.  We made no mutation, so commit the
+                # empty transaction and leave the converged table alone.
+                self._conn.commit()
+                return
+            live_descriptor = tuple(
+                (
+                    _col(row, 1, "name"),
+                    _col(row, 2, "type"),
+                    _col(row, 3, "notnull"),
+                    _col(row, 4, "dflt_value"),
+                    _col(row, 5, "pk"),
+                )
+                for row in rows
+            )
+            table_row = cursor.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                ("session_turn_leases",),
+            ).fetchone()
+            table_sql = _col(table_row, 0, "sql") if table_row is not None else None
+            if (
+                live_descriptor != proven_legacy_descriptor
+                or not isinstance(table_sql, str)
+                or " ".join(table_sql.split()) != proven_legacy_table_sql
+            ):
+                raise sqlite3.DatabaseError(
+                    "SESSION_TURN_LEASE_EPOCH_HEAL_REFUSED: "
+                    "session_turn_leases does not match the proven legacy descriptor"
+                )
+
+            fence_definitions = tuple(
+                (name, sql)
+                for name, sql in turn_fence_trigger_definitions()
+                if name.startswith("turn_fence_session_turn_leases_")
+            )
+            expected_fences = dict(fence_definitions)
+            object_rows = cursor.execute(
+                "SELECT type, name, sql FROM sqlite_master "
+                "WHERE tbl_name = ? AND type IN ('index', 'trigger') "
+                "AND sql IS NOT NULL ORDER BY type, name",
+                ("session_turn_leases",),
+            ).fetchall()
+            preserved_indexes = []
+            preserved_triggers = []
+            for row in object_rows:
+                object_type = _col(row, 0, "type")
+                name = _col(row, 1, "name")
+                sql = _col(row, 2, "sql")
+                if not isinstance(name, str) or not isinstance(sql, str):
+                    raise sqlite3.DatabaseError(
+                        "SESSION_TURN_LEASE_EPOCH_REBUILD_REFUSED: "
+                        "session_turn_leases has an unprovable schema object"
+                    )
+                if name in expected_fences:
+                    if object_type != "trigger" or sql != expected_fences[name]:
+                        raise sqlite3.DatabaseError(
+                            "SESSION_TURN_LEASE_EPOCH_REBUILD_REFUSED: "
+                            "turn-fence object is not the canonical declaration"
+                        )
+                    continue
+                if "epoch" in sql.lower():
+                    raise sqlite3.DatabaseError(
+                        "SESSION_TURN_LEASE_EPOCH_REBUILD_REFUSED: "
+                        "session_turn_leases schema object depends on epoch"
+                    )
+                if object_type == "index":
+                    preserved_indexes.append((name, sql))
+                elif object_type == "trigger":
+                    preserved_triggers.append((name, sql))
+                else:
+                    raise sqlite3.DatabaseError(
+                        "SESSION_TURN_LEASE_EPOCH_REBUILD_REFUSED: "
+                        "session_turn_leases has an unsupported schema object"
+                    )
+
+            mentions_lease_table = re.compile(
+                r"(?<![0-9A-Za-z_$])session_turn_leases(?![0-9A-Za-z_$])",
+                re.IGNORECASE,
+            )
+            dependent_rows = cursor.execute(
+                "SELECT type, name, sql FROM sqlite_master "
+                "WHERE type IN ('view', 'trigger') AND tbl_name != ? "
+                "ORDER BY type, name",
+                ("session_turn_leases",),
+            ).fetchall()
+            for row in dependent_rows:
+                object_type = _col(row, 0, "type")
+                name = _col(row, 1, "name")
+                sql = _col(row, 2, "sql")
+                if not isinstance(name, str) or not isinstance(sql, str):
+                    raise sqlite3.DatabaseError(
+                        "SESSION_TURN_LEASE_EPOCH_REBUILD_REFUSED: "
+                        "session_turn_leases has an unprovable dependent object"
+                    )
+                if mentions_lease_table.search(sql):
+                    raise sqlite3.DatabaseError(
+                        "SESSION_TURN_LEASE_EPOCH_REBUILD_REFUSED: "
+                        "session_turn_leases has an unprovable dependent object"
+                    )
+
+            table_names = cursor.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name != ?",
+                ("session_turn_leases",),
+            ).fetchall()
+            for table_name_row in table_names:
+                table_name = _col(table_name_row, 0, "name")
+                if not isinstance(table_name, str):
+                    raise sqlite3.DatabaseError(
+                        "SESSION_TURN_LEASE_EPOCH_REBUILD_REFUSED: "
+                        "session_turn_leases has an unprovable dependent object"
+                    )
+                escaped_table_name = table_name.replace('"', '""')
+                foreign_keys = cursor.execute(
+                    f'PRAGMA foreign_key_list("{escaped_table_name}")'
+                ).fetchall()
+                if any(
+                    isinstance(_col(foreign_key, 2, "table"), str)
+                    and _col(foreign_key, 2, "table").casefold()
+                    == "session_turn_leases"
+                    for foreign_key in foreign_keys
+                ):
+                    raise sqlite3.DatabaseError(
+                        "SESSION_TURN_LEASE_EPOCH_REBUILD_REFUSED: "
+                        "session_turn_leases has an unprovable dependent object"
+                    )
+
+            cursor.execute(
+                'ALTER TABLE "session_turn_leases" '
+                'RENAME TO "session_turn_leases_legacy_epoch"'
+            )
+            self._session_turn_lease_epoch_rebuild_checkpoint("rename")
+            cursor.execute(
+                """CREATE TABLE session_turn_leases (
+    conversation_id TEXT PRIMARY KEY,
+    holder TEXT NOT NULL,
+    acquired_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    owner_pid INTEGER,
+    owner_pid_start REAL
+)"""
+            )
+            self._session_turn_lease_epoch_rebuild_checkpoint("create")
+            source_rows = [
+                tuple(row)
+                for row in cursor.execute(
+                    f"SELECT {projection} FROM session_turn_leases_legacy_epoch "
+                    "ORDER BY rowid"
+                ).fetchall()
+            ]
+            source_count = cursor.execute(
+                "SELECT COUNT(*) FROM session_turn_leases_legacy_epoch"
+            ).fetchone()[0]
+            cursor.execute(
+                "INSERT INTO session_turn_leases "
+                f"({projection}) SELECT {projection} "
+                "FROM session_turn_leases_legacy_epoch ORDER BY rowid"
+            )
+            self._session_turn_lease_epoch_rebuild_checkpoint("copy")
+            target_rows = [
+                tuple(row)
+                for row in cursor.execute(
+                    f"SELECT {projection} FROM session_turn_leases ORDER BY rowid"
+                ).fetchall()
+            ]
+            target_count = cursor.execute(
+                "SELECT COUNT(*) FROM session_turn_leases"
+            ).fetchone()[0]
+            if (
+                source_count != target_count
+                or len(source_rows) != source_count
+                or target_rows != source_rows
+            ):
+                raise sqlite3.DatabaseError(
+                    "SESSION_TURN_LEASE_EPOCH_REBUILD_VERIFY_FAILED: "
+                    "session_turn_leases copy did not preserve every row"
+                )
+            self._session_turn_lease_epoch_rebuild_checkpoint("verify")
+            cursor.execute("DROP TABLE session_turn_leases_legacy_epoch")
+            self._session_turn_lease_epoch_rebuild_checkpoint("drop")
+            for _name, sql in preserved_indexes:
+                cursor.execute(sql)
+            self._session_turn_lease_epoch_rebuild_checkpoint("index")
+            for _name, sql in preserved_triggers:
+                cursor.execute(sql)
+            for _name, sql in fence_definitions:
+                cursor.execute(sql)
+            actual_fences = {
+                _col(row, 0, "name"): _col(row, 1, "sql")
+                for row in cursor.execute(
+                    "SELECT name, sql FROM sqlite_master "
+                    "WHERE type = 'trigger' AND name IN (?, ?, ?)",
+                    tuple(expected_fences),
+                ).fetchall()
+            }
+            if actual_fences != expected_fences:
+                raise sqlite3.DatabaseError(
+                    "SESSION_TURN_LEASE_EPOCH_REBUILD_VERIFY_FAILED: "
+                    "session_turn_leases turn-fence triggers were not restored"
+                )
+            self._session_turn_lease_epoch_rebuild_checkpoint("trigger")
+            self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
+
     def _apply_turn_fence_generation_delta(self, cursor: sqlite3.Cursor) -> None:
         """Atomically install and verify the complete v27 trigger barrier."""
         definitions = turn_fence_trigger_definitions()
@@ -889,6 +1254,11 @@ class SessionSchemaMixin:
         # landed — the version-gated rebuild is unreachable there, #73823).
         # Same PK-rebuild constraint as gateway_routing above.
         self._heal_session_model_usage_pk(cursor)
+
+        # Remove the legacy NOT NULL/no-DEFAULT `epoch` column from
+        # session_turn_leases if present. No version-gated migration covers
+        # this table, so the heal runs unconditionally like the two above.
+        self._heal_session_turn_leases_legacy_epoch(cursor)
 
         # Indexes that reference reconciler-added columns must be created
         # AFTER _reconcile_columns runs — declaring them in SCHEMA_SQL
