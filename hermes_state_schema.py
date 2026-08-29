@@ -823,6 +823,127 @@ class SessionSchemaMixin:
         finally:
             cursor.execute("PRAGMA foreign_keys=ON")
 
+    def _heal_session_turn_leases_legacy_epoch(self, cursor: sqlite3.Cursor) -> None:
+        """Drop the legacy ``epoch`` column from ``session_turn_leases``.
+
+        Installs whose ``session_turn_leases`` table predates this module
+        carry ``epoch INTEGER NOT NULL`` with no ``DEFAULT`` (plus the
+        nullable ``owner_pid`` / ``owner_pid_start``, see below).
+        ``try_acquire_session_turn_lease``'s
+        ``INSERT OR IGNORE INTO session_turn_leases (conversation_id, holder,
+        acquired_at, expires_at) ...`` never populates ``epoch``, the NOT
+        NULL constraint rejects every row, and ``OR IGNORE`` swallows that
+        constraint violation with no error anywhere: the INSERT silently
+        does nothing, the row never exists, the following ``SELECT holder``
+        returns no owner, and ``try_acquire_session_turn_lease`` returns
+        False forever. Every caller then polls the full patience window and
+        reports "Another Hermes process is using this session" while nothing
+        holds it — measured as a 10-hour total outage on a live store.
+
+        There has never been a version-gated migration for this table (grep
+        confirms), so no schema_version bump could have healed it and a
+        store can be sitting at ``schema_version == SCHEMA_VERSION`` today
+        and still be broken. This has to run unconditionally on every open,
+        same pattern as :meth:`_heal_gateway_routing_pk` and
+        :meth:`_heal_session_model_usage_pk` above.
+
+        ``owner_pid`` / ``owner_pid_start`` are deliberately left in place.
+        They are nullable, so they were never the cause of the failure; no
+        code path (grepped repo-wide) reads or writes them on this table;
+        and ``SCHEMA_SQL``'s ``CREATE TABLE IF NOT EXISTS`` never looks at
+        them again once the table exists. Dropping them would fix nothing
+        and only adds DDL surface to what is otherwise a narrowly-scoped
+        repair — left for a separate cleanup if ever wanted.
+        """
+        try:
+            rows = cursor.execute(
+                'PRAGMA table_info("session_turn_leases")'
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return
+        if not rows:
+            # Table doesn't exist yet -- SCHEMA_SQL above just created it
+            # correctly (4 columns, no epoch).
+            return
+
+        def _col(row, idx, name):
+            return row[idx] if isinstance(row, (tuple, list)) else row[name]
+
+        live_cols = {_col(r, 1, "name") for r in rows}
+        if "epoch" not in live_cols:
+            return  # Already the shape hermes_state_common.py declares.
+
+        logger.info(
+            "session_turn_leases has legacy NOT NULL 'epoch' column with no "
+            "DEFAULT; every acquire has been silently failing on this "
+            "store (INSERT OR IGNORE swallows the NOT NULL violation). "
+            "Dropping the column."
+        )
+
+        if sqlite3.sqlite_version_info >= (3, 35, 0):
+            # DROP COLUMN (SQLite >= 3.35, released 2021-03-12; the
+            # interpreter this repo runs under is 3.50.4) is an in-place
+            # schema edit: unlike a rename+rebuild it does not touch the
+            # table's identity, so the three turn-fence triggers already
+            # attached to session_turn_leases (it is in
+            # TURN_FENCE_GOVERNED_TABLES) are untouched -- nothing to
+            # reinstall, nothing to verify, no schema_version bookkeeping
+            # to disturb. None of those triggers' bodies reference `epoch`
+            # (turn_fence_trigger_sql() only ever calls
+            # hermes_turn_fence_generation(), see hermes_state_common.py),
+            # so SQLite's "column used by a trigger/view" restriction on
+            # DROP COLUMN does not apply here -- verified empirically
+            # (governed table with all three triggers attached, DROP
+            # COLUMN succeeds and the triggers keep firing) before this
+            # was written; see tests/state/test_session_turn_lease_epoch_heal.py.
+            try:
+                cursor.execute(
+                    'ALTER TABLE "session_turn_leases" DROP COLUMN "epoch"'
+                )
+            except sqlite3.OperationalError as exc:
+                logger.warning(
+                    "session_turn_leases epoch heal failed; store remains "
+                    "broken for turn-lease acquisition: %s", exc,
+                )
+            return
+
+        # SQLite < 3.35: no DROP COLUMN support, rebuild the table. Same
+        # rename/recreate/copy/drop shape as _heal_gateway_routing_pk /
+        # _heal_session_model_usage_pk above, with one addition those two
+        # don't need: session_turn_leases is TURN_FENCE_GOVERNED, and
+        # ALTER TABLE RENAME carries any trigger whose ON clause names the
+        # old table over to the *new* (renamed) name (verified empirically),
+        # so the freshly created table comes back with NO triggers. The
+        # explicit reinstall below closes that gap for this table without
+        # touching schema_version or the other seven governed tables.
+        cursor.execute(
+            'ALTER TABLE "session_turn_leases" '
+            'RENAME TO "session_turn_leases_legacy_epoch"'
+        )
+        cursor.execute(
+            """CREATE TABLE session_turn_leases (
+    conversation_id TEXT PRIMARY KEY,
+    holder TEXT NOT NULL,
+    acquired_at REAL NOT NULL,
+    expires_at REAL NOT NULL
+)"""
+        )
+        cursor.execute(
+            "INSERT OR IGNORE INTO session_turn_leases "
+            "(conversation_id, holder, acquired_at, expires_at) "
+            "SELECT conversation_id, holder, acquired_at, expires_at "
+            "FROM session_turn_leases_legacy_epoch"
+        )
+        cursor.execute("DROP TABLE session_turn_leases_legacy_epoch")
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_session_turn_leases_expires "
+            "ON session_turn_leases(expires_at)"
+        )
+        for trigger_name, trigger_sql in turn_fence_trigger_definitions():
+            if trigger_name.startswith("turn_fence_session_turn_leases_"):
+                cursor.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
+                cursor.execute(trigger_sql)
+
     def _apply_turn_fence_generation_delta(self, cursor: sqlite3.Cursor) -> None:
         """Atomically install and verify the complete v27 trigger barrier."""
         definitions = turn_fence_trigger_definitions()
@@ -889,6 +1010,13 @@ class SessionSchemaMixin:
         # landed — the version-gated rebuild is unreachable there, #73823).
         # Same PK-rebuild constraint as gateway_routing above.
         self._heal_session_model_usage_pk(cursor)
+
+        # Drop the legacy NOT NULL `epoch` column from session_turn_leases
+        # if present. There is no version-gated migration for this table,
+        # so this must run unconditionally like the two heals above (#84512:
+        # measured as a 10-hour outage — every turn-lease acquire silently
+        # failed via INSERT OR IGNORE swallowing the NOT NULL violation).
+        self._heal_session_turn_leases_legacy_epoch(cursor)
 
         # Indexes that reference reconciler-added columns must be created
         # AFTER _reconcile_columns runs — declaring them in SCHEMA_SQL
