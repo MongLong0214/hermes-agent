@@ -20,6 +20,7 @@ Covers:
 """
 
 import asyncio
+import logging
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -476,5 +477,106 @@ def test_runner_release_turn_lease_is_token_scoped_and_bare_safe():
         assert runner._release_turn_lease("key-a", 1) is False
         # Empty key guard.
         assert runner._release_turn_lease("", 1) is False
+
+    _run(scenario())
+
+
+def test_stale_release_does_not_orphan_its_own_lease_when_slot_is_overwritten():
+    """A second turn on the same routing key must not orphan the first turn's
+
+    own lease when it overwrites the shared per-key slot (#64934). Turn A
+    acquires "sess-old"; while A is still in flight, turn B acquires
+    "sess-new" on the SAME routing key and overwrites
+    state.turn.lease_token/lease_generation. A's own finally must still be
+    able to free sess-old — via the token threaded through directly, not by
+    looking the token up through the now-overwritten shared slot.
+    """
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+
+    async def scenario():
+        runner._turn_leases = SessionTurnLeaseRegistry()
+
+        # Turn A acquires sess-old on routing key K, generation 1.
+        token_a = await runner._turn_leases.acquire(
+            "sess-old", owner_key="key-k", generation=1, timeout=5
+        )
+        assert token_a is not None
+        state = runner._session_state("key-k")
+        state.turn.lease_token = token_a
+        state.turn.lease_generation = 1
+
+        # Turn B acquires sess-new on the SAME routing key K, generation 2 —
+        # this overwrites the shared slot exactly as the acquire site does.
+        token_b = await runner._turn_leases.acquire(
+            "sess-new", owner_key="key-k", generation=2, timeout=5
+        )
+        assert token_b is not None
+        state.turn.lease_token = token_b
+        state.turn.lease_generation = 2
+
+        # Turn A's own release, using its own token passed through directly,
+        # must still free sess-old even though the shared slot moved on.
+        assert (
+            runner._release_turn_lease("key-k", 1, token=token_a) is True
+        )
+        assert runner._turn_leases._leases["sess-old"].holder is None
+
+        # Turn B's slot must be untouched by A's release.
+        assert state.turn.lease_token is token_b
+        assert state.turn.lease_generation == 2
+        assert runner._turn_leases._leases["sess-new"].holder is token_b
+
+        assert (
+            runner._release_turn_lease("key-k", 2, token=token_b) is True
+        )
+
+    _run(scenario())
+
+
+def test_long_wait_logs_progress_before_the_timeout(monkeypatch, caplog):
+    """A blocked acquire emits periodic diagnostic progress warnings while it
+    waits, cancelled the instant the wait ends (#64934).
+
+    The production symptom was a completely silent 13-28 minute hang with
+    only a single contention warning logged at entry — nothing distinguishes
+    a healthy long wait from a stuck one until it either resolves or times
+    out. This must never touch the lock itself.
+    """
+    import gateway.turn_lease as turn_lease_mod
+
+    monkeypatch.setattr(turn_lease_mod, "WAIT_PROGRESS_LOG_INTERVAL", 0.05)
+
+    async def scenario():
+        registry = SessionTurnLeaseRegistry()
+        holder = await registry.acquire(
+            "sess-progress", owner_key="key-holder", generation=1, timeout=5
+        )
+
+        with caplog.at_level(logging.WARNING, logger="gateway.turn_lease"):
+            waiter_task = asyncio.create_task(
+                registry.acquire(
+                    "sess-progress", owner_key="key-waiter", generation=1, timeout=5
+                )
+            )
+            # Let several progress intervals elapse while still blocked.
+            await asyncio.sleep(0.2)
+            assert not waiter_task.done()
+            assert registry.release(holder) is True
+            waiter_token = await waiter_task
+
+        progress_records = [
+            r for r in caplog.records if "still waiting" in r.message
+        ]
+        assert progress_records, "expected at least one progress warning while blocked"
+
+        # No further progress logging once the wait has ended — the progress
+        # loop is cancelled the instant the lock is acquired.
+        caplog.clear()
+        await asyncio.sleep(0.2)
+        assert not [r for r in caplog.records if "still waiting" in r.message]
+
+        assert registry.release(waiter_token) is True
 
     _run(scenario())

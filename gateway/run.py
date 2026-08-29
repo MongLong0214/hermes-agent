@@ -2665,6 +2665,7 @@ from gateway.turn_lease import (
     DEFAULT_LEASE_WAIT,
     SessionTurnLeaseRegistry,
     TurnLeaseTimeoutError,
+    TurnLeaseToken,
 )
 from gateway.session_state import (
     SERVICE_TIER_UNSET as _SERVICE_TIER_UNSET,
@@ -18254,8 +18255,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._release_running_agent_state(_quick_key)
             # Turn lease (#64934): release THIS turn's lease token — keyed by
             # (routing key, run generation) so this unwind can only ever free
-            # the lease its own turn acquired, never a newer turn's.
-            self._release_turn_lease(_quick_key, _run_generation)
+            # the lease its own turn acquired, never a newer turn's. Pass the
+            # token straight through (stashed on the event at acquire time)
+            # instead of relying solely on the shared per-key slot, which a
+            # second concurrent turn on this same routing key may have
+            # already overwritten with its own token.
+            self._release_turn_lease(
+                _quick_key,
+                _run_generation,
+                token=getattr(event, "_gateway_turn_lease_token", None),
+            )
 
     def _restore_moa_one_shot(self, event: "MessageEvent", quick_key: str) -> None:
         """Revert a ``/moa <prompt>`` one-shot model override after its turn.
@@ -19538,6 +19547,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _lease_state = self._session_state(_quick_key).turn
                 _lease_state.lease_token = _lease_token
                 _lease_state.lease_generation = run_generation
+                # Stash this turn's OWN token on the event too. The shared
+                # slot above is a single mutable box per routing key: a
+                # second concurrent turn on the same key (e.g. a stale
+                # unwind, or a fresh turn after /new) overwrites it
+                # unconditionally, which would otherwise strand this turn's
+                # release with no way to find its token (#64934 orphan).
+                # The event is per-turn and never shared, so this survives
+                # the overwrite untouched.
+                event._gateway_turn_lease_token = _lease_token
 
         # A turn only becomes durable recovery work after it owns (or has
         # explicitly degraded past) the per-session lease.  Marking before the
@@ -26792,31 +26810,68 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._persist_active_agents()
         return True
 
-    def _release_turn_lease(self, session_key: str, run_generation: int) -> bool:
+    def _release_turn_lease(
+        self,
+        session_key: str,
+        run_generation: int,
+        *,
+        token: Optional[TurnLeaseToken] = None,
+    ) -> bool:
         """Release the turn lease acquired by (``session_key``, ``run_generation``).
 
         Companion to the acquisition in ``_handle_message_with_agent``
-        (#64934). The token map is keyed by (routing key, run generation), so
-        this can only ever free the lease its own turn acquired — a stale
-        unwind whose generation was bumped by /stop or /new pops ITS token,
-        and the registry's identity check refuses it if a newer turn already
-        holds the lease. Idempotent and safe for bare test runners built via
+        (#64934). ``state.turn.lease_token``/``lease_generation`` is a SINGLE
+        shared slot per routing key — a second concurrent turn on the same
+        key (a stale unwind, or a fresh turn after /new landing on the same
+        key before the first turn unwound) overwrites it unconditionally.
+        When that happens the first turn's own token is gone from the slot,
+        and looking it up there would either release the WRONG (newer)
+        lease or, with the old generation guard, silently orphan the first
+        turn's own lease forever (no TTL ever reclaims it).
+
+        ``token``, when given, is this call's own lease token — stashed on
+        the per-turn event at acquire time, so it is never shared and can
+        never be clobbered by another turn. It is released directly via
+        ``registry.release()``, which is itself identity-checked (only frees
+        the lease if this token is still its current holder). The shared
+        slot is cleared too, but ONLY if it still points at this same token —
+        never a newer turn's.
+
+        With no ``token``, falls back to the previous generation-checked
+        shared-slot lookup unchanged, for any caller that has no event to
+        stash a token on.
+
+        Idempotent and safe for bare test runners built via
         ``object.__new__`` (getattr defaults).
         """
         if not session_key:
             return False
         registry = getattr(self, "_turn_leases", None)
+        if registry is None:
+            return False
+        if token is not None:
+            state = self._peek_session_state(session_key)
+            if state is not None:
+                turn = state.turn
+                if turn.lease_token is token:
+                    turn.lease_token = None
+                    turn.lease_generation = None
+            try:
+                return registry.release(token)
+            except Exception:
+                logger.debug("Failed to release turn lease", exc_info=True)
+                return False
         state = self._peek_session_state(session_key)
-        if state is None or registry is None:
+        if state is None:
             return False
         turn = state.turn
         if turn.lease_token is None or turn.lease_generation != run_generation:
             return False
-        token = turn.lease_token
+        resolved_token = turn.lease_token
         turn.lease_token = None
         turn.lease_generation = None
         try:
-            return registry.release(token)
+            return registry.release(resolved_token)
         except Exception:
             logger.debug("Failed to release turn lease", exc_info=True)
             return False

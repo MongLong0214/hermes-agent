@@ -61,6 +61,15 @@ logger = logging.getLogger(__name__)
 # exceed the cap rather than break serialization.
 DEFAULT_MAX_LEASES = 512
 
+# How often (seconds) a blocked acquire logs a diagnostic "still waiting"
+# progress warning while it sits behind another turn's held lease. Purely
+# diagnostic — it never touches the lock. The production symptom this closes
+# was a completely silent 13-28 minute hang: only ONE contention warning is
+# logged today, at entry, so nothing distinguishes a healthy long wait from a
+# stuck one until it either resolves or times out. Cancelled the instant the
+# wait ends (success or timeout alike).
+WAIT_PROGRESS_LOG_INTERVAL = 60.0
+
 # Fallback wait (seconds) when the caller passes no positive timeout. The
 # gateway carries this independently through its internal
 # HERMES_TURN_LEASE_TIMEOUT bridge because lease contention is not agent
@@ -149,6 +158,39 @@ class _SessionLease:
         )
 
 
+async def _log_wait_progress(
+    session_id: str,
+    owner_key: str,
+    generation: int,
+    lease: "_SessionLease",
+) -> None:
+    """Log a "still waiting" warning every ``WAIT_PROGRESS_LOG_INTERVAL``.
+
+    Runs alongside a blocked :meth:`SessionTurnLeaseRegistry.acquire` call;
+    the caller cancels this task the instant its wait ends (success or
+    timeout), so it never outlives the acquire it is diagnosing and never
+    touches the lock itself. Purely diagnostic (#64934) — without this, a
+    healthy 20-minute wait and a permanently orphaned lease look identical
+    in the logs until one of them times out.
+    """
+    _start = time.time()
+    while True:
+        await asyncio.sleep(WAIT_PROGRESS_LOG_INTERVAL)
+        holder = lease.holder
+        logger.warning(
+            "turn lease still waiting after %.0fs on session %s (waiter: "
+            "routing key %s gen %s; holder: routing key %s gen %s) — still "
+            "blocked, not stuck: no TTL evicts a held lease short of "
+            "release or process restart (#64934)",
+            time.time() - _start,
+            session_id,
+            owner_key,
+            generation,
+            holder.owner_key if holder else "?",
+            holder.generation if holder else "?",
+        )
+
+
 class SessionTurnLeaseRegistry:
     """Asyncio lease per resolved session_id serializing transcript turns.
 
@@ -209,7 +251,8 @@ class SessionTurnLeaseRegistry:
         token = TurnLeaseToken(session_id, owner_key, int(generation))
         lease = self._get_or_create(session_id)
 
-        if lease.lock.locked():
+        _contended = lease.lock.locked()
+        if _contended:
             holder = lease.holder
             logger.warning(
                 "turn lease contention on session %s: routing key %s (gen %s) "
@@ -224,6 +267,19 @@ class SessionTurnLeaseRegistry:
                 holder.generation if holder else "?",
                 time.time() - lease.acquired_at if lease.acquired_at else -1.0,
             )
+
+        # Purely diagnostic: log progress every WAIT_PROGRESS_LOG_INTERVAL
+        # while this acquire is blocked, so a long-but-healthy wait is
+        # distinguishable from a silently stuck one before it either
+        # resolves or times out. Never touches the lock; cancelled the
+        # instant the wait below ends, one way or another.
+        _progress_task = (
+            asyncio.ensure_future(
+                _log_wait_progress(session_id, owner_key, generation, lease)
+            )
+            if _contended
+            else None
+        )
 
         # Lock.release() wakes a waiter while leaving the lock momentarily
         # unlocked. Track every in-progress acquire across that handoff so
@@ -255,6 +311,12 @@ class SessionTurnLeaseRegistry:
             ) from None
         finally:
             lease.pending_acquires -= 1
+            if _progress_task is not None:
+                _progress_task.cancel()
+                try:
+                    await _progress_task
+                except asyncio.CancelledError:
+                    pass
 
         # The lock is held and there is no await before holder publication, so
         # the lease cannot become evictable after the pending count is cleared.
