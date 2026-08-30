@@ -3644,13 +3644,14 @@ class TurnReceiptConflictError(RuntimeError):
 
 @dataclass(frozen=True)
 class TerminalTurnReceipt:
-    """The immutable outcome that must commit with one assistant message."""
+    """The immutable outcome that must commit with one explicit batch row."""
 
     session_id: str
     turn_request_id: str
     binding_digest: str
     claim_token: str
     response_digest: str
+    terminal_message_index: int
 
     def __post_init__(self) -> None:
         if not all(
@@ -3667,6 +3668,12 @@ class TerminalTurnReceipt:
                 "terminal turn receipt requires session, request, binding digest, "
                 "claim token, and response digest"
             )
+        if (
+            not isinstance(self.terminal_message_index, int)
+            or isinstance(self.terminal_message_index, bool)
+            or self.terminal_message_index < 0
+        ):
+            raise ValueError("terminal turn receipt requires a nonnegative row index")
 
 
 _OFFLINE_REBUILD_EPOCH_KEY = "_hermes_offline_rebuild_epoch_v1"
@@ -8977,6 +8984,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 binding_digest=binding_digest,
                 claim_token=claim_token,
                 response_digest=response_digest,
+                terminal_message_index=0,
             ),
         )
         receipt = self.get_turn_receipt(session_id, turn_request_id, binding_digest)
@@ -11740,12 +11748,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         it describes rather than leaving a durable, ambiguous reply.
         """
         if terminal_turn_receipt is not None:
-            if role != "assistant":
-                raise ValueError(
-                    "terminal_turn_receipt can only accompany an assistant row"
-                )
             if terminal_turn_receipt.session_id != session_id:
                 raise ValueError("terminal_turn_receipt session does not match append")
+            self._validate_terminal_turn_receipt_batch(
+                [
+                    {
+                        "role": role,
+                        "content": content,
+                        "tool_calls": tool_calls,
+                        "display_kind": display_kind,
+                    }
+                ],
+                terminal_turn_receipt,
+            )
         # Display metadata is presentation-only and never changes the model
         # context role/content replayed to providers.
         display_metadata_json = self._encode_display_metadata(display_metadata)
@@ -11854,6 +11869,30 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
         )
 
+    @staticmethod
+    def _validate_terminal_turn_receipt_batch(
+        messages: List[Dict[str, Any]], receipt: TerminalTurnReceipt
+    ) -> None:
+        """Fence a receipt to one visible, newly inserted assistant row."""
+        index = receipt.terminal_message_index
+        if index < 0 or index >= len(messages):
+            raise ValueError("terminal_turn_receipt index is outside the batch")
+        terminal_message = messages[index]
+        if not isinstance(terminal_message, dict):
+            raise ValueError("terminal_turn_receipt index does not select a message")
+        if sum(message is terminal_message for message in messages) != 1:
+            raise ValueError("terminal_turn_receipt message is not unique in the batch")
+        if (
+            terminal_message.get("role") != "assistant"
+            or terminal_message.get("display_kind") == "hidden"
+            or terminal_message.get("tool_calls")
+            or not isinstance(terminal_message.get("content"), str)
+            or terminal_message.get(_DB_PERSISTED_MARKER_KEY)
+        ):
+            raise ValueError("terminal_turn_receipt row is not a visible terminal assistant")
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", receipt.response_digest):
+            raise ValueError("terminal_turn_receipt response digest is invalid")
+
     def append_messages_batch(
         self,
         session_id: str,
@@ -11894,10 +11933,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if terminal_turn_receipt is not None:
             if terminal_turn_receipt.session_id != session_id:
                 raise ValueError("terminal_turn_receipt session does not match append")
-            if not any(message.get("role") == "assistant" for message in messages):
-                raise ValueError(
-                    "terminal_turn_receipt requires an assistant row in the batch"
-                )
+            self._validate_terminal_turn_receipt_batch(
+                messages, terminal_turn_receipt
+            )
 
         if terminal_turn_receipt is not None and chunk_rows is not None:
             raise ValueError(
@@ -11927,6 +11965,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 turn_lease_holder=turn_lease_holder,
                 turn_lease_ttl_seconds=turn_lease_ttl_seconds,
             )
+            if terminal_turn_receipt is not None:
+                existing_terminal_id = self._preflight_terminal_turn_receipt(
+                    conn, terminal_turn_receipt
+                )
+                if existing_terminal_id is not None:
+                    raise TurnReceiptConflictError(
+                        "a completed terminal receipt cannot be replayed as a batch"
+                    )
             inserted, tool_calls_total = self._insert_message_rows(
                 conn, session_id, messages
             )
@@ -11943,20 +11989,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     (inserted, session_id),
                 )
             if terminal_turn_receipt is not None:
-                existing_terminal_id = self._preflight_terminal_turn_receipt(
-                    conn, terminal_turn_receipt
-                )
-                if existing_terminal_id is not None:
-                    raise TurnReceiptConflictError(
-                        "a completed terminal receipt cannot be replayed as a batch"
+                terminal_message_id = messages[
+                    terminal_turn_receipt.terminal_message_index
+                ].get("_row_id")
+                if not isinstance(terminal_message_id, int):
+                    raise sqlite3.DatabaseError(
+                        "terminal_turn_receipt selected row was not inserted"
                     )
-                terminal_message_id = next(
-                    int(message["_row_id"])
-                    for message in reversed(messages)
-                    if message.get("role") == "assistant" and "_row_id" in message
-                )
                 self._complete_terminal_turn_receipt(
-                    conn, terminal_turn_receipt, terminal_message_id
+                    conn, terminal_turn_receipt, int(terminal_message_id)
                 )
             return inserted
 

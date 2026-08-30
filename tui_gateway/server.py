@@ -10811,6 +10811,7 @@ def _run_prompt_submit(
     display_metadata: dict | None = None,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    turn_receipt=None,
 ) -> bool:
     with session["history_lock"]:
         if session.get("_closing"):
@@ -10946,7 +10947,7 @@ def _run_prompt_submit(
             streamer = make_stream_renderer(cols)
             prompt = text
 
-            if isinstance(prompt, str) and "@" in prompt:
+            if turn_receipt is None and isinstance(prompt, str) and "@" in prompt:
                 from agent.context_references import preprocess_context_references
                 from agent.model_metadata import get_model_context_length
 
@@ -10985,7 +10986,7 @@ def _run_prompt_submit(
             #            blocking the submit path on vision calls — #83291).
             # See agent/image_routing.py for the full decision table.
             run_message: Any = prompt
-            if images:
+            if images and turn_receipt is None:
                 try:
                     from agent.image_routing import (
                         decide_image_input_mode,
@@ -11041,13 +11042,18 @@ def _run_prompt_submit(
             # begin() first — it cuts any still-speaking previous turn, and
             # that cut IS this turn's barge-in, so it must latch before we
             # consume the latch below.
-            tts_queue = _tts_stream_begin()
+            if turn_receipt is None:
+                tts_queue = _tts_stream_begin()
 
             # Full-duplex agent-turn listener: armed at utterance-submit so
             # the user can interject DURING generation, not just during
             # playback. _tts_stream_begin arms it too when a pipeline
             # starts; this covers voice mode without working TTS.
-            if _voice_mode_enabled() and _voice_cfg_dict().get("barge_in", True):
+            if (
+                turn_receipt is None
+                and _voice_mode_enabled()
+                and _voice_cfg_dict().get("barge_in", True)
+            ):
                 _arm_full_duplex_listener()
 
             # Ambient "thinking" sound (voice mode only): calm bubble blips
@@ -11057,7 +11063,7 @@ def _run_prompt_submit(
             # stopped in the finally the instant the turn ends.
             # voice.thinking_sound config-gates it; macOS TCC handled inside.
             thinking_started = False
-            if _voice_mode_enabled():
+            if turn_receipt is None and _voice_mode_enabled():
                 try:
                     from tools.voice_mode import (
                         is_audio_output_active,
@@ -11085,15 +11091,18 @@ def _run_prompt_submit(
             # ("rude!") instead of being oblivious to its own interruption.
             from tools.tts_streaming import SPEECH_INTERRUPTED_NOTE, take_speech_interrupted
 
-            if take_speech_interrupted():
-                run_message = _prepend_note(run_message, SPEECH_INTERRUPTED_NOTE)
+            if turn_receipt is None:
+                if take_speech_interrupted():
+                    run_message = _prepend_note(run_message, SPEECH_INTERRUPTED_NOTE)
 
-            # Reactions the user added since the last turn.
-            run_message = _prepend_note(run_message, _pending_reaction_notes(session))
+                # Reactions the user added since the last turn.
+                run_message = _prepend_note(
+                    run_message, _pending_reaction_notes(session)
+                )
 
-            # Which window the message was typed into. HUD mode is per-turn
-            # state, so it cannot live in the (byte-stable) system prompt.
-            run_message = _prepend_note(run_message, _hud_surface_note(session))
+                # Which window the message was typed into. HUD mode is per-turn
+                # state, so it cannot live in the (byte-stable) system prompt.
+                run_message = _prepend_note(run_message, _hud_surface_note(session))
 
             def _stream(delta):
                 with session["history_lock"]:
@@ -11125,9 +11134,13 @@ def _run_prompt_submit(
                 "conversation_history": list(history),
                 "stream_callback": _stream,
                 "persist_user_message": (
-                    _build_persist_user_message(prompt, images, run_message) if images else prompt
+                    _build_persist_user_message(prompt, images, run_message)
+                    if images and turn_receipt is None
+                    else prompt
                 ),
             }
+            if turn_receipt is not None:
+                run_kwargs["turn_receipt"] = turn_receipt
             # Type a synthesized turn at turn START so the crash persist writes
             # its row as a timeline event, instead of leaving a raw user bubble
             # until the turn ends — and forever if it never does, which is
@@ -11343,6 +11356,10 @@ def _run_prompt_submit(
                 status = "complete"
 
             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
+            if isinstance(result, dict) and isinstance(result.get("turn_receipt"), dict):
+                payload["turn_receipt"] = _public_turn_receipt_disposition(
+                    result["turn_receipt"]
+                )
             if last_reasoning:
                 payload["reasoning"] = last_reasoning
             if status_note:
