@@ -168,6 +168,24 @@ def _public_turn_receipt_disposition(receipt: dict) -> dict:
     }
 
 
+def _target_bind_request(params: dict) -> tuple[str, str, int, str]:
+    """Validate the closed target-bind request schema before touching SQLite."""
+    fields = {
+        "session_id",
+        "actor_id",
+        "binding_generation",
+        "executor_runtime_identity",
+    }
+    if set(params) != fields:
+        raise ValueError("target bind request has an invalid schema")
+    return (
+        params["session_id"],
+        params["actor_id"],
+        params["binding_generation"],
+        params["executor_runtime_identity"],
+    )
+
+
 def _derive_turn_receipt_request(
     session: dict, params: dict, text, display_kind, truncation=None
 ):
@@ -1197,6 +1215,38 @@ def _(rid, params: dict) -> dict:
     )
 
 
+@method("target.bind")
+def _(rid, params: dict) -> dict:
+    """Durably bind one authenticated caller identity to a session lineage."""
+    from hermes_state import (
+        TargetBindReceiptConflictError,
+        TargetBindReceiptFenceError,
+    )
+
+    try:
+        request = _target_bind_request(params)
+        with _profile_db() as db:
+            if db is None:
+                return _err(rid, 5071, "target bind receipt storage is unavailable")
+            receipt = db.prepare_target_bind_receipt(*request)
+    except TargetBindReceiptConflictError:
+        return _err(rid, 4091, "target_bind_receipt_conflict")
+    except (TargetBindReceiptFenceError, ValueError):
+        return _err(rid, 4004, "target_bind_receipt_invalid")
+    except Exception:
+        return _err(rid, 5071, "target bind receipt storage is unavailable")
+    return _ok(
+        rid,
+        {
+            "target_bind_receipt": {
+                "domain": receipt["domain"],
+                "version": receipt["version"],
+                "digest": receipt["digest"],
+            }
+        },
+    )
+
+
 @method("clipboard.paste")
 def _(rid, params: dict) -> dict:
     session, err = _sess_building(params, rid)
@@ -1911,6 +1961,7 @@ def register(server) -> None:
     # sites) resolve the same free names after the split.
     g = vars(server)
     for helper in (
+        _target_bind_request,
         _derive_turn_receipt_request,
         _turn_receipt_request_id,
         _sanitize_turn_receipt_text,
