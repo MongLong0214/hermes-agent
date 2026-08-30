@@ -6603,3 +6603,65 @@ def test_nested_write_transaction_refuses_replaced_offline_rebuild_owner(tmp_pat
                 )
     finally:
         db.close()
+
+
+def test_turn_receipt_persists_acp_identity_separate_from_target_bind_evidence(tmp_path):
+    """A receipt is bound to the closed ACP identity, not only caller digest bytes."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "hermes-session"
+    request_id = "acp-turn-1"
+    binding_digest = "sha256:" + "a" * 64
+    identity = {
+        "schema": "hermes.acp-terminal-receipt-identity",
+        "version": 1,
+        "turnRequestId": request_id,
+        "targetActorId": "actor-1",
+        "promptDigest": "sha256:" + "b" * 64,
+        "bindingGeneration": 7,
+        "targetBindingId": "target-binding-1",
+        "targetAttestationId": "target-attestation-1",
+        "executorSessionId": "executor-session-1",
+        "executorSessionIncarnation": "executor-incarnation-1",
+    }
+    try:
+        db.create_session(session_id, source="test")
+        target_bind_record = db.prepare_target_bind_receipt(
+            session_id,
+            "actor-1",
+            7,
+            "executor-runtime-1",
+        )
+        target_bind = {
+            key: target_bind_record[key]
+            for key in (
+                "schema",
+                "domain",
+                "version",
+                "actor_id",
+                "binding_generation",
+                "executor_runtime_identity",
+                "requested_session_id",
+                "lineage_root_digest",
+                "receipt_digest",
+            )
+        }
+
+        prepared = db.prepare_acp_turn_receipt(
+            session_id,
+            identity,
+            target_bind,
+        )
+
+        assert prepared["receiptIdentity"] == identity
+        assert prepared["receiptIdentityDigest"] != binding_digest
+        assert prepared["targetBindReceiptDigest"] == target_bind["receipt_digest"]
+        assert db.prepare_acp_turn_receipt(session_id, identity, target_bind) == prepared
+
+        conflicting = {**identity, "targetAttestationId": "target-attestation-2"}
+        with pytest.raises(hermes_state.TurnReceiptConflictError):
+            db.prepare_acp_turn_receipt(session_id, conflicting, target_bind)
+
+        assert db.get_acp_turn_receipt(session_id, identity, target_bind) == prepared
+        assert db.get_acp_turn_receipt(session_id, conflicting, target_bind) is None
+    finally:
+        db.close()
