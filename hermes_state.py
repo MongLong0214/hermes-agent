@@ -3642,6 +3642,21 @@ class TurnReceiptConflictError(RuntimeError):
     """An existing receipt conflicts with the requested immutable binding."""
 
 
+class TargetBindReceiptFenceError(RuntimeError):
+    """A target bind receipt cannot be safely resolved from durable state."""
+
+
+class TargetBindReceiptConflictError(RuntimeError):
+    """An existing target bind identity conflicts with immutable evidence."""
+
+
+_TARGET_BIND_RECEIPT_META_PREFIX = "target_bind_receipt:"
+_TARGET_BIND_RECEIPT_SCHEMA = "hermes.target-bind-receipt"
+_TARGET_BIND_RECEIPT_DOMAIN = "hermes.target-bind"
+_TARGET_BIND_RECEIPT_VERSION = 1
+_TARGET_BIND_LINEAGE_ROOT_DIGEST_DOMAIN = b"hermes.target-bind:lineage-root\0"
+
+
 @dataclass(frozen=True)
 class TerminalTurnReceipt:
     """The immutable outcome that must commit with one explicit batch row."""
@@ -8790,6 +8805,160 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ).rowcount
 
         return int(self._execute_write(_do, _count_write=False) or 0)
+
+    @staticmethod
+    def _require_target_bind_identifier(value: Any, name: str) -> str:
+        """Accept only a canonical opaque identifier for a bind receipt."""
+        if (
+            not isinstance(value, str)
+            or not value
+            or value != value.strip()
+            or len(value) > 512
+            or any(ord(char) < 32 or ord(char) == 127 for char in value)
+        ):
+            raise ValueError(f"{name} must be a non-empty opaque identifier")
+        return value
+
+    @staticmethod
+    def _target_bind_receipt_root(conn, session_id: str) -> str:
+        """Resolve one exact durable lineage root or fence malformed ancestry."""
+        current = session_id
+        seen = set()
+        for _ in range(100):
+            if current in seen:
+                raise TargetBindReceiptFenceError("target bind lineage is cyclic")
+            seen.add(current)
+            row = conn.execute(
+                "SELECT id, parent_session_id FROM sessions WHERE id = ?", (current,)
+            ).fetchone()
+            if row is None:
+                raise TargetBindReceiptFenceError("target bind session is unavailable")
+            parent_id = row["parent_session_id"]
+            if parent_id is None:
+                return str(row["id"])
+            if not isinstance(parent_id, str) or not parent_id:
+                raise TargetBindReceiptFenceError("target bind lineage is invalid")
+            current = parent_id
+        raise TargetBindReceiptFenceError("target bind lineage is ambiguous")
+
+    @staticmethod
+    def _target_bind_canonical_digest(payload: Dict[str, Any]) -> str:
+        """Return the canonical SHA-256 commitment for a public receipt payload."""
+        payload_bytes = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return "sha256:" + hashlib.sha256(payload_bytes).hexdigest()
+
+    @staticmethod
+    def _target_bind_lineage_root_digest(lineage_root_id: str) -> str:
+        """Commit to resolved root bytes without disclosing the private root."""
+        root_bytes = lineage_root_id.encode("utf-8")
+        return "sha256:" + hashlib.sha256(
+            _TARGET_BIND_LINEAGE_ROOT_DIGEST_DOMAIN + root_bytes
+        ).hexdigest()
+
+    @staticmethod
+    def _target_bind_receipt_record(
+        *,
+        session_id: str,
+        lineage_root_id: str,
+        actor_id: str,
+        binding_generation: int,
+        executor_runtime_identity: str,
+    ) -> tuple[str, Dict[str, Any]]:
+        """Build the stable identity key and immutable receipt evidence."""
+        binding_identity = {
+            "domain": _TARGET_BIND_RECEIPT_DOMAIN,
+            "version": _TARGET_BIND_RECEIPT_VERSION,
+            "actor_id": actor_id,
+            "binding_generation": binding_generation,
+            "executor_runtime_identity": executor_runtime_identity,
+        }
+        identity_bytes = json.dumps(
+            binding_identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        identity_digest = "sha256:" + hashlib.sha256(identity_bytes).hexdigest()
+        public_receipt = {
+            "domain": _TARGET_BIND_RECEIPT_DOMAIN,
+            "version": _TARGET_BIND_RECEIPT_VERSION,
+            "actor_id": actor_id,
+            "binding_generation": binding_generation,
+            "executor_runtime_identity": executor_runtime_identity,
+            "requested_session_id": session_id,
+            "lineage_root_digest": SessionDB._target_bind_lineage_root_digest(
+                lineage_root_id
+            ),
+        }
+        record = {
+            "schema": _TARGET_BIND_RECEIPT_SCHEMA,
+            **public_receipt,
+            "lineage_root_id": lineage_root_id,
+            "binding_identity": identity_digest,
+        }
+        record["receipt_digest"] = SessionDB._target_bind_canonical_digest(public_receipt)
+        return _TARGET_BIND_RECEIPT_META_PREFIX + identity_digest.removeprefix("sha256:"), record
+
+    def prepare_target_bind_receipt(
+        self,
+        session_id: str,
+        actor_id: str,
+        binding_generation: int,
+        executor_runtime_identity: str,
+    ) -> Dict[str, Any]:
+        """Persist or replay one immutable target-authenticated bind receipt."""
+        session_id = self._require_target_bind_identifier(session_id, "session_id")
+        actor_id = self._require_target_bind_identifier(actor_id, "actor_id")
+        executor_runtime_identity = self._require_target_bind_identifier(
+            executor_runtime_identity, "executor_runtime_identity"
+        )
+        if (
+            not isinstance(binding_generation, int)
+            or isinstance(binding_generation, bool)
+            or binding_generation < 0
+        ):
+            raise ValueError("binding_generation must be a nonnegative integer")
+
+        def _do(conn):
+            lineage_root_id = self._target_bind_receipt_root(conn, session_id)
+            key, expected = self._target_bind_receipt_record(
+                session_id=session_id,
+                lineage_root_id=lineage_root_id,
+                actor_id=actor_id,
+                binding_generation=binding_generation,
+                executor_runtime_identity=executor_runtime_identity,
+            )
+            row = conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?", (key,)
+            ).fetchone()
+            if row is not None:
+                try:
+                    stored = json.loads(row["value"])
+                except (TypeError, json.JSONDecodeError) as exc:
+                    raise TargetBindReceiptFenceError(
+                        "target bind receipt is malformed"
+                    ) from exc
+                if not isinstance(stored, dict):
+                    raise TargetBindReceiptFenceError("target bind receipt is malformed")
+                if stored != expected:
+                    raise TargetBindReceiptConflictError(
+                        "target bind identity is already bound to different evidence"
+                    )
+                return stored
+            conn.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, ?)",
+                (
+                    key,
+                    json.dumps(
+                        expected,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                ),
+            )
+            return expected
+
+        return self._execute_write(_do)
 
     @staticmethod
     def _require_turn_receipt_binding_digest(binding_digest: str) -> None:
