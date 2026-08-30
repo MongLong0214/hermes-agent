@@ -14108,7 +14108,11 @@ def main():
         # and raises OSError on failure (which propagates as a traceback).
         sys.exit(1)
 
-    _processed_argv = _coalesce_session_name_args(sys.argv[1:])
+    _processed_argv = (
+        sys.argv[1:]
+        if _TARGET_BIND_STARTUP
+        else _coalesce_session_name_args(sys.argv[1:])
+    )
 
     # ── Defensive subparser routing (bpo-9338 workaround) ───────────
     # On some Python versions (notably <3.11), argparse fails to route

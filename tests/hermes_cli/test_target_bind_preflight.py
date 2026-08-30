@@ -211,6 +211,10 @@ def test_target_bind_preflight_rejects_malformed_or_trailing_json(tmp_path, payl
         ("--safe-mode",),
         ("--reasoning", "high"),
         ("--safe-mode", "--reasoning", "high"),
+        ("--resume", "sentinel-session"),
+        ("-r", "sentinel-session"),
+        ("-c", "sentinel-session"),
+        ("--continue", "sentinel-session"),
     ],
 )
 @pytest.mark.parametrize("valid_request", [True, False])
