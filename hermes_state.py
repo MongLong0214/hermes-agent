@@ -33,6 +33,7 @@ import time
 import weakref
 from collections import deque
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 from agent.memory_manager import sanitize_context
@@ -357,6 +358,7 @@ def _delete_delegate_children(conn, parent_ids: List[str]) -> List[str]:
     ids = _collect_delegate_child_ids(conn, parent_ids)
     if ids:
         ph = ",".join("?" * len(ids))
+        _retire_terminal_turn_receipts(conn, ids)
         conn.execute(f"DELETE FROM messages WHERE session_id IN ({ph})", ids)
         # FK safety: orphan any untagged stragglers pointing at a doomed row.
         conn.execute(
@@ -366,6 +368,29 @@ def _delete_delegate_children(conn, parent_ids: List[str]) -> List[str]:
         )
         conn.execute(f"DELETE FROM sessions WHERE id IN ({ph})", ids)
     return ids
+
+
+def _retire_terminal_turn_receipts(
+    conn, session_ids: List[str], *, active_only: bool = False
+) -> None:
+    """Retire receipts whose terminal rows are about to be deleted.
+
+    Older state databases retain the original ``RESTRICT`` terminal-message
+    foreign key, so this explicit lifecycle step is needed alongside the
+    current-schema cascade.  The caller already owns the transcript write
+    transaction, making receipt retirement and message deletion atomic.
+    """
+    ids = [session_id for session_id in session_ids if session_id]
+    if not ids:
+        return
+    placeholders = ",".join("?" * len(ids))
+    active_clause = " AND active = 1" if active_only else ""
+    conn.execute(
+        "DELETE FROM turn_receipts WHERE terminal_message_id IN ("
+        f"SELECT id FROM messages WHERE session_id IN ({placeholders})"
+        f"{active_clause})",
+        ids,
+    )
 
 T = TypeVar("T")
 
@@ -3607,6 +3632,38 @@ class SessionTurnLeaseLostError(RuntimeError):
     the lease row is gone. A later writer may already be persisting a
     newer turn; landing this write would interleave a stale reply.
     """
+
+
+class TurnReceiptFenceError(RuntimeError):
+    """A terminal receipt cannot be completed by the presented claim token."""
+
+
+class TurnReceiptConflictError(RuntimeError):
+    """An existing completed receipt conflicts with the requested binding."""
+
+
+@dataclass(frozen=True)
+class TerminalTurnReceipt:
+    """The immutable outcome that must commit with one assistant message."""
+
+    session_id: str
+    turn_request_id: str
+    claim_token: str
+    response_digest: str
+
+    def __post_init__(self) -> None:
+        if not all(
+            isinstance(value, str) and value
+            for value in (
+                self.session_id,
+                self.turn_request_id,
+                self.claim_token,
+                self.response_digest,
+            )
+        ):
+            raise ValueError(
+                "terminal turn receipt requires session, request, claim token, and digest"
+            )
 
 
 _OFFLINE_REBUILD_EPOCH_KEY = "_hermes_offline_rebuild_epoch_v1"
@@ -8661,6 +8718,221 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         self._execute_write(_do)
 
+    # ------------------------------------------------------------------
+    # Dormant terminal turn receipts
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _turn_receipt_public(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
+        """Project a receipt into its stable adapter-facing representation."""
+        if row is None:
+            return None
+        return {
+            "turnRequestId": str(row["turn_request_id"]),
+            "sessionId": str(row["session_id"]),
+            "status": str(row["status"]),
+            "terminalMessageId": row["terminal_message_id"],
+            "responseDigest": row["response_digest"],
+            "createdAt": float(row["created_at"]),
+            "claimedAt": (
+                float(row["claimed_at"])
+                if row["claimed_at"] is not None
+                else None
+            ),
+            "completedAt": (
+                float(row["completed_at"])
+                if row["completed_at"] is not None
+                else None
+            ),
+        }
+
+    def migrate_turn_receipts(self) -> int:
+        """Normalize the receipt rows an existing state DB gained at startup.
+
+        ``SCHEMA_SQL`` creates the table for databases that predate this
+        dormant feature.  This small, idempotent normalizer is intentionally
+        retained behind the adapter's ``migration`` surface for such opens;
+        it neither imports an external store nor owns a transaction.
+        """
+
+        def _do(conn):
+            return conn.execute(
+                "UPDATE turn_receipts SET status = 'PREPARED' "
+                "WHERE status IS NULL OR TRIM(status) = ''"
+            ).rowcount
+
+        return int(self._execute_write(_do) or 0)
+
+    def prepare_turn_receipt(
+        self, session_id: str, turn_request_id: str
+    ) -> Dict[str, Any]:
+        """Create or return the durable PREPARED receipt for one request."""
+        if not session_id or not turn_request_id:
+            raise ValueError("session_id and turn_request_id are required")
+        now = time.time()
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT * FROM turn_receipts WHERE turn_request_id = ?",
+                (turn_request_id,),
+            ).fetchone()
+            if row is not None:
+                if row["session_id"] != session_id:
+                    raise TurnReceiptConflictError(
+                        "turn request id is already bound to another session"
+                    )
+                return self._turn_receipt_public(row)
+            conn.execute(
+                "INSERT INTO turn_receipts "
+                "(turn_request_id, session_id, status, created_at) "
+                "VALUES (?, ?, 'PREPARED', ?)",
+                (turn_request_id, session_id, now),
+            )
+            row = conn.execute(
+                "SELECT * FROM turn_receipts WHERE turn_request_id = ?",
+                (turn_request_id,),
+            ).fetchone()
+            return self._turn_receipt_public(row)
+
+        result = self._execute_write(_do)
+        if result is None:  # pragma: no cover - table primary key guarantees a row
+            raise sqlite3.DatabaseError("TURN_RECEIPT_PREPARE_MISSING")
+        return result
+
+    def get_turn_receipt(
+        self, session_id: str, turn_request_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return a receipt only when it belongs to the requested session."""
+        if not session_id or not turn_request_id:
+            return None
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT * FROM turn_receipts "
+                "WHERE session_id = ? AND turn_request_id = ?",
+                (session_id, turn_request_id),
+            ).fetchone()
+        return self._turn_receipt_public(row)
+
+    def claim_turn_receipt(
+        self, session_id: str, turn_request_id: str, claim_token: str
+    ) -> bool:
+        """Claim PREPARED once, or idempotently retry its stored token."""
+        if not session_id or not turn_request_id or not claim_token:
+            return False
+        claimed_at = time.time()
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT status, claim_token FROM turn_receipts "
+                "WHERE session_id = ? AND turn_request_id = ?",
+                (session_id, turn_request_id),
+            ).fetchone()
+            if row is None:
+                return False
+            if row["status"] == "CLAIMED":
+                return row["claim_token"] == claim_token
+            if row["status"] != "PREPARED":
+                return False
+            changed = conn.execute(
+                "UPDATE turn_receipts SET status = 'CLAIMED', claim_token = ?, "
+                "claimed_at = ? WHERE session_id = ? AND turn_request_id = ? "
+                "AND status = 'PREPARED'",
+                (claim_token, claimed_at, session_id, turn_request_id),
+            ).rowcount
+            return changed == 1
+
+        return bool(self._execute_write(_do))
+
+    @staticmethod
+    def _preflight_terminal_turn_receipt(
+        conn, receipt: TerminalTurnReceipt
+    ) -> Optional[int]:
+        """Refuse a stale completion before its assistant row is inserted."""
+        row = conn.execute(
+            "SELECT status, claim_token, terminal_message_id, response_digest "
+            "FROM turn_receipts WHERE session_id = ? AND turn_request_id = ?",
+            (receipt.session_id, receipt.turn_request_id),
+        ).fetchone()
+        if row is None:
+            raise TurnReceiptFenceError("terminal receipt was not prepared")
+        if row["status"] == "COMPLETED":
+            if row["claim_token"] != receipt.claim_token:
+                raise TurnReceiptFenceError("terminal receipt claim token was refused")
+            if (
+                row["terminal_message_id"] is not None
+                and row["response_digest"] == receipt.response_digest
+            ):
+                return int(row["terminal_message_id"])
+            raise TurnReceiptConflictError(
+                "completed turn receipt has a different terminal binding"
+            )
+        if row["status"] != "CLAIMED" or row["claim_token"] != receipt.claim_token:
+            raise TurnReceiptFenceError("terminal receipt claim token was refused")
+        return None
+
+    @staticmethod
+    def _complete_terminal_turn_receipt(
+        conn, receipt: TerminalTurnReceipt, terminal_message_id: int
+    ) -> None:
+        """Complete one claimed receipt on the existing transcript transaction."""
+        completed_at = time.time()
+        changed = conn.execute(
+            "UPDATE turn_receipts SET status = 'COMPLETED', "
+            "terminal_message_id = ?, response_digest = ?, completed_at = ? "
+            "WHERE session_id = ? AND turn_request_id = ? AND status = 'CLAIMED' "
+            "AND claim_token = ?",
+            (
+                terminal_message_id,
+                receipt.response_digest,
+                completed_at,
+                receipt.session_id,
+                receipt.turn_request_id,
+                receipt.claim_token,
+            ),
+        ).rowcount
+        if changed != 1:
+            raise TurnReceiptFenceError("terminal receipt completion was refused")
+
+    def finish_turn_receipt(
+        self,
+        session_id: str,
+        turn_request_id: str,
+        claim_token: str,
+        *,
+        assistant_content: str,
+        response_digest: str,
+    ) -> Dict[str, Any]:
+        """Append an assistant terminal row and complete its receipt together."""
+        self.append_message(
+            session_id,
+            "assistant",
+            content=assistant_content,
+            terminal_turn_receipt=TerminalTurnReceipt(
+                session_id=session_id,
+                turn_request_id=turn_request_id,
+                claim_token=claim_token,
+                response_digest=response_digest,
+            ),
+        )
+        receipt = self.get_turn_receipt(session_id, turn_request_id)
+        if receipt is None:  # pragma: no cover - guarded by the same transaction
+            raise sqlite3.DatabaseError("TURN_RECEIPT_FINISH_MISSING")
+        return receipt
+
+    def prune_turn_receipts(self, session_id: str, completed_before: float) -> int:
+        """Prune only old COMPLETED receipts; pending evidence is retained."""
+        if not session_id:
+            return 0
+
+        def _do(conn):
+            return conn.execute(
+                "DELETE FROM turn_receipts WHERE session_id = ? "
+                "AND status = 'COMPLETED' AND completed_at < ?",
+                (session_id, float(completed_before)),
+            ).rowcount
+
+        return int(self._execute_write(_do) or 0)
+
     def get_compression_lock_holder(self, session_id: str) -> Optional[str]:
         """Return the current (non-expired) holder for ``session_id``, or None.
 
@@ -11376,6 +11648,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         compression_lock_holder: Optional[str] = None,
         turn_lease_holder: Optional[str] = None,
         turn_lease_ttl_seconds: float = 300.0,
+        terminal_turn_receipt: Optional[TerminalTurnReceipt] = None,
     ) -> int:
         """
         Append a message to a session. Returns the message row ID.
@@ -11396,7 +11669,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         (which sqlite3 cannot bind and which the conversation loop scrubs
         from every outgoing payload anyway, so the scrubbed form IS the
         wire bytes).
+
+        ``terminal_turn_receipt`` is completed in this very transaction.  A
+        fenced or failed receipt update therefore rolls back the assistant row
+        it describes rather than leaving a durable, ambiguous reply.
         """
+        if terminal_turn_receipt is not None:
+            if role != "assistant":
+                raise ValueError(
+                    "terminal_turn_receipt can only accompany an assistant row"
+                )
+            if terminal_turn_receipt.session_id != session_id:
+                raise ValueError("terminal_turn_receipt session does not match append")
         # Display metadata is presentation-only and never changes the model
         # context role/content replayed to providers.
         display_metadata_json = self._encode_display_metadata(display_metadata)
@@ -11440,6 +11724,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 turn_lease_holder=turn_lease_holder,
                 turn_lease_ttl_seconds=turn_lease_ttl_seconds,
             )
+            if terminal_turn_receipt is not None:
+                existing_terminal_id = self._preflight_terminal_turn_receipt(
+                    conn, terminal_turn_receipt
+                )
+                if existing_terminal_id is not None:
+                    return existing_terminal_id
             cursor = conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
@@ -11484,6 +11774,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?",
                     (session_id,),
                 )
+            if terminal_turn_receipt is not None:
+                self._complete_terminal_turn_receipt(
+                    conn, terminal_turn_receipt, int(msg_id)
+                )
             return msg_id
 
         # Transcript append is THE critical write: its failure aborts the
@@ -11503,6 +11797,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         turn_lease_holder: Optional[str] = None,
         chunk_rows: Optional[int] = None,
         turn_lease_ttl_seconds: float = 300.0,
+        terminal_turn_receipt: Optional[TerminalTurnReceipt] = None,
     ) -> int:
         """Append multiple messages atomically in ONE write transaction.
 
@@ -11531,6 +11826,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         leaves a partial seed), just with bounded lock holds. A turn flush
         never needs it. Returns the inserted row count.
         """
+        if terminal_turn_receipt is not None:
+            if terminal_turn_receipt.session_id != session_id:
+                raise ValueError("terminal_turn_receipt session does not match append")
+            if not any(message.get("role") == "assistant" for message in messages):
+                raise ValueError(
+                    "terminal_turn_receipt requires an assistant row in the batch"
+                )
+
+        if terminal_turn_receipt is not None and chunk_rows is not None:
+            raise ValueError(
+                "terminal_turn_receipt cannot be combined with chunk_rows"
+            )
+
         if not messages:
             return 0
 
@@ -11568,6 +11876,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 conn.execute(
                     "UPDATE sessions SET message_count = message_count + ? WHERE id = ?",
                     (inserted, session_id),
+                )
+            if terminal_turn_receipt is not None:
+                existing_terminal_id = self._preflight_terminal_turn_receipt(
+                    conn, terminal_turn_receipt
+                )
+                if existing_terminal_id is not None:
+                    raise TurnReceiptConflictError(
+                        "a completed terminal receipt cannot be replayed as a batch"
+                    )
+                terminal_message_id = next(
+                    int(message["_row_id"])
+                    for message in reversed(messages)
+                    if message.get("role") == "assistant" and "_row_id" in message
+                )
+                self._complete_terminal_turn_receipt(
+                    conn, terminal_turn_receipt, terminal_message_id
                 )
             return inserted
 
@@ -11978,6 +12302,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     (session_id,),
                 )
             else:
+                _retire_terminal_turn_receipts(
+                    conn, [session_id], active_only=active_only
+                )
                 conn.execute(
                     f"DELETE FROM messages WHERE session_id = ?{active_clause}",
                     (session_id,),
@@ -13432,6 +13759,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     def clear_messages(self, session_id: str) -> None:
         """Delete all messages for a session and reset its counters."""
         def _do(conn):
+            _retire_terminal_turn_receipts(conn, [session_id])
             conn.execute(
                 "DELETE FROM messages WHERE session_id = ?", (session_id,)
             )
@@ -13532,6 +13860,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "WHERE parent_session_id = ?",
                 (session_id,),
             )
+            _retire_terminal_turn_receipts(conn, [session_id])
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
             self._delete_unreferenced_system_prompts(conn)

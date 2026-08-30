@@ -551,6 +551,22 @@ CREATE TABLE IF NOT EXISTS session_turn_leases (
     expires_at REAL NOT NULL
 );
 
+-- A dormant terminal-outcome record.  The terminal assistant row and its
+-- COMPLETED receipt are written through SessionDB's one canonical transcript
+-- transaction; this table intentionally has no prompt/model ingress of its
+-- own.
+CREATE TABLE IF NOT EXISTS turn_receipts (
+    turn_request_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    status TEXT NOT NULL,
+    claim_token TEXT,
+    terminal_message_id INTEGER REFERENCES messages(id) ON DELETE CASCADE,
+    response_digest TEXT,
+    created_at REAL NOT NULL,
+    claimed_at REAL,
+    completed_at REAL
+);
+
 CREATE TABLE IF NOT EXISTS async_delegations (
     delegation_id TEXT PRIMARY KEY,
     origin_session TEXT NOT NULL,
@@ -612,6 +628,10 @@ CREATE INDEX IF NOT EXISTS idx_sessions_handoff_state
     ON sessions(handoff_state, started_at);
 CREATE INDEX IF NOT EXISTS idx_sessions_system_prompt_hash
     ON sessions(system_prompt_hash);
+CREATE INDEX IF NOT EXISTS idx_turn_receipts_session_status
+    ON turn_receipts(session_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_turn_receipts_completed_prune
+    ON turn_receipts(status, completed_at);
 """
 
 
