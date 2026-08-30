@@ -485,6 +485,114 @@ def test_receipt_handlers_reject_non_string_or_blank_request_ids(
 
 @pytest.mark.parametrize("handler", ["prompt.submit", "turn.prepare", "turn.status"])
 @pytest.mark.parametrize(
+    "multipart",
+    [
+        [{"type": "text", "text": "first multipart input"}],
+        [{"type": "text", "text": "second multipart input"}],
+        {"type": "text", "text": "object input"},
+        None,
+        7,
+        True,
+        1.5,
+        object(),
+    ],
+)
+def test_receipt_handlers_reject_non_string_text_before_session_or_binding_mutation(
+    receipt_gateway, handler, multipart, monkeypatch
+):
+    """Receipt admission is text-only before any handler can touch a session."""
+    server, db, _session_id, session_key, session, _image, events, effects = receipt_gateway
+    monkeypatch.setattr(
+        server,
+        "_sess_nowait",
+        lambda *_args: pytest.fail("receipt text validation opened a session"),
+    )
+
+    result = server._methods[handler](
+        "rid", {**_params(), "text": multipart}
+    )
+
+    assert result["error"] == {
+        "code": 4004,
+        "message": "turn_receipt_text must be a string",
+    }
+    assert effects == {key: 0 for key in effects}
+    assert events == []
+    assert db.get_messages(session_key) == []
+    assert db._conn.execute("SELECT COUNT(*) FROM turn_receipts").fetchone()[0] == 0
+    assert session["history"] == [{"role": "user", "content": "old", "_row_id": 71}]
+
+
+def test_distinct_receipt_multipart_inputs_cannot_create_share_or_replay_a_binding(
+    receipt_gateway,
+):
+    """Two different multimodal bodies never become the same receipt binding."""
+    server, db, _session_id, session_key, _session, _image, _events, _effects = receipt_gateway
+    request_id = "multipart-never-bound"
+    multipart_inputs = [
+        [{"type": "text", "text": "first"}],
+        [{"type": "text", "text": "second"}],
+    ]
+
+    results = [
+        server._methods["prompt.submit"](
+            "rid",
+            {
+                "session_id": "live-session",
+                "text": multipart,
+                "turn_request_id": request_id,
+            },
+        )
+        for multipart in multipart_inputs
+    ]
+
+    assert [result["error"] for result in results] == [
+        {"code": 4004, "message": "turn_receipt_text must be a string"},
+        {"code": 4004, "message": "turn_receipt_text must be a string"},
+    ]
+    assert db._conn.execute("SELECT COUNT(*) FROM turn_receipts").fetchone()[0] == 0
+    assert TurnReceiptAdapter(db).completed_replay(
+        request_binding(
+            session_id=session_key,
+            turn_request_id=request_id,
+            text="ordinary text cannot replay multipart",
+            display_kind=None,
+            attachments=[],
+            truncation=None,
+        )
+    ) is None
+
+
+def test_non_receipt_multimodal_prompt_keeps_the_ordinary_path(
+    receipt_gateway, monkeypatch
+):
+    """The receipt-only text admission rule does not narrow normal multimodal input."""
+    server, _db, _session_id, _session_key, session, _image, _events, _effects = receipt_gateway
+    multipart = [{"type": "text", "text": "ordinary multipart"}]
+    seen: dict[str, object] = {}
+    session["running"] = False
+    monkeypatch.setattr(server, "_voice_mode_enabled", lambda: False)
+    monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *_args: None)
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *_args: False)
+    monkeypatch.setattr(server, "_start_agent_build", lambda *_args: None)
+    monkeypatch.setattr(server, "_wait_agent_for_prompt", lambda *_args: None)
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *_args, **kwargs: seen.update(text=_args[3], **kwargs),
+    )
+    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
+
+    result = server._methods["prompt.submit"](
+        "rid", {"session_id": "live-session", "text": multipart}
+    )
+
+    assert result["result"]["status"] == "streaming"
+    assert seen["text"] is multipart
+
+
+@pytest.mark.parametrize("handler", ["prompt.submit", "turn.prepare", "turn.status"])
+@pytest.mark.parametrize(
     ("param", "value"),
     [
         ("truncate_before_row_id", True),

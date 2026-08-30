@@ -1805,7 +1805,8 @@ def run_conversation(
     Returns:
         Dict: Complete conversation result with final response and message history
     """
-    if moa_config is None:
+    receipt_raw_text_only = turn_receipt is not None
+    if moa_config is None and not receipt_raw_text_only:
         try:
             from hermes_cli.moa_config import decode_moa_turn
 
@@ -1862,6 +1863,7 @@ def run_conversation(
         # MoA turns append per-call aggregated context to the API copy of the
         # user message, so no byte-stable api_content sidecar can be stamped.
         moa_active=bool(moa_config),
+        receipt_raw_text_only=receipt_raw_text_only,
     )
     user_message = _ctx.user_message
     original_user_message = _ctx.original_user_message
@@ -2223,7 +2225,14 @@ def run_conversation(
             # never mutated beyond the api_content stamp, so nothing leaks
             # into the clean transcript content.
             if idx == current_turn_user_idx and msg.get("role") == "user":
-                if isinstance(_api_content, str) and _api_content:
+                if receipt_raw_text_only:
+                    # Receipt admission already applied the complete text safety
+                    # sanitization; keep this live/persisted row and every wire
+                    # projection bound to those exact admitted bytes.
+                    msg["content"] = user_message
+                    msg.pop("api_content", None)
+                    api_msg["content"] = user_message
+                elif isinstance(_api_content, str) and _api_content:
                     # Stamped by the prologue from the same composition —
                     # reuse it so the persisted sidecar and the wire cannot
                     # drift, and so every pass this turn sends identical
@@ -2392,18 +2401,19 @@ def run_conversation(
         # should_compress(). Request-only: persisted history is untouched, so
         # caching/sanitization below operate on whatever the engine selected.
         # Fail-open (see _apply_context_engine_selection).
-        _sel_incoming = (
-            messages[current_turn_user_idx]
-            if 0 <= current_turn_user_idx < len(messages)
-            else None
-        )
-        api_messages = _apply_context_engine_selection(
-            agent,
-            api_messages,
-            messages,
-            _sel_incoming,
-            logger=request_logger,
-        )
+        if not receipt_raw_text_only:
+            _sel_incoming = (
+                messages[current_turn_user_idx]
+                if 0 <= current_turn_user_idx < len(messages)
+                else None
+            )
+            api_messages = _apply_context_engine_selection(
+                agent,
+                api_messages,
+                messages,
+                _sel_incoming,
+                logger=request_logger,
+            )
 
         # Safety net: strip orphaned tool results / add stubs for missing
         # results before sending to the API.  Runs unconditionally — not
@@ -2432,7 +2442,12 @@ def run_conversation(
         # the original conversation history in `messages` is untouched.
         for am in api_messages:
             if isinstance(am.get("content"), str):
-                am["content"] = am["content"].strip()
+                if not (
+                    receipt_raw_text_only
+                    and am.get("role") == "user"
+                    and am.get("content") == user_message
+                ):
+                    am["content"] = am["content"].strip()
         _canonicalize_api_tool_calls(api_messages)
 
         # Proactively strip any surrogate characters before the API call.
@@ -2925,94 +2940,99 @@ def run_conversation(
                     _xh["x-initiator"] = "user"
                     api_kwargs["extra_headers"] = _xh
                     agent._is_user_initiated_turn = False
-                try:
-                    from hermes_cli.middleware import apply_llm_request_middleware
-
-                    _llm_request_mw = apply_llm_request_middleware(
-                        api_kwargs,
-                        task_id=effective_task_id,
-                        turn_id=turn_id,
-                        api_request_id=api_request_id,
-                        session_id=agent.session_id or "",
-                        platform=agent.platform or "",
-                        model=agent.model,
-                        provider=agent.provider,
-                        base_url=agent.base_url,
-                        api_mode=agent.api_mode,
-                        api_call_count=api_call_count,
-                    )
-                    api_kwargs = _llm_request_mw.payload
-                    _original_api_kwargs = _llm_request_mw.original_payload
-                    _llm_middleware_trace = _llm_request_mw.trace
-                except Exception:
+                if receipt_raw_text_only:
                     _original_api_kwargs = dict(api_kwargs)
                     _llm_middleware_trace = []
+                else:
+                    try:
+                        from hermes_cli.middleware import apply_llm_request_middleware
 
-                try:
-                    from hermes_cli.lifecycle import (
-                        has_hook,
-                        invoke_hook as _invoke_hook,
-                    )
-                    if has_hook("pre_api_request"):
-                        request_messages = api_kwargs.get("messages")
-                        if not isinstance(request_messages, list):
-                            request_messages = api_kwargs.get("input")
-                        if not isinstance(request_messages, list):
-                            request_messages = api_messages
-                        # Shallow-copy the outer list so plugins that retain the
-                        # reference for async snapshotting don't observe later
-                        # mutations of api_messages.  The inner dicts are not
-                        # mutated by the agent loop, so a shallow copy is
-                        # sufficient; a deepcopy would walk every tool result
-                        # and base64 image on every API call.
-                        #
-                        # The ``request_messages`` and ``conversation_history``
-                        # kwargs below are pre-existing raw passthroughs
-                        # consumed by the bundled langfuse plugin
-                        # (``plugins/observability/langfuse/__init__.py:_coerce_request_messages``).
-                        # They predate ``request`` and are intentionally NOT
-                        # sanitised — secrets are not expected here because
-                        # ``api_kwargs`` is the same object passed to the
-                        # provider client.  New consumers should read the
-                        # sanitised view from ``request["body"]["messages"]``.
-                        _request_payload = agent._api_request_payload_for_hook(api_kwargs)
-                        # Anthropic (``system``) and Responses/Codex
-                        # (``instructions``) move the system prompt out of
-                        # messages; pass it explicitly for observability
-                        # plugins (Langfuse).
-                        system_prompt_for_hooks = _system_prompt_for_hooks(
-                            api_kwargs, request_messages
-                        )
-                        _invoke_hook(
-                            "pre_api_request",
+                        _llm_request_mw = apply_llm_request_middleware(
+                            api_kwargs,
                             task_id=effective_task_id,
                             turn_id=turn_id,
                             api_request_id=api_request_id,
                             session_id=agent.session_id or "",
-                            user_message=original_user_message,
-                            conversation_history=list(messages),
                             platform=agent.platform or "",
                             model=agent.model,
                             provider=agent.provider,
                             base_url=agent.base_url,
                             api_mode=agent.api_mode,
                             api_call_count=api_call_count,
-                            retry_count=retry_count,
-                            request_messages=list(request_messages)
-                            if isinstance(request_messages, list)
-                            else [],
-                            system_prompt=system_prompt_for_hooks,
-                            message_count=len(api_messages),
-                            tool_count=len(agent.tools or []),
-                            approx_input_tokens=approx_tokens,
-                            request_char_count=total_chars,
-                            max_tokens=agent.max_tokens,
-                            started_at=api_start_time,
-                            middleware_trace=list(_llm_middleware_trace),
-                            request=_request_payload,
                         )
-                except Exception:
-                    pass
+                        api_kwargs = _llm_request_mw.payload
+                        _original_api_kwargs = _llm_request_mw.original_payload
+                        _llm_middleware_trace = _llm_request_mw.trace
+                    except Exception:
+                        _original_api_kwargs = dict(api_kwargs)
+                        _llm_middleware_trace = []
+
+                if not receipt_raw_text_only:
+                    try:
+                        from hermes_cli.lifecycle import (
+                            has_hook,
+                            invoke_hook as _invoke_hook,
+                        )
+                        if has_hook("pre_api_request"):
+                            request_messages = api_kwargs.get("messages")
+                            if not isinstance(request_messages, list):
+                                request_messages = api_kwargs.get("input")
+                            if not isinstance(request_messages, list):
+                                request_messages = api_messages
+                            # Shallow-copy the outer list so plugins that retain the
+                            # reference for async snapshotting don't observe later
+                            # mutations of api_messages.  The inner dicts are not
+                            # mutated by the agent loop, so a shallow copy is
+                            # sufficient; a deepcopy would walk every tool result
+                            # and base64 image on every API call.
+                            #
+                            # The ``request_messages`` and ``conversation_history``
+                            # kwargs below are pre-existing raw passthroughs
+                            # consumed by the bundled langfuse plugin
+                            # (``plugins/observability/langfuse/__init__.py:_coerce_request_messages``).
+                            # They predate ``request`` and are intentionally NOT
+                            # sanitised — secrets are not expected here because
+                            # ``api_kwargs`` is the same object passed to the
+                            # provider client.  New consumers should read the
+                            # sanitised view from ``request["body"]["messages"]``.
+                            _request_payload = agent._api_request_payload_for_hook(api_kwargs)
+                            # Anthropic (``system``) and Responses/Codex
+                            # (``instructions``) move the system prompt out of
+                            # messages; pass it explicitly for observability
+                            # plugins (Langfuse).
+                            system_prompt_for_hooks = _system_prompt_for_hooks(
+                                api_kwargs, request_messages
+                            )
+                            _invoke_hook(
+                                "pre_api_request",
+                                task_id=effective_task_id,
+                                turn_id=turn_id,
+                                api_request_id=api_request_id,
+                                session_id=agent.session_id or "",
+                                user_message=original_user_message,
+                                conversation_history=list(messages),
+                                platform=agent.platform or "",
+                                model=agent.model,
+                                provider=agent.provider,
+                                base_url=agent.base_url,
+                                api_mode=agent.api_mode,
+                                api_call_count=api_call_count,
+                                retry_count=retry_count,
+                                request_messages=list(request_messages)
+                                if isinstance(request_messages, list)
+                                else [],
+                                system_prompt=system_prompt_for_hooks,
+                                message_count=len(api_messages),
+                                tool_count=len(agent.tools or []),
+                                approx_input_tokens=approx_tokens,
+                                request_char_count=total_chars,
+                                max_tokens=agent.max_tokens,
+                                started_at=api_start_time,
+                                middleware_trace=list(_llm_middleware_trace),
+                                request=_request_payload,
+                            )
+                    except Exception:
+                        pass
 
                 if env_var_enabled("HERMES_DUMP_REQUESTS"):
                     agent._dump_api_request_debug(api_kwargs, reason="preflight")
@@ -3129,8 +3149,6 @@ def run_conversation(
                         defer_logical_completion=True,
                     )
 
-                from hermes_cli.middleware import run_llm_execution_middleware
-
                 _model_request_active = getattr(agent, "_model_request_active", None)
                 _redirect_lock = getattr(agent, "_pending_redirect_lock", None)
                 if _redirect_lock is not None:
@@ -3141,22 +3159,27 @@ def run_conversation(
                     _model_request_active.set()
                 _redirect_crossed_response = False
                 try:
-                    response = run_llm_execution_middleware(
-                        api_kwargs,
-                        _perform_api_call,
-                        original_request=_original_api_kwargs,
-                        task_id=effective_task_id,
-                        turn_id=turn_id,
-                        api_request_id=api_request_id,
-                        session_id=agent.session_id or "",
-                        platform=agent.platform or "",
-                        model=agent.model,
-                        provider=agent.provider,
-                        base_url=agent.base_url,
-                        api_mode=agent.api_mode,
-                        api_call_count=api_call_count,
-                        middleware_trace=list(_llm_middleware_trace),
-                    )
+                    if receipt_raw_text_only:
+                        response = _perform_api_call(api_kwargs)
+                    else:
+                        from hermes_cli.middleware import run_llm_execution_middleware
+
+                        response = run_llm_execution_middleware(
+                            api_kwargs,
+                            _perform_api_call,
+                            original_request=_original_api_kwargs,
+                            task_id=effective_task_id,
+                            turn_id=turn_id,
+                            api_request_id=api_request_id,
+                            session_id=agent.session_id or "",
+                            platform=agent.platform or "",
+                            model=agent.model,
+                            provider=agent.provider,
+                            base_url=agent.base_url,
+                            api_mode=agent.api_mode,
+                            api_call_count=api_call_count,
+                            middleware_trace=list(_llm_middleware_trace),
+                        )
                 finally:
                     if _redirect_lock is not None:
                         with _redirect_lock:

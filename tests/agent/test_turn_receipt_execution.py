@@ -68,6 +68,183 @@ def _request(session_id, request_id="request-1"):
     )
 
 
+def _provider_user_content(agent):
+    """Return the current user bytes passed to the mock provider."""
+    provider_kwargs = agent.client.chat.completions.create.call_args.kwargs
+    return next(
+        message["content"]
+        for message in provider_kwargs["messages"]
+        if message.get("role") == "user"
+    )
+
+
+def _install_mutable_request_seams(monkeypatch, calls):
+    """Install seams that would visibly rewrite provider input if invoked."""
+    import hermes_cli.lifecycle as lifecycle
+    import hermes_cli.middleware as middleware
+
+    def invoke_hook(name, *_args, **_kwargs):
+        calls["hooks"].append(name)
+        return [{"context": "PLUGIN_CONTEXT"}] if name == "pre_llm_call" else []
+
+    def replace_request(request, **_kwargs):
+        calls["request_middleware"] += 1
+        replacement = dict(request)
+        replacement["messages"] = [{"role": "user", "content": "REQUEST_REWRITE"}]
+        return middleware.RequestMiddlewareResult(
+            payload=replacement,
+            original_payload=request,
+            changed=True,
+            trace=[{"source": "test"}],
+        )
+
+    def replace_execution(request, next_call, **_kwargs):
+        calls["execution_middleware"] += 1
+        replacement = dict(request)
+        replacement["messages"] = [{"role": "user", "content": "EXECUTION_REWRITE"}]
+        return next_call(replacement)
+
+    monkeypatch.setattr(lifecycle, "has_hook", lambda name: name == "pre_api_request")
+    monkeypatch.setattr(lifecycle, "invoke_hook", invoke_hook)
+    monkeypatch.setattr(middleware, "apply_llm_request_middleware", replace_request)
+    monkeypatch.setattr(middleware, "run_llm_execution_middleware", replace_execution)
+
+
+def test_receipt_execution_binds_the_provider_to_raw_admitted_text(
+    receipt_agent, monkeypatch
+):
+    """Receipt turns bypass every mutable enrichment and request seam."""
+    from tests.run_agent.test_run_agent import _mock_response
+
+    agent, db, session_id = receipt_agent
+    admitted_text = "  admitted raw text  "
+    request = request_binding(
+        session_id=session_id,
+        turn_request_id="raw-text-only-execution",
+        text=admitted_text,
+        display_kind=None,
+        attachments=[],
+        truncation=None,
+    )
+    TurnReceiptAdapter(db).prepare_or_replay(request)
+    calls = {"hooks": [], "request_middleware": 0, "execution_middleware": 0, "memory": []}
+    _install_mutable_request_seams(monkeypatch, calls)
+
+    class Memory:
+        def on_turn_start(self, *args):
+            calls["memory"].append(("start", args))
+
+        def prefetch_all(self, *args):
+            calls["memory"].append(("prefetch", args))
+            return "MEMORY_CONTEXT"
+
+    agent._memory_manager = Memory()
+    agent._gateway_turn_context_notes = "GATEWAY_CONTEXT"
+    agent.client.chat.completions.create.return_value = _mock_response("done")
+
+    result = agent.run_conversation(admitted_text, turn_receipt=request)
+
+    assert result["completed"] is True
+    assert agent.client.chat.completions.create.call_count == 1
+    assert _provider_user_content(agent) == admitted_text
+    persisted_user = next(
+        message for message in result["messages"] if message["role"] == "user"
+    )
+    assert persisted_user["content"] == admitted_text
+    assert "api_content" not in persisted_user
+    assert db.get_messages(session_id)[0]["content"] == admitted_text
+    assert "pre_llm_call" not in calls["hooks"]
+    assert "pre_api_request" not in calls["hooks"]
+    assert calls["request_middleware"] == 0
+    assert calls["execution_middleware"] == 0
+    assert calls["memory"] == []
+    assert agent._gateway_turn_context_notes == "GATEWAY_CONTEXT"
+
+
+def test_ordinary_execution_still_runs_mutable_request_seams(
+    receipt_agent, monkeypatch
+):
+    """The receipt fence does not suppress normal turn enrichment or middleware."""
+    from tests.run_agent.test_run_agent import _mock_response
+
+    agent, _db, _session_id = receipt_agent
+    calls = {"hooks": [], "request_middleware": 0, "execution_middleware": 0, "memory": []}
+    _install_mutable_request_seams(monkeypatch, calls)
+
+    class Memory:
+        def on_turn_start(self, *args):
+            calls["memory"].append(("start", args))
+
+        def prefetch_all(self, *args):
+            calls["memory"].append(("prefetch", args))
+            return "MEMORY_CONTEXT"
+
+    agent._memory_manager = Memory()
+    agent._gateway_turn_context_notes = "GATEWAY_CONTEXT"
+    agent.client.chat.completions.create.return_value = _mock_response("done")
+
+    result = agent.run_conversation("ordinary execution")
+
+    assert result["completed"] is True
+    assert agent.client.chat.completions.create.call_count == 1
+    assert _provider_user_content(agent) == "EXECUTION_REWRITE"
+    assert "pre_llm_call" in calls["hooks"]
+    assert "pre_api_request" in calls["hooks"]
+    assert calls["request_middleware"] == 1
+    assert calls["execution_middleware"] == 1
+    assert [entry[0] for entry in calls["memory"]] == ["start", "prefetch"]
+    assert agent._gateway_turn_context_notes == ""
+
+
+def test_receipt_rebinds_raw_text_on_every_tool_loop_provider_pass(
+    receipt_agent, monkeypatch
+):
+    """A tool continuation cannot replace the receipt turn's user bytes."""
+    from tests.run_agent.test_run_agent import _mock_response, _mock_tool_call
+
+    agent, db, session_id = receipt_agent
+    admitted_text = "  receipt bytes survive every pass  "
+    request = request_binding(
+        session_id=session_id,
+        turn_request_id="raw-text-every-provider-pass",
+        text=admitted_text,
+        display_kind=None,
+        attachments=[],
+        truncation=None,
+    )
+    TurnReceiptAdapter(db).prepare_or_replay(request)
+    tool_call = _mock_tool_call("receipt_test_tool", call_id="receipt-loop-tool")
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response("", finish_reason="tool_calls", tool_calls=[tool_call]),
+        _mock_response("done"),
+    ]
+    monkeypatch.setattr(
+        agent,
+        "_execute_tool_calls",
+        lambda _assistant, messages, *_args: messages.append(
+            {
+                "role": "tool",
+                "name": "receipt_test_tool",
+                "tool_call_id": "receipt-loop-tool",
+                "content": "tool result",
+            }
+        ),
+    )
+
+    result = agent.run_conversation(admitted_text, turn_receipt=request)
+
+    assert result["completed"] is True
+    assert agent.client.chat.completions.create.call_count == 2
+    assert [
+        next(
+            message["content"]
+            for message in call.kwargs["messages"]
+            if message.get("role") == "user"
+        )
+        for call in agent.client.chat.completions.create.call_args_list
+    ] == [admitted_text, admitted_text]
+
+
 @pytest.mark.parametrize("state", ["COMPLETED", "CLAIMED"])
 def test_aiagent_claims_after_durable_lease_and_races_return_before_execution(
     receipt_agent, monkeypatch, state

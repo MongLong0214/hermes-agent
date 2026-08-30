@@ -135,6 +135,16 @@ def _turn_receipt_request_id(params: dict) -> str | None:
     return request_id.strip()
 
 
+def _sanitize_turn_receipt_text(raw_text) -> str:
+    """Admit only the exact text shape receipt v1 can bind and execute."""
+    if not isinstance(raw_text, str):
+        raise ValueError("turn_receipt_text must be a string")
+    from agent.message_sanitization import _sanitize_surrogates
+    from hermes_cli.input_sanitize import sanitize_user_prompt_text
+
+    return _sanitize_surrogates(sanitize_user_prompt_text(raw_text))
+
+
 def _validate_turn_receipt_truncation_identifiers(params: dict) -> None:
     """Reject non-canonical receipt truncation identifiers before admission."""
     for key in ("truncate_before_row_id", "truncate_before_user_ordinal"):
@@ -435,7 +445,7 @@ def _(rid, params: dict) -> dict:
 
     sid = params.get("session_id", "")
     raw_text = params.get("text", "")
-    text = sanitize_user_prompt_text(raw_text) if isinstance(raw_text, str) else raw_text
+    text = raw_text
     has_truncation = (
         params.get("truncate_before_user_ordinal") is not None
         or params.get("truncate_before_row_id") is not None
@@ -455,6 +465,7 @@ def _(rid, params: dict) -> dict:
         request_id = _turn_receipt_request_id(params)
         if request_id is not None:
             _validate_turn_receipt_truncation_identifiers(params)
+            text = _sanitize_turn_receipt_text(raw_text)
     except ValueError as exc:
         return _err(rid, 4004, str(exc))
     if request_id is not None:
@@ -538,6 +549,12 @@ def _(rid, params: dict) -> dict:
                 4009,
                 "turn receipts are unavailable with compute-host isolation",
             )
+    else:
+        text = (
+            sanitize_user_prompt_text(raw_text)
+            if isinstance(raw_text, str)
+            else raw_text
+        )
     # Typed bare stop phrase while backend voice mode is active ends the
     # voice chat instead of sending "stop" to the agent — the typed twin of
     # the spoken stop phrase (PR #73106), applied at the ONE server-side
@@ -1100,13 +1117,13 @@ def _(rid, params: dict) -> dict:
 @method("turn.prepare")
 def _(rid, params: dict) -> dict:
     """Explicit opt-in admission without submitting a turn."""
-    from hermes_cli.input_sanitize import sanitize_user_prompt_text
     from tui_gateway.turn_receipts import TurnReceiptAdapter
 
     try:
         request_id = _turn_receipt_request_id(params)
         if request_id is not None:
             _validate_turn_receipt_truncation_identifiers(params)
+            text = _sanitize_turn_receipt_text(params.get("text", ""))
     except ValueError as exc:
         return _err(rid, 4004, str(exc))
     if request_id is None:
@@ -1116,8 +1133,6 @@ def _(rid, params: dict) -> dict:
         return err
     if session.get("attached_images"):
         return _err(rid, 4004, "turn_receipt_attachments_unsupported")
-    text = params.get("text", "")
-    text = sanitize_user_prompt_text(text) if isinstance(text, str) else text
     text, truncation = _effective_turn_receipt_input(session, params, text)
     request = _derive_turn_receipt_request(
         session, params, text,
@@ -1145,13 +1160,13 @@ def _(rid, params: dict) -> dict:
 def _(rid, params: dict) -> dict:
     # Status deliberately derives the same binding server-side; a client
     # digest is not a capability to inspect or replay another request.
-    from hermes_cli.input_sanitize import sanitize_user_prompt_text
     from tui_gateway.turn_receipts import TurnReceiptAdapter
 
     try:
         request_id = _turn_receipt_request_id(params)
         if request_id is not None:
             _validate_turn_receipt_truncation_identifiers(params)
+            text = _sanitize_turn_receipt_text(params.get("text", ""))
     except ValueError as exc:
         return _err(rid, 4004, str(exc))
     if request_id is None:
@@ -1159,8 +1174,6 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
-    text = params.get("text", "")
-    text = sanitize_user_prompt_text(text) if isinstance(text, str) else text
     text, truncation = _effective_turn_receipt_input(session, params, text)
     request = _derive_turn_receipt_request(
         session, params, text,
@@ -1900,6 +1913,7 @@ def register(server) -> None:
     for helper in (
         _derive_turn_receipt_request,
         _turn_receipt_request_id,
+        _sanitize_turn_receipt_text,
         _validate_turn_receipt_truncation_identifiers,
         _public_turn_receipt_disposition,
         _effective_turn_receipt_input,
