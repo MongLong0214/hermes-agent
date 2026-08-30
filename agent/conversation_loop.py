@@ -1924,6 +1924,10 @@ def run_conversation(
     # reused as the final response — not merely because any interim was
     # streamed. (#65919 review: response-loss blocker)
     _pending_verification_response_previewed = False
+    # A successful receipt claim belongs only to this invocation.  The
+    # finalizer must see it even when the loop exits before creating the
+    # genuine terminal-response hold.
+    terminal_receipt_hold = None
     # If pre-API compression fires after MoA advisors have produced guidance,
     # retain that ephemeral output and rebase it onto the compacted transcript
     # on the next loop iteration. This prevents a second advisor fan-out.
@@ -8283,7 +8287,6 @@ def run_conversation(
                 # Unlike the tool-call exit, failure must NOT abort the turn:
                 # no side effect follows and _persist_session retries the write.
                 # Full incident narrative: tests/run_agent/test_81641_*.py.
-                terminal_receipt_hold = None
                 if turn_receipt is None:
                     try:
                         agent._flush_messages_to_session_db(messages, conversation_history)
@@ -8421,7 +8424,8 @@ def run_conversation(
         _turn_exit_reason=_turn_exit_reason,
         _pending_verification_response=_pending_verification_response,
         _pending_verification_response_previewed=_pending_verification_response_previewed,
-        terminal_receipt_hold=locals().get("terminal_receipt_hold"),
+        terminal_receipt_hold=terminal_receipt_hold,
+        claimed_receipt=turn_receipt,
     )
 
 

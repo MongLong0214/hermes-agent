@@ -271,3 +271,61 @@ def test_final_response_fill_invalidates_flush_scan_cursor():
     )
 
     assert agent._db_flush_scan_prefix is None
+
+
+def test_ordinary_turn_hooks_keep_parent_pre_surrogate_order_and_payload(
+    monkeypatch,
+):
+    """Receipt settlement must not reorder non-receipted finalization hooks."""
+    import agent.conversation_loop as conversation_loop
+    import hermes_cli.lifecycle as lifecycle
+    import agent.turn_finalizer as turn_finalizer
+
+    agent = FakeAgent()
+    raw_response = "\ud800ordinary response"
+    messages = [
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": raw_response},
+    ]
+    events: list[tuple[str, str | None]] = []
+
+    def invoke_hook(name, *_args, **kwargs):
+        if name == "post_llm_call":
+            events.append(("post_llm_call", kwargs["assistant_response"]))
+        return []
+
+    def notify(*_args, **_kwargs):
+        events.append(("context_complete", None))
+
+    def sanitize(value):
+        events.append(("sanitize", value))
+        return value.replace("\ud800", "\ufffd")
+
+    monkeypatch.setattr(lifecycle, "invoke_hook", invoke_hook)
+    monkeypatch.setattr(
+        conversation_loop, "_notify_context_engine_turn_complete", notify
+    )
+    monkeypatch.setattr(turn_finalizer, "_sanitize_surrogates", sanitize)
+
+    result = finalize_turn(
+        agent,
+        final_response=raw_response,
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="q",
+        original_user_message="q",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    assert events == [
+        ("post_llm_call", raw_response),
+        ("context_complete", None),
+        ("sanitize", raw_response),
+    ]
+    assert result["final_response"] == "\ufffdordinary response"

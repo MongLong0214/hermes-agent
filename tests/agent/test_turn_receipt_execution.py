@@ -225,6 +225,61 @@ def test_genuine_terminal_response_is_sanitized_and_atomically_completes(
     assert "post_llm_call" in hooks
 
 
+def test_claimed_receipt_interrupted_before_terminal_fails_closed(
+    receipt_agent, monkeypatch
+):
+    """The real loop must carry a claim to finalization even without a hold."""
+    import agent.conversation_loop as conversation_loop
+    import hermes_cli.lifecycle as lifecycle
+
+    agent, db, session_id = receipt_agent
+    request = _request(session_id, request_id="interrupted-before-terminal")
+    receipts = TurnReceiptAdapter(db)
+    receipts.prepare_or_replay(request)
+    real_claim = TurnReceiptAdapter.claim_after_lease
+
+    def claim_then_interrupt(adapter, request_arg):
+        claimed = real_claim(adapter, request_arg)
+        agent._interrupt_requested = True
+        return claimed
+
+    monkeypatch.setattr(
+        TurnReceiptAdapter, "claim_after_lease", claim_then_interrupt
+    )
+    hooks: list[str] = []
+    monkeypatch.setattr(
+        lifecycle,
+        "invoke_hook",
+        lambda name, *_args, **_kwargs: hooks.append(name) or [],
+    )
+    calls = {"memory": 0, "background": 0, "context": 0}
+    monkeypatch.setattr(
+        agent,
+        "_sync_external_memory_for_turn",
+        lambda **_kwargs: calls.__setitem__("memory", calls["memory"] + 1),
+    )
+    monkeypatch.setattr(
+        agent,
+        "_spawn_background_review",
+        lambda **_kwargs: calls.__setitem__("background", calls["background"] + 1),
+    )
+    monkeypatch.setattr(
+        conversation_loop,
+        "_notify_context_engine_turn_complete",
+        lambda *_args, **_kwargs: calls.__setitem__("context", calls["context"] + 1),
+    )
+
+    result = agent.run_conversation("question", turn_receipt=request)
+
+    assert result["turn_exit_reason"] == "session_persistence_failed"
+    assert result["failed"] is True
+    assert TurnReceiptAdapter(db).status_for(request)["status"] == "CLAIMED"
+    assert all(row.get("role") != "assistant" for row in db.get_messages(session_id))
+    assert calls == {"memory": 0, "background": 0, "context": 0}
+    assert "post_llm_call" not in hooks
+    assert "on_session_end" not in hooks
+
+
 def test_receipt_flush_binds_the_held_batch_row_not_a_later_assistant(
     receipt_agent,
 ):
@@ -365,7 +420,9 @@ def test_compression_retry_preserves_receipt_context_and_never_generic_persists(
     assert receipts.status_for(request)["status"] == "CLAIMED"
 
 
-@pytest.mark.parametrize("failure", ["flush_false", "replaced", "marked"])
+@pytest.mark.parametrize(
+    "failure", ["missing_hold", "flush_false", "flush_error", "replaced", "marked"]
+)
 def test_failed_terminal_settlement_never_completes_or_runs_post_success_work(
     receipt_agent, monkeypatch, failure
 ):
@@ -388,6 +445,14 @@ def test_failed_terminal_settlement_never_completes_or_runs_post_success_work(
         terminal["_db_persisted"] = True
     elif failure == "flush_false":
         monkeypatch.setattr(agent, "_persist_session", lambda *_a, **_kw: False)
+    elif failure == "flush_error":
+        def raise_flush(*_args, **_kwargs):
+            raise RuntimeError("flush exploded")
+
+        monkeypatch.setattr(agent, "_persist_session", raise_flush)
+    elif failure == "missing_hold":
+        messages = [{"role": "user", "content": "question"}]
+        hold = None
 
     hooks: list[str] = []
     monkeypatch.setattr(
@@ -422,6 +487,7 @@ def test_failed_terminal_settlement_never_completes_or_runs_post_success_work(
         _should_review_memory=True,
         _turn_exit_reason="text_response(finish_reason=stop)",
         terminal_receipt_hold=hold,
+        claimed_receipt=claimed,
     )
 
     assert result["turn_exit_reason"] == "session_persistence_failed"

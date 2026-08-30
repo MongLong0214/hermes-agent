@@ -137,6 +137,7 @@ def finalize_turn(
     _pending_verification_response=None,
     _pending_verification_response_previewed=False,
     terminal_receipt_hold=None,
+    claimed_receipt=None,
 ):
     """Run the post-loop finalization and return the turn ``result`` dict.
 
@@ -144,6 +145,12 @@ def finalize_turn(
     loop). See module docstring.
     """
     from agent.conversation_loop import logger
+
+    # Receipt state is invocation-local.  A claim without the terminal hold
+    # created only by the genuine text-response exit has no atomic settlement
+    # path, so it must not fall through to ordinary final persistence.
+    receipt_turn = claimed_receipt is not None
+    receipt_settlement_failed = receipt_turn and terminal_receipt_hold is None
 
     budget_exhausted = (
         api_call_count >= agent.max_iterations
@@ -153,6 +160,7 @@ def finalize_turn(
         budget_exhausted
         and not interrupted
         and not failed
+        and not receipt_settlement_failed
         and str(_turn_exit_reason) in {"unknown", "budget_exhausted"}
     )
     continuation_budget_exhausted = (
@@ -279,6 +287,25 @@ def finalize_turn(
     # killing the turn.
     _cleanup_errors = []
 
+    def _fail_receipted_turn(receipt_error) -> None:
+        nonlocal completed, failed, final_response, receipt_settlement_failed
+        nonlocal _turn_exit_reason
+        failed = True
+        completed = False
+        receipt_settlement_failed = True
+        _turn_exit_reason = "session_persistence_failed"
+        final_response = (
+            "session storage could not be written — check the state database "
+            "health, then send your message again"
+        )
+        _cleanup_errors.append(f"terminal_receipt: {receipt_error}")
+        logger.error("terminal receipt settlement failed", exc_info=True)
+
+    if receipt_settlement_failed:
+        _fail_receipted_turn(
+            RuntimeError("claimed turn receipt has no genuine terminal response")
+        )
+
     # Save trajectory if enabled.  ``user_message`` may be a multimodal
     # list of parts; the trajectory format wants a plain string.
     try:
@@ -308,24 +335,32 @@ def finalize_turn(
         # state.db. (#65919 §7)
         _drop_verification_continuation_scaffolding(messages)
 
-        if terminal_receipt_hold is not None:
+        if receipt_turn:
             # Removing synthetic verification nudges can shift the terminal
             # row. The held object identity remains the sole authority: do
             # not select a replacement by position, role, or content.
-            held = terminal_receipt_hold.terminal_message
-            matching_indices = [
-                index for index, message in enumerate(messages) if message is held
-            ]
-            if len(matching_indices) != 1:
+            if (
+                terminal_receipt_hold is None
+                or terminal_receipt_hold.claimed is not claimed_receipt
+            ):
                 receipt_hold_rebase_error = RuntimeError(
                     "terminal turn receipt hold was replaced"
                 )
             else:
-                object.__setattr__(
-                    terminal_receipt_hold,
-                    "terminal_message_index",
-                    matching_indices[0],
-                )
+                held = terminal_receipt_hold.terminal_message
+                matching_indices = [
+                    index for index, message in enumerate(messages) if message is held
+                ]
+                if len(matching_indices) != 1:
+                    receipt_hold_rebase_error = RuntimeError(
+                        "terminal turn receipt hold was replaced"
+                    )
+                else:
+                    object.__setattr__(
+                        terminal_receipt_hold,
+                        "terminal_message_index",
+                        matching_indices[0],
+                    )
 
         # When the turn was interrupted and the last message is a tool
         # result, append a synthetic assistant message to close the
@@ -341,7 +376,7 @@ def finalize_turn(
         # here instead. On an interrupt ``final_response`` is typically
         # empty, so fall back to an explicit placeholder rather than
         # persisting an empty-content assistant turn.
-        if interrupted:
+        if interrupted and not receipt_turn:
             from agent.message_sanitization import close_interrupted_tool_sequence
             close_interrupted_tool_sequence(messages, final_response)
 
@@ -360,7 +395,7 @@ def finalize_turn(
         # Compare content (not just role) so a verification candidate that
         # matches the final response is not duplicated at budget
         # exhaustion. (#65919 §7)
-        if final_response and not interrupted:
+        if final_response and not interrupted and not receipt_turn:
             try:
                 _tail = messages[-1] if messages else None
             except Exception:
@@ -423,7 +458,7 @@ def finalize_turn(
         # persisted, run micro-compaction to absorb the oldest uncompacted
         # exchange into the rolling summary.  This amortizes compression
         # across turns rather than batching it into one big pause.
-        if terminal_receipt_hold is None and not interrupted and not failed:
+        if not receipt_turn and not interrupted and not failed:
             try:
                 _compressor = getattr(agent, "context_compressor", None)
                 # Strict `is True` + isinstance gates: plugin context engines
@@ -469,11 +504,15 @@ def finalize_turn(
             except Exception as _mc_err:
                 logger.info("Micro-compaction failed: %s", _mc_err)
 
-        if terminal_receipt_hold is None:
+        if not receipt_turn:
             agent._persist_session(messages, conversation_history)
     except Exception as _persist_err:
-        _cleanup_errors.append(f"persist_session: {_persist_err}")
-        logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
+        if receipt_turn:
+            if not receipt_settlement_failed:
+                _fail_receipted_turn(_persist_err)
+        else:
+            _cleanup_errors.append(f"persist_session: {_persist_err}")
+            logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
 
     # The gateway owns a separate in-memory history snapshot. Keep it current
     # even when finalization reports a cleanup error: a later prompt must not be
@@ -617,7 +656,12 @@ def finalize_turn(
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can transform the LLM's output text before it's returned.
     # First hook to return a string wins; None/empty return leaves text unchanged.
-    if final_response and not interrupted and receipt_hold_rebase_error is None:
+    if (
+        final_response
+        and not interrupted
+        and not receipt_settlement_failed
+        and receipt_hold_rebase_error is None
+    ):
         try:
             from hermes_cli.lifecycle import invoke_hook as _invoke_hook
             _transform_results = _invoke_hook(
@@ -635,6 +679,58 @@ def finalize_turn(
                     break  # First non-empty string wins
         except Exception as exc:
             logger.warning("transform_llm_output hook failed: %s", exc)
+
+    # Non-receipted turns retain the pre-surrogate hook position and payload
+    # from the parent finalizer. Receipt turns wait until atomic completion.
+    if not receipt_turn:
+        # Plugin hook: post_llm_call
+        # Fired once per turn after the tool-calling loop completes.
+        # Plugins can use this to persist conversation data (e.g. sync
+        # to an external memory system).
+        if final_response and not interrupted:
+            try:
+                from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+                _invoke_hook(
+                    "post_llm_call",
+                    session_id=agent.session_id,
+                    task_id=effective_task_id,
+                    turn_id=turn_id,
+                    user_message=original_user_message,
+                    assistant_response=final_response,
+                    conversation_history=list(messages),
+                    model=agent.model,
+                    platform=getattr(agent, "platform", None) or "",
+                )
+            except Exception as exc:
+                logger.warning("post_llm_call hook failed: %s", exc)
+
+        # Context engine observation hook: notify the active engine that this
+        # turn has finished, with the finalized transcript. Complements the
+        # per-request select_context() hook (selection before the request;
+        # observation after the turn). No-op default, fail-open.
+        try:
+            from agent.conversation_loop import _notify_context_engine_turn_complete
+            # Forward the turn's canonical usage when the host has it. The loop
+            # stashes the most recent API response's usage dict (the same
+            # canonical buckets fed to ``update_from_response``) on the agent as
+            # ``_last_turn_usage``. It is ``None`` on turns that never reached a
+            # provider response (early failure / interrupt), which is exactly the
+            # contract: real usage when available, ``None`` otherwise.
+            _turn_usage = getattr(agent, "_last_turn_usage", None)
+            _notify_context_engine_turn_complete(
+                agent,
+                messages,
+                usage=_turn_usage,
+                logger=logger,
+                turn_id=turn_id,
+                task_id=effective_task_id,
+                api_call_count=api_call_count,
+                interrupted=interrupted,
+                failed=failed,
+                turn_exit_reason=_turn_exit_reason,
+            )
+        except Exception as exc:
+            logger.warning("on_turn_complete notification failed: %s", exc)
 
     # Extract reasoning from the CURRENT turn only.  Walk backwards
     # but stop at the user message that started this turn — anything
@@ -666,17 +762,23 @@ def finalize_turn(
         final_response = _sanitize_surrogates(final_response)
 
     receipt_public = None
-    receipt_settlement_failed = False
-    if terminal_receipt_hold is not None:
+    if receipt_turn and not receipt_settlement_failed:
         try:
-            if receipt_hold_rebase_error is not None:
-                raise receipt_hold_rebase_error
+            if (
+                receipt_hold_rebase_error is not None
+                or terminal_receipt_hold is None
+                or terminal_receipt_hold.claimed is not claimed_receipt
+            ):
+                raise receipt_hold_rebase_error or RuntimeError(
+                    "terminal turn receipt hold was replaced"
+                )
             held = terminal_receipt_hold.terminal_message
             index = terminal_receipt_hold.terminal_message_index
             if (
                 interrupted or failed or index < 0 or index >= len(messages)
                 or messages[index] is not held or held.get("role") != "assistant"
-                or held.get("tool_calls") or not isinstance(final_response, str)
+                or held.get("display_kind") == "hidden" or held.get("tool_calls")
+                or not isinstance(final_response, str)
                 or held.get(_DB_PERSISTED_MARKER)
             ):
                 raise RuntimeError("terminal turn receipt hold was replaced")
@@ -700,15 +802,9 @@ def finalize_turn(
             if not receipt_public or receipt_public.get("status") != "COMPLETED":
                 raise RuntimeError("terminal turn receipt did not complete")
         except Exception as receipt_error:
-            failed = True
-            completed = False
-            receipt_settlement_failed = True
-            _turn_exit_reason = "session_persistence_failed"
-            final_response = "session storage could not be written — check the state database health, then send your message again"
-            _cleanup_errors.append(f"terminal_receipt: {receipt_error}")
-            logger.error("terminal receipt settlement failed", exc_info=True)
+            _fail_receipted_turn(receipt_error)
 
-    if not receipt_settlement_failed:
+    if receipt_turn and not receipt_settlement_failed:
         # Plugin hook: post_llm_call runs only after a terminal receipt has
         # committed its canonical assistant row and public response digest.
         if final_response and not interrupted:
