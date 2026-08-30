@@ -102,6 +102,153 @@ from utils import base_url_host_matches, env_var_enabled
 logger = logging.getLogger(__name__)
 
 
+class _ReceiptExecutionProfileError(RuntimeError):
+    """Fail closed before a receipt reaches a mutable/unsupported call path."""
+
+
+def _receipt_runtime_is_supported(agent: Any, moa_config: Any = None) -> bool:
+    """Whether the live runtime remains inside the closed receipt profile."""
+    return (
+        getattr(agent, "api_mode", None) == "chat_completions"
+        and str(getattr(agent, "provider", "") or "").strip().lower() != "moa"
+        and moa_config is None
+    )
+
+
+def _receipt_admitted_text(turn_receipt: Any, user_message: Any) -> Any:
+    """Capture the receipt's gateway-admitted scalar text before turn setup.
+
+    Receipt bindings deliberately retain only a digest, so the sanitized
+    gateway argument is the text-bearing half of the admission pair.  Capture
+    it before any turn helper runs; a future receipt type may carry ``text``
+    directly without changing the invariant.
+    """
+    bound_text = getattr(getattr(turn_receipt, "request", None), "text", None)
+    return bound_text if isinstance(bound_text, str) else user_message
+
+
+def _receipt_pre_call_invariant_error(
+    agent: Any,
+    *,
+    messages: Any,
+    current_turn_user_idx: int,
+    current_turn_user_row: Any,
+    admitted_text: Any,
+    expected_wire_index: int,
+    expected_wire_count: int,
+    api_kwargs: Any,
+    moa_config: Any,
+) -> Optional[str]:
+    """Return why a receipt call is unsafe, or ``None`` at its final boundary.
+
+    The no-repair/no-compression receipt profile keeps one stable current-turn
+    row.  Check both that anchor and the provider-bound payload so any missing,
+    duplicate, multipart, or changed projection fails before the SDK sees it.
+    """
+    if not _receipt_runtime_is_supported(agent, moa_config):
+        return "runtime_changed"
+    if not isinstance(admitted_text, str):
+        return "admitted_text_not_scalar"
+    if not isinstance(messages, list):
+        return "messages_not_list"
+    if not (0 <= current_turn_user_idx < len(messages)):
+        return "current_user_index_missing"
+    if messages[current_turn_user_idx] is not current_turn_user_row:
+        return "current_user_anchor_moved"
+    if sum(message is current_turn_user_row for message in messages) != 1:
+        return "current_user_anchor_duplicated"
+    if not isinstance(current_turn_user_row, dict):
+        return "current_user_row_not_mapping"
+    if (
+        current_turn_user_row.get("role") != "user"
+        or not isinstance(current_turn_user_row.get("content"), str)
+        or current_turn_user_row.get("content") != admitted_text
+    ):
+        return "current_user_source_changed"
+    if not isinstance(api_kwargs, dict):
+        return "api_kwargs_not_mapping"
+    wire_messages = api_kwargs.get("messages")
+    if not isinstance(wire_messages, list):
+        return "provider_messages_not_list"
+    if len(wire_messages) != expected_wire_count:
+        return "provider_messages_count_changed"
+    if not (0 <= expected_wire_index < len(wire_messages)):
+        return "provider_current_user_index_missing"
+    wire_current = wire_messages[expected_wire_index]
+    if not isinstance(wire_current, dict) or wire_current.get("role") != "user":
+        return "provider_current_user_missing"
+    if not isinstance(wire_current.get("content"), str):
+        return "provider_current_user_multipart"
+    if wire_current.get("content") != admitted_text:
+        return "provider_current_user_changed"
+    return None
+
+
+def _receipt_requires_compression(agent: Any, request_tokens: int) -> bool:
+    """Detect a direct threshold breach without invoking compression policy."""
+    if not getattr(agent, "compression_enabled", False):
+        return False
+    threshold = getattr(getattr(agent, "context_compressor", None), "threshold_tokens", 0)
+    return isinstance(threshold, int) and threshold > 0 and request_tokens >= threshold
+
+
+def _receipt_sequence_requires_repair(messages: Any) -> bool:
+    """Purely detect the three live-history shapes sequence repair would alter."""
+    if not isinstance(messages, list):
+        return True
+
+    def _is_codex_interim(message: Any) -> bool:
+        return isinstance(message, dict) and bool(
+            message.get("codex_reasoning_items")
+            or message.get("codex_message_items")
+            or message.get("finish_reason") == "incomplete"
+        )
+
+    collapsed_last: Any = None
+    known_tool_ids: set[Any] = set()
+    filtered_last: Any = None
+    for message in messages:
+        if not isinstance(message, dict):
+            collapsed_last = message
+            filtered_last = message
+            continue
+        role = message.get("role")
+        if (
+            role == "assistant"
+            and isinstance(collapsed_last, dict)
+            and collapsed_last.get("role") == "assistant"
+            and not _is_codex_interim(collapsed_last)
+            and not _is_codex_interim(message)
+        ):
+            return True
+        collapsed_last = message
+
+        if role == "assistant":
+            known_tool_ids = {
+                tool_id
+                for tool_call in (message.get("tool_calls") or [])
+                if isinstance(tool_call, dict)
+                for tool_id in (tool_call.get("id"), tool_call.get("call_id"))
+                if tool_id
+            }
+        elif role == "tool":
+            tool_call_id = message.get("tool_call_id")
+            if not tool_call_id or tool_call_id not in known_tool_ids:
+                return True
+            known_tool_ids.remove(tool_call_id)
+        elif role == "user":
+            known_tool_ids = set()
+            if (
+                isinstance(filtered_last, dict)
+                and filtered_last.get("role") == "user"
+                and isinstance(filtered_last.get("content"), str)
+                and isinstance(message.get("content"), str)
+            ):
+                return True
+        filtered_last = message
+    return False
+
+
 # Scaffold marker used by _apply_active_turn_redirect and the ghost-row filter
 # in the api_messages loop. Module-level so both sites can never drift.
 _INTERRUPT_SCAFFOLD_MARKER = "[This response was interrupted by a user correction.]"
@@ -1806,6 +1953,7 @@ def run_conversation(
         Dict: Complete conversation result with final response and message history
     """
     receipt_raw_text_only = turn_receipt is not None
+    receipt_admitted_text = _receipt_admitted_text(turn_receipt, user_message)
     if moa_config is None and not receipt_raw_text_only:
         try:
             from hermes_cli.moa_config import decode_moa_turn
@@ -1822,17 +1970,19 @@ def run_conversation(
     # The gateway caches agents across user turns.  Compression state is
     # per-turn: carrying a prior in-place boundary forward would make a later
     # uncompressed result look like a compacted transcript to gateway writers.
-    agent._last_compaction_in_place = False
-    agent._last_compression_attempt_recorded = False
-    agent._last_compression_attempt_in_place = None
+    if not receipt_raw_text_only:
+        agent._last_compaction_in_place = False
+        agent._last_compression_attempt_recorded = False
+        agent._last_compression_attempt_in_place = None
 
     # Adopt any ~/.hermes/.env credential/base-url edits made since the last
     # turn — a Settings save updates .env but not this worker's client, which
     # was built at agent init (#67821). No-op when .env is unchanged.
-    try:
-        agent._try_refresh_env_client_credentials()
-    except Exception:
-        logger.debug("per-turn env credential refresh failed", exc_info=True)
+    if not receipt_raw_text_only:
+        try:
+            agent._try_refresh_env_client_credentials()
+        except Exception:
+            logger.debug("per-turn env credential refresh failed", exc_info=True)
 
     # ── Per-turn setup (the prologue) ──
     # All once-per-turn setup — stdio guarding, retry-counter resets, user
@@ -1876,6 +2026,13 @@ def run_conversation(
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
+    receipt_current_turn_user_row = (
+        messages[current_turn_user_idx]
+        if receipt_raw_text_only
+        and isinstance(messages, list)
+        and 0 <= current_turn_user_idx < len(messages)
+        else None
+    )
 
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.
@@ -1934,6 +2091,23 @@ def run_conversation(
     # retain that ephemeral output and rebase it onto the compacted transcript
     # on the next loop iteration. This prevents a second advisor fan-out.
     pending_moa_prepared_request = None
+    receipt_profile_rejection = None
+    if receipt_raw_text_only:
+        if not _receipt_runtime_is_supported(agent, moa_config):
+            receipt_profile_rejection = "runtime_changed_before_loop"
+        elif not isinstance(receipt_admitted_text, str):
+            receipt_profile_rejection = "admitted_text_not_scalar"
+        elif user_message != receipt_admitted_text:
+            receipt_profile_rejection = "admitted_text_changed_before_loop"
+        elif (
+            not isinstance(receipt_current_turn_user_row, dict)
+            or receipt_current_turn_user_row.get("role") != "user"
+            or receipt_current_turn_user_row.get("content") != receipt_admitted_text
+        ):
+            receipt_profile_rejection = "current_user_changed_before_loop"
+        if receipt_profile_rejection is not None:
+            failed = True
+            _turn_exit_reason = "receipt_execution_profile_rejected"
 
     # Per-turn tally of consecutive successful credential-pool token refreshes,
     # keyed by (provider, pool-entry-id). A persistent upstream 401 lets
@@ -1954,7 +2128,7 @@ def run_conversation(
     # all run inside Codex). Default Hermes path is bypassed entirely.
     # See agent/transports/codex_app_server_session.py for the adapter
     # and references/codex-app-server-runtime.md for the rationale.
-    if agent.api_mode == "codex_app_server":
+    if not receipt_raw_text_only and agent.api_mode == "codex_app_server":
         return agent._run_codex_app_server_turn(
             user_message=user_message,
             original_user_message=original_user_message,
@@ -1963,8 +2137,26 @@ def run_conversation(
             should_review_memory=_should_review_memory,
         )
 
-    while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
-        _redirect_text = agent._drain_pending_redirect()
+    while (
+        receipt_profile_rejection is None
+        and (
+            (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0)
+            or agent._budget_grace_call
+        )
+    ):
+        if receipt_raw_text_only and not _receipt_runtime_is_supported(
+            agent, moa_config
+        ):
+            receipt_profile_rejection = "runtime_changed_before_call_setup"
+            failed = True
+            _turn_exit_reason = "receipt_execution_profile_rejected"
+            break
+        if receipt_raw_text_only and agent._has_pending_redirect():
+            receipt_profile_rejection = "redirect_rewrite_required"
+            failed = True
+            _turn_exit_reason = "receipt_execution_profile_rejected"
+            break
+        _redirect_text = "" if receipt_raw_text_only else agent._drain_pending_redirect()
         if _redirect_text:
             _apply_active_turn_redirect(agent, messages, _redirect_text)
             if isinstance(original_user_message, str):
@@ -2046,7 +2238,12 @@ def run_conversation(
         # iteration, no tools yet), the steer stays pending for the next
         # tool batch — injecting into a user message would break role
         # alternation, and there's no tool output to piggyback on.
-        _pre_api_steer = agent._drain_pending_steer()
+        if receipt_raw_text_only and getattr(agent, "_pending_steer", None):
+            receipt_profile_rejection = "steer_rewrite_required"
+            failed = True
+            _turn_exit_reason = "receipt_execution_profile_rejected"
+            break
+        _pre_api_steer = "" if receipt_raw_text_only else agent._drain_pending_steer()
         if _pre_api_steer:
             _injected = False
             for _si in range(len(messages) - 1, -1, -1):
@@ -2091,7 +2288,7 @@ def run_conversation(
         # to wrap up and deliver from the state it already has. Same
         # cache-safe channel as /steer (appended to the newest tool
         # result); dormant when no budget is set.
-        if getattr(agent, "run_budget_seconds", None):
+        if not receipt_raw_text_only and getattr(agent, "run_budget_seconds", None):
             _maybe_inject_run_budget_wrapup(agent, messages)
 
         # Prepare messages for API call
@@ -2105,25 +2302,26 @@ def run_conversation(
         # iteration. Identity-keyed (strong refs) — compression/undo/repair
         # rewriting the list breaks the prefix match and forces a re-scan
         # from the divergence point. See sanitize_tool_call_arguments.
-        _sanitize_cursor = getattr(agent, "_sanitize_args_cursor", None)
-        if _sanitize_cursor is None:
-            _sanitize_cursor = {}
-            try:
-                agent._sanitize_args_cursor = _sanitize_cursor
-            except Exception:
-                pass
-        repaired_tool_calls = agent._sanitize_tool_call_arguments(
-            messages,
-            logger=request_logger,
-            session_id=agent.session_id,
-            cursor=_sanitize_cursor,
-        )
-        if repaired_tool_calls > 0:
-            request_logger.info(
-                "Sanitized %s corrupted tool_call arguments before request (session=%s)",
-                repaired_tool_calls,
-                agent.session_id or "-",
+        if not receipt_raw_text_only:
+            _sanitize_cursor = getattr(agent, "_sanitize_args_cursor", None)
+            if _sanitize_cursor is None:
+                _sanitize_cursor = {}
+                try:
+                    agent._sanitize_args_cursor = _sanitize_cursor
+                except Exception:
+                    pass
+            repaired_tool_calls = agent._sanitize_tool_call_arguments(
+                messages,
+                logger=request_logger,
+                session_id=agent.session_id,
+                cursor=_sanitize_cursor,
             )
+            if repaired_tool_calls > 0:
+                request_logger.info(
+                    "Sanitized %s corrupted tool_call arguments before request (session=%s)",
+                    repaired_tool_calls,
+                    agent.session_id or "-",
+                )
 
         # Drop legacy ghost rows from the incomplete #73146 else branch BEFORE
         # the alternation repair below: a hidden assistant placeholder whose
@@ -2131,23 +2329,24 @@ def run_conversation(
         # an assistant message makes the model echo it and self-replicate
         # (#81841). Dropping before repair lets repair_message_sequence fix
         # any user→user adjacency the filter creates.
-        messages = [
-            msg for msg in messages
-            if not (
-                msg.get("display_kind") == "hidden"
-                and msg.get("role") == "assistant"
-                and (
-                    (
-                        isinstance(msg.get("content"), str)
-                        and msg["content"].strip() == _INTERRUPT_SCAFFOLD_MARKER
-                    )
-                    or (
-                        isinstance(msg.get("api_content"), str)
-                        and msg["api_content"].strip() == _INTERRUPT_SCAFFOLD_MARKER
+        if not receipt_raw_text_only:
+            messages = [
+                msg for msg in messages
+                if not (
+                    msg.get("display_kind") == "hidden"
+                    and msg.get("role") == "assistant"
+                    and (
+                        (
+                            isinstance(msg.get("content"), str)
+                            and msg["content"].strip() == _INTERRUPT_SCAFFOLD_MARKER
+                        )
+                        or (
+                            isinstance(msg.get("api_content"), str)
+                            and msg["api_content"].strip() == _INTERRUPT_SCAFFOLD_MARKER
+                        )
                     )
                 )
-            )
-        ]
+            ]
 
         # Defensive: repair malformed role-alternation before API call.
         # Catches cases where the history got wedged into a
@@ -2159,14 +2358,21 @@ def run_conversation(
         # repair_message_sequence_with_cursor also recomputes the SessionDB
         # flush cursor (_last_flushed_db_idx) when repair compacts the list,
         # so the turn-end flush doesn't skip the assistant/tool chain (#44837).
-        from agent.agent_runtime_helpers import repair_message_sequence_with_cursor
-        repaired_seq = repair_message_sequence_with_cursor(agent, messages)
-        if repaired_seq > 0:
-            request_logger.info(
-                "Repaired %s message-alternation violations before request (session=%s)",
-                repaired_seq,
-                agent.session_id or "-",
-            )
+        if not receipt_raw_text_only:
+            from agent.agent_runtime_helpers import repair_message_sequence_with_cursor
+
+            repaired_seq = repair_message_sequence_with_cursor(agent, messages)
+            if repaired_seq > 0:
+                request_logger.info(
+                    "Repaired %s message-alternation violations before request (session=%s)",
+                    repaired_seq,
+                    agent.session_id or "-",
+                )
+        elif _receipt_sequence_requires_repair(messages):
+            receipt_profile_rejection = "sequence_rewrite_required"
+            failed = True
+            _turn_exit_reason = "receipt_execution_profile_rejected"
+            break
 
         api_messages = []
         for idx, msg in enumerate(messages):
@@ -2227,11 +2433,9 @@ def run_conversation(
             if idx == current_turn_user_idx and msg.get("role") == "user":
                 if receipt_raw_text_only:
                     # Receipt admission already applied the complete text safety
-                    # sanitization; keep this live/persisted row and every wire
-                    # projection bound to those exact admitted bytes.
-                    msg["content"] = user_message
-                    msg.pop("api_content", None)
-                    api_msg["content"] = user_message
+                    # sanitization; the stable live row stays untouched and the
+                    # provider copy is bound to the immutable admitted bytes.
+                    api_msg["content"] = receipt_admitted_text
                 elif isinstance(_api_content, str) and _api_content:
                     # Stamped by the prologue from the same composition —
                     # reuse it so the persisted sidecar and the wire cannot
@@ -2419,7 +2623,8 @@ def run_conversation(
         # results before sending to the API.  Runs unconditionally — not
         # gated on context_compressor — so orphans from session loading or
         # manual message manipulation are always caught.
-        api_messages = agent._sanitize_api_messages(api_messages)
+        if not receipt_raw_text_only:
+            api_messages = agent._sanitize_api_messages(api_messages)
 
         # Drop thinking-only assistant turns (reasoning but no visible
         # output and no tool_calls) and merge any adjacent user messages
@@ -2429,10 +2634,11 @@ def run_conversation(
         # a thinking-only turn. Runs on the per-call copy only — the
         # stored conversation history keeps the reasoning block for the
         # UI transcript and session persistence.
-        api_messages = agent._drop_thinking_only_and_merge_users(
-            api_messages,
-            drop_codex_reasoning_items=agent.api_mode != "codex_responses",
-        )
+        if not receipt_raw_text_only:
+            api_messages = agent._drop_thinking_only_and_merge_users(
+                api_messages,
+                drop_codex_reasoning_items=agent.api_mode != "codex_responses",
+            )
 
         # Normalize message whitespace and tool-call JSON for consistent
         # prefix matching.  Ensures bit-perfect prefixes across turns,
@@ -2440,21 +2646,18 @@ def run_conversation(
         # (llama.cpp, vLLM, Ollama) and improves cache hit rates for
         # cloud providers.  Operates on api_messages (the API copy) so
         # the original conversation history in `messages` is untouched.
-        for am in api_messages:
-            if isinstance(am.get("content"), str):
-                if not (
-                    receipt_raw_text_only
-                    and am.get("role") == "user"
-                    and am.get("content") == user_message
-                ):
+        if not receipt_raw_text_only:
+            for am in api_messages:
+                if isinstance(am.get("content"), str):
                     am["content"] = am["content"].strip()
-        _canonicalize_api_tool_calls(api_messages)
+            _canonicalize_api_tool_calls(api_messages)
 
         # Proactively strip any surrogate characters before the API call.
         # Models served via Ollama (Kimi K2.5, GLM-5, Qwen) can return
         # lone surrogates (U+D800-U+DFFF) that crash json.dumps() inside
         # the OpenAI SDK. Sanitizing here prevents the 3-retry cycle.
-        _sanitize_messages_surrogates(api_messages)
+        if not receipt_raw_text_only:
+            _sanitize_messages_surrogates(api_messages)
 
         # NOTE (empty-content class fix): no send-time pad loop here.  The
         # single owner for "never send a turn strict wire validation rejects
@@ -2538,15 +2741,29 @@ def run_conversation(
             _estimate_tools_tokens_rough(agent.tools) if agent.tools else 0
         )
         total_chars = approx_tokens * 4
+        if receipt_raw_text_only and _receipt_requires_compression(
+            agent, request_pressure_tokens
+        ):
+            receipt_profile_rejection = "compression_rewrite_required"
+            failed = True
+            _turn_exit_reason = "receipt_execution_profile_rejected"
+            api_call_count -= 1
+            agent._api_call_count = api_call_count
+            try:
+                agent.iteration_budget.refund()
+            except Exception:
+                pass
+            break
         # Stash this request's rough estimate so update_from_response() can
         # pair it with the provider's real prompt count — the (rough, real)
         # anchor behind should_defer_preflight_to_real_usage()'s projection.
         # getattr guard: test doubles built via object.__new__ lack the method.
-        _note_rough = getattr(
-            agent.context_compressor, "note_request_rough_estimate", None
-        )
-        if callable(_note_rough):
-            _note_rough(request_pressure_tokens)
+        if not receipt_raw_text_only:
+            _note_rough = getattr(
+                agent.context_compressor, "note_request_rough_estimate", None
+            )
+            if callable(_note_rough):
+                _note_rough(request_pressure_tokens)
 
         _runtime_context_error = _ollama_context_limit_error(
             agent, request_pressure_tokens
@@ -2614,14 +2831,19 @@ def run_conversation(
                 f"{_previous_preflight_pressure:,}",
                 f"{request_pressure_tokens:,}",
             )
-        _defer_preflight = getattr(
-            _compressor, "should_defer_preflight_to_real_usage", lambda _t: False
-        )
-        _compression_cooldown = getattr(
-            _compressor, "get_active_compression_failure_cooldown", lambda: None
-        )()
+        if receipt_raw_text_only:
+            _defer_preflight = lambda _tokens: False
+            _compression_cooldown = None
+        else:
+            _defer_preflight = getattr(
+                _compressor, "should_defer_preflight_to_real_usage", lambda _t: False
+            )
+            _compression_cooldown = getattr(
+                _compressor, "get_active_compression_failure_cooldown", lambda: None
+            )()
         if (
-            agent.compression_enabled
+            not receipt_raw_text_only
+            and agent.compression_enabled
             and len(messages) > 1
             and compression_attempts < max_compression_attempts
             and not _preflight_compression_blocked
@@ -2739,7 +2961,8 @@ def run_conversation(
                     break
                 continue
         elif (
-            agent.compression_enabled
+            not receipt_raw_text_only
+            and agent.compression_enabled
             and len(messages) > 1
             and compression_attempts < max_compression_attempts
             and not _defer_preflight(request_pressure_tokens)
@@ -2764,7 +2987,7 @@ def run_conversation(
                     request_pressure_tokens,
                     int(getattr(_compressor, "threshold_tokens", 0) or 0),
                 )
-        elif not agent.compression_enabled and len(messages) > 1:
+        elif not receipt_raw_text_only and not agent.compression_enabled and len(messages) > 1:
             # Uncompressed session guard (#89297): compression is disabled, so
             # nothing shrinks a growing session. Reuse the unconditionally
             # computed request estimate (zero marginal cost — this site runs
@@ -2828,6 +3051,8 @@ def run_conversation(
         finish_reason = "stop"
         response = None  # Guard against UnboundLocalError if all retries fail
         api_kwargs = None  # Guard against UnboundLocalError in except handler
+        receipt_wire_current_index = -1
+        receipt_wire_message_count = 0
         api_request_id = f"{turn_id}:api:{api_call_count}"
         agent._current_api_request_id = api_request_id
 
@@ -2906,6 +3131,11 @@ def run_conversation(
                         tools_for_api=tools_for_api,
                     )
                 )
+                if receipt_raw_text_only:
+                    receipt_wire_current_index = (
+                        len(api_messages) - len(messages) + current_turn_user_idx
+                    )
+                    receipt_wire_message_count = len(api_messages)
                 if tools_for_api == agent.tools:
                     api_kwargs = agent._build_api_kwargs(api_messages)
                 else:
@@ -2922,9 +3152,10 @@ def run_conversation(
                 # point"). One in-place walk here guarantees the entire
                 # payload json.dumps()-safe regardless of which leaf produced
                 # the string. Fast no-op when the payload is clean.
-                _sanitize_structure_surrogates(api_kwargs)
-                if agent._force_ascii_payload:
-                    _sanitize_structure_non_ascii(api_kwargs)
+                if not receipt_raw_text_only:
+                    _sanitize_structure_surrogates(api_kwargs)
+                    if agent._force_ascii_payload:
+                        _sanitize_structure_non_ascii(api_kwargs)
                 if agent.api_mode == "codex_responses":
                     api_kwargs = agent._get_transport().preflight_kwargs(
                         api_kwargs,
@@ -3115,6 +3346,24 @@ def run_conversation(
                         _use_streaming = False
 
                 def _perform_api_call(next_api_kwargs):
+                    if receipt_raw_text_only:
+                        receipt_error = _receipt_pre_call_invariant_error(
+                            agent,
+                            messages=messages,
+                            current_turn_user_idx=current_turn_user_idx,
+                            current_turn_user_row=receipt_current_turn_user_row,
+                            admitted_text=receipt_admitted_text,
+                            expected_wire_index=receipt_wire_current_index,
+                            expected_wire_count=receipt_wire_message_count,
+                            api_kwargs=next_api_kwargs,
+                            moa_config=moa_config,
+                        )
+                        if receipt_error is not None:
+                            logger.warning(
+                                "Receipt execution profile blocked provider call: %s",
+                                receipt_error,
+                            )
+                            raise _ReceiptExecutionProfileError(receipt_error)
                     if agent.api_mode == "codex_responses":
                         next_api_kwargs = agent._get_transport().preflight_kwargs(
                             next_api_kwargs,
@@ -3202,6 +3451,11 @@ def run_conversation(
                         thinking_spinner = None
                     if agent.thinking_callback:
                         agent.thinking_callback("")
+                    if receipt_raw_text_only:
+                        receipt_profile_rejection = "redirect_rewrite_required"
+                        failed = True
+                        _turn_exit_reason = "receipt_execution_profile_rejected"
+                        break
                     if agent.clear_interrupt(preserve_redirect=True):
                         _retry.restart_with_redirected_messages = True
                     else:
@@ -4398,6 +4652,16 @@ def run_conversation(
                     thinking_spinner = None
                 if agent.thinking_callback:
                     agent.thinking_callback("")
+
+                if receipt_raw_text_only:
+                    receipt_profile_rejection = (
+                        str(api_error)
+                        if isinstance(api_error, _ReceiptExecutionProfileError)
+                        else "provider_error_rewrite_required"
+                    )
+                    failed = True
+                    _turn_exit_reason = "receipt_execution_profile_rejected"
+                    break
 
                 # -----------------------------------------------------------
                 # UnicodeEncodeError recovery.  Two common causes:
@@ -6573,6 +6837,9 @@ def run_conversation(
                     # stale request.
                     break
         
+        if receipt_profile_rejection is not None:
+            break
+
         if _retry.restart_with_redirected_messages:
             # The cancelled request produced no valid assistant item. Reuse the
             # same logical iteration after the outer loop appends the displayed
@@ -7449,7 +7716,8 @@ def run_conversation(
                     )
 
                 if (
-                    agent.compression_enabled
+                    not receipt_raw_text_only
+                    and agent.compression_enabled
                     and compression_attempts < max_compression_attempts
                     and _compressor.should_compress(_real_tokens)
                 ):
@@ -7500,7 +7768,7 @@ def run_conversation(
                                 final_response = _HANDOFF_SKIP_FINAL_RESPONSE
                             _turn_exit_reason = "compaction_handoff_not_actionable"
                             break
-                elif agent.compression_enabled:
+                elif not receipt_raw_text_only and agent.compression_enabled:
                     # Over threshold but compression is blocked (summary-LLM
                     # cooldown or anti-thrashing). Surface a deduped warning so
                     # the user isn't left with a silently growing context that

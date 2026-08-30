@@ -8881,12 +8881,16 @@ class AIAgent:
                     daemon=True,
                 )
 
-            # Receipt v1 is deliberately limited to normal chat-completions.
-            # The app-server owns a separate subprocess/runtime finalizer, so
-            # never claim a receipt it cannot settle atomically.
-            if (
-                turn_receipt is not None
-                and getattr(self, "api_mode", None) == "codex_app_server"
+            # Receipt v1 is a closed execution profile: only the direct,
+            # standard chat-completions transport can claim it.  Keep this
+            # ahead of relay/task/model setup and, critically, ahead of the
+            # claim so an unsupported runtime cannot leave a durable receipt
+            # in CLAIMED without a compatible atomic finalizer.
+            if turn_receipt is not None and (
+                getattr(self, "api_mode", None) != "chat_completions"
+                or str(getattr(self, "provider", "") or "").strip().lower()
+                == "moa"
+                or moa_config is not None
             ):
                 return {
                     "final_response": "",

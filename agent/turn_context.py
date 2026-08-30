@@ -462,9 +462,10 @@ def build_turn_context(
     # Recover a session rotated by another path before binding log/turn ids or
     # copying client-supplied history. Everything in this turn must consistently
     # belong to the canonical child, including observability metadata.
-    recovered_history = recover_rotated_compression_session(agent)
-    if recovered_history is not None:
-        conversation_history = recovered_history
+    if not receipt_raw_text_only:
+        recovered_history = recover_rotated_compression_session(agent)
+        if recovered_history is not None:
+            conversation_history = recovered_history
 
     # NOTE: the DB session row is created later, AFTER the system prompt is
     # restored/built (see _ensure_db_session() below the system-prompt block).
@@ -481,7 +482,8 @@ def build_turn_context(
     set_current_write_origin(getattr(agent, "_memory_write_origin", "assistant_tool"))
 
     # Restore the primary runtime if the previous turn activated fallback.
-    agent._restore_primary_runtime()
+    if not receipt_raw_text_only:
+        agent._restore_primary_runtime()
 
     # Tell auxiliary_client what the live main provider/model are for this turn
     # after primary restoration has settled the runtime.
@@ -541,10 +543,11 @@ def build_turn_context(
         logger.debug("between-turns MCP tool refresh skipped", exc_info=True)
 
     # Sanitize surrogate characters from user input.
-    if isinstance(user_message, str):
-        user_message = sanitize_surrogates(user_message)
-    if isinstance(persist_user_message, str):
-        persist_user_message = sanitize_surrogates(persist_user_message)
+    if not receipt_raw_text_only:
+        if isinstance(user_message, str):
+            user_message = sanitize_surrogates(user_message)
+        if isinstance(persist_user_message, str):
+            persist_user_message = sanitize_surrogates(persist_user_message)
 
     # Store stream callback for _interruptible_api_call to pick up.
     agent._stream_callback = stream_callback
@@ -803,7 +806,12 @@ def build_turn_context(
     # the previous turn finished. The cheap gap pre-check gates the (more
     # expensive) token estimate, mirroring ``_should_run_preflight_estimate``.
     _idle_after = getattr(agent, "compression_idle_compact_after_seconds", 0)
-    if agent.compression_enabled and _idle_after > 0 and messages:
+    if (
+        not receipt_raw_text_only
+        and agent.compression_enabled
+        and _idle_after > 0
+        and messages
+    ):
         _idle_gap = time.time() - getattr(agent, "_last_activity_ts", time.time())
         if _idle_gap >= _idle_after:
             _compressor = agent.context_compressor
@@ -880,7 +888,7 @@ def build_turn_context(
     _preflight_compression_blocked = False
     agent._turn_received_provider_response = False
     agent._turn_preflight_display_snapshot = None
-    if agent.compression_enabled and _should_run_preflight_estimate(
+    if not receipt_raw_text_only and agent.compression_enabled and _should_run_preflight_estimate(
         messages,
         agent.context_compressor.protect_first_n,
         agent.context_compressor.protect_last_n,
@@ -1177,7 +1185,7 @@ def build_turn_context(
                     agent._last_content_with_tools = None
                     agent._last_content_tools_all_housekeeping = False
                     agent._mute_post_response = False
-    elif not agent.compression_enabled:
+    elif not receipt_raw_text_only and not agent.compression_enabled:
         # Uncompressed session guard (#89297): when compression is explicitly
         # disabled, sessions can grow past the model's context window across
         # hundreds of messages with nothing to shrink them. The warning itself
@@ -1393,13 +1401,9 @@ def build_turn_context(
     # copy AFTER this composition, so the stamped bytes would never match the
     # wire either — skip the stamp rather than persist provably wrong "exact
     # sent bytes" (MoA keeps its pre-sidecar cache behavior).
-    if receipt_raw_text_only and (
-        0 <= current_turn_user_idx < len(messages)
-        and messages[current_turn_user_idx].get("role") == "user"
-    ):
-        messages[current_turn_user_idx].pop("api_content", None)
-    elif (
-        not moa_active
+    if (
+        not receipt_raw_text_only
+        and not moa_active
         and getattr(agent, "api_mode", None) != "codex_app_server"
         and 0 <= current_turn_user_idx < len(messages)
         and messages[current_turn_user_idx].get("role") == "user"
@@ -1475,7 +1479,8 @@ def build_turn_context(
     # turn failed before producing one). Fire-and-forget on a daemon thread,
     # a no-op once the session has a title, and shared by every surface
     # because every surface enters the turn through this prologue.
-    _maybe_title_session_at_turn_start(agent, messages)
+    if not receipt_raw_text_only:
+        _maybe_title_session_at_turn_start(agent, messages)
 
     return TurnContext(
         user_message=user_message,

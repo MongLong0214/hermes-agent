@@ -47,6 +47,8 @@ def receipt_agent(tmp_path):
     agent._session_db = db
     agent._session_db_created = True
     agent._cached_system_prompt = "You are helpful."
+    agent.api_mode = "chat_completions"
+    agent.provider = "openrouter"
     agent._use_prompt_caching = False
     agent.tool_delay = 0
     agent.compression_enabled = False
@@ -243,6 +245,12 @@ def test_receipt_rebinds_raw_text_on_every_tool_loop_provider_pass(
         )
         for call in agent.client.chat.completions.create.call_args_list
     ] == [admitted_text, admitted_text]
+    assert result["final_response"] == "done"
+    assert all(
+        "[This response was interrupted by a user correction.]"
+        not in str(message.get("content"))
+        for message in result["messages"]
+    )
 
 
 @pytest.mark.parametrize("state", ["COMPLETED", "CLAIMED"])
@@ -345,6 +353,329 @@ def test_receipt_codex_app_server_fails_closed_after_lease_before_claim_or_dispa
     assert "turn_receipt" not in result
     assert TurnReceiptAdapter(db).status_for(request)["status"] == "PREPARED"
     assert db.get_messages(session_id) == []
+
+
+@pytest.mark.parametrize(
+    ("api_mode", "provider", "moa_config"),
+    [
+        ("codex_responses", "openrouter", None),
+        ("anthropic_messages", "openrouter", None),
+        ("chat_completions", "moa", None),
+        ("chat_completions", "openrouter", {"reference_models": []}),
+    ],
+)
+def test_receipt_closed_profile_rejects_unsupported_runtime_before_claim(
+    receipt_agent, monkeypatch, api_mode, provider, moa_config
+):
+    """Only a direct standard chat-completions runtime may claim a receipt."""
+    agent, db, session_id = receipt_agent
+    request = _request(session_id, request_id=f"unsupported-{api_mode}-{provider}")
+    TurnReceiptAdapter(db).prepare_or_replay(request)
+    agent.api_mode = api_mode
+    agent.provider = provider
+    claims: list[object] = []
+
+    def reject_claim(*_args, **_kwargs):
+        claims.append("claim")
+        pytest.fail("unsupported receipt runtime claimed before rejection")
+
+    monkeypatch.setattr(TurnReceiptAdapter, "claim_after_lease", reject_claim)
+    agent.client.chat.completions.create.side_effect = lambda *_a, **_kw: pytest.fail(
+        "unsupported receipt runtime reached the provider"
+    )
+
+    result = agent.run_conversation(
+        "question", turn_receipt=request, moa_config=moa_config
+    )
+
+    assert claims == []
+    assert result["completed"] is False
+    assert result["failure_reason"] == "turn_receipt_runtime_unsupported"
+    assert TurnReceiptAdapter(db).status_for(request)["status"] == "PREPARED"
+
+
+def test_receipt_closed_profile_skips_title_and_preflight_compression(
+    receipt_agent, monkeypatch
+):
+    """A receipt fails before the provider when its no-rewrite profile overflows."""
+    from agent import turn_context
+    from tests.run_agent.test_run_agent import _mock_response
+
+    agent, db, session_id = receipt_agent
+    request = _request(session_id, request_id="closed-profile-preflight")
+    TurnReceiptAdapter(db).prepare_or_replay(request)
+    calls = {"title": 0, "compress": 0}
+    agent.compression_enabled = True
+    agent.context_compressor.threshold_tokens = 1
+
+    def title(*_args, **_kwargs):
+        calls["title"] += 1
+
+    def compress(*_args, **_kwargs):
+        calls["compress"] += 1
+        pytest.fail("receipt started a compression rewrite")
+
+    monkeypatch.setattr(turn_context, "_maybe_title_session_at_turn_start", title)
+    monkeypatch.setattr(agent, "_compress_context", compress)
+    agent.client.chat.completions.create.return_value = _mock_response("unexpected")
+
+    result = agent.run_conversation("question", turn_receipt=request)
+
+    assert calls == {"title": 0, "compress": 0}
+    assert agent.client.chat.completions.create.call_count == 0
+    assert result["completed"] is False
+    assert TurnReceiptAdapter(db).status_for(request)["status"] == "CLAIMED"
+
+
+def test_receipt_closed_profile_skips_current_turn_api_sanitizer(
+    receipt_agent, monkeypatch
+):
+    """Receipt execution never enters the mutable API-message sanitizer."""
+    from tests.run_agent.test_run_agent import _mock_response
+
+    agent, db, session_id = receipt_agent
+    request = _request(session_id, request_id="closed-profile-sanitizer")
+    TurnReceiptAdapter(db).prepare_or_replay(request)
+    calls = {"sanitize": 0}
+
+    def rewrite_current_user(api_messages):
+        calls["sanitize"] += 1
+        for message in api_messages:
+            if message.get("role") == "user":
+                message["content"] = "SANITIZER_REWRITE"
+        return api_messages
+
+    monkeypatch.setattr(agent, "_sanitize_api_messages", rewrite_current_user)
+    agent.client.chat.completions.create.return_value = _mock_response("done")
+
+    result = agent.run_conversation("question", turn_receipt=request)
+
+    assert calls == {"sanitize": 0}
+    assert result["completed"] is True
+    assert _provider_user_content(agent) == "question"
+    assert TurnReceiptAdapter(db).status_for(request)["status"] == "COMPLETED"
+
+
+def test_receipt_closed_profile_rejects_sequence_repair_without_mutating_history(
+    receipt_agent, monkeypatch
+):
+    """A receipt refuses, rather than merging, malformed adjacent user turns."""
+    from agent import agent_runtime_helpers
+
+    agent, db, session_id = receipt_agent
+    request = _request(session_id, request_id="closed-profile-sequence-repair")
+    TurnReceiptAdapter(db).prepare_or_replay(request)
+    monkeypatch.setattr(
+        agent_runtime_helpers,
+        "repair_message_sequence_with_cursor",
+        lambda *_args, **_kwargs: pytest.fail("receipt mutated message sequence"),
+    )
+    agent.client.chat.completions.create.side_effect = lambda *_args, **_kwargs: pytest.fail(
+        "receipt reached provider despite required sequence repair"
+    )
+
+    result = agent.run_conversation(
+        "question",
+        conversation_history=[{"role": "user", "content": "earlier question"}],
+        turn_receipt=request,
+    )
+
+    assert result["completed"] is False
+    assert TurnReceiptAdapter(db).status_for(request)["status"] == "CLAIMED"
+
+
+@pytest.mark.parametrize("mutation", ["missing", "duplicate", "multipart", "changed"])
+def test_receipt_closed_profile_rejects_a_mutated_provider_bound_current_user(
+    receipt_agent, monkeypatch, mutation
+):
+    """The final provider boundary requires one exact, scalar current user row."""
+    from tests.run_agent.test_run_agent import _mock_response
+
+    agent, db, session_id = receipt_agent
+    request = _request(session_id, request_id=f"closed-profile-wire-{mutation}")
+    TurnReceiptAdapter(db).prepare_or_replay(request)
+    real_build = agent._build_api_kwargs
+
+    def build_with_mutated_current_user(messages, **kwargs):
+        api_kwargs = real_build(messages, **kwargs)
+        wire_messages = api_kwargs["messages"]
+        current_index = next(
+            index
+            for index, message in enumerate(wire_messages)
+            if message.get("role") == "user" and message.get("content") == "question"
+        )
+        if mutation == "missing":
+            del wire_messages[current_index]
+        elif mutation == "duplicate":
+            wire_messages.insert(current_index + 1, dict(wire_messages[current_index]))
+        elif mutation == "multipart":
+            wire_messages[current_index]["content"] = [
+                {"type": "text", "text": "question"}
+            ]
+        else:
+            wire_messages[current_index]["content"] = "changed"
+        return api_kwargs
+
+    monkeypatch.setattr(agent, "_build_api_kwargs", build_with_mutated_current_user)
+    agent.client.chat.completions.create.return_value = _mock_response("unexpected")
+
+    result = agent.run_conversation("question", turn_receipt=request)
+
+    assert agent.client.chat.completions.create.call_count == 0
+    assert result["completed"] is False
+    assert TurnReceiptAdapter(db).status_for(request)["status"] == "CLAIMED"
+
+
+def test_receipt_closed_profile_never_retries_unicode_as_ascii_rewrite(
+    receipt_agent,
+):
+    """An encoding error cannot turn a receipt into a rewritten ASCII retry."""
+    from tests.run_agent.test_run_agent import _mock_response
+
+    agent, db, session_id = receipt_agent
+    request = _request(session_id, request_id="closed-profile-ascii-retry")
+    TurnReceiptAdapter(db).prepare_or_replay(request)
+    agent.client.chat.completions.create.side_effect = [
+        UnicodeEncodeError("ascii", "question", 0, 1, "ordinal not in range"),
+        _mock_response("unexpected retry"),
+    ]
+
+    result = agent.run_conversation("question", turn_receipt=request)
+
+    assert agent.client.chat.completions.create.call_count == 1
+    assert agent._force_ascii_payload is False
+    assert result["completed"] is False
+    assert TurnReceiptAdapter(db).status_for(request)["status"] == "CLAIMED"
+
+
+def test_receipt_closed_profile_blocks_unsupported_fallback_before_second_call(
+    receipt_agent, monkeypatch
+):
+    """A fallback mode change cannot escape the final provider-call fence."""
+    from tests.run_agent.test_run_agent import _mock_response, _mock_tool_call
+
+    agent, db, session_id = receipt_agent
+    request = _request(session_id, request_id="closed-profile-fallback-mode")
+    TurnReceiptAdapter(db).prepare_or_replay(request)
+    tool_call = _mock_tool_call("receipt_test_tool", call_id="receipt-fallback-tool")
+
+    def first_response(*_args, **_kwargs):
+        agent.api_mode = "codex_responses"
+        return _mock_response("", finish_reason="tool_calls", tool_calls=[tool_call])
+
+    agent.client.chat.completions.create.side_effect = first_response
+    monkeypatch.setattr(
+        agent,
+        "_execute_tool_calls",
+        lambda _assistant, messages, *_args: messages.append(
+            {
+                "role": "tool",
+                "name": "receipt_test_tool",
+                "tool_call_id": "receipt-fallback-tool",
+                "content": "tool result",
+            }
+        ),
+    )
+
+    result = agent.run_conversation("question", turn_receipt=request)
+
+    assert agent.client.chat.completions.create.call_count == 1
+    assert result["completed"] is False
+    assert TurnReceiptAdapter(db).status_for(request)["status"] == "CLAIMED"
+
+
+def test_ordinary_execution_retains_title_compression_and_repair_paths(
+    receipt_agent, monkeypatch
+):
+    """The closed receipt fence leaves ordinary turn shaping untouched."""
+    from agent import agent_runtime_helpers, turn_context
+    from tests.run_agent.test_run_agent import _mock_response
+
+    agent, _db, _session_id = receipt_agent
+    calls = {"title": 0, "compress": 0, "repair": 0, "sanitize": 0}
+    agent.compression_enabled = True
+    agent.context_compressor.threshold_tokens = 1
+    real_repair = agent_runtime_helpers.repair_message_sequence_with_cursor
+    real_sanitize = agent._sanitize_api_messages
+
+    monkeypatch.setattr(
+        turn_context,
+        "_maybe_title_session_at_turn_start",
+        lambda *_args, **_kwargs: calls.__setitem__("title", calls["title"] + 1),
+    )
+    monkeypatch.setattr(
+        agent,
+        "_compress_context",
+        lambda messages, *_args, **_kwargs: (
+            calls.__setitem__("compress", calls["compress"] + 1) or messages,
+            agent._cached_system_prompt,
+        ),
+    )
+    monkeypatch.setattr(
+        agent_runtime_helpers,
+        "repair_message_sequence_with_cursor",
+        lambda *args, **kwargs: (
+            calls.__setitem__("repair", calls["repair"] + 1)
+            or real_repair(*args, **kwargs)
+        ),
+    )
+    monkeypatch.setattr(
+        agent,
+        "_sanitize_api_messages",
+        lambda api_messages: (
+            calls.__setitem__("sanitize", calls["sanitize"] + 1)
+            or real_sanitize(api_messages)
+        ),
+    )
+    agent.client.chat.completions.create.return_value = _mock_response("done")
+
+    result = agent.run_conversation("ordinary execution")
+
+    assert result["completed"] is True
+    assert calls["title"] == 1
+    assert calls["compress"] >= 1
+    assert calls["repair"] >= 1
+    assert calls["sanitize"] >= 1
+
+
+def test_ordinary_execution_retains_ascii_recovery_and_virtual_moa(
+    receipt_agent, monkeypatch
+):
+    """Ordinary retries and virtual MoA remain available outside receipt mode."""
+    from agent import moa_loop
+    from tests.run_agent.test_run_agent import _mock_response
+
+    agent, _db, _session_id = receipt_agent
+    agent.client.chat.completions.create.side_effect = [
+        UnicodeEncodeError("ascii", "ordinary", 0, 1, "ordinal not in range"),
+        _mock_response("ascii recovered"),
+    ]
+
+    recovered = agent.run_conversation("ordinary")
+
+    assert recovered["completed"] is True
+    assert agent.client.chat.completions.create.call_count == 2
+    assert agent._force_ascii_payload is True
+
+    moa_calls: list[object] = []
+    monkeypatch.setattr(
+        moa_loop,
+        "aggregate_moa_context",
+        lambda **_kwargs: moa_calls.append("aggregate") or "",
+    )
+    agent._force_ascii_payload = False
+    agent.client.chat.completions.create.reset_mock()
+    agent.client.chat.completions.create.side_effect = None
+    agent.client.chat.completions.create.return_value = _mock_response("moa done")
+
+    virtual_moa = agent.run_conversation(
+        "ordinary moa",
+        moa_config={"reference_models": [], "aggregator": {}},
+    )
+
+    assert virtual_moa["completed"] is True
+    assert moa_calls == ["aggregate"]
+    assert agent.client.chat.completions.create.call_count == 1
 
 
 def test_genuine_terminal_response_is_sanitized_and_atomically_completes(
