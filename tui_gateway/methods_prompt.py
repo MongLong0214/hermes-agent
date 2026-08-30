@@ -105,10 +105,6 @@ def _resolved_turn_receipt_truncation(session: dict, params: dict):
 def _effective_turn_receipt_input(session: dict, params: dict, text):
     """Resolve the model-bound text and truncation identity before turn effects."""
     truncation = _resolved_turn_receipt_truncation(session, params)
-    if truncation is not None and isinstance(text, str):
-        text = _expand_skill_invocation_for_replay(
-            text, str(session.get("session_key") or "")
-        )
     return text, truncation
 
 
@@ -137,6 +133,29 @@ def _turn_receipt_request_id(params: dict) -> str | None:
     if not isinstance(request_id, str) or not request_id.strip():
         raise ValueError("turn_request_id must be a non-empty string")
     return request_id.strip()
+
+
+def _validate_turn_receipt_truncation_identifiers(params: dict) -> None:
+    """Reject non-canonical receipt truncation identifiers before admission."""
+    for key in ("truncate_before_row_id", "truncate_before_user_ordinal"):
+        value = params.get(key)
+        if value is not None and type(value) is not int:
+            raise ValueError(f"{key} has an invalid receipt identifier")
+    message_id = params.get("truncate_before_message_id")
+    if message_id is not None and (
+        not isinstance(message_id, str) or not message_id
+    ):
+        raise ValueError(
+            "truncate_before_message_id has an invalid receipt identifier"
+        )
+
+
+def _public_turn_receipt_disposition(receipt: dict) -> dict:
+    """Project internal receipt evidence onto the two-field wire contract."""
+    return {
+        "turnRequestId": receipt.get("turnRequestId"),
+        "status": receipt.get("status"),
+    }
 
 
 def _derive_turn_receipt_request(
@@ -434,6 +453,8 @@ def _(rid, params: dict) -> dict:
     receipt_input_resolved = False
     try:
         request_id = _turn_receipt_request_id(params)
+        if request_id is not None:
+            _validate_turn_receipt_truncation_identifiers(params)
     except ValueError as exc:
         return _err(rid, 4004, str(exc))
     if request_id is not None:
@@ -473,20 +494,39 @@ def _(rid, params: dict) -> dict:
                 {
                     "text": replay["assistantContent"],
                     "status": "complete",
-                    "turn_receipt": replay,
+                    "turn_receipt": _public_turn_receipt_disposition(replay),
                     "replayed": True,
                 },
             )
-            return _ok(rid, {"status": "complete", "turn_receipt": replay, "replayed": True})
+            return _ok(
+                rid,
+                {
+                    "status": "complete",
+                    "turn_receipt": _public_turn_receipt_disposition(replay),
+                    "replayed": True,
+                },
+            )
         if receipt.get("status") == "CLAIMED":
-            return _ok(rid, {"status": "in_progress", "turn_receipt": receipt})
+            return _ok(
+                rid,
+                {
+                    "status": "in_progress",
+                    "turn_receipt": _public_turn_receipt_disposition(receipt),
+                },
+            )
         # Receipts deliberately do not enter redirect/queue paths: those
         # envelopes cannot carry the invocation-local claim and attachment
         # snapshot needed to preserve exactly-once execution.  Let the caller
         # retry its still-PREPARED receipt when the active turn settles.
         with session["history_lock"]:
             if session.get("running"):
-                return _ok(rid, {"status": "in_progress", "turn_receipt": receipt})
+                return _ok(
+                    rid,
+                    {
+                        "status": "in_progress",
+                        "turn_receipt": _public_turn_receipt_disposition(receipt),
+                    },
+                )
         # Compute-host frames likewise carry neither the lease/claim nor the
         # private admission snapshot.  Refuse before any normal turn effect
         # rather than silently dispatching an unclaimed receipt.
@@ -505,7 +545,7 @@ def _(rid, params: dict) -> dict:
     # being ON: typed "stop" outside a voice chat is a normal message.
     # (The desktop's voice conversation is renderer-owned and never flips
     # the backend flag, so it handles its own typed stop client-side.)
-    if isinstance(text, str) and _voice_mode_enabled():
+    if turn_receipt is None and isinstance(text, str) and _voice_mode_enabled():
         try:
             from tools.voice_mode import is_voice_stop_phrase
 
@@ -529,7 +569,7 @@ def _(rid, params: dict) -> dict:
             logger.info("prompt.submit: typed stop phrase — voice chat ended")
             return _ok(rid, {"voice_stopped": True})
     truncate_user_ordinal = params.get("truncate_before_user_ordinal")
-    if params.get("interrupted"):
+    if turn_receipt is None and params.get("interrupted"):
         # Client-side barge-in (desktop VAD / typing over playback) — latch it
         # so this turn's model message carries the interruption note.
         from tools.tts_streaming import mark_speech_interrupted
@@ -1035,6 +1075,7 @@ def _(rid, params: dict) -> dict:
                 return
         _run_prompt_submit(
             rid, sid, session, text, display_kind=display_kind,
+            image_paths=[] if turn_receipt is not None else None,
             turn_receipt=turn_receipt,
         )
 
@@ -1064,6 +1105,8 @@ def _(rid, params: dict) -> dict:
 
     try:
         request_id = _turn_receipt_request_id(params)
+        if request_id is not None:
+            _validate_turn_receipt_truncation_identifiers(params)
     except ValueError as exc:
         return _err(rid, 4004, str(exc))
     if request_id is None:
@@ -1095,7 +1138,7 @@ def _(rid, params: dict) -> dict:
         if isinstance(exc, TurnReceiptConflictError):
             return _err(rid, 4091, "turn_receipt_binding_conflict")
         return _err(rid, 5071, f"session storage could not be written: {exc}")
-    return _ok(rid, {"turn_receipt": receipt})
+    return _ok(rid, {"turn_receipt": _public_turn_receipt_disposition(receipt)})
 
 
 @method("turn.status")
@@ -1107,6 +1150,8 @@ def _(rid, params: dict) -> dict:
 
     try:
         request_id = _turn_receipt_request_id(params)
+        if request_id is not None:
+            _validate_turn_receipt_truncation_identifiers(params)
     except ValueError as exc:
         return _err(rid, 4004, str(exc))
     if request_id is None:
@@ -1133,7 +1178,10 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5071, f"session storage could not be read: {exc}")
     if receipt is None:
         return _err(rid, 4040, "turn receipt not found")
-    return _ok(rid, {"turn_receipt": replay or receipt})
+    return _ok(
+        rid,
+        {"turn_receipt": _public_turn_receipt_disposition(replay or receipt)},
+    )
 
 
 @method("clipboard.paste")
@@ -1852,6 +1900,8 @@ def register(server) -> None:
     for helper in (
         _derive_turn_receipt_request,
         _turn_receipt_request_id,
+        _validate_turn_receipt_truncation_identifiers,
+        _public_turn_receipt_disposition,
         _effective_turn_receipt_input,
         _ensure_turn_receipt_session_identity,
         _resolved_turn_receipt_truncation,

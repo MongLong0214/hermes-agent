@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import threading
+import types
 
 import pytest
 
@@ -154,7 +155,7 @@ def _effective_request(session_key, *, text="/replay original", turn_request_id=
     return request_binding(
         session_id=session_key,
         turn_request_id=turn_request_id,
-        text=f"expanded::sanitized::{text.strip()}",
+        text=f"sanitized::{text.strip()}",
         display_kind=None,
         attachments=[],
         truncation={
@@ -188,9 +189,11 @@ def test_completed_duplicate_replays_before_voice_interrupt_busy_or_turn_effects
 
     result = server._methods["prompt.submit"]("rid", _params())
 
-    replay = result["result"]["turn_receipt"]
+    replay = adapter.completed_replay(request)
+    disposition = {"turnRequestId": "request-1", "status": "COMPLETED"}
     assert result["result"]["status"] == "complete"
     assert result["result"]["replayed"] is True
+    assert result["result"]["turn_receipt"] == disposition
     assert replay["assistantContent"] == assistant_bytes
     assert replay["responseDigest"] == digest
     assert replay == TurnReceiptAdapter(db).completed_replay(request)
@@ -199,11 +202,10 @@ def test_completed_duplicate_replays_before_voice_interrupt_busy_or_turn_effects
     assert session["history"] == [{"role": "user", "content": "old", "_row_id": 71}]
     assert [row["content"] for row in db.get_messages(session_key)] == [assistant_bytes]
     assert events == [
-        ("expand", "sanitized::/replay original"),
         ("message.complete", session_id, {
             "text": assistant_bytes,
             "status": "complete",
-            "turn_receipt": replay,
+            "turn_receipt": disposition,
             "replayed": True,
         }),
     ]
@@ -224,7 +226,238 @@ def test_conflicting_effective_input_fails_before_all_turn_effects(receipt_gatew
     assert effects == {key: 0 for key in effects}
     assert session["history"] == [{"role": "user", "content": "old", "_row_id": 71}]
     assert db.get_messages(session_key) == []
-    assert events == [("expand", f"sanitized::{text.strip()}")]
+    assert events == []
+
+
+def test_receipt_v1_runtime_sends_only_admitted_sanitized_text(
+    tmp_path, monkeypatch
+):
+    """Receipt turns must not consume or prepend any runtime enrichment."""
+    from tui_gateway import server
+
+    db = SessionDB(tmp_path / "state.db")
+    sid, session_key = "receipt-raw-live", "receipt-raw-session"
+    db.create_session(session_key, source="tui")
+    seen: dict[str, object] = {}
+    calls = {"context": 0, "speech": 0, "reactions": 0, "hud": 0}
+
+    def run_conversation(message, **kwargs):
+        seen["message"] = message
+        seen["persisted"] = kwargs["persist_user_message"]
+        return {"final_response": "done"}
+
+    session = {
+        "session_key": session_key,
+        "history": [],
+        "history_lock": threading.RLock(),
+        "history_version": 0,
+        "running": False,
+        "attached_images": [],
+        "agent": types.SimpleNamespace(
+            session_id=session_key,
+            api_mode="chat_completions",
+            run_conversation=run_conversation,
+            clear_interrupt=lambda: None,
+        ),
+        "transport": None,
+        "cwd": str(tmp_path),
+    }
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_db", db)
+    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
+    monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *_args: None)
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *_args: False)
+    monkeypatch.setattr(server, "_start_agent_build", lambda *_args: None)
+    monkeypatch.setattr(server, "_wait_agent_for_prompt", lambda *_args: None)
+    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
+    monkeypatch.setattr(server, "_apply_pending_model_switch", lambda *_args: None)
+    monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda *_args: None)
+    monkeypatch.setattr(server, "_sync_bot_capabilities", lambda *_args: None)
+    monkeypatch.setattr(server, "_session_cwd", lambda _session: str(tmp_path))
+    monkeypatch.setattr(server, "_register_session_cwd", lambda _session: None)
+    monkeypatch.setattr(server, "_tts_stream_begin", lambda: None)
+    monkeypatch.setattr(server, "_voice_mode_enabled", lambda: False)
+    monkeypatch.setattr(server, "_load_interim_assistant_messages", lambda: False)
+    monkeypatch.setattr(server, "_pending_reaction_notes", lambda _session: calls.__setitem__("reactions", calls["reactions"] + 1) or "[reaction]")
+    monkeypatch.setattr(server, "_hud_surface_note", lambda _session: calls.__setitem__("hud", calls["hud"] + 1) or "[hud]")
+    monkeypatch.setattr(
+        "hermes_cli.input_sanitize.sanitize_user_prompt_text",
+        lambda value: f"sanitized::{value}",
+    )
+    monkeypatch.setattr(
+        "agent.context_references.preprocess_context_references",
+        lambda *_args, **_kwargs: calls.__setitem__("context", calls["context"] + 1),
+    )
+    monkeypatch.setattr(
+        "tools.tts_streaming.take_speech_interrupted",
+        lambda: calls.__setitem__("speech", calls["speech"] + 1) or True,
+    )
+    try:
+        result = server._methods["prompt.submit"](
+            "rid",
+            {
+                "session_id": sid,
+                "text": "raw @context",
+                "surface": "hud",
+                "turn_request_id": "raw-runtime-request",
+            },
+        )
+
+        assert result["result"]["status"] == "streaming"
+        assert seen == {
+            "message": "sanitized::raw @context",
+            "persisted": "sanitized::raw @context",
+        }
+        assert calls == {"context": 0, "speech": 0, "reactions": 0, "hud": 0}
+    finally:
+        server._sessions.pop(sid, None)
+        db.close()
+
+
+def test_receipt_admission_keeps_late_attachment_for_the_next_ordinary_turn(
+    tmp_path, monkeypatch
+):
+    """A post-admission attachment cannot enter or be consumed by receipt v1."""
+    from tui_gateway import server
+
+    db = SessionDB(tmp_path / "state.db")
+    sid, session_key = "receipt-race-live", "receipt-race-session"
+    db.create_session(session_key, source="tui")
+    image = tmp_path / "late.png"
+    image.write_bytes(b"late attachment")
+    runs: list[tuple[object, object]] = []
+    image_messages: list[tuple[str, list[str]]] = []
+
+    def run_conversation(message, **kwargs):
+        runs.append((message, kwargs["persist_user_message"]))
+        return {"final_response": "done"}
+
+    session = {
+        "session_key": session_key,
+        "history": [],
+        "history_lock": threading.RLock(),
+        "history_version": 0,
+        "running": False,
+        "attached_images": [],
+        "agent": types.SimpleNamespace(
+            session_id=session_key,
+            api_mode="chat_completions",
+            run_conversation=run_conversation,
+            clear_interrupt=lambda: None,
+        ),
+        "transport": None,
+        "cwd": str(tmp_path),
+    }
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_db", db)
+    monkeypatch.setattr(server, "_emit", lambda *_args: None)
+    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
+    monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *_args: None)
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *_args: False)
+    monkeypatch.setattr(server, "_start_agent_build", lambda *_args: None)
+    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
+    monkeypatch.setattr(server, "_apply_pending_model_switch", lambda *_args: None)
+    monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda *_args: None)
+    monkeypatch.setattr(server, "_sync_bot_capabilities", lambda *_args: None)
+    monkeypatch.setattr(server, "_session_cwd", lambda _session: str(tmp_path))
+    monkeypatch.setattr(server, "_register_session_cwd", lambda _session: None)
+    monkeypatch.setattr(server, "_tts_stream_begin", lambda: None)
+    monkeypatch.setattr(server, "_voice_mode_enabled", lambda: False)
+    monkeypatch.setattr(server, "_load_interim_assistant_messages", lambda: False)
+    monkeypatch.setattr(
+        "hermes_cli.input_sanitize.sanitize_user_prompt_text",
+        lambda value: f"sanitized::{value}",
+    )
+    monkeypatch.setattr(
+        server,
+        "_build_image_ref_message",
+        lambda prompt, paths: image_messages.append((prompt, list(paths)))
+        or f"{prompt} [image={paths[0]}]",
+    )
+    barrier = {"attach": True}
+
+    def wait_until_admitted(*_args):
+        if barrier["attach"]:
+            barrier["attach"] = False
+            session["attached_images"].append(str(image))
+        return None
+
+    monkeypatch.setattr(server, "_wait_agent_for_prompt", wait_until_admitted)
+    try:
+        receipt = server._methods["prompt.submit"](
+            "receipt",
+            {
+                "session_id": sid,
+                "text": "receipt text",
+                "turn_request_id": "late-attachment-request",
+            },
+        )
+
+        assert receipt["result"]["status"] == "streaming"
+        assert runs == [("sanitized::receipt text", "sanitized::receipt text")]
+        assert image_messages == []
+        assert session["attached_images"] == [str(image)]
+
+        ordinary = server._methods["prompt.submit"](
+            "ordinary", {"session_id": sid, "text": "ordinary text"}
+        )
+
+        assert ordinary["result"]["status"] == "streaming"
+        assert image_messages == [("sanitized::ordinary text", [str(image)])]
+        assert runs[-1][0] == f"sanitized::ordinary text [image={image}]"
+        assert str(image) in runs[-1][1]
+        assert session["attached_images"] == []
+    finally:
+        server._sessions.pop(sid, None)
+        db.close()
+
+
+def test_receipt_rpc_boundaries_expose_only_the_safe_disposition(receipt_gateway):
+    """Admission, status, in-progress, and replay cannot expose row metadata."""
+    server, db, session_id, session_key, session, _image, events, effects = receipt_gateway
+    request = _effective_request(session_key)
+    expected = {"turnRequestId": "request-1", "status": "PREPARED"}
+
+    prepared = server._methods["turn.prepare"]("prepare", _params())
+    status = server._methods["turn.status"]("status", _params())
+    in_progress = server._methods["prompt.submit"]("submit", _params())
+
+    assert prepared["result"]["turn_receipt"] == expected
+    assert status["result"]["turn_receipt"] == expected
+    assert in_progress["result"] == {"status": "in_progress", "turn_receipt": expected}
+    assert TurnReceiptAdapter(db).status_for(request)["sessionId"] == session_key
+    assert effects == {key: 0 for key in effects}
+
+    claimed = TurnReceiptAdapter(db).claim_after_lease(request)
+    assistant_text = "stored assistant reply"
+    TurnReceiptAdapter(db).finish(
+        session_key,
+        request.turn_request_id,
+        request.binding_digest,
+        claimed.claim_token,
+        assistant_content=assistant_text,
+        response_digest="sha256:" + "1" * 64,
+    )
+    replay = server._methods["prompt.submit"]("replay", _params())
+    completed = {"turnRequestId": "request-1", "status": "COMPLETED"}
+
+    assert replay["result"] == {
+        "status": "complete",
+        "turn_receipt": completed,
+        "replayed": True,
+    }
+    assert events[-1] == (
+        "message.complete",
+        session_id,
+        {
+            "text": assistant_text,
+            "status": "complete",
+            "turn_receipt": completed,
+            "replayed": True,
+        },
+    )
+    assert set(events[-1][2]["turn_receipt"]) == {"turnRequestId", "status"}
+    assert session["history"] == [{"role": "user", "content": "old", "_row_id": 71}]
 
 
 @pytest.mark.parametrize("handler", ["prompt.submit", "turn.prepare", "turn.status"])
@@ -245,6 +478,45 @@ def test_receipt_handlers_reject_non_string_or_blank_request_ids(
         "message": "turn_request_id must be a non-empty string",
     }
     assert effects == {key: 0 for key in effects}
+    assert db.get_messages(session_key) == []
+    assert db._conn.execute("SELECT COUNT(*) FROM turn_receipts").fetchone()[0] == 0
+    assert session["history"] == [{"role": "user", "content": "old", "_row_id": 71}]
+
+
+@pytest.mark.parametrize("handler", ["prompt.submit", "turn.prepare", "turn.status"])
+@pytest.mark.parametrize(
+    ("param", "value"),
+    [
+        ("truncate_before_row_id", True),
+        ("truncate_before_row_id", 71.0),
+        ("truncate_before_row_id", "71"),
+        ("truncate_before_user_ordinal", True),
+        ("truncate_before_user_ordinal", 0.0),
+        ("truncate_before_user_ordinal", "0"),
+        ("truncate_before_message_id", True),
+        ("truncate_before_message_id", 71),
+        ("truncate_before_message_id", 71.0),
+        ("truncate_before_message_id", ""),
+    ],
+)
+def test_receipt_handlers_reject_malformed_truncation_identifiers_before_mutation(
+    receipt_gateway, handler, param, value
+):
+    """Receipt v1 accepts only JSON integer ids and nonempty string message ids."""
+    server, db, _session_id, session_key, session, _image, events, effects = receipt_gateway
+    params = _params()
+    params.pop("truncate_before_row_id")
+    params.pop("truncate_before_user_ordinal")
+    params[param] = value
+
+    result = server._methods[handler]("rid", params)
+
+    assert result["error"] == {
+        "code": 4004,
+        "message": f"{param} has an invalid receipt identifier",
+    }
+    assert effects == {key: 0 for key in effects}
+    assert events == []
     assert db.get_messages(session_key) == []
     assert db._conn.execute("SELECT COUNT(*) FROM turn_receipts").fetchone()[0] == 0
     assert session["history"] == [{"role": "user", "content": "old", "_row_id": 71}]
@@ -396,7 +668,7 @@ def test_prepared_receipt_while_busy_returns_in_progress_without_dispatch(
         "status": "in_progress",
         "turn_receipt": prepared["result"]["turn_receipt"],
     }
-    assert TurnReceiptAdapter(db).status_for(expected) == prepared["result"]["turn_receipt"]
+    assert TurnReceiptAdapter(db).status_for(expected)["status"] == "PREPARED"
     assert effects == {key: 0 for key in effects}
 
 
@@ -418,7 +690,7 @@ def test_receipt_submit_rejects_compute_host_before_any_dispatch(
         "code": 4009,
         "message": "turn receipts are unavailable with compute-host isolation",
     }
-    assert TurnReceiptAdapter(db).status_for(expected) == prepared["result"]["turn_receipt"]
+    assert TurnReceiptAdapter(db).status_for(expected)["status"] == "PREPARED"
     assert effects == {key: 0 for key in effects}
 
 

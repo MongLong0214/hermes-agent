@@ -250,18 +250,24 @@ def test_completed_turn_still_clears_inflight(emits, turn_env):
 
 
 def test_completed_turn_emits_public_receipt_with_transformed_response(emits, turn_env):
-    public_receipt = {
+    internal_receipt = {
         "turnRequestId": "turn-request-7",
         "status": "COMPLETED",
+        "sessionId": "session-key",
         "terminalMessageId": 91,
         "responseDigest": "sha256:public-digest",
+        "createdAt": 1.0,
+        "claimedAt": 2.0,
+        "completedAt": 3.0,
+        "bindingDigest": "binding:private",
+        "claimToken": "claim:private",
     }
     transformed_response = "Transformed terminal response"
     agent = types.SimpleNamespace(
         session_id="session-key",
         run_conversation=lambda *a, **k: {
             "final_response": transformed_response,
-            "turn_receipt": public_receipt,
+            "turn_receipt": internal_receipt,
         },
         clear_interrupt=lambda: None,
     )
@@ -275,10 +281,11 @@ def test_completed_turn_emits_public_receipt_with_transformed_response(emits, tu
         "text": transformed_response,
         "usage": {},
         "status": "complete",
-        "turn_receipt": public_receipt,
+        "turn_receipt": {
+            "turnRequestId": "turn-request-7",
+            "status": "COMPLETED",
+        },
     }
-    assert "bindingDigest" not in payload["turn_receipt"]
-    assert "claimToken" not in payload["turn_receipt"]
 
 
 @pytest.mark.parametrize(
