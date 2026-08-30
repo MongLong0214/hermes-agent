@@ -3639,7 +3639,7 @@ class TurnReceiptFenceError(RuntimeError):
 
 
 class TurnReceiptConflictError(RuntimeError):
-    """An existing completed receipt conflicts with the requested binding."""
+    """An existing receipt conflicts with the requested immutable binding."""
 
 
 @dataclass(frozen=True)
@@ -3648,6 +3648,7 @@ class TerminalTurnReceipt:
 
     session_id: str
     turn_request_id: str
+    binding_digest: str
     claim_token: str
     response_digest: str
 
@@ -3657,12 +3658,14 @@ class TerminalTurnReceipt:
             for value in (
                 self.session_id,
                 self.turn_request_id,
+                self.binding_digest,
                 self.claim_token,
                 self.response_digest,
             )
         ):
             raise ValueError(
-                "terminal turn receipt requires session, request, claim token, and digest"
+                "terminal turn receipt requires session, request, binding digest, "
+                "claim token, and response digest"
             )
 
 
@@ -4783,6 +4786,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 apply_database_pragmas(self._conn, db_label="state.db")
                 self._conn.execute("PRAGMA foreign_keys=ON")
                 self._fts_cjk_loaded = load_fts5_cjk_extension(self._conn)
+                self.migrate_turn_receipts()
                 self._init_schema()
 
             def _connect_and_init_with_lock_patience():
@@ -8747,28 +8751,72 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         }
 
     def migrate_turn_receipts(self) -> int:
-        """Normalize the receipt rows an existing state DB gained at startup.
+        """Migrate receipt schema without adopting legacy unbound rows.
 
         ``SCHEMA_SQL`` creates the table for databases that predate this
-        dormant feature.  This small, idempotent normalizer is intentionally
-        retained behind the adapter's ``migration`` surface for such opens;
+        dormant feature.  A C3-A table has no ``binding_digest`` column, so
+        SQLite can only add it nullable while preserving its existing rows.
+        Those rows remain explicitly unbound and every bound operation fences
+        them; a supplied digest is never used to backfill historic evidence.
+        This normalizer remains behind the adapter's ``migration`` surface;
         it neither imports an external store nor owns a transaction.
         """
 
         def _do(conn):
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'turn_receipts'"
+            ).fetchone()
+            if exists is None:
+                return 0
+            columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(turn_receipts)").fetchall()
+            }
+            if "binding_digest" not in columns:
+                conn.execute(
+                    "ALTER TABLE turn_receipts ADD COLUMN binding_digest TEXT"
+                )
             return conn.execute(
                 "UPDATE turn_receipts SET status = 'PREPARED' "
                 "WHERE status IS NULL OR TRIM(status) = ''"
             ).rowcount
 
-        return int(self._execute_write(_do) or 0)
+        return int(self._execute_write(_do, _count_write=False) or 0)
+
+    @staticmethod
+    def _require_turn_receipt_binding_digest(binding_digest: str) -> None:
+        """Reject absent bindings without imposing a digest canonicalization policy."""
+        if not isinstance(binding_digest, str) or not binding_digest:
+            raise ValueError("binding_digest is required")
+
+    @staticmethod
+    def _bound_turn_receipt_row(
+        row: Optional[sqlite3.Row], session_id: str, binding_digest: str
+    ) -> Optional[sqlite3.Row]:
+        """Return *row* only when its immutable request binding matches."""
+        if row is None:
+            return None
+        if row["session_id"] != session_id:
+            raise TurnReceiptConflictError(
+                "turn request id is already bound to another session"
+            )
+        stored_digest = row["binding_digest"]
+        if not isinstance(stored_digest, str) or not stored_digest:
+            raise TurnReceiptFenceError("turn receipt has no binding digest")
+        if stored_digest != binding_digest:
+            raise TurnReceiptConflictError(
+                "turn request id is already bound to another digest"
+            )
+        return row
 
     def prepare_turn_receipt(
-        self, session_id: str, turn_request_id: str
+        self, session_id: str, turn_request_id: str, binding_digest: str
     ) -> Dict[str, Any]:
         """Create or return the durable PREPARED receipt for one request."""
         if not session_id or not turn_request_id:
             raise ValueError("session_id and turn_request_id are required")
+        self._require_turn_receipt_binding_digest(binding_digest)
         now = time.time()
 
         def _do(conn):
@@ -8777,16 +8825,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (turn_request_id,),
             ).fetchone()
             if row is not None:
-                if row["session_id"] != session_id:
-                    raise TurnReceiptConflictError(
-                        "turn request id is already bound to another session"
-                    )
-                return self._turn_receipt_public(row)
+                return self._turn_receipt_public(
+                    self._bound_turn_receipt_row(row, session_id, binding_digest)
+                )
             conn.execute(
                 "INSERT INTO turn_receipts "
-                "(turn_request_id, session_id, status, created_at) "
-                "VALUES (?, ?, 'PREPARED', ?)",
-                (turn_request_id, session_id, now),
+                "(turn_request_id, session_id, binding_digest, status, created_at) "
+                "VALUES (?, ?, ?, 'PREPARED', ?)",
+                (turn_request_id, session_id, binding_digest, now),
             )
             row = conn.execute(
                 "SELECT * FROM turn_receipts WHERE turn_request_id = ?",
@@ -8800,33 +8846,40 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return result
 
     def get_turn_receipt(
-        self, session_id: str, turn_request_id: str
+        self, session_id: str, turn_request_id: str, binding_digest: str
     ) -> Optional[Dict[str, Any]]:
-        """Return a receipt only when it belongs to the requested session."""
+        """Return a receipt only when its request binding matches exactly."""
         if not session_id or not turn_request_id:
             return None
+        self._require_turn_receipt_binding_digest(binding_digest)
         with self._read_ctx() as conn:
             row = conn.execute(
-                "SELECT * FROM turn_receipts "
-                "WHERE session_id = ? AND turn_request_id = ?",
-                (session_id, turn_request_id),
+                "SELECT * FROM turn_receipts WHERE turn_request_id = ?",
+                (turn_request_id,),
             ).fetchone()
-        return self._turn_receipt_public(row)
+        return self._turn_receipt_public(
+            self._bound_turn_receipt_row(row, session_id, binding_digest)
+        )
 
     def claim_turn_receipt(
-        self, session_id: str, turn_request_id: str, claim_token: str
+        self,
+        session_id: str,
+        turn_request_id: str,
+        binding_digest: str,
+        claim_token: str,
     ) -> bool:
         """Claim PREPARED once, or idempotently retry its stored token."""
         if not session_id or not turn_request_id or not claim_token:
             return False
+        self._require_turn_receipt_binding_digest(binding_digest)
         claimed_at = time.time()
 
         def _do(conn):
             row = conn.execute(
-                "SELECT status, claim_token FROM turn_receipts "
-                "WHERE session_id = ? AND turn_request_id = ?",
-                (session_id, turn_request_id),
+                "SELECT * FROM turn_receipts WHERE turn_request_id = ?",
+                (turn_request_id,),
             ).fetchone()
+            row = self._bound_turn_receipt_row(row, session_id, binding_digest)
             if row is None:
                 return False
             if row["status"] == "CLAIMED":
@@ -8836,8 +8889,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             changed = conn.execute(
                 "UPDATE turn_receipts SET status = 'CLAIMED', claim_token = ?, "
                 "claimed_at = ? WHERE session_id = ? AND turn_request_id = ? "
-                "AND status = 'PREPARED'",
-                (claim_token, claimed_at, session_id, turn_request_id),
+                "AND binding_digest = ? AND status = 'PREPARED'",
+                (
+                    claim_token,
+                    claimed_at,
+                    session_id,
+                    turn_request_id,
+                    binding_digest,
+                ),
             ).rowcount
             return changed == 1
 
@@ -8849,10 +8908,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     ) -> Optional[int]:
         """Refuse a stale completion before its assistant row is inserted."""
         row = conn.execute(
-            "SELECT status, claim_token, terminal_message_id, response_digest "
-            "FROM turn_receipts WHERE session_id = ? AND turn_request_id = ?",
-            (receipt.session_id, receipt.turn_request_id),
+            "SELECT * FROM turn_receipts WHERE turn_request_id = ?",
+            (receipt.turn_request_id,),
         ).fetchone()
+        row = SessionDB._bound_turn_receipt_row(
+            row, receipt.session_id, receipt.binding_digest
+        )
         if row is None:
             raise TurnReceiptFenceError("terminal receipt was not prepared")
         if row["status"] == "COMPLETED":
@@ -8880,13 +8941,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             "UPDATE turn_receipts SET status = 'COMPLETED', "
             "terminal_message_id = ?, response_digest = ?, completed_at = ? "
             "WHERE session_id = ? AND turn_request_id = ? AND status = 'CLAIMED' "
-            "AND claim_token = ?",
+            "AND binding_digest = ? AND claim_token = ?",
             (
                 terminal_message_id,
                 receipt.response_digest,
                 completed_at,
                 receipt.session_id,
                 receipt.turn_request_id,
+                receipt.binding_digest,
                 receipt.claim_token,
             ),
         ).rowcount
@@ -8897,12 +8959,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self,
         session_id: str,
         turn_request_id: str,
+        binding_digest: str,
         claim_token: str,
         *,
         assistant_content: str,
         response_digest: str,
     ) -> Dict[str, Any]:
         """Append an assistant terminal row and complete its receipt together."""
+        self._require_turn_receipt_binding_digest(binding_digest)
         self.append_message(
             session_id,
             "assistant",
@@ -8910,11 +8974,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             terminal_turn_receipt=TerminalTurnReceipt(
                 session_id=session_id,
                 turn_request_id=turn_request_id,
+                binding_digest=binding_digest,
                 claim_token=claim_token,
                 response_digest=response_digest,
             ),
         )
-        receipt = self.get_turn_receipt(session_id, turn_request_id)
+        receipt = self.get_turn_receipt(session_id, turn_request_id, binding_digest)
         if receipt is None:  # pragma: no cover - guarded by the same transaction
             raise sqlite3.DatabaseError("TURN_RECEIPT_FINISH_MISSING")
         return receipt
