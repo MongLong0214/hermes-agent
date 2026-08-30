@@ -12608,6 +12608,27 @@ def main():
     chat_parser.set_defaults(func=cmd_chat)
 
     # =========================================================================
+    # target bind command — local JSON preflight for an external controller
+    # =========================================================================
+    from hermes_cli.target_bind import cmd_target_bind
+
+    target_parser = subparsers.add_parser(
+        "target",
+        help="Run local target binding operations",
+    )
+    target_subparsers = target_parser.add_subparsers(dest="target_command")
+    target_bind_parser = target_subparsers.add_parser(
+        "bind",
+        help="Verify and persist a target-bind receipt from stdin JSON",
+    )
+    target_bind_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Read exactly one JSON request from standard input",
+    )
+    target_bind_parser.set_defaults(func=cmd_target_bind)
+
+    # =========================================================================
     # model command  (parser built in hermes_cli/subcommands/model.py)
     # =========================================================================
     build_model_parser(subparsers, cmd_model=cmd_model)
