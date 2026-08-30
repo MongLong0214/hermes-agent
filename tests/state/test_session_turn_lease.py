@@ -2,16 +2,211 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import threading
 import time
+import uuid
 from types import SimpleNamespace
 
 import pytest
 
 import hermes_state
-from hermes_state import SessionDB, SessionTurnLeaseLostError
+from hermes_state import (
+    SessionDB,
+    SessionTurnLeaseLostError,
+    TurnReceiptFenceError,
+)
+
+
+def _complete_turn_receipt(
+    db, session_id: str, turn_request_id: str
+) -> tuple[str, dict]:
+    """Create one completed receipt whose terminal row destructive flows remove."""
+    claim_token = f"claim-{turn_request_id}"
+    db.prepare_turn_receipt(session_id, turn_request_id)
+    assert db.claim_turn_receipt(session_id, turn_request_id, claim_token)
+    receipt = db.finish_turn_receipt(
+        session_id,
+        turn_request_id,
+        claim_token,
+        assistant_content="terminal reply",
+        response_digest="sha256:" + "e" * 64,
+    )
+    return claim_token, receipt
+
+
+def _open_with_legacy_restrict_receipts(path):
+    """Open a database whose pre-C3 receipt FK still uses RESTRICT."""
+    fresh = SessionDB(path)
+    try:
+        foreign_keys = fresh._conn.execute(
+            "PRAGMA foreign_key_list('turn_receipts')"
+        ).fetchall()
+        assert any(
+            row["from"] == "terminal_message_id"
+            and row["on_delete"] == "CASCADE"
+            for row in foreign_keys
+        )
+    finally:
+        fresh.close()
+
+    with sqlite3.connect(path) as conn:
+        conn.execute("DROP TABLE turn_receipts")
+        conn.execute(
+            """CREATE TABLE turn_receipts (
+                turn_request_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                status TEXT NOT NULL,
+                claim_token TEXT,
+                terminal_message_id INTEGER REFERENCES messages(id),
+                response_digest TEXT,
+                created_at REAL NOT NULL,
+                claimed_at REAL,
+                completed_at REAL
+            )"""
+        )
+    return SessionDB(path)
+
+
+def test_turn_receipt_claim_token_fences_retries_across_restart(tmp_path):
+    """The stored token alone may retry a claim and its finished receipt."""
+    from tui_gateway.turn_receipts import TurnReceiptAdapter
+
+    path = tmp_path / "state.db"
+    db = SessionDB(path)
+    db.create_session("session", source="test")
+    receipts = TurnReceiptAdapter(db)
+    receipts.prepare("session", "request")
+    token, claimed = receipts.claim("session", "request", claim_token="claim-a")
+    assert token == "claim-a"
+    assert claimed is not None
+    claimed_at = claimed["claimedAt"]
+    db.close()
+
+    reopened = SessionDB(path)
+    receipts = TurnReceiptAdapter(reopened)
+    try:
+        retry_token, retried_claim = receipts.claim(
+            "session", "request", claim_token="claim-a"
+        )
+        assert retry_token == "claim-a"
+        assert retried_claim is not None
+        assert retried_claim["claimedAt"] == claimed_at
+
+        rejected_token, rejected_claim = receipts.claim(
+            "session", "request", claim_token="claim-b"
+        )
+        assert rejected_token is None
+        assert rejected_claim == retried_claim
+
+        completed = receipts.finish(
+            "session",
+            "request",
+            "claim-a",
+            assistant_content="terminal reply",
+            response_digest="sha256:" + "e" * 64,
+        )
+        with pytest.raises(TurnReceiptFenceError):
+            receipts.finish(
+                "session",
+                "request",
+                "claim-b",
+                assistant_content="terminal reply",
+                response_digest="sha256:" + "e" * 64,
+            )
+        completed_bytes = json.dumps(completed, separators=(",", ":"))
+        retried_completed = receipts.finish(
+            "session",
+            "request",
+            "claim-a",
+            assistant_content="terminal reply",
+            response_digest="sha256:" + "e" * 64,
+        )
+        assert (
+            json.dumps(retried_completed, separators=(",", ":")) == completed_bytes
+        )
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize("operation", ("replace", "clear", "delete"))
+def test_destructive_message_operations_retire_terminal_receipts(tmp_path, operation):
+    """Terminal-message deletion also works for existing RESTRICT schemas."""
+    db = _open_with_legacy_restrict_receipts(tmp_path / f"{operation}.db")
+    db.create_session("session", source="test")
+    _, completed = _complete_turn_receipt(db, "session", f"request-{operation}")
+    assert completed["terminalMessageId"] is not None
+
+    if operation == "replace":
+        db.replace_messages(
+            "session", [{"role": "user", "content": "replacement"}]
+        )
+        assert [row["content"] for row in db.get_messages("session")] == [
+            "replacement"
+        ]
+    elif operation == "clear":
+        db.clear_messages("session")
+        assert db.get_messages("session") == []
+    else:
+        assert db.delete_session("session") is True
+
+    assert db.get_turn_receipt("session", f"request-{operation}") is None
+    assert db._conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    db.close()
+
+
+def test_terminal_assistant_row_and_completed_receipt_commit_atomically(tmp_path):
+    """Each injected failure leaves neither the terminal row nor COMPLETED receipt."""
+    from hermes_state import TerminalTurnReceipt
+
+    for stage, trigger_sql in (
+        (
+            "before row insert",
+            """CREATE TRIGGER terminal_receipt_before_row_insert
+            BEFORE INSERT ON messages WHEN NEW.role = 'assistant'
+            BEGIN SELECT RAISE(ABORT, 'before row insert'); END""",
+        ),
+        (
+            "after row insert",
+            """CREATE TRIGGER terminal_receipt_after_row_insert
+            AFTER INSERT ON messages WHEN NEW.role = 'assistant'
+            BEGIN SELECT RAISE(ABORT, 'after row insert'); END""",
+        ),
+        (
+            "before receipt update",
+            """CREATE TRIGGER terminal_receipt_before_receipt_update
+            BEFORE UPDATE OF status ON turn_receipts
+            WHEN NEW.status = 'COMPLETED'
+            BEGIN SELECT RAISE(ABORT, 'before receipt update'); END""",
+        ),
+    ):
+        db = SessionDB(tmp_path / f"{stage.replace(' ', '-')}.db")
+        db.create_session("session", source="test")
+        turn_request_id = uuid.uuid4().hex
+        claim_token = uuid.uuid4().hex
+        db.prepare_turn_receipt("session", turn_request_id)
+        assert db.claim_turn_receipt("session", turn_request_id, claim_token)
+        db._conn.execute(trigger_sql)
+
+        with pytest.raises(sqlite3.DatabaseError, match=stage):
+            db.append_message(
+                "session",
+                "assistant",
+                content="terminal reply",
+                terminal_turn_receipt=TerminalTurnReceipt(
+                    session_id="session",
+                    turn_request_id=turn_request_id,
+                    claim_token=claim_token,
+                    response_digest="sha256:" + "a" * 64,
+                ),
+            )
+
+        assert db.get_messages("session") == []
+        receipt = db.get_turn_receipt("session", turn_request_id)
+        assert receipt["status"] != "COMPLETED", stage
+        db.close()
 
 
 def test_turn_lease_serializes_separate_session_db_instances(tmp_path):
