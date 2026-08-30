@@ -1843,13 +1843,20 @@ class HermesACPAgent(acp.Agent):
             logger.error("prompt: session %s not found", session_id)
             return PromptResponse(stop_reason="refusal")
 
-        terminal_receipt_present = "hermes.acpTerminalReceipt" in kwargs
+        hermes_metadata = kwargs.get("hermes")
+        terminal_receipt_present = (
+            isinstance(hermes_metadata, dict)
+            and "acpTerminalReceipt" in hermes_metadata
+        )
         terminal_receipt: ClaimedReceipt | None = None
         terminal_receipt_db = None
         terminal_receipt_identity: dict[str, Any] | None = None
         terminal_receipt_target: dict[str, Any] | None = None
         if terminal_receipt_present:
-            metadata = kwargs["hermes.acpTerminalReceipt"]
+            hermes_metadata = kwargs["hermes"]
+            if set(hermes_metadata) != {"acpTerminalReceipt"}:
+                return self._terminal_receipt_refusal()
+            metadata = hermes_metadata["acpTerminalReceipt"]
             if not isinstance(metadata, dict) or set(metadata) != {
                 "operation", "receiptIdentity", "targetBindReceipt"
             }:
@@ -1869,8 +1876,16 @@ class HermesACPAgent(acp.Agent):
                 return self._terminal_receipt_refusal()
             current_agent_session_id = getattr(state.agent, "session_id", None) or state.session_id
             try:
+                admission = db.validate_acp_turn_receipt_request(
+                    session_id, receipt_identity, target_bind_receipt
+                )
+                receipt_identity = admission["receiptIdentity"]
+                target_bind_receipt = admission["targetBindReceipt"]
                 target_session_id = target_bind_receipt["requested_session_id"]
-                if db.get_conversation_root(current_agent_session_id) != target_session_id:
+                if (
+                    db.get_conversation_root(current_agent_session_id)
+                    != db.get_conversation_root(target_session_id)
+                ):
                     return self._terminal_receipt_refusal()
             except Exception:
                 logger.debug("ACP terminal receipt target refused", exc_info=True)
@@ -1886,7 +1901,11 @@ class HermesACPAgent(acp.Agent):
                     return self._terminal_receipt_refusal()
                 if receipt is None:
                     return await self._terminal_receipt_response(
-                        session_id, {"status": "NEVER_FOUND"}
+                        session_id,
+                        {
+                            "status": "NEVER_FOUND",
+                            "turnRequestId": receipt_identity["turnRequestId"],
+                        },
                     )
                 if receipt.get("status") == "COMPLETED":
                     request = self._terminal_receipt_request(
@@ -1904,10 +1923,10 @@ class HermesACPAgent(acp.Agent):
                     return await self._terminal_receipt_response(session_id, replay)
                 return await self._terminal_receipt_response(session_id, receipt)
 
-            user_content = _content_blocks_to_openai_user_content(prompt)
-            if not all(isinstance(block, TextContentBlock) for block in prompt) or not isinstance(
-                user_content, str
-            ):
+            if len(prompt) != 1 or not isinstance(prompt[0], TextContentBlock):
+                return self._terminal_receipt_refusal()
+            user_content = prompt[0].text
+            if not isinstance(user_content, str):
                 return self._terminal_receipt_refusal()
             normalized_user_content = user_content.replace("\r\n", "\n").replace("\r", "\n")
             expected_prompt_digest = "sha256:" + hashlib.sha256(

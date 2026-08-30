@@ -6646,6 +6646,9 @@ def test_turn_receipt_persists_acp_identity_separate_from_target_bind_evidence(t
             )
         }
 
+        admission = db.validate_acp_turn_receipt_request(session_id, identity, target_bind)
+        assert admission["receiptIdentity"] == identity
+        assert admission["targetBindReceipt"] == target_bind
         prepared = db.prepare_acp_turn_receipt(
             session_id,
             identity,
@@ -6658,10 +6661,66 @@ def test_turn_receipt_persists_acp_identity_separate_from_target_bind_evidence(t
         assert db.prepare_acp_turn_receipt(session_id, identity, target_bind) == prepared
 
         conflicting = {**identity, "targetAttestationId": "target-attestation-2"}
+        conflicting_admission = db.validate_acp_turn_receipt_request(
+            session_id, conflicting, target_bind
+        )
+        assert conflicting_admission["receiptIdentityDigest"] != admission["receiptIdentityDigest"]
         with pytest.raises(hermes_state.TurnReceiptConflictError):
             db.prepare_acp_turn_receipt(session_id, conflicting, target_bind)
 
         assert db.get_acp_turn_receipt(session_id, identity, target_bind) == prepared
         assert db.get_acp_turn_receipt(session_id, conflicting, target_bind) is None
+    finally:
+        db.close()
+
+
+def test_acp_receipt_identity_validation_is_closed_and_side_effect_free(tmp_path):
+    """Invalid ACP admission cannot insert a receipt or mutate bind evidence."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "hermes-session"
+    identity = {
+        "schema": "hermes.acp-terminal-receipt-identity",
+        "version": 1,
+        "turnRequestId": "turn-identity-validation",
+        "targetActorId": "actor-1",
+        "promptDigest": "sha256:" + "b" * 64,
+        "bindingGeneration": 7,
+        "targetBindingId": "opaque-target-binding",
+        "targetAttestationId": "opaque-target-attestation",
+        "executorSessionId": "opaque-executor-session",
+        "executorSessionIncarnation": "opaque-incarnation",
+    }
+    try:
+        db.create_session(session_id, source="test")
+        target_record = db.prepare_target_bind_receipt(
+            session_id, "actor-1", 7, "executor-runtime-1"
+        )
+        target_bind = {
+            key: target_record[key]
+            for key in (
+                "schema", "domain", "version", "actor_id", "binding_generation",
+                "executor_runtime_identity", "requested_session_id", "lineage_root_digest",
+                "receipt_digest",
+            )
+        }
+        for malformed_identity in (
+            {key: value for key, value in identity.items() if key != "executorSessionId"},
+            {**identity, "unexpected": True},
+        ):
+            with pytest.raises(ValueError):
+                db.validate_acp_turn_receipt_request(
+                    session_id, malformed_identity, target_bind
+                )
+        with pytest.raises(hermes_state.TargetBindReceiptFenceError):
+            db.validate_acp_turn_receipt_request(
+                session_id,
+                identity,
+                {key: value for key, value in target_bind.items() if key != "receipt_digest"},
+            )
+
+        assert db.get_turn_receipt(
+            session_id, identity["turnRequestId"], "sha256:" + "b" * 64
+        ) is None
+        assert db.validate_target_bind_receipt(session_id, target_bind) == target_bind
     finally:
         db.close()

@@ -9152,6 +9152,48 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 conn, session_id, target_bind_receipt
             )
 
+    def validate_acp_turn_receipt_request(
+        self,
+        session_id: str,
+        receipt_identity: Dict[str, Any],
+        target_bind_receipt: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Return closed ACP admission evidence without inserting or updating.
+
+        ACP-local identifiers remain opaque to Hermes: their normalized bytes
+        are committed in the identity digest, while Hermes resolves only its
+        target-bind actor, generation, runtime, and lineage-root evidence.
+        """
+        session_id = self._require_target_bind_identifier(session_id, "session_id")
+        turn_request_id = (
+            receipt_identity.get("turnRequestId")
+            if isinstance(receipt_identity, dict)
+            and isinstance(receipt_identity.get("turnRequestId"), str)
+            else ""
+        )
+        normalized_identity, identity_digest = self._canonical_acp_turn_receipt_identity(
+            receipt_identity, turn_request_id=turn_request_id
+        )
+        with self._read_ctx() as conn:
+            normalized_target_bind = self._validate_target_bind_receipt_on_conn(
+                conn, session_id, target_bind_receipt
+            )
+        if (
+            normalized_identity["targetActorId"]
+            != normalized_target_bind["actor_id"]
+            or normalized_identity["bindingGeneration"]
+            != normalized_target_bind["binding_generation"]
+        ):
+            raise TargetBindReceiptFenceError(
+                "receipt identity is not authorized by target bind receipt"
+            )
+        return {
+            "receiptIdentity": normalized_identity,
+            "receiptIdentityDigest": identity_digest,
+            "targetBindReceipt": normalized_target_bind,
+            "targetBindReceiptDigest": normalized_target_bind["receipt_digest"],
+        }
+
     @staticmethod
     def _require_turn_receipt_binding_digest(binding_digest: str) -> None:
         """Reject absent bindings without imposing a digest canonicalization policy."""
@@ -9185,20 +9227,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         target_bind_receipt: Dict[str, Any],
     ) -> Dict[str, Any]:
         """Prepare one receipt using its closed ACP identity as the binding."""
-        turn_request_id = (
-            receipt_identity.get("turnRequestId")
-            if isinstance(receipt_identity, dict)
-            else ""
-        )
-        normalized_identity, identity_digest = self._canonical_acp_turn_receipt_identity(
-            receipt_identity, turn_request_id=turn_request_id
+        admission = self.validate_acp_turn_receipt_request(
+            session_id, receipt_identity, target_bind_receipt
         )
         return self.prepare_turn_receipt(
             session_id,
-            normalized_identity["turnRequestId"],
-            identity_digest,
-            receipt_identity=normalized_identity,
-            target_bind_receipt=target_bind_receipt,
+            admission["receiptIdentity"]["turnRequestId"],
+            admission["receiptIdentityDigest"],
+            receipt_identity=admission["receiptIdentity"],
+            target_bind_receipt=admission["targetBindReceipt"],
         )
 
     def prepare_turn_receipt(
@@ -9238,6 +9275,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 ):
                     raise TargetBindReceiptFenceError(
                         "receipt identity is not authorized by target bind receipt"
+                    )
+                if binding_digest != identity_digest:
+                    raise TurnReceiptFenceError(
+                        "ACP receipt identity digest does not match binding digest"
                     )
                 target_bind_digest = normalized_target_bind["receipt_digest"]
             row = conn.execute(
@@ -9326,17 +9367,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         target_bind_receipt: Dict[str, Any],
     ) -> Optional[Dict[str, Any]]:
         """Read one ACP receipt after revalidating its durable admission proof."""
-        turn_request_id = (
-            receipt_identity.get("turnRequestId")
-            if isinstance(receipt_identity, dict)
-            else ""
+        admission = self.validate_acp_turn_receipt_request(
+            session_id, receipt_identity, target_bind_receipt
         )
-        normalized_identity, identity_digest = self._canonical_acp_turn_receipt_identity(
-            receipt_identity, turn_request_id=turn_request_id
-        )
-        normalized_target_bind = self.validate_target_bind_receipt(
-            session_id, target_bind_receipt
-        )
+        normalized_identity = admission["receiptIdentity"]
+        identity_digest = admission["receiptIdentityDigest"]
+        normalized_target_bind = admission["targetBindReceipt"]
         try:
             receipt = self.get_turn_receipt(
                 session_id, normalized_identity["turnRequestId"], identity_digest
