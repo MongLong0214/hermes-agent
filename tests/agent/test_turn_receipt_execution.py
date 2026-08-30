@@ -225,6 +225,146 @@ def test_genuine_terminal_response_is_sanitized_and_atomically_completes(
     assert "post_llm_call" in hooks
 
 
+def test_receipt_flush_binds_the_held_batch_row_not_a_later_assistant(
+    receipt_agent,
+):
+    """The receipt index, rather than batch order, selects the terminal row."""
+    from tui_gateway.turn_receipts import TerminalReceiptHold
+
+    agent, db, session_id = receipt_agent
+    request = _request(session_id, request_id="exact-held-batch-row")
+    receipts = TurnReceiptAdapter(db)
+    receipts.prepare_or_replay(request)
+    claimed = receipts.claim_after_lease(request)
+    held = {"role": "assistant", "content": "held terminal"}
+    later = {"role": "assistant", "content": "later assistant"}
+    messages = [{"role": "user", "content": "question"}, held, later]
+    hold = TerminalReceiptHold(
+        claimed,
+        held,
+        1,
+        "sha256:" + hashlib.sha256(held["content"].encode()).hexdigest(),
+    )
+
+    assert agent._flush_messages_to_session_db(
+        messages, [], terminal_receipt_hold=hold
+    ) is True
+
+    completed = receipts.status_for(request)
+    rows = db.get_messages(session_id)
+    held_row = rows[1]
+    assert completed["status"] == "COMPLETED"
+    assert completed["terminalMessageId"] == held_row["id"]
+    assert held_row["content"] == held["content"]
+    assert completed["terminalMessageId"] != rows[2]["id"]
+
+
+@pytest.mark.parametrize("failure", ["missing", "duplicate", "moved", "hidden", "marked"])
+def test_receipt_flush_rejects_nonexact_held_mapping_before_any_write(
+    receipt_agent, failure
+):
+    """A receipt cannot settle through a missing, stale, hidden, or duplicate hold."""
+    from tui_gateway.turn_receipts import TerminalReceiptHold
+
+    agent, db, session_id = receipt_agent
+    request = _request(session_id, request_id=f"invalid-held-{failure}")
+    receipts = TurnReceiptAdapter(db)
+    receipts.prepare_or_replay(request)
+    claimed = receipts.claim_after_lease(request)
+    held = {"role": "assistant", "content": "held terminal"}
+    messages = [{"role": "user", "content": "question"}, held]
+    hold_index = 1
+    if failure == "missing":
+        hold = {"role": "assistant", "content": "missing terminal"}
+    elif failure == "duplicate":
+        messages.append(held)
+        hold = held
+    elif failure == "moved":
+        messages.insert(1, {"role": "assistant", "content": "replacement"})
+        hold = held
+    elif failure == "hidden":
+        held["display_kind"] = "hidden"
+        hold = held
+    else:
+        held["_db_persisted"] = True
+        hold = held
+    terminal_hold = TerminalReceiptHold(
+        claimed,
+        hold,
+        hold_index,
+        "sha256:" + hashlib.sha256(hold["content"].encode()).hexdigest(),
+    )
+
+    with pytest.raises(RuntimeError, match="terminal turn receipt hold is not persistable"):
+        agent._flush_messages_to_session_db(
+            messages, [], terminal_receipt_hold=terminal_hold
+        )
+
+    assert db.get_messages(session_id) == []
+    assert receipts.status_for(request)["status"] == "CLAIMED"
+
+
+def test_compression_retry_preserves_receipt_context_and_never_generic_persists(
+    receipt_agent, monkeypatch
+):
+    """A live-tip retry must carry the exact receipt or leave its held row absent."""
+    from tui_gateway.turn_receipts import TerminalReceiptHold
+
+    agent, db, session_id = receipt_agent
+    request = _request(session_id, request_id="compression-held-retry")
+    receipts = TurnReceiptAdapter(db)
+    receipts.prepare_or_replay(request)
+    claimed = receipts.claim_after_lease(request)
+    held = {"role": "assistant", "content": "held after compression"}
+    hold = TerminalReceiptHold(
+        claimed,
+        held,
+        1,
+        "sha256:" + hashlib.sha256(held["content"].encode()).hexdigest(),
+    )
+    messages = [{"role": "user", "content": "question"}, held]
+    live_tip = "receipt-live-compression-tip"
+    db.end_session(session_id, "compression")
+    db.create_session(live_tip, source="test", parent_session_id=session_id)
+
+    calls = []
+    real_append = db.append_messages_batch
+
+    def observed_append(*args, **kwargs):
+        calls.append((kwargs["session_id"], kwargs.get("terminal_turn_receipt")))
+        return real_append(*args, **kwargs)
+
+    monkeypatch.setattr(db, "append_messages_batch", observed_append)
+
+    assert agent._flush_messages_to_session_db(
+        messages, [], terminal_receipt_hold=hold
+    ) is False
+    assert [session for session, _receipt in calls] == [session_id, live_tip]
+    first_receipt = calls[0][1]
+    second_receipt = calls[1][1]
+    assert first_receipt is not None
+    assert second_receipt is not None
+    assert (
+        first_receipt.session_id,
+        first_receipt.turn_request_id,
+        first_receipt.binding_digest,
+        first_receipt.claim_token,
+        first_receipt.response_digest,
+        first_receipt.terminal_message_index,
+    ) == (
+        second_receipt.session_id,
+        second_receipt.turn_request_id,
+        second_receipt.binding_digest,
+        second_receipt.claim_token,
+        second_receipt.response_digest,
+        second_receipt.terminal_message_index,
+    )
+    assert first_receipt.terminal_message_index == 1
+    assert db.get_messages(session_id) == []
+    assert db.get_messages(live_tip) == []
+    assert receipts.status_for(request)["status"] == "CLAIMED"
+
+
 @pytest.mark.parametrize("failure", ["flush_false", "replaced", "marked"])
 def test_failed_terminal_settlement_never_completes_or_runs_post_success_work(
     receipt_agent, monkeypatch, failure

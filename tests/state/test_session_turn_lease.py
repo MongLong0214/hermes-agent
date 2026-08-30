@@ -216,6 +216,7 @@ def test_terminal_assistant_row_and_completed_receipt_commit_atomically(tmp_path
                     binding_digest=binding_digest,
                     claim_token=claim_token,
                     response_digest="sha256:" + "a" * 64,
+                    terminal_message_index=0,
                 ),
             )
 

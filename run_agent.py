@@ -2161,9 +2161,15 @@ class AIAgent:
             hold_message = terminal_receipt_hold.terminal_message
             hold_index = terminal_receipt_hold.terminal_message_index
             if (
-                hold_index < 0 or hold_index >= len(messages)
+                not isinstance(hold_index, int)
+                or isinstance(hold_index, bool)
+                or hold_index < 0
+                or hold_index >= len(messages)
+                or not isinstance(hold_message, dict)
                 or messages[hold_index] is not hold_message
+                or sum(message is hold_message for message in messages) != 1
                 or hold_message.get("role") != "assistant"
+                or hold_message.get("display_kind") == "hidden"
                 or hold_message.get("tool_calls")
                 or not isinstance(hold_message.get("content"), str)
                 or hold_message.get(_DB_PERSISTED_MARKER)
@@ -2416,7 +2422,22 @@ class AIAgent:
                 if terminal_receipt_hold is not None:
                     from hermes_state import TerminalTurnReceipt
 
-                    if terminal_receipt_hold.terminal_message not in _batch_msgs:
+                    hold_message = terminal_receipt_hold.terminal_message
+                    terminal_indices = [
+                        index
+                        for index, message in enumerate(_batch_msgs)
+                        if message is hold_message
+                    ]
+                    if len(terminal_indices) != 1:
+                        raise RuntimeError("terminal receipt hold was not selected for batch")
+                    terminal_message_index = terminal_indices[0]
+                    terminal_row = _batch_rows[terminal_message_index]
+                    if (
+                        terminal_row.get("role") != "assistant"
+                        or terminal_row.get("display_kind") == "hidden"
+                        or terminal_row.get("tool_calls")
+                        or not isinstance(terminal_row.get("content"), str)
+                    ):
                         raise RuntimeError("terminal receipt hold was not selected for batch")
                     claimed = terminal_receipt_hold.claimed
                     terminal_turn_receipt = TerminalTurnReceipt(
@@ -2425,6 +2446,7 @@ class AIAgent:
                         binding_digest=claimed.request.binding_digest,
                         claim_token=claimed.claim_token,
                         response_digest=terminal_receipt_hold.response_digest,
+                        terminal_message_index=terminal_message_index,
                     )
                 self._session_db.append_messages_batch(
                     session_id=self.session_id,
@@ -2510,6 +2532,7 @@ class AIAgent:
                                 messages,
                                 conversation_history,
                                 _adoption_budget=0,
+                                terminal_receipt_hold=terminal_receipt_hold,
                             )
                 # No live tip (or budget exhausted): fail closed — never guess
                 # a target session. The per-turn diagnostic flag lets the

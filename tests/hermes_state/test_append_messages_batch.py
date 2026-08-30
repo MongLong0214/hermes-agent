@@ -8,12 +8,16 @@ counters in one UPDATE.
 
 import json
 import sqlite3
+from dataclasses import replace
 
 import pytest
 
 from hermes_state import (
     CompressionSessionClosedError,
     SessionDB,
+    TerminalTurnReceipt,
+    TurnReceiptConflictError,
+    TurnReceiptFenceError,
 )
 
 
@@ -45,7 +49,147 @@ def _turn_messages():
     ]
 
 
+def _claimed_terminal_receipt(
+    db: SessionDB, request_id: str, *, terminal_message_index: int
+) -> TerminalTurnReceipt:
+    binding_digest = f"binding:{request_id}"
+    claim_token = f"claim:{request_id}"
+    db.prepare_turn_receipt("sess-batch", request_id, binding_digest)
+    assert db.claim_turn_receipt(
+        "sess-batch", request_id, binding_digest, claim_token
+    )
+    return TerminalTurnReceipt(
+        session_id="sess-batch",
+        turn_request_id=request_id,
+        binding_digest=binding_digest,
+        claim_token=claim_token,
+        response_digest="sha256:" + "a" * 64,
+        terminal_message_index=terminal_message_index,
+    )
+
+
 class TestAppendMessagesBatch:
+    def test_terminal_receipt_binds_its_explicit_batch_row_not_the_tail(self, db):
+        """A later assistant does not replace the explicitly held terminal row."""
+        receipt = _claimed_terminal_receipt(
+            db, "explicit-terminal-index", terminal_message_index=1
+        )
+        messages = [
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "held terminal"},
+            {"role": "assistant", "content": "later assistant"},
+        ]
+
+        assert db.append_messages_batch(
+            "sess-batch", messages, terminal_turn_receipt=receipt
+        ) == 3
+
+        completed = db.get_turn_receipt(
+            "sess-batch", receipt.turn_request_id, receipt.binding_digest
+        )
+        assert completed["status"] == "COMPLETED"
+        rows = db.get_messages("sess-batch")
+        held_row = rows[1]
+        assert held_row["content"] == "held terminal"
+        assert completed["terminalMessageId"] == held_row["id"]
+        assert completed["terminalMessageId"] != rows[2]["id"]
+
+    def test_receipted_batch_rejects_invalid_mapping_before_writing(self, db):
+        """Every invalid receipt mapping leaves its claimed receipt and rows intact."""
+        cases = [
+            (
+                "out-of-range-index",
+                [
+                    {"role": "user", "content": "question"},
+                    {"role": "assistant", "content": "held terminal"},
+                ],
+                2,
+                {},
+                ValueError,
+            ),
+            (
+                "moved-to-user-row",
+                [
+                    {"role": "user", "content": "question"},
+                    {"role": "assistant", "content": "held terminal"},
+                ],
+                0,
+                {},
+                ValueError,
+            ),
+            (
+                "hidden-terminal-row",
+                [
+                    {"role": "user", "content": "question"},
+                    {
+                        "role": "assistant",
+                        "content": "held terminal",
+                        "display_kind": "hidden",
+                    },
+                ],
+                1,
+                {},
+                ValueError,
+            ),
+            (
+                "duplicate-held-object",
+                (lambda held: [
+                    {"role": "user", "content": "question"}, held, held
+                ])({"role": "assistant", "content": "held terminal"}),
+                1,
+                {},
+                ValueError,
+            ),
+            (
+                "invalid-digest",
+                [
+                    {"role": "user", "content": "question"},
+                    {"role": "assistant", "content": "held terminal"},
+                ],
+                1,
+                {"response_digest": "not-a-sha256-digest"},
+                ValueError,
+            ),
+            (
+                "wrong-claim-token",
+                [
+                    {"role": "user", "content": "question"},
+                    {"role": "assistant", "content": "held terminal"},
+                ],
+                1,
+                {"claim_token": "wrong-claim-token"},
+                TurnReceiptFenceError,
+            ),
+            (
+                "wrong-binding",
+                [
+                    {"role": "user", "content": "question"},
+                    {"role": "assistant", "content": "held terminal"},
+                ],
+                1,
+                {"binding_digest": "wrong-binding"},
+                TurnReceiptConflictError,
+            ),
+        ]
+
+        for name, messages, index, overrides, error_type in cases:
+            receipt = _claimed_terminal_receipt(
+                db, name, terminal_message_index=index
+            )
+            receipt = replace(receipt, **overrides)
+
+            with pytest.raises(error_type):
+                db.append_messages_batch(
+                    "sess-batch", messages, terminal_turn_receipt=receipt
+                )
+
+            assert db.get_messages("sess-batch") == [], name
+            actual = db.get_turn_receipt(
+                "sess-batch", name, f"binding:{name}"
+            )
+            assert actual["status"] == "CLAIMED", name
+            assert all("_row_id" not in message for message in messages), name
+
     def test_batch_rows_identical_to_single_appends(self, db, tmp_path):
         """The batch writer stores the same bytes append_message would."""
         db2 = SessionDB(db_path=tmp_path / "state2.db")
