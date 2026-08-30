@@ -777,6 +777,78 @@ def test_genuine_terminal_response_is_sanitized_and_atomically_completes(
     assert "post_llm_call" in hooks
 
 
+@pytest.mark.parametrize(
+    ("provider_content", "request_id"),
+    [
+        pytest.param({"text": "done"}, "non-string-dict-terminal", id="dict"),
+        pytest.param(
+            [{"type": "text", "text": "done"}],
+            "non-string-text-parts-terminal",
+            id="text-parts",
+        ),
+    ],
+)
+def test_non_string_provider_terminal_content_fails_closed_before_receipt_settlement(
+    receipt_agent, monkeypatch, provider_content, request_id
+):
+    """Receipt completion requires the provider terminal content to be a string."""
+    from tests.run_agent.test_run_agent import _mock_response
+    import agent.conversation_loop as conversation_loop
+    import hermes_cli.lifecycle as lifecycle
+
+    agent, db, session_id = receipt_agent
+    request = _request(session_id, request_id=request_id)
+    receipts = TurnReceiptAdapter(db)
+    receipts.prepare_or_replay(request)
+    transport = agent._get_transport()
+    real_normalize_response = transport.normalize_response
+    normalized_responses: list[object] = []
+
+    def normalize_response(*args, **kwargs):
+        normalized = real_normalize_response(*args, **kwargs)
+        normalized_responses.append(normalized)
+        return normalized
+
+    monkeypatch.setattr(transport, "normalize_response", normalize_response)
+    monkeypatch.setattr(agent, "_get_transport", lambda: transport)
+    agent.client.chat.completions.create.return_value = _mock_response(provider_content)
+    hooks: list[str] = []
+    monkeypatch.setattr(
+        lifecycle,
+        "invoke_hook",
+        lambda name, *_args, **_kwargs: hooks.append(name) or [],
+    )
+    calls = {"memory": 0, "background": 0, "context": 0}
+    monkeypatch.setattr(
+        agent,
+        "_sync_external_memory_for_turn",
+        lambda **_kwargs: calls.__setitem__("memory", calls["memory"] + 1),
+    )
+    monkeypatch.setattr(
+        agent,
+        "_spawn_background_review",
+        lambda **_kwargs: calls.__setitem__("background", calls["background"] + 1),
+    )
+    monkeypatch.setattr(
+        conversation_loop,
+        "_notify_context_engine_turn_complete",
+        lambda *_args, **_kwargs: calls.__setitem__("context", calls["context"] + 1),
+    )
+
+    result = agent.run_conversation("question", turn_receipt=request)
+
+    assert normalized_responses[-1].content is provider_content
+    assert agent.client.chat.completions.create.call_count == 1
+    assert result["completed"] is False
+    assert result["failed"] is True
+    assert "turn_receipt" not in result
+    assert receipts.status_for(request)["status"] == "CLAIMED"
+    assert all(row.get("role") != "assistant" for row in db.get_messages(session_id))
+    assert calls == {"memory": 0, "background": 0, "context": 0}
+    assert "post_llm_call" not in hooks
+    assert "on_session_end" not in hooks
+
+
 def test_claimed_receipt_interrupted_before_terminal_fails_closed(
     receipt_agent, monkeypatch
 ):

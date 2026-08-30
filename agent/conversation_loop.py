@@ -6939,7 +6939,20 @@ def run_conversation(
             normalized = _transport.normalize_response(response, **_normalize_kwargs)
             assistant_message = normalized
             finish_reason = normalized.finish_reason
-            
+
+            # A receipt may settle only from a scalar text terminal response.
+            # Tool continuations retain normal provider-content normalization;
+            # they cannot create a terminal receipt hold on this pass.
+            if (
+                receipt_raw_text_only
+                and not getattr(assistant_message, "tool_calls", None)
+                and not isinstance(assistant_message.content, str)
+            ):
+                receipt_profile_rejection = "terminal_content_not_scalar"
+                failed = True
+                _turn_exit_reason = "receipt_execution_profile_rejected"
+                break
+
             # Normalize content to string — some OpenAI-compatible servers
             # (llama-server, etc.) return content as a dict or list instead
             # of a plain string, which crashes downstream .strip() calls.
