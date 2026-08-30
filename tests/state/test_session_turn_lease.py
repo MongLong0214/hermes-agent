@@ -25,11 +25,15 @@ def _complete_turn_receipt(
 ) -> tuple[str, dict]:
     """Create one completed receipt whose terminal row destructive flows remove."""
     claim_token = f"claim-{turn_request_id}"
-    db.prepare_turn_receipt(session_id, turn_request_id)
-    assert db.claim_turn_receipt(session_id, turn_request_id, claim_token)
+    binding_digest = f"binding:{turn_request_id}"
+    db.prepare_turn_receipt(session_id, turn_request_id, binding_digest)
+    assert db.claim_turn_receipt(
+        session_id, turn_request_id, binding_digest, claim_token
+    )
     receipt = db.finish_turn_receipt(
         session_id,
         turn_request_id,
+        binding_digest,
         claim_token,
         assistant_content="terminal reply",
         response_digest="sha256:" + "e" * 64,
@@ -78,8 +82,11 @@ def test_turn_receipt_claim_token_fences_retries_across_restart(tmp_path):
     db = SessionDB(path)
     db.create_session("session", source="test")
     receipts = TurnReceiptAdapter(db)
-    receipts.prepare("session", "request")
-    token, claimed = receipts.claim("session", "request", claim_token="claim-a")
+    binding_digest = "binding:claim-retry"
+    receipts.prepare("session", "request", binding_digest)
+    token, claimed = receipts.claim(
+        "session", "request", binding_digest, claim_token="claim-a"
+    )
     assert token == "claim-a"
     assert claimed is not None
     claimed_at = claimed["claimedAt"]
@@ -89,14 +96,14 @@ def test_turn_receipt_claim_token_fences_retries_across_restart(tmp_path):
     receipts = TurnReceiptAdapter(reopened)
     try:
         retry_token, retried_claim = receipts.claim(
-            "session", "request", claim_token="claim-a"
+            "session", "request", binding_digest, claim_token="claim-a"
         )
         assert retry_token == "claim-a"
         assert retried_claim is not None
         assert retried_claim["claimedAt"] == claimed_at
 
         rejected_token, rejected_claim = receipts.claim(
-            "session", "request", claim_token="claim-b"
+            "session", "request", binding_digest, claim_token="claim-b"
         )
         assert rejected_token is None
         assert rejected_claim == retried_claim
@@ -104,6 +111,7 @@ def test_turn_receipt_claim_token_fences_retries_across_restart(tmp_path):
         completed = receipts.finish(
             "session",
             "request",
+            binding_digest,
             "claim-a",
             assistant_content="terminal reply",
             response_digest="sha256:" + "e" * 64,
@@ -112,6 +120,7 @@ def test_turn_receipt_claim_token_fences_retries_across_restart(tmp_path):
             receipts.finish(
                 "session",
                 "request",
+                binding_digest,
                 "claim-b",
                 assistant_content="terminal reply",
                 response_digest="sha256:" + "e" * 64,
@@ -120,6 +129,7 @@ def test_turn_receipt_claim_token_fences_retries_across_restart(tmp_path):
         retried_completed = receipts.finish(
             "session",
             "request",
+            binding_digest,
             "claim-a",
             assistant_content="terminal reply",
             response_digest="sha256:" + "e" * 64,
@@ -152,7 +162,9 @@ def test_destructive_message_operations_retire_terminal_receipts(tmp_path, opera
     else:
         assert db.delete_session("session") is True
 
-    assert db.get_turn_receipt("session", f"request-{operation}") is None
+    assert db.get_turn_receipt(
+        "session", f"request-{operation}", f"binding:request-{operation}"
+    ) is None
     assert db._conn.execute("PRAGMA foreign_key_check").fetchall() == []
     db.close()
 
@@ -186,8 +198,11 @@ def test_terminal_assistant_row_and_completed_receipt_commit_atomically(tmp_path
         db.create_session("session", source="test")
         turn_request_id = uuid.uuid4().hex
         claim_token = uuid.uuid4().hex
-        db.prepare_turn_receipt("session", turn_request_id)
-        assert db.claim_turn_receipt("session", turn_request_id, claim_token)
+        binding_digest = f"binding:{turn_request_id}"
+        db.prepare_turn_receipt("session", turn_request_id, binding_digest)
+        assert db.claim_turn_receipt(
+            "session", turn_request_id, binding_digest, claim_token
+        )
         db._conn.execute(trigger_sql)
 
         with pytest.raises(sqlite3.DatabaseError, match=stage):
@@ -198,13 +213,14 @@ def test_terminal_assistant_row_and_completed_receipt_commit_atomically(tmp_path
                 terminal_turn_receipt=TerminalTurnReceipt(
                     session_id="session",
                     turn_request_id=turn_request_id,
+                    binding_digest=binding_digest,
                     claim_token=claim_token,
                     response_digest="sha256:" + "a" * 64,
                 ),
             )
 
         assert db.get_messages("session") == []
-        receipt = db.get_turn_receipt("session", turn_request_id)
+        receipt = db.get_turn_receipt("session", turn_request_id, binding_digest)
         assert receipt["status"] != "COMPLETED", stage
         db.close()
 

@@ -558,6 +558,7 @@ CREATE TABLE IF NOT EXISTS session_turn_leases (
 CREATE TABLE IF NOT EXISTS turn_receipts (
     turn_request_id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    binding_digest TEXT NOT NULL CHECK (binding_digest <> ''),
     status TEXT NOT NULL,
     claim_token TEXT,
     terminal_message_id INTEGER REFERENCES messages(id) ON DELETE CASCADE,

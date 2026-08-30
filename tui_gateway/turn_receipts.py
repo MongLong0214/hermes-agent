@@ -24,39 +24,49 @@ class TurnReceiptAdapter:
         """Converge a pre-receipt canonical state DB through SessionDB."""
         return self._db.migrate_turn_receipts()
 
-    def prepare(self, session_id: str, turn_request_id: str) -> dict[str, Any]:
+    def prepare(
+        self, session_id: str, turn_request_id: str, binding_digest: str
+    ) -> dict[str, Any]:
         """Create (or idempotently retrieve) a PREPARED receipt."""
-        return self._db.prepare_turn_receipt(session_id, turn_request_id)
+        return self._db.prepare_turn_receipt(
+            session_id, turn_request_id, binding_digest
+        )
 
     def get(
-        self, session_id: str, turn_request_id: str
+        self, session_id: str, turn_request_id: str, binding_digest: str
     ) -> Optional[dict[str, Any]]:
-        """Get a receipt scoped to one durable session."""
-        return self._db.get_turn_receipt(session_id, turn_request_id)
+        """Get a receipt scoped to its immutable durable request binding."""
+        return self._db.get_turn_receipt(
+            session_id, turn_request_id, binding_digest
+        )
 
     def status(
-        self, session_id: str, turn_request_id: str
+        self, session_id: str, turn_request_id: str, binding_digest: str
     ) -> Optional[dict[str, Any]]:
         """Alias for the stable status lookup used by later protocol wiring."""
-        return self.get(session_id, turn_request_id)
+        return self.get(session_id, turn_request_id, binding_digest)
 
     def claim(
         self,
         session_id: str,
         turn_request_id: str,
+        binding_digest: str,
         *,
         claim_token: Optional[str] = None,
     ) -> tuple[Optional[str], Optional[dict[str, Any]]]:
         """Claim a prepared receipt once and return the token on success."""
         token = claim_token or uuid.uuid4().hex
-        if not self._db.claim_turn_receipt(session_id, turn_request_id, token):
-            return None, self.get(session_id, turn_request_id)
-        return token, self.get(session_id, turn_request_id)
+        if not self._db.claim_turn_receipt(
+            session_id, turn_request_id, binding_digest, token
+        ):
+            return None, self.get(session_id, turn_request_id, binding_digest)
+        return token, self.get(session_id, turn_request_id, binding_digest)
 
     def finish(
         self,
         session_id: str,
         turn_request_id: str,
+        binding_digest: str,
         claim_token: str,
         *,
         assistant_content: str,
@@ -66,6 +76,7 @@ class TurnReceiptAdapter:
         return self._db.finish_turn_receipt(
             session_id,
             turn_request_id,
+            binding_digest,
             claim_token,
             assistant_content=assistant_content,
             response_digest=response_digest,
