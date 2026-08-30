@@ -514,6 +514,279 @@ class TestAcpTerminalReceipt:
         return response.field_meta["hermes"]["acpTerminalReceipt"]
 
     @pytest.mark.anyio
+    async def test_terminal_receipt_prompt_restores_exact_persisted_non_acp_session(
+        self, tmp_path
+    ):
+        """A validated receipt may attach only to its durable canonical target."""
+        db = SessionDB(tmp_path / "canonical.db")
+        session_id = "canonical-telegram-session"
+        raw_text = "continue the canonical thread"
+        history = [
+            {"role": "user", "content": "canonical opening"},
+            {"role": "assistant", "content": "canonical reply"},
+        ]
+        captured: dict[str, object] = {}
+        created_agents: list[object] = []
+
+        class CanonicalAgent:
+            def __init__(self):
+                created_agents.append(self)
+                self._session_db = db
+                self._session_db_created = True
+                self.session_id = session_id
+                self.model = "canonical-model"
+                self.provider = "test"
+
+            def run_conversation(self, **kwargs):
+                captured.update(kwargs)
+                receipt = kwargs["turn_receipt"]
+                TurnReceiptAdapter(db).finish(
+                    session_id,
+                    receipt.request.turn_request_id,
+                    receipt.request.binding_digest,
+                    receipt.claim_token,
+                    assistant_content="receipt-authorized reply",
+                    response_digest="sha256:" + "b" * 64,
+                )
+                return {"final_response": "transient", "messages": []}
+
+        try:
+            db.create_session(
+                session_id,
+                source="telegram",
+                model="canonical-model",
+                model_config={"cwd": "/canonical"},
+            )
+            db.replace_messages(session_id, [dict(message) for message in history])
+            metadata = self._durable_metadata(db, session_id, raw_text)
+            manager = SessionManager(agent_factory=CanonicalAgent, db=db)
+            acp_agent = HermesACPAgent(session_manager=manager)
+
+            response = await acp_agent.prompt(
+                prompt=[TextContentBlock(type="text", text=raw_text)],
+                session_id=session_id,
+                hermes={"acpTerminalReceipt": metadata},
+            )
+
+            assert response.stop_reason == "end_turn"
+            assert self._terminal_meta(response)["status"] == "COMPLETED"
+            assert self._terminal_meta(response)["assistantContent"] == "receipt-authorized reply"
+            assert len(created_agents) == 1
+            assert created_agents[0].session_id == session_id
+            assert db.get_conversation_root(session_id) == session_id
+            assert [
+                {"role": message["role"], "content": message["content"]}
+                for message in captured["conversation_history"]
+            ] == history
+            assert [row["id"] for row in db.list_sessions_rich(limit=10)] == [session_id]
+            assert db.get_session(session_id)["source"] == "telegram"
+        finally:
+            db.close()
+
+    @pytest.mark.anyio
+    async def test_terminal_receipt_restore_does_not_open_non_acp_session_to_ordinary_acp(
+        self, tmp_path
+    ):
+        """The exceptional receipt path must not make a canonical target adoptable."""
+        db = SessionDB(tmp_path / "source-fence.db")
+        session_id = "canonical-gateway-session"
+        raw_text = "receipt-only attach"
+        run_calls: list[dict] = []
+
+        class CanonicalAgent:
+            def __init__(self):
+                self._session_db = db
+                self._session_db_created = True
+                self.session_id = session_id
+                self.model = "canonical-model"
+                self.provider = "test"
+
+            def run_conversation(self, **kwargs):
+                run_calls.append(kwargs)
+                receipt = kwargs.get("turn_receipt")
+                if receipt is not None:
+                    TurnReceiptAdapter(db).finish(
+                        session_id,
+                        receipt.request.turn_request_id,
+                        receipt.request.binding_digest,
+                        receipt.claim_token,
+                        assistant_content="authorized",
+                        response_digest="sha256:" + "c" * 64,
+                    )
+                return {"final_response": "transient", "messages": []}
+
+        try:
+            db.create_session(session_id, source="gateway", model="canonical-model")
+            db.replace_messages(
+                session_id,
+                [{"role": "user", "content": "persisted canonical history"}],
+            )
+            metadata = self._durable_metadata(db, session_id, raw_text)
+            manager = SessionManager(agent_factory=CanonicalAgent, db=db)
+            acp_agent = HermesACPAgent(session_manager=manager)
+
+            authorized = await acp_agent.prompt(
+                prompt=[TextContentBlock(type="text", text=raw_text)],
+                session_id=session_id,
+                hermes={"acpTerminalReceipt": metadata},
+            )
+
+            assert authorized.stop_reason == "end_turn"
+            assert manager.get_session(session_id) is None
+            assert await acp_agent.load_session(cwd="/tmp", session_id=session_id) is None
+            resumed = await acp_agent.resume_session(cwd="/tmp", session_id=session_id)
+            assert resumed.field_meta["hermes"]["sessionProvenance"]["acpSessionId"] != session_id
+            refused = await acp_agent.prompt(
+                prompt=[TextContentBlock(type="text", text="ordinary ACP prompt")],
+                session_id=session_id,
+            )
+            assert refused.stop_reason == "refusal"
+            assert len(run_calls) == 1
+        finally:
+            db.close()
+
+    @pytest.mark.anyio
+    async def test_terminal_receipt_status_does_not_materialize_non_acp_target(self, tmp_path):
+        """Status is a durable receipt lookup, not a conversation restore."""
+        db = SessionDB(tmp_path / "status-no-restore.db")
+        session_id = "canonical-gateway-status"
+        agent_builds: list[None] = []
+
+        def fail_if_built():
+            agent_builds.append(None)
+            raise AssertionError("terminal status constructed an agent")
+
+        try:
+            db.create_session(session_id, source="gateway", model="canonical-model")
+            db.replace_messages(session_id, [{"role": "user", "content": "canonical history"}])
+            metadata = self._durable_metadata(db, session_id, "status digest")
+            metadata["operation"] = "status"
+            before_ids = [row["id"] for row in db.list_sessions_rich(limit=10)]
+            manager = SessionManager(agent_factory=fail_if_built, db=db)
+            acp_agent = HermesACPAgent(session_manager=manager)
+
+            response = await acp_agent.prompt(
+                prompt=[],
+                session_id=session_id,
+                hermes={"acpTerminalReceipt": metadata},
+            )
+
+            assert self._terminal_meta(response) == {
+                "status": "NEVER_FOUND",
+                "turnRequestId": "turn-request-1",
+            }
+            assert agent_builds == []
+            assert manager.get_session(session_id) is None
+            assert [row["id"] for row in db.list_sessions_rich(limit=10)] == before_ids
+        finally:
+            db.close()
+
+    @pytest.mark.anyio
+    async def test_terminal_receipt_execute_checks_exact_digest_before_non_acp_restore(self, tmp_path):
+        """A digest mismatch cannot materialize or mutate a canonical target."""
+        db = SessionDB(tmp_path / "digest-before-restore.db")
+        session_id = "canonical-gateway-digest"
+        agent_builds: list[None] = []
+
+        def fail_if_built():
+            agent_builds.append(None)
+            raise AssertionError("bad terminal prompt constructed an agent")
+
+        try:
+            db.create_session(session_id, source="gateway", model="canonical-model")
+            db.replace_messages(session_id, [{"role": "user", "content": "canonical history"}])
+            metadata = self._durable_metadata(db, session_id, "authorized bytes")
+            before_ids = [row["id"] for row in db.list_sessions_rich(limit=10)]
+            manager = SessionManager(agent_factory=fail_if_built, db=db)
+            acp_agent = HermesACPAgent(session_manager=manager)
+
+            response = await acp_agent.prompt(
+                prompt=[TextContentBlock(type="text", text="different bytes")],
+                session_id=session_id,
+                hermes={"acpTerminalReceipt": metadata},
+            )
+
+            assert response.stop_reason == "refusal"
+            assert self._terminal_meta(response)["status"] == "REFUSED"
+            assert agent_builds == []
+            assert manager.get_session(session_id) is None
+            assert [row["id"] for row in db.list_sessions_rich(limit=10)] == before_ids
+            assert db.get_acp_turn_receipt(
+                session_id,
+                metadata["receiptIdentity"],
+                metadata["targetBindReceipt"],
+            ) is None
+        finally:
+            db.close()
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        "case",
+        ("tampered-target", "identity-mismatch", "requested-session-mismatch", "unknown-target"),
+    )
+    async def test_unvalidated_terminal_target_refuses_before_agent_build_or_turn_mutation(
+        self, tmp_path, case
+    ):
+        """Invalid terminal target evidence cannot construct a persisted ACP agent."""
+        db = SessionDB(tmp_path / f"{case}.db")
+        target_session_id = "persisted-acp-target"
+        raw_text = "fail closed before restore"
+        agent_builds: list[None] = []
+
+        def fail_if_built():
+            agent_builds.append(None)
+            raise AssertionError("invalid terminal receipt constructed an agent")
+
+        try:
+            db.create_session(target_session_id, source="acp", model="test")
+            valid_metadata = self._durable_metadata(db, target_session_id, raw_text)
+            metadata = valid_metadata
+            requested_session_id = target_session_id
+            if case == "tampered-target":
+                metadata = {
+                    **metadata,
+                    "targetBindReceipt": {
+                        **metadata["targetBindReceipt"],
+                        "receipt_digest": "sha256:" + "f" * 64,
+                    },
+                }
+            elif case == "identity-mismatch":
+                metadata = {
+                    **metadata,
+                    "receiptIdentity": {
+                        **metadata["receiptIdentity"],
+                        "targetActorId": "different-target-actor",
+                    },
+                }
+            elif case == "requested-session-mismatch":
+                requested_session_id = "different-session"
+            elif case == "unknown-target":
+                requested_session_id = "unknown-session"
+
+            acp_agent = HermesACPAgent(
+                session_manager=SessionManager(agent_factory=fail_if_built, db=db)
+            )
+            response = await acp_agent.prompt(
+                prompt=[TextContentBlock(type="text", text=raw_text)],
+                session_id=requested_session_id,
+                hermes={"acpTerminalReceipt": metadata},
+            )
+
+            assert response.stop_reason == "refusal"
+            assert self._terminal_meta(response)["status"] == "REFUSED"
+            assert agent_builds == []
+            assert (
+                db.get_acp_turn_receipt(
+                    target_session_id,
+                    valid_metadata["receiptIdentity"],
+                    valid_metadata["targetBindReceipt"],
+                )
+                is None
+            )
+        finally:
+            db.close()
+
+    @pytest.mark.anyio
     async def test_acp_terminal_receipt_execute_forwards_exact_raw_text_and_claim(
         self, agent, mock_manager
     ):

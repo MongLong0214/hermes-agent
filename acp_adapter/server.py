@@ -1838,16 +1838,119 @@ class HermesACPAgent(acp.Agent):
         **kwargs: Any,
     ) -> PromptResponse:
         """Run Hermes on the user's prompt and stream events back to the editor."""
-        state = self.session_manager.get_session(session_id)
-        if state is None:
-            logger.error("prompt: session %s not found", session_id)
-            return PromptResponse(stop_reason="refusal")
-
         hermes_metadata = kwargs.get("hermes")
         terminal_receipt_present = (
             isinstance(hermes_metadata, dict)
             and "acpTerminalReceipt" in hermes_metadata
         )
+        # Terminal-receipt prompts inspect only an already-cached state first.
+        # A cache miss must validate the durable receipt before any source-based
+        # restore can call _make_agent.
+        state = (
+            self.session_manager._get_cached_session(session_id)
+            if terminal_receipt_present
+            else self.session_manager.get_session(session_id)
+        )
+        terminal_receipt_db_hint = None
+        if state is None and terminal_receipt_present:
+            # A non-ACP session can be materialized only after the durable
+            # receipt evidence has authenticated this exact target. Ordinary
+            # ACP paths retain SessionManager's source fence above.
+            if set(hermes_metadata) != {"acpTerminalReceipt"}:
+                return self._terminal_receipt_refusal()
+            metadata = hermes_metadata["acpTerminalReceipt"]
+            if not isinstance(metadata, dict) or set(metadata) != {
+                "operation", "receiptIdentity", "targetBindReceipt"
+            }:
+                return self._terminal_receipt_refusal()
+            operation = metadata["operation"]
+            receipt_identity = metadata["receiptIdentity"]
+            target_bind_receipt = metadata["targetBindReceipt"]
+            if (
+                operation not in {"execute", "status"}
+                or not isinstance(receipt_identity, dict)
+                or not isinstance(target_bind_receipt, dict)
+                or target_bind_receipt.get("requested_session_id") != session_id
+            ):
+                return self._terminal_receipt_refusal()
+            terminal_receipt_db_hint = self.session_manager._get_db()
+            if terminal_receipt_db_hint is None:
+                return self._terminal_receipt_refusal()
+            try:
+                admission = terminal_receipt_db_hint.validate_acp_turn_receipt_request(
+                    session_id, receipt_identity, target_bind_receipt
+                )
+                receipt_identity = admission["receiptIdentity"]
+                target_bind_receipt = admission["targetBindReceipt"]
+            except Exception:
+                logger.debug("ACP terminal receipt target refused", exc_info=True)
+                return self._terminal_receipt_refusal()
+
+            # A cache-miss status request is strictly a durable read: never
+            # build an AIAgent or materialize its transcript merely to report
+            # receipt state.
+            if operation == "status":
+                adapter = TurnReceiptAdapter(terminal_receipt_db_hint)
+                try:
+                    receipt = terminal_receipt_db_hint.get_acp_turn_receipt(
+                        session_id, receipt_identity, target_bind_receipt
+                    )
+                except Exception:
+                    logger.debug("ACP terminal receipt status refused", exc_info=True)
+                    return self._terminal_receipt_refusal()
+                if receipt is None:
+                    return await self._terminal_receipt_response(
+                        session_id,
+                        {
+                            "status": "NEVER_FOUND",
+                            "turnRequestId": receipt_identity["turnRequestId"],
+                        },
+                    )
+                if receipt.get("status") == "COMPLETED":
+                    request = self._terminal_receipt_request(
+                        session_id, receipt_identity, receipt
+                    )
+                    if request is None:
+                        return self._terminal_receipt_refusal()
+                    try:
+                        replay = adapter.completed_replay(request)
+                    except Exception:
+                        logger.debug("ACP terminal receipt replay refused", exc_info=True)
+                        return self._terminal_receipt_refusal()
+                    if replay is None:
+                        return self._terminal_receipt_refusal()
+                    return await self._terminal_receipt_response(session_id, replay)
+                return await self._terminal_receipt_response(session_id, receipt)
+
+            # The exact terminal user bytes are closed over before an
+            # exceptional non-ACP restore can build an agent or load history.
+            if len(prompt) != 1 or not isinstance(prompt[0], TextContentBlock):
+                return self._terminal_receipt_refusal()
+            raw_user_content = prompt[0].text
+            if not isinstance(raw_user_content, str):
+                return self._terminal_receipt_refusal()
+            expected_prompt_digest = "sha256:" + hashlib.sha256(
+                json.dumps(raw_user_content, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            if receipt_identity.get("promptDigest") != expected_prompt_digest:
+                return self._terminal_receipt_refusal()
+
+            state = self.session_manager._restore_authorized_terminal_receipt_target(
+                session_id, db=terminal_receipt_db_hint
+            )
+            if state is None:
+                # A valid receipt for an ACP-owned row retains the established
+                # ordinary restore path, but only after the receipt preflight.
+                state = self.session_manager.get_session(session_id)
+
+        if state is None:
+            logger.error("prompt: session %s not found", session_id)
+            return (
+                self._terminal_receipt_refusal()
+                if terminal_receipt_present
+                else PromptResponse(stop_reason="refusal")
+            )
+
         terminal_receipt: ClaimedReceipt | None = None
         terminal_receipt_db = None
         terminal_receipt_identity: dict[str, Any] | None = None
@@ -1871,7 +1974,11 @@ class HermesACPAgent(acp.Agent):
                 or target_bind_receipt.get("requested_session_id") != session_id
             ):
                 return self._terminal_receipt_refusal()
-            db = getattr(state.agent, "_session_db", None)
+            db = (
+                terminal_receipt_db_hint
+                if terminal_receipt_db_hint is not None
+                else getattr(state.agent, "_session_db", None)
+            )
             if db is None:
                 return self._terminal_receipt_refusal()
             current_agent_session_id = getattr(state.agent, "session_id", None) or state.session_id
