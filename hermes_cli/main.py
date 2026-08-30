@@ -693,6 +693,54 @@ def _apply_profile_override() -> None:
 
 _apply_profile_override()
 
+
+def _register_target_bind_parser(subparsers, *, handler=None) -> None:
+    """Register the built-in target-bind grammar on a top-level parser."""
+    target_parser = subparsers.add_parser(
+        "target",
+        help="Run local target binding operations",
+    )
+    target_subparsers = target_parser.add_subparsers(dest="target_command")
+    target_bind_parser = target_subparsers.add_parser(
+        "bind",
+        help="Verify and persist a target-bind receipt from stdin JSON",
+    )
+    target_bind_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Read exactly one JSON request from standard input",
+    )
+    if handler is not None:
+        target_bind_parser.set_defaults(func=handler)
+
+
+def _target_bind_startup_selected() -> bool:
+    """Classify the local target-bind preflight with the canonical CLI grammar."""
+    from contextlib import redirect_stderr, redirect_stdout
+    from io import StringIO
+
+    from hermes_cli._parser import build_top_level_parser
+
+    # This intentionally uses the real top-level parser rather than another
+    # argv scanner: any valid top-level option, including options that take a
+    # value, must be consumed exactly as production argparse consumes it.
+    # Keep the temporary parser limited to the one nested grammar needed to
+    # identify this closed local preflight, and swallow parser output/errors.
+    with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+        try:
+            parser, subparsers, _chat_parser = build_top_level_parser()
+            _register_target_bind_parser(subparsers)
+            args = parser.parse_args(sys.argv[1:])
+        except SystemExit:
+            return False
+    return (
+        getattr(args, "command", None) == "target"
+        and getattr(args, "target_command", None) == "bind"
+    )
+
+
+_TARGET_BIND_STARTUP = _target_bind_startup_selected()
+
 # Windows launcher self-heal — the ``hermes`` command users run is a COPY of
 # the venv console script, staged into the managed binary dir (the default
 # Hermes root's ``bin``, next to the managed uv) by install.ps1. That dir
@@ -726,13 +774,14 @@ from hermes_cli.env_loader import load_hermes_dotenv
 # Updating dependencies must not import optional secret-manager libraries into
 # the updater process before ``uv`` replaces the environment.  On Windows,
 # Bitwarden's cryptography import maps ``_rust.pyd`` and the parent updater then
-# prevents its own child installer from replacing that file (#73381).  Profile
-# flags have already been stripped above, so the first remaining argument is
-# the authoritative argparse subcommand.  Dotenv/managed config still loads;
-# only external secret fetches are unnecessary for installation maintenance.
+# prevents its own child installer from replacing that file (#73381).  Dotenv/
+# managed config still loads; only external secret fetches are unnecessary for
+# installation maintenance and the local target-bind preflight.
 load_hermes_dotenv(
     project_env=PROJECT_ROOT / ".env",
-    load_external_secrets=sys.argv[1:2] != ["update"],
+    load_external_secrets=(
+        sys.argv[1:2] != ["update"] and not _TARGET_BIND_STARTUP
+    ),
 )
 
 # Bridge security.redact_secrets from config.yaml → HERMES_REDACT_SECRETS env
@@ -11792,7 +11841,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "prompt-size",
         "resume",
         "send", "sessions", "setup",
-        "skin", "skills", "slack", "status", "sync", "tools", "uninstall", "update",
+        "skin", "skills", "slack", "status", "sync", "target", "tools", "uninstall", "update",
         "webhook", "whatsapp", "whatsapp-cloud", "worktree", "chat", "secrets", "security",
         "verify",
         # Help-ish invocations — plugin commands not being listed in
@@ -11872,6 +11921,8 @@ def _plugin_cli_discovery_needed() -> bool:
     argparse setup, saving ~500-650ms per invocation for users whose
     enabled plugins don't contribute any CLI command.
     """
+    if _TARGET_BIND_STARTUP:
+        return False
     first = _first_positional_argv()
     if first is None:
         # Bare ``hermes`` or only flags → defaults to ``chat``.
@@ -12606,6 +12657,13 @@ def main():
 
     parser, subparsers, chat_parser = build_top_level_parser()
     chat_parser.set_defaults(func=cmd_chat)
+
+    # =========================================================================
+    # target bind command — local JSON preflight for an external controller
+    # =========================================================================
+    from hermes_cli.target_bind import cmd_target_bind
+
+    _register_target_bind_parser(subparsers, handler=cmd_target_bind)
 
     # =========================================================================
     # model command  (parser built in hermes_cli/subcommands/model.py)
@@ -14050,7 +14108,11 @@ def main():
         # and raises OSError on failure (which propagates as a traceback).
         sys.exit(1)
 
-    _processed_argv = _coalesce_session_name_args(sys.argv[1:])
+    _processed_argv = (
+        sys.argv[1:]
+        if _TARGET_BIND_STARTUP
+        else _coalesce_session_name_args(sys.argv[1:])
+    )
 
     # ── Defensive subparser routing (bpo-9338 workaround) ───────────
     # On some Python versions (notably <3.11), argparse fails to route

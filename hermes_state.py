@@ -8904,8 +8904,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         actor_id: str,
         binding_generation: int,
         executor_runtime_identity: str,
+        *,
+        expected_lineage_root_digest: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Persist or replay one immutable target-authenticated bind receipt."""
+        """Persist or replay one immutable target-authenticated bind receipt.
+
+        ``expected_lineage_root_digest`` is an optional preflight fence for
+        local callers.  Existing trusted callers omit it and retain their
+        server-resolved lineage behavior.
+        """
         session_id = self._require_target_bind_identifier(session_id, "session_id")
         actor_id = self._require_target_bind_identifier(actor_id, "actor_id")
         executor_runtime_identity = self._require_target_bind_identifier(
@@ -8917,9 +8924,25 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             or binding_generation < 0
         ):
             raise ValueError("binding_generation must be a nonnegative integer")
+        if expected_lineage_root_digest is not None and (
+            not isinstance(expected_lineage_root_digest, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", expected_lineage_root_digest)
+            is None
+        ):
+            raise ValueError("expected_lineage_root_digest must be canonical")
 
         def _do(conn):
             lineage_root_id = self._target_bind_receipt_root(conn, session_id)
+            lineage_root_digest = self._target_bind_lineage_root_digest(
+                lineage_root_id
+            )
+            if (
+                expected_lineage_root_digest is not None
+                and expected_lineage_root_digest != lineage_root_digest
+            ):
+                raise TargetBindReceiptFenceError(
+                    "expected target bind lineage root does not match"
+                )
             key, expected = self._target_bind_receipt_record(
                 session_id=session_id,
                 lineage_root_id=lineage_root_id,
