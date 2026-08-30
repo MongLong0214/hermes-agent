@@ -192,6 +192,72 @@ def test_target_bind_preflight_rejects_malformed_or_trailing_json(tmp_path, payl
     assert json.loads(result.stdout) == {"error": "target_bind_preflight_invalid"}
 
 
+@pytest.mark.parametrize("valid_request", [True, False])
+def test_target_bind_preflight_bypasses_external_sources_and_plugin_discovery(
+    tmp_path, valid_request
+):
+    profile_home = _profile_home(tmp_path)
+    with SessionDB(profile_home / "state.db") as db:
+        db.create_session("lineage-root", source="cli-test")
+        db.create_session(
+            "lineage-tip", source="cli-test", parent_session_id="lineage-root"
+        )
+
+    secret_marker = tmp_path / "external-secret-ran"
+    secret_helper = tmp_path / "external-secret-helper"
+    secret_helper.write_text(
+        "#!/bin/sh\n"
+        f"printf ran > {secret_marker!s}\n"
+        "printf 'SENTINEL_API_KEY=not-a-real-credential\\n'\n",
+        encoding="utf-8",
+    )
+    secret_helper.chmod(0o700)
+
+    plugin_marker = tmp_path / "plugin-discovery-ran"
+    plugin = profile_home / "plugins" / "target-bind-sentinel"
+    plugin.mkdir(parents=True)
+    (plugin / "plugin.yaml").write_text(
+        "name: target-bind-sentinel\nversion: 0.1.0\ndescription: fixture\n",
+        encoding="utf-8",
+    )
+    (plugin / "__init__.py").write_text(
+        "from pathlib import Path\n"
+        "import sys\n"
+        f"Path({str(plugin_marker)!r}).write_text('ran', encoding='utf-8')\n"
+        "sys.stdout.write('plugin-discovery-sentinel')\n"
+        "def register(ctx):\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    (profile_home / "config.yaml").write_text(
+        "secrets:\n"
+        "  command:\n"
+        "    enabled: true\n"
+        f"    command: {json.dumps(str(secret_helper))}\n"
+        "plugins:\n"
+        "  enabled:\n"
+        "    - target-bind-sentinel\n",
+        encoding="utf-8",
+    )
+
+    payload = (
+        _encoded(_request(session_id="lineage-tip", lineage_root="lineage-root"))
+        if valid_request
+        else "{"
+    )
+    result = _run_preflight(profile_home, payload)
+
+    assert (secret_marker.exists(), plugin_marker.exists()) == (False, False)
+    output = json.loads(result.stdout)
+    assert result.stdout == _encoded(output)
+    if valid_request:
+        assert result.returncode == 0, result.stderr
+        assert output["requested_session_id"] == "lineage-tip"
+    else:
+        _assert_closed_error(result, profile_home)
+        assert output == {"error": "target_bind_preflight_invalid"}
+
+
 def test_target_bind_preflight_refuses_missing_cyclic_and_unavailable_storage(tmp_path):
     profile_home = _profile_home(tmp_path)
     with SessionDB(profile_home / "state.db") as db:

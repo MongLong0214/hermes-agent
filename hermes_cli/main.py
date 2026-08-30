@@ -729,10 +729,13 @@ from hermes_cli.env_loader import load_hermes_dotenv
 # prevents its own child installer from replacing that file (#73381).  Profile
 # flags have already been stripped above, so the first remaining argument is
 # the authoritative argparse subcommand.  Dotenv/managed config still loads;
-# only external secret fetches are unnecessary for installation maintenance.
+# only external secret fetches are unnecessary for installation maintenance
+# and the local target-bind preflight.
 load_hermes_dotenv(
     project_env=PROJECT_ROOT / ".env",
-    load_external_secrets=sys.argv[1:2] != ["update"],
+    load_external_secrets=(
+        sys.argv[1:2] != ["update"] and sys.argv[1:3] != ["target", "bind"]
+    ),
 )
 
 # Bridge security.redact_secrets from config.yaml → HERMES_REDACT_SECRETS env
@@ -11792,7 +11795,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "prompt-size",
         "resume",
         "send", "sessions", "setup",
-        "skin", "skills", "slack", "status", "sync", "tools", "uninstall", "update",
+        "skin", "skills", "slack", "status", "sync", "target", "tools", "uninstall", "update",
         "webhook", "whatsapp", "whatsapp-cloud", "worktree", "chat", "secrets", "security",
         "verify",
         # Help-ish invocations — plugin commands not being listed in
