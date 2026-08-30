@@ -21,6 +21,7 @@ import errno
 import hashlib
 import json
 import logging
+import math
 import os
 import queue
 import random
@@ -1083,11 +1084,122 @@ class WalUnsupportedError(sqlite3.OperationalError):
     """
 
 
+@contextmanager
+def _same_connection_raw_maintenance_fence(
+    conn: sqlite3.Connection,
+    *,
+    assert_authority: Callable[[], None],
+):
+    """Keep real SQLite exclusion from authority proof through raw maintenance.
+
+    ``BEGIN IMMEDIATE`` is a sufficient write fence for ordinary DML, but
+    SQLite forbids a transaction around ``VACUUM`` and may reject checkpoint
+    or journal-mode pragmas in one.  On SQLite 3.50.4, exclusive locking mode
+    plus a completed ``BEGIN EXCLUSIVE`` keeps the same connection's writer
+    exclusion after that transaction ends, including in WAL mode.  The
+    authority read therefore cannot be followed by another connection's
+    ``BEGIN IMMEDIATE``/marker commit before the raw operation.
+
+    The normal-mode transaction in ``finally`` releases that exclusion after
+    the raw operation in both WAL and DELETE mode.  A journal-mode switch is
+    the exception: SQLite retains its lock after a successful switch to WAL,
+    so SessionDB replaces its disposable initialization connection afterward.
+    """
+    if conn.in_transaction:
+        raise sqlite3.ProgrammingError(
+            "raw SQLite maintenance fence requires an autocommit connection"
+        )
+
+    mode = conn.execute("PRAGMA locking_mode=EXCLUSIVE").fetchone()
+    if mode is None or str(mode[0]).strip().lower() != "exclusive":
+        raise sqlite3.OperationalError(
+            "could not request exclusive SQLite maintenance locking mode"
+        )
+
+    try:
+        conn.execute("BEGIN EXCLUSIVE")
+        conn.execute("COMMIT")
+    except BaseException as acquire_exc:
+        if conn.in_transaction:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+        try:
+            conn.execute("PRAGMA locking_mode=NORMAL")
+        except BaseException as reset_exc:
+            try:
+                acquire_exc.add_note(
+                    f"raw SQLite maintenance lock reset failed: {reset_exc}"
+                )
+            except Exception:
+                pass
+        raise
+
+    primary_exc: Optional[BaseException] = None
+    try:
+        assert_authority()
+        yield
+    except BaseException as exc:
+        primary_exc = exc
+        raise
+    finally:
+        if conn.in_transaction:
+            try:
+                conn.execute("ROLLBACK")
+            except BaseException as rollback_exc:
+                if primary_exc is not None:
+                    try:
+                        primary_exc.add_note(
+                            f"raw SQLite maintenance rollback failed: {rollback_exc}"
+                        )
+                    except Exception:
+                        pass
+                else:
+                    raise
+        try:
+            conn.execute("PRAGMA locking_mode=NORMAL")
+            # SQLite 3.50.4 does not relinquish the exclusive lock merely
+            # because the PRAGMA reports NORMAL. A completed normal-mode
+            # transaction is the bounded release point in both DELETE and
+            # WAL; it is deliberately AFTER the raw operation, not wrapped
+            # around it.
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("COMMIT")
+        except BaseException as release_exc:
+            if primary_exc is not None:
+                try:
+                    primary_exc.add_note(
+                        f"raw SQLite maintenance lock release failed: {release_exc}"
+                    )
+                except Exception:
+                    pass
+            else:
+                raise
+
+
+def _run_journal_mode_change(
+    conn: sqlite3.Connection,
+    sql: str,
+    *,
+    before_journal_mode_change: Optional[Callable[[], None]],
+) -> Any:
+    """Run one setting journal-mode pragma under the shared authority fence."""
+    if before_journal_mode_change is None:
+        return conn.execute(sql).fetchone()
+    with _same_connection_raw_maintenance_fence(
+        conn,
+        assert_authority=before_journal_mode_change,
+    ):
+        return conn.execute(sql).fetchone()
+
+
 def apply_wal_with_fallback(
     conn: sqlite3.Connection,
     *,
     db_label: str = "state.db",
     require_wal: bool = False,
+    before_journal_mode_change: Optional[Callable[[], None]] = None,
 ) -> str:
     """Set ``journal_mode=WAL`` on ``conn``, falling back to DELETE on failure.
 
@@ -1131,7 +1243,11 @@ def apply_wal_with_fallback(
     on the same NFS mount.
 
     Shared by :class:`SessionDB` and ``hermes_cli.kanban_db.connect`` so
-    both databases get identical fallback behavior.
+    both databases get identical fallback behavior. A public ``state.db``
+    caller passes ``before_journal_mode_change`` to prove durable
+    offline-rebuild authority on this exact connection immediately before
+    SQLite is allowed to switch modes. Other databases deliberately leave it
+    unset: their journal policy does not share state.db's marker.
 
     Never downgrades to DELETE if the on-disk DB header reports WAL — see
     _on_disk_journal_mode.  That holds for both the NFS path and the
@@ -1148,6 +1264,7 @@ def apply_wal_with_fallback(
             conn,
             db_label=db_label,
             require_delete=configured == "delete",
+            before_journal_mode_change=before_journal_mode_change,
         )
 
     # Read-only probe — no flock, no checkpoint, no WAL/SHM unlink.
@@ -1175,7 +1292,11 @@ def apply_wal_with_fallback(
                 "concurrent openers); refusing to downgrade a database "
                 "this process does not exclusively own"
             )
-        actual = _set_journal_mode_no_wait(conn, "DELETE")
+        actual = _set_journal_mode_no_wait(
+            conn,
+            "DELETE",
+            before_journal_mode_change=before_journal_mode_change,
+        )
         if actual != "delete":
             raise sqlite3.OperationalError(
                 f"could not set configured journal_mode=delete (got {actual or 'no result'})"
@@ -1192,7 +1313,11 @@ def apply_wal_with_fallback(
         # returned row, not the mere absence of an exception; otherwise we
         # report a false ``"wal"`` AND skip the fallback WARNING, leaving the
         # DB silently in DELETE (reader-blocks-writer) with no signal.
-        row = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+        row = _run_journal_mode_change(
+            conn,
+            "PRAGMA journal_mode=WAL",
+            before_journal_mode_change=before_journal_mode_change,
+        )
         mode = str(row[0]).strip().lower() if row and row[0] is not None else ""
         if mode == "wal":
             _apply_wal_size_limit(conn)
@@ -1232,7 +1357,11 @@ def apply_wal_with_fallback(
             for _ in range(2):
                 time.sleep(0.05)
                 try:
-                    row = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+                    row = _run_journal_mode_change(
+                        conn,
+                        "PRAGMA journal_mode=WAL",
+                        before_journal_mode_change=before_journal_mode_change,
+                    )
                 except sqlite3.OperationalError as retry_exc:
                     if "disk i/o error" not in str(retry_exc).lower():
                         raise
@@ -1259,11 +1388,20 @@ def apply_wal_with_fallback(
             # Caller mandates WAL — fail loudly instead of degrading to DELETE.
             raise WalUnsupportedError(str(exc)) from exc
         _log_wal_fallback_once(db_label, exc)
-        _set_journal_mode_no_wait(conn, "DELETE")
+        _set_journal_mode_no_wait(
+            conn,
+            "DELETE",
+            before_journal_mode_change=before_journal_mode_change,
+        )
         return "delete"
 
 
-def _set_journal_mode_no_wait(conn: sqlite3.Connection, mode: str) -> str:
+def _set_journal_mode_no_wait(
+    conn: sqlite3.Connection,
+    mode: str,
+    *,
+    before_journal_mode_change: Optional[Callable[[], None]] = None,
+) -> str:
     """Execute ``PRAGMA journal_mode=<mode>`` without waiting on other openers.
 
     This is the ONLY place a journal-mode switch pragma may be issued for a
@@ -1290,7 +1428,11 @@ def _set_journal_mode_no_wait(conn: sqlite3.Connection, mode: str) -> str:
         previous_timeout = 0
     conn.execute("PRAGMA busy_timeout=0")
     try:
-        row = conn.execute(f"PRAGMA journal_mode={mode}").fetchone()
+        row = _run_journal_mode_change(
+            conn,
+            f"PRAGMA journal_mode={mode}",
+            before_journal_mode_change=before_journal_mode_change,
+        )
         return str(row[0]).strip().lower() if row and row[0] is not None else ""
     finally:
         try:
@@ -1304,6 +1446,7 @@ def _apply_delete_for_wal_reset_bug(
     *,
     db_label: str,
     require_delete: bool = False,
+    before_journal_mode_change: Optional[Callable[[], None]] = None,
 ) -> str:
     """Avoid enabling WAL when the linked SQLite has the WAL-reset bug.
 
@@ -1345,7 +1488,11 @@ def _apply_delete_for_wal_reset_bug(
 
     actual = ""
     try:
-        actual = _set_journal_mode_no_wait(conn, "DELETE")
+        actual = _set_journal_mode_no_wait(
+            conn,
+            "DELETE",
+            before_journal_mode_change=before_journal_mode_change,
+        )
     except sqlite3.OperationalError as exc:
         if require_delete:
             raise
@@ -1640,7 +1787,7 @@ def _validate_connection_schema(
 
 def _probe_existing_state_db_schema(
     db_path: Path, *, allow_malformed_repair: bool
-) -> int:
+) -> Optional[int]:
     """Read and validate an existing DB before any package write path opens it."""
     def probe() -> int:
         conn = sqlite3.connect(
@@ -1658,10 +1805,22 @@ def _probe_existing_state_db_schema(
     except IncompatibleSchemaError:
         raise
     except sqlite3.DatabaseError as exc:
-        if not (
+        if is_malformed_schema_error(exc):
+            # A read-only open must preserve the underlying malformed-store
+            # failure.  It never repairs the database, and its caller relies
+            # on the DatabaseError path to prove the tracked handle closed.
+            if not allow_malformed_repair:
+                raise
+        elif (
             allow_malformed_repair
-            and is_malformed_schema_error(exc)
+            and isinstance(exc, sqlite3.OperationalError)
+            and "no such table: schema_version" in str(exc).lower()
         ):
+            # A pre-versioned state store is initialized and healed below.
+            # Its tables can still carry a durable rebuild marker, which the
+            # post-open authority check fences before schema DDL runs.
+            return None
+        else:
             raise IncompatibleSchemaError() from None
         if not _claim_repair_attempt(db_path):
             raise
@@ -2205,9 +2364,13 @@ def _persistent_repair_attempts_exhausted(db_path: Path) -> bool:
 
 
 def _record_repair_outcome(
-    db_path: Path, *, repaired: bool, fingerprint: "Optional[str]" = None
+    db_path: Path,
+    *,
+    repaired: bool,
+    fingerprint: "Optional[str]" = None,
+    _local_rebuild_marker: Optional[str] = None,
 ) -> None:
-    """Update the persistent attempt ledger after a repair pass. Never raises.
+    """Update the persistent attempt ledger after a repair pass.
 
     Defaults to the post-attempt fingerprint — the file state the NEXT
     attempt's exhaustion probe will observe.
@@ -2220,9 +2383,19 @@ def _record_repair_outcome(
     passes never matches.
     """
     ledger_path = _repair_ledger_path(db_path)
+    conn: Optional[sqlite3.Connection] = None
     try:
+        # The ledger is a separate file, so its publication must borrow a
+        # SQLite write lock. BEGIN IMMEDIATE prevents a marker takeover after
+        # this exact proof and before unlinking or rewriting the ledger.
+        conn = _connect_repair_durable(db_path)
+        conn.execute("BEGIN IMMEDIATE")
+        _assert_repair_state_db_write_authority(
+            conn, local_marker=_local_rebuild_marker
+        )
         if repaired:
             ledger_path.unlink(missing_ok=True)
+            conn.execute("COMMIT")
             return
         ledger = _read_repair_ledger(db_path)
         recorded = ledger.get("fingerprint")
@@ -2250,8 +2423,19 @@ def _record_repair_outcome(
             ),
             encoding="utf-8",
         )
+        conn.execute("COMMIT")
+    except SessionTurnLeaseLostError:
+        raise
     except Exception as exc:  # pragma: no cover - best effort
         logger.warning("Could not update state.db repair ledger: %s", exc)
+    finally:
+        if conn is not None:
+            if conn.in_transaction:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+            conn.close()
 
 
 def _existing_malformed_backups(db_path: Path) -> "List[Path]":
@@ -2612,6 +2796,43 @@ def _connect_repair_durable(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+def _backup_db_file_under_repair_authority(
+    db_path: Path,
+    *,
+    local_marker: Optional[str],
+) -> "Tuple[Optional[Path], Optional[str]]":
+    """Hold repair authority on the copying connection until backup completes."""
+    conn = _connect_repair_durable(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            _assert_repair_state_db_write_authority(
+                conn, local_marker=local_marker
+            )
+            result = _backup_db_file(db_path)
+        except BaseException as exc:
+            if conn.in_transaction:
+                try:
+                    conn.execute("ROLLBACK")
+                except BaseException as rollback_exc:
+                    try:
+                        exc.add_note(
+                            f"repair backup rollback failed: {rollback_exc}"
+                        )
+                    except Exception:
+                        pass
+            raise
+        conn.execute("ROLLBACK")
+        return result
+    finally:
+        if conn.in_transaction:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+        conn.close()
+
+
 def _reapply_durability_barriers(conn: sqlite3.Connection) -> bool:
     """Best-effort (re)application of the macOS write barriers.  Never raises.
 
@@ -2631,7 +2852,15 @@ def _reapply_durability_barriers(conn: sqlite3.Connection) -> bool:
         return False
 
 
-def _db_opens_cleanly(db_path: Path) -> Optional[str]:
+_REPAIR_AUTHORITY_UNSET = object()
+
+
+def _db_opens_cleanly(
+    db_path: Path,
+    *,
+    write_connection: Optional[Any] = None,
+    _repair_local_marker: Any = _REPAIR_AUTHORITY_UNSET,
+) -> Optional[str]:
     """Probe a DB on a fresh connection. Returns None if healthy, else a reason.
 
     Runs the same first-statement (``PRAGMA journal_mode``) that trips the
@@ -2643,6 +2872,9 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
     past as a false "ok" (#50502).
     """
     conn = _connect_repair_durable(db_path)
+    probe_write_connection = (
+        conn if write_connection is None else write_connection
+    )
     try:
         # Best-effort tokenizer load: a DB carrying the messages_fts_cjk
         # index needs the cjk_unicode61 extension before any statement can
@@ -2723,21 +2955,26 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
         # populated DB", not corruption.
         probe_session_id = f"_hermes_fts_health_probe_{time.time_ns()}"
         try:
-            conn.execute("BEGIN IMMEDIATE")
-            conn.execute(
+            probe_write_connection.execute("BEGIN IMMEDIATE")
+            if _repair_local_marker is not _REPAIR_AUTHORITY_UNSET:
+                _assert_repair_state_db_write_authority(
+                    probe_write_connection,
+                    local_marker=_repair_local_marker,
+                )
+            probe_write_connection.execute(
                 "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
                 (probe_session_id, "_health_probe", time.time()),
             )
-            conn.execute(
+            probe_write_connection.execute(
                 "INSERT INTO messages (session_id, role, content, timestamp) "
                 "VALUES (?, ?, ?, ?)",
                 (probe_session_id, "user", "_fts_health_probe", time.time()),
             )
-            conn.execute("ROLLBACK")
+            probe_write_connection.execute("ROLLBACK")
         except sqlite3.OperationalError as exc:
             # Missing tables / FTS disabled — not the corruption class we probe.
             try:
-                conn.execute("ROLLBACK")
+                probe_write_connection.execute("ROLLBACK")
             except sqlite3.Error:
                 pass
             msg = str(exc).lower()
@@ -2750,6 +2987,12 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
                 # a tokenizer-less one self-heals by dropping the triggers.
                 return None
             return str(exc)
+        except BaseException:
+            try:
+                probe_write_connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
         return None
     except sqlite3.DatabaseError as exc:
         return str(exc)
@@ -2811,7 +3054,12 @@ def _live_writer_holds_db(db_path: Path) -> bool:
                 pass
 
 
-def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, Any]:
+def repair_state_db_schema(
+    db_path: Path,
+    *,
+    backup: bool = True,
+    _local_rebuild_marker: Optional[str] = None,
+) -> Dict[str, Any]:
     """Repair a state.db whose ``sqlite_master`` schema is malformed or whose
     FTS indexes reject writes.
 
@@ -2856,31 +3104,14 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
         report["error"] = f"{db_path} does not exist"
         return report
 
-    # Cross-restart attempt cap (#86747): the in-memory claim bounds one
-    # process, but a corruption class the strategies below cannot heal
-    # (b-tree page damage) previously re-ran the whole surgery — and took a
-    # fresh multi-hundred-MB forensic backup — on EVERY restart, forever.
-    # After _MAX_PERSISTENT_REPAIR_ATTEMPTS failures against the same
-    # damaged file, stop retrying and surface a terminal, actionable error.
-    if _persistent_repair_attempts_exhausted(db_path):
-        report["error"] = (
-            f"automatic repair has already failed "
-            f"{_MAX_PERSISTENT_REPAIR_ATTEMPTS} times on this exact file — "
-            "the corruption is beyond the schema/FTS repair strategies "
-            "(likely b-tree page damage). Manual recovery required: restore "
-            f"a backup, or salvage with `sqlite3 {db_path} \".recover\"`. "
-            f"Delete {_repair_ledger_path(db_path).name} to force another "
-            "automatic attempt."
-        )
-        logger.error("state.db repair skipped: %s", report["error"])
-        return report
-
     with _cross_process_repair_lock(db_path) as holding_lock:
         if not holding_lock:
             # Another process is still inside its critical section. It may
             # nonetheless have healed the file already (long VACUUM after a
             # successful strategy), so re-probe before reporting failure.
-            if _db_opens_cleanly(db_path) is None:
+            if _db_opens_cleanly(
+                db_path, _repair_local_marker=_local_rebuild_marker
+            ) is None:
                 report["repaired"] = True
                 report["strategy"] = "repaired_by_other_process"
                 return report
@@ -2906,7 +3137,43 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
             logger.error("state.db repair skipped: %s", report["error"])
             return report
 
-        result = _repair_state_db_schema_locked(db_path, backup=backup, report=report)
+        # A forensic backup is publication too: prove repair authority before
+        # it, and again on every later replacement connection.  In particular
+        # a malformed state_meta table is not evidence of the ordinary
+        # bootstrap/no-owner state.
+        conn = _connect_repair_durable(db_path)
+        try:
+            _assert_repair_state_db_write_authority(
+                conn, local_marker=_local_rebuild_marker
+            )
+        finally:
+            conn.close()
+
+        # Cross-restart attempt cap: the in-memory claim bounds one
+        # process, but a corruption class the strategies below cannot heal
+        # (b-tree page damage) previously re-ran the whole surgery — and took a
+        # fresh multi-hundred-MB forensic backup — on EVERY restart, forever.
+        # The authority check above must precede this accounting: a refusal is
+        # neither a repair attempt nor evidence that can spend its budget.
+        if _persistent_repair_attempts_exhausted(db_path):
+            report["error"] = (
+                f"automatic repair has already failed "
+                f"{_MAX_PERSISTENT_REPAIR_ATTEMPTS} times on this exact file — "
+                "the corruption is beyond the schema/FTS repair strategies "
+                "(likely b-tree page damage). Manual recovery required: restore "
+                f"a backup, or salvage with `sqlite3 {db_path} \".recover\"`. "
+                f"Delete {_repair_ledger_path(db_path).name} to force another "
+                "automatic attempt."
+            )
+            logger.error("state.db repair skipped: %s", report["error"])
+            return report
+
+        result = _repair_state_db_schema_locked(
+            db_path,
+            backup=backup,
+            report=report,
+            _local_rebuild_marker=_local_rebuild_marker,
+        )
         # Persist the outcome AFTER surgery, keyed on the post-attempt
         # fingerprint — that is the file state the NEXT attempt's exhaustion
         # probe will observe. Failures count toward the cross-restart cap;
@@ -2914,12 +3181,20 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
         # file re-keys the ledger and restarts the count: that keeps a
         # genuinely NEW corruption event from inheriting a stale budget,
         # while the backup dedupe/cap above bounds the disk cost either way.)
-        _record_repair_outcome(db_path, repaired=bool(result.get("repaired")))
+        _record_repair_outcome(
+            db_path,
+            repaired=bool(result.get("repaired")),
+            _local_rebuild_marker=_local_rebuild_marker,
+        )
         return result
 
 
 def _repair_state_db_schema_locked(
-    db_path: Path, *, backup: bool, report: Dict[str, Any]
+    db_path: Path,
+    *,
+    backup: bool,
+    report: Dict[str, Any],
+    _local_rebuild_marker: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Repair strategies for :func:`repair_state_db_schema`.
 
@@ -2929,13 +3204,18 @@ def _repair_state_db_schema_locked(
     # repaired the file, in which case redoing the surgery would undo its
     # work on a now-healthy DB (the repair/re-corrupt cascade this lock
     # exists to break).
-    if _db_opens_cleanly(db_path) is None:
+    if _db_opens_cleanly(
+        db_path, _repair_local_marker=_local_rebuild_marker
+    ) is None:
         report["repaired"] = True
         report["strategy"] = "already_healthy"
         return report
 
     if backup:
-        bpath, backup_error = _backup_db_file(db_path)
+        bpath, backup_error = _backup_db_file_under_repair_authority(
+            db_path,
+            local_marker=_local_rebuild_marker,
+        )
         report["backup_path"] = str(bpath) if bpath else None
         if bpath is None:
             # HARD STOP (#69603): every strategy below mutates the damaged
@@ -2961,20 +3241,35 @@ def _repair_state_db_schema_locked(
             # The cjk index can only be rebuilt with its tokenizer loaded;
             # best-effort (a tokenizer-less host skips it at the probe below).
             load_fts5_cjk_extension(conn)
-            for table_name in (
-                "messages_fts", "messages_fts_trigram", "messages_fts_cjk"
-            ):
-                try:
-                    conn.execute(
-                        f"INSERT INTO {table_name}({table_name}) VALUES('rebuild')"
-                    )
-                except sqlite3.OperationalError:
-                    # Table absent (FTS disabled / trigram off / cjk not
-                    # present or tokenizer unavailable) — skip it.
-                    continue
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                _assert_repair_state_db_write_authority(
+                    conn, local_marker=_local_rebuild_marker
+                )
+                for table_name in (
+                    "messages_fts", "messages_fts_trigram", "messages_fts_cjk"
+                ):
+                    try:
+                        _assert_repair_state_db_write_authority(
+                            conn, local_marker=_local_rebuild_marker
+                        )
+                        conn.execute(
+                            f"INSERT INTO {table_name}({table_name}) VALUES('rebuild')"
+                        )
+                    except sqlite3.OperationalError:
+                        # Table absent (FTS disabled / trigram off / cjk not
+                        # present or tokenizer unavailable) — skip it.
+                        continue
+                conn.commit()
+            except BaseException:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
         finally:
             conn.close()
-        if _db_opens_cleanly(db_path) is None:
+        if _db_opens_cleanly(
+            db_path, _repair_local_marker=_local_rebuild_marker
+        ) is None:
             report["repaired"] = True
             report["strategy"] = "rebuild_fts"
             logger.warning(
@@ -2997,11 +3292,22 @@ def _repair_state_db_schema_locked(
             # REINDEX rewrites every index b-tree; take the barriers now that
             # the schema parses, in case the open-time attempt was refused.
             _reapply_durability_barriers(conn)
-            conn.execute("REINDEX")
-            conn.commit()
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                _assert_repair_state_db_write_authority(
+                    conn, local_marker=_local_rebuild_marker
+                )
+                conn.execute("REINDEX")
+                conn.commit()
+            except BaseException:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
         finally:
             conn.close()
-        if _db_opens_cleanly(db_path) is None:
+        if _db_opens_cleanly(
+            db_path, _repair_local_marker=_local_rebuild_marker
+        ) is None:
             report["repaired"] = True
             report["strategy"] = "reindex_btree"
             logger.warning(
@@ -3015,24 +3321,44 @@ def _repair_state_db_schema_locked(
     try:
         conn = _connect_repair_durable(db_path)
         try:
-            conn.execute("PRAGMA writable_schema=ON")
-            dupes = conn.execute(
-                "SELECT type, name, COUNT(*) AS c, MIN(rowid) AS keep "
-                "FROM sqlite_master GROUP BY type, name HAVING c > 1"
-            ).fetchall()
-            for type_, name, _count, keep in dupes:
-                conn.execute(
-                    "DELETE FROM sqlite_master "
-                    "WHERE type IS ? AND name IS ? AND rowid <> ?",
-                    (type_, name, keep),
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                _assert_repair_state_db_write_authority(
+                    conn, local_marker=_local_rebuild_marker
                 )
-            if dupes:
-                _bump_schema_cookie(conn)
-            conn.execute("PRAGMA writable_schema=OFF")
-            conn.commit()
+                conn.execute("PRAGMA writable_schema=ON")
+                dupes = conn.execute(
+                    "SELECT type, name, COUNT(*) AS c, MIN(rowid) AS keep "
+                    "FROM sqlite_master GROUP BY type, name HAVING c > 1"
+                ).fetchall()
+                for type_, name, _count, keep in dupes:
+                    _assert_repair_state_db_write_authority(
+                        conn, local_marker=_local_rebuild_marker
+                    )
+                    conn.execute(
+                        "DELETE FROM sqlite_master "
+                        "WHERE type IS ? AND name IS ? AND rowid <> ?",
+                        (type_, name, keep),
+                    )
+                if dupes:
+                    _assert_repair_state_db_write_authority(
+                        conn, local_marker=_local_rebuild_marker
+                    )
+                    _bump_schema_cookie(conn)
+                conn.execute("PRAGMA writable_schema=OFF")
+                conn.commit()
+            except BaseException:
+                try:
+                    conn.execute("PRAGMA writable_schema=OFF")
+                finally:
+                    if conn.in_transaction:
+                        conn.rollback()
+                raise
         finally:
             conn.close()
-        if _db_opens_cleanly(db_path) is None:
+        if _db_opens_cleanly(
+            db_path, _repair_local_marker=_local_rebuild_marker
+        ) is None:
             report["repaired"] = True
             report["strategy"] = "dedup_schema"
             logger.warning(
@@ -3047,19 +3373,47 @@ def _repair_state_db_schema_locked(
     try:
         conn = _connect_repair_durable(db_path)
         try:
-            conn.execute("PRAGMA writable_schema=ON")
-            conn.execute("DELETE FROM sqlite_master WHERE name LIKE 'messages_fts%'")
-            _bump_schema_cookie(conn)
-            conn.execute("PRAGMA writable_schema=OFF")
-            conn.commit()
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                _assert_repair_state_db_write_authority(
+                    conn, local_marker=_local_rebuild_marker
+                )
+                conn.execute("PRAGMA writable_schema=ON")
+                _assert_repair_state_db_write_authority(
+                    conn, local_marker=_local_rebuild_marker
+                )
+                conn.execute(
+                    "DELETE FROM sqlite_master WHERE name LIKE 'messages_fts%'"
+                )
+                _assert_repair_state_db_write_authority(
+                    conn, local_marker=_local_rebuild_marker
+                )
+                _bump_schema_cookie(conn)
+                conn.execute("PRAGMA writable_schema=OFF")
+                conn.commit()
+            except BaseException:
+                try:
+                    conn.execute("PRAGMA writable_schema=OFF")
+                finally:
+                    if conn.in_transaction:
+                        conn.rollback()
+                raise
             # The schema is repaired and parseable now, so the barriers can
             # finally stick — and VACUUM, which rewrites the entire file, is
             # the single most damaging operation to lose halfway.
             _reapply_durability_barriers(conn)
-            conn.execute("VACUUM")
+            with _same_connection_raw_maintenance_fence(
+                conn,
+                assert_authority=lambda: _assert_offline_rebuild_maintenance_authority(
+                    conn, local_marker=_local_rebuild_marker
+                ),
+            ):
+                conn.execute("VACUUM")
         finally:
             conn.close()
-        reason = _db_opens_cleanly(db_path)
+        reason = _db_opens_cleanly(
+            db_path, _repair_local_marker=_local_rebuild_marker
+        )
         if reason is None:
             report["repaired"] = True
             report["strategy"] = "drop_fts_rebuild"
@@ -3253,6 +3607,123 @@ class SessionTurnLeaseLostError(RuntimeError):
     the lease row is gone. A later writer may already be persisting a
     newer turn; landing this write would interleave a stale reply.
     """
+
+
+_OFFLINE_REBUILD_EPOCH_KEY = "_hermes_offline_rebuild_epoch_v1"
+
+
+def _assert_offline_rebuild_write_authority(
+    conn: sqlite3.Connection,
+    local_marker: Optional[str],
+    *,
+    require_metadata_table: bool = False,
+) -> None:
+    """Refuse writes unless the durable rebuild claim matches this owner."""
+    try:
+        rows = conn.execute(
+            "SELECT value FROM state_meta WHERE key = ?",
+            (_OFFLINE_REBUILD_EPOCH_KEY,),
+        ).fetchall()
+    except sqlite3.OperationalError as exc:
+        # Bootstrap and pre-versioned stores have no metadata table yet.
+        # Every other failure, including a malformed readable table, must
+        # stop the pending write rather than being mistaken for absence.
+        if "no such table: state_meta" in str(exc).lower():
+            if local_marker is None and not require_metadata_table:
+                return
+            if require_metadata_table:
+                raise SessionTurnLeaseLostError(
+                    "refusing write without provable offline rebuild authority"
+                ) from exc
+            raise SessionTurnLeaseLostError(
+                "refusing write while an offline rebuild owns this database"
+            ) from exc
+        raise SessionTurnLeaseLostError(
+            "refusing write without provable offline rebuild authority"
+        ) from exc
+    except sqlite3.Error as exc:
+        raise SessionTurnLeaseLostError(
+            "refusing write without provable offline rebuild authority"
+        ) from exc
+    if not rows:
+        if local_marker is None:
+            return
+        raise SessionTurnLeaseLostError(
+            "refusing write while an offline rebuild owns this database"
+        )
+    if len(rows) != 1:
+        raise SessionTurnLeaseLostError(
+            "refusing write without provable offline rebuild authority"
+        )
+    row = rows[0]
+    value = row["value"] if isinstance(row, sqlite3.Row) else row[0]
+    if local_marker is not None and local_marker == value:
+        return
+    raise SessionTurnLeaseLostError(
+        "refusing write while an offline rebuild owns this database"
+    )
+
+
+def _assert_repair_state_db_write_authority(
+    conn: sqlite3.Connection, *, local_marker: Optional[str]
+) -> None:
+    """Prove repair authority even when another schema row is malformed.
+
+    A duplicate FTS definition prevents SQLite from parsing *any* ordinary
+    statement, including the metadata SELECT.  ``writable_schema`` lets this
+    one connection read state_meta without repairing it; the fallback is
+    deliberately read-only apart from that connection-local pragma.  A
+    damaged state_meta shape/value still cannot establish no-owner authority
+    and is fenced.
+    """
+    try:
+        _assert_offline_rebuild_write_authority(
+            conn,
+            local_marker,
+            require_metadata_table=True,
+        )
+        return
+    except SessionTurnLeaseLostError as exc:
+        cause = exc.__cause__
+        if not (
+            isinstance(cause, sqlite3.DatabaseError)
+            and is_malformed_schema_error(cause)
+        ):
+            raise
+    except Exception as exc:
+        raise SessionTurnLeaseLostError(
+            "refusing schema repair without provable offline rebuild authority"
+        ) from exc
+
+    try:
+        conn.execute("PRAGMA writable_schema=ON")
+        _assert_offline_rebuild_write_authority(
+            conn,
+            local_marker,
+            require_metadata_table=True,
+        )
+    except SessionTurnLeaseLostError:
+        raise
+    except Exception as exc:
+        raise SessionTurnLeaseLostError(
+            "refusing schema repair without provable offline rebuild authority"
+        ) from exc
+    finally:
+        try:
+            conn.execute("PRAGMA writable_schema=OFF")
+        except sqlite3.Error:
+            pass
+
+
+def _assert_offline_rebuild_maintenance_authority(
+    conn: sqlite3.Connection, *, local_marker: Optional[str]
+) -> None:
+    """Refuse raw maintenance while a durable rebuild claim governs this DB."""
+    _assert_offline_rebuild_write_authority(conn, local_marker)
+    if local_marker is not None:
+        raise SessionTurnLeaseLostError(
+            "refusing raw SQLite maintenance while an offline rebuild owns this database"
+        )
 
 
 class _SerializedCursor(sqlite3.Cursor):
@@ -3919,6 +4390,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     _COMPRESSION_BUSY_WAIT_S = 5.0
     _WRITE_RETRY_MIN_S = 0.020   # 20ms
     _WRITE_RETRY_MAX_S = 0.150   # 150ms
+    _offline_rebuild_ownership_error = SessionTurnLeaseLostError
     _WRITE_RETRY_SLOW_AFTER_S = 2.0
     _WRITE_RETRY_SLOW_MIN_S = 0.250  # 250ms
     _WRITE_RETRY_SLOW_MAX_S = 1.000  # 1s
@@ -3996,13 +4468,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     def __init__(self, db_path: Path = None, read_only: bool = False):
         self.db_path = db_path or _default_db_path()
         path_existed_before_connect = self.db_path.exists()
+        existing_schema_version: Optional[int] = None
         # Fail hard (before any connection/pragma/mkdir) if a pytest-context
         # process resolved the developer's production state.db — see the
         # live-DB test-isolation guard block near _default_db_path().
         _ensure_test_isolation(self.db_path)
         self.read_only = read_only
 
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         # Read-path split (WAL only): recall/browse queries borrow a
         # read-only connection from a bounded pool so they never queue
         # behind writer flushes on self._lock. See _read_ctx().
@@ -4076,6 +4549,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._fts_cjk_available = False
         self._fts_unavailable_warned = False
         self._conn = None
+        self._offline_rebuild_marker: Optional[str] = None
+        self._offline_rebuild_depth = 0
+        self._offline_rebuild_transition = False
         # Async token accounting (see queue_token_counts). The condition
         # guards queue + writer state; it is distinct from self._lock so
         # enqueue/flush bookkeeping never contends with SQLite writes.
@@ -4186,7 +4662,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     path_existed_before_connect = False
 
             if path_existed_before_connect:
-                _probe_existing_state_db_schema(
+                existing_schema_version = _probe_existing_state_db_schema(
                     self.db_path, allow_malformed_repair=True
                 )
 
@@ -4207,11 +4683,46 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 register_turn_fence_generation(self._conn)
                 _validate_connection_schema(
                     self._conn,
-                    allow_uninitialized_schema=not path_existed_before_connect,
+                    allow_uninitialized_schema=(
+                        not path_existed_before_connect
+                        or existing_schema_version is None
+                    ),
                 )
+                self._assert_offline_rebuild_write_authority(self._conn)
                 self._wal_active = (
-                    apply_wal_with_fallback(self._conn, db_label="state.db") == "wal"
+                    apply_wal_with_fallback(
+                        self._conn,
+                        db_label="state.db",
+                        before_journal_mode_change=lambda: self._assert_offline_rebuild_maintenance_authority(
+                            self._conn
+                        ),
+                    )
+                    == "wal"
                 )
+                if self._wal_active:
+                    # SQLite 3.50.4 retains an EXCLUSIVE lock from a
+                    # successful WAL mode change until the setting connection
+                    # closes, even after a normal-mode transaction. This
+                    # startup connection is disposable, so replace it before
+                    # it becomes SessionDB's long-lived writer.
+                    old_conn, self._conn = self._conn, None
+                    old_conn.close()
+                    self._conn = _connect_tracked_db(
+                        str(self.db_path),
+                        check_same_thread=False,
+                        timeout=1.0,
+                        isolation_level=None,
+                    )
+                    self._conn.row_factory = sqlite3.Row
+                    register_turn_fence_generation(self._conn)
+                    _validate_connection_schema(
+                        self._conn,
+                        allow_uninitialized_schema=(
+                            not path_existed_before_connect
+                            or existing_schema_version is None
+                        ),
+                    )
+                    self._assert_offline_rebuild_write_authority(self._conn)
                 apply_database_pragmas(self._conn, db_label="state.db")
                 self._conn.execute("PRAGMA foreign_keys=ON")
                 self._fts_cjk_loaded = load_fts5_cjk_extension(self._conn)
@@ -4586,6 +5097,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         )
 
     def _ensure_fts_cjk_schema(self, cursor) -> None:
+        with self.offline_rebuild(reason="ensure CJK FTS schema"):
+            self._ensure_fts_cjk_schema_owned(cursor)
+
+    def _ensure_fts_cjk_schema_owned(self, cursor) -> None:
         """Create / repair / self-heal the CJK-bigram index surface.
 
         ``cursor`` may be a Cursor or a Connection (both expose execute /
@@ -4636,18 +5151,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         "with the extension to rebuild.",
                         fts5_cjk_so_path(),
                     )
-                    cursor.execute(
-                        "INSERT INTO state_meta (key, value) VALUES (?, '1') "
-                        "ON CONFLICT(key) DO UPDATE SET value = '1'",
-                        (FTS_CJK_STALE_KEY,),
-                    )
-                    for trig in live:
-                        cursor.execute(f"DROP TRIGGER IF EXISTS {trig}")
+
+                    def detach_cjk_triggers(conn: sqlite3.Connection) -> None:
+                        conn.execute(
+                            "INSERT INTO state_meta (key, value) VALUES (?, '1') "
+                            "ON CONFLICT(key) DO UPDATE SET value = '1'",
+                            (FTS_CJK_STALE_KEY,),
+                        )
+                        for trig in live:
+                            conn.execute(f"DROP TRIGGER IF EXISTS {trig}")
+
+                    self._execute_write(detach_cjk_triggers, _count_write=False)
             self._fts_cjk_available = False
             return
 
         try:
-            cursor.executescript(FTS_CJK_TABLE_SQL)
+            self._execute_fts_schema_script(cursor, FTS_CJK_TABLE_SQL)
             if not cjk_present:
                 # Freshly created. An empty DB's index is complete by
                 # construction (triggers will cover every future row); a
@@ -4656,26 +5175,29 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # keep NEW rows indexed while old rows await the
                 # `optimize-storage` backfill. Either way any old stale
                 # breadcrumb refers to a table that no longer exists.
-                cursor.execute(
-                    "DELETE FROM state_meta WHERE key = ?",
-                    (FTS_CJK_STALE_KEY,),
-                )
-                n_msgs = cursor.execute(
-                    "SELECT COUNT(*) FROM messages WHERE role <> 'tool'"
-                ).fetchone()[0]
-                if n_msgs > 0:
-                    hw = cursor.execute(
-                        "SELECT COALESCE(MAX(id), 0) FROM messages"
+                def seed_cjk_backfill(conn: sqlite3.Connection) -> None:
+                    conn.execute(
+                        "DELETE FROM state_meta WHERE key = ?",
+                        (FTS_CJK_STALE_KEY,),
+                    )
+                    n_msgs = conn.execute(
+                        "SELECT COUNT(*) FROM messages WHERE role <> 'tool'"
                     ).fetchone()[0]
-                    for k, v in (
-                        ("fts_cjk_rebuild_high_water", str(hw)),
-                        ("fts_cjk_rebuild_progress", "0"),
-                    ):
-                        cursor.execute(
-                            "INSERT INTO state_meta (key, value) VALUES (?, ?) "
-                            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                            (k, v),
-                        )
+                    if n_msgs > 0:
+                        hw = conn.execute(
+                            "SELECT COALESCE(MAX(id), 0) FROM messages"
+                        ).fetchone()[0]
+                        for k, v in (
+                            ("fts_cjk_rebuild_high_water", str(hw)),
+                            ("fts_cjk_rebuild_progress", "0"),
+                        ):
+                            conn.execute(
+                                "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                                (k, v),
+                            )
+
+                self._execute_write(seed_cjk_backfill, _count_write=False)
             stale = cursor.execute(
                 "SELECT 1 FROM state_meta WHERE key = ?",
                 (FTS_CJK_STALE_KEY,),
@@ -4688,7 +5210,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # `optimize-storage` run rebuilds from scratch.
                 self._fts_cjk_available = False
                 return
-            cursor.executescript(FTS_CJK_TRIGGER_SQL)
+            self._execute_fts_schema_script(cursor, FTS_CJK_TRIGGER_SQL)
             backfill_pending = cursor.execute(
                 "SELECT 1 FROM state_meta "
                 "WHERE key = 'fts_cjk_rebuild_high_water' LIMIT 1"
@@ -4717,6 +5239,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         table_name: str,
         ddl: str,
     ) -> bool:
+        with self.offline_rebuild(reason=f"ensure {table_name} FTS schema"):
+            return self._ensure_fts_schema_owned(cursor, table_name, ddl)
+
+    def _ensure_fts_schema_owned(
+        self,
+        cursor: sqlite3.Cursor,
+        table_name: str,
+        ddl: str,
+    ) -> bool:
         status = self._fts_table_probe(cursor, table_name)
         if status is None:
             return False
@@ -4724,7 +5255,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # Run even when the virtual table exists so any dropped or missing
             # triggers are recreated after a previous no-FTS5 runtime disabled
             # them to keep message writes working.
-            cursor.executescript(ddl)
+            self._execute_fts_schema_script(cursor, ddl)
             return True
         except sqlite3.OperationalError as exc:
             if not self._is_fts5_unavailable_error(exc):
@@ -4738,10 +5269,319 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 self._warn_fts5_unavailable(exc)
             return False
 
+    @staticmethod
+    def _split_fts_schema_script(script: str) -> list[str]:
+        """Split FTS DDL without breaking trigger bodies on their semicolons."""
+        statements = []
+        pending = ""
+        for character in script:
+            pending += character
+            if character == ";" and sqlite3.complete_statement(pending):
+                if pending.strip():
+                    statements.append(pending)
+                pending = ""
+        if pending.strip():
+            statements.append(pending)
+        return statements
+
+    def _execute_fts_schema_script(self, cursor, script: str) -> None:
+        """Run FTS schema writes under one post-BEGIN ownership comparison."""
+        statements = self._split_fts_schema_script(script)
+        while statements and statements[0].lstrip().upper().startswith("SELECT"):
+            cursor.execute(statements.pop(0))
+        if not statements:
+            return
+        with self.write_transaction():
+            for statement in statements:
+                cursor.execute(statement)
+
+    @contextmanager
+    def _same_connection_transaction_boundary(self):
+        """Hold this instance and its exact physical connection together."""
+        with self._lock:
+            conn = self._conn
+            if conn is None:
+                raise sqlite3.ProgrammingError(
+                    "SessionDB has no connection for a transaction boundary"
+                )
+            serial_lock = getattr(conn, "_hermes_serial_lock", None)
+            if serial_lock is None:
+                serial_lock = threading.RLock()
+                conn._hermes_serial_lock = serial_lock
+            with serial_lock:
+                if self._conn is not conn:
+                    raise sqlite3.ProgrammingError(
+                        "SessionDB connection changed while entering a transaction boundary"
+                    )
+                yield conn
+
+    @staticmethod
+    def _begin_immediate_before_deadline(
+        conn: sqlite3.Connection, deadline: float, *, immediate: bool = True
+    ) -> None:
+        """Begin within the retry budget and restore the prior busy timeout."""
+        row = conn.execute("PRAGMA busy_timeout").fetchone()
+        previous_timeout_ms = int(row[0]) if row and row[0] is not None else 0
+        bounded_timeout_ms = min(
+            previous_timeout_ms, max(0, int((deadline - time.monotonic()) * 1000))
+        )
+        changed = bounded_timeout_ms != previous_timeout_ms
+        if changed:
+            conn.execute(f"PRAGMA busy_timeout={bounded_timeout_ms}")
+        try:
+            conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+        except BaseException:
+            if changed:
+                try:
+                    conn.execute(f"PRAGMA busy_timeout={previous_timeout_ms}")
+                except Exception:
+                    pass
+            raise
+        if changed:
+            try:
+                conn.execute(f"PRAGMA busy_timeout={previous_timeout_ms}")
+            except BaseException as exc:
+                # The caller must distinguish this from a failed BEGIN: work
+                # started and cannot be replayed even after rollback succeeds.
+                try:
+                    setattr(exc, "_hermes_transaction_started", True)
+                except Exception:
+                    pass
+                raise
+
+    def _rollback_or_retire_failed_transaction(
+        self, conn: sqlite3.Connection, primary_exc: BaseException
+    ) -> None:
+        """Rollback once, or permanently retire an indeterminate connection."""
+        rollback_exc = None
+        try:
+            conn.rollback()
+        except BaseException as exc:
+            rollback_exc = exc
+        if rollback_exc is None and not conn.in_transaction:
+            return
+        if rollback_exc is None:
+            rollback_exc = sqlite3.OperationalError(
+                "SQLite rollback left a transaction active"
+            )
+        if self._conn is conn:
+            self._conn = None
+        try:
+            conn.close()
+        except BaseException as close_exc:
+            try:
+                primary_exc.add_note("SQLite transaction cleanup failed")
+            except Exception:
+                pass
+            try:
+                rollback_exc.add_note(str(close_exc))
+            except Exception:
+                pass
+        raise primary_exc from rollback_exc
+
+    def _assert_offline_rebuild_write_authority(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        """Refuse writes while a different durable rebuild claim is active."""
+        _assert_offline_rebuild_write_authority(
+            conn, self._offline_rebuild_marker
+        )
+
+    def _assert_offline_rebuild_maintenance_authority(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        """Refuse raw maintenance while any rebuild claim governs this DB.
+
+        SQLite cannot compare the durable marker and run VACUUM or a WAL
+        checkpoint in one transaction.  A local claim therefore makes those
+        no-transaction statements inadmissible; they must wait until its
+        compare-delete release completes.  A foreign claim is refused by the
+        exact durable comparison immediately before the statement as well.
+        """
+        self._assert_offline_rebuild_write_authority(conn)
+        if self._offline_rebuild_marker is not None:
+            raise SessionTurnLeaseLostError(
+                "refusing raw SQLite maintenance while an offline rebuild owns this database"
+            )
+
+    @contextmanager
+    def _raw_maintenance_fence(self):
+        """Fence one no-transaction raw operation on this exact connection."""
+        conn = self._conn
+        if conn is None:
+            raise sqlite3.ProgrammingError(
+                "SessionDB has no connection for raw SQLite maintenance"
+            )
+        with _same_connection_raw_maintenance_fence(
+            conn,
+            assert_authority=lambda: self._assert_offline_rebuild_maintenance_authority(
+                conn
+            ),
+        ):
+            yield conn
+
+    @contextmanager
+    def offline_rebuild(self, *, reason: str):
+        """Hold this database's durable exclusion claim for FTS maintenance."""
+        if self.read_only:
+            yield self
+            return
+        if self._offline_rebuild_marker is not None:
+            self._assert_offline_rebuild_write_authority(self._conn)
+            self._offline_rebuild_depth += 1
+            try:
+                yield self
+            finally:
+                self._offline_rebuild_depth -= 1
+            return
+
+        owner_pid = os.getpid()
+        owner_pid_start = time.time()
+        if owner_pid <= 0 or not math.isfinite(owner_pid_start):
+            raise SessionTurnLeaseLostError(
+                "offline rebuild cannot establish a valid process identity"
+            )
+        marker_value = json.dumps(
+            {
+                "generation": 1,
+                "nonce": os.urandom(16).hex(),
+                "owner_pid": owner_pid,
+                "owner_pid_start": owner_pid_start,
+                "reason": reason,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+        def claim(conn: sqlite3.Connection) -> None:
+            row = conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?",
+                (_OFFLINE_REBUILD_EPOCH_KEY,),
+            ).fetchone()
+            if row is not None:
+                raise SessionTurnLeaseLostError(
+                    "offline rebuild exclusion is already held"
+                )
+            conn.execute(
+                "INSERT INTO state_meta(key, value) VALUES (?, ?)",
+                (_OFFLINE_REBUILD_EPOCH_KEY, marker_value),
+            )
+
+        self._offline_rebuild_transition = True
+        try:
+            self._execute_write(claim, _count_write=False)
+        except BaseException:
+            self._offline_rebuild_marker = None
+            raise
+        finally:
+            self._offline_rebuild_transition = False
+        self._offline_rebuild_marker = marker_value
+        self._offline_rebuild_depth = 1
+        primary_exc: Optional[BaseException] = None
+        try:
+            with self._same_connection_transaction_boundary() as conn:
+                self._assert_offline_rebuild_write_authority(conn)
+                yield self
+        except BaseException as exc:
+            primary_exc = exc
+            raise
+        finally:
+            def release(conn: sqlite3.Connection) -> None:
+                cursor = conn.execute(
+                    "DELETE FROM state_meta WHERE key = ? AND value = ?",
+                    (_OFFLINE_REBUILD_EPOCH_KEY, marker_value),
+                )
+                if cursor.rowcount != 1:
+                    raise SessionTurnLeaseLostError(
+                        "offline rebuild exclusion changed before release"
+                    )
+
+            try:
+                self._offline_rebuild_transition = True
+                self._execute_write(release, _count_write=False)
+            except BaseException:
+                if primary_exc is None:
+                    raise
+                try:
+                    primary_exc.add_note(
+                        "offline rebuild exclusion changed before release"
+                    )
+                except Exception:
+                    pass
+            finally:
+                self._offline_rebuild_transition = False
+                self._offline_rebuild_depth = 0
+                self._offline_rebuild_marker = None
+
+    @contextmanager
+    def write_transaction(
+        self, patience_s: Optional[float] = None, *, immediate: bool = True
+    ):
+        """Yield one caller-owned transaction without replaying post-BEGIN work."""
+        if patience_s is None:
+            patience_s = self._WRITE_PATIENCE_S
+
+        # Schema initialization composes several helpers that each retain a
+        # standalone transaction contract.  When its outer transaction is
+        # already active, they must stay on that exact connection and leave
+        # commit/rollback to the owner rather than creating an implicit gap.
+        with self._same_connection_transaction_boundary() as conn:
+            if conn.in_transaction:
+                self._assert_offline_rebuild_write_authority(conn)
+                yield conn
+                return
+
+        deadline = time.monotonic() + patience_s
+        while True:
+            ownership = contextlib.ExitStack()
+            transaction_started = False
+            try:
+                conn = ownership.enter_context(self._same_connection_transaction_boundary())
+                try:
+                    self._begin_immediate_before_deadline(
+                        conn, deadline, immediate=immediate
+                    )
+                    transaction_started = True
+                except BaseException as exc:
+                    if getattr(exc, "_hermes_transaction_started", False):
+                        self._rollback_or_retire_failed_transaction(conn, exc)
+                    raise
+            except sqlite3.OperationalError as exc:
+                ownership.close()
+                if (
+                    not transaction_started
+                    and not getattr(exc, "_hermes_transaction_started", False)
+                    and ("locked" in str(exc).lower() or "busy" in str(exc).lower())
+                    and self._sleep_before_write_retry(deadline, patience_s)
+                ):
+                    continue
+                raise
+            except BaseException:
+                ownership.close()
+                raise
+            break
+
+        try:
+            try:
+                self._assert_offline_rebuild_write_authority(conn)
+                yield conn
+            except BaseException as exc:
+                self._rollback_or_retire_failed_transaction(conn, exc)
+                raise
+            try:
+                conn.commit()
+            except BaseException as exc:
+                self._rollback_or_retire_failed_transaction(conn, exc)
+                raise
+        finally:
+            ownership.close()
+
     def _execute_write(
         self,
         fn: Callable[[sqlite3.Connection], T],
         patience_s: Optional[float] = None,
+        *,
+        _count_write: bool = True,
     ) -> T:
         """Execute a write transaction with BEGIN IMMEDIATE and jitter retry.
 
@@ -4769,6 +5609,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         if patience_s is None:
             patience_s = self._WRITE_PATIENCE_S
+
+        # See write_transaction(): nested schema/FTS recovery helpers inherit
+        # the initialization transaction's exact authority comparison and must
+        # neither commit nor replay its caller's work.
+        with self._same_connection_transaction_boundary() as conn:
+            if conn.in_transaction:
+                self._assert_offline_rebuild_write_authority(conn)
+                return fn(conn)
+
         deadline = time.monotonic() + patience_s
         # Set on the first compression-busy collision so the short wait is
         # measured from then, not from the start of the write.
@@ -4785,26 +5634,39 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return "no more rows available" in str(exc).lower()
 
         while True:
+            transaction_started = False
+            commit_attempted = False
             try:
-                with self._lock:
-                    self._conn.execute("BEGIN IMMEDIATE")
+                with self._same_connection_transaction_boundary() as conn:
                     try:
-                        result = fn(self._conn)
-                        self._conn.commit()
-                    except BaseException:
-                        try:
-                            self._conn.rollback()
-                        except Exception:
-                            pass
+                        self._begin_immediate_before_deadline(conn, deadline)
+                        transaction_started = True
+                    except BaseException as exc:
+                        if getattr(exc, "_hermes_transaction_started", False):
+                            self._rollback_or_retire_failed_transaction(conn, exc)
+                        raise
+                    try:
+                        self._assert_offline_rebuild_write_authority(conn)
+                        result = fn(conn)
+                        commit_attempted = True
+                        conn.commit()
+                    except BaseException as exc:
+                        self._rollback_or_retire_failed_transaction(conn, exc)
                         raise
                 # Success — periodic best-effort checkpoint + FTS merge.
-                self._write_count += 1
-                if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
-                    self._try_wal_checkpoint()
-                if self._write_count % self._FTS_MERGE_EVERY_N_WRITES == 0:
-                    self._try_incremental_merge_fts()
+                if _count_write:
+                    self._write_count += 1
+                    if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
+                        self._try_wal_checkpoint()
+                    if (
+                        not self._offline_rebuild_transition
+                        and self._write_count % self._FTS_MERGE_EVERY_N_WRITES == 0
+                    ):
+                        self._try_incremental_merge_fts()
                 return result
             except SessionCompressionInProgressError:
+                if transaction_started or commit_attempted:
+                    raise
                 # A live foreign compression lock is transient: the compressor
                 # publishes in a couple of seconds. Without any wait, a steer
                 # that lands mid-compression aborts the user's turn as
@@ -4826,6 +5688,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     continue
                 raise
             except sqlite3.OperationalError as exc:
+                if (
+                    commit_attempted
+                    or transaction_started
+                    or getattr(exc, "_hermes_transaction_started", False)
+                ):
+                    raise
                 err_msg = str(exc).lower()
                 if "locked" in err_msg or "busy" in err_msg:
                     if self._sleep_before_write_retry(deadline, patience_s):
@@ -4844,6 +5712,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # Non-lock error or patience exhausted — propagate.
                 raise
             except sqlite3.DatabaseError as exc:
+                if (
+                    commit_attempted
+                    or transaction_started
+                    or getattr(exc, "_hermes_transaction_started", False)
+                ):
+                    raise
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
                     continue
                 # Corrupt FTS shadow tables make every write raise the
@@ -4864,6 +5738,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # subclass) or another sqlite3.Error class outside the two
                 # handlers above. Message-scoped: anything else propagates
                 # untouched.
+                if (
+                    commit_attempted
+                    or transaction_started
+                    or getattr(exc, "_hermes_transaction_started", False)
+                ):
+                    raise
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
                     continue
                 raise
@@ -5095,31 +5975,25 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return False
 
         try:
-            with self._lock:
-                self._conn.execute("BEGIN IMMEDIATE")
-                try:
-                    self._conn.execute(
+            with self.write_transaction() as conn:
+                conn.execute(
+                    "INSERT INTO state_meta (key, value) VALUES (?, '1') "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (FTS_STALE_KEY,),
+                )
+                cjk_triggers_present = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'trigger' "
+                    f"AND name IN ({','.join('?' for _ in _FTS_CJK_TRIGGERS)}) "
+                    "LIMIT 1",
+                    _FTS_CJK_TRIGGERS,
+                ).fetchone()
+                if cjk_triggers_present:
+                    conn.execute(
                         "INSERT INTO state_meta (key, value) VALUES (?, '1') "
                         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                        (FTS_STALE_KEY,),
+                        (FTS_CJK_STALE_KEY,),
                     )
-                    cjk_triggers_present = self._conn.execute(
-                        "SELECT 1 FROM sqlite_master WHERE type = 'trigger' "
-                        f"AND name IN ({','.join('?' for _ in _FTS_CJK_TRIGGERS)}) "
-                        "LIMIT 1",
-                        _FTS_CJK_TRIGGERS,
-                    ).fetchone()
-                    if cjk_triggers_present:
-                        self._conn.execute(
-                            "INSERT INTO state_meta (key, value) VALUES (?, '1') "
-                            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                            (FTS_CJK_STALE_KEY,),
-                        )
-                    self._drop_all_fts_triggers(self._conn.cursor())
-                    self._conn.commit()
-                except BaseException:
-                    self._conn.rollback()
-                    raise
+                self._drop_all_fts_triggers(conn.cursor())
         except sqlite3.Error as detach_exc:
             logger.error(
                 "Could not detach corrupt FTS indexes; canonical write still "
@@ -5160,9 +6034,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         try:
             with self._lock:
-                result = self._conn.execute(
-                    "PRAGMA wal_checkpoint(PASSIVE)"
-                ).fetchone()
+                if self._conn is None:
+                    return
+                try:
+                    with self._raw_maintenance_fence() as conn:
+                        result = conn.execute(
+                            "PRAGMA wal_checkpoint(PASSIVE)"
+                        ).fetchone()
+                except SessionTurnLeaseLostError as exc:
+                    if isinstance(exc.__cause__, sqlite3.Error):
+                        logger.warning("WAL checkpoint (PASSIVE) failed: %s", exc)
+                    else:
+                        logger.debug("WAL checkpoint (PASSIVE) skipped: %s", exc)
+                    return
                 if result and result[1] > 0:
                     logger.debug(
                         "WAL checkpoint: %d/%d pages checkpointed",
@@ -5245,7 +6129,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     # checkpoint was already made PASSIVE to avoid. TRUNCATE
                     # belongs only on a sole-opener/quiescent connection.
                     try:
-                        self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                        with self._raw_maintenance_fence() as conn:
+                            conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                    except SessionTurnLeaseLostError as exc:
+                        if isinstance(exc.__cause__, sqlite3.Error):
+                            logger.debug(
+                                "WAL checkpoint (PASSIVE) at close failed: %s", exc
+                            )
+                        else:
+                            logger.debug(
+                                "WAL checkpoint (PASSIVE) at close skipped: %s", exc
+                            )
                     except Exception as exc:
                         logger.debug(
                             "WAL checkpoint (PASSIVE) at close failed: %s",
@@ -13308,8 +14202,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     affected.append(row["id"])
             return affected
 
-        with self._read_ctx() as conn:
-            affected_ids = _find_affected(conn)
+        # A backup is about to acquire the raw-maintenance fence.  Use the
+        # writer for its preflight read so this operation does not leave one
+        # of SessionDB's pooled WAL readers in the way of that fence.
+        if backup:
+            with self._lock:
+                affected_ids = _find_affected(self._conn)
+        else:
+            with self._read_ctx() as conn:
+                affected_ids = _find_affected(conn)
 
         if dry_run:
             return {
@@ -13336,7 +14237,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 f"{self.db_path.name}.pre-clean-markers-backup-{stamp}"
             )
             with self._lock:
-                self._conn.execute("VACUUM INTO ?", (str(dest),))
+                with self._raw_maintenance_fence() as conn:
+                    conn.execute("VACUUM INTO ?", (str(dest),))
             backup_path = str(dest)
             logger.info("Backed up state.db to %s before clean-markers write", backup_path)
 
@@ -13475,7 +14377,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                automatically clears bindings.
         """
         def _do(conn):
-            conn.executescript(
+            for statement in self._split_fts_schema_script(
                 """
                 CREATE TABLE IF NOT EXISTS telegram_dm_topic_mode (
                     chat_id TEXT PRIMARY KEY,
@@ -13508,7 +14410,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 CREATE INDEX IF NOT EXISTS idx_telegram_dm_topic_bindings_user
                 ON telegram_dm_topic_bindings(user_id, chat_id);
                 """
-            )
+            ):
+                conn.execute(statement)
 
             # v1 → v2: rebuild telegram_dm_topic_bindings if its session_id FK
             # lacks ON DELETE CASCADE. SQLite can't ALTER a foreign key, so we
@@ -13527,7 +14430,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     for row in fk_rows
                 )
                 if needs_rebuild:
-                    conn.executescript(
+                    for statement in self._split_fts_schema_script(
                         """
                         CREATE TABLE telegram_dm_topic_bindings_new (
                             chat_id TEXT NOT NULL,
@@ -13552,7 +14455,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         CREATE INDEX idx_telegram_dm_topic_bindings_user
                             ON telegram_dm_topic_bindings(user_id, chat_id);
                         """
-                    )
+                    ):
+                        conn.execute(statement)
 
             conn.execute(
                 "INSERT INTO state_meta (key, value) VALUES (?, ?) "
@@ -14030,31 +14934,34 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         optimized = 0
         try:
             optimized = self.optimize_fts()
+        except SessionTurnLeaseLostError:
+            raise
         except Exception as exc:
             logger.warning("FTS optimize before VACUUM failed: %s", exc)
         # VACUUM cannot be executed inside a transaction.
         with self._lock:
-            # Best-effort WAL checkpoint first, then VACUUM. PASSIVE, not
-            # TRUNCATE: a manual `hermes sessions vacuum` runs in a transient
-            # CLI process, and a TRUNCATE reset here would race a live gateway
-            # writer and tear B-tree pages (#45383). VACUUM folds the WAL back
-            # itself; journal_size_limit bounds the file.
-            try:
-                self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except Exception as exc:
-                logger.debug("WAL checkpoint (PASSIVE) before VACUUM failed: %s", exc)
-            self._conn.execute("VACUUM")
-            # ...and again afterwards. VACUUM rewrites every page THROUGH the
-            # WAL, so the pre-VACUUM checkpoint above does nothing for the
-            # slack VACUUM itself creates: on a 3.0 GB database it left a
-            # 3.07 GB state.db-wal behind, so `sessions optimize` reported
-            # "reclaimed -11.2 MB" while actually consuming 3 GB of disk and
-            # filling the host to 100%. Truncating here is what makes the
-            # command a net win instead of a net loss on large databases.
-            try:
-                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            except Exception as exc:
-                logger.debug("WAL checkpoint (TRUNCATE) after VACUUM failed: %s", exc)
+            with self._raw_maintenance_fence() as conn:
+                # Best-effort WAL checkpoint first, then VACUUM. PASSIVE, not
+                # TRUNCATE: a manual `hermes sessions vacuum` runs in a transient
+                # CLI process, and a TRUNCATE reset here would race a live gateway
+                # writer and tear B-tree pages (#45383). VACUUM folds the WAL back
+                # itself; journal_size_limit bounds the file.
+                try:
+                    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                except Exception as exc:
+                    logger.debug("WAL checkpoint (PASSIVE) before VACUUM failed: %s", exc)
+                conn.execute("VACUUM")
+                # ...and again afterwards. VACUUM rewrites every page THROUGH the
+                # WAL, so the pre-VACUUM checkpoint above does nothing for the
+                # slack VACUUM itself creates: on a 3.0 GB database it left a
+                # 3.07 GB state.db-wal behind, so `sessions optimize` reported
+                # "reclaimed -11.2 MB" while actually consuming 3 GB of disk and
+                # filling the host to 100%. Truncating here is what makes the
+                # command a net win instead of a net loss on large databases.
+                try:
+                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                except Exception as exc:
+                    logger.debug("WAL checkpoint (TRUNCATE) after VACUUM failed: %s", exc)
         return optimized
 
     def maybe_auto_prune_and_vacuum(
@@ -14126,6 +15033,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     self.vacuum()
                     result["vacuumed"] = True
                     self.set_meta("last_vacuum", str(now))
+                except SessionTurnLeaseLostError:
+                    # A raw-maintenance fence refusal says another owner may
+                    # now govern state.db. It is not a best-effort vacuum
+                    # failure and must not fall through to success metadata.
+                    raise
                 except Exception as exc:
                     logger.warning("state.db VACUUM failed: %s", exc)
 
@@ -14140,6 +15052,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     retention_days,
                     " + VACUUM" if result["vacuumed"] else "",
                 )
+        except SessionTurnLeaseLostError:
+            raise
         except Exception as exc:
             # Maintenance must never block startup. Log and return error marker.
             logger.warning("state.db auto-maintenance failed: %s", exc)

@@ -213,10 +213,15 @@ class SessionSchemaMixin:
         if not to_drop:
             return 0
 
-        for name in to_drop:
-            # Names are drawn from the update_names literal allowlist above —
-            # never user input — so the identifier is interpolation-safe.
-            cursor.execute(f"DROP TRIGGER IF EXISTS {name}")
+        # The active rebuild owner (when any) must be checked after BEGIN and
+        # before the first trigger DROP.  `_init_schema()` holds that owner
+        # across its whole FTS repair sequence; this transaction closes the
+        # gap between inspecting sqlite_master and mutating it.
+        with self.write_transaction() as repair_conn:
+            for name in to_drop:
+                # Names are drawn from the update_names literal allowlist above
+                # — never user input — so the identifier is interpolation-safe.
+                repair_conn.execute(f"DROP TRIGGER IF EXISTS {name}")
 
         # Re-apply current DDL so CREATE TRIGGER installs the OF variants.
         # Choose legacy vs v23 the same way _init_schema does.
@@ -282,14 +287,16 @@ class SessionSchemaMixin:
         """
         self._fts_cjk_available = False
         try:
-            self.set_meta(FTS_CJK_STALE_KEY, "1", cursor=cursor)
+            with self.write_transaction() as repair_conn:
+                self.set_meta(FTS_CJK_STALE_KEY, "1", cursor=repair_conn)
         except Exception:
             logger.debug(
                 "Could not persist CJK FTS stale breadcrumb",
                 exc_info=True,
             )
         try:
-            cursor.execute("DROP TRIGGER IF EXISTS messages_fts_cjk_update")
+            with self.write_transaction() as repair_conn:
+                repair_conn.execute("DROP TRIGGER IF EXISTS messages_fts_cjk_update")
         except Exception:
             logger.debug(
                 "Could not drop residual CJK UPDATE trigger after quarantine",
@@ -372,6 +379,12 @@ class SessionSchemaMixin:
             raise
 
     def _recover_stale_fts(self, cursor: sqlite3.Cursor, *, legacy: bool) -> bool:
+        with self.offline_rebuild(reason="recover stale FTS"):
+            return self._recover_stale_fts_owned(cursor, legacy=legacy)
+
+    def _recover_stale_fts_owned(
+        self, cursor: sqlite3.Cursor, *, legacy: bool
+    ) -> bool:
         """Atomically rebuild stale base/trigram indexes and resume syncing."""
         foreign_holders = self._foreign_state_db_holders()
         if foreign_holders:
@@ -440,23 +453,19 @@ class SessionSchemaMixin:
         # One write transaction closes the dangerous gap: no canonical writer
         # can slip between the full rebuild and trigger restoration.
         recovery_sql = (
-            "BEGIN IMMEDIATE;"
-            + drop_sql
+            drop_sql
             + rebuild_sql
             + f"DELETE FROM state_meta WHERE key = '{FTS_STALE_KEY}';"
-            + "COMMIT;"
         )
         try:
-            cursor.executescript(recovery_sql)
+            self._execute_fts_schema_script(cursor, recovery_sql)
         except sqlite3.DatabaseError as exc:
-            try:
-                self._conn.rollback()
-            except sqlite3.Error:
-                pass
             # Stale indexes must remain detached even on SQLite builds whose
             # DDL transaction behavior differs.
-            self._drop_all_fts_triggers(cursor)
-            self._conn.commit()
+            self._execute_write(
+                lambda conn: self._drop_all_fts_triggers(conn),
+                _count_write=False,
+            )
             logger.error(
                 "Automatic rebuild of stale FTS indexes failed (%s); "
                 "canonical writes remain enabled with FTS detached.",
@@ -975,7 +984,9 @@ class SessionSchemaMixin:
             "conversation_id, holder, acquired_at, expires_at, "
             "owner_pid, owner_pid_start"
         )
-        cursor.execute("BEGIN IMMEDIATE")
+        owns_transaction = not self._conn.in_transaction
+        if owns_transaction:
+            cursor.execute("BEGIN IMMEDIATE")
         try:
             rows = cursor.execute(
                 'PRAGMA table_info("session_turn_leases")'
@@ -985,7 +996,8 @@ class SessionSchemaMixin:
                 # Another writer completed the repair before this transaction
                 # acquired its lock.  We made no mutation, so commit the
                 # empty transaction and leave the converged table alone.
-                self._conn.commit()
+                if owns_transaction:
+                    self._conn.commit()
                 return
             live_descriptor = tuple(
                 (
@@ -1183,9 +1195,11 @@ class SessionSchemaMixin:
                     "session_turn_leases turn-fence triggers were not restored"
                 )
             self._session_turn_lease_epoch_rebuild_checkpoint("trigger")
-            self._conn.commit()
+            if owns_transaction:
+                self._conn.commit()
         except BaseException:
-            self._conn.rollback()
+            if owns_transaction:
+                self._conn.rollback()
             raise
 
     def _apply_turn_fence_generation_delta(self, cursor: sqlite3.Cursor) -> None:
@@ -1196,8 +1210,7 @@ class SessionSchemaMixin:
         ):
             raise RuntimeError("turn-fence trigger declaration is incomplete")
         expected = dict(definitions)
-        cursor.execute("BEGIN")
-        try:
+        with self.write_transaction():
             for name, _sql in definitions:
                 cursor.execute(f"DROP TRIGGER IF EXISTS {name}")
             for _name, sql in definitions:
@@ -1215,12 +1228,71 @@ class SessionSchemaMixin:
                 "INSERT INTO schema_version (version) VALUES (?)",
                 (SCHEMA_VERSION,),
             )
-            self._conn.commit()
-        except BaseException:
-            self._conn.rollback()
-            raise
 
     def _init_schema(self):
+        """Run writable startup schema work under guarded transactions."""
+        conn = self._conn
+        foreign_keys_enabled = bool(
+            conn.execute("PRAGMA foreign_keys").fetchone()[0]
+        )
+        if foreign_keys_enabled:
+            # The legacy session_model_usage shape may contain orphaned rows;
+            # its established healer needs this disabled for the in-transaction
+            # copy.  Restore the connection policy after the schema boundary.
+            conn.execute("PRAGMA foreign_keys=OFF")
+        primary_exc = None
+        try:
+            # The modern DROP COLUMN path has a deliberately short deferred
+            # boundary: a competing writer can still prove a real lock race
+            # at the DDL itself, while the marker is compared after BEGIN.
+            # The full initialization transaction below then covers every
+            # remaining schema, reconciliation, migration, and FTS mutation.
+            with self.write_transaction(immediate=False):
+                self._heal_session_turn_leases_legacy_epoch(conn.cursor())
+            with self.write_transaction():
+                self._init_schema_mutations()
+        except BaseException as exc:
+            primary_exc = exc
+            raise
+        finally:
+            # A failed guarded transaction can retire its physical connection
+            # after rollback.  Do not mask that body error by restoring a
+            # pragma on the closed handle.  If a live handle cannot prove the
+            # old policy was restored, retire it rather than leave a reusable
+            # connection with foreign keys disabled.
+            if foreign_keys_enabled and self._conn is conn:
+                try:
+                    conn.execute("PRAGMA foreign_keys=ON")
+                except BaseException as restore_exc:
+                    self._conn = None
+                    close_exc = None
+                    try:
+                        conn.close()
+                    except BaseException as exc:
+                        close_exc = exc
+                    if primary_exc is None:
+                        if close_exc is not None:
+                            try:
+                                restore_exc.add_note(
+                                    f"connection retirement failed: {close_exc}"
+                                )
+                            except Exception:
+                                pass
+                        raise
+                    try:
+                        primary_exc.add_note(
+                            f"foreign-key policy restoration failed: {restore_exc}"
+                        )
+                        if close_exc is not None:
+                            primary_exc.add_note(
+                                f"connection retirement failed: {close_exc}"
+                            )
+                    except Exception:
+                        pass
+                    if primary_exc.__cause__ is None:
+                        raise primary_exc from restore_exc
+
+    def _init_schema_mutations(self):
         """Create tables and FTS if they don't exist, reconcile columns.
 
         Schema management follows the declarative reconciliation pattern
@@ -1235,7 +1307,8 @@ class SessionSchemaMixin:
         """
         cursor = self._conn.cursor()
 
-        cursor.executescript(SCHEMA_SQL)
+        for statement in self._split_fts_schema_script(SCHEMA_SQL):
+            cursor.execute(statement)
 
         # ── Declarative column reconciliation ──────────────────────────
         # Diff live tables against SCHEMA_SQL and ADD any missing columns.
@@ -1275,7 +1348,8 @@ class SessionSchemaMixin:
 
         # Deferred indexes that reference the reconciler-added ``active``
         # column (idx_messages_session_active) — same ordering constraint.
-        cursor.executescript(DEFERRED_INDEX_SQL)
+        for statement in self._split_fts_schema_script(DEFERRED_INDEX_SQL):
+            cursor.execute(statement)
 
         # Heal NULL ``active`` rows unconditionally on every startup.
         # On real-world DBs the reconciler-added ``active`` column can lack
@@ -1303,14 +1377,18 @@ class SessionSchemaMixin:
         if self._fts_stale:
             # A prior process deliberately detached FTS after corruption.
             # Keep every FTS writer detached until a full rebuild succeeds.
-            self._drop_all_fts_triggers(cursor)
+            with self.offline_rebuild(reason="detach stale FTS triggers"):
+                with self.write_transaction() as repair_conn:
+                    self._drop_all_fts_triggers(repair_conn)
         if not fts5_available:
             # Existing FTS triggers can still fire on messages INSERT/UPDATE
             # even though the current sqlite runtime cannot read the virtual
             # tables they target. Drop only the triggers so core persistence
             # continues; if a future runtime has FTS5, _ensure_fts_schema()
             # recreates them.
-            self._drop_fts_triggers(cursor)
+            with self.offline_rebuild(reason="detach unavailable FTS triggers"):
+                with self.write_transaction() as repair_conn:
+                    self._drop_fts_triggers(repair_conn)
 
         # ── Schema version bookkeeping ─────────────────────────────────
         # Bump to current so future data migrations (if any) can gate on
@@ -1631,74 +1709,82 @@ class SessionSchemaMixin:
             pass  # Index already exists
 
         if fts5_available:
-            # FTS5 setup. Run the DDL even when the virtual table exists so
-            # CREATE TRIGGER IF NOT EXISTS repairs trigger-only degradation from
-            # an earlier no-FTS5 runtime.
-            #
-            # OPT-IN v23 boundary: a legacy v22 install (inline-content FTS,
-            # not yet opted into `hermes db optimize`) must keep its EXISTING
-            # inline schema + triggers. Running the v23 external-content DDL
-            # here would create the trigram source VIEW and leave the DB in a
-            # mixed inline/external state. So for a legacy DB we only ensure
-            # its inline triggers exist (via the legacy DDL), and skip the
-            # v23 view/external tables entirely. Fresh installs and opted-in
-            # DBs have no legacy inline FTS, so they get the v23 DDL.
-            legacy_fts = self._db_has_legacy_inline_fts(cursor)
-            if self._fts_stale:
-                if self._recover_stale_fts(cursor, legacy=legacy_fts):
-                    # CJK was detached alongside the corrupt base indexes and
-                    # has its own stale marker. Its existing ensure path keeps
-                    # it offline until its dedicated rebuild.
-                    self._ensure_fts_cjk_schema(cursor)
+            # Keep one durable owner across setup and any later raw repair.
+            # The nested ensure helpers deliberately retain their standalone
+            # ownership contract, but their temporary claims must not leave a
+            # gap before `_init_schema()` rebuilds indexes or replaces broad
+            # triggers below.
+            with self.offline_rebuild(reason="initialize FTS schema"):
+                # FTS5 setup. Run the DDL even when the virtual table exists so
+                # CREATE TRIGGER IF NOT EXISTS repairs trigger-only degradation from
+                # an earlier no-FTS5 runtime.
+                #
+                # OPT-IN v23 boundary: a legacy v22 install (inline-content FTS,
+                # not yet opted into `hermes db optimize`) must keep its EXISTING
+                # inline schema + triggers. Running the v23 external-content DDL
+                # here would create the trigram source VIEW and leave the DB in a
+                # mixed inline/external state. So for a legacy DB we only ensure
+                # its inline triggers exist (via the legacy DDL), and skip the
+                # v23 view/external tables entirely. Fresh installs and opted-in
+                # DBs have no legacy inline FTS, so they get the v23 DDL.
+                legacy_fts = self._db_has_legacy_inline_fts(cursor)
+                if self._fts_stale:
+                    if self._recover_stale_fts(cursor, legacy=legacy_fts):
+                        # CJK was detached alongside the corrupt base indexes and
+                        # has its own stale marker. Its existing ensure path keeps
+                        # it offline until its dedicated rebuild.
+                        self._ensure_fts_cjk_schema(cursor)
+                    else:
+                        self._fts_enabled = False
+                        self._trigram_available = False
+                        self._fts_cjk_available = False
+                elif legacy_fts:
+                    triggers_need_repair = (
+                        self._fts_trigger_count(cursor) < len(_FTS_TRIGGERS)
+                    )
+                    self._fts_enabled = self._ensure_fts_schema(
+                        cursor, "messages_fts", LEGACY_FTS_SQL
+                    )
+                    if self._fts_enabled:
+                        trigram_enabled = self._ensure_fts_schema(
+                            cursor, "messages_fts_trigram", LEGACY_FTS_TRIGRAM_SQL
+                        )
+                        self._trigram_available = trigram_enabled
+                        if triggers_need_repair:
+                            with self.write_transaction() as repair_conn:
+                                self._rebuild_legacy_fts_indexes(
+                                    repair_conn, include_trigram=trigram_enabled
+                                )
                 else:
-                    self._fts_enabled = False
-                    self._trigram_available = False
-                    self._fts_cjk_available = False
-            elif legacy_fts:
-                triggers_need_repair = (
-                    self._fts_trigger_count(cursor) < len(_FTS_TRIGGERS)
-                )
-                self._fts_enabled = self._ensure_fts_schema(
-                    cursor, "messages_fts", LEGACY_FTS_SQL
-                )
-                if self._fts_enabled:
-                    trigram_enabled = self._ensure_fts_schema(
-                        cursor, "messages_fts_trigram", LEGACY_FTS_TRIGRAM_SQL
+                    triggers_need_repair = (
+                        self._fts_trigger_count(cursor) < len(_FTS_TRIGGERS)
                     )
-                    self._trigram_available = trigram_enabled
-                    if triggers_need_repair:
-                        self._rebuild_legacy_fts_indexes(
-                            cursor, include_trigram=trigram_enabled
-                        )
-            else:
-                triggers_need_repair = (
-                    self._fts_trigger_count(cursor) < len(_FTS_TRIGGERS)
-                )
-                self._fts_enabled = self._ensure_fts_schema(
-                    cursor, "messages_fts", FTS_SQL
-                )
-
-                # Trigram FTS5 for CJK/substring search. This is optional
-                # relative to the main FTS table; if it cannot be created,
-                # CJK search falls back to LIKE.
-                if self._fts_enabled:
-                    trigram_enabled = self._ensure_fts_schema(
-                        cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
+                    self._fts_enabled = self._ensure_fts_schema(
+                        cursor, "messages_fts", FTS_SQL
                     )
-                    self._trigram_available = trigram_enabled
-                    if triggers_need_repair:
-                        self._rebuild_fts_indexes(
-                            cursor,
-                            include_trigram=trigram_enabled,
-                        )
-                    # CJK-bigram index (cjk_unicode61). Strictly additive to
-                    # the surfaces above and gated on the loadable tokenizer:
-                    self._ensure_fts_cjk_schema(cursor)
 
-            # Replace any pre-existing broad AFTER UPDATE triggers with
-            # AFTER UPDATE OF variants. IF NOT EXISTS cannot rewrite them.
-            if getattr(self, "_fts_enabled", False):
-                self._migrate_broad_fts_update_triggers(cursor)
+                    # Trigram FTS5 for CJK/substring search. This is optional
+                    # relative to the main FTS table; if it cannot be created,
+                    # CJK search falls back to LIKE.
+                    if self._fts_enabled:
+                        trigram_enabled = self._ensure_fts_schema(
+                            cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
+                        )
+                        self._trigram_available = trigram_enabled
+                        if triggers_need_repair:
+                            with self.write_transaction() as repair_conn:
+                                self._rebuild_fts_indexes(
+                                    repair_conn,
+                                    include_trigram=trigram_enabled,
+                                )
+                        # CJK-bigram index (cjk_unicode61). Strictly additive to
+                        # the surfaces above and gated on the loadable tokenizer:
+                        self._ensure_fts_cjk_schema(cursor)
+
+                # Replace any pre-existing broad AFTER UPDATE triggers with
+                # AFTER UPDATE OF variants. IF NOT EXISTS cannot rewrite them.
+                if getattr(self, "_fts_enabled", False):
+                    self._migrate_broad_fts_update_triggers(cursor)
 
         if current_version < SCHEMA_VERSION:
             self._apply_turn_fence_generation_delta(cursor)

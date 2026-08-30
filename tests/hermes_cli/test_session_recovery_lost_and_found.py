@@ -17,7 +17,11 @@ from pathlib import Path
 
 import pytest
 
-from hermes_state import SessionDB, register_turn_fence_generation
+from hermes_state import (
+    SessionDB,
+    SessionTurnLeaseLostError,
+    register_turn_fence_generation,
+)
 from hermes_cli import session_recovery
 from hermes_cli.session_lost_and_found import (
     classify_lost_and_found_row,
@@ -34,6 +38,8 @@ from hermes_cli.session_recovery import (
 )
 
 from tests.hermes_cli.test_session_recovery import (
+    _arm_seal_authority_interleaving,
+    _assert_seal_authority_interleaving_blocked,
     _btree_leaf_pages,
     _make_page_spanning_source,
 )
@@ -318,6 +324,348 @@ def test_lost_and_found_destination_fence_failures_leave_no_output(
         assert not (output.with_name(output.name + suffix)).exists()
 
 
+@pytest.mark.parametrize(
+    ("takeover_marker", "expected_marker"),
+    (
+        (
+            b"\x00foreign-lost-found-seal-owner\xff",
+            b"\x00foreign-lost-found-seal-owner\xff",
+        ),
+        (None, None),
+    ),
+    ids=("foreign", "null"),
+)
+def test_lost_and_found_seal_refuses_marker_after_release(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    takeover_marker: bytes | None,
+    expected_marker: bytes | None,
+) -> None:
+    """The page-level recovery lane shares sealing's no-maintenance fence."""
+    source = tmp_path / "schemaless.db"
+    output = tmp_path / "recovered.db"
+    _make_schema_unreadable_source(source)
+    source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+    schema_ref = tmp_path / "schema-ref.db"
+    SessionDB(db_path=schema_ref).close()
+
+    import hermes_cli.session_lost_and_found as laf
+
+    monkeypatch.setattr(laf, "find_sqlite3_cli", lambda: "synthetic-sqlite3")
+
+    def run_synthetic_recover(
+        _snapshot: Path,
+        lost_and_found: Path,
+        _sqlite3_bin: str,
+    ) -> dict[str, str]:
+        _make_synthetic_lost_and_found(lost_and_found, schema_ref)
+        return {"mode": "synthetic"}
+
+    monkeypatch.setattr(laf, "run_cli_lost_and_found_recover", run_synthetic_recover)
+
+    candidate: Path | None = None
+    marker_key = session_recovery._OFFLINE_REBUILD_EPOCH_KEY
+    raw_maintenance: list[str] = []
+    takeover_complete = False
+    sealing_started = False
+    original_create_stage = session_recovery._create_destination_stage
+    original_seal = session_recovery._seal_staged_database
+    original_refresh = session_recovery._refresh_stage_children
+    original_connect = sqlite3.connect
+
+    def capture_stage(path: Path):
+        nonlocal candidate
+        stage = original_create_stage(path)
+        candidate = stage.candidate
+        return stage
+
+    def trace_sealing_connection(database, *args, **kwargs):
+        connection = original_connect(database, *args, **kwargs)
+        if takeover_complete and candidate is not None and Path(database) == candidate:
+            connection.set_trace_callback(
+                lambda sql: raw_maintenance.append(sql)
+                if "WAL_CHECKPOINT(TRUNCATE)" in sql.upper()
+                or "JOURNAL_MODE=DELETE" in sql.upper()
+                else None
+            )
+        return connection
+
+    def take_over_after_seal_refresh(stage, **kwargs):
+        nonlocal takeover_complete
+        result = original_refresh(stage, **kwargs)
+        if not sealing_started or takeover_complete:
+            return result
+        assert candidate == stage.candidate
+        with original_connect(str(stage.candidate), isolation_level=None) as writer:
+            assert writer.execute(
+                "SELECT value FROM state_meta WHERE key = ?", (marker_key,)
+            ).fetchone() is None
+            writer.execute(
+                "INSERT INTO state_meta(key, value) VALUES (?, ?)",
+                (
+                    marker_key,
+                    None
+                    if takeover_marker is None
+                    else sqlite3.Binary(takeover_marker),
+                ),
+            )
+        takeover_complete = True
+        return result
+
+    def run_seal_after_takeover_seam(stage):
+        nonlocal sealing_started
+        assert candidate == stage.candidate
+        sealing_started = True
+        return original_seal(stage)
+
+    monkeypatch.setattr(session_recovery, "_create_destination_stage", capture_stage)
+    monkeypatch.setattr(session_recovery, "_cleanup_destination_stage", lambda _stage: None)
+    monkeypatch.setattr(session_recovery.sqlite3, "connect", trace_sealing_connection)
+    monkeypatch.setattr(
+        session_recovery, "_refresh_stage_children", take_over_after_seal_refresh
+    )
+    monkeypatch.setattr(session_recovery, "_seal_staged_database", run_seal_after_takeover_seam)
+
+    caught: BaseException | None = None
+    try:
+        recover_session_database(source, output, work_dir=tmp_path, allow_partial=True)
+    except BaseException as exc:
+        caught = exc
+
+    assert raw_maintenance == []
+    assert isinstance(caught, SessionTurnLeaseLostError)
+    assert takeover_complete is True
+    assert candidate is not None
+    assert not output.exists()
+    with original_connect(str(candidate)) as destination:
+        assert destination.execute(
+            "SELECT CAST(value AS BLOB) FROM state_meta WHERE key = ?",
+            (marker_key,),
+        ).fetchone() == (expected_marker,)
+    assert hashlib.sha256(source.read_bytes()).hexdigest() == source_hash
+
+
+@pytest.mark.parametrize(
+    ("authority_select", "takeover_marker"),
+    (
+        (1, b"\x00foreign-lost-found-checkpoint-owner\xff"),
+        (1, None),
+        (2, b"\x00foreign-lost-found-journal-owner\xff"),
+        (2, None),
+    ),
+    ids=("checkpoint-foreign", "checkpoint-null", "journal-foreign", "journal-null"),
+)
+def test_lost_and_found_seal_blocks_takeover_at_pragma_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    authority_select: int,
+    takeover_marker: bytes | None,
+) -> None:
+    """The lost-and-found lane shares the seal's continuous SQLite authority."""
+    source = tmp_path / "schemaless.db"
+    output = tmp_path / "recovered.db"
+    _make_schema_unreadable_source(source)
+    source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+    schema_ref = tmp_path / "schema-ref.db"
+    SessionDB(db_path=schema_ref).close()
+
+    import hermes_cli.session_lost_and_found as laf
+
+    monkeypatch.setattr(laf, "find_sqlite3_cli", lambda: "synthetic-sqlite3")
+
+    def run_synthetic_recover(
+        _snapshot: Path,
+        lost_and_found: Path,
+        _sqlite3_bin: str,
+    ) -> dict[str, str]:
+        _make_synthetic_lost_and_found(lost_and_found, schema_ref)
+        return {"mode": "synthetic"}
+
+    monkeypatch.setattr(laf, "run_cli_lost_and_found_recover", run_synthetic_recover)
+    state = _arm_seal_authority_interleaving(
+        monkeypatch,
+        authority_select=authority_select,
+        takeover_marker=takeover_marker,
+    )
+
+    report = None
+    recovery_error: BaseException | None = None
+    try:
+        report = recover_session_database(
+            source, output, work_dir=tmp_path, allow_partial=True
+        )
+    except BaseException as exc:
+        recovery_error = exc
+
+    assert state["authority_selects"] >= authority_select
+    _assert_seal_authority_interleaving_blocked(state)
+    assert recovery_error is None
+    assert report is not None
+    assert report["verified"] is True
+    assert output.exists()
+    with sqlite3.connect(str(output)) as destination:
+        assert destination.execute(
+            "SELECT value FROM state_meta WHERE key = ?",
+            (session_recovery._OFFLINE_REBUILD_EPOCH_KEY,),
+        ).fetchone() is None
+        assert destination.execute("PRAGMA journal_mode").fetchone() == ("delete",)
+    assert hashlib.sha256(source.read_bytes()).hexdigest() == source_hash
+
+
+def test_lost_and_found_publication_refuses_marker_after_barrier(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The page-level recovery lane uses publication's final no-owner proof."""
+    source = tmp_path / "schemaless.db"
+    output = tmp_path / "recovered.db"
+    _make_schema_unreadable_source(source)
+    source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+    schema_ref = tmp_path / "schema-ref.db"
+    SessionDB(db_path=schema_ref).close()
+
+    import hermes_cli.session_lost_and_found as laf
+
+    monkeypatch.setattr(laf, "find_sqlite3_cli", lambda: "synthetic-sqlite3")
+
+    def run_synthetic_recover(
+        _snapshot: Path,
+        lost_and_found: Path,
+        _sqlite3_bin: str,
+    ) -> dict[str, str]:
+        _make_synthetic_lost_and_found(lost_and_found, schema_ref)
+        return {"mode": "synthetic"}
+
+    monkeypatch.setattr(laf, "run_cli_lost_and_found_recover", run_synthetic_recover)
+
+    candidate: Path | None = None
+    foreign_marker = "foreign-lost-found-publication-owner"
+    original_create_stage = session_recovery._create_destination_stage
+
+    def capture_stage(path: Path):
+        nonlocal candidate
+        stage = original_create_stage(path)
+        candidate = stage.candidate
+        return stage
+
+    def take_over_after_barrier(staged_candidate: Path, _output: Path) -> None:
+        assert candidate == staged_candidate
+        with sqlite3.connect(str(staged_candidate), isolation_level=None) as writer:
+            assert writer.execute(
+                "SELECT value FROM state_meta WHERE key = ?",
+                (session_recovery._OFFLINE_REBUILD_EPOCH_KEY,),
+            ).fetchone() is None
+            writer.execute(
+                "INSERT INTO state_meta(key, value) VALUES (?, ?)",
+                (session_recovery._OFFLINE_REBUILD_EPOCH_KEY, foreign_marker),
+            )
+
+    monkeypatch.setattr(session_recovery, "_create_destination_stage", capture_stage)
+    monkeypatch.setattr(session_recovery, "_publication_barrier", take_over_after_barrier)
+
+    with pytest.raises(SessionTurnLeaseLostError):
+        recover_session_database(source, output, work_dir=tmp_path, allow_partial=True)
+
+    assert candidate is not None and candidate.exists()
+    assert not output.exists()
+    with sqlite3.connect(str(candidate)) as destination:
+        assert destination.execute(
+            "SELECT value FROM state_meta WHERE key = ?",
+            (session_recovery._OFFLINE_REBUILD_EPOCH_KEY,),
+        ).fetchone() == (foreign_marker,)
+    assert hashlib.sha256(source.read_bytes()).hexdigest() == source_hash
+
+
+def test_lost_and_found_copy_refusal_retains_the_real_stage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Page-level copy loss preserves its stage and cannot reach publication."""
+    source = tmp_path / "schemaless.db"
+    output = tmp_path / "recovered.db"
+    _make_schema_unreadable_source(source)
+    schema_ref = tmp_path / "schema-ref.db"
+    SessionDB(db_path=schema_ref).close()
+
+    import hermes_cli.session_lost_and_found as laf
+
+    monkeypatch.setattr(laf, "find_sqlite3_cli", lambda: "synthetic-sqlite3")
+
+    def run_synthetic_recover(
+        _snapshot: Path,
+        lost_and_found: Path,
+        _sqlite3_bin: str,
+    ) -> dict[str, str]:
+        _make_synthetic_lost_and_found(lost_and_found, schema_ref)
+        return {"mode": "synthetic"}
+
+    candidate: Path | None = None
+    stage = None
+    copy_started = False
+    cleanup_calls = 0
+    original_create_stage = session_recovery._create_destination_stage
+    original_map_rows = laf.map_lost_and_found_rows
+    original_cleanup = session_recovery._cleanup_destination_stage
+
+    def capture_stage(path: Path):
+        nonlocal candidate, stage
+        stage = original_create_stage(path)
+        candidate = stage.candidate
+        return stage
+
+    def take_over_during_real_mapping(lf_conn, destination):
+        nonlocal copy_started
+        assert candidate is not None
+        copy_started = True
+        with sqlite3.connect(str(candidate), isolation_level=None) as writer:
+            writer.execute(
+                "UPDATE state_meta SET value = ? WHERE key = ?",
+                (
+                    "foreign-lost-and-found-copy-owner",
+                    session_recovery._OFFLINE_REBUILD_EPOCH_KEY,
+                ),
+            )
+        assert stage is not None
+        session_recovery._refresh_stage_children(stage, require_main=True)
+        return original_map_rows(lf_conn, destination)
+
+    def record_real_cleanup(destination_stage) -> None:
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        original_cleanup(destination_stage)
+
+    monkeypatch.setattr(laf, "run_cli_lost_and_found_recover", run_synthetic_recover)
+    monkeypatch.setattr(session_recovery, "_create_destination_stage", capture_stage)
+    monkeypatch.setattr(laf, "map_lost_and_found_rows", take_over_during_real_mapping)
+    monkeypatch.setattr(
+        session_recovery, "_cleanup_destination_stage", record_real_cleanup
+    )
+    monkeypatch.setattr(
+        session_recovery,
+        "_seal_staged_database",
+        lambda _stage: pytest.fail("copy refusal reached staged-database sealing"),
+    )
+    monkeypatch.setattr(
+        session_recovery,
+        "_publish_staged_database",
+        lambda _stage, _output: pytest.fail("copy refusal reached publication"),
+    )
+
+    with pytest.raises(SessionTurnLeaseLostError):
+        recover_session_database(source, output, work_dir=tmp_path, allow_partial=True)
+
+    assert copy_started is True
+    assert stage is not None and stage.retain_on_authority_refusal is True
+    assert cleanup_calls == 0
+    assert candidate is not None and candidate.exists()
+    assert not output.exists()
+    with sqlite3.connect(str(candidate)) as destination:
+        assert destination.execute(
+            "SELECT value FROM state_meta WHERE key = ?",
+            (session_recovery._OFFLINE_REBUILD_EPOCH_KEY,),
+        ).fetchone() == ("foreign-lost-and-found-copy-owner",)
+
+
 @pytest.mark.skipif(
     not HAVE_SQLITE3_CLI,
     reason="sqlite3 CLI not on PATH; .recover is a shell-only feature",
@@ -390,6 +738,125 @@ def test_lost_and_found_lane_recovers_schema_unreadable_source(
         assert len(sessions) == expected["sessions"]
     finally:
         recovered_db.close()
+
+
+@pytest.mark.skipif(
+    not HAVE_SQLITE3_CLI,
+    reason="sqlite3 CLI not on PATH; .recover is a shell-only feature",
+)
+def test_page_level_salvage_stops_later_dml_when_marker_is_replaced(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A page-level map commit must not authorize stubs or derived writes."""
+    source = tmp_path / "schemaless.db"
+    output = tmp_path / "recovered.db"
+    _make_schema_unreadable_source(source)
+    candidate: Path | None = None
+    original_create_stage = session_recovery._create_destination_stage
+
+    def capture_stage(path: Path):
+        nonlocal candidate
+        stage = original_create_stage(path)
+        candidate = stage.candidate
+        return stage
+
+    monkeypatch.setattr(session_recovery, "_create_destination_stage", capture_stage)
+    monkeypatch.setattr(session_recovery, "_cleanup_destination_stage", lambda _stage: None)
+    monkeypatch.setattr(
+        session_recovery,
+        "_refresh_stage_children",
+        lambda _stage, **_kwargs: None,
+    )
+    monkeypatch.setattr(session_recovery, "_seal_staged_database", lambda _stage: None)
+    monkeypatch.setattr(
+        session_recovery,
+        "_publish_staged_database",
+        lambda _stage, _output: None,
+    )
+
+    import hermes_cli.session_lost_and_found as laf
+
+    original_map = laf.map_lost_and_found_rows
+    original_rebuild = laf.rebuild_fts_indexes
+    foreign_marker = "foreign-page-level-owner"
+    adversarial_fts_value = "foreign-page-level-fts-storage-version"
+    adversarial_meta_value = "foreign-page-level-adversarial-value"
+    foreign_session_id = "foreign-page-level-orphan"
+    rebuilt_fts = False
+    replaced = False
+
+    def replace_marker_after_map(lf_conn, destination):
+        nonlocal replaced
+        report = original_map(lf_conn, destination)
+        assert candidate is not None
+        with sqlite3.connect(str(candidate), isolation_level=None) as writer:
+            marker = writer.execute(
+                "SELECT value FROM state_meta WHERE key = ?",
+                (session_recovery._OFFLINE_REBUILD_EPOCH_KEY,),
+            ).fetchone()
+            if marker is None:
+                writer.execute(
+                    "INSERT INTO state_meta(key, value) VALUES (?, ?)",
+                    (session_recovery._OFFLINE_REBUILD_EPOCH_KEY, foreign_marker),
+                )
+            else:
+                cursor = writer.execute(
+                    "UPDATE state_meta SET value = ? WHERE key = ?",
+                    (foreign_marker, session_recovery._OFFLINE_REBUILD_EPOCH_KEY),
+                )
+                assert cursor.rowcount == 1
+            writer.execute(
+                "INSERT OR REPLACE INTO state_meta(key, value) VALUES (?, ?)",
+                ("fts_storage_version", adversarial_fts_value),
+            )
+            writer.execute(
+                "INSERT OR REPLACE INTO state_meta(key, value) VALUES (?, ?)",
+                ("adversarial-after-page-level-marker", adversarial_meta_value),
+            )
+            register_turn_fence_generation(writer)
+            writer.execute(
+                "INSERT INTO messages(id, session_id, role, content, timestamp) "
+                "VALUES (999999, ?, 'user', 'foreign orphan', 1.0)",
+                (foreign_session_id,),
+            )
+        replaced = True
+        return report
+
+    def observe_fts_rebuild(destination):
+        nonlocal rebuilt_fts
+        rebuilt_fts = True
+        return original_rebuild(destination)
+
+    monkeypatch.setattr(laf, "map_lost_and_found_rows", replace_marker_after_map)
+    monkeypatch.setattr(laf, "rebuild_fts_indexes", observe_fts_rebuild)
+
+    with pytest.raises(SessionTurnLeaseLostError):
+        recover_session_database(source, output, work_dir=tmp_path, allow_partial=True)
+
+    assert replaced is True
+    assert rebuilt_fts is False
+    assert candidate is not None
+    assert output.exists() is False
+    with sqlite3.connect(str(candidate)) as destination:
+        assert destination.execute(
+            "SELECT value FROM state_meta WHERE key = ?",
+            (session_recovery._OFFLINE_REBUILD_EPOCH_KEY,),
+        ).fetchone() == (foreign_marker,)
+        assert destination.execute(
+            "SELECT value FROM state_meta WHERE key = 'fts_storage_version'"
+        ).fetchone() == (adversarial_fts_value,)
+        assert destination.execute(
+            "SELECT value FROM state_meta "
+            "WHERE key = 'adversarial-after-page-level-marker'"
+        ).fetchone() == (adversarial_meta_value,)
+        assert destination.execute(
+            "SELECT COUNT(*) FROM messages WHERE session_id = ?",
+            (foreign_session_id,),
+        ).fetchone() == (1,)
+        assert destination.execute(
+            "SELECT id FROM sessions WHERE id = ?", (foreign_session_id,)
+        ).fetchone() is None
 
 
 # ── mapper unit tests (no sqlite3 CLI required) ─────────────────────────────

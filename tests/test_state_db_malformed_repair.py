@@ -19,6 +19,7 @@ import subprocess
 import sys
 import uuid
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -144,17 +145,61 @@ def test_auto_heal_attempted_once_per_process(tmp_path, monkeypatch):
 
 
 
-def test_unrepairable_file_fails_safely(tmp_path, monkeypatch):
-    """A file too damaged to recover must report failure, keep a backup, and
-    never raise from the repair routine itself."""
+def test_unprovable_btree_file_refuses_before_repair_publication(tmp_path, monkeypatch):
+    """Unreadable metadata is not permission to back up, budget, or mutate."""
     db_path = tmp_path / "state.db"
     db_path.write_bytes(b"SQLite format 3\x00" + b"\x00\xde\xad\xbe\xef" * 200)
+    before = _repair_artifact_snapshot(db_path)
+    locked = MagicMock(wraps=hermes_state._repair_state_db_schema_locked)
+    recorded = MagicMock(wraps=hermes_state._record_repair_outcome)
+    monkeypatch.setattr(hermes_state, "_repair_state_db_schema_locked", locked)
+    monkeypatch.setattr(hermes_state, "_record_repair_outcome", recorded)
 
-    report = repair_state_db_schema(db_path)
-    assert report["repaired"] is False
-    assert report["error"]
-    # The (damaged) original bytes are preserved for manual restore.
-    assert report["backup_path"] and Path(report["backup_path"]).exists()
+    with pytest.raises(hermes_state.SessionTurnLeaseLostError, match="provable"):
+        repair_state_db_schema(db_path)
+
+    locked.assert_not_called()
+    recorded.assert_not_called()
+    assert _repair_artifact_snapshot(db_path) == before
+    assert not list(tmp_path.glob("state.db.malformed-backup-*"))
+    assert not hermes_state._repair_ledger_path(db_path).exists()
+
+
+def test_automatic_malformed_schema_repair_refuses_unprovable_metadata(
+    tmp_path, monkeypatch
+):
+    """The automatic caller preserves an authority refusal without publication."""
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+    _corrupt_duplicate_fts(db_path)
+    before = _repair_artifact_snapshot(db_path)
+    locked = MagicMock(wraps=hermes_state._repair_state_db_schema_locked)
+    recorded = MagicMock(wraps=hermes_state._record_repair_outcome)
+    monkeypatch.setattr(hermes_state, "_repair_state_db_schema_locked", locked)
+    monkeypatch.setattr(hermes_state, "_record_repair_outcome", recorded)
+
+    real_assert = hermes_state._assert_repair_state_db_write_authority
+
+    def unreadable_authority(conn, *, local_marker):
+        raise hermes_state.SessionTurnLeaseLostError(
+            "refusing schema repair without provable offline rebuild authority"
+        )
+
+    monkeypatch.setattr(
+        hermes_state, "_assert_repair_state_db_write_authority", unreadable_authority
+    )
+    opened = None
+    with pytest.raises(hermes_state.SessionTurnLeaseLostError, match="provable"):
+        opened = SessionDB(db_path=db_path)
+    if opened is not None:
+        opened.close()
+
+    assert real_assert is not None  # preserve an explicit real repair seam.
+    locked.assert_not_called()
+    recorded.assert_not_called()
+    assert _repair_artifact_snapshot(db_path) == before
+    assert not list(tmp_path.glob("state.db.malformed-backup-*"))
+    assert not hermes_state._repair_ledger_path(db_path).exists()
 
 
 
@@ -271,6 +316,484 @@ def _corrupt_fts_index_data(db_path: Path) -> None:
     conn = sqlite3.connect(str(db_path), isolation_level=None)
     conn.execute("UPDATE messages_fts_data SET block = X'DEADBEEFDEADBEEF'")
     conn.close()
+
+
+def _install_rebuild_claim(db_path: Path, value) -> None:
+    """Install one durable claim without keeping a writer open."""
+    conn = sqlite3.connect(str(db_path), isolation_level=None)
+    try:
+        if value is None:
+            conn.execute(
+                "INSERT INTO state_meta(key, value) VALUES (?, NULL)",
+                (hermes_state._OFFLINE_REBUILD_EPOCH_KEY,),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO state_meta(key, value) VALUES (?, ?)",
+                (hermes_state._OFFLINE_REBUILD_EPOCH_KEY, value),
+            )
+    finally:
+        conn.close()
+
+
+def _repair_artifact_snapshot(db_path: Path) -> dict[str, bytes | None]:
+    """Snapshot the durable bytes repair must not publish on a fence refusal."""
+    paths = (db_path, db_path.with_name(db_path.name + "-wal"))
+    return {str(path): path.read_bytes() if path.exists() else None for path in paths}
+
+
+def _repair_mutations(statements: list[str]) -> list[str]:
+    """Return schema/FTS/raw-maintenance mutations from a repair trace."""
+    prefixes = (
+        "INSERT INTO MESSAGES_FTS",
+        "REINDEX",
+        "DELETE FROM SQLITE_MASTER",
+        "VACUUM",
+    )
+    return [
+        sql
+        for sql in statements
+        if " ".join(sql.upper().split()).startswith(prefixes)
+    ]
+
+
+def _install_final_repair_ledger_takeover(
+    monkeypatch: pytest.MonkeyPatch,
+    db_path: Path,
+) -> dict[str, int]:
+    """Install a deterministic takeover in the gap after strategy success."""
+    calls = {"count": 0}
+    real_record = hermes_state._record_repair_outcome
+
+    def take_over_before_publication(path: Path, **kwargs) -> None:
+        calls["count"] += 1
+        _install_rebuild_claim(path, "foreign-final-repair-ledger-owner")
+        real_record(path, **kwargs)
+
+    monkeypatch.setattr(
+        hermes_state, "_record_repair_outcome", take_over_before_publication
+    )
+    return calls
+
+
+def test_direct_repair_refuses_final_ledger_publication_after_takeover(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Finished repair bytes never authorize its later ledger deletion."""
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+    _corrupt_fts_index_data(db_path)
+    ledger_path = hermes_state._repair_ledger_path(db_path)
+    sentinel = b'{"fingerprint":"prior","failed_attempts":2}'
+    ledger_path.write_bytes(sentinel)
+    calls = _install_final_repair_ledger_takeover(monkeypatch, db_path)
+
+    with pytest.raises(hermes_state.SessionTurnLeaseLostError):
+        repair_state_db_schema(db_path, backup=False)
+
+    assert calls == {"count": 1}
+    assert ledger_path.read_bytes() == sentinel
+    with sqlite3.connect(str(db_path)) as conn:
+        assert conn.execute(
+            "SELECT value FROM state_meta WHERE key = ?",
+            (hermes_state._OFFLINE_REBUILD_EPOCH_KEY,),
+        ).fetchone() == ("foreign-final-repair-ledger-owner",)
+
+
+def test_automatic_repair_refuses_final_ledger_publication_after_takeover(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The automatic malformed-schema caller does not replay or publish success."""
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+    _corrupt_duplicate_fts(db_path)
+    ledger_path = hermes_state._repair_ledger_path(db_path)
+    sentinel = b'{"fingerprint":"prior","failed_attempts":2}'
+    ledger_path.write_bytes(sentinel)
+    calls = _install_final_repair_ledger_takeover(monkeypatch, db_path)
+
+    with pytest.raises(hermes_state.SessionTurnLeaseLostError):
+        SessionDB(db_path=db_path)
+
+    assert calls == {"count": 1}
+    assert ledger_path.read_bytes() == sentinel
+    with sqlite3.connect(str(db_path)) as conn:
+        assert conn.execute(
+            "SELECT value FROM state_meta WHERE key = ?",
+            (hermes_state._OFFLINE_REBUILD_EPOCH_KEY,),
+        ).fetchone() == ("foreign-final-repair-ledger-owner",)
+
+
+@pytest.mark.parametrize(
+    "claim_state",
+    ("foreign", "null", "unprovable_state_meta"),
+)
+def test_direct_repair_refuses_unprovable_authority_before_fts_mutation(
+    tmp_path, monkeypatch, claim_state
+):
+    """Schema repair must fence every non-bootstrap metadata state before FTS DML."""
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+    if claim_state == "foreign":
+        _install_rebuild_claim(db_path, "foreign-repair-owner")
+    elif claim_state == "null":
+        _install_rebuild_claim(db_path, None)
+    else:
+        conn = sqlite3.connect(str(db_path), isolation_level=None)
+        try:
+            conn.execute("DROP TABLE state_meta")
+            conn.execute("CREATE TABLE state_meta (key TEXT PRIMARY KEY, broken TEXT)")
+        finally:
+            conn.close()
+    _corrupt_fts_index_data(db_path)
+    before = _repair_artifact_snapshot(db_path)
+    statements: list[str] = []
+    original_connect = hermes_state._connect_repair_durable
+
+    def traced_repair_connect(path):
+        conn = original_connect(path)
+        conn.set_trace_callback(statements.append)
+        return conn
+
+    monkeypatch.setattr(
+        hermes_state, "_connect_repair_durable", traced_repair_connect
+    )
+    refusal = None
+    try:
+        repair_state_db_schema(db_path)
+    except hermes_state.SessionTurnLeaseLostError as exc:
+        refusal = exc
+
+    assert type(refusal) is hermes_state.SessionTurnLeaseLostError, (
+        "repair reached a mutating ladder without proving authority: "
+        f"{_repair_mutations(statements)!r}"
+    )
+    assert _repair_mutations(statements) == []
+    assert _repair_artifact_snapshot(db_path) == before
+    assert not hermes_state._repair_ledger_path(db_path).exists()
+    assert not list(tmp_path.glob("state.db.malformed-backup-*"))
+
+
+def test_direct_repair_refuses_deleted_expected_local_claim_before_mutation(
+    tmp_path, monkeypatch
+):
+    """A vanished exact local claim is not the ordinary no-owner repair case."""
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+    expected_marker = "deleted-local-repair-owner"
+    _install_rebuild_claim(db_path, expected_marker)
+    conn = sqlite3.connect(str(db_path), isolation_level=None)
+    try:
+        assert conn.execute(
+            "DELETE FROM state_meta WHERE key = ?",
+            (hermes_state._OFFLINE_REBUILD_EPOCH_KEY,),
+        ).rowcount == 1
+    finally:
+        conn.close()
+    _corrupt_fts_index_data(db_path)
+    before = _repair_artifact_snapshot(db_path)
+    statements: list[str] = []
+    original_connect = hermes_state._connect_repair_durable
+
+    def traced_repair_connect(path):
+        conn = original_connect(path)
+        conn.set_trace_callback(statements.append)
+        return conn
+
+    monkeypatch.setattr(
+        hermes_state, "_connect_repair_durable", traced_repair_connect
+    )
+    refusal = None
+    try:
+        repair_state_db_schema(
+            db_path,
+            backup=False,
+            _local_rebuild_marker=expected_marker,
+        )
+    except hermes_state.SessionTurnLeaseLostError as exc:
+        refusal = exc
+
+    assert type(refusal) is hermes_state.SessionTurnLeaseLostError, (
+        "repair treated a deleted expected local claim as no owner: "
+        f"{_repair_mutations(statements)!r}"
+    )
+    assert _repair_mutations(statements) == []
+    assert _repair_artifact_snapshot(db_path) == before
+    assert not hermes_state._repair_ledger_path(db_path).exists()
+
+
+def test_repair_rechecks_authority_on_the_backup_mutation_connection(
+    tmp_path, monkeypatch
+):
+    """A claim after the first proof blocks backup before repair can mutate."""
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+    _corrupt_fts_index_data(db_path)
+    histories: dict[int, list[str]] = {}
+    original_connect = hermes_state._connect_repair_durable
+    original_budget_check = hermes_state._persistent_repair_attempts_exhausted
+    takeover_installed = False
+
+    def traced_repair_connect(path: Path):
+        conn = original_connect(path)
+        history: list[str] = []
+        histories[id(conn)] = history
+        conn.set_trace_callback(history.append)
+        return conn
+
+    def take_over_after_initial_proof(path: Path) -> bool:
+        nonlocal takeover_installed
+        with sqlite3.connect(str(path), isolation_level=None) as writer:
+            writer.execute(
+                "INSERT INTO state_meta(key, value) VALUES (?, ?)",
+                (
+                    hermes_state._OFFLINE_REBUILD_EPOCH_KEY,
+                    "foreign-repair-backup-owner",
+                ),
+            )
+        takeover_installed = True
+        return original_budget_check(path)
+
+    monkeypatch.setattr(
+        hermes_state, "_connect_repair_durable", traced_repair_connect
+    )
+    monkeypatch.setattr(
+        hermes_state,
+        "_persistent_repair_attempts_exhausted",
+        take_over_after_initial_proof,
+    )
+
+    with pytest.raises(hermes_state.SessionTurnLeaseLostError):
+        repair_state_db_schema(db_path)
+
+    statements = [sql for history in histories.values() for sql in history]
+    assert takeover_installed is True
+    assert any(
+        " ".join(sql.upper().split()).startswith("BEGIN IMMEDIATE")
+        for sql in statements
+    )
+    assert _repair_mutations(statements) == []
+    assert not list(tmp_path.glob("state.db.malformed-backup-*"))
+    assert not hermes_state._repair_ledger_path(db_path).exists()
+
+
+def test_existing_repair_with_deleted_state_meta_refuses_before_mutation(
+    tmp_path, monkeypatch
+):
+    """An existing damaged store without metadata is not repair bootstrap."""
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+    with sqlite3.connect(str(db_path), isolation_level=None) as conn:
+        conn.execute("DROP TABLE state_meta")
+    _corrupt_duplicate_fts(db_path)
+    before = _repair_artifact_snapshot(db_path)
+    statements: list[str] = []
+    original_connect = hermes_state._connect_repair_durable
+
+    def traced_repair_connect(path: Path):
+        conn = original_connect(path)
+        conn.set_trace_callback(statements.append)
+        return conn
+
+    monkeypatch.setattr(
+        hermes_state, "_connect_repair_durable", traced_repair_connect
+    )
+
+    with pytest.raises(hermes_state.SessionTurnLeaseLostError):
+        repair_state_db_schema(db_path, backup=False)
+
+    assert _repair_mutations(statements) == []
+    assert _repair_artifact_snapshot(db_path) == before
+    assert not hermes_state._repair_ledger_path(db_path).exists()
+
+
+def test_fresh_state_db_bootstrap_still_initializes_metadata(tmp_path):
+    """Only ordinary initialization may create metadata for a fresh database."""
+    db_path = tmp_path / "fresh-state.db"
+
+    db = SessionDB(db_path=db_path)
+    try:
+        assert db._conn.execute(
+            "SELECT 1 FROM state_meta WHERE key = ?",
+            (hermes_state._OFFLINE_REBUILD_EPOCH_KEY,),
+        ).fetchone() is None
+    finally:
+        db.close()
+
+
+def test_direct_repair_allows_exact_local_claim_for_transactional_fts_rebuild(
+    tmp_path,
+):
+    """An exact local claim still permits the repair ladder's transactional FTS step."""
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+    local_marker = "exact-local-repair-owner"
+    _install_rebuild_claim(db_path, local_marker)
+    _corrupt_fts_index_data(db_path)
+
+    report = repair_state_db_schema(
+        db_path,
+        backup=False,
+        _local_rebuild_marker=local_marker,
+    )
+
+    assert report["repaired"] is True
+    assert report["strategy"] == "rebuild_fts"
+    with sqlite3.connect(str(db_path)) as conn:
+        assert conn.execute(
+            "SELECT value FROM state_meta WHERE key = ?",
+            (hermes_state._OFFLINE_REBUILD_EPOCH_KEY,),
+        ).fetchone() == (local_marker,)
+
+
+@pytest.mark.parametrize("claim_value", ("foreign-probe-owner", None))
+def test_probe_refuses_malformed_store_claim_without_repair_publication(
+    tmp_path, monkeypatch, claim_value
+):
+    """Automatic open must not repair a malformed store behind a durable claim."""
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+    _install_rebuild_claim(db_path, claim_value)
+    _corrupt_duplicate_fts(db_path)
+    before = _repair_artifact_snapshot(db_path)
+    statements: list[str] = []
+    original_connect = hermes_state._connect_repair_durable
+
+    def traced_repair_connect(path):
+        conn = original_connect(path)
+        conn.set_trace_callback(statements.append)
+        return conn
+
+    monkeypatch.setattr(
+        hermes_state, "_connect_repair_durable", traced_repair_connect
+    )
+    opened = None
+    refusal = None
+    try:
+        opened = SessionDB(db_path=db_path)
+    except hermes_state.SessionTurnLeaseLostError as exc:
+        refusal = exc
+    finally:
+        if opened is not None:
+            opened.close()
+
+    assert type(refusal) is hermes_state.SessionTurnLeaseLostError
+    assert _repair_mutations(statements) == []
+    assert _repair_artifact_snapshot(db_path) == before
+    assert not hermes_state._repair_ledger_path(db_path).exists()
+    assert not list(tmp_path.glob("state.db.malformed-backup-*"))
+
+
+@pytest.mark.parametrize("claim_value", ("foreign-vacuum-owner", None))
+def test_repair_rechecks_same_connection_authority_immediately_before_vacuum(
+    tmp_path, monkeypatch, claim_value
+):
+    """A claim installed after DML blocks the repair ladder's raw VACUUM."""
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+    histories: dict[int, list[str]] = {}
+    original_connect = hermes_state._connect_repair_durable
+
+    def traced_repair_connect(path):
+        conn = original_connect(path)
+        history: list[str] = []
+        histories[id(conn)] = history
+        conn.set_trace_callback(history.append)
+        return conn
+
+    original_reapply = hermes_state._reapply_durability_barriers
+    injected = False
+
+    def inject_claim_after_fts_drop(conn):
+        nonlocal injected
+        result = original_reapply(conn)
+        statements = histories.get(id(conn), [])
+        if not injected and any(
+            "DELETE FROM SQLITE_MASTER WHERE NAME LIKE 'MESSAGES_FTS%'"
+            in " ".join(sql.upper().split())
+            for sql in statements
+        ):
+            _install_rebuild_claim(db_path, claim_value)
+            injected = True
+        return result
+
+    monkeypatch.setattr(
+        hermes_state, "_connect_repair_durable", traced_repair_connect
+    )
+    monkeypatch.setattr(
+        hermes_state, "_reapply_durability_barriers", inject_claim_after_fts_drop
+    )
+    monkeypatch.setattr(
+        hermes_state, "_db_opens_cleanly", lambda *_args, **_kwargs: "forced unhealthy"
+    )
+    refusal = None
+    try:
+        repair_state_db_schema(db_path, backup=False)
+    except hermes_state.SessionTurnLeaseLostError as exc:
+        refusal = exc
+
+    statements = [sql for history in histories.values() for sql in history]
+    raw_vacuum = [
+        sql
+        for sql in statements
+        if " ".join(sql.upper().split()).startswith("VACUUM")
+    ]
+    assert injected is True
+    assert raw_vacuum == []
+    assert type(refusal) is hermes_state.SessionTurnLeaseLostError
+    with sqlite3.connect(str(db_path)) as conn:
+        row = conn.execute(
+            "SELECT value FROM state_meta WHERE key = ?",
+            (hermes_state._OFFLINE_REBUILD_EPOCH_KEY,),
+        ).fetchone()
+    assert row == (claim_value,)
+    assert not hermes_state._repair_ledger_path(db_path).exists()
+
+
+def test_repair_refuses_raw_vacuum_while_exact_local_claim_is_active(
+    tmp_path, monkeypatch
+):
+    """Transactional repair may use an exact local claim, but raw VACUUM may not."""
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+    local_marker = "active-local-vacuum-owner"
+    _install_rebuild_claim(db_path, local_marker)
+    statements: list[str] = []
+    original_connect = hermes_state._connect_repair_durable
+
+    def traced_repair_connect(path):
+        conn = original_connect(path)
+        conn.set_trace_callback(statements.append)
+        return conn
+
+    monkeypatch.setattr(
+        hermes_state, "_connect_repair_durable", traced_repair_connect
+    )
+    monkeypatch.setattr(
+        hermes_state, "_db_opens_cleanly", lambda *_args, **_kwargs: "forced unhealthy"
+    )
+    refusal = None
+    try:
+        repair_state_db_schema(
+            db_path,
+            backup=False,
+            _local_rebuild_marker=local_marker,
+        )
+    except hermes_state.SessionTurnLeaseLostError as exc:
+        refusal = exc
+
+    assert not [
+        sql
+        for sql in statements
+        if " ".join(sql.upper().split()).startswith("VACUUM")
+    ]
+    assert type(refusal) is hermes_state.SessionTurnLeaseLostError
+    with sqlite3.connect(str(db_path)) as conn:
+        assert conn.execute(
+            "SELECT value FROM state_meta WHERE key = ?",
+            (hermes_state._OFFLINE_REBUILD_EPOCH_KEY,),
+        ).fetchone() == (local_marker,)
+    assert not hermes_state._repair_ledger_path(db_path).exists()
 
 
 def test_fts_write_corruption_detected_by_write_probe(tmp_path):

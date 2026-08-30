@@ -29,8 +29,12 @@ from hermes_state import (
     FTS_STORAGE_VERSION,
     SCHEMA_VERSION,
     SessionDB,
+    SessionTurnLeaseLostError,
     TURN_FENCE_GENERATION,
+    _OFFLINE_REBUILD_EPOCH_KEY,
+    _assert_offline_rebuild_maintenance_authority,
     _db_opens_cleanly,
+    _same_connection_raw_maintenance_fence,
     register_turn_fence_generation,
 )
 
@@ -55,6 +59,7 @@ _TOPIC_TABLES = (
 # These values describe derived indexes or the schema that owns an optional
 # table. A fresh destination must generate them from its own current schema.
 _GENERATED_META_KEYS = frozenset({
+    _OFFLINE_REBUILD_EPOCH_KEY,
     "fts_storage_version",
     "fts_optimize_available",
     "fts_rebuild_high_water",
@@ -135,6 +140,65 @@ def _require_destination_fenced(destination: sqlite3.Connection) -> None:
         raise SessionRecoveryDestinationError(_DESTINATION_FENCE_ERROR) from None
 
 
+def _is_destination_dml(sql: str) -> bool:
+    return sql.lstrip().upper().startswith(
+        ("INSERT ", "UPDATE ", "DELETE ", "REPLACE ")
+    )
+
+
+class _DestinationAuthorityProxy:
+    """Require the active recovery claim immediately before destination DML."""
+
+    def __init__(
+        self,
+        destination_db: SessionDB,
+        connection: Optional[sqlite3.Connection] = None,
+    ) -> None:
+        self._destination_db = destination_db
+        self._connection = connection or destination_db._conn
+        self._marker = destination_db._offline_rebuild_marker
+        if self._marker is None:
+            raise SessionTurnLeaseLostError(
+                "recovery destination has no active offline rebuild claim"
+            )
+
+    def _assert_write_authority(self, sql: str) -> None:
+        if not _is_destination_dml(sql):
+            return
+        self._destination_db._assert_offline_rebuild_write_authority(
+            self._connection
+        )
+        row = self._connection.execute(
+            "SELECT value FROM state_meta WHERE key = ?",
+            (_OFFLINE_REBUILD_EPOCH_KEY,),
+        ).fetchone()
+        value = (
+            row["value"]
+            if isinstance(row, sqlite3.Row)
+            else row[0]
+            if row
+            else None
+        )
+        if value != self._marker:
+            raise SessionTurnLeaseLostError(
+                "recovery destination offline rebuild claim changed before write"
+            )
+
+    def execute(
+        self, sql: str, parameters: tuple[Any, ...] = ()
+    ) -> sqlite3.Cursor:
+        self._assert_write_authority(sql)
+        return self._connection.execute(sql, parameters)
+
+    def executemany(self, sql: str, parameters: Any) -> sqlite3.Cursor:
+        self._assert_write_authority(sql)
+        return self._connection.executemany(sql, parameters)
+
+    def executescript(self, sql: str) -> sqlite3.Cursor:
+        self._assert_write_authority("INSERT " + sql)
+        return self._connection.executescript(sql)
+
+
 def _sidecar_path(db_path: Path, suffix: str) -> Path:
     return db_path if not suffix else db_path.with_name(db_path.name + suffix)
 
@@ -163,6 +227,7 @@ class _DestinationStage:
     candidate: Path
     directory_identity: tuple[int, int, int, int]
     children: dict[str, tuple[int, int, int, int]] = field(default_factory=dict)
+    retain_on_authority_refusal: bool = False
 
 
 def _create_destination_stage(output: Path) -> _DestinationStage:
@@ -286,13 +351,30 @@ def _seal_staged_database(stage: _DestinationStage) -> None:
     try:
         connection = sqlite3.connect(str(stage.candidate), isolation_level=None)
         try:
-            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            journal_mode = connection.execute("PRAGMA journal_mode=DELETE").fetchone()
-            if journal_mode is None or str(journal_mode[0]).lower() != "delete":
-                raise sqlite3.DatabaseError("journal mode was not sealed")
+            with _same_connection_raw_maintenance_fence(
+                connection,
+                assert_authority=lambda: _assert_offline_rebuild_maintenance_authority(
+                    connection, local_marker=None
+                ),
+            ):
+                connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                _assert_offline_rebuild_maintenance_authority(
+                    connection, local_marker=None
+                )
+                journal_mode = connection.execute(
+                    "PRAGMA journal_mode=DELETE"
+                ).fetchone()
+                if journal_mode is None or str(journal_mode[0]).lower() != "delete":
+                    raise sqlite3.DatabaseError("journal mode was not sealed")
         finally:
             connection.close()
-        if _db_opens_cleanly(stage.candidate) is not None:
+        if (
+            _db_opens_cleanly(
+                stage.candidate,
+                _repair_local_marker=None,
+            )
+            is not None
+        ):
             raise sqlite3.DatabaseError("staged database health probe failed")
         for suffix in ("-wal", "-shm", "-journal"):
             if os.path.lexists(_sidecar_path(stage.candidate, suffix)):
@@ -300,6 +382,11 @@ def _seal_staged_database(stage: _DestinationStage) -> None:
         _refresh_stage_children(stage, require_main=True)
         _fsync_path(stage.candidate)
         _fsync_path(stage.directory, directory=True)
+    except SessionTurnLeaseLostError:
+        # A foreign owner may need the exact staged bytes for inspection or a
+        # hand-off. Do not let the generic recovery cleanup erase that proof.
+        stage.retain_on_authority_refusal = True
+        raise
     except (OSError, sqlite3.Error):
         raise SessionRecoveryDestinationError(_DESTINATION_STAGE_ERROR) from None
 
@@ -346,10 +433,36 @@ def _publish_staged_database(stage: _DestinationStage, output: Path) -> None:
         raise SessionRecoverySafetyError(_DESTINATION_STAGE_CHANGED_ERROR)
     if any(os.path.lexists(_sidecar_path(output, suffix)) for suffix in _SIDECAR_SUFFIXES):
         raise SessionRecoverySafetyError(_DESTINATION_COLLISION_ERROR)
+
+    # Hold a RESERVED write lock while proving no-owner authority and renaming
+    # the file. A concurrent claimant therefore cannot commit its marker in
+    # the interval after this proof and before the native no-replace publish.
+    connection = sqlite3.connect(str(stage.candidate), isolation_level=None)
     try:
+        connection.execute("BEGIN IMMEDIATE")
+        if _path_identity(stage.candidate) != expected:
+            raise SessionRecoverySafetyError(_DESTINATION_STAGE_CHANGED_ERROR)
+        if any(os.path.lexists(_sidecar_path(output, suffix)) for suffix in _SIDECAR_SUFFIXES):
+            raise SessionRecoverySafetyError(_DESTINATION_COLLISION_ERROR)
+        _assert_offline_rebuild_maintenance_authority(
+            connection, local_marker=None
+        )
         _native_no_replace_publish(stage.candidate, output)
+        connection.execute("ROLLBACK")
+    except SessionTurnLeaseLostError:
+        stage.retain_on_authority_refusal = True
+        raise
     except OSError:
         raise SessionRecoverySafetyError(_DESTINATION_COLLISION_ERROR) from None
+    except sqlite3.Error:
+        raise SessionRecoveryDestinationError(_DESTINATION_STAGE_ERROR) from None
+    finally:
+        if connection.in_transaction:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+        connection.close()
     try:
         if _path_identity(output) != expected or os.path.lexists(stage.candidate):
             raise SessionRecoveryDestinationError(_DESTINATION_STAGE_ERROR)
@@ -1445,6 +1558,7 @@ def _verify_recovered_database(
     copy_report: dict[str, dict[str, Any]],
     allow_partial: bool = False,
     orphan_cleanup: Optional[dict[str, Any]] = None,
+    destination: Optional[_DestinationAuthorityProxy] = None,
 ) -> dict[str, Any]:
     verification: dict[str, Any] = {
         "errors": [],
@@ -1452,12 +1566,12 @@ def _verify_recovered_database(
         "loss_detected": False,
     }
 
-    open_error = _db_opens_cleanly(output)
+    open_error = _db_opens_cleanly(output, write_connection=destination)
     verification["opens_cleanly"] = open_error is None
     if open_error is not None:
         verification["errors"].append(f"database health probe: {open_error}")
 
-    conn = sqlite3.connect(str(output), isolation_level=None)
+    conn: Any = destination or sqlite3.connect(str(output), isolation_level=None)
     try:
         integrity_rows = [
             str(row[0]) for row in conn.execute("PRAGMA integrity_check").fetchall()
@@ -1598,25 +1712,34 @@ def _verify_recovered_database(
                 verification["loss_detected"] = True
 
         fts_checks: dict[str, str] = {}
-        for table in ("messages_fts", "messages_fts_trigram", "messages_fts_cjk"):
-            if not _table_columns(conn, table):
-                continue
-            try:
-                conn.execute(
-                    f'INSERT INTO "{table}" ("{table}") VALUES (\'integrity-check\')'
-                )
-                conn.execute(
-                    f'SELECT 1 FROM "{table}" WHERE "{table}" MATCH \'""\' LIMIT 1'
-                ).fetchone()
-                fts_checks[table] = "ok"
-            except sqlite3.DatabaseError as exc:
-                fts_checks[table] = str(exc)
-                verification["errors"].append(f"{table} integrity check failed: {exc}")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for table in ("messages_fts", "messages_fts_trigram", "messages_fts_cjk"):
+                if not _table_columns(conn, table):
+                    continue
+                try:
+                    conn.execute(
+                        f'INSERT INTO "{table}" ("{table}") VALUES (\'integrity-check\')'
+                    )
+                    conn.execute(
+                        f'SELECT 1 FROM "{table}" WHERE "{table}" MATCH \'""\' LIMIT 1'
+                    ).fetchone()
+                    fts_checks[table] = "ok"
+                except sqlite3.DatabaseError as exc:
+                    fts_checks[table] = str(exc)
+                    verification["errors"].append(
+                        f"{table} integrity check failed: {exc}"
+                    )
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
         verification["fts_checks"] = fts_checks
     except sqlite3.DatabaseError as exc:
         verification["errors"].append(f"verification query failed: {exc}")
     finally:
-        conn.close()
+        if destination is None:
+            conn.close()
 
     verification["healthy"] = not verification["errors"]
     verification["complete"] = bool(
@@ -1712,62 +1835,58 @@ def _recover_via_lost_and_found(
 
     destination_db = SessionDB(db_path=stage.candidate)
     _refresh_stage_children(stage, require_main=True)
-    destination_db.close()
 
     lf_conn = sqlite3.connect(str(lf_path), isolation_level=None)
     destination_conn = sqlite3.connect(
         str(stage.candidate), isolation_level=None, timeout=1.0
     )
     try:
-        # The store's turn-fence triggers on the canonical tables call
-        # hermes_turn_fence_generation(), a UDF that only the connection which
-        # created it knows. SessionDB.close() above tore that connection down,
-        # so this bare reopen must re-register the scalar itself or the first
-        # INSERT into a governed table raises "no such function". This is safe
-        # here (unlike minting the marker on a live production writer): the
-        # output path can never already exist (_validate_paths refuses to
-        # reuse one) and it is never swapped over a running gateway, so there
-        # is no concurrent turn-lease holder this recovery-only connection
-        # could bypass. session_turn_leases (the table that check guards) is
-        # also not part of _CANONICAL_TABLES, so no lease row ever reaches
-        # this database.
-        _require_destination_fenced(destination_conn)
-        destination_conn.execute("PRAGMA foreign_keys=OFF")
-        mapping = map_lost_and_found_rows(lf_conn, destination_conn)
-        stubbing = stub_missing_parent_sessions(destination_conn)
-        fts = rebuild_fts_indexes(destination_conn)
-        derived_metadata = _finalize_derived_metadata(destination_conn)
+        with destination_db.offline_rebuild(reason="recover session database"):
+            _require_destination_fenced(destination_conn)
+            destination_conn.execute("PRAGMA foreign_keys=OFF")
+            destination = _DestinationAuthorityProxy(destination_db, destination_conn)
+            mapping = map_lost_and_found_rows(lf_conn, destination)
+            stubbing = stub_missing_parent_sessions(destination)
+            destination.execute("BEGIN IMMEDIATE")
+            try:
+                fts = rebuild_fts_indexes(destination)
+                destination.execute("COMMIT")
+            except BaseException:
+                destination.execute("ROLLBACK")
+                raise
+            derived_metadata = _finalize_derived_metadata(destination)
+            copy_report: dict[str, dict[str, Any]] = {
+                table: {
+                    "mode": "lost_and_found_salvage",
+                    "status": "partial",
+                    "copied_rows": (
+                        int(mapping["direct_table_rows"].get(table) or 0)
+                        + int(mapping["mapped"].get(table) or 0)
+                    ),
+                    "error": "recovered via page-level lost_and_found salvage; "
+                    "row completeness cannot be verified against the source",
+                }
+                for table in ("sessions", "messages", "session_model_usage")
+            }
+            verification = _verify_recovered_database(
+                stage.candidate,
+                expected_counts={"sessions": None, "messages": None},
+                copy_report=copy_report,
+                allow_partial=True,
+                orphan_cleanup={
+                    "sessions_reconstructed": stubbing["sessions_stubbed"],
+                    "messages_retained": stubbing["messages_retained"],
+                    "messages_removed": 0,
+                    "total_removed_or_relinked": 0,
+                },
+                destination=destination,
+            )
     finally:
         lf_conn.close()
         destination_conn.close()
+        destination_db.close()
     _refresh_stage_children(stage, require_main=True)
 
-    copy_report: dict[str, dict[str, Any]] = {
-        table: {
-            "mode": "lost_and_found_salvage",
-            "status": "partial",
-            "copied_rows": (
-                int(mapping["direct_table_rows"].get(table) or 0)
-                + int(mapping["mapped"].get(table) or 0)
-            ),
-            "error": "recovered via page-level lost_and_found salvage; "
-            "row completeness cannot be verified against the source",
-        }
-        for table in ("sessions", "messages", "session_model_usage")
-    }
-
-    verification = _verify_recovered_database(
-        stage.candidate,
-        expected_counts={"sessions": None, "messages": None},
-        copy_report=copy_report,
-        allow_partial=True,
-        orphan_cleanup={
-            "sessions_reconstructed": stubbing["sessions_stubbed"],
-            "messages_retained": stubbing["messages_retained"],
-            "messages_removed": 0,
-            "total_removed_or_relinked": 0,
-        },
-    )
     verification["loss_detected"] = True
     verification["warnings"].append(
         "BEST-EFFORT page-level salvage: the source table schemas were "
@@ -1899,95 +2018,102 @@ def recover_session_database(
             )
 
             destination_db = SessionDB(db_path=stage.candidate)
-            if has_topic_tables:
-                destination_db.apply_telegram_topic_migration()
-            _refresh_stage_children(stage, require_main=True)
-            destination_db.close()
-            destination_db = None
+            with destination_db.offline_rebuild(reason="recover session database"):
+                if has_topic_tables:
+                    destination_db.apply_telegram_topic_migration()
+                _refresh_stage_children(stage, require_main=True)
 
-            destination_conn = sqlite3.connect(
-                str(stage.candidate),
-                isolation_level=None,
-                timeout=1.0,
-            )
-            _require_destination_fenced(destination_conn)
-            destination_conn.execute("PRAGMA foreign_keys=OFF")
-
-            copy_report: dict[str, dict[str, Any]] = {}
-            for table in _CANONICAL_TABLES:
-                table_inspection = inspection["tables"][table]
-                copy_function = (
-                    _copy_table_salvage if allow_partial else _copy_table
+                destination_conn = sqlite3.connect(
+                    str(stage.candidate),
+                    isolation_level=None,
+                    timeout=1.0,
                 )
-                copy_report[table] = copy_function(
-                    source_conn,
+                _require_destination_fenced(destination_conn)
+                destination_conn.execute("PRAGMA foreign_keys=OFF")
+                copy_destination = _DestinationAuthorityProxy(
+                    destination_db,
                     destination_conn,
-                    table,
-                    chunk_size=chunk_size,
-                    progress_cb=progress_cb,
-                    source_rows=table_inspection.get("rows"),
                 )
 
-            state_meta_inspection = inspection["tables"]["state_meta"]
-            if state_meta_inspection.get("available"):
-                state_meta_copy_function = (
-                    _copy_state_meta_salvage
-                    if allow_partial
-                    else _copy_state_meta
-                )
-                copy_report["state_meta"] = state_meta_copy_function(
-                    source_conn,
-                    destination_conn,
-                    chunk_size=chunk_size,
-                    progress_cb=progress_cb,
-                    source_rows=state_meta_inspection.get("rows"),
-                )
-            else:
-                copy_report["state_meta"] = {"status": "missing", "copied_rows": 0}
+                copy_report: dict[str, dict[str, Any]] = {}
+                for table in _CANONICAL_TABLES:
+                    table_inspection = inspection["tables"][table]
+                    copy_function = (
+                        _copy_table_salvage if allow_partial else _copy_table
+                    )
+                    copy_report[table] = copy_function(
+                        source_conn,
+                        copy_destination,
+                        table,
+                        chunk_size=chunk_size,
+                        progress_cb=progress_cb,
+                        source_rows=table_inspection.get("rows"),
+                    )
 
-            for table in _TOPIC_TABLES:
-                table_inspection = inspection["tables"][table]
-                if not table_inspection.get("available"):
-                    copy_report[table] = {
+                state_meta_inspection = inspection["tables"]["state_meta"]
+                if state_meta_inspection.get("available"):
+                    state_meta_copy_function = (
+                        _copy_state_meta_salvage
+                        if allow_partial
+                        else _copy_state_meta
+                    )
+                    copy_report["state_meta"] = state_meta_copy_function(
+                        source_conn,
+                        copy_destination,
+                        chunk_size=chunk_size,
+                        progress_cb=progress_cb,
+                        source_rows=state_meta_inspection.get("rows"),
+                    )
+                else:
+                    copy_report["state_meta"] = {
                         "status": "missing",
                         "copied_rows": 0,
                     }
-                    continue
-                copy_function = (
-                    _copy_table_salvage if allow_partial else _copy_table
+
+                for table in _TOPIC_TABLES:
+                    table_inspection = inspection["tables"][table]
+                    if not table_inspection.get("available"):
+                        copy_report[table] = {
+                            "status": "missing",
+                            "copied_rows": 0,
+                        }
+                        continue
+                    copy_function = (
+                        _copy_table_salvage if allow_partial else _copy_table
+                    )
+                    copy_report[table] = copy_function(
+                        source_conn,
+                        copy_destination,
+                        table,
+                        chunk_size=chunk_size,
+                        progress_cb=progress_cb,
+                        source_rows=table_inspection.get("rows"),
+                    )
+                orphan_cleanup = (
+                    _cleanup_partial_orphans(copy_destination)
+                    if allow_partial
+                    else None
                 )
-                copy_report[table] = copy_function(
-                    source_conn,
-                    destination_conn,
-                    table,
-                    chunk_size=chunk_size,
-                    progress_cb=progress_cb,
-                    source_rows=table_inspection.get("rows"),
+                derived_metadata = _finalize_derived_metadata(copy_destination)
+                verification = _verify_recovered_database(
+                    stage.candidate,
+                    expected_counts={
+                        table: inspection["tables"][table].get("rows")
+                        for table in _CANONICAL_TABLES
+                    },
+                    copy_report=copy_report,
+                    allow_partial=allow_partial,
+                    orphan_cleanup=orphan_cleanup,
+                    destination=copy_destination,
                 )
-            orphan_cleanup = (
-                _cleanup_partial_orphans(destination_conn)
-                if allow_partial
-                else None
-            )
-            derived_metadata = _finalize_derived_metadata(destination_conn)
         finally:
             source_conn.close()
-            if destination_conn is not None:
-                destination_conn.close()
             if destination_db is not None:
+                if destination_conn is not None:
+                    destination_conn.close()
                 destination_db.close()
         _refresh_stage_children(stage, require_main=True)
 
-        verification = _verify_recovered_database(
-            stage.candidate,
-            expected_counts={
-                table: inspection["tables"][table].get("rows")
-                for table in _CANONICAL_TABLES
-            },
-            copy_report=copy_report,
-            allow_partial=allow_partial,
-            orphan_cleanup=orphan_cleanup,
-        )
         source_unchanged = (
             _source_fingerprint(source) == inspection["source_fingerprint"]
         )
@@ -2024,8 +2150,12 @@ def recover_session_database(
         _seal_staged_database(stage)
         _publish_staged_database(stage, output)
         return report
-    finally:
+    except SessionTurnLeaseLostError:
         if stage is not None:
+            stage.retain_on_authority_refusal = True
+        raise
+    finally:
+        if stage is not None and not stage.retain_on_authority_refusal:
             _cleanup_destination_stage(stage)
         temp_dir.cleanup()
 

@@ -87,6 +87,8 @@ class SessionSearchMixin:
             self._merge_fts_incrementally(
                 max_pages=self._FTS_MERGE_MAX_PAGES_PER_INDEX
             )
+        except self._offline_rebuild_ownership_error as exc:
+            logger.debug("FTS incremental merge skipped: %s", exc)
         except sqlite3.Error as exc:
             # Routine maintenance is best effort, but unexpected SQLite errors
             # must remain visible instead of being silently mistaken for an
@@ -122,6 +124,10 @@ class SessionSearchMixin:
         return {"pending": True, "total": total, "indexed": progress, "percent": pct}
 
     def _fts_rebuild_finish(self) -> None:
+        with self.offline_rebuild(reason="finish FTS rebuild"):
+            self._fts_rebuild_finish_owned()
+
+    def _fts_rebuild_finish_owned(self) -> None:
         """Finalize the deferred rebuild: boundary sweep + clear markers.
 
         The sweep is cheap insurance against any write that slipped through
@@ -172,6 +178,10 @@ class SessionSearchMixin:
         logger.info("Deferred FTS rebuild complete — all messages indexed.")
 
     def _fts_teardown_trash_step(self) -> bool:
+        with self.offline_rebuild(reason="teardown FTS trash"):
+            return self._fts_teardown_trash_step_owned()
+
+    def _fts_teardown_trash_step_owned(self) -> bool:
         """Tear down one chunk of a demoted v22 FTS shadow table.
 
         The trash tables are PLAIN tables (their vtable parent was demoted
@@ -275,6 +285,10 @@ class SessionSearchMixin:
             return True
 
     def fts_rebuild_step(self) -> bool:
+        with self.offline_rebuild(reason="FTS rebuild step"):
+            return self._fts_rebuild_step_owned()
+
+    def _fts_rebuild_step_owned(self) -> bool:
         """Backfill one chunk of the deferred FTS rebuild.
 
         Returns True when more work remains, False when the rebuild is
@@ -361,6 +375,10 @@ class SessionSearchMixin:
         return {"pending": True, "total": total, "indexed": progress, "percent": pct}
 
     def fts_cjk_rebuild_step(self) -> bool:
+        with self.offline_rebuild(reason="CJK FTS rebuild step"):
+            return self._fts_cjk_rebuild_step_owned()
+
+    def _fts_cjk_rebuild_step_owned(self) -> bool:
         """Backfill one chunk of the CJK index. True while work remains."""
         if not self._fts_enabled or not self._fts_cjk_loaded:
             return False
@@ -433,6 +451,10 @@ class SessionSearchMixin:
         logger.info("CJK FTS index backfill complete — serving CJK search.")
 
     def _fts_cjk_reset_if_stale(self) -> None:
+        with self.offline_rebuild(reason="reset stale CJK FTS"):
+            self._fts_cjk_reset_if_stale_owned()
+
+    def _fts_cjk_reset_if_stale_owned(self) -> None:
         """Rebuild path for a stale cjk index (triggers were dropped).
 
         The gap's extent is unknown, so the only safe recovery is a from-
@@ -582,6 +604,10 @@ class SessionSearchMixin:
         return int(hw)
 
     def _repair_optimize_bookkeeping(self) -> None:
+        with self.offline_rebuild(reason="repair FTS bookkeeping"):
+            self._repair_optimize_bookkeeping_owned()
+
+    def _repair_optimize_bookkeeping_owned(self) -> None:
         """Heal interrupted demote/backfill bookkeeping before optimize runs.
 
         Covers two post-#65798 failure classes:
@@ -677,6 +703,10 @@ class SessionSearchMixin:
             return self._fts_external_index_empty_with_messages(self._conn)
 
     def _demote_legacy_fts_to_trash(self) -> int:
+        with self.offline_rebuild(reason="demote legacy FTS"):
+            return self._demote_legacy_fts_to_trash_owned()
+
+    def _demote_legacy_fts_to_trash_owned(self) -> int:
         """Demote the legacy inline FTS vtables and stage their shadow tables
         for chunked teardown. Returns MAX(messages.id) as the rebuild high
         water. O(1) schema surgery — the heavy delete is deferred to the
@@ -745,6 +775,49 @@ class SessionSearchMixin:
         return hw
 
     def optimize_fts_storage(
+        self,
+        *,
+        progress_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
+        vacuum: bool = True,
+    ) -> Dict[str, Any]:
+        with self.offline_rebuild(reason="optimize FTS storage"):
+            result = self._optimize_fts_storage_owned(
+                progress_cb=progress_cb, vacuum=vacuum
+            )
+        if vacuum and result.get("ok"):
+            result["vacuumed"] = self._vacuum_fts_storage()
+        return result
+
+    def _vacuum_fts_storage(self) -> bool:
+        """Reclaim FTS pages only after an optimize claim has been released."""
+        try:
+            with self._lock:
+                with self._raw_maintenance_fence() as conn:
+                    conn.execute("VACUUM")
+            vacuum_ok = True
+        except sqlite3.OperationalError as exc:
+            # Most common cause: not enough free disk for VACUUM's temp copy.
+            # The optimization still succeeded; space is reclaimed later.
+            logger.warning("VACUUM after FTS optimize failed: %s", exc)
+            vacuum_ok = False
+
+        # Best-effort: fold the WAL back into the main file so the on-disk
+        # size settles now rather than at close().  This remains PASSIVE: a
+        # transient optimize process must not reset a live gateway's WAL.
+        try:
+            with self._lock:
+                with self._raw_maintenance_fence() as conn:
+                    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        except self._offline_rebuild_ownership_error:
+            raise
+        except Exception as exc:
+            logger.debug(
+                "WAL checkpoint (PASSIVE) after optimize VACUUM failed: %s",
+                exc,
+            )
+        return vacuum_ok
+
+    def _optimize_fts_storage_owned(
         self,
         *,
         progress_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
@@ -896,36 +969,11 @@ class SessionSearchMixin:
         vacuum_ok = None
         if vacuum:
             _emit("vacuum")
-            try:
-                with self._lock:
-                    self._conn.execute("VACUUM")
-                vacuum_ok = True
-            except sqlite3.OperationalError as exc:
-                # Most common cause: not enough free disk for VACUUM's temp
-                # copy. The optimization still succeeded; space just isn't
-                # reclaimed until a later VACUUM. Non-fatal.
-                logger.warning("VACUUM after FTS optimize failed: %s", exc)
-                vacuum_ok = False
-            # Best-effort: fold the WAL back into the main file so the on-disk
-            # size settles now rather than at close(). NOTE this is REFUSED
-            # (SQLITE_BUSY) while any other connection holds a WAL read-mark —
-            # e.g. a live gateway sharing the DB — so it is not sufficient on
-            # its own. Callers must therefore NOT size the result by stat()ing
-            # the file; use :meth:`logical_size_bytes`, which is truthful
-            # immediately regardless of readers.
-            # PASSIVE, not TRUNCATE: optimize-storage runs from a transient CLI
-            # process; a TRUNCATE reset here would race a live gateway writer
-            # and tear B-tree pages (#45383). (The TRUNCATE was already refused
-            # SQLITE_BUSY while the gateway holds a read-mark, per the note
-            # above; PASSIVE removes the reset attempt entirely.)
-            try:
-                with self._lock:
-                    self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except Exception as exc:
-                logger.debug(
-                    "WAL checkpoint (PASSIVE) after optimize VACUUM failed: %s",
-                    exc,
-                )
+            # VACUUM and wal_checkpoint cannot share the marker comparison's
+            # transaction.  The public wrapper defers them until its local
+            # claim has compare-deleted; prove that claim still exists before
+            # the final transactional settle work proceeds.
+            self._assert_offline_rebuild_write_authority(self._conn)
 
         # Phase 4: stamp the FTS storage layout as current, clear the "available"
         # flag, and advance schema_version if it was somehow still behind (the
@@ -1631,9 +1679,7 @@ class SessionSearchMixin:
         )
         for match in context_matches:
             try:
-                with self._read_ctx() as conn:
-                    ctx_cursor = conn.execute(
-                        """WITH target AS (
+                context_sql = """WITH target AS (
                                SELECT session_id, timestamp, id
                                FROM messages
                                WHERE id = ?
@@ -1662,28 +1708,42 @@ class SessionSearchMixin:
                                   OR (m.timestamp = t.timestamp AND m.id > t.id)
                                ORDER BY m.timestamp ASC, m.id ASC
                                LIMIT 1
-                           )""",
-                        (match["id"], match["id"]),
+                           )"""
+                # Keep the full-search trace on the primary connection when
+                # it is already idle, but never wait behind a writer merely
+                # to enrich a result.  The contended case retains the pooled
+                # WAL read path and its no-convoy guarantee.
+                if self._lock.acquire(blocking=False):
+                    try:
+                        context_rows = self._conn.execute(
+                            context_sql, (match["id"], match["id"])
+                        ).fetchall()
+                    finally:
+                        self._lock.release()
+                else:
+                    with self._read_ctx() as conn:
+                        context_rows = conn.execute(
+                            context_sql, (match["id"], match["id"])
+                        ).fetchall()
+                context_msgs = []
+                for row in context_rows:
+                    decoded = self._decode_content(row["content"])
+                    if isinstance(decoded, list):
+                        text_parts = [
+                            part.get("text", "")
+                            for part in decoded
+                            if isinstance(part, dict)
+                            and part.get("type") == "text"
+                        ]
+                        text = " ".join(t for t in text_parts if t).strip()
+                        preview = text or "[multimodal content]"
+                    elif isinstance(decoded, str):
+                        preview = decoded
+                    else:
+                        preview = ""
+                    context_msgs.append(
+                        {"role": row["role"], "content": preview[:200]}
                     )
-                    context_msgs = []
-                    for row in ctx_cursor.fetchall():
-                        decoded = self._decode_content(row["content"])
-                        if isinstance(decoded, list):
-                            text_parts = [
-                                part.get("text", "")
-                                for part in decoded
-                                if isinstance(part, dict)
-                                and part.get("type") == "text"
-                            ]
-                            text = " ".join(t for t in text_parts if t).strip()
-                            preview = text or "[multimodal content]"
-                        elif isinstance(decoded, str):
-                            preview = decoded
-                        else:
-                            preview = ""
-                        context_msgs.append(
-                            {"role": row["role"], "content": preview[:200]}
-                        )
                 match["context"] = context_msgs
             except Exception:
                 match["context"] = []
@@ -2351,7 +2411,20 @@ class SessionSearchMixin:
             # teardown) — in every case the table is not queryable.
             return False
 
+    def _execute_fts_command_owned(
+        self, sql: str, parameters: Tuple[Any, ...] = ()
+    ) -> sqlite3.Cursor:
+        """Run one FTS command with its rebuild-claim check in that transaction."""
+        return self._execute_write(
+            lambda conn: conn.execute(sql, parameters),
+            _count_write=False,
+        )
+
     def optimize_fts(self) -> int:
+        with self.offline_rebuild(reason="optimize FTS"):
+            return self._optimize_fts_owned()
+
+    def _optimize_fts_owned(self) -> int:
         """Merge fragmented FTS5 b-tree segments into one per index.
 
         FTS5 indexes grow as a series of incremental segments — one per
@@ -2380,7 +2453,7 @@ class SessionSearchMixin:
                 try:
                     # The column name in the INSERT must match the table name
                     # for FTS5 special commands.
-                    self._conn.execute(
+                    self._execute_fts_command_owned(
                         f"INSERT INTO {tbl}({tbl}) VALUES('optimize')"
                     )
                     optimized += 1
@@ -2391,6 +2464,10 @@ class SessionSearchMixin:
         return optimized
 
     def rebuild_fts(self) -> int:
+        with self.offline_rebuild(reason="rebuild FTS"):
+            return self._rebuild_fts_owned()
+
+    def _rebuild_fts_owned(self) -> int:
         """Rebuild FTS5 indexes from the canonical ``messages`` table.
 
         Uses the FTS5 ``'rebuild'`` command, which rewrites the internal
@@ -2409,19 +2486,25 @@ class SessionSearchMixin:
                 if not self._fts_table_exists(tbl):
                     continue
                 try:
-                    self._conn.execute(
+                    self._execute_fts_command_owned(
                         f"INSERT INTO {tbl}({tbl}) VALUES('rebuild')"
                     )
-                    self._conn.commit()
                     rebuilt += 1
                 except sqlite3.OperationalError as exc:
-                    self._conn.rollback()
                     logger.warning(
                         "FTS rebuild failed for %s: %s", tbl, exc
                     )
         return rebuilt
 
     def _merge_fts_incrementally(
+        self, *, max_pages: int, max_commands: Optional[int] = None
+    ) -> int:
+        with self.offline_rebuild(reason="merge FTS"):
+            return self._merge_fts_incrementally_owned(
+                max_pages=max_pages, max_commands=max_commands
+            )
+
+    def _merge_fts_incrementally_owned(
         self, *, max_pages: int, max_commands: Optional[int] = None
     ) -> int:
         """Run bounded FTS5 ``'merge'`` commands against each present index.
@@ -2476,13 +2559,13 @@ class SessionSearchMixin:
                 # connections inherit it. Setting config is a metadata-only
                 # write — it never touches segment data.
                 if not getattr(self, "_fts_usermerge_floor_applied", False):
-                    self._conn.execute(
+                    self._execute_fts_command_owned(
                         f"INSERT INTO {tbl}({tbl}, rank) "
                         "VALUES('usermerge', 2)"
                     )
                 for _ in range(max_commands):
                     before = self._conn.total_changes
-                    self._conn.execute(
+                    self._execute_fts_command_owned(
                         f"INSERT INTO {tbl}({tbl}, rank) VALUES('merge', ?)",
                         (max_pages,),
                     )

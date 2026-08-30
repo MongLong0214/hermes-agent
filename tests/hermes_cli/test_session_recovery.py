@@ -6,6 +6,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -36,6 +37,127 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(64 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _arm_seal_authority_interleaving(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    authority_select: int,
+    takeover_marker: bytes | None,
+) -> dict[str, object]:
+    """Attempt a second-connection takeover immediately after a seal proof."""
+    state: dict[str, object] = {
+        "authority_selects": 0,
+        "candidate": None,
+        "raw_after_takeover": [],
+        "sealing_pragmas": [],
+        "sealing_active": False,
+        "takeover_attempted": False,
+        "takeover_committed": False,
+        "takeover_error": None,
+    }
+    original_connect = sqlite3.connect
+    original_create_stage = session_recovery._create_destination_stage
+    original_seal = session_recovery._seal_staged_database
+
+    def take_over(candidate: Path) -> None:
+        state["takeover_attempted"] = True
+        writer = original_connect(str(candidate), isolation_level=None, timeout=0)
+        try:
+            writer.execute("BEGIN IMMEDIATE")
+            writer.execute(
+                "INSERT INTO state_meta(key, value) VALUES (?, ?)",
+                (
+                    hermes_state._OFFLINE_REBUILD_EPOCH_KEY,
+                    None
+                    if takeover_marker is None
+                    else sqlite3.Binary(takeover_marker),
+                ),
+            )
+            writer.execute("COMMIT")
+            state["takeover_committed"] = True
+        except sqlite3.OperationalError as exc:
+            state["takeover_error"] = exc
+        finally:
+            if writer.in_transaction:
+                writer.execute("ROLLBACK")
+            writer.close()
+
+    class _AuthorityCursor:
+        def __init__(self, cursor: sqlite3.Cursor, candidate: Path) -> None:
+            self._cursor = cursor
+            self._candidate = candidate
+
+        def fetchall(self):
+            rows = self._cursor.fetchall()
+            assert rows == []
+            take_over(self._candidate)
+            return rows
+
+        def __getattr__(self, name: str):
+            return getattr(self._cursor, name)
+
+    class _SealingConnection:
+        def __init__(self, connection: sqlite3.Connection, candidate: Path) -> None:
+            self._connection = connection
+            self._candidate = candidate
+
+        def execute(self, sql: str, parameters=()):
+            normalized = sql.lstrip().upper()
+            if normalized.startswith("PRAGMA WAL_CHECKPOINT(TRUNCATE)") or normalized.startswith(
+                "PRAGMA JOURNAL_MODE=DELETE"
+            ):
+                state["sealing_pragmas"].append(normalized)
+                if state["takeover_committed"]:
+                    state["raw_after_takeover"].append(normalized)
+            cursor = self._connection.execute(sql, parameters)
+            if normalized.startswith("SELECT VALUE FROM STATE_META"):
+                state["authority_selects"] += 1
+                if state["authority_selects"] == authority_select:
+                    return _AuthorityCursor(cursor, self._candidate)
+            return cursor
+
+        def __getattr__(self, name: str):
+            return getattr(self._connection, name)
+
+    def capture_stage(path: Path):
+        stage = original_create_stage(path)
+        state["candidate"] = stage.candidate
+        return stage
+
+    def sealing_connection(database, *args, **kwargs):
+        connection = original_connect(database, *args, **kwargs)
+        candidate = state["candidate"]
+        if (
+            state["sealing_active"]
+            and isinstance(candidate, Path)
+            and Path(database) == candidate
+        ):
+            return _SealingConnection(connection, candidate)
+        return connection
+
+    def seal_with_interleaving(stage):
+        state["sealing_active"] = True
+        try:
+            return original_seal(stage)
+        finally:
+            state["sealing_active"] = False
+
+    monkeypatch.setattr(session_recovery, "_create_destination_stage", capture_stage)
+    monkeypatch.setattr(session_recovery, "_seal_staged_database", seal_with_interleaving)
+    monkeypatch.setattr(session_recovery.sqlite3, "connect", sealing_connection)
+    return state
+
+
+def _assert_seal_authority_interleaving_blocked(state: dict[str, object]) -> None:
+    """Assert the attempted takeover never became authority for a raw pragma."""
+    assert state["takeover_attempted"] is True
+    assert state["raw_after_takeover"] == []
+    assert state["takeover_committed"] is False
+    assert isinstance(state["takeover_error"], sqlite3.OperationalError)
+    pragmas = state["sealing_pragmas"]
+    assert any("WAL_CHECKPOINT(TRUNCATE)" in sql for sql in pragmas)
+    assert any("JOURNAL_MODE=DELETE" in sql for sql in pragmas)
 
 
 def _make_source(path: Path) -> dict[str, int]:
@@ -703,6 +825,515 @@ def test_recover_exact_path_copies_rows_into_a_real_v27_store(
     assert message_count == expected["messages"]
 
 
+def test_normal_recovery_stops_before_later_dml_when_marker_is_replaced(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A committed chunk must not authorize the next destination write."""
+    source = tmp_path / "source.db"
+    output = tmp_path / "recovered.db"
+    _make_source(source)
+    candidate: Path | None = None
+    original_create_stage = session_recovery._create_destination_stage
+
+    def capture_stage(path: Path):
+        nonlocal candidate
+        stage = original_create_stage(path)
+        candidate = stage.candidate
+        return stage
+
+    monkeypatch.setattr(session_recovery, "_create_destination_stage", capture_stage)
+    monkeypatch.setattr(session_recovery, "_cleanup_destination_stage", lambda _stage: None)
+
+    foreign_marker = "foreign-recovery-owner"
+    adversarial_fts_value = "foreign-fts-storage-version"
+    adversarial_meta_value = "foreign-adversarial-value"
+    replaced = False
+
+    def replace_marker_after_committed_chunk(progress: dict[str, object]) -> None:
+        nonlocal replaced
+        if replaced or progress["table"] != "sessions":
+            return
+        assert candidate is not None
+        with sqlite3.connect(str(candidate), isolation_level=None) as writer:
+            marker = writer.execute(
+                "SELECT value FROM state_meta WHERE key = ?",
+                (hermes_state._OFFLINE_REBUILD_EPOCH_KEY,),
+            ).fetchone()
+            assert marker is not None, "recovery must own a durable marker"
+            cursor = writer.execute(
+                "UPDATE state_meta SET value = ? WHERE key = ?",
+                (foreign_marker, hermes_state._OFFLINE_REBUILD_EPOCH_KEY),
+            )
+            assert cursor.rowcount == 1
+            writer.execute(
+                "INSERT OR REPLACE INTO state_meta(key, value) VALUES (?, ?)",
+                ("fts_storage_version", adversarial_fts_value),
+            )
+            writer.execute(
+                "INSERT OR REPLACE INTO state_meta(key, value) VALUES (?, ?)",
+                ("adversarial-after-marker", adversarial_meta_value),
+            )
+        replaced = True
+
+    with pytest.raises(hermes_state.SessionTurnLeaseLostError):
+        recover_session_database(
+            source,
+            output,
+            work_dir=tmp_path,
+            chunk_size=1,
+            progress_cb=replace_marker_after_committed_chunk,
+        )
+
+    assert replaced is True
+    assert candidate is not None
+    with sqlite3.connect(str(candidate)) as destination:
+        assert destination.execute(
+            "SELECT value FROM state_meta WHERE key = ?",
+            (hermes_state._OFFLINE_REBUILD_EPOCH_KEY,),
+        ).fetchone() == (foreign_marker,)
+        assert destination.execute(
+            "SELECT value FROM state_meta WHERE key = 'fts_storage_version'"
+        ).fetchone() == (adversarial_fts_value,)
+        assert destination.execute(
+            "SELECT value FROM state_meta WHERE key = 'adversarial-after-marker'"
+        ).fetchone() == (adversarial_meta_value,)
+        assert destination.execute("SELECT COUNT(*) FROM sessions").fetchone() == (1,)
+        assert destination.execute("SELECT COUNT(*) FROM messages").fetchone() == (0,)
+        assert destination.execute(
+            "SELECT value FROM state_meta WHERE key = 'goal:recovery-session-0'"
+        ).fetchone() is None
+
+
+def test_recovery_health_probe_stops_before_dml_when_marker_is_replaced(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real recovery health probe cannot write after a claim takeover."""
+    source = tmp_path / "source.db"
+    output = tmp_path / "recovered.db"
+    _make_source(source)
+    candidate: Path | None = None
+    original_create_stage = session_recovery._create_destination_stage
+
+    def capture_stage(path: Path):
+        nonlocal candidate
+        stage = original_create_stage(path)
+        candidate = stage.candidate
+        return stage
+
+    monkeypatch.setattr(session_recovery, "_create_destination_stage", capture_stage)
+    monkeypatch.setattr(session_recovery, "_cleanup_destination_stage", lambda _stage: None)
+
+    foreign_marker = "foreign-health-probe-owner"
+    adversarial_key = "adversarial-health-probe-marker"
+    adversarial_value = "foreign-health-probe-bytes"
+    takeover_complete = False
+    health_probe_dml: list[str] = []
+    original_connect_repair = hermes_state._connect_repair_durable
+
+    def trace_health_probe_connection(path: Path) -> sqlite3.Connection:
+        connection = original_connect_repair(path)
+
+        def record_dml(sql: str) -> None:
+            if takeover_complete and sql.lstrip().upper().startswith(
+                ("INSERT ", "UPDATE ", "DELETE ", "REPLACE ")
+            ):
+                health_probe_dml.append(sql)
+
+        connection.set_trace_callback(record_dml)
+        return connection
+
+    monkeypatch.setattr(
+        hermes_state, "_connect_repair_durable", trace_health_probe_connection
+    )
+    real_health_probe = hermes_state._db_opens_cleanly
+
+    def replace_marker_before_health_probe(path: Path, **kwargs: object):
+        nonlocal takeover_complete
+        assert candidate is not None
+        with sqlite3.connect(str(candidate), isolation_level=None) as writer:
+            cursor = writer.execute(
+                "UPDATE state_meta SET value = ? WHERE key = ?",
+                (foreign_marker, hermes_state._OFFLINE_REBUILD_EPOCH_KEY),
+            )
+            assert cursor.rowcount == 1
+            writer.execute(
+                "INSERT OR REPLACE INTO state_meta(key, value) VALUES (?, ?)",
+                (adversarial_key, adversarial_value),
+            )
+            # The current schema's turn-fence triggers are a second line of
+            # defense. Remove them here so this regression proves the health
+            # probe itself validates the no-owner contract before it tries a
+            # write, including against a legacy candidate without those
+            # triggers.
+            trigger_names = [
+                row[0]
+                for row in writer.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+                )
+            ]
+            for trigger_name in trigger_names:
+                writer.execute(f'DROP TRIGGER "{trigger_name}"')
+        takeover_complete = True
+        return real_health_probe(path, **kwargs)
+
+    monkeypatch.setattr(
+        session_recovery, "_db_opens_cleanly", replace_marker_before_health_probe
+    )
+
+    with pytest.raises(hermes_state.SessionTurnLeaseLostError):
+        recover_session_database(source, output, work_dir=tmp_path, chunk_size=1)
+
+    assert takeover_complete is True
+    assert health_probe_dml == []
+    assert candidate is not None
+    with sqlite3.connect(str(candidate)) as destination:
+        assert destination.execute(
+            "SELECT value FROM state_meta WHERE key = ?",
+            (hermes_state._OFFLINE_REBUILD_EPOCH_KEY,),
+        ).fetchone() == (foreign_marker,)
+        assert destination.execute(
+            "SELECT value FROM state_meta WHERE key = ?",
+            (adversarial_key,),
+        ).fetchone() == (adversarial_value,)
+
+
+def test_seal_health_probe_refuses_foreign_marker_without_turn_fence_triggers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The seal's own health write probe fences legacy candidates before DML."""
+    output = tmp_path / "recovered.db"
+    stage = session_recovery._create_destination_stage(output)
+    db = SessionDB(db_path=stage.candidate)
+    db.close()
+    session_recovery._refresh_stage_children(stage, require_main=True)
+    foreign_marker = "foreign-seal-health-probe-owner"
+    dml: list[str] = []
+    original_connect = hermes_state._connect_repair_durable
+    real_health_probe = hermes_state._db_opens_cleanly
+
+    def traced_connect(path: Path) -> sqlite3.Connection:
+        connection = original_connect(path)
+        connection.set_trace_callback(
+            lambda sql: dml.append(sql)
+            if sql.lstrip().upper().startswith(("INSERT ", "UPDATE ", "DELETE "))
+            else None
+        )
+        return connection
+
+    def take_over_before_health_probe(path: Path, **kwargs: object):
+        with sqlite3.connect(str(path), isolation_level=None) as writer:
+            writer.execute(
+                "INSERT INTO state_meta(key, value) VALUES (?, ?)",
+                (hermes_state._OFFLINE_REBUILD_EPOCH_KEY, foreign_marker),
+            )
+            trigger_names = [
+                row[0]
+                for row in writer.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+                )
+            ]
+            for trigger_name in trigger_names:
+                writer.execute(f'DROP TRIGGER "{trigger_name}"')
+        return real_health_probe(path, **kwargs)
+
+    monkeypatch.setattr(hermes_state, "_connect_repair_durable", traced_connect)
+    monkeypatch.setattr(session_recovery, "_db_opens_cleanly", take_over_before_health_probe)
+
+    with pytest.raises(hermes_state.SessionTurnLeaseLostError):
+        session_recovery._seal_staged_database(stage)
+
+    assert dml == []
+    with sqlite3.connect(str(stage.candidate)) as destination:
+        assert destination.execute(
+            "SELECT value FROM state_meta WHERE key = ?",
+            (hermes_state._OFFLINE_REBUILD_EPOCH_KEY,),
+        ).fetchone() == (foreign_marker,)
+
+
+def test_normal_recovery_excludes_the_source_offline_rebuild_marker(
+    tmp_path: Path,
+) -> None:
+    """A stale source claim must never displace recovery's own claim."""
+    source = tmp_path / "source.db"
+    output = tmp_path / "recovered.db"
+    _make_source(source)
+    source_marker = "foreign-source-rebuild-marker"
+    source_db = SessionDB(db_path=source)
+    try:
+        source_db.set_meta(hermes_state._OFFLINE_REBUILD_EPOCH_KEY, source_marker)
+    finally:
+        source_db.close()
+
+    report = recover_session_database(source, output, work_dir=tmp_path, chunk_size=1)
+
+    assert hermes_state._OFFLINE_REBUILD_EPOCH_KEY in report["copy"]["state_meta"][
+        "excluded_keys"
+    ]
+    with sqlite3.connect(str(output)) as destination:
+        assert destination.execute(
+            "SELECT value FROM state_meta WHERE key = ?",
+            (hermes_state._OFFLINE_REBUILD_EPOCH_KEY,),
+        ).fetchone() is None
+
+
+@pytest.mark.parametrize("takeover", ("replace", "delete"))
+def test_normal_recovery_topic_migration_stops_after_authority_loss(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    takeover: str,
+) -> None:
+    """Topic migration must keep its scripts inside recovery's owner transaction."""
+    source = tmp_path / "source.db"
+    output = tmp_path / "recovered.db"
+    _make_source(source)
+
+    candidate: Path | None = None
+    original_create_stage = session_recovery._create_destination_stage
+
+    def capture_stage(path: Path):
+        nonlocal candidate
+        stage = original_create_stage(path)
+        candidate = stage.candidate
+        return stage
+
+    monkeypatch.setattr(session_recovery, "_create_destination_stage", capture_stage)
+    monkeypatch.setattr(session_recovery, "_cleanup_destination_stage", lambda _stage: None)
+
+    foreign_marker = "foreign-topic-migration-owner-\u03bb"
+    takeover_started = threading.Event()
+    takeover_complete = threading.Event()
+    migration_script_seen = threading.Event()
+    takeover_errors: list[BaseException] = []
+    later_topic_mutations: list[str] = []
+    authority_checks = 0
+    waited_after_migration = False
+
+    def is_candidate_db(db_path: object) -> bool:
+        return candidate is not None and Path(str(db_path)).resolve() == candidate.resolve()
+
+    def take_over_marker() -> None:
+        takeover_started.set()
+        try:
+            assert candidate is not None
+            with sqlite3.connect(str(candidate), isolation_level=None, timeout=3.0) as writer:
+                marker = writer.execute(
+                    "SELECT value FROM state_meta WHERE key = ?",
+                    (hermes_state._OFFLINE_REBUILD_EPOCH_KEY,),
+                ).fetchone()
+                assert marker is not None, "recovery must own a durable marker"
+                if takeover == "replace":
+                    cursor = writer.execute(
+                        "UPDATE state_meta SET value = ? WHERE key = ?",
+                        (foreign_marker, hermes_state._OFFLINE_REBUILD_EPOCH_KEY),
+                    )
+                    assert cursor.rowcount == 1
+                else:
+                    cursor = writer.execute(
+                        "DELETE FROM state_meta WHERE key = ?",
+                        (hermes_state._OFFLINE_REBUILD_EPOCH_KEY,),
+                    )
+                    assert cursor.rowcount == 1
+        except BaseException as exc:
+            takeover_errors.append(exc)
+        finally:
+            takeover_complete.set()
+
+    original_connect = hermes_state._connect_tracked_db
+
+    def connect_with_topic_migration_trace(path: object, *args: object, **kwargs: object):
+        conn = original_connect(path, *args, **kwargs)
+        if not is_candidate_db(path):
+            return conn
+
+        def trace_topic_migration(sql: str) -> None:
+            normalized = sql.lstrip().upper()
+            if normalized.startswith(
+                "CREATE TABLE IF NOT EXISTS TELEGRAM_DM_TOPIC_MODE"
+            ) and not migration_script_seen.is_set():
+                # _execute_write already made its exact-owner comparison.
+                assert authority_checks >= 2
+                migration_script_seen.set()
+                if conn.in_transaction:
+                    threading.Thread(target=take_over_marker, daemon=True).start()
+                else:
+                    take_over_marker()
+            elif takeover_complete.is_set() and (
+                "TELEGRAM_DM_TOPIC" in normalized
+                or normalized.startswith("INSERT INTO STATE_META")
+            ) and normalized.startswith(("CREATE ", "DROP ", "ALTER ", "INSERT ", "UPDATE ")):
+                later_topic_mutations.append(sql)
+
+        conn.set_trace_callback(trace_topic_migration)
+        return conn
+
+    monkeypatch.setattr(
+        hermes_state, "_connect_tracked_db", connect_with_topic_migration_trace
+    )
+    original_assert_authority = SessionDB._assert_offline_rebuild_write_authority
+
+    def count_migration_authority_checks(self: SessionDB, conn: sqlite3.Connection) -> None:
+        nonlocal authority_checks
+        original_assert_authority(self, conn)
+        if is_candidate_db(self.db_path) and self._offline_rebuild_marker is not None:
+            authority_checks += 1
+
+    monkeypatch.setattr(
+        SessionDB, "_assert_offline_rebuild_write_authority", count_migration_authority_checks
+    )
+    original_execute_write = SessionDB._execute_write
+
+    def wait_for_takeover_after_migration(self: SessionDB, *args: object, **kwargs: object):
+        nonlocal waited_after_migration
+        result = original_execute_write(self, *args, **kwargs)
+        if (
+            is_candidate_db(self.db_path)
+            and migration_script_seen.is_set()
+            and not waited_after_migration
+        ):
+            waited_after_migration = True
+            assert takeover_complete.wait(3.0), "foreign takeover did not finish"
+        return result
+
+    monkeypatch.setattr(SessionDB, "_execute_write", wait_for_takeover_after_migration)
+
+    with pytest.raises(hermes_state.SessionTurnLeaseLostError):
+        recover_session_database(source, output, work_dir=tmp_path, chunk_size=1)
+
+    assert migration_script_seen.is_set()
+    assert takeover_started.is_set()
+    assert takeover_complete.is_set()
+    assert takeover_errors == []
+    assert later_topic_mutations == []
+    assert candidate is not None
+    with sqlite3.connect(str(candidate)) as destination:
+        marker = destination.execute(
+            "SELECT CAST(value AS BLOB) FROM state_meta WHERE key = ?",
+            (hermes_state._OFFLINE_REBUILD_EPOCH_KEY,),
+        ).fetchone()
+        if takeover == "replace":
+            assert marker == (foreign_marker.encode("utf-8"),)
+        else:
+            assert marker is None
+
+
+def test_sql_salvage_stops_before_later_dml_when_marker_is_replaced(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Salvage must recheck the claim after every committed rowid chunk."""
+    source = tmp_path / "source.db"
+    filtered_output = tmp_path / "filtered.db"
+    output = tmp_path / "recovered.db"
+    _make_source(source)
+    source_db = SessionDB(db_path=source)
+    try:
+        source_db.set_meta(
+            hermes_state._OFFLINE_REBUILD_EPOCH_KEY,
+            "foreign-source-rebuild-marker",
+        )
+    finally:
+        source_db.close()
+
+    filtered_report = recover_session_database(
+        source,
+        filtered_output,
+        work_dir=tmp_path,
+        chunk_size=1,
+        allow_partial=True,
+    )
+    assert hermes_state._OFFLINE_REBUILD_EPOCH_KEY in filtered_report["copy"][
+        "state_meta"
+    ]["excluded_keys"]
+    with sqlite3.connect(str(filtered_output)) as destination:
+        assert destination.execute(
+            "SELECT value FROM state_meta WHERE key = ?",
+            (hermes_state._OFFLINE_REBUILD_EPOCH_KEY,),
+        ).fetchone() is None
+
+    candidate: Path | None = None
+    original_create_stage = session_recovery._create_destination_stage
+
+    def capture_stage(path: Path):
+        nonlocal candidate
+        stage = original_create_stage(path)
+        candidate = stage.candidate
+        return stage
+
+    monkeypatch.setattr(session_recovery, "_create_destination_stage", capture_stage)
+    monkeypatch.setattr(session_recovery, "_cleanup_destination_stage", lambda _stage: None)
+
+    foreign_marker = "foreign-salvage-owner"
+    adversarial_fts_value = "foreign-salvage-fts-storage-version"
+    adversarial_meta_value = "foreign-salvage-adversarial-value"
+    foreign_session_id = "foreign-salvage-orphan"
+    replaced = False
+
+    def replace_marker_after_committed_chunk(progress: dict[str, object]) -> None:
+        nonlocal replaced
+        if replaced or progress["table"] != "sessions":
+            return
+        assert candidate is not None
+        with sqlite3.connect(str(candidate), isolation_level=None) as writer:
+            marker = writer.execute(
+                "SELECT value FROM state_meta WHERE key = ?",
+                (hermes_state._OFFLINE_REBUILD_EPOCH_KEY,),
+            ).fetchone()
+            assert marker is not None, "recovery must own a durable marker"
+            cursor = writer.execute(
+                "UPDATE state_meta SET value = ? WHERE key = ?",
+                (foreign_marker, hermes_state._OFFLINE_REBUILD_EPOCH_KEY),
+            )
+            assert cursor.rowcount == 1
+            writer.execute(
+                "INSERT OR REPLACE INTO state_meta(key, value) VALUES (?, ?)",
+                ("fts_storage_version", adversarial_fts_value),
+            )
+            writer.execute(
+                "INSERT OR REPLACE INTO state_meta(key, value) VALUES (?, ?)",
+                ("adversarial-after-salvage-marker", adversarial_meta_value),
+            )
+            register_turn_fence_generation(writer)
+            writer.execute(
+                "INSERT INTO messages(id, session_id, role, content, timestamp) "
+                "VALUES (999999, ?, 'user', 'foreign orphan', 1.0)",
+                (foreign_session_id,),
+            )
+        replaced = True
+
+    with pytest.raises(hermes_state.SessionTurnLeaseLostError):
+        recover_session_database(
+            source,
+            output,
+            work_dir=tmp_path,
+            chunk_size=1,
+            progress_cb=replace_marker_after_committed_chunk,
+            allow_partial=True,
+        )
+
+    assert replaced is True
+    assert candidate is not None
+    with sqlite3.connect(str(candidate)) as destination:
+        assert destination.execute(
+            "SELECT value FROM state_meta WHERE key = ?",
+            (hermes_state._OFFLINE_REBUILD_EPOCH_KEY,),
+        ).fetchone() == (foreign_marker,)
+        assert destination.execute(
+            "SELECT value FROM state_meta WHERE key = 'fts_storage_version'"
+        ).fetchone() == (adversarial_fts_value,)
+        assert destination.execute(
+            "SELECT value FROM state_meta "
+            "WHERE key = 'adversarial-after-salvage-marker'"
+        ).fetchone() == (adversarial_meta_value,)
+        assert destination.execute("SELECT COUNT(*) FROM sessions").fetchone() == (1,)
+        assert destination.execute("SELECT COUNT(*) FROM messages").fetchone() == (1,)
+        assert destination.execute(
+            "SELECT id FROM sessions WHERE id = ?", (foreign_session_id,)
+        ).fetchone() is None
+
+
 def test_recover_into_destination_without_fence_triggers_still_works(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -825,8 +1456,130 @@ def test_exact_recovery_destination_fence_failures_leave_no_output(
         "Recovery destination turn-fence setup is unavailable or incompatible."
     )
     assert _sha256(source) == source_hash
+
+
+def test_normal_recovery_publication_refuses_marker_after_barrier(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Publication re-proves no-owner authority after the final testable seam."""
+    source = tmp_path / "source.db"
+    output = tmp_path / "recovered.db"
+    _make_source(source)
+    source_hash = _sha256(source)
+    candidate: Path | None = None
+    foreign_marker = "foreign-normal-publication-owner"
+    original_create_stage = session_recovery._create_destination_stage
+
+    def capture_stage(path: Path):
+        nonlocal candidate
+        stage = original_create_stage(path)
+        candidate = stage.candidate
+        return stage
+
+    def take_over_after_barrier(staged_candidate: Path, _output: Path) -> None:
+        assert candidate == staged_candidate
+        with sqlite3.connect(str(staged_candidate), isolation_level=None) as writer:
+            assert writer.execute(
+                "SELECT value FROM state_meta WHERE key = ?",
+                (hermes_state._OFFLINE_REBUILD_EPOCH_KEY,),
+            ).fetchone() is None
+            writer.execute(
+                "INSERT INTO state_meta(key, value) VALUES (?, ?)",
+                (hermes_state._OFFLINE_REBUILD_EPOCH_KEY, foreign_marker),
+            )
+
+    monkeypatch.setattr(session_recovery, "_create_destination_stage", capture_stage)
+    monkeypatch.setattr(session_recovery, "_publication_barrier", take_over_after_barrier)
+
+    with pytest.raises(hermes_state.SessionTurnLeaseLostError):
+        recover_session_database(source, output, work_dir=tmp_path, chunk_size=1)
+
+    assert candidate is not None and candidate.exists()
+    assert not output.exists()
+    with sqlite3.connect(str(candidate)) as destination:
+        assert destination.execute(
+            "SELECT value FROM state_meta WHERE key = ?",
+            (hermes_state._OFFLINE_REBUILD_EPOCH_KEY,),
+        ).fetchone() == (foreign_marker,)
+    assert _sha256(source) == source_hash
     for suffix in ("", "-wal", "-shm", "-journal"):
         assert not os.path.lexists(output.with_name(output.name + suffix))
+
+
+def test_normal_recovery_copy_refusal_retains_the_real_stage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Copy-time authority loss reaches cleanup but retains staged evidence."""
+    source = tmp_path / "source.db"
+    output = tmp_path / "recovered.db"
+    _make_source(source)
+    candidate: Path | None = None
+    stage = None
+    copy_started = False
+    cleanup_calls = 0
+    original_create_stage = session_recovery._create_destination_stage
+    original_copy_table = session_recovery._copy_table
+    original_cleanup = session_recovery._cleanup_destination_stage
+
+    def capture_stage(path: Path):
+        nonlocal candidate, stage
+        stage = original_create_stage(path)
+        candidate = stage.candidate
+        return stage
+
+    def take_over_during_real_copy(source_conn, destination, table, **kwargs):
+        nonlocal copy_started
+        if not copy_started:
+            assert candidate is not None
+            copy_started = True
+            with sqlite3.connect(str(candidate), isolation_level=None) as writer:
+                writer.execute(
+                    "UPDATE state_meta SET value = ? WHERE key = ?",
+                    (
+                        "foreign-normal-copy-owner",
+                        hermes_state._OFFLINE_REBUILD_EPOCH_KEY,
+                    ),
+                )
+            assert stage is not None
+            session_recovery._refresh_stage_children(stage, require_main=True)
+        return original_copy_table(source_conn, destination, table, **kwargs)
+
+    def record_real_cleanup(destination_stage) -> None:
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        original_cleanup(destination_stage)
+
+    monkeypatch.setattr(session_recovery, "_create_destination_stage", capture_stage)
+    monkeypatch.setattr(session_recovery, "_copy_table", take_over_during_real_copy)
+    monkeypatch.setattr(
+        session_recovery, "_cleanup_destination_stage", record_real_cleanup
+    )
+    monkeypatch.setattr(
+        session_recovery,
+        "_seal_staged_database",
+        lambda _stage: pytest.fail("copy refusal reached staged-database sealing"),
+    )
+    monkeypatch.setattr(
+        session_recovery,
+        "_publish_staged_database",
+        lambda _stage, _output: pytest.fail("copy refusal reached publication"),
+    )
+
+    with pytest.raises(hermes_state.SessionTurnLeaseLostError):
+        recover_session_database(source, output, work_dir=tmp_path, chunk_size=1)
+
+    assert copy_started is True
+    assert stage is not None and stage.retain_on_authority_refusal is True
+    assert cleanup_calls == 0
+    assert candidate is not None and candidate.exists()
+    assert not output.exists()
+    with sqlite3.connect(str(candidate)) as destination:
+        assert destination.execute(
+            "SELECT value FROM state_meta WHERE key = ?",
+            (hermes_state._OFFLINE_REBUILD_EPOCH_KEY,),
+        ).fetchone() == ("foreign-normal-copy-owner",)
 
 
 def test_sessions_recover_cli_maps_destination_error_without_report(
@@ -954,4 +1707,153 @@ def test_recovery_publication_refuses_substituted_stage_identity(
     assert _sha256(source) == source_hash
 
 
+@pytest.mark.parametrize(
+    ("takeover_marker", "expected_marker"),
+    (
+        (b"\x00foreign-normal-seal-owner\xff", b"\x00foreign-normal-seal-owner\xff"),
+        (None, None),
+    ),
+    ids=("foreign", "null"),
+)
+def test_normal_recovery_seal_refuses_marker_after_release(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    takeover_marker: bytes | None,
+    expected_marker: bytes | None,
+) -> None:
+    """Sealing must not perform raw maintenance after recovery releases its claim."""
+    source = tmp_path / "source.db"
+    output = tmp_path / "recovered.db"
+    _make_source(source)
+    source_hash = _sha256(source)
+    candidate: Path | None = None
+    marker_key = hermes_state._OFFLINE_REBUILD_EPOCH_KEY
+    raw_maintenance: list[str] = []
+    takeover_complete = False
+    sealing_started = False
+    original_create_stage = session_recovery._create_destination_stage
+    original_seal = session_recovery._seal_staged_database
+    original_refresh = session_recovery._refresh_stage_children
+    original_connect = sqlite3.connect
 
+    def capture_stage(path: Path):
+        nonlocal candidate
+        stage = original_create_stage(path)
+        candidate = stage.candidate
+        return stage
+
+    def trace_sealing_connection(database, *args, **kwargs):
+        connection = original_connect(database, *args, **kwargs)
+        if takeover_complete and candidate is not None and Path(database) == candidate:
+            connection.set_trace_callback(
+                lambda sql: raw_maintenance.append(sql)
+                if "WAL_CHECKPOINT(TRUNCATE)" in sql.upper()
+                or "JOURNAL_MODE=DELETE" in sql.upper()
+                else None
+            )
+        return connection
+
+    def take_over_after_seal_refresh(stage, **kwargs):
+        nonlocal takeover_complete
+        result = original_refresh(stage, **kwargs)
+        if not sealing_started or takeover_complete:
+            return result
+        assert candidate == stage.candidate
+        with original_connect(str(stage.candidate), isolation_level=None) as writer:
+            # The local compare-delete release must be complete before this
+            # independent owner arrives after sealing's stage validation.
+            assert writer.execute(
+                "SELECT value FROM state_meta WHERE key = ?", (marker_key,)
+            ).fetchone() is None
+            writer.execute(
+                "INSERT INTO state_meta(key, value) VALUES (?, ?)",
+                (
+                    marker_key,
+                    None
+                    if takeover_marker is None
+                    else sqlite3.Binary(takeover_marker),
+                ),
+            )
+        takeover_complete = True
+        return result
+
+    def run_seal_after_takeover_seam(stage):
+        nonlocal sealing_started
+        assert candidate == stage.candidate
+        sealing_started = True
+        return original_seal(stage)
+
+    monkeypatch.setattr(session_recovery, "_create_destination_stage", capture_stage)
+    monkeypatch.setattr(session_recovery, "_cleanup_destination_stage", lambda _stage: None)
+    monkeypatch.setattr(session_recovery.sqlite3, "connect", trace_sealing_connection)
+    monkeypatch.setattr(
+        session_recovery, "_refresh_stage_children", take_over_after_seal_refresh
+    )
+    monkeypatch.setattr(session_recovery, "_seal_staged_database", run_seal_after_takeover_seam)
+
+    caught: BaseException | None = None
+    try:
+        recover_session_database(source, output, work_dir=tmp_path, chunk_size=1)
+    except BaseException as exc:
+        caught = exc
+
+    assert raw_maintenance == []
+    assert isinstance(caught, hermes_state.SessionTurnLeaseLostError)
+    assert takeover_complete is True
+    assert candidate is not None
+    assert not output.exists()
+    with original_connect(str(candidate)) as destination:
+        assert destination.execute(
+            "SELECT CAST(value AS BLOB) FROM state_meta WHERE key = ?",
+            (marker_key,),
+        ).fetchone() == (expected_marker,)
+    assert _sha256(source) == source_hash
+
+
+@pytest.mark.parametrize(
+    ("authority_select", "takeover_marker"),
+    (
+        (1, b"\x00foreign-normal-checkpoint-owner\xff"),
+        (1, None),
+        (2, b"\x00foreign-normal-journal-owner\xff"),
+        (2, None),
+    ),
+    ids=("checkpoint-foreign", "checkpoint-null", "journal-foreign", "journal-null"),
+)
+def test_normal_recovery_seal_blocks_takeover_at_pragma_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    authority_select: int,
+    takeover_marker: bytes | None,
+) -> None:
+    """The seal retains SQLite authority through each raw maintenance boundary."""
+    source = tmp_path / "source.db"
+    output = tmp_path / "recovered.db"
+    _make_source(source)
+    source_hash = _sha256(source)
+    state = _arm_seal_authority_interleaving(
+        monkeypatch,
+        authority_select=authority_select,
+        takeover_marker=takeover_marker,
+    )
+
+    report = None
+    recovery_error: BaseException | None = None
+    try:
+        report = recover_session_database(source, output, work_dir=tmp_path, chunk_size=1)
+    except BaseException as exc:
+        recovery_error = exc
+
+    assert state["authority_selects"] >= authority_select
+    _assert_seal_authority_interleaving_blocked(state)
+    assert recovery_error is None
+    assert report is not None
+    assert report["copy"]["sessions"]["copied_rows"] == 3
+    assert output.exists()
+    with sqlite3.connect(str(output)) as destination:
+        assert destination.execute(
+            "SELECT value FROM state_meta WHERE key = ?",
+            (hermes_state._OFFLINE_REBUILD_EPOCH_KEY,),
+        ).fetchone() is None
+        assert destination.execute("PRAGMA journal_mode").fetchone() == ("delete",)
+    assert _sha256(source) == source_hash

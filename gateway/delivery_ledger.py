@@ -90,26 +90,52 @@ def _connect() -> sqlite3.Connection:
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
-    from hermes_state import apply_wal_with_fallback
-
-    apply_wal_with_fallback(conn, db_label="state.db (delivery_ledger)")
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS delivery_obligations (
-            obligation_id TEXT PRIMARY KEY,
-            session_key TEXT NOT NULL,
-            platform TEXT NOT NULL,
-            chat_id TEXT NOT NULL,
-            thread_id TEXT,
-            content TEXT NOT NULL,
-            state TEXT NOT NULL,
-            attempts INTEGER NOT NULL DEFAULT 0,
-            created_at REAL NOT NULL,
-            updated_at REAL NOT NULL,
-            owner_pid INTEGER,
-            owner_started_at INTEGER,
-            last_error TEXT
-        )"""
+    from hermes_state import (
+        _assert_offline_rebuild_maintenance_authority,
+        _assert_offline_rebuild_write_authority,
+        apply_wal_with_fallback,
     )
+
+    apply_wal_with_fallback(
+        conn,
+        db_label="state.db (delivery_ledger)",
+        before_journal_mode_change=lambda: _assert_offline_rebuild_maintenance_authority(
+            conn, local_marker=None
+        ),
+    )
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        _assert_offline_rebuild_write_authority(conn, local_marker=None)
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS delivery_obligations (
+                obligation_id TEXT PRIMARY KEY,
+                session_key TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                thread_id TEXT,
+                content TEXT NOT NULL,
+                state TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                owner_pid INTEGER,
+                owner_started_at INTEGER,
+                last_error TEXT
+            )"""
+        )
+        conn.execute("COMMIT")
+    except BaseException as exc:
+        if conn.in_transaction:
+            try:
+                conn.execute("ROLLBACK")
+            except BaseException as rollback_exc:
+                try:
+                    exc.add_note(
+                        f"delivery ledger schema rollback failed: {rollback_exc}"
+                    )
+                except Exception:
+                    pass
+        raise
 
 
 @contextmanager
@@ -127,6 +153,13 @@ def _transaction() -> Iterator[sqlite3.Connection]:
     conn = _connect()
     try:
         with conn:
+            # A reserved write transaction makes the authority read and all
+            # following ledger DML one ownership boundary: another owner
+            # cannot install the durable rebuild marker between them.
+            conn.execute("BEGIN IMMEDIATE")
+            from hermes_state import _assert_offline_rebuild_write_authority
+
+            _assert_offline_rebuild_write_authority(conn, local_marker=None)
             yield conn
     finally:
         conn.close()

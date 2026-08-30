@@ -85,10 +85,11 @@ def _governed_triggers(db):
 
 
 def _lease_store_snapshot(db_path):
-    """Exact observable schema/data state used by refusal/rollback tests."""
+    """Exact durable schema/data/metadata state for rollback assertions."""
     conn = sqlite3.connect(db_path)
     try:
         return {
+            "dump": tuple(conn.iterdump()),
             "objects": conn.execute(
                 "SELECT type, name, tbl_name, sql FROM sqlite_master "
                 "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
@@ -101,6 +102,9 @@ def _lease_store_snapshot(db_path):
             ).fetchall(),
             "schema_version": conn.execute(
                 "SELECT version FROM schema_version ORDER BY rowid"
+            ).fetchall(),
+            "state_meta": conn.execute(
+                "SELECT key, value, typeof(value) FROM state_meta ORDER BY key"
             ).fetchall(),
         }
     finally:
@@ -698,11 +702,25 @@ class TestSessionTurnLeasesEpochHeal:
     def test_modern_drop_postcondition_refuses_sabotaged_epoch_removal(
         self, tmp_path, monkeypatch
     ):
-        """A successful DROP that leaves epoch behind cannot publish a false heal."""
+        """A failed postcondition rolls back the entire guarded epoch heal."""
         db_path = tmp_path / "state.db"
         _make_schema_current_epoch_variant(db_path, LEGACY_SQL)
         original_execute = hermes_state._SerializedCursor.execute
+        original_heal = SessionDB._heal_session_turn_leases_legacy_epoch
+        original_connect = hermes_state._connect_tracked_db
         sabotaged = False
+        snapshot_before_heal = None
+        opened = []
+
+        def snapshot_immediately_before_heal(self, cursor):
+            nonlocal snapshot_before_heal
+            snapshot_before_heal = _lease_store_snapshot(db_path)
+            return original_heal(self, cursor)
+
+        def capture_opened_connection(*args, **kwargs):
+            conn = original_connect(*args, **kwargs)
+            opened.append(conn)
+            return conn
 
         def restore_epoch_after_drop(cursor, sql, parameters=()):
             nonlocal sabotaged
@@ -722,19 +740,27 @@ class TestSessionTurnLeasesEpochHeal:
         monkeypatch.setattr(
             hermes_state._SerializedCursor, "execute", restore_epoch_after_drop
         )
+        monkeypatch.setattr(
+            SessionDB,
+            "_heal_session_turn_leases_legacy_epoch",
+            snapshot_immediately_before_heal,
+        )
+        monkeypatch.setattr(
+            hermes_state, "_connect_tracked_db", capture_opened_connection
+        )
         with pytest.raises(
             sqlite3.DatabaseError, match="SESSION_TURN_LEASE_EPOCH_HEAL_INCOMPLETE"
-        ):
+        ) as caught:
             SessionDB(db_path=db_path)
 
         assert sabotaged
+        assert snapshot_before_heal is not None
         after = _lease_store_snapshot(db_path)
-        assert any(column[1] == "epoch" for column in after["columns"])
-        assert after["rows"] == [("seed", "holder", 1.0, 2.0, 123, 456.0, 0)]
-        assert not any(
-            row[0] == "table" and row[1] == "session_turn_leases_legacy_epoch"
-            for row in after["objects"]
-        )
+        assert after == snapshot_before_heal
+        assert caught.value.__cause__ is None
+        assert len(opened) == 1
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            opened[0].execute("PRAGMA foreign_keys")
 
     def test_modern_locked_drop_retries_through_open_boundary(self, tmp_path, monkeypatch):
         """A real busy DROP reaches SessionDB's existing open-time retry loop."""
