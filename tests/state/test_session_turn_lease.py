@@ -266,7 +266,7 @@ def test_turn_lease_write_txn_does_not_trust_fail_open_key_helper(
 def test_turn_lease_retries_locked_in_txn_key_walk(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ):
-    """A locked lineage walk must retry, not INSERT under the child id."""
+    """A post-BEGIN locked lineage walk rolls back without replaying work."""
     db = SessionDB(tmp_path / "state.db")
     db.create_session(
         "delegate",
@@ -292,16 +292,16 @@ def test_turn_lease_retries_locked_in_txn_key_walk(
 
     monkeypatch.setattr(db, "_session_turn_lease_key_on_conn", flaky_walk)
     holder = f"pid={os.getpid()}:turn=delegate"
-    assert db.try_acquire_session_turn_lease(
-        "delegate-continuation", holder, ttl_seconds=5
-    )
-    assert attempts["n"] >= 2
-    monkeypatch.setattr(db, "_session_turn_lease_key_on_conn", original)
-    assert not db.try_acquire_session_turn_lease(
-        "delegate", f"pid={os.getpid()}:turn=other", ttl_seconds=5
-    )
-    assert db.refresh_session_turn_lease("delegate", holder, ttl_seconds=5)
-    db.release_session_turn_lease("delegate-continuation", holder)
+    with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+        db.try_acquire_session_turn_lease(
+            "delegate-continuation", holder, ttl_seconds=5
+        )
+
+    assert attempts["n"] == 1
+    assert db._conn.execute(
+        "SELECT conversation_id FROM session_turn_leases WHERE conversation_id = ?",
+        ("delegate",),
+    ).fetchone() is None
 
 
 def test_turn_lease_refresh_and_release_are_owner_fenced(tmp_path):

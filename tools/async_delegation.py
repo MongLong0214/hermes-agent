@@ -146,47 +146,78 @@ def _connect() -> sqlite3.Connection:
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
-    from hermes_state import apply_wal_with_fallback
-
-    apply_wal_with_fallback(conn, db_label="state.db (async_delegation)")
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS async_delegations (
-            delegation_id TEXT PRIMARY KEY,
-            origin_session TEXT NOT NULL,
-            origin_ui_session_id TEXT NOT NULL DEFAULT '',
-            parent_session_id TEXT,
-            state TEXT NOT NULL,
-            dispatched_at REAL NOT NULL,
-            completed_at REAL,
-            updated_at REAL NOT NULL,
-            event_json TEXT,
-            result_json TEXT,
-            delivery_state TEXT NOT NULL DEFAULT 'pending',
-            delivery_attempts INTEGER NOT NULL DEFAULT 0,
-            delivered_at REAL,
-            owner_pid INTEGER,
-            owner_started_at INTEGER,
-            task_json TEXT,
-            delivery_claim TEXT,
-            delivery_claimed_at REAL,
-            origin_session_id TEXT NOT NULL DEFAULT ''
-        )"""
+    from hermes_state import (
+        _assert_offline_rebuild_maintenance_authority,
+        _assert_offline_rebuild_write_authority,
+        apply_wal_with_fallback,
     )
-    columns = {row[1] for row in conn.execute("PRAGMA table_info(async_delegations)")}
-    for name, sql_type in (
-        ("owner_pid", "INTEGER"),
-        ("owner_started_at", "INTEGER"),
-        ("task_json", "TEXT"),
-        ("delivery_claim", "TEXT"),
-        ("delivery_claimed_at", "REAL"),
-        # Raw api_server session id (X-Hermes-Session-Id) of the ORIGINATING
-        # request — the wake self-post target. Without persisting it,
-        # completions recovered after a process restart are unroutable on
-        # api_server (the in-memory record that carried it is gone).
-        ("origin_session_id", "TEXT"),
-    ):
-        if name not in columns:
-            conn.execute(f"ALTER TABLE async_delegations ADD COLUMN {name} {sql_type}")
+
+    apply_wal_with_fallback(
+        conn,
+        db_label="state.db (async_delegation)",
+        before_journal_mode_change=lambda: _assert_offline_rebuild_maintenance_authority(
+            conn, local_marker=None
+        ),
+    )
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        _assert_offline_rebuild_write_authority(conn, local_marker=None)
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS async_delegations (
+                delegation_id TEXT PRIMARY KEY,
+                origin_session TEXT NOT NULL,
+                origin_ui_session_id TEXT NOT NULL DEFAULT '',
+                parent_session_id TEXT,
+                state TEXT NOT NULL,
+                dispatched_at REAL NOT NULL,
+                completed_at REAL,
+                updated_at REAL NOT NULL,
+                event_json TEXT,
+                result_json TEXT,
+                delivery_state TEXT NOT NULL DEFAULT 'pending',
+                delivery_attempts INTEGER NOT NULL DEFAULT 0,
+                delivered_at REAL,
+                owner_pid INTEGER,
+                owner_started_at INTEGER,
+                task_json TEXT,
+                delivery_claim TEXT,
+                delivery_claimed_at REAL,
+                origin_session_id TEXT NOT NULL DEFAULT ''
+            )"""
+        )
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(async_delegations)")
+        }
+        for name, sql_type in (
+            ("owner_pid", "INTEGER"),
+            ("owner_started_at", "INTEGER"),
+            ("task_json", "TEXT"),
+            ("delivery_claim", "TEXT"),
+            ("delivery_claimed_at", "REAL"),
+            # Raw api_server session id (X-Hermes-Session-Id) of the ORIGINATING
+            # request — the wake self-post target. Without persisting it,
+            # completions recovered after a process restart are unroutable on
+            # api_server (the in-memory record that carried it is gone).
+            ("origin_session_id", "TEXT"),
+        ):
+            if name not in columns:
+                _assert_offline_rebuild_write_authority(conn, local_marker=None)
+                conn.execute(
+                    f"ALTER TABLE async_delegations ADD COLUMN {name} {sql_type}"
+                )
+        conn.execute("COMMIT")
+    except BaseException as exc:
+        if conn.in_transaction:
+            try:
+                conn.execute("ROLLBACK")
+            except BaseException as rollback_exc:
+                try:
+                    exc.add_note(
+                        f"async delegation schema rollback failed: {rollback_exc}"
+                    )
+                except Exception:
+                    pass
+        raise
 
 
 @contextmanager
@@ -203,6 +234,12 @@ def _transaction() -> Iterator[sqlite3.Connection]:
     conn = _connect()
     try:
         with conn:
+            # BEGIN IMMEDIATE prevents a marker takeover after this exact
+            # connection proves no-owner authority and before durable DML.
+            conn.execute("BEGIN IMMEDIATE")
+            from hermes_state import _assert_offline_rebuild_write_authority
+
+            _assert_offline_rebuild_write_authority(conn, local_marker=None)
             yield conn
     finally:
         conn.close()

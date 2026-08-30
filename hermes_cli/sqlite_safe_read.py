@@ -147,18 +147,30 @@ class _TrackingMixin:
     """Untrack-on-close behaviour, mixable into any Connection subclass."""
 
     _hermes_tracked_path: str | None = None
+    _hermes_native_close_complete = False
 
     def close(self) -> None:  # type: ignore[misc]
+        if getattr(self, "_hermes_native_close_complete", False):
+            return
         with _live_lock:
             path = getattr(self, "_hermes_tracked_path", None)
-            # Close first; untrack only once the descriptor is actually gone.
-            # Untracking before a failing close (e.g. cross-thread
-            # ProgrammingError) leaves the FD open while the byte-probe
-            # guard thinks nothing is live — see #75629.
-            super().close()  # type: ignore[misc]
+            primary = None
+            try:
+                super().close()  # type: ignore[misc]
+            except BaseException as exc:
+                primary = exc
+            try:
+                sqlite3.Connection.close(self)
+            except BaseException:
+                if primary is not None:
+                    raise primary
+                raise
+            self._hermes_native_close_complete = True
             if path is not None:
                 self._hermes_tracked_path = None
                 untrack_connection(path)
+            if primary is not None:
+                raise primary
 
 
 class TrackedConnection(_TrackingMixin, sqlite3.Connection):
