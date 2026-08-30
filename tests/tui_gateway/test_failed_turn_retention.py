@@ -249,6 +249,63 @@ def test_completed_turn_still_clears_inflight(emits, turn_env):
     assert server._inflight_snapshot(session) is None
 
 
+def test_completed_turn_emits_public_receipt_with_transformed_response(emits, turn_env):
+    public_receipt = {
+        "turnRequestId": "turn-request-7",
+        "status": "COMPLETED",
+        "terminalMessageId": 91,
+        "responseDigest": "sha256:public-digest",
+    }
+    transformed_response = "Transformed terminal response"
+    agent = types.SimpleNamespace(
+        session_id="session-key",
+        run_conversation=lambda *a, **k: {
+            "final_response": transformed_response,
+            "turn_receipt": public_receipt,
+        },
+        clear_interrupt=lambda: None,
+    )
+    session = _session(agent=agent, running=True)
+    server._start_inflight_turn(session, "do the thing")
+
+    server._run_prompt_submit("rid", "sid", session, "do the thing")
+
+    payload = _events(emits, "message.complete")[0]
+    assert payload == {
+        "text": transformed_response,
+        "usage": {},
+        "status": "complete",
+        "turn_receipt": public_receipt,
+    }
+    assert "bindingDigest" not in payload["turn_receipt"]
+    assert "claimToken" not in payload["turn_receipt"]
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        {"final_response": "failed", "error": "provider failed", "failed": True},
+        {"final_response": "still running", "status": "in_progress"},
+        {"final_response": "ordinary completion", "turn_receipt": None},
+    ],
+)
+def test_terminal_results_without_public_receipts_do_not_invent_one(
+    emits, turn_env, result
+):
+    agent = types.SimpleNamespace(
+        session_id="session-key",
+        run_conversation=lambda *a, **k: result,
+        clear_interrupt=lambda: None,
+    )
+    session = _session(agent=agent, running=True)
+    server._start_inflight_turn(session, "do the thing")
+
+    server._run_prompt_submit("rid", "sid", session, "do the thing")
+
+    payload = _events(emits, "message.complete")[0]
+    assert "turn_receipt" not in payload
+
+
 # ── Exception path ─────────────────────────────────────────────────────
 
 

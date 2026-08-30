@@ -11346,6 +11346,8 @@ def _run_prompt_submit(
                 status = "complete"
 
             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
+            if isinstance(result, dict) and isinstance(result.get("turn_receipt"), dict):
+                payload["turn_receipt"] = result["turn_receipt"]
             if last_reasoning:
                 payload["reasoning"] = last_reasoning
             if status_note:
