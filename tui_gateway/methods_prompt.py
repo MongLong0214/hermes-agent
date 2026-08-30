@@ -112,6 +112,39 @@ def _effective_turn_receipt_input(session: dict, params: dict, text):
     return text, truncation
 
 
+def _ensure_turn_receipt_session_identity(session: dict, db, request) -> None:
+    """Create the canonical row only when receipt admission needs it.
+
+    Normal prompt submits keep their lazy first-message write.  Receipt rows
+    have a foreign key to ``sessions``, though, so the durable session identity
+    must exist before their first prepare write.
+    """
+    get_session = getattr(db, "get_session", None)
+    if not callable(get_session):
+        raise RuntimeError("session storage cannot verify receipt identity")
+    if get_session(request.session_id) is not None:
+        return
+    _ensure_session_db_row(session)
+    if get_session(request.session_id) is None:
+        raise RuntimeError("session storage could not establish receipt identity")
+
+
+def _admitted_turn_receipt_attachments_match(session: dict, request) -> bool:
+    """Require the execution-time list and bytes to match receipt admission."""
+    from tui_gateway.turn_receipts import attachment_snapshot_is_current
+
+    with session["history_lock"]:
+        attachments = list(session.get("attached_images") or [])
+        if not attachment_snapshot_is_current(request, attachments):
+            return False
+        # The immutable invocation-local path list is handed to
+        # ``_run_prompt_submit``.  Consume only the matching session list so
+        # normal attachment lifecycle remains one-turn scoped without allowing
+        # the runner to read a later mutable session list.
+        session["attached_images"] = []
+    return True
+
+
 def _derive_turn_receipt_request(
     session: dict, params: dict, text, display_kind, truncation=None
 ):
@@ -421,6 +454,7 @@ def _(rid, params: dict) -> dict:
             with _session_db(session) as db:
                 if db is None:
                     return _err(rid, 5071, "session storage is unavailable")
+                _ensure_turn_receipt_session_identity(session, db, turn_receipt)
                 receipts = TurnReceiptAdapter(db)
                 receipt = receipts.prepare_or_replay(turn_receipt)
                 replay = receipts.completed_replay(turn_receipt)
@@ -445,6 +479,24 @@ def _(rid, params: dict) -> dict:
             return _ok(rid, {"status": "complete", "turn_receipt": replay, "replayed": True})
         if receipt.get("status") == "CLAIMED":
             return _ok(rid, {"status": "in_progress", "turn_receipt": receipt})
+        # Receipts deliberately do not enter redirect/queue paths: those
+        # envelopes cannot carry the invocation-local claim and attachment
+        # snapshot needed to preserve exactly-once execution.  Let the caller
+        # retry its still-PREPARED receipt when the active turn settles.
+        with session["history_lock"]:
+            if session.get("running"):
+                return _ok(rid, {"status": "in_progress", "turn_receipt": receipt})
+        # Compute-host frames likewise carry neither the lease/claim nor the
+        # private admission snapshot.  Refuse before any normal turn effect
+        # rather than silently dispatching an unclaimed receipt.
+        if _session_uses_compute_host(
+            session, _load_dashboard_process_isolation_config()
+        ):
+            return _err(
+                rid,
+                4009,
+                "turn receipts are unavailable with compute-host isolation",
+            )
     # Typed bare stop phrase while backend voice mode is active ends the
     # voice chat instead of sending "stop" to the agent — the typed twin of
     # the spoken stop phrase (PR #73106), applied at the ONE server-side
@@ -980,8 +1032,26 @@ def _(rid, params: dict) -> dict:
                     },
                 )
                 return
+        if turn_receipt is not None and not _admitted_turn_receipt_attachments_match(
+            session, turn_receipt
+        ):
+            with session["history_lock"]:
+                session["running"] = False
+                session["last_active"] = time.time()
+                _clear_inflight_turn(session)
+            _emit(
+                "error",
+                sid,
+                {
+                    "message": "attachment changed after turn receipt admission; retry the turn"
+                },
+            )
+            return
         _run_prompt_submit(
             rid, sid, session, text, display_kind=display_kind,
+            image_paths=list(turn_receipt.attachment_paths)
+            if turn_receipt is not None
+            else None,
             turn_receipt=turn_receipt,
         )
 
@@ -1027,6 +1097,7 @@ def _(rid, params: dict) -> dict:
         with _session_db(session) as db:
             if db is None:
                 return _err(rid, 5071, "session storage is unavailable")
+            _ensure_turn_receipt_session_identity(session, db, request)
             receipt = TurnReceiptAdapter(db).prepare_or_replay(request)
     except Exception as exc:
         from hermes_state import TurnReceiptConflictError
@@ -1786,6 +1857,8 @@ def register(server) -> None:
     for helper in (
         _derive_turn_receipt_request,
         _effective_turn_receipt_input,
+        _ensure_turn_receipt_session_identity,
+        _admitted_turn_receipt_attachments_match,
         _resolved_turn_receipt_truncation,
         _history_user_indices,
         _message_row_id,

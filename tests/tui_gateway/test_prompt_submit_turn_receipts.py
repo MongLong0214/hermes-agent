@@ -28,6 +28,8 @@ def receipt_gateway(tmp_path, monkeypatch):
         "interrupted": 0,
         "active_slot": 0,
         "busy_queue": 0,
+        "drain": 0,
+        "compute": 0,
         "inflight": 0,
         "bootstrap": 0,
         "agent_build": 0,
@@ -66,6 +68,18 @@ def receipt_gateway(tmp_path, monkeypatch):
         lambda *_args, **_kw: effects.__setitem__(
             "busy_queue", effects["busy_queue"] + 1
         ) or {"result": {"status": "queued"}},
+    )
+    monkeypatch.setattr(
+        server,
+        "_drain_queued_prompt",
+        lambda *_args, **_kw: effects.__setitem__("drain", effects["drain"] + 1),
+    )
+    monkeypatch.setattr(
+        server,
+        "_submit_prompt_to_compute_host",
+        lambda *_args, **_kw: effects.__setitem__(
+            "compute", effects["compute"] + 1
+        ) or {"result": {"status": "streaming"}},
     )
     monkeypatch.setattr(
         server,
@@ -222,11 +236,10 @@ def test_conflicting_effective_input_fails_before_all_turn_effects(
     assert events == [("expand", f"sanitized::{text.strip()}")]
 
 
-def test_prepare_status_and_submit_share_server_effective_input(
+def test_prepared_receipt_while_busy_returns_in_progress_without_dispatch(
     receipt_gateway, monkeypatch
 ):
     server, db, _session_id, session_key, _session, image, _events, effects = receipt_gateway
-    monkeypatch.setattr(server, "_voice_mode_enabled", lambda: False)
     monkeypatch.setattr(
         server,
         "_ensure_active_session_slot",
@@ -243,7 +256,161 @@ def test_prepare_status_and_submit_share_server_effective_input(
 
     assert prepared["result"]["turn_receipt"]["status"] == "PREPARED"
     assert status["result"]["turn_receipt"] == prepared["result"]["turn_receipt"]
-    assert submitted["result"] == {"status": "queued"}
+    assert submitted["result"] == {
+        "status": "in_progress",
+        "turn_receipt": prepared["result"]["turn_receipt"],
+    }
     assert TurnReceiptAdapter(db).status_for(expected) == prepared["result"]["turn_receipt"]
-    assert effects["active_slot"] == 1
-    assert effects["busy_queue"] == 1
+    assert effects == {key: 0 for key in effects}
+
+
+def test_receipt_submit_rejects_compute_host_before_any_dispatch(
+    receipt_gateway, monkeypatch
+):
+    server, db, _session_id, session_key, session, image, _events, effects = receipt_gateway
+    session["running"] = False
+    monkeypatch.setattr(server, "_voice_mode_enabled", lambda: False)
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *_args: True)
+    expected = _effective_request(session_key, image)
+    params = _params()
+
+    prepared = server._methods["turn.prepare"]("prepare", params)
+    submitted = server._methods["prompt.submit"]("submit", params)
+
+    assert prepared["result"]["turn_receipt"]["status"] == "PREPARED"
+    assert submitted["error"] == {
+        "code": 4009,
+        "message": "turn receipts are unavailable with compute-host isolation",
+    }
+    assert TurnReceiptAdapter(db).status_for(expected) == prepared["result"]["turn_receipt"]
+    assert effects == {key: 0 for key in effects}
+
+
+class _InlineThread:
+    def __init__(self, *, target, daemon):
+        self._target = target
+
+    def start(self):
+        self._target()
+
+
+def test_fresh_receipt_handlers_establish_session_identity_before_receipt_fk(
+    tmp_path, monkeypatch
+):
+    """Both registered admission paths work before an ordinary first turn."""
+    from tui_gateway import server
+
+    db = SessionDB(tmp_path / "state.db")
+    image = tmp_path / "attached.png"
+    image.write_bytes(b"fresh attachment bytes")
+    prepared_id, prepared_key = "fresh-prepare", "fresh-prepare-key"
+    submitted_id, submitted_key = "fresh-submit", "fresh-submit-key"
+
+    def fresh_session(key):
+        return {
+            "session_key": key,
+            "history": [{"role": "user", "content": "old", "_row_id": 71}],
+            "history_lock": threading.RLock(),
+            "history_version": 0,
+            "running": False,
+            "attached_images": [str(image)],
+            "agent": object(),
+            "transport": None,
+            "source": "tui",
+            "cwd": str(tmp_path),
+        }
+
+    server._sessions[prepared_id] = fresh_session(prepared_key)
+    server._sessions[submitted_id] = fresh_session(submitted_key)
+    monkeypatch.setattr(server, "_db", db)
+    monkeypatch.setattr(server, "_voice_mode_enabled", lambda: False)
+    monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *_args: None)
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *_args: False)
+    monkeypatch.setattr(server, "_start_agent_build", lambda *_args: None)
+    monkeypatch.setattr(server, "_wait_agent_for_prompt", lambda *_args: None)
+    monkeypatch.setattr(server, "_run_prompt_submit", lambda *_args, **_kw: None)
+    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
+    try:
+        prepared = server._methods["turn.prepare"](
+            "prepare", {**_params(), "session_id": prepared_id}
+        )
+        submitted = server._methods["prompt.submit"](
+            "submit",
+            {
+                **_params(turn_request_id="fresh-submit-request"),
+                "session_id": submitted_id,
+            },
+        )
+
+        assert prepared["result"]["turn_receipt"]["status"] == "PREPARED"
+        assert submitted["result"]["status"] == "streaming"
+        assert db.get_session(prepared_key) is not None
+        assert db.get_session(submitted_key) is not None
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM turn_receipts WHERE session_id IN (?, ?)",
+            (prepared_key, submitted_key),
+        ).fetchone()[0] == 2
+    finally:
+        server._sessions.pop(prepared_id, None)
+        server._sessions.pop(submitted_id, None)
+        db.close()
+
+
+@pytest.mark.parametrize("mutation", ["list", "path", "bytes"])
+def test_mutated_admitted_attachment_fails_before_execution(
+    receipt_gateway, monkeypatch, tmp_path, mutation
+):
+    server, db, _session_id, session_key, session, image, _events, effects = receipt_gateway
+    session["running"] = False
+    monkeypatch.setattr(server, "_voice_mode_enabled", lambda: False)
+    monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *_args: None)
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *_args: False)
+    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
+    replacement = tmp_path / "replacement.png"
+    replacement.write_bytes(b"replacement attachment bytes")
+
+    def mutate_after_admission(*_args):
+        if mutation == "list":
+            session["attached_images"].append(str(replacement))
+        elif mutation == "path":
+            session["attached_images"] = [str(replacement)]
+        else:
+            image.write_bytes(b"mutated attachment bytes")
+        return None
+
+    monkeypatch.setattr(server, "_wait_agent_for_prompt", mutate_after_admission)
+    expected = _effective_request(session_key, image)
+
+    submitted = server._methods["prompt.submit"]("submit", _params())
+
+    assert submitted["result"]["status"] == "streaming"
+    assert TurnReceiptAdapter(db).status_for(expected)["status"] == "PREPARED"
+    assert effects["agent_run"] == 0
+    assert effects["busy_queue"] == effects["drain"] == effects["compute"] == 0
+    assert db.get_messages(session_key) == []
+    assert session["running"] is False
+
+
+def test_receipted_execution_uses_the_admitted_attachment_paths(
+    receipt_gateway, monkeypatch
+):
+    server, _db, _session_id, _session_key, session, image, _events, effects = receipt_gateway
+    session["running"] = False
+    monkeypatch.setattr(server, "_voice_mode_enabled", lambda: False)
+    monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *_args: None)
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *_args: False)
+    monkeypatch.setattr(server, "_wait_agent_for_prompt", lambda *_args: None)
+    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
+    captured = {}
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *_args, **kwargs: captured.update(kwargs)
+        or effects.__setitem__("agent_run", effects["agent_run"] + 1),
+    )
+
+    submitted = server._methods["prompt.submit"]("submit", _params())
+
+    assert submitted["result"]["status"] == "streaming"
+    assert captured["image_paths"] == [str(image)]
+    assert effects["agent_run"] == 1

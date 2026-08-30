@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 
@@ -12,7 +13,7 @@ from hermes_state import (
     TurnReceiptConflictError,
     TurnReceiptFenceError,
 )
-from tui_gateway.turn_receipts import TurnReceiptAdapter
+from tui_gateway.turn_receipts import ReceiptRequest, TurnReceiptAdapter
 
 
 def _opened_adapter(tmp_path):
@@ -149,6 +150,42 @@ def test_finish_is_idempotent_for_a_completed_receipt(tmp_path):
         assert db.message_count("session") == 1
         with pytest.raises(TurnReceiptConflictError):
             receipts.prepare("session", "request-1", "binding:completed-other")
+    finally:
+        db.close()
+
+
+def test_completed_replay_finds_the_exact_soft_archived_terminal_row(tmp_path):
+    db, receipts = _opened_adapter(tmp_path)
+    try:
+        request = ReceiptRequest("session", "archived-request", "binding:archived")
+        receipts.prepare_or_replay(request)
+        claimed = receipts.claim_after_lease(request)
+        assistant_bytes = "transformed terminal � bytes 😀"
+        response_digest = "sha256:" + hashlib.sha256(
+            assistant_bytes.encode("utf-8")
+        ).hexdigest()
+        completed = receipts.finish(
+            request.session_id,
+            request.turn_request_id,
+            request.binding_digest,
+            claimed.claim_token,
+            assistant_content=assistant_bytes,
+            response_digest=response_digest,
+        )
+        db.replace_messages(
+            "session", [], active_only=True, archive_dropped=True
+        )
+        db.append_message("session", "assistant", content="different active assistant")
+
+        replay = receipts.completed_replay(request)
+
+        assert db.get_messages("session")[0]["content"] == "different active assistant"
+        assert replay == {
+            **completed,
+            "assistantContent": assistant_bytes,
+        }
+        assert replay["terminalMessageId"] != db.get_messages("session")[0]["id"]
+        assert replay["responseDigest"] == response_digest
     finally:
         db.close()
 
