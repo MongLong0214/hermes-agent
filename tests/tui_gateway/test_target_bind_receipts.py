@@ -10,8 +10,20 @@ import pytest
 from hermes_state import SessionDB
 
 
+def _canonical_sha256(payload: dict) -> str:
+    canonical = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(canonical).hexdigest()
+
+
+def _lineage_root_digest(lineage_root: str) -> str:
+    payload = b"hermes.target-bind:lineage-root\0" + lineage_root.encode("utf-8")
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
 def test_target_bind_persists_the_gateway_resolved_lineage_root(tmp_path, monkeypatch):
-    """The public receipt commits the actor binding without exposing session internals."""
+    """ACP can recompute the public receipt without learning the raw root."""
     from tui_gateway import server
 
     db = SessionDB(tmp_path / "state.db")
@@ -32,11 +44,38 @@ def test_target_bind_persists_the_gateway_resolved_lineage_root(tmp_path, monkey
         )
 
         receipt = response["result"]["target_bind_receipt"]
-        assert set(receipt) == {"domain", "version", "digest"}
-        assert receipt["domain"] == "hermes.target-bind"
-        assert receipt["version"] == 1
-        assert receipt["digest"].startswith("sha256:")
-        assert "lineage" not in json.dumps(response)
+        expected_receipt = {
+            "domain": "hermes.target-bind",
+            "version": 1,
+            "actor_id": "acp-actor-7",
+            "binding_generation": 4,
+            "executor_runtime_identity": "executor-runtime-9",
+            "requested_session_id": "lineage-tip",
+            "lineage_root_digest": _lineage_root_digest("lineage-root"),
+        }
+        expected_receipt["receipt_digest"] = _canonical_sha256(expected_receipt)
+        assert receipt == expected_receipt
+        assert set(receipt) == set(expected_receipt)
+        assert "lineage-root" not in json.dumps(response)
+        assert "caller-supplied" not in json.dumps(response)
+
+        # An ACP verifier derives both hashes independently and rejects every
+        # public-field tamper, including the two commitments themselves.
+        for field, tampered_value in {
+            "domain": "hermes.target-bind-tampered",
+            "version": 2,
+            "actor_id": "acp-actor-tampered",
+            "binding_generation": 5,
+            "executor_runtime_identity": "executor-runtime-tampered",
+            "requested_session_id": "session-tampered",
+            "lineage_root_digest": _lineage_root_digest("lineage-root-tampered"),
+            "receipt_digest": "sha256:" + "0" * 64,
+        }.items():
+            tampered = dict(receipt)
+            tampered[field] = tampered_value
+            assert _canonical_sha256(
+                {key: value for key, value in tampered.items() if key != "receipt_digest"}
+            ) != tampered["receipt_digest"]
 
         records = db.list_meta_prefix("target_bind_receipt:")
         assert len(records) == 1
@@ -46,14 +85,8 @@ def test_target_bind_persists_the_gateway_resolved_lineage_root(tmp_path, monkey
         assert stored["executor_runtime_identity"] == "executor-runtime-9"
         assert stored["requested_session_id"] == "lineage-tip"
         assert stored["lineage_root_id"] == "lineage-root"
-        assert stored["digest"] == receipt["digest"]
-        canonical = json.dumps(
-            {key: value for key, value in stored.items() if key != "digest"},
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        assert stored["digest"] == "sha256:" + hashlib.sha256(canonical).hexdigest()
+        assert stored["lineage_root_digest"] == receipt["lineage_root_digest"]
+        assert stored["receipt_digest"] == receipt["receipt_digest"]
     finally:
         db.close()
 
@@ -182,6 +215,8 @@ def test_target_bind_rejects_invalid_or_ambiguous_input_without_a_receipt(
             "code": 4004,
             "message": "target_bind_receipt_invalid",
         }
+        assert "result" not in response
+        assert "caller-supplied" not in json.dumps(response)
         assert db.list_meta_prefix("target_bind_receipt:") == []
     finally:
         db.close()

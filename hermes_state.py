@@ -3654,6 +3654,7 @@ _TARGET_BIND_RECEIPT_META_PREFIX = "target_bind_receipt:"
 _TARGET_BIND_RECEIPT_SCHEMA = "hermes.target-bind-receipt"
 _TARGET_BIND_RECEIPT_DOMAIN = "hermes.target-bind"
 _TARGET_BIND_RECEIPT_VERSION = 1
+_TARGET_BIND_LINEAGE_ROOT_DIGEST_DOMAIN = b"hermes.target-bind:lineage-root\0"
 
 
 @dataclass(frozen=True)
@@ -8841,6 +8842,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         raise TargetBindReceiptFenceError("target bind lineage is ambiguous")
 
     @staticmethod
+    def _target_bind_canonical_digest(payload: Dict[str, Any]) -> str:
+        """Return the canonical SHA-256 commitment for a public receipt payload."""
+        payload_bytes = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return "sha256:" + hashlib.sha256(payload_bytes).hexdigest()
+
+    @staticmethod
+    def _target_bind_lineage_root_digest(lineage_root_id: str) -> str:
+        """Commit to resolved root bytes without disclosing the private root."""
+        root_bytes = lineage_root_id.encode("utf-8")
+        return "sha256:" + hashlib.sha256(
+            _TARGET_BIND_LINEAGE_ROOT_DIGEST_DOMAIN + root_bytes
+        ).hexdigest()
+
+    @staticmethod
     def _target_bind_receipt_record(
         *,
         session_id: str,
@@ -8861,21 +8878,24 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             binding_identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         ).encode("utf-8")
         identity_digest = "sha256:" + hashlib.sha256(identity_bytes).hexdigest()
-        record = {
-            "schema": _TARGET_BIND_RECEIPT_SCHEMA,
+        public_receipt = {
             "domain": _TARGET_BIND_RECEIPT_DOMAIN,
             "version": _TARGET_BIND_RECEIPT_VERSION,
             "actor_id": actor_id,
             "binding_generation": binding_generation,
             "executor_runtime_identity": executor_runtime_identity,
             "requested_session_id": session_id,
+            "lineage_root_digest": SessionDB._target_bind_lineage_root_digest(
+                lineage_root_id
+            ),
+        }
+        record = {
+            "schema": _TARGET_BIND_RECEIPT_SCHEMA,
+            **public_receipt,
             "lineage_root_id": lineage_root_id,
             "binding_identity": identity_digest,
         }
-        receipt_bytes = json.dumps(
-            record, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        ).encode("utf-8")
-        record["digest"] = "sha256:" + hashlib.sha256(receipt_bytes).hexdigest()
+        record["receipt_digest"] = SessionDB._target_bind_canonical_digest(public_receipt)
         return _TARGET_BIND_RECEIPT_META_PREFIX + identity_digest.removeprefix("sha256:"), record
 
     def prepare_target_bind_receipt(

@@ -1241,7 +1241,12 @@ def _(rid, params: dict) -> dict:
             "target_bind_receipt": {
                 "domain": receipt["domain"],
                 "version": receipt["version"],
-                "digest": receipt["digest"],
+                "actor_id": receipt["actor_id"],
+                "binding_generation": receipt["binding_generation"],
+                "executor_runtime_identity": receipt["executor_runtime_identity"],
+                "requested_session_id": receipt["requested_session_id"],
+                "lineage_root_digest": receipt["lineage_root_digest"],
+                "receipt_digest": receipt["receipt_digest"],
             }
         },
     )
