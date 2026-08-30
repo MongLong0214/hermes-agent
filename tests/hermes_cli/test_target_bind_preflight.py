@@ -42,7 +42,11 @@ def _request(*, session_id: str, lineage_root: str, **overrides: object) -> dict
     return request
 
 
-def _run_preflight(profile_home: Path, payload: str) -> subprocess.CompletedProcess[str]:
+def _run_preflight(
+    profile_home: Path,
+    payload: str,
+    argv_prefix: tuple[str, ...] = (),
+) -> subprocess.CompletedProcess[str]:
     controller_home = profile_home.parent.parent / "controller-home"
     controller_home.mkdir(exist_ok=True)
     env = os.environ.copy()
@@ -54,7 +58,15 @@ def _run_preflight(profile_home: Path, payload: str) -> subprocess.CompletedProc
         }
     )
     return subprocess.run(
-        [sys.executable, "-m", "hermes_cli.main", "target", "bind", "--json"],
+        [
+            sys.executable,
+            "-m",
+            "hermes_cli.main",
+            *argv_prefix,
+            "target",
+            "bind",
+            "--json",
+        ],
         cwd=_REPO_ROOT,
         input=payload,
         text=True,
@@ -192,9 +204,18 @@ def test_target_bind_preflight_rejects_malformed_or_trailing_json(tmp_path, payl
     assert json.loads(result.stdout) == {"error": "target_bind_preflight_invalid"}
 
 
+@pytest.mark.parametrize(
+    "argv_prefix",
+    [
+        (),
+        ("--safe-mode",),
+        ("--reasoning", "high"),
+        ("--safe-mode", "--reasoning", "high"),
+    ],
+)
 @pytest.mark.parametrize("valid_request", [True, False])
 def test_target_bind_preflight_bypasses_external_sources_and_plugin_discovery(
-    tmp_path, valid_request
+    tmp_path, valid_request, argv_prefix
 ):
     profile_home = _profile_home(tmp_path)
     with SessionDB(profile_home / "state.db") as db:
@@ -245,7 +266,7 @@ def test_target_bind_preflight_bypasses_external_sources_and_plugin_discovery(
         if valid_request
         else "{"
     )
-    result = _run_preflight(profile_home, payload)
+    result = _run_preflight(profile_home, payload, argv_prefix)
 
     assert (secret_marker.exists(), plugin_marker.exists()) == (False, False)
     output = json.loads(result.stdout)
