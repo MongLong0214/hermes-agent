@@ -1928,11 +1928,8 @@ class HermesACPAgent(acp.Agent):
             user_content = prompt[0].text
             if not isinstance(user_content, str):
                 return self._terminal_receipt_refusal()
-            normalized_user_content = user_content.replace("\r\n", "\n").replace("\r", "\n")
             expected_prompt_digest = "sha256:" + hashlib.sha256(
-                json.dumps(
-                    normalized_user_content, ensure_ascii=False, separators=(",", ":")
-                ).encode("utf-8")
+                json.dumps(user_content, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
             ).hexdigest()
             if receipt_identity.get("promptDigest") != expected_prompt_digest:
                 return self._terminal_receipt_refusal()

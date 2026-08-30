@@ -455,9 +455,8 @@ class TestAcpTerminalReceipt:
     def _receipt_metadata(
         session_id: str, raw_text: str, *, operation: str = "execute"
     ) -> dict:
-        normalized = raw_text.replace("\r\n", "\n").replace("\r", "\n")
         prompt_digest = "sha256:" + hashlib.sha256(
-            json.dumps(normalized, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            json.dumps(raw_text, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
         return {
             "operation": operation,
@@ -591,6 +590,79 @@ class TestAcpTerminalReceipt:
         state.agent.run_conversation.assert_not_called()
         assert state.history == []
         assert state.is_running is False
+
+    @pytest.mark.anyio
+    async def test_acp_terminal_receipt_digest_binds_exact_crlf_bytes(
+        self, agent, mock_manager
+    ):
+        state = mock_manager.create_session(cwd="/tmp")
+        lf_text = "line one\nline two"
+        crlf_text = "line one\r\nline two"
+        lf_metadata = self._receipt_metadata(state.session_id, lf_text)
+        db = MagicMock()
+        prepared = self._receipt_row(state.session_id, "PREPARED")
+        completed = self._receipt_row(state.session_id, "COMPLETED")
+        db.prepare_acp_turn_receipt.return_value = prepared
+        db.get_acp_turn_receipt.return_value = completed
+        db.get_conversation_root.return_value = state.session_id
+        db.validate_acp_turn_receipt_request.return_value = self._admission(lf_metadata)
+        state.agent._session_db = db
+        state.agent.run_conversation = MagicMock(
+            return_value={"final_response": "ignored transient result", "messages": []}
+        )
+        request = ReceiptRequest(
+            state.session_id, "turn-request-1", prepared["receiptIdentityDigest"]
+        )
+        claimed = ClaimedReceipt(request, "claim-token")
+        receipt_adapter = MagicMock()
+        receipt_adapter.claim_after_lease.return_value = claimed
+        receipt_adapter.completed_replay.return_value = {
+            **completed,
+            "assistantContent": "durable exact response",
+        }
+
+        with patch("acp_adapter.server.TurnReceiptAdapter", return_value=receipt_adapter):
+            refused = await agent.prompt(
+                prompt=[TextContentBlock(type="text", text=crlf_text)],
+                session_id=state.session_id,
+                hermes={"acpTerminalReceipt": lf_metadata},
+            )
+
+            assert refused.stop_reason == "refusal"
+            assert self._terminal_meta(refused)["status"] == "REFUSED"
+            db.prepare_acp_turn_receipt.assert_not_called()
+            db.get_acp_turn_receipt.assert_not_called()
+            state.agent.run_conversation.assert_not_called()
+            assert state.history == []
+            assert state.is_running is False
+
+            exact_crlf_metadata = self._receipt_metadata(state.session_id, crlf_text)
+            assert exact_crlf_metadata["receiptIdentity"]["promptDigest"] == "sha256:" + hashlib.sha256(
+                json.dumps(crlf_text, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            db.reset_mock()
+            db.get_conversation_root.return_value = state.session_id
+            db.validate_acp_turn_receipt_request.return_value = self._admission(exact_crlf_metadata)
+            state.agent.run_conversation.reset_mock()
+
+            admitted = await agent.prompt(
+                prompt=[TextContentBlock(type="text", text=crlf_text)],
+                session_id=state.session_id,
+                hermes={"acpTerminalReceipt": exact_crlf_metadata},
+            )
+
+        db.prepare_acp_turn_receipt.assert_called_once_with(
+            state.session_id,
+            exact_crlf_metadata["receiptIdentity"],
+            exact_crlf_metadata["targetBindReceipt"],
+        )
+        run_kwargs = state.agent.run_conversation.call_args.kwargs
+        assert run_kwargs["user_message"] == crlf_text
+        assert run_kwargs["persist_user_message"] == crlf_text
+        assert self._terminal_meta(admitted) == {
+            **completed,
+            "assistantContent": "durable exact response",
+        }
 
     @pytest.mark.anyio
     async def test_acp_terminal_receipt_status_is_model_free_for_every_durable_state(
