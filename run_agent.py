@@ -8881,6 +8881,23 @@ class AIAgent:
                     daemon=True,
                 )
 
+            # Receipt v1 is deliberately limited to normal chat-completions.
+            # The app-server owns a separate subprocess/runtime finalizer, so
+            # never claim a receipt it cannot settle atomically.
+            if (
+                turn_receipt is not None
+                and getattr(self, "api_mode", None) == "codex_app_server"
+            ):
+                return {
+                    "final_response": "",
+                    "messages": list(conversation_history or []),
+                    "api_calls": 0,
+                    "completed": False,
+                    "failed": True,
+                    "error": "turn_receipt_runtime_unsupported",
+                    "failure_reason": "turn_receipt_runtime_unsupported",
+                }
+
             # Receipt claiming is deliberately after the durable session lease
             # and before any relay/task/model/tool setup.  The immutable value
             # remains local to this invocation; cached agents never retain it.

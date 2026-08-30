@@ -126,6 +126,50 @@ def test_aiagent_claims_after_durable_lease_and_races_return_before_execution(
         assert result["final_response"] == ""
 
 
+def test_receipt_codex_app_server_fails_closed_after_lease_before_claim_or_dispatch(
+    receipt_agent, monkeypatch
+):
+    """Receipt v1 never hands a claimed turn to the app-server runtime."""
+    agent, db, session_id = receipt_agent
+    request = _request(session_id, request_id="app-server-unsupported")
+    TurnReceiptAdapter(db).prepare_or_replay(request)
+    agent.api_mode = "codex_app_server"
+    events: list[str] = []
+    real_acquire = db.acquire_session_turn_lease
+    real_claim = TurnReceiptAdapter.claim_after_lease
+
+    def acquire(*args, **kwargs):
+        events.append("lease")
+        return real_acquire(*args, **kwargs)
+
+    def claim(adapter, request_arg):
+        events.append("claim")
+        return real_claim(adapter, request_arg)
+
+    def app_server_turn(**_kwargs):
+        events.append("app_server")
+        return {
+            "final_response": "unexpected app-server result",
+            "messages": [],
+            "api_calls": 0,
+            "completed": True,
+        }
+
+    monkeypatch.setattr(db, "acquire_session_turn_lease", acquire)
+    monkeypatch.setattr(TurnReceiptAdapter, "claim_after_lease", claim)
+    monkeypatch.setattr(agent, "_run_codex_app_server_turn", app_server_turn)
+
+    result = agent.run_conversation("question", turn_receipt=request)
+
+    assert events == ["lease"]
+    assert result["completed"] is False
+    assert result["error"] == "turn_receipt_runtime_unsupported"
+    assert result["failure_reason"] == "turn_receipt_runtime_unsupported"
+    assert "turn_receipt" not in result
+    assert TurnReceiptAdapter(db).status_for(request)["status"] == "PREPARED"
+    assert db.get_messages(session_id) == []
+
+
 def test_genuine_terminal_response_is_sanitized_and_atomically_completes(
     receipt_agent, monkeypatch
 ):
@@ -495,5 +539,66 @@ def test_failed_terminal_settlement_never_completes_or_runs_post_success_work(
     assert TurnReceiptAdapter(db).status_for(request)["status"] == "CLAIMED"
     assert db.get_messages(session_id) == []
     assert calls == {"memory": 0, "background": 0}
+    assert "post_llm_call" not in hooks
+    assert "on_session_end" not in hooks
+
+
+def test_non_string_held_receipt_content_fails_before_persistence_or_completion(
+    receipt_agent, monkeypatch
+):
+    """Receipt settlement must not replace a non-text held assistant payload."""
+    from agent.turn_finalizer import finalize_turn
+    from tui_gateway.turn_receipts import TerminalReceiptHold
+    import hermes_cli.lifecycle as lifecycle
+
+    agent, db, session_id = receipt_agent
+    request = _request(session_id, request_id="non-string-held-content")
+    receipts = TurnReceiptAdapter(db)
+    receipts.prepare_or_replay(request)
+    claimed = receipts.claim_after_lease(request)
+    original_content = {"unexpected": "held assistant object"}
+    held = {"role": "assistant", "content": original_content}
+    messages = [{"role": "user", "content": "question"}, held]
+    hold = TerminalReceiptHold(claimed, held, 1)
+    persist_calls: list[object] = []
+    hooks: list[str] = []
+
+    def persist(*_args, **_kwargs):
+        persist_calls.append("persist")
+        return True
+
+    monkeypatch.setattr(agent, "_persist_session", persist)
+    monkeypatch.setattr(
+        lifecycle,
+        "invoke_hook",
+        lambda name, *_args, **_kwargs: hooks.append(name) or [],
+    )
+
+    result = finalize_turn(
+        agent,
+        final_response="text response",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="question",
+        original_user_message="question",
+        _should_review_memory=True,
+        _turn_exit_reason="text_response(finish_reason=stop)",
+        terminal_receipt_hold=hold,
+        claimed_receipt=claimed,
+    )
+
+    assert held["content"] is original_content
+    assert persist_calls == []
+    assert result["turn_exit_reason"] == "session_persistence_failed"
+    assert result["failed"] is True
+    assert result["completed"] is False
+    assert "turn_receipt" not in result
+    assert receipts.status_for(request)["status"] == "CLAIMED"
+    assert db.get_messages(session_id) == []
     assert "post_llm_call" not in hooks
     assert "on_session_end" not in hooks

@@ -129,20 +129,14 @@ def _ensure_turn_receipt_session_identity(session: dict, db, request) -> None:
         raise RuntimeError("session storage could not establish receipt identity")
 
 
-def _admitted_turn_receipt_attachments_match(session: dict, request) -> bool:
-    """Require the execution-time list and bytes to match receipt admission."""
-    from tui_gateway.turn_receipts import attachment_snapshot_is_current
-
-    with session["history_lock"]:
-        attachments = list(session.get("attached_images") or [])
-        if not attachment_snapshot_is_current(request, attachments):
-            return False
-        # The immutable invocation-local path list is handed to
-        # ``_run_prompt_submit``.  Consume only the matching session list so
-        # normal attachment lifecycle remains one-turn scoped without allowing
-        # the runner to read a later mutable session list.
-        session["attached_images"] = []
-    return True
+def _turn_receipt_request_id(params: dict) -> str | None:
+    """Return the receipt request ID or reject an invalid explicit opt-in."""
+    if "turn_request_id" not in params:
+        return None
+    request_id = params["turn_request_id"]
+    if not isinstance(request_id, str) or not request_id.strip():
+        raise ValueError("turn_request_id must be a non-empty string")
+    return request_id.strip()
 
 
 def _derive_turn_receipt_request(
@@ -151,8 +145,8 @@ def _derive_turn_receipt_request(
     """Derive the receipt binding from the trusted gateway session/request."""
     from tui_gateway.turn_receipts import request_binding
 
-    request_id = str(params.get("turn_request_id") or "").strip()
-    if not request_id:
+    request_id = _turn_receipt_request_id(params)
+    if request_id is None:
         return None
     return request_binding(
         session_id=str(session.get("session_key") or params.get("session_id") or ""),
@@ -438,13 +432,18 @@ def _(rid, params: dict) -> dict:
     session = None
     turn_receipt = None
     receipt_input_resolved = False
-    request_id = params.get("turn_request_id")
-    if isinstance(request_id, str) and request_id.strip():
+    try:
+        request_id = _turn_receipt_request_id(params)
+    except ValueError as exc:
+        return _err(rid, 4004, str(exc))
+    if request_id is not None:
         from tui_gateway.turn_receipts import TurnReceiptAdapter
 
         session, err = _sess_nowait(params, rid)
         if err:
             return err
+        if session.get("attached_images"):
+            return _err(rid, 4004, "turn_receipt_attachments_unsupported")
         text, truncation = _effective_turn_receipt_input(session, params, text)
         receipt_input_resolved = True
         turn_receipt = _derive_turn_receipt_request(
@@ -454,9 +453,11 @@ def _(rid, params: dict) -> dict:
             with _session_db(session) as db:
                 if db is None:
                     return _err(rid, 5071, "session storage is unavailable")
-                _ensure_turn_receipt_session_identity(session, db, turn_receipt)
                 receipts = TurnReceiptAdapter(db)
-                receipt = receipts.prepare_or_replay(turn_receipt)
+                receipt = receipts.status_for(turn_receipt)
+                if receipt is None:
+                    _ensure_turn_receipt_session_identity(session, db, turn_receipt)
+                    receipt = receipts.prepare_or_replay(turn_receipt)
                 replay = receipts.completed_replay(turn_receipt)
         except Exception as exc:
             from hermes_state import TurnReceiptConflictError
@@ -1032,26 +1033,8 @@ def _(rid, params: dict) -> dict:
                     },
                 )
                 return
-        if turn_receipt is not None and not _admitted_turn_receipt_attachments_match(
-            session, turn_receipt
-        ):
-            with session["history_lock"]:
-                session["running"] = False
-                session["last_active"] = time.time()
-                _clear_inflight_turn(session)
-            _emit(
-                "error",
-                sid,
-                {
-                    "message": "attachment changed after turn receipt admission; retry the turn"
-                },
-            )
-            return
         _run_prompt_submit(
             rid, sid, session, text, display_kind=display_kind,
-            image_paths=list(turn_receipt.attachment_paths)
-            if turn_receipt is not None
-            else None,
             turn_receipt=turn_receipt,
         )
 
@@ -1079,12 +1062,17 @@ def _(rid, params: dict) -> dict:
     from hermes_cli.input_sanitize import sanitize_user_prompt_text
     from tui_gateway.turn_receipts import TurnReceiptAdapter
 
+    try:
+        request_id = _turn_receipt_request_id(params)
+    except ValueError as exc:
+        return _err(rid, 4004, str(exc))
+    if request_id is None:
+        return _err(rid, 4004, "turn_request_id required")
     session, err = _sess_nowait(params, rid)
     if err:
         return err
-    request_id = str(params.get("turn_request_id") or "").strip()
-    if not request_id:
-        return _err(rid, 4004, "turn_request_id required")
+    if session.get("attached_images"):
+        return _err(rid, 4004, "turn_receipt_attachments_unsupported")
     text = params.get("text", "")
     text = sanitize_user_prompt_text(text) if isinstance(text, str) else text
     text, truncation = _effective_turn_receipt_input(session, params, text)
@@ -1097,8 +1085,11 @@ def _(rid, params: dict) -> dict:
         with _session_db(session) as db:
             if db is None:
                 return _err(rid, 5071, "session storage is unavailable")
-            _ensure_turn_receipt_session_identity(session, db, request)
-            receipt = TurnReceiptAdapter(db).prepare_or_replay(request)
+            receipts = TurnReceiptAdapter(db)
+            receipt = receipts.status_for(request)
+            if receipt is None:
+                _ensure_turn_receipt_session_identity(session, db, request)
+                receipt = receipts.prepare_or_replay(request)
     except Exception as exc:
         from hermes_state import TurnReceiptConflictError
         if isinstance(exc, TurnReceiptConflictError):
@@ -1114,6 +1105,12 @@ def _(rid, params: dict) -> dict:
     from hermes_cli.input_sanitize import sanitize_user_prompt_text
     from tui_gateway.turn_receipts import TurnReceiptAdapter
 
+    try:
+        request_id = _turn_receipt_request_id(params)
+    except ValueError as exc:
+        return _err(rid, 4004, str(exc))
+    if request_id is None:
+        return _err(rid, 4004, "turn_request_id required")
     session, err = _sess_nowait(params, rid)
     if err:
         return err
@@ -1125,8 +1122,6 @@ def _(rid, params: dict) -> dict:
         "hidden" if params.get("display_kind") == "hidden" else None,
         truncation,
     )
-    if request is None:
-        return _err(rid, 4004, "turn_request_id required")
     try:
         with _session_db(session) as db:
             receipt = TurnReceiptAdapter(db).status_for(request) if db else None
@@ -1856,9 +1851,9 @@ def register(server) -> None:
     g = vars(server)
     for helper in (
         _derive_turn_receipt_request,
+        _turn_receipt_request_id,
         _effective_turn_receipt_input,
         _ensure_turn_receipt_session_identity,
-        _admitted_turn_receipt_attachments_match,
         _resolved_turn_receipt_truncation,
         _history_user_indices,
         _message_row_id,

@@ -778,6 +778,7 @@ def finalize_turn(
                 interrupted or failed or index < 0 or index >= len(messages)
                 or messages[index] is not held or held.get("role") != "assistant"
                 or held.get("display_kind") == "hidden" or held.get("tool_calls")
+                or not isinstance(held.get("content"), str)
                 or not isinstance(final_response, str)
                 or held.get(_DB_PERSISTED_MARKER)
             ):
