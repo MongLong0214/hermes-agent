@@ -1,0 +1,293 @@
+"""Receipt execution contracts over the real agent loop and SessionDB."""
+
+from __future__ import annotations
+
+import hashlib
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from hermes_state import SessionDB
+from tui_gateway.turn_receipts import TurnReceiptAdapter, request_binding
+
+
+def _tool_defs():
+    return [{
+        "type": "function",
+        "function": {
+            "name": "receipt_test_tool",
+            "description": "test boundary",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }]
+
+
+@pytest.fixture()
+def receipt_agent(tmp_path):
+    from run_agent import AIAgent
+
+    db = SessionDB(tmp_path / "state.db")
+    session_id = "receipt-agent-session"
+    db.create_session(session_id, source="test")
+    with (
+        patch("run_agent.get_tool_definitions", return_value=_tool_defs()),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            skip_background_review=False,
+        )
+    agent.client = MagicMock()
+    agent.session_id = session_id
+    agent._session_db = db
+    agent._session_db_created = True
+    agent._cached_system_prompt = "You are helpful."
+    agent._use_prompt_caching = False
+    agent.tool_delay = 0
+    agent.compression_enabled = False
+    agent.save_trajectories = False
+    try:
+        yield agent, db, session_id
+    finally:
+        db.close()
+
+
+def _request(session_id, request_id="request-1"):
+    return request_binding(
+        session_id=session_id,
+        turn_request_id=request_id,
+        text="question",
+        display_kind=None,
+        attachments=[],
+        truncation=None,
+    )
+
+
+@pytest.mark.parametrize("state", ["COMPLETED", "CLAIMED"])
+def test_aiagent_claims_after_durable_lease_and_races_return_before_execution(
+    receipt_agent, monkeypatch, state
+):
+    """The actual AIAgent entry point fences races before relay/model/tool work."""
+    agent, db, session_id = receipt_agent
+    from agent import relay_runtime
+
+    request = _request(session_id)
+    receipts = TurnReceiptAdapter(db)
+    receipts.prepare_or_replay(request)
+    claimed = receipts.claim_after_lease(request)
+    assistant = "already durable"
+    if state == "COMPLETED":
+        receipts.finish(
+            session_id,
+            request.turn_request_id,
+            request.binding_digest,
+            claimed.claim_token,
+            assistant_content=assistant,
+            response_digest="sha256:" + hashlib.sha256(assistant.encode()).hexdigest(),
+        )
+
+    events: list[str] = []
+    real_acquire = db.acquire_session_turn_lease
+    real_claim = TurnReceiptAdapter.claim_after_lease
+
+    def acquire(*args, **kwargs):
+        events.append("lease")
+        return real_acquire(*args, **kwargs)
+
+    def claim_after_lease(adapter, request_arg):
+        events.append("claim")
+        return real_claim(adapter, request_arg)
+
+    monkeypatch.setattr(db, "acquire_session_turn_lease", acquire)
+    monkeypatch.setattr(TurnReceiptAdapter, "claim_after_lease", claim_after_lease)
+    monkeypatch.setattr(
+        relay_runtime.SESSION_COORDINATOR,
+        "acquire_conversation",
+        lambda *_args, **_kwargs: pytest.fail("relay opened after receipt race"),
+    )
+    agent.client.chat.completions.create.side_effect = lambda *_a, **_kw: pytest.fail(
+        "model called after receipt race"
+    )
+
+    result = agent.run_conversation("question", turn_receipt=request)
+
+    assert events[:2] == ["lease", "claim"]
+    assert agent.client.chat.completions.create.call_count == 0
+    if state == "COMPLETED":
+        assert result["replayed"] is True
+        assert result["final_response"] == assistant
+    else:
+        assert result["in_progress"] is True
+        assert result["final_response"] == ""
+
+
+def test_genuine_terminal_response_is_sanitized_and_atomically_completes(
+    receipt_agent, monkeypatch
+):
+    """Only the later visible non-tool assistant response owns completion."""
+    agent, db, session_id = receipt_agent
+    from tests.run_agent.test_run_agent import _mock_response, _mock_tool_call
+    import agent.verify_hooks as verify_hooks
+    import agent.verification_stop as verification_stop
+    import hermes_cli.lifecycle as lifecycle
+    import hermes_cli.plugins as plugins
+
+    request = _request(session_id)
+    TurnReceiptAdapter(db).prepare_or_replay(request)
+    tool_call = _mock_tool_call("receipt_test_tool", call_id="tool-1")
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response("tool narration", finish_reason="tool_calls", tool_calls=[tool_call]),
+        _mock_response("verify candidate", finish_reason="stop"),
+        _mock_response("pre-verify candidate", finish_reason="stop"),
+        _mock_response("\ud800genuine terminal", finish_reason="stop"),
+    ]
+
+    def execute_tool(_assistant_message, messages, *_args):
+        agent._turn_file_mutation_paths.add("changed.py")
+        messages.append({
+            "role": "tool",
+            "name": "receipt_test_tool",
+            "tool_call_id": "tool-1",
+            "content": "tool result",
+        })
+
+    monkeypatch.setattr(agent, "_execute_tool_calls", execute_tool)
+    monkeypatch.setattr(verification_stop, "verify_on_stop_enabled", lambda: True)
+    monkeypatch.setattr(
+        verification_stop,
+        "build_verify_on_stop_nudge",
+        lambda **_kwargs: "verify again" if not getattr(agent, "_verify_sent", False) else None,
+    )
+    real_emit_interim = agent._emit_interim_assistant_message
+
+    def emit_interim(message):
+        if message.get("content") == "verify candidate":
+            agent._verify_sent = True
+        return real_emit_interim(message)
+
+    monkeypatch.setattr(agent, "_emit_interim_assistant_message", emit_interim)
+    monkeypatch.setattr(lifecycle, "has_hook", lambda name: name == "pre_verify")
+    monkeypatch.setattr(verify_hooks, "max_verify_nudges", lambda: 1)
+    pre_verify = iter(["verify hook again", None])
+    monkeypatch.setattr(
+        plugins,
+        "get_pre_verify_continue_message",
+        lambda **_kw: next(pre_verify),
+    )
+    hooks: list[str] = []
+    real_invoke = lifecycle.invoke_hook
+
+    def invoke_hook(name, *args, **kwargs):
+        hooks.append(name)
+        return real_invoke(name, *args, **kwargs)
+
+    monkeypatch.setattr(lifecycle, "invoke_hook", invoke_hook)
+    events: list[str] = []
+    real_acquire = db.acquire_session_turn_lease
+    real_claim = TurnReceiptAdapter.claim_after_lease
+    monkeypatch.setattr(
+        db,
+        "acquire_session_turn_lease",
+        lambda *args, **kwargs: events.append("lease") or real_acquire(*args, **kwargs),
+    )
+    monkeypatch.setattr(
+        TurnReceiptAdapter,
+        "claim_after_lease",
+        lambda adapter, request_arg: events.append("claim") or real_claim(adapter, request_arg),
+    )
+
+    result = agent.run_conversation("question", turn_receipt=request)
+
+    assert events[:2] == ["lease", "claim"]
+    assert agent.client.chat.completions.create.call_count == 4
+    assert agent._pre_verify_nudges == 1
+    assert result["final_response"] == "\ufffdgenuine terminal"
+    receipt = TurnReceiptAdapter(db).status_for(request)
+    replay = TurnReceiptAdapter(db).completed_replay(request)
+    assert receipt["status"] == "COMPLETED"
+    assert replay["assistantContent"] == result["final_response"]
+    assert receipt["responseDigest"] == "sha256:" + hashlib.sha256(
+        result["final_response"].encode("utf-8")
+    ).hexdigest()
+    rows = db.get_messages(session_id)
+    terminal = next(row for row in rows if row["id"] == receipt["terminalMessageId"])
+    assert terminal["content"] == result["final_response"]
+    assert sum(row["id"] == receipt["terminalMessageId"] for row in rows) == 1
+    assert any(row.get("content") == "tool narration" and row.get("tool_calls") for row in rows)
+    assert any(row.get("content") == "verify candidate" for row in rows)
+    assert any(row.get("content") == "pre-verify candidate" for row in rows)
+    assert all("\ud800" not in str(row.get("content")) for row in rows)
+    assert "post_llm_call" in hooks
+
+
+@pytest.mark.parametrize("failure", ["flush_false", "replaced", "marked"])
+def test_failed_terminal_settlement_never_completes_or_runs_post_success_work(
+    receipt_agent, monkeypatch, failure
+):
+    """A failed terminal hold is fail-closed before memory/background/hooks."""
+    from agent.turn_finalizer import finalize_turn
+    from tui_gateway.turn_receipts import TerminalReceiptHold
+    import hermes_cli.lifecycle as lifecycle
+
+    agent, db, session_id = receipt_agent
+    request = _request(session_id, request_id=f"{failure}-request")
+    receipts = TurnReceiptAdapter(db)
+    receipts.prepare_or_replay(request)
+    claimed = receipts.claim_after_lease(request)
+    terminal = {"role": "assistant", "content": "\ud800raw final"}
+    messages = [{"role": "user", "content": "question"}, terminal]
+    hold = TerminalReceiptHold(claimed, terminal, 1)
+    if failure == "replaced":
+        messages[1] = {"role": "assistant", "content": "replacement"}
+    elif failure == "marked":
+        terminal["_db_persisted"] = True
+    elif failure == "flush_false":
+        monkeypatch.setattr(agent, "_persist_session", lambda *_a, **_kw: False)
+
+    hooks: list[str] = []
+    monkeypatch.setattr(
+        lifecycle,
+        "invoke_hook",
+        lambda name, *_args, **_kwargs: hooks.append(name) or [],
+    )
+    calls = {"memory": 0, "background": 0}
+    monkeypatch.setattr(
+        agent,
+        "_sync_external_memory_for_turn",
+        lambda **_kw: calls.__setitem__("memory", calls["memory"] + 1),
+    )
+    monkeypatch.setattr(
+        agent,
+        "_spawn_background_review",
+        lambda **_kw: calls.__setitem__("background", calls["background"] + 1),
+    )
+
+    result = finalize_turn(
+        agent,
+        final_response="\ud800raw final",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="question",
+        original_user_message="question",
+        _should_review_memory=True,
+        _turn_exit_reason="text_response(finish_reason=stop)",
+        terminal_receipt_hold=hold,
+    )
+
+    assert result["turn_exit_reason"] == "session_persistence_failed"
+    assert result["failed"] is True
+    assert TurnReceiptAdapter(db).status_for(request)["status"] == "CLAIMED"
+    assert db.get_messages(session_id) == []
+    assert calls == {"memory": 0, "background": 0}
+    assert "post_llm_call" not in hooks
+    assert "on_session_end" not in hooks

@@ -2001,7 +2001,10 @@ class AIAgent:
                 if timestamp is not None:
                     msg["timestamp"] = timestamp
 
-    def _persist_session(self, messages: List[Dict], conversation_history: List[Dict] = None):
+    def _persist_session(
+        self, messages: List[Dict], conversation_history: List[Dict] = None, *,
+        terminal_receipt_hold=None,
+    ):
         """Save session state to both JSON log and SQLite on any exit path.
 
         Ensures conversations are never lost, even on errors or early returns.
@@ -2022,24 +2025,27 @@ class AIAgent:
 
         persist_lock = getattr(self, "_session_persist_lock", None)
 
-        def _persist_and_drain() -> None:
+        def _persist_and_drain():
             self._drop_trailing_empty_response_scaffolding(messages)
             self._session_messages = messages
             self._save_session_log(messages)
-            self._flush_messages_to_session_db(messages, conversation_history)
+            flushed = self._flush_messages_to_session_db(
+                messages, conversation_history,
+                terminal_receipt_hold=terminal_receipt_hold,
+            )
             # Drain async token-accounting deltas at every persist point (turn
             # finalize + error exits) so a crash after this line loses at most
             # the in-flight API call's delta. Cheap no-op when nothing queued.
             if self._session_db is not None:
                 self._session_db.flush_token_counts()
             note_turn_persisted(self)
+            return flushed
 
         if persist_lock is None:
-            _persist_and_drain()
-            return
+            return _persist_and_drain()
 
         with persist_lock:
-            _persist_and_drain()
+            return _persist_and_drain()
 
     def _drop_trailing_empty_response_scaffolding(self, messages: List[Dict]) -> None:
         """Remove private empty-response retry/failure scaffolding from transcript tails.
@@ -2103,19 +2109,26 @@ class AIAgent:
         self,
         messages: List[Dict],
         conversation_history: Optional[List[Dict]] = None,
+        *,
+        terminal_receipt_hold=None,
     ):
         """Serialize direct and turn-boundary session flushes per agent."""
         persist_lock = getattr(self, "_session_persist_lock", None)
         if persist_lock is None:
-            return self._flush_messages_to_session_db_unlocked(messages, conversation_history)
+            return self._flush_messages_to_session_db_unlocked(
+                messages, conversation_history, terminal_receipt_hold=terminal_receipt_hold
+            )
         with persist_lock:
-            return self._flush_messages_to_session_db_unlocked(messages, conversation_history)
+            return self._flush_messages_to_session_db_unlocked(
+                messages, conversation_history, terminal_receipt_hold=terminal_receipt_hold
+            )
 
     def _flush_messages_to_session_db_unlocked(
         self,
         messages: List[Dict],
         conversation_history: Optional[List[Dict]] = None,
         _adoption_budget: int = 1,
+        terminal_receipt_hold=None,
     ):
         """Persist any un-flushed messages to the SQLite session store.
 
@@ -2144,6 +2157,18 @@ class AIAgent:
             return None
         if not self._session_db:
             return None
+        if terminal_receipt_hold is not None:
+            hold_message = terminal_receipt_hold.terminal_message
+            hold_index = terminal_receipt_hold.terminal_message_index
+            if (
+                hold_index < 0 or hold_index >= len(messages)
+                or messages[hold_index] is not hold_message
+                or hold_message.get("role") != "assistant"
+                or hold_message.get("tool_calls")
+                or not isinstance(hold_message.get("content"), str)
+                or hold_message.get(_DB_PERSISTED_MARKER)
+            ):
+                raise RuntimeError("terminal turn receipt hold is not persistable")
         # Persist user-message override (#48677 chokepoint): historically this
         # mutated the live `messages` list in place, which — on the early
         # crash-resilience persist that runs BEFORE the API call is built —
@@ -2387,6 +2412,20 @@ class AIAgent:
             # re-writes the whole tail (same recovery contract as before,
             # minus the partial-prefix case that could double-pay counters).
             if _batch_rows:
+                terminal_turn_receipt = None
+                if terminal_receipt_hold is not None:
+                    from hermes_state import TerminalTurnReceipt
+
+                    if terminal_receipt_hold.terminal_message not in _batch_msgs:
+                        raise RuntimeError("terminal receipt hold was not selected for batch")
+                    claimed = terminal_receipt_hold.claimed
+                    terminal_turn_receipt = TerminalTurnReceipt(
+                        session_id=claimed.request.session_id,
+                        turn_request_id=claimed.request.turn_request_id,
+                        binding_digest=claimed.request.binding_digest,
+                        claim_token=claimed.claim_token,
+                        response_digest=terminal_receipt_hold.response_digest,
+                    )
                 self._session_db.append_messages_batch(
                     session_id=self.session_id,
                     messages=_batch_rows,
@@ -2400,6 +2439,7 @@ class AIAgent:
                         self, "_active_session_turn_lease_ttl_seconds", 300.0
                     )
                     or 300.0,
+                    terminal_turn_receipt=terminal_turn_receipt,
                 )
                 for _written in _batch_msgs:
                     _written[_DB_PERSISTED_MARKER] = True
@@ -8501,6 +8541,7 @@ class AIAgent:
         persist_user_display_kind: Optional[str] = None,
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         moa_config: Optional[dict[str, Any]] = None,
+        turn_receipt=None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         # A review deliberately shares this agent's session_id for prompt-cache
@@ -8556,6 +8597,7 @@ class AIAgent:
         task_started = False
         task_finished = False
         relay_outcome = "failed"
+        claimed_turn_receipt = None
 
         def _stop_durable_turn_lease_refresher() -> None:
             nonlocal durable_turn_lease_turn_active
@@ -8816,6 +8858,36 @@ class AIAgent:
                     daemon=True,
                 )
 
+            # Receipt claiming is deliberately after the durable session lease
+            # and before any relay/task/model/tool setup.  The immutable value
+            # remains local to this invocation; cached agents never retain it.
+            if turn_receipt is not None:
+                from tui_gateway.turn_receipts import ClaimedReceipt, TurnReceiptAdapter
+
+                adapter = TurnReceiptAdapter(getattr(self, "_session_db", None))
+                claimed_or_status = adapter.claim_after_lease(turn_receipt)
+                if isinstance(claimed_or_status, ClaimedReceipt):
+                    claimed_turn_receipt = claimed_or_status
+                else:
+                    replay = adapter.completed_replay(turn_receipt)
+                    if replay is not None:
+                        return {
+                            "final_response": replay["assistantContent"],
+                            "messages": list(conversation_history or []),
+                            "api_calls": 0,
+                            "completed": True,
+                            "turn_receipt": replay,
+                            "replayed": True,
+                        }
+                    return {
+                        "final_response": "",
+                        "messages": list(conversation_history or []),
+                        "api_calls": 0,
+                        "completed": False,
+                        "in_progress": True,
+                        "turn_receipt": claimed_or_status,
+                    }
+
 
             relay_lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(
                 profile_key=relay_runtime.current_profile_key(),
@@ -8875,6 +8947,7 @@ class AIAgent:
                         persist_user_display_kind=persist_user_display_kind,
                         persist_user_display_metadata=persist_user_display_metadata,
                         moa_config=moa_config,
+                        turn_receipt=claimed_turn_receipt,
                     )
                 finally:
                     # The lease remains held through relay/task finalization, but

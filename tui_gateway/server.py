@@ -10811,6 +10811,7 @@ def _run_prompt_submit(
     display_metadata: dict | None = None,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    turn_receipt=None,
 ) -> bool:
     with session["history_lock"]:
         if session.get("_closing"):
@@ -11128,6 +11129,8 @@ def _run_prompt_submit(
                     _build_persist_user_message(prompt, images, run_message) if images else prompt
                 ),
             }
+            if turn_receipt is not None:
+                run_kwargs["turn_receipt"] = turn_receipt
             # Type a synthesized turn at turn START so the crash persist writes
             # its row as a timeline event, instead of leaving a raw user bubble
             # until the turn ends — and forever if it never does, which is

@@ -1775,6 +1775,7 @@ def run_conversation(
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    turn_receipt=None,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -8282,14 +8283,23 @@ def run_conversation(
                 # Unlike the tool-call exit, failure must NOT abort the turn:
                 # no side effect follows and _persist_session retries the write.
                 # Full incident narrative: tests/run_agent/test_81641_*.py.
-                try:
-                    agent._flush_messages_to_session_db(messages, conversation_history)
-                except Exception:
-                    logger.warning(
-                        "final text-turn flush failed (session=%s) — reply is "
-                        "not yet durable; relying on finalize_turn retry",
-                        getattr(agent, "session_id", None) or "none",
-                        exc_info=True,
+                terminal_receipt_hold = None
+                if turn_receipt is None:
+                    try:
+                        agent._flush_messages_to_session_db(messages, conversation_history)
+                    except Exception:
+                        logger.warning(
+                            "final text-turn flush failed (session=%s) — reply is "
+                            "not yet durable; relying on finalize_turn retry",
+                            getattr(agent, "session_id", None) or "none",
+                            exc_info=True,
+                        )
+                else:
+                    from tui_gateway.turn_receipts import TerminalReceiptHold
+                    terminal_receipt_hold = TerminalReceiptHold(
+                        claimed=turn_receipt,
+                        terminal_message=final_msg,
+                        terminal_message_index=len(messages) - 1,
                     )
 
                 _turn_exit_reason = f"text_response(finish_reason={finish_reason})"
@@ -8411,6 +8421,7 @@ def run_conversation(
         _turn_exit_reason=_turn_exit_reason,
         _pending_verification_response=_pending_verification_response,
         _pending_verification_response_previewed=_pending_verification_response_previewed,
+        terminal_receipt_hold=locals().get("terminal_receipt_hold"),
     )
 
 

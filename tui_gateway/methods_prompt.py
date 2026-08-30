@@ -13,6 +13,124 @@ method = _registry.method
 _profile_scoped = _registry.profile_scoped
 
 
+def _resolved_turn_receipt_truncation(session: dict, params: dict):
+    """Return the server-resolved identity of a requested history cut."""
+    has_truncation = any(
+        params.get(key) is not None
+        for key in (
+            "truncate_before_user_ordinal",
+            "truncate_before_row_id",
+            "truncate_before_message_id",
+        )
+    )
+    if not has_truncation:
+        return None
+
+    identity = {
+        "confirm_truncate": is_truthy_value(params.get("confirm_truncate")),
+        "confirm_empty_truncate": is_truthy_value(
+            params.get("confirm_empty_truncate")
+        ),
+    }
+    history = session.get("history", [])
+    if not isinstance(history, list):
+        history = []
+    prefix_user_count = sum(
+        1
+        for message in session.get("display_history_prefix") or []
+        if isinstance(message, dict)
+        and message.get("role") == "user"
+        and not message.get("display_kind")
+    )
+
+    raw_row_id = params.get("truncate_before_row_id")
+    if raw_row_id is not None:
+        try:
+            if isinstance(raw_row_id, bool):
+                raise ValueError
+            row_id = int(raw_row_id)
+        except (TypeError, ValueError):
+            return {**identity, "kind": "invalid_row_id"}
+        found = _resolve_truncate_row_id(session, history, row_id)
+        if found is None:
+            return {**identity, "kind": "unresolved_row_id", "row_id": row_id}
+        user_ordinal, _history_index = found
+        return {
+            **identity,
+            "kind": "row_id",
+            "row_id": row_id,
+            "user_ordinal": user_ordinal,
+        }
+
+    raw_message_id = params.get("truncate_before_message_id")
+    if raw_message_id is not None:
+        message_id = str(raw_message_id)
+        for user_ordinal, history_index in enumerate(_history_user_indices(history)):
+            message = history[history_index]
+            if message.get("id") == message_id or message.get("message_id") == message_id:
+                return {
+                    **identity,
+                    "kind": "message_id",
+                    "message_id": message_id,
+                    "user_ordinal": user_ordinal,
+                }
+        return {**identity, "kind": "unresolved_message_id", "message_id": message_id}
+
+    raw_ordinal = params.get("truncate_before_user_ordinal")
+    try:
+        if isinstance(raw_ordinal, bool):
+            raise ValueError
+        visible_ordinal = int(raw_ordinal)
+    except (TypeError, ValueError):
+        return {**identity, "kind": "invalid_ordinal"}
+    segment_ordinal = visible_ordinal - prefix_user_count
+    user_indices = _history_user_indices(history)
+    if segment_ordinal < 0 or segment_ordinal >= len(user_indices):
+        return {
+            **identity,
+            "kind": "unresolved_ordinal",
+            "visible_ordinal": visible_ordinal,
+            "segment_ordinal": segment_ordinal,
+        }
+    target = history[user_indices[segment_ordinal]]
+    return {
+        **identity,
+        "kind": "ordinal",
+        "visible_ordinal": visible_ordinal,
+        "segment_ordinal": segment_ordinal,
+        "row_id": _message_row_id(target),
+    }
+
+
+def _effective_turn_receipt_input(session: dict, params: dict, text):
+    """Resolve the model-bound text and truncation identity before turn effects."""
+    truncation = _resolved_turn_receipt_truncation(session, params)
+    if truncation is not None and isinstance(text, str):
+        text = _expand_skill_invocation_for_replay(
+            text, str(session.get("session_key") or "")
+        )
+    return text, truncation
+
+
+def _derive_turn_receipt_request(
+    session: dict, params: dict, text, display_kind, truncation=None
+):
+    """Derive the receipt binding from the trusted gateway session/request."""
+    from tui_gateway.turn_receipts import request_binding
+
+    request_id = str(params.get("turn_request_id") or "").strip()
+    if not request_id:
+        return None
+    return request_binding(
+        session_id=str(session.get("session_key") or params.get("session_id") or ""),
+        turn_request_id=request_id,
+        text=text,
+        display_kind=display_kind,
+        attachments=list(session.get("attached_images") or []),
+        truncation=truncation,
+    )
+
+
 def _history_user_indices(history: list) -> list:
     """Indices of model-visible user turns (excludes display_kind timeline markers)."""
     return [
@@ -272,10 +390,61 @@ def _(rid, params: dict) -> dict:
     sid = params.get("session_id", "")
     raw_text = params.get("text", "")
     text = sanitize_user_prompt_text(raw_text) if isinstance(raw_text, str) else raw_text
+    has_truncation = (
+        params.get("truncate_before_user_ordinal") is not None
+        or params.get("truncate_before_row_id") is not None
+        or params.get("truncate_before_message_id") is not None
+    )
     # Off-screen sends (widget intents): type the persisted user row so no
     # client renders it as a bubble. Whitelisted to "hidden" — display_kind
     # is a DB-only sidecar and this RPC must not mint arbitrary kinds.
     display_kind = "hidden" if params.get("display_kind") == "hidden" else None
+    # Receipted turns resolve and admit their complete server-derived input
+    # before any voice/interruption/busy/truncation/bootstrap effect. Ordinary
+    # no-receipt submits retain their established ordering below.
+    session = None
+    turn_receipt = None
+    receipt_input_resolved = False
+    request_id = params.get("turn_request_id")
+    if isinstance(request_id, str) and request_id.strip():
+        from tui_gateway.turn_receipts import TurnReceiptAdapter
+
+        session, err = _sess_nowait(params, rid)
+        if err:
+            return err
+        text, truncation = _effective_turn_receipt_input(session, params, text)
+        receipt_input_resolved = True
+        turn_receipt = _derive_turn_receipt_request(
+            session, params, text, display_kind, truncation
+        )
+        try:
+            with _session_db(session) as db:
+                if db is None:
+                    return _err(rid, 5071, "session storage is unavailable")
+                receipts = TurnReceiptAdapter(db)
+                receipt = receipts.prepare_or_replay(turn_receipt)
+                replay = receipts.completed_replay(turn_receipt)
+        except Exception as exc:
+            from hermes_state import TurnReceiptConflictError
+
+            if isinstance(exc, TurnReceiptConflictError):
+                return _err(rid, 4091, "turn_receipt_binding_conflict")
+            logger.warning("turn receipt admission failed", exc_info=True)
+            return _err(rid, 5071, f"session storage could not be written: {exc}")
+        if replay is not None:
+            _emit(
+                "message.complete",
+                sid,
+                {
+                    "text": replay["assistantContent"],
+                    "status": "complete",
+                    "turn_receipt": replay,
+                    "replayed": True,
+                },
+            )
+            return _ok(rid, {"status": "complete", "turn_receipt": replay, "replayed": True})
+        if receipt.get("status") == "CLAIMED":
+            return _ok(rid, {"status": "in_progress", "turn_receipt": receipt})
     # Typed bare stop phrase while backend voice mode is active ends the
     # voice chat instead of sending "stop" to the agent — the typed twin of
     # the spoken stop phrase (PR #73106), applied at the ONE server-side
@@ -313,9 +482,10 @@ def _(rid, params: dict) -> dict:
         from tools.tts_streaming import mark_speech_interrupted
 
         mark_speech_interrupted()
-    session, err = _sess_nowait(params, rid)
-    if err:
-        return err
+    if session is None:
+        session, err = _sess_nowait(params, rid)
+        if err:
+            return err
     if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
         return _err(rid, 4090, limit_message)
     # Which desktop window this message was typed into. Rewritten on every
@@ -323,12 +493,7 @@ def _(rid, params: dict) -> dict:
     # in turn: a stale "hud" would tell the model the user is still floating
     # over another app when they are back in Hermes.
     session["client_surface"] = "hud" if params.get("surface") == "hud" else ""
-    has_truncation = (
-        truncate_user_ordinal is not None
-        or params.get("truncate_before_row_id") is not None
-        or params.get("truncate_before_message_id") is not None
-    )
-    if has_truncation and isinstance(text, str):
+    if has_truncation and not receipt_input_resolved and isinstance(text, str):
         # A rewind/regenerate replays a turn from what the transcript shows. A
         # skill turn shows its invocation, so re-expand it here — otherwise
         # re-running `/work fix it` sends the agent nine literal characters
@@ -815,7 +980,10 @@ def _(rid, params: dict) -> dict:
                     },
                 )
                 return
-        _run_prompt_submit(rid, sid, session, text, display_kind=display_kind)
+        _run_prompt_submit(
+            rid, sid, session, text, display_kind=display_kind,
+            turn_receipt=turn_receipt,
+        )
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
     # Keep a handle so session.interrupt can tell a live turn from a stuck
@@ -833,6 +1001,73 @@ def _(rid, params: dict) -> dict:
             ),
         },
     )
+
+
+@method("turn.prepare")
+def _(rid, params: dict) -> dict:
+    """Explicit opt-in admission without submitting a turn."""
+    from hermes_cli.input_sanitize import sanitize_user_prompt_text
+    from tui_gateway.turn_receipts import TurnReceiptAdapter
+
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    request_id = str(params.get("turn_request_id") or "").strip()
+    if not request_id:
+        return _err(rid, 4004, "turn_request_id required")
+    text = params.get("text", "")
+    text = sanitize_user_prompt_text(text) if isinstance(text, str) else text
+    text, truncation = _effective_turn_receipt_input(session, params, text)
+    request = _derive_turn_receipt_request(
+        session, params, text,
+        "hidden" if params.get("display_kind") == "hidden" else None,
+        truncation,
+    )
+    try:
+        with _session_db(session) as db:
+            if db is None:
+                return _err(rid, 5071, "session storage is unavailable")
+            receipt = TurnReceiptAdapter(db).prepare_or_replay(request)
+    except Exception as exc:
+        from hermes_state import TurnReceiptConflictError
+        if isinstance(exc, TurnReceiptConflictError):
+            return _err(rid, 4091, "turn_receipt_binding_conflict")
+        return _err(rid, 5071, f"session storage could not be written: {exc}")
+    return _ok(rid, {"turn_receipt": receipt})
+
+
+@method("turn.status")
+def _(rid, params: dict) -> dict:
+    # Status deliberately derives the same binding server-side; a client
+    # digest is not a capability to inspect or replay another request.
+    from hermes_cli.input_sanitize import sanitize_user_prompt_text
+    from tui_gateway.turn_receipts import TurnReceiptAdapter
+
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    text = params.get("text", "")
+    text = sanitize_user_prompt_text(text) if isinstance(text, str) else text
+    text, truncation = _effective_turn_receipt_input(session, params, text)
+    request = _derive_turn_receipt_request(
+        session, params, text,
+        "hidden" if params.get("display_kind") == "hidden" else None,
+        truncation,
+    )
+    if request is None:
+        return _err(rid, 4004, "turn_request_id required")
+    try:
+        with _session_db(session) as db:
+            receipt = TurnReceiptAdapter(db).status_for(request) if db else None
+            replay = TurnReceiptAdapter(db).completed_replay(request) if db else None
+    except Exception as exc:
+        from hermes_state import TurnReceiptConflictError
+        if isinstance(exc, TurnReceiptConflictError):
+            return _err(rid, 4091, "turn_receipt_binding_conflict")
+        return _err(rid, 5071, f"session storage could not be read: {exc}")
+    if receipt is None:
+        return _err(rid, 4040, "turn receipt not found")
+    return _ok(rid, {"turn_receipt": replay or receipt})
 
 
 @method("clipboard.paste")
@@ -1549,6 +1784,9 @@ def register(server) -> None:
     # sites) resolve the same free names after the split.
     g = vars(server)
     for helper in (
+        _derive_turn_receipt_request,
+        _effective_turn_receipt_input,
+        _resolved_turn_receipt_truncation,
         _history_user_indices,
         _message_row_id,
         _mem_db_pair_agrees,
