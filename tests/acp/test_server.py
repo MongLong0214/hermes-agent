@@ -1425,6 +1425,46 @@ class TestAcpTerminalReceipt:
             db.close()
 
     @pytest.mark.anyio
+    async def test_acp_terminal_receipt_supported_runtime_honors_public_policy_before_claim(
+        self, agent, mock_manager, tmp_path, monkeypatch
+    ):
+        """ACP's preclaim gate resolves the same public receipt policy."""
+        state = mock_manager.create_session(cwd="/tmp")
+        db = SessionDB(tmp_path / "public-policy-before-claim.db")
+        raw_text = "public policy blocks an otherwise supported runtime"
+        try:
+            db.create_session(state.session_id, source="test")
+            metadata = self._durable_metadata(db, state.session_id, raw_text)
+            state.agent._session_db = db
+            state.agent.session_id = state.session_id
+            state.agent.api_mode = "chat_completions"
+            state.agent.provider = "openrouter"
+            state.agent.run_conversation = MagicMock(
+                return_value={"final_response": "unexpected", "messages": []}
+            )
+            monkeypatch.setattr(
+                "run_agent.is_turn_receipt_runtime_supported",
+                lambda *_args: False,
+            )
+
+            with patch.object(
+                db, "claim_turn_receipt", wraps=db.claim_turn_receipt
+            ) as claim_receipt:
+                response = await agent.prompt(
+                    prompt=[TextContentBlock(type="text", text=raw_text)],
+                    session_id=state.session_id,
+                    hermes={"acpTerminalReceipt": metadata},
+                )
+
+            assert self._terminal_meta(response)["status"] == "PREPARED"
+            claim_receipt.assert_not_called()
+            state.agent.run_conversation.assert_not_called()
+            assert state.is_running is False
+            assert db.get_messages(state.session_id) == []
+        finally:
+            db.close()
+
+    @pytest.mark.anyio
     async def test_acp_terminal_receipt_run_exception_returns_durable_aborted_without_assistant_row(
         self, agent, mock_manager, tmp_path
     ):
