@@ -8908,29 +8908,32 @@ class AIAgent:
             if turn_receipt is not None:
                 from tui_gateway.turn_receipts import ClaimedReceipt, TurnReceiptAdapter
 
-                adapter = TurnReceiptAdapter(getattr(self, "_session_db", None))
-                claimed_or_status = adapter.claim_after_lease(turn_receipt)
-                if isinstance(claimed_or_status, ClaimedReceipt):
-                    claimed_turn_receipt = claimed_or_status
+                if isinstance(turn_receipt, ClaimedReceipt):
+                    claimed_turn_receipt = turn_receipt
                 else:
-                    replay = adapter.completed_replay(turn_receipt)
-                    if replay is not None:
+                    adapter = TurnReceiptAdapter(getattr(self, "_session_db", None))
+                    claimed_or_status = adapter.claim_after_lease(turn_receipt)
+                    if isinstance(claimed_or_status, ClaimedReceipt):
+                        claimed_turn_receipt = claimed_or_status
+                    else:
+                        replay = adapter.completed_replay(turn_receipt)
+                        if replay is not None:
+                            return {
+                                "final_response": replay["assistantContent"],
+                                "messages": list(conversation_history or []),
+                                "api_calls": 0,
+                                "completed": True,
+                                "turn_receipt": replay,
+                                "replayed": True,
+                            }
                         return {
-                            "final_response": replay["assistantContent"],
+                            "final_response": "",
                             "messages": list(conversation_history or []),
                             "api_calls": 0,
-                            "completed": True,
-                            "turn_receipt": replay,
-                            "replayed": True,
+                            "completed": False,
+                            "in_progress": True,
+                            "turn_receipt": claimed_or_status,
                         }
-                    return {
-                        "final_response": "",
-                        "messages": list(conversation_history or []),
-                        "api_calls": 0,
-                        "completed": False,
-                        "in_progress": True,
-                        "turn_receipt": claimed_or_status,
-                    }
 
 
             relay_lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(
