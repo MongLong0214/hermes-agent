@@ -23,24 +23,59 @@ def test_main_enables_unstable_protocol(monkeypatch):
     assert calls["kwargs"]["use_unstable_protocol"] is True
 
 
-def test_main_skips_configured_mcp_discovery_when_requested(monkeypatch):
+def test_main_dark_mode_skips_dotenv_and_configured_mcp_but_runs_agent(monkeypatch):
+    dotenv_calls = []
     discovery_calls = []
+    agent_calls = []
 
     async def fake_run_agent(agent, **kwargs):
-        pass
+        agent_calls.append((agent, kwargs))
 
     monkeypatch.setattr(entry, "_setup_logging", lambda: None)
-    monkeypatch.setattr(entry, "_load_env", lambda: None)
-    monkeypatch.setenv("HERMES_ACP_SKIP_CONFIGURED_MCP", "1")
+    monkeypatch.setattr(entry, "_load_env", lambda: dotenv_calls.append(True))
     monkeypatch.setattr(
-        "tools.mcp_tool.discover_mcp_tools",
-        lambda: discovery_calls.append(True),
+        "hermes_cli.mcp_startup.start_background_mcp_discovery",
+        lambda **kwargs: discovery_calls.append(kwargs),
     )
+    monkeypatch.setenv("HERMES_ACP_SKIP_ENV_LOAD", "1")
+    monkeypatch.setenv("HERMES_ACP_SKIP_CONFIGURED_MCP", "1")
     monkeypatch.setattr(acp, "run_agent", fake_run_agent)
 
     entry.main([])
 
+    assert dotenv_calls == []
     assert discovery_calls == []
+    assert len(agent_calls) == 1
+
+
+@pytest.mark.parametrize(
+    "env_value",
+    [
+        pytest.param(None, id="missing"),
+        pytest.param("0", id="zero"),
+        pytest.param("true", id="nonliteral"),
+    ],
+)
+def test_main_loads_dotenv_unless_dark_value_is_exactly_1(monkeypatch, env_value):
+    dotenv_calls = []
+    agent_calls = []
+
+    async def fake_run_agent(agent, **kwargs):
+        agent_calls.append((agent, kwargs))
+
+    monkeypatch.setattr(entry, "_setup_logging", lambda: None)
+    monkeypatch.setattr(entry, "_load_env", lambda: dotenv_calls.append(True))
+    monkeypatch.setenv("HERMES_ACP_SKIP_CONFIGURED_MCP", "1")
+    if env_value is None:
+        monkeypatch.delenv("HERMES_ACP_SKIP_ENV_LOAD", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_ACP_SKIP_ENV_LOAD", env_value)
+    monkeypatch.setattr(acp, "run_agent", fake_run_agent)
+
+    entry.main([])
+
+    assert dotenv_calls == [True]
+    assert len(agent_calls) == 1
 
 
 

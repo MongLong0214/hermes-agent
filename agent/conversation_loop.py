@@ -106,15 +106,6 @@ class _ReceiptExecutionProfileError(RuntimeError):
     """Fail closed before a receipt reaches a mutable/unsupported call path."""
 
 
-def _receipt_runtime_is_supported(agent: Any, moa_config: Any = None) -> bool:
-    """Whether the live runtime remains inside the closed receipt profile."""
-    return (
-        getattr(agent, "api_mode", None) == "chat_completions"
-        and str(getattr(agent, "provider", "") or "").strip().lower() != "moa"
-        and moa_config is None
-    )
-
-
 def _receipt_admitted_text(turn_receipt: Any, user_message: Any) -> Any:
     """Capture the receipt's gateway-admitted scalar text before turn setup.
 
@@ -145,7 +136,11 @@ def _receipt_pre_call_invariant_error(
     row.  Check both that anchor and the provider-bound payload so any missing,
     duplicate, multipart, or changed projection fails before the SDK sees it.
     """
-    if not _receipt_runtime_is_supported(agent, moa_config):
+    if not _ra().is_turn_receipt_runtime_supported(
+        getattr(agent, "api_mode", None),
+        getattr(agent, "provider", None),
+        moa_config,
+    ):
         return "runtime_changed"
     if not isinstance(admitted_text, str):
         return "admitted_text_not_scalar"
@@ -2093,7 +2088,11 @@ def run_conversation(
     pending_moa_prepared_request = None
     receipt_profile_rejection = None
     if receipt_raw_text_only:
-        if not _receipt_runtime_is_supported(agent, moa_config):
+        if not _ra().is_turn_receipt_runtime_supported(
+            getattr(agent, "api_mode", None),
+            getattr(agent, "provider", None),
+            moa_config,
+        ):
             receipt_profile_rejection = "runtime_changed_before_loop"
         elif not isinstance(receipt_admitted_text, str):
             receipt_profile_rejection = "admitted_text_not_scalar"
@@ -2144,8 +2143,10 @@ def run_conversation(
             or agent._budget_grace_call
         )
     ):
-        if receipt_raw_text_only and not _receipt_runtime_is_supported(
-            agent, moa_config
+        if receipt_raw_text_only and not _ra().is_turn_receipt_runtime_supported(
+            getattr(agent, "api_mode", None),
+            getattr(agent, "provider", None),
+            moa_config,
         ):
             receipt_profile_rejection = "runtime_changed_before_call_setup"
             failed = True

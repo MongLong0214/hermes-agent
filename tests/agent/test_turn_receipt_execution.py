@@ -394,6 +394,67 @@ def test_receipt_closed_profile_rejects_unsupported_runtime_before_claim(
     assert TurnReceiptAdapter(db).status_for(request)["status"] == "PREPARED"
 
 
+def test_receipt_runtime_policy_authority_controls_prologue_and_loop(
+    receipt_agent, monkeypatch
+):
+    """Receipt gates resolve policy through one mutable public authority."""
+    import agent.conversation_loop as conversation_loop
+    import run_agent
+
+    agent, db, session_id = receipt_agent
+    assert run_agent.is_turn_receipt_runtime_supported(
+        "chat_completions", "openrouter"
+    )
+    assert not run_agent.is_turn_receipt_runtime_supported(
+        "codex_responses", "openrouter"
+    )
+    assert not run_agent.is_turn_receipt_runtime_supported(
+        "anthropic_messages", "openrouter"
+    )
+    assert not run_agent.is_turn_receipt_runtime_supported("chat_completions", "moa")
+
+    policy_calls: list[tuple[object, ...]] = []
+
+    def deny_receipt_runtime(*args):
+        policy_calls.append(args)
+        return False
+
+    monkeypatch.setattr(
+        run_agent, "is_turn_receipt_runtime_supported", deny_receipt_runtime
+    )
+    current_user = {"role": "user", "content": "question"}
+    assert conversation_loop._receipt_pre_call_invariant_error(
+        agent,
+        messages=[current_user],
+        current_turn_user_idx=0,
+        current_turn_user_row=current_user,
+        admitted_text="question",
+        expected_wire_index=0,
+        expected_wire_count=1,
+        api_kwargs={"messages": [current_user]},
+        moa_config=None,
+    ) == "runtime_changed"
+
+    request = _request(session_id, request_id="public-policy-prologue")
+    TurnReceiptAdapter(db).prepare_or_replay(request)
+    monkeypatch.setattr(
+        TurnReceiptAdapter,
+        "claim_after_lease",
+        lambda *_args, **_kwargs: pytest.fail("public policy allowed receipt claim"),
+    )
+
+    result = agent.run_conversation("question", turn_receipt=request)
+
+    assert result["failure_reason"] == "turn_receipt_runtime_unsupported"
+    receipt = TurnReceiptAdapter(db).status_for(request)
+    assert receipt is not None
+    assert receipt["status"] == "PREPARED"
+    assert policy_calls == [
+        ("chat_completions", "openrouter", None),
+        ("chat_completions", "openrouter", None),
+    ]
+
+
 def test_receipt_closed_profile_skips_title_and_preflight_compression(
     receipt_agent, monkeypatch
 ):

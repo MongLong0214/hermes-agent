@@ -3642,6 +3642,40 @@ class TurnReceiptConflictError(RuntimeError):
     """An existing receipt conflicts with the requested immutable binding."""
 
 
+class TargetBindReceiptFenceError(RuntimeError):
+    """A target bind receipt cannot be safely resolved from durable state."""
+
+
+class TargetBindReceiptConflictError(RuntimeError):
+    """An existing target bind identity conflicts with immutable evidence."""
+
+
+_TARGET_BIND_RECEIPT_META_PREFIX = "target_bind_receipt:"
+_TARGET_BIND_RECEIPT_SCHEMA = "hermes.target-bind-receipt"
+_TARGET_BIND_RECEIPT_DOMAIN = "hermes.target-bind"
+_TARGET_BIND_RECEIPT_VERSION = 1
+_TARGET_BIND_LINEAGE_ROOT_DIGEST_DOMAIN = b"hermes.target-bind:lineage-root\0"
+_ACP_TURN_RECEIPT_IDENTITY_SCHEMA = "hermes.acp-terminal-receipt-identity"
+_ACP_TURN_RECEIPT_IDENTITY_VERSION = 1
+_ACP_TURN_RECEIPT_ABORT_REASON = "HERMES_AGENT_RUN_EXCEPTION"
+_ACP_TURN_RECEIPT_ABORT_RECEIPT_ID_DOMAIN = "hermes.acp-terminal-abort-receipt-id"
+_ACP_TURN_RECEIPT_ABORT_EVIDENCE_DOMAIN = "hermes.acp-terminal-abort-evidence"
+_ACP_TURN_RECEIPT_IDENTITY_FIELDS = frozenset(
+    {
+        "schema",
+        "version",
+        "turnRequestId",
+        "targetActorId",
+        "promptDigest",
+        "bindingGeneration",
+        "targetBindingId",
+        "targetAttestationId",
+        "executorSessionId",
+        "executorSessionIncarnation",
+    }
+)
+
+
 @dataclass(frozen=True)
 class TerminalTurnReceipt:
     """The immutable outcome that must commit with one explicit batch row."""
@@ -8738,7 +8772,47 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """Project a receipt into its stable adapter-facing representation."""
         if row is None:
             return None
-        return {
+        if row["status"] == "ABORTED":
+            identity_json = row["receipt_identity_json"]
+            target_bind_json = row["target_bind_receipt_json"]
+            if not isinstance(identity_json, str) or not isinstance(target_bind_json, str):
+                raise TurnReceiptFenceError("aborted turn receipt evidence is malformed")
+            try:
+                identity = json.loads(identity_json)
+                target_bind = json.loads(target_bind_json)
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise TurnReceiptFenceError(
+                    "aborted turn receipt evidence is malformed"
+                ) from exc
+            if not isinstance(identity, dict) or not isinstance(target_bind, dict):
+                raise TurnReceiptFenceError("aborted turn receipt evidence is malformed")
+            receipt_id = row["abort_receipt_id"]
+            evidence_digest = row["abort_evidence_digest"]
+            reason_code = row["abort_reason_code"]
+            if not all(
+                isinstance(value, str) and value
+                for value in (
+                    row["receipt_identity_digest"],
+                    row["target_bind_receipt_digest"],
+                    receipt_id,
+                    evidence_digest,
+                    reason_code,
+                )
+            ):
+                raise TurnReceiptFenceError("aborted turn receipt evidence is malformed")
+            return {
+                "status": "ABORTED",
+                "turnRequestId": str(row["turn_request_id"]),
+                "sessionId": str(target_bind["requested_session_id"]),
+                "receiptIdentity": identity,
+                "receiptIdentityDigest": row["receipt_identity_digest"],
+                "targetBindReceipt": target_bind,
+                "targetBindReceiptDigest": row["target_bind_receipt_digest"],
+                "receiptId": receipt_id,
+                "evidenceDigest": evidence_digest,
+                "reasonCode": reason_code,
+            }
+        result = {
             "turnRequestId": str(row["turn_request_id"]),
             "sessionId": str(row["session_id"]),
             "status": str(row["status"]),
@@ -8756,6 +8830,31 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 else None
             ),
         }
+        identity_json = row["receipt_identity_json"]
+        target_bind_json = row["target_bind_receipt_json"]
+        if identity_json is not None or target_bind_json is not None:
+            if not isinstance(identity_json, str) or not isinstance(target_bind_json, str):
+                raise TurnReceiptFenceError("turn receipt admission evidence is malformed")
+            try:
+                identity = json.loads(identity_json)
+                target_bind = json.loads(target_bind_json)
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise TurnReceiptFenceError(
+                    "turn receipt admission evidence is malformed"
+                ) from exc
+            if not isinstance(identity, dict) or not isinstance(target_bind, dict):
+                raise TurnReceiptFenceError("turn receipt admission evidence is malformed")
+            result.update(
+                {
+                    "receiptIdentity": identity,
+                    "receiptIdentityDigest": row["receipt_identity_digest"],
+                    "targetBindReceipt": target_bind,
+                    "targetBindReceiptDigest": row["target_bind_receipt_digest"],
+                }
+            )
+        if "terminal_response" in row.keys() and row["terminal_response"] is not None:
+            result["responseText"] = row["terminal_response"]
+        return result
 
     def migrate_turn_receipts(self) -> int:
         """Migrate receipt schema without adopting legacy unbound rows.
@@ -8784,12 +8883,364 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 conn.execute(
                     "ALTER TABLE turn_receipts ADD COLUMN binding_digest TEXT"
                 )
+            for column in (
+                "receipt_identity_json",
+                "receipt_identity_digest",
+                "target_bind_receipt_json",
+                "target_bind_receipt_digest",
+                "abort_receipt_id",
+                "abort_evidence_digest",
+                "abort_reason_code",
+            ):
+                if column not in columns:
+                    conn.execute(f"ALTER TABLE turn_receipts ADD COLUMN {column} TEXT")
+            if "aborted_at" not in columns:
+                conn.execute("ALTER TABLE turn_receipts ADD COLUMN aborted_at REAL")
             return conn.execute(
                 "UPDATE turn_receipts SET status = 'PREPARED' "
                 "WHERE status IS NULL OR TRIM(status) = ''"
             ).rowcount
 
         return int(self._execute_write(_do, _count_write=False) or 0)
+
+    @staticmethod
+    def _require_target_bind_identifier(value: Any, name: str) -> str:
+        """Accept only a canonical opaque identifier for a bind receipt."""
+        if (
+            not isinstance(value, str)
+            or not value
+            or value != value.strip()
+            or len(value) > 512
+            or any(ord(char) < 32 or ord(char) == 127 for char in value)
+        ):
+            raise ValueError(f"{name} must be a non-empty opaque identifier")
+        return value
+
+    @staticmethod
+    def _target_bind_receipt_root(conn, session_id: str) -> str:
+        """Resolve one exact durable lineage root or fence malformed ancestry."""
+        current = session_id
+        seen = set()
+        for _ in range(100):
+            if current in seen:
+                raise TargetBindReceiptFenceError("target bind lineage is cyclic")
+            seen.add(current)
+            row = conn.execute(
+                "SELECT id, parent_session_id FROM sessions WHERE id = ?", (current,)
+            ).fetchone()
+            if row is None:
+                raise TargetBindReceiptFenceError("target bind session is unavailable")
+            parent_id = row["parent_session_id"]
+            if parent_id is None:
+                return str(row["id"])
+            if not isinstance(parent_id, str) or not parent_id:
+                raise TargetBindReceiptFenceError("target bind lineage is invalid")
+            current = parent_id
+        raise TargetBindReceiptFenceError("target bind lineage is ambiguous")
+
+    @staticmethod
+    def _target_bind_canonical_digest(payload: Dict[str, Any]) -> str:
+        """Return the canonical SHA-256 commitment for a public receipt payload."""
+        payload_bytes = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return "sha256:" + hashlib.sha256(payload_bytes).hexdigest()
+
+    @staticmethod
+    def _target_bind_lineage_root_digest(lineage_root_id: str) -> str:
+        """Commit to resolved root bytes without disclosing the private root."""
+        root_bytes = lineage_root_id.encode("utf-8")
+        return "sha256:" + hashlib.sha256(
+            _TARGET_BIND_LINEAGE_ROOT_DIGEST_DOMAIN + root_bytes
+        ).hexdigest()
+
+    @staticmethod
+    def _target_bind_receipt_record(
+        *,
+        session_id: str,
+        lineage_root_id: str,
+        actor_id: str,
+        binding_generation: int,
+        executor_runtime_identity: str,
+    ) -> tuple[str, Dict[str, Any]]:
+        """Build the stable identity key and immutable receipt evidence."""
+        binding_identity = {
+            "domain": _TARGET_BIND_RECEIPT_DOMAIN,
+            "version": _TARGET_BIND_RECEIPT_VERSION,
+            "actor_id": actor_id,
+            "binding_generation": binding_generation,
+            "executor_runtime_identity": executor_runtime_identity,
+        }
+        identity_bytes = json.dumps(
+            binding_identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        identity_digest = "sha256:" + hashlib.sha256(identity_bytes).hexdigest()
+        public_receipt = {
+            "domain": _TARGET_BIND_RECEIPT_DOMAIN,
+            "version": _TARGET_BIND_RECEIPT_VERSION,
+            "actor_id": actor_id,
+            "binding_generation": binding_generation,
+            "executor_runtime_identity": executor_runtime_identity,
+            "requested_session_id": session_id,
+            "lineage_root_digest": SessionDB._target_bind_lineage_root_digest(
+                lineage_root_id
+            ),
+        }
+        record = {
+            "schema": _TARGET_BIND_RECEIPT_SCHEMA,
+            **public_receipt,
+            "lineage_root_id": lineage_root_id,
+            "binding_identity": identity_digest,
+        }
+        record["receipt_digest"] = SessionDB._target_bind_canonical_digest(public_receipt)
+        return _TARGET_BIND_RECEIPT_META_PREFIX + identity_digest.removeprefix("sha256:"), record
+
+    def prepare_target_bind_receipt(
+        self,
+        session_id: str,
+        actor_id: str,
+        binding_generation: int,
+        executor_runtime_identity: str,
+        *,
+        expected_lineage_root_digest: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Persist or replay one immutable target-authenticated bind receipt.
+
+        ``expected_lineage_root_digest`` is an optional preflight fence for
+        local callers.  Existing trusted callers omit it and retain their
+        server-resolved lineage behavior.
+        """
+        session_id = self._require_target_bind_identifier(session_id, "session_id")
+        actor_id = self._require_target_bind_identifier(actor_id, "actor_id")
+        executor_runtime_identity = self._require_target_bind_identifier(
+            executor_runtime_identity, "executor_runtime_identity"
+        )
+        if (
+            not isinstance(binding_generation, int)
+            or isinstance(binding_generation, bool)
+            or binding_generation < 0
+        ):
+            raise ValueError("binding_generation must be a nonnegative integer")
+        if expected_lineage_root_digest is not None and (
+            not isinstance(expected_lineage_root_digest, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", expected_lineage_root_digest)
+            is None
+        ):
+            raise ValueError("expected_lineage_root_digest must be canonical")
+
+        def _do(conn):
+            lineage_root_id = self._target_bind_receipt_root(conn, session_id)
+            lineage_root_digest = self._target_bind_lineage_root_digest(
+                lineage_root_id
+            )
+            if (
+                expected_lineage_root_digest is not None
+                and expected_lineage_root_digest != lineage_root_digest
+            ):
+                raise TargetBindReceiptFenceError(
+                    "expected target bind lineage root does not match"
+                )
+            key, expected = self._target_bind_receipt_record(
+                session_id=session_id,
+                lineage_root_id=lineage_root_id,
+                actor_id=actor_id,
+                binding_generation=binding_generation,
+                executor_runtime_identity=executor_runtime_identity,
+            )
+            row = conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?", (key,)
+            ).fetchone()
+            if row is not None:
+                try:
+                    stored = json.loads(row["value"])
+                except (TypeError, json.JSONDecodeError) as exc:
+                    raise TargetBindReceiptFenceError(
+                        "target bind receipt is malformed"
+                    ) from exc
+                if not isinstance(stored, dict):
+                    raise TargetBindReceiptFenceError("target bind receipt is malformed")
+                if stored != expected:
+                    raise TargetBindReceiptConflictError(
+                        "target bind identity is already bound to different evidence"
+                    )
+                return stored
+            conn.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, ?)",
+                (
+                    key,
+                    json.dumps(
+                        expected,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                ),
+            )
+            return expected
+
+        return self._execute_write(_do)
+
+    @staticmethod
+    def _canonical_acp_turn_receipt_identity(
+        value: Any, *, turn_request_id: str
+    ) -> tuple[Dict[str, Any], str]:
+        """Validate the complete, closed ACP v1 identity denominator."""
+        if not isinstance(value, dict) or set(value) != _ACP_TURN_RECEIPT_IDENTITY_FIELDS:
+            raise ValueError("receipt_identity must be the closed ACP v1 identity")
+        if (
+            value.get("schema") != _ACP_TURN_RECEIPT_IDENTITY_SCHEMA
+            or value.get("version") != _ACP_TURN_RECEIPT_IDENTITY_VERSION
+            or value.get("turnRequestId") != turn_request_id
+        ):
+            raise ValueError("receipt_identity is not the current ACP v1 identity")
+        normalized = {
+            "schema": _ACP_TURN_RECEIPT_IDENTITY_SCHEMA,
+            "version": _ACP_TURN_RECEIPT_IDENTITY_VERSION,
+            "turnRequestId": SessionDB._require_target_bind_identifier(
+                value["turnRequestId"], "turnRequestId"
+            ),
+            "targetActorId": SessionDB._require_target_bind_identifier(
+                value["targetActorId"], "targetActorId"
+            ),
+            "promptDigest": value["promptDigest"],
+            "bindingGeneration": value["bindingGeneration"],
+            "targetBindingId": SessionDB._require_target_bind_identifier(
+                value["targetBindingId"], "targetBindingId"
+            ),
+            "targetAttestationId": SessionDB._require_target_bind_identifier(
+                value["targetAttestationId"], "targetAttestationId"
+            ),
+            "executorSessionId": SessionDB._require_target_bind_identifier(
+                value["executorSessionId"], "executorSessionId"
+            ),
+            "executorSessionIncarnation": SessionDB._require_target_bind_identifier(
+                value["executorSessionIncarnation"], "executorSessionIncarnation"
+            ),
+        }
+        if re.fullmatch(r"sha256:[0-9a-f]{64}", normalized["promptDigest"]) is None:
+            raise ValueError("receipt_identity promptDigest must be canonical")
+        generation = normalized["bindingGeneration"]
+        if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
+            raise ValueError("receipt_identity bindingGeneration must be nonnegative")
+        payload = json.dumps(
+            normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return normalized, "sha256:" + hashlib.sha256(payload).hexdigest()
+
+    @staticmethod
+    def _target_bind_public_receipt(record: Dict[str, Any]) -> Dict[str, Any]:
+        """Return only caller-safe, durable target-bind authorization evidence."""
+        fields = (
+            "schema",
+            "domain",
+            "version",
+            "actor_id",
+            "binding_generation",
+            "executor_runtime_identity",
+            "requested_session_id",
+            "lineage_root_digest",
+            "receipt_digest",
+        )
+        return {field: record[field] for field in fields}
+
+    def _validate_target_bind_receipt_on_conn(
+        self, conn, session_id: str, value: Any
+    ) -> Dict[str, Any]:
+        """Resolve caller evidence against exact current local durable state."""
+        expected_fields = {
+            "schema", "domain", "version", "actor_id", "binding_generation",
+            "executor_runtime_identity", "requested_session_id", "lineage_root_digest",
+            "receipt_digest",
+        }
+        if not isinstance(value, dict) or set(value) != expected_fields:
+            raise TargetBindReceiptFenceError("target bind receipt is not closed")
+        if (
+            value.get("schema") != _TARGET_BIND_RECEIPT_SCHEMA
+            or value.get("domain") != _TARGET_BIND_RECEIPT_DOMAIN
+            or value.get("version") != _TARGET_BIND_RECEIPT_VERSION
+            or value.get("requested_session_id") != session_id
+        ):
+            raise TargetBindReceiptFenceError("target bind receipt is not current")
+        actor_id = self._require_target_bind_identifier(value.get("actor_id"), "actor_id")
+        runtime_identity = self._require_target_bind_identifier(
+            value.get("executor_runtime_identity"), "executor_runtime_identity"
+        )
+        generation = value.get("binding_generation")
+        if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
+            raise TargetBindReceiptFenceError("target bind receipt generation is invalid")
+        lineage_root = self._target_bind_receipt_root(conn, session_id)
+        key, expected = self._target_bind_receipt_record(
+            session_id=session_id,
+            lineage_root_id=lineage_root,
+            actor_id=actor_id,
+            binding_generation=generation,
+            executor_runtime_identity=runtime_identity,
+        )
+        row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
+        if row is None:
+            raise TargetBindReceiptFenceError("target bind receipt is unavailable")
+        try:
+            stored = json.loads(row["value"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise TargetBindReceiptFenceError("target bind receipt is malformed") from exc
+        if stored != expected:
+            raise TargetBindReceiptFenceError("target bind receipt is stale")
+        public = self._target_bind_public_receipt(expected)
+        if value != public:
+            raise TargetBindReceiptFenceError("target bind receipt does not match durable state")
+        return public
+
+    def validate_target_bind_receipt(
+        self, session_id: str, target_bind_receipt: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Return exact current target-bind evidence or fail closed."""
+        session_id = self._require_target_bind_identifier(session_id, "session_id")
+        with self._read_ctx() as conn:
+            return self._validate_target_bind_receipt_on_conn(
+                conn, session_id, target_bind_receipt
+            )
+
+    def validate_acp_turn_receipt_request(
+        self,
+        session_id: str,
+        receipt_identity: Dict[str, Any],
+        target_bind_receipt: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Return closed ACP admission evidence without inserting or updating.
+
+        ACP-local identifiers remain opaque to Hermes: their normalized bytes
+        are committed in the identity digest, while Hermes resolves only its
+        target-bind actor, generation, runtime, and lineage-root evidence.
+        """
+        session_id = self._require_target_bind_identifier(session_id, "session_id")
+        turn_request_id = (
+            receipt_identity.get("turnRequestId")
+            if isinstance(receipt_identity, dict)
+            and isinstance(receipt_identity.get("turnRequestId"), str)
+            else ""
+        )
+        normalized_identity, identity_digest = self._canonical_acp_turn_receipt_identity(
+            receipt_identity, turn_request_id=turn_request_id
+        )
+        with self._read_ctx() as conn:
+            normalized_target_bind = self._validate_target_bind_receipt_on_conn(
+                conn, session_id, target_bind_receipt
+            )
+        if (
+            normalized_identity["targetActorId"]
+            != normalized_target_bind["actor_id"]
+            or normalized_identity["bindingGeneration"]
+            != normalized_target_bind["binding_generation"]
+        ):
+            raise TargetBindReceiptFenceError(
+                "receipt identity is not authorized by target bind receipt"
+            )
+        return {
+            "receiptIdentity": normalized_identity,
+            "receiptIdentityDigest": identity_digest,
+            "targetBindReceipt": normalized_target_bind,
+            "targetBindReceiptDigest": normalized_target_bind["receipt_digest"],
+        }
 
     @staticmethod
     def _require_turn_receipt_binding_digest(binding_digest: str) -> None:
@@ -8817,30 +9268,119 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
         return row
 
-    def prepare_turn_receipt(
-        self, session_id: str, turn_request_id: str, binding_digest: str
+    def prepare_acp_turn_receipt(
+        self,
+        session_id: str,
+        receipt_identity: Dict[str, Any],
+        target_bind_receipt: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """Create or return the durable PREPARED receipt for one request."""
+        """Prepare one receipt using its closed ACP identity as the binding."""
+        admission = self.validate_acp_turn_receipt_request(
+            session_id, receipt_identity, target_bind_receipt
+        )
+        return self.prepare_turn_receipt(
+            session_id,
+            admission["receiptIdentity"]["turnRequestId"],
+            admission["receiptIdentityDigest"],
+            receipt_identity=admission["receiptIdentity"],
+            target_bind_receipt=admission["targetBindReceipt"],
+        )
+
+    def prepare_turn_receipt(
+        self,
+        session_id: str,
+        turn_request_id: str,
+        binding_digest: str,
+        *,
+        receipt_identity: Optional[Dict[str, Any]] = None,
+        target_bind_receipt: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Create or replay one receipt with optional closed ACP admission evidence."""
         if not session_id or not turn_request_id:
             raise ValueError("session_id and turn_request_id are required")
         self._require_turn_receipt_binding_digest(binding_digest)
+        if (receipt_identity is None) != (target_bind_receipt is None):
+            raise ValueError("receipt identity and target bind receipt are coupled")
         now = time.time()
 
         def _do(conn):
+            normalized_identity = None
+            identity_digest = None
+            normalized_target_bind = None
+            target_bind_digest = None
+            if receipt_identity is not None:
+                normalized_identity, identity_digest = self._canonical_acp_turn_receipt_identity(
+                    receipt_identity, turn_request_id=turn_request_id
+                )
+                normalized_target_bind = self._validate_target_bind_receipt_on_conn(
+                    conn, session_id, target_bind_receipt
+                )
+                if (
+                    normalized_identity["targetActorId"]
+                    != normalized_target_bind["actor_id"]
+                    or normalized_identity["bindingGeneration"]
+                    != normalized_target_bind["binding_generation"]
+                ):
+                    raise TargetBindReceiptFenceError(
+                        "receipt identity is not authorized by target bind receipt"
+                    )
+                if binding_digest != identity_digest:
+                    raise TurnReceiptFenceError(
+                        "ACP receipt identity digest does not match binding digest"
+                    )
+                target_bind_digest = normalized_target_bind["receipt_digest"]
             row = conn.execute(
                 "SELECT * FROM turn_receipts WHERE turn_request_id = ?",
                 (turn_request_id,),
             ).fetchone()
             if row is not None:
-                return self._turn_receipt_public(
-                    self._bound_turn_receipt_row(row, session_id, binding_digest)
+                row = self._bound_turn_receipt_row(row, session_id, binding_digest)
+                if row is None:  # pragma: no cover - guarded by the selected row
+                    raise TurnReceiptFenceError("turn receipt disappeared during prepare")
+                if normalized_identity is not None:
+                    if (
+                        row["receipt_identity_digest"] != identity_digest
+                        or row["target_bind_receipt_digest"] != target_bind_digest
+                    ):
+                        raise TurnReceiptConflictError(
+                            "turn request id is already bound to another ACP identity"
+                        )
+                return self._turn_receipt_public(row)
+            if normalized_identity is None:
+                conn.execute(
+                    "INSERT INTO turn_receipts "
+                    "(turn_request_id, session_id, binding_digest, status, created_at) "
+                    "VALUES (?, ?, ?, 'PREPARED', ?)",
+                    (turn_request_id, session_id, binding_digest, now),
                 )
-            conn.execute(
-                "INSERT INTO turn_receipts "
-                "(turn_request_id, session_id, binding_digest, status, created_at) "
-                "VALUES (?, ?, ?, 'PREPARED', ?)",
-                (turn_request_id, session_id, binding_digest, now),
-            )
+            else:
+                conn.execute(
+                    "INSERT INTO turn_receipts "
+                    "(turn_request_id, session_id, binding_digest, receipt_identity_json, "
+                    "receipt_identity_digest, target_bind_receipt_json, "
+                    "target_bind_receipt_digest, status, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'PREPARED', ?)",
+                    (
+                        turn_request_id,
+                        session_id,
+                        binding_digest,
+                        json.dumps(
+                            normalized_identity,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        identity_digest,
+                        json.dumps(
+                            normalized_target_bind,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        target_bind_digest,
+                        now,
+                    ),
+                )
             row = conn.execute(
                 "SELECT * FROM turn_receipts WHERE turn_request_id = ?",
                 (turn_request_id,),
@@ -8867,6 +9407,37 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return self._turn_receipt_public(
             self._bound_turn_receipt_row(row, session_id, binding_digest)
         )
+
+    def get_acp_turn_receipt(
+        self,
+        session_id: str,
+        receipt_identity: Dict[str, Any],
+        target_bind_receipt: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Read one ACP receipt after revalidating its durable admission proof."""
+        admission = self.validate_acp_turn_receipt_request(
+            session_id, receipt_identity, target_bind_receipt
+        )
+        normalized_identity = admission["receiptIdentity"]
+        identity_digest = admission["receiptIdentityDigest"]
+        normalized_target_bind = admission["targetBindReceipt"]
+        try:
+            receipt = self.get_turn_receipt(
+                session_id, normalized_identity["turnRequestId"], identity_digest
+            )
+        except TurnReceiptConflictError:
+            return None
+        if receipt is None:
+            return None
+        if (
+            receipt.get("receiptIdentityDigest") != identity_digest
+            or receipt.get("targetBindReceiptDigest")
+            != normalized_target_bind["receipt_digest"]
+        ):
+            raise TurnReceiptConflictError(
+                "turn request id is already bound to another ACP identity"
+            )
+        return receipt
 
     def claim_turn_receipt(
         self,
@@ -8908,6 +9479,153 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return changed == 1
 
         return bool(self._execute_write(_do))
+
+    @staticmethod
+    def _canonical_acp_abort_digest(payload: Dict[str, Any]) -> str:
+        """Hash one canonical UTF-8 abort evidence payload."""
+        encoded = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+    @classmethod
+    def _acp_abort_evidence_digests(
+        cls,
+        *,
+        receipt_identity_digest: str,
+        target_bind_receipt_digest: str,
+        claim_token: str,
+        reason_code: str,
+    ) -> tuple[str, str]:
+        """Derive the closed ABORTED receipt and evidence commitments."""
+        receipt_id = cls._canonical_acp_abort_digest(
+            {
+                "domain": _ACP_TURN_RECEIPT_ABORT_RECEIPT_ID_DOMAIN,
+                "version": 1,
+                "receiptIdentityDigest": receipt_identity_digest,
+                "targetBindReceiptDigest": target_bind_receipt_digest,
+                "claimToken": claim_token,
+            }
+        )
+        evidence_digest = cls._canonical_acp_abort_digest(
+            {
+                "domain": _ACP_TURN_RECEIPT_ABORT_EVIDENCE_DOMAIN,
+                "version": 1,
+                "receiptId": receipt_id,
+                "receiptIdentityDigest": receipt_identity_digest,
+                "targetBindReceiptDigest": target_bind_receipt_digest,
+                "reasonCode": reason_code,
+                "claimToken": claim_token,
+            }
+        )
+        return receipt_id, evidence_digest
+
+    def abort_acp_turn_receipt(
+        self,
+        session_id: str,
+        receipt_identity: Dict[str, Any],
+        target_bind_receipt: Dict[str, Any],
+        claim_token: str,
+        reason_code: str,
+    ) -> Dict[str, Any]:
+        """Atomically terminalize one matching claimed ACP receipt as ABORTED."""
+        session_id = self._require_target_bind_identifier(session_id, "session_id")
+        if not isinstance(claim_token, str) or not claim_token:
+            raise ValueError("claim_token is required")
+        if reason_code != _ACP_TURN_RECEIPT_ABORT_REASON:
+            raise ValueError("abort reason code is not allowed")
+        turn_request_id = ""
+        if isinstance(receipt_identity, dict):
+            candidate_turn_request_id = receipt_identity.get("turnRequestId")
+            if isinstance(candidate_turn_request_id, str):
+                turn_request_id = candidate_turn_request_id
+
+        def _do(conn):
+            identity, identity_digest = self._canonical_acp_turn_receipt_identity(
+                receipt_identity, turn_request_id=turn_request_id
+            )
+            target_bind = self._validate_target_bind_receipt_on_conn(
+                conn, session_id, target_bind_receipt
+            )
+            if (
+                identity["targetActorId"] != target_bind["actor_id"]
+                or identity["bindingGeneration"] != target_bind["binding_generation"]
+            ):
+                raise TargetBindReceiptFenceError(
+                    "receipt identity is not authorized by target bind receipt"
+                )
+            target_bind_digest = target_bind["receipt_digest"]
+            row = conn.execute(
+                "SELECT * FROM turn_receipts WHERE turn_request_id = ?",
+                (identity["turnRequestId"],),
+            ).fetchone()
+            row = self._bound_turn_receipt_row(row, session_id, identity_digest)
+            if row is None:
+                raise TurnReceiptFenceError("ACP terminal receipt was not prepared")
+            if (
+                row["receipt_identity_digest"] != identity_digest
+                or row["target_bind_receipt_digest"] != target_bind_digest
+            ):
+                raise TurnReceiptConflictError(
+                    "turn request id is already bound to another ACP identity"
+                )
+            if row["claim_token"] != claim_token:
+                raise TurnReceiptFenceError("ACP terminal receipt claim token was refused")
+            if row["status"] == "COMPLETED":
+                return self._turn_receipt_public(row)
+            receipt_id, evidence_digest = self._acp_abort_evidence_digests(
+                receipt_identity_digest=identity_digest,
+                target_bind_receipt_digest=target_bind_digest,
+                claim_token=claim_token,
+                reason_code=reason_code,
+            )
+            if row["status"] == "ABORTED":
+                if (
+                    row["abort_receipt_id"] != receipt_id
+                    or row["abort_evidence_digest"] != evidence_digest
+                    or row["abort_reason_code"] != reason_code
+                    or row["aborted_at"] is None
+                ):
+                    raise TurnReceiptConflictError(
+                        "aborted turn receipt has different terminal evidence"
+                    )
+                return self._turn_receipt_public(row)
+            if row["status"] != "CLAIMED":
+                raise TurnReceiptFenceError("ACP terminal receipt was not claimed")
+            changed = conn.execute(
+                "UPDATE turn_receipts SET status = 'ABORTED', abort_receipt_id = ?, "
+                "abort_evidence_digest = ?, abort_reason_code = ?, aborted_at = ? "
+                "WHERE session_id = ? AND turn_request_id = ? AND status = 'CLAIMED' "
+                "AND binding_digest = ? AND receipt_identity_digest = ? "
+                "AND target_bind_receipt_digest = ? AND claim_token = ?",
+                (
+                    receipt_id,
+                    evidence_digest,
+                    reason_code,
+                    time.time(),
+                    session_id,
+                    identity["turnRequestId"],
+                    identity_digest,
+                    identity_digest,
+                    target_bind_digest,
+                    claim_token,
+                ),
+            ).rowcount
+            if changed != 1:
+                raise TurnReceiptFenceError("ACP terminal receipt abort was refused")
+            row = conn.execute(
+                "SELECT * FROM turn_receipts WHERE turn_request_id = ?",
+                (identity["turnRequestId"],),
+            ).fetchone()
+            aborted = self._turn_receipt_public(row)
+            if aborted is None:  # pragma: no cover - primary-key update preserves the row
+                raise sqlite3.DatabaseError("ACP_TURN_RECEIPT_ABORT_MISSING")
+            return aborted
+
+        result = self._execute_write(_do)
+        if not isinstance(result, dict):  # pragma: no cover - durable receipt always projects
+            raise sqlite3.DatabaseError("ACP_TURN_RECEIPT_ABORT_MISSING")
+        return result
 
     @staticmethod
     def _preflight_terminal_turn_receipt(
