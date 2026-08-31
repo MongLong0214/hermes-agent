@@ -103,6 +103,17 @@ def _session_source_for_agent(platform: Optional[str]) -> str:
     return platform or "cli"
 
 
+def is_turn_receipt_runtime_supported(
+    api_mode: object, provider: object, moa_config: object = None
+) -> bool:
+    """Whether a runtime can atomically finalize a durable turn receipt."""
+    return (
+        api_mode == "chat_completions"
+        and str(provider or "").strip().lower() != "moa"
+        and moa_config is None
+    )
+
+
 # OpenAI lazy proxy + safe stdio + proxy URL helpers — see agent/process_bootstrap.py.
 # `OpenAI` is re-exported here so `patch("run_agent.OpenAI", ...)` in tests works.
 # The other `# noqa: F401` re-exports below cover names accessed via
@@ -8886,11 +8897,10 @@ class AIAgent:
             # ahead of relay/task/model setup and, critically, ahead of the
             # claim so an unsupported runtime cannot leave a durable receipt
             # in CLAIMED without a compatible atomic finalizer.
-            if turn_receipt is not None and (
-                getattr(self, "api_mode", None) != "chat_completions"
-                or str(getattr(self, "provider", "") or "").strip().lower()
-                == "moa"
-                or moa_config is not None
+            if turn_receipt is not None and not is_turn_receipt_runtime_supported(
+                getattr(self, "api_mode", None),
+                getattr(self, "provider", None),
+                moa_config,
             ):
                 return {
                     "final_response": "",
@@ -8908,29 +8918,32 @@ class AIAgent:
             if turn_receipt is not None:
                 from tui_gateway.turn_receipts import ClaimedReceipt, TurnReceiptAdapter
 
-                adapter = TurnReceiptAdapter(getattr(self, "_session_db", None))
-                claimed_or_status = adapter.claim_after_lease(turn_receipt)
-                if isinstance(claimed_or_status, ClaimedReceipt):
-                    claimed_turn_receipt = claimed_or_status
+                if isinstance(turn_receipt, ClaimedReceipt):
+                    claimed_turn_receipt = turn_receipt
                 else:
-                    replay = adapter.completed_replay(turn_receipt)
-                    if replay is not None:
+                    adapter = TurnReceiptAdapter(getattr(self, "_session_db", None))
+                    claimed_or_status = adapter.claim_after_lease(turn_receipt)
+                    if isinstance(claimed_or_status, ClaimedReceipt):
+                        claimed_turn_receipt = claimed_or_status
+                    else:
+                        replay = adapter.completed_replay(turn_receipt)
+                        if replay is not None:
+                            return {
+                                "final_response": replay["assistantContent"],
+                                "messages": list(conversation_history or []),
+                                "api_calls": 0,
+                                "completed": True,
+                                "turn_receipt": replay,
+                                "replayed": True,
+                            }
                         return {
-                            "final_response": replay["assistantContent"],
+                            "final_response": "",
                             "messages": list(conversation_history or []),
                             "api_calls": 0,
-                            "completed": True,
-                            "turn_receipt": replay,
-                            "replayed": True,
+                            "completed": False,
+                            "in_progress": True,
+                            "turn_receipt": claimed_or_status,
                         }
-                    return {
-                        "final_response": "",
-                        "messages": list(conversation_history or []),
-                        "api_calls": 0,
-                        "completed": False,
-                        "in_progress": True,
-                        "turn_receipt": claimed_or_status,
-                    }
 
 
             relay_lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(

@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+import sqlite3
 from types import SimpleNamespace
 from unittest.mock import MagicMock, AsyncMock, patch
 
@@ -51,7 +52,13 @@ from tui_gateway.turn_receipts import ClaimedReceipt, ReceiptRequest, TurnReceip
 @pytest.fixture()
 def mock_manager():
     """SessionManager with a mock agent factory."""
-    return SessionManager(agent_factory=lambda: MagicMock(name="MockAIAgent"))
+    def agent_factory():
+        result = MagicMock(name="MockAIAgent")
+        result.api_mode = "chat_completions"
+        result.provider = "openrouter"
+        return result
+
+    return SessionManager(agent_factory=agent_factory)
 
 
 @pytest.fixture()
@@ -472,7 +479,23 @@ class TestAcpTerminalReceipt:
                 "executorSessionId": "executor-session",
                 "executorSessionIncarnation": "executor-incarnation",
             },
-            "targetBindReceipt": {"requested_session_id": session_id},
+            "targetBindReceipt": {
+                "domain": "hermes.target-bind",
+                "version": 1,
+                "actor_id": "target-actor",
+                "binding_generation": 1,
+                "executor_runtime_identity": "executor-runtime",
+                "requested_session_id": session_id,
+                "lineage_root_digest": "sha256:" + "d" * 64,
+                "receipt_digest": "sha256:" + "c" * 64,
+            }
+        }
+
+    @staticmethod
+    def _internal_target_bind_receipt(metadata: dict) -> dict:
+        return {
+            "schema": "hermes.target-bind-receipt",
+            **metadata["targetBindReceipt"],
         }
 
     @staticmethod
@@ -484,12 +507,12 @@ class TestAcpTerminalReceipt:
             "receiptIdentityDigest": "sha256:" + "a" * 64,
         }
 
-    @staticmethod
-    def _admission(metadata: dict) -> dict:
+    @classmethod
+    def _admission(cls, metadata: dict) -> dict:
         return {
             "receiptIdentity": metadata["receiptIdentity"],
             "receiptIdentityDigest": "sha256:" + "a" * 64,
-            "targetBindReceipt": metadata["targetBindReceipt"],
+            "targetBindReceipt": cls._internal_target_bind_receipt(metadata),
             "targetBindReceiptDigest": "sha256:" + "c" * 64,
         }
 
@@ -502,16 +525,402 @@ class TestAcpTerminalReceipt:
         metadata["targetBindReceipt"] = {
             key: record[key]
             for key in (
-                "schema", "domain", "version", "actor_id", "binding_generation",
+                "domain", "version", "actor_id", "binding_generation",
                 "executor_runtime_identity", "requested_session_id", "lineage_root_digest",
                 "receipt_digest",
             )
+        }
+        assert set(metadata["targetBindReceipt"]) == {
+            "domain", "version", "actor_id", "binding_generation",
+            "executor_runtime_identity", "requested_session_id", "lineage_root_digest",
+            "receipt_digest",
         }
         return metadata
 
     @staticmethod
     def _terminal_meta(response: PromptResponse) -> dict:
         return response.field_meta["hermes"]["acpTerminalReceipt"]
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("operation", ([], {}), ids=("list", "dict"))
+    async def test_terminal_receipt_non_string_operation_refuses_before_non_acp_restore(
+        self, tmp_path, operation
+    ):
+        """Malformed operations must not restore a non-ACP target or mutate receipts."""
+        db = SessionDB(tmp_path / "malformed-operation-cache-miss.db")
+        session_id = "canonical-gateway-malformed-operation"
+        raw_text = "malformed operation must fail closed"
+        agent_builds: list[None] = []
+
+        def fail_if_built():
+            agent_builds.append(None)
+            raise AssertionError("malformed terminal operation constructed an agent")
+
+        try:
+            db.create_session(session_id, source="gateway", model="canonical-model")
+            metadata = self._durable_metadata(db, session_id, raw_text)
+            metadata["operation"] = operation
+            with (
+                patch.object(
+                    db,
+                    "prepare_acp_turn_receipt",
+                    wraps=db.prepare_acp_turn_receipt,
+                ) as prepare_receipt,
+                patch.object(
+                    db,
+                    "claim_turn_receipt",
+                    wraps=db.claim_turn_receipt,
+                ) as claim_receipt,
+            ):
+                response = await HermesACPAgent(
+                    session_manager=SessionManager(agent_factory=fail_if_built, db=db)
+                ).prompt(
+                    prompt=[TextContentBlock(type="text", text=raw_text)],
+                    session_id=session_id,
+                    hermes={"acpTerminalReceipt": metadata},
+                )
+
+            assert response.stop_reason == "refusal"
+            assert self._terminal_meta(response)["status"] == "REFUSED"
+            assert agent_builds == []
+            prepare_receipt.assert_not_called()
+            claim_receipt.assert_not_called()
+            assert db.get_acp_turn_receipt(
+                session_id,
+                metadata["receiptIdentity"],
+                self._internal_target_bind_receipt(metadata),
+            ) is None
+        finally:
+            db.close()
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("operation", ([], {}), ids=("list", "dict"))
+    async def test_terminal_receipt_non_string_operation_refuses_cached_session_without_receipt_side_effects(
+        self, agent, mock_manager, operation
+    ):
+        """Malformed operations must not prepare, claim, or run a cached session."""
+        state = mock_manager.create_session(cwd="/tmp")
+        raw_text = "cached malformed operation must fail closed"
+        metadata = self._receipt_metadata(state.session_id, raw_text)
+        metadata["operation"] = operation
+        db = MagicMock()
+        state.agent._session_db = db
+        state.agent.run_conversation = MagicMock()
+
+        with patch("acp_adapter.server.TurnReceiptAdapter") as receipt_adapter:
+            response = await agent.prompt(
+                prompt=[TextContentBlock(type="text", text=raw_text)],
+                session_id=state.session_id,
+                hermes={"acpTerminalReceipt": metadata},
+            )
+
+        assert response.stop_reason == "refusal"
+        assert self._terminal_meta(response)["status"] == "REFUSED"
+        db.validate_acp_turn_receipt_request.assert_not_called()
+        db.prepare_acp_turn_receipt.assert_not_called()
+        db.claim_turn_receipt.assert_not_called()
+        receipt_adapter.assert_not_called()
+        state.agent.run_conversation.assert_not_called()
+        assert state.history == []
+        assert state.is_running is False
+
+    @pytest.mark.anyio
+    async def test_terminal_receipt_prompt_restores_exact_persisted_non_acp_session(
+        self, tmp_path
+    ):
+        """A validated receipt may attach only to its durable canonical target."""
+        db = SessionDB(tmp_path / "canonical.db")
+        session_id = "canonical-telegram-session"
+        raw_text = "continue the canonical thread"
+        history = [
+            {"role": "user", "content": "canonical opening"},
+            {"role": "assistant", "content": "canonical reply"},
+        ]
+        captured: dict[str, object] = {}
+        created_agents: list[object] = []
+
+        class CanonicalAgent:
+            def __init__(self):
+                created_agents.append(self)
+                self._session_db = db
+                self._session_db_created = True
+                self.session_id = session_id
+                self.model = "canonical-model"
+                self.provider = "test"
+                self.api_mode = "chat_completions"
+
+            def run_conversation(self, **kwargs):
+                captured.update(kwargs)
+                receipt = kwargs["turn_receipt"]
+                TurnReceiptAdapter(db).finish(
+                    session_id,
+                    receipt.request.turn_request_id,
+                    receipt.request.binding_digest,
+                    receipt.claim_token,
+                    assistant_content="receipt-authorized reply",
+                    response_digest="sha256:" + "b" * 64,
+                )
+                return {"final_response": "transient", "messages": []}
+
+        try:
+            db.create_session(
+                session_id,
+                source="telegram",
+                model="canonical-model",
+                model_config={"cwd": "/canonical"},
+            )
+            db.replace_messages(session_id, [dict(message) for message in history])
+            metadata = self._durable_metadata(db, session_id, raw_text)
+            manager = SessionManager(agent_factory=CanonicalAgent, db=db)
+            acp_agent = HermesACPAgent(session_manager=manager)
+
+            response = await acp_agent.prompt(
+                prompt=[TextContentBlock(type="text", text=raw_text)],
+                session_id=session_id,
+                hermes={"acpTerminalReceipt": metadata},
+            )
+
+            assert response.stop_reason == "end_turn"
+            assert self._terminal_meta(response)["status"] == "COMPLETED"
+            assert self._terminal_meta(response)["assistantContent"] == "receipt-authorized reply"
+            assert len(created_agents) == 1
+            assert created_agents[0].session_id == session_id
+            assert db.get_conversation_root(session_id) == session_id
+            assert [
+                {"role": message["role"], "content": message["content"]}
+                for message in captured["conversation_history"]
+            ] == history
+            assert [row["id"] for row in db.list_sessions_rich(limit=10)] == [session_id]
+            assert db.get_session(session_id)["source"] == "telegram"
+
+            internal_metadata = {
+                **metadata,
+                "targetBindReceipt": {
+                    "schema": "hermes.target-bind-receipt",
+                    **metadata["targetBindReceipt"],
+                },
+            }
+            assert set(internal_metadata["targetBindReceipt"]) == {
+                "schema", "domain", "version", "actor_id", "binding_generation",
+                "executor_runtime_identity", "requested_session_id", "lineage_root_digest",
+                "receipt_digest",
+            }
+            rejected = await HermesACPAgent(
+                session_manager=SessionManager(agent_factory=CanonicalAgent, db=db)
+            ).prompt(
+                prompt=[TextContentBlock(type="text", text=raw_text)],
+                session_id=session_id,
+                hermes={"acpTerminalReceipt": internal_metadata},
+            )
+            assert rejected.stop_reason == "refusal"
+            assert self._terminal_meta(rejected)["status"] == "REFUSED"
+            assert created_agents == [created_agents[0]]
+        finally:
+            db.close()
+
+    @pytest.mark.anyio
+    async def test_terminal_receipt_restore_does_not_open_non_acp_session_to_ordinary_acp(
+        self, tmp_path
+    ):
+        """The exceptional receipt path must not make a canonical target adoptable."""
+        db = SessionDB(tmp_path / "source-fence.db")
+        session_id = "canonical-gateway-session"
+        raw_text = "receipt-only attach"
+        run_calls: list[dict] = []
+
+        class CanonicalAgent:
+            def __init__(self):
+                self._session_db = db
+                self._session_db_created = True
+                self.session_id = session_id
+                self.model = "canonical-model"
+                self.provider = "test"
+                self.api_mode = "chat_completions"
+
+            def run_conversation(self, **kwargs):
+                run_calls.append(kwargs)
+                receipt = kwargs.get("turn_receipt")
+                if receipt is not None:
+                    TurnReceiptAdapter(db).finish(
+                        session_id,
+                        receipt.request.turn_request_id,
+                        receipt.request.binding_digest,
+                        receipt.claim_token,
+                        assistant_content="authorized",
+                        response_digest="sha256:" + "c" * 64,
+                    )
+                return {"final_response": "transient", "messages": []}
+
+        try:
+            db.create_session(session_id, source="gateway", model="canonical-model")
+            db.replace_messages(
+                session_id,
+                [{"role": "user", "content": "persisted canonical history"}],
+            )
+            metadata = self._durable_metadata(db, session_id, raw_text)
+            manager = SessionManager(agent_factory=CanonicalAgent, db=db)
+            acp_agent = HermesACPAgent(session_manager=manager)
+
+            authorized = await acp_agent.prompt(
+                prompt=[TextContentBlock(type="text", text=raw_text)],
+                session_id=session_id,
+                hermes={"acpTerminalReceipt": metadata},
+            )
+
+            assert authorized.stop_reason == "end_turn"
+            assert manager.get_session(session_id) is None
+            assert await acp_agent.load_session(cwd="/tmp", session_id=session_id) is None
+            resumed = await acp_agent.resume_session(cwd="/tmp", session_id=session_id)
+            assert resumed.field_meta["hermes"]["sessionProvenance"]["acpSessionId"] != session_id
+            refused = await acp_agent.prompt(
+                prompt=[TextContentBlock(type="text", text="ordinary ACP prompt")],
+                session_id=session_id,
+            )
+            assert refused.stop_reason == "refusal"
+            assert len(run_calls) == 1
+        finally:
+            db.close()
+
+    @pytest.mark.anyio
+    async def test_terminal_receipt_status_does_not_materialize_non_acp_target(self, tmp_path):
+        """Status is a durable receipt lookup, not a conversation restore."""
+        db = SessionDB(tmp_path / "status-no-restore.db")
+        session_id = "canonical-gateway-status"
+        agent_builds: list[None] = []
+
+        def fail_if_built():
+            agent_builds.append(None)
+            raise AssertionError("terminal status constructed an agent")
+
+        try:
+            db.create_session(session_id, source="gateway", model="canonical-model")
+            db.replace_messages(session_id, [{"role": "user", "content": "canonical history"}])
+            metadata = self._durable_metadata(db, session_id, "status digest")
+            metadata["operation"] = "status"
+            before_ids = [row["id"] for row in db.list_sessions_rich(limit=10)]
+            manager = SessionManager(agent_factory=fail_if_built, db=db)
+            acp_agent = HermesACPAgent(session_manager=manager)
+
+            response = await acp_agent.prompt(
+                prompt=[],
+                session_id=session_id,
+                hermes={"acpTerminalReceipt": metadata},
+            )
+
+            assert self._terminal_meta(response) == {
+                "status": "NEVER_FOUND",
+                "turnRequestId": "turn-request-1",
+            }
+            assert agent_builds == []
+            assert manager.get_session(session_id) is None
+            assert [row["id"] for row in db.list_sessions_rich(limit=10)] == before_ids
+        finally:
+            db.close()
+
+    @pytest.mark.anyio
+    async def test_terminal_receipt_execute_checks_exact_digest_before_non_acp_restore(self, tmp_path):
+        """A digest mismatch cannot materialize or mutate a canonical target."""
+        db = SessionDB(tmp_path / "digest-before-restore.db")
+        session_id = "canonical-gateway-digest"
+        agent_builds: list[None] = []
+
+        def fail_if_built():
+            agent_builds.append(None)
+            raise AssertionError("bad terminal prompt constructed an agent")
+
+        try:
+            db.create_session(session_id, source="gateway", model="canonical-model")
+            db.replace_messages(session_id, [{"role": "user", "content": "canonical history"}])
+            metadata = self._durable_metadata(db, session_id, "authorized bytes")
+            before_ids = [row["id"] for row in db.list_sessions_rich(limit=10)]
+            manager = SessionManager(agent_factory=fail_if_built, db=db)
+            acp_agent = HermesACPAgent(session_manager=manager)
+
+            response = await acp_agent.prompt(
+                prompt=[TextContentBlock(type="text", text="different bytes")],
+                session_id=session_id,
+                hermes={"acpTerminalReceipt": metadata},
+            )
+
+            assert response.stop_reason == "refusal"
+            assert self._terminal_meta(response)["status"] == "REFUSED"
+            assert agent_builds == []
+            assert manager.get_session(session_id) is None
+            assert [row["id"] for row in db.list_sessions_rich(limit=10)] == before_ids
+            assert db.get_acp_turn_receipt(
+                session_id,
+                metadata["receiptIdentity"],
+                self._internal_target_bind_receipt(metadata),
+            ) is None
+        finally:
+            db.close()
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        "case",
+        ("tampered-target", "identity-mismatch", "requested-session-mismatch", "unknown-target"),
+    )
+    async def test_unvalidated_terminal_target_refuses_before_agent_build_or_turn_mutation(
+        self, tmp_path, case
+    ):
+        """Invalid terminal target evidence cannot construct a persisted ACP agent."""
+        db = SessionDB(tmp_path / f"{case}.db")
+        target_session_id = "persisted-acp-target"
+        raw_text = "fail closed before restore"
+        agent_builds: list[None] = []
+
+        def fail_if_built():
+            agent_builds.append(None)
+            raise AssertionError("invalid terminal receipt constructed an agent")
+
+        try:
+            db.create_session(target_session_id, source="acp", model="test")
+            valid_metadata = self._durable_metadata(db, target_session_id, raw_text)
+            metadata = valid_metadata
+            requested_session_id = target_session_id
+            if case == "tampered-target":
+                metadata = {
+                    **metadata,
+                    "targetBindReceipt": {
+                        **metadata["targetBindReceipt"],
+                        "receipt_digest": "sha256:" + "f" * 64,
+                    },
+                }
+            elif case == "identity-mismatch":
+                metadata = {
+                    **metadata,
+                    "receiptIdentity": {
+                        **metadata["receiptIdentity"],
+                        "targetActorId": "different-target-actor",
+                    },
+                }
+            elif case == "requested-session-mismatch":
+                requested_session_id = "different-session"
+            elif case == "unknown-target":
+                requested_session_id = "unknown-session"
+
+            acp_agent = HermesACPAgent(
+                session_manager=SessionManager(agent_factory=fail_if_built, db=db)
+            )
+            response = await acp_agent.prompt(
+                prompt=[TextContentBlock(type="text", text=raw_text)],
+                session_id=requested_session_id,
+                hermes={"acpTerminalReceipt": metadata},
+            )
+
+            assert response.stop_reason == "refusal"
+            assert self._terminal_meta(response)["status"] == "REFUSED"
+            assert agent_builds == []
+            assert (
+                db.get_acp_turn_receipt(
+                    target_session_id,
+                    valid_metadata["receiptIdentity"],
+                    self._internal_target_bind_receipt(valid_metadata),
+                )
+                is None
+            )
+        finally:
+            db.close()
 
     @pytest.mark.anyio
     async def test_acp_terminal_receipt_execute_forwards_exact_raw_text_and_claim(
@@ -528,6 +937,8 @@ class TestAcpTerminalReceipt:
         state.agent._session_db = db
         db.get_conversation_root.return_value = state.session_id
         db.validate_acp_turn_receipt_request.return_value = self._admission(metadata)
+        state.agent.api_mode = "chat_completions"
+        state.agent.provider = "openrouter"
         request = ReceiptRequest(
             state.session_id, "turn-request-1", prepared["receiptIdentityDigest"]
         )
@@ -550,7 +961,9 @@ class TestAcpTerminalReceipt:
             )
 
         db.prepare_acp_turn_receipt.assert_called_once_with(
-            state.session_id, metadata["receiptIdentity"], metadata["targetBindReceipt"]
+            state.session_id,
+            metadata["receiptIdentity"],
+            self._internal_target_bind_receipt(metadata),
         )
         receipt_adapter.claim_after_lease.assert_called_once_with(request)
         run_kwargs = state.agent.run_conversation.call_args.kwargs
@@ -558,7 +971,9 @@ class TestAcpTerminalReceipt:
         assert run_kwargs["persist_user_message"] == raw_text
         assert run_kwargs["turn_receipt"] is claimed
         db.get_acp_turn_receipt.assert_called_once_with(
-            state.session_id, metadata["receiptIdentity"], metadata["targetBindReceipt"]
+            state.session_id,
+            metadata["receiptIdentity"],
+            self._internal_target_bind_receipt(metadata),
         )
         assert self._terminal_meta(response) == {
             **completed,
@@ -654,7 +1069,7 @@ class TestAcpTerminalReceipt:
         db.prepare_acp_turn_receipt.assert_called_once_with(
             state.session_id,
             exact_crlf_metadata["receiptIdentity"],
-            exact_crlf_metadata["targetBindReceipt"],
+            self._internal_target_bind_receipt(exact_crlf_metadata),
         )
         run_kwargs = state.agent.run_conversation.call_args.kwargs
         assert run_kwargs["user_message"] == crlf_text
@@ -785,7 +1200,9 @@ class TestAcpTerminalReceipt:
         assert wrapper_response.stop_reason == "refusal"
         assert self._terminal_meta(wrapper_response)["status"] == "REFUSED"
         db.prepare_acp_turn_receipt.assert_called_once_with(
-            state.session_id, metadata["receiptIdentity"], metadata["targetBindReceipt"]
+            state.session_id,
+            metadata["receiptIdentity"],
+            self._internal_target_bind_receipt(metadata),
         )
         state.agent.run_conversation.assert_not_called()
 
@@ -870,9 +1287,14 @@ class TestAcpTerminalReceipt:
         )
 
         assert response.stop_reason == "refusal"
-        db.validate_acp_turn_receipt_request.assert_called_once_with(
-            state.session_id, metadata["receiptIdentity"], metadata["targetBindReceipt"]
-        )
+        if set(metadata["targetBindReceipt"]) == {"requested_session_id"}:
+            db.validate_acp_turn_receipt_request.assert_not_called()
+        else:
+            db.validate_acp_turn_receipt_request.assert_called_once_with(
+                state.session_id,
+                metadata["receiptIdentity"],
+                self._internal_target_bind_receipt(metadata),
+            )
         db.prepare_acp_turn_receipt.assert_not_called()
         state.agent.run_conversation.assert_not_called()
 
@@ -913,7 +1335,9 @@ class TestAcpTerminalReceipt:
             db.create_session(state.session_id, source="test")
             metadata = self._durable_metadata(db, state.session_id, raw_text)
             prepared = db.prepare_acp_turn_receipt(
-                state.session_id, metadata["receiptIdentity"], metadata["targetBindReceipt"]
+                state.session_id,
+                metadata["receiptIdentity"],
+                self._internal_target_bind_receipt(metadata),
             )
             assert db.claim_turn_receipt(
                 state.session_id,
@@ -934,7 +1358,9 @@ class TestAcpTerminalReceipt:
             assert self._terminal_meta(response)["status"] == "CLAIMED"
             state.agent.run_conversation.assert_not_called()
             receipt = db.get_acp_turn_receipt(
-                state.session_id, metadata["receiptIdentity"], metadata["targetBindReceipt"]
+                state.session_id,
+                metadata["receiptIdentity"],
+                self._internal_target_bind_receipt(metadata),
             )
             assert receipt is not None
             assert receipt["status"] == "CLAIMED"
@@ -942,7 +1368,104 @@ class TestAcpTerminalReceipt:
             db.close()
 
     @pytest.mark.anyio
-    async def test_acp_terminal_receipt_run_exception_keeps_claimed_without_assistant_row(
+    @pytest.mark.parametrize(
+        ("api_mode", "provider"),
+        (("codex_responses", "openrouter"), ("chat_completions", "moa")),
+        ids=("codex-responses", "moa-provider"),
+    )
+    async def test_acp_terminal_execute_unsupported_runtime_remains_prepared_before_claim(
+        self, agent, mock_manager, tmp_path, api_mode, provider
+    ):
+        """Unsupported restored runtimes prepare the durable receipt but never claim it."""
+        state = mock_manager.create_session(cwd="/tmp")
+        db = SessionDB(tmp_path / f"unsupported-{api_mode}-{provider}.db")
+        raw_text = "unsupported receipt runtime"
+        try:
+            db.create_session(state.session_id, source="test")
+            metadata = self._durable_metadata(db, state.session_id, raw_text)
+            state.agent._session_db = db
+            state.agent.session_id = state.session_id
+            state.agent.api_mode = api_mode
+            state.agent.provider = provider
+            state.agent.run_conversation = MagicMock(
+                return_value={"final_response": "unexpected", "messages": []}
+            )
+
+            with (
+                patch.object(
+                    db, "prepare_acp_turn_receipt", wraps=db.prepare_acp_turn_receipt
+                ) as prepare_receipt,
+                patch.object(db, "claim_turn_receipt", wraps=db.claim_turn_receipt) as claim_receipt,
+            ):
+                response = await agent.prompt(
+                    prompt=[TextContentBlock(type="text", text=raw_text)],
+                    session_id=state.session_id,
+                    hermes={"acpTerminalReceipt": metadata},
+                )
+                status_response = await agent.prompt(
+                    prompt=[TextContentBlock(type="text", text=raw_text)],
+                    session_id=state.session_id,
+                    hermes={
+                        "acpTerminalReceipt": {**metadata, "operation": "status"}
+                    },
+                )
+
+            assert self._terminal_meta(response)["status"] == "PREPARED"
+            prepare_receipt.assert_called_once_with(
+                state.session_id,
+                metadata["receiptIdentity"],
+                self._internal_target_bind_receipt(metadata),
+            )
+            claim_receipt.assert_not_called()
+            state.agent.run_conversation.assert_not_called()
+            assert state.is_running is False
+            assert db.get_messages(state.session_id) == []
+            assert self._terminal_meta(status_response)["status"] == "PREPARED"
+        finally:
+            db.close()
+
+    @pytest.mark.anyio
+    async def test_acp_terminal_receipt_supported_runtime_honors_public_policy_before_claim(
+        self, agent, mock_manager, tmp_path, monkeypatch
+    ):
+        """ACP's preclaim gate resolves the same public receipt policy."""
+        state = mock_manager.create_session(cwd="/tmp")
+        db = SessionDB(tmp_path / "public-policy-before-claim.db")
+        raw_text = "public policy blocks an otherwise supported runtime"
+        try:
+            db.create_session(state.session_id, source="test")
+            metadata = self._durable_metadata(db, state.session_id, raw_text)
+            state.agent._session_db = db
+            state.agent.session_id = state.session_id
+            state.agent.api_mode = "chat_completions"
+            state.agent.provider = "openrouter"
+            state.agent.run_conversation = MagicMock(
+                return_value={"final_response": "unexpected", "messages": []}
+            )
+            monkeypatch.setattr(
+                "run_agent.is_turn_receipt_runtime_supported",
+                lambda *_args: False,
+            )
+
+            with patch.object(
+                db, "claim_turn_receipt", wraps=db.claim_turn_receipt
+            ) as claim_receipt:
+                response = await agent.prompt(
+                    prompt=[TextContentBlock(type="text", text=raw_text)],
+                    session_id=state.session_id,
+                    hermes={"acpTerminalReceipt": metadata},
+                )
+
+            assert self._terminal_meta(response)["status"] == "PREPARED"
+            claim_receipt.assert_not_called()
+            state.agent.run_conversation.assert_not_called()
+            assert state.is_running is False
+            assert db.get_messages(state.session_id) == []
+        finally:
+            db.close()
+
+    @pytest.mark.anyio
+    async def test_acp_terminal_receipt_run_exception_returns_durable_aborted_without_assistant_row(
         self, agent, mock_manager, tmp_path
     ):
         state = mock_manager.create_session(cwd="/tmp")
@@ -955,19 +1478,81 @@ class TestAcpTerminalReceipt:
             state.agent.session_id = state.session_id
             state.agent.run_conversation = MagicMock(side_effect=RuntimeError("settlement failed"))
 
-            response = await agent.prompt(
-                prompt=[TextContentBlock(type="text", text=raw_text)],
-                session_id=state.session_id,
-                hermes={"acpTerminalReceipt": metadata},
-            )
+            with patch.object(
+                db,
+                "abort_acp_turn_receipt",
+                wraps=db.abort_acp_turn_receipt,
+            ) as abort_receipt:
+                response = await agent.prompt(
+                    prompt=[TextContentBlock(type="text", text=raw_text)],
+                    session_id=state.session_id,
+                    hermes={"acpTerminalReceipt": metadata},
+                )
 
-            assert self._terminal_meta(response)["status"] == "CLAIMED"
+            terminal = self._terminal_meta(response)
+            assert set(terminal) == {
+                "status",
+                "turnRequestId",
+                "sessionId",
+                "receiptIdentity",
+                "receiptIdentityDigest",
+                "targetBindReceipt",
+                "targetBindReceiptDigest",
+                "receiptId",
+                "evidenceDigest",
+                "reasonCode",
+            }
+            assert terminal["status"] == "ABORTED"
+            assert terminal["reasonCode"] == "HERMES_AGENT_RUN_EXCEPTION"
+            assert "settlement failed" not in json.dumps(terminal, sort_keys=True)
+            abort_receipt.assert_called_once()
             state.agent.run_conversation.assert_called_once()
             receipt = db.get_acp_turn_receipt(
-                state.session_id, metadata["receiptIdentity"], metadata["targetBindReceipt"]
+                state.session_id,
+                metadata["receiptIdentity"],
+                self._internal_target_bind_receipt(metadata),
             )
             assert receipt is not None
-            assert receipt["status"] != "COMPLETED"
+            assert receipt == terminal
+            assert db.get_messages(state.session_id) == []
+        finally:
+            db.close()
+
+    @pytest.mark.anyio
+    async def test_acp_terminal_receipt_abort_write_failure_keeps_claimed_without_assistant_row(
+        self, agent, mock_manager, tmp_path
+    ):
+        """The server re-reads a still-claimed receipt when abort persistence refuses."""
+        state = mock_manager.create_session(cwd="/tmp")
+        db = SessionDB(tmp_path / "abort-write-failure.db")
+        raw_text = "abort write fails after run exception"
+        try:
+            db.create_session(state.session_id, source="test")
+            metadata = self._durable_metadata(db, state.session_id, raw_text)
+            state.agent._session_db = db
+            state.agent.session_id = state.session_id
+            state.agent.run_conversation = MagicMock(side_effect=RuntimeError("hidden failure"))
+
+            with patch.object(
+                db,
+                "abort_acp_turn_receipt",
+                side_effect=sqlite3.DatabaseError("abort write refused"),
+            ) as abort_receipt:
+                response = await agent.prompt(
+                    prompt=[TextContentBlock(type="text", text=raw_text)],
+                    session_id=state.session_id,
+                    hermes={"acpTerminalReceipt": metadata},
+                )
+
+            abort_receipt.assert_called_once()
+            assert self._terminal_meta(response)["status"] == "CLAIMED"
+            receipt = db.get_acp_turn_receipt(
+                state.session_id,
+                metadata["receiptIdentity"],
+                self._internal_target_bind_receipt(metadata),
+            )
+            assert receipt is not None
+            assert receipt["status"] == "CLAIMED"
             assert db.get_messages(state.session_id) == []
         finally:
             db.close()
@@ -984,7 +1569,9 @@ class TestAcpTerminalReceipt:
             db.create_session(state.session_id, source="test")
             metadata = self._durable_metadata(db, state.session_id, raw_text)
             prepared = db.prepare_acp_turn_receipt(
-                state.session_id, metadata["receiptIdentity"], metadata["targetBindReceipt"]
+                state.session_id,
+                metadata["receiptIdentity"],
+                self._internal_target_bind_receipt(metadata),
             )
             assert db.claim_turn_receipt(
                 state.session_id,

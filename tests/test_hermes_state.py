@@ -1,8 +1,9 @@
 """Tests for hermes_state.py — SessionDB SQLite CRUD, FTS5 search, export."""
 
+import hashlib
+import json
 import sqlite3
 import time
-import json
 import threading
 from contextlib import contextmanager
 from pathlib import Path
@@ -6670,6 +6671,270 @@ def test_turn_receipt_persists_acp_identity_separate_from_target_bind_evidence(t
 
         assert db.get_acp_turn_receipt(session_id, identity, target_bind) == prepared
         assert db.get_acp_turn_receipt(session_id, conflicting, target_bind) is None
+    finally:
+        db.close()
+
+
+def _acp_abort_inputs(db, session_id: str, turn_request_id: str) -> tuple[dict, dict]:
+    """Build one closed ACP identity and its matching durable target proof."""
+    identity = {
+        "schema": "hermes.acp-terminal-receipt-identity",
+        "version": 1,
+        "turnRequestId": turn_request_id,
+        "targetActorId": "abort-actor",
+        "promptDigest": "sha256:" + "b" * 64,
+        "bindingGeneration": 3,
+        "targetBindingId": "abort-target-binding",
+        "targetAttestationId": "abort-target-attestation",
+        "executorSessionId": "abort-executor-session",
+        "executorSessionIncarnation": "abort-executor-incarnation",
+    }
+    target_record = db.prepare_target_bind_receipt(
+        session_id, "abort-actor", 3, "abort-executor-runtime"
+    )
+    target_bind = {
+        key: target_record[key]
+        for key in (
+            "schema",
+            "domain",
+            "version",
+            "actor_id",
+            "binding_generation",
+            "executor_runtime_identity",
+            "requested_session_id",
+            "lineage_root_digest",
+            "receipt_digest",
+        )
+    }
+    return identity, target_bind
+
+
+def _abort_canonical_digest(payload: dict) -> str:
+    return "sha256:" + hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+
+def test_abort_acp_turn_receipt_commits_closed_terminal_evidence_and_fences_late_finish(tmp_path):
+    """Only the matching claim may atomically make a closed ACP receipt ABORTED."""
+    db_path = tmp_path / "abort-receipt.db"
+    db = SessionDB(db_path=db_path)
+    session_id = "abort-session"
+    turn_request_id = "abort-turn"
+    claim_token = "secret-claim-token"
+    reason_code = "HERMES_AGENT_RUN_EXCEPTION"
+    try:
+        db.create_session(session_id, source="test")
+        identity, target_bind = _acp_abort_inputs(db, session_id, turn_request_id)
+        prepared = db.prepare_acp_turn_receipt(session_id, identity, target_bind)
+        assert db.get_acp_turn_receipt(session_id, identity, target_bind)["status"] == "PREPARED"
+        assert db.claim_turn_receipt(
+            session_id,
+            turn_request_id,
+            prepared["receiptIdentityDigest"],
+            claim_token,
+        )
+
+        aborted = db.abort_acp_turn_receipt(
+            session_id, identity, target_bind, claim_token, reason_code
+        )
+
+        with pytest.raises(hermes_state.TurnReceiptFenceError):
+            db.abort_acp_turn_receipt(
+                session_id, identity, target_bind, "wrong-claim-token", reason_code
+            )
+        with pytest.raises(hermes_state.TargetBindReceiptFenceError):
+            db.abort_acp_turn_receipt(
+                session_id,
+                identity,
+                {**target_bind, "receipt_digest": "sha256:" + "f" * 64},
+                claim_token,
+                reason_code,
+            )
+        with pytest.raises(hermes_state.TurnReceiptConflictError):
+            db.abort_acp_turn_receipt(
+                session_id,
+                {**identity, "targetAttestationId": "wrong-binding"},
+                target_bind,
+                claim_token,
+                reason_code,
+            )
+        with pytest.raises(ValueError):
+            db.abort_acp_turn_receipt(
+                session_id, identity, target_bind, claim_token, "CHANGED_REASON"
+            )
+
+        prepared_identity, prepared_target = _acp_abort_inputs(
+            db, session_id, "still-prepared-turn"
+        )
+        db.prepare_acp_turn_receipt(session_id, prepared_identity, prepared_target)
+        with pytest.raises(hermes_state.TurnReceiptFenceError):
+            db.abort_acp_turn_receipt(
+                session_id,
+                prepared_identity,
+                prepared_target,
+                claim_token,
+                reason_code,
+            )
+        assert (
+            db.get_acp_turn_receipt(session_id, prepared_identity, prepared_target)["status"]
+            == "PREPARED"
+        )
+
+        expected_receipt_id = _abort_canonical_digest(
+            {
+                "domain": "hermes.acp-terminal-abort-receipt-id",
+                "version": 1,
+                "receiptIdentityDigest": prepared["receiptIdentityDigest"],
+                "targetBindReceiptDigest": prepared["targetBindReceiptDigest"],
+                "claimToken": claim_token,
+            }
+        )
+        expected_evidence_digest = _abort_canonical_digest(
+            {
+                "domain": "hermes.acp-terminal-abort-evidence",
+                "version": 1,
+                "receiptId": expected_receipt_id,
+                "receiptIdentityDigest": prepared["receiptIdentityDigest"],
+                "targetBindReceiptDigest": prepared["targetBindReceiptDigest"],
+                "reasonCode": reason_code,
+                "claimToken": claim_token,
+            }
+        )
+        assert set(aborted) == {
+            "status",
+            "turnRequestId",
+            "sessionId",
+            "receiptIdentity",
+            "receiptIdentityDigest",
+            "targetBindReceipt",
+            "targetBindReceiptDigest",
+            "receiptId",
+            "evidenceDigest",
+            "reasonCode",
+        }
+        assert aborted == {
+            "status": "ABORTED",
+            "turnRequestId": turn_request_id,
+            "sessionId": target_bind["requested_session_id"],
+            "receiptIdentity": identity,
+            "receiptIdentityDigest": prepared["receiptIdentityDigest"],
+            "targetBindReceipt": target_bind,
+            "targetBindReceiptDigest": prepared["targetBindReceiptDigest"],
+            "receiptId": expected_receipt_id,
+            "evidenceDigest": expected_evidence_digest,
+            "reasonCode": reason_code,
+        }
+        assert claim_token not in json.dumps(aborted, sort_keys=True)
+        assert db.abort_acp_turn_receipt(
+            session_id, identity, target_bind, claim_token, reason_code
+        ) == aborted
+        with pytest.raises(ValueError):
+            db.abort_acp_turn_receipt(
+                session_id, identity, target_bind, claim_token, "CHANGED_REASON"
+            )
+        with pytest.raises(hermes_state.TurnReceiptFenceError):
+            db.finish_turn_receipt(
+                session_id,
+                turn_request_id,
+                prepared["receiptIdentityDigest"],
+                claim_token,
+                assistant_content="must not persist",
+                response_digest="sha256:" + "a" * 64,
+            )
+        assert db.get_messages(session_id) == []
+    finally:
+        db.close()
+
+    reopened = SessionDB(db_path=db_path)
+    try:
+        assert reopened.get_acp_turn_receipt(session_id, identity, target_bind) == aborted
+    finally:
+        reopened.close()
+
+
+def test_abort_acp_turn_receipt_leaves_completed_race_unchanged(tmp_path):
+    """An ABORTED writer must not overwrite a terminal assistant committed first."""
+    db = SessionDB(db_path=tmp_path / "completed-race.db")
+    session_id = "completed-race-session"
+    claim_token = "completed-race-claim"
+    try:
+        db.create_session(session_id, source="test")
+        identity, target_bind = _acp_abort_inputs(db, session_id, "completed-race-turn")
+        prepared = db.prepare_acp_turn_receipt(session_id, identity, target_bind)
+        assert db.claim_turn_receipt(
+            session_id,
+            identity["turnRequestId"],
+            prepared["receiptIdentityDigest"],
+            claim_token,
+        )
+        completed = db.finish_turn_receipt(
+            session_id,
+            identity["turnRequestId"],
+            prepared["receiptIdentityDigest"],
+            claim_token,
+            assistant_content="completed first",
+            response_digest="sha256:" + "c" * 64,
+        )
+        with pytest.raises(hermes_state.TurnReceiptFenceError):
+            db.abort_acp_turn_receipt(
+                session_id,
+                identity,
+                target_bind,
+                "wrong-completed-claim",
+                "HERMES_AGENT_RUN_EXCEPTION",
+            )
+        assert db.abort_acp_turn_receipt(
+            session_id,
+            identity,
+            target_bind,
+            claim_token,
+            "HERMES_AGENT_RUN_EXCEPTION",
+        ) == completed
+        assert [message["content"] for message in db.get_messages(session_id)] == [
+            "completed first"
+        ]
+    finally:
+        db.close()
+
+
+def test_migrate_turn_receipts_adds_nullable_abort_evidence_columns(tmp_path):
+    """Existing receipt tables gain all abort evidence fields without rebuilding rows."""
+    db = SessionDB(db_path=tmp_path / "legacy-turn-receipts.db")
+    try:
+        assert db._conn is not None
+        db._conn.execute("DROP TABLE turn_receipts")
+        db._conn.execute(
+            """CREATE TABLE turn_receipts (
+                turn_request_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                binding_digest TEXT NOT NULL,
+                receipt_identity_json TEXT,
+                receipt_identity_digest TEXT,
+                target_bind_receipt_json TEXT,
+                target_bind_receipt_digest TEXT,
+                status TEXT NOT NULL,
+                claim_token TEXT,
+                terminal_message_id INTEGER,
+                response_digest TEXT,
+                created_at REAL NOT NULL,
+                claimed_at REAL,
+                completed_at REAL
+            )"""
+        )
+        db._conn.commit()
+        assert db.migrate_turn_receipts() == 0
+        columns = {
+            row["name"] for row in db._conn.execute("PRAGMA table_info(turn_receipts)")
+        }
+        assert {
+            "abort_receipt_id",
+            "abort_evidence_digest",
+            "abort_reason_code",
+            "aborted_at",
+        } <= columns
     finally:
         db.close()
 
