@@ -1789,6 +1789,27 @@ class HermesACPAgent(acp.Agent):
         )
 
     @staticmethod
+    def _target_bind_receipt_from_wire(
+        receipt: Any, session_id: str
+    ) -> dict[str, Any] | None:
+        """Adapt one closed ACP target-bind wire receipt to Hermes' internal form."""
+        wire_keys = {
+            "domain", "version", "actor_id", "binding_generation",
+            "executor_runtime_identity", "requested_session_id", "lineage_root_digest",
+            "receipt_digest",
+        }
+        if (
+            not isinstance(receipt, dict)
+            or set(receipt) != wire_keys
+            or receipt.get("domain") != "hermes.target-bind"
+            or type(receipt.get("version")) is not int
+            or receipt["version"] != 1
+            or receipt.get("requested_session_id") != session_id
+        ):
+            return None
+        return {"schema": "hermes.target-bind-receipt", **receipt}
+
+    @staticmethod
     def _terminal_receipt_request(
         session_id: str, receipt_identity: dict[str, Any], receipt: Any
     ) -> ReceiptRequest | None:
@@ -1865,12 +1886,13 @@ class HermesACPAgent(acp.Agent):
                 return self._terminal_receipt_refusal()
             operation = metadata["operation"]
             receipt_identity = metadata["receiptIdentity"]
-            target_bind_receipt = metadata["targetBindReceipt"]
+            target_bind_receipt = self._target_bind_receipt_from_wire(
+                metadata["targetBindReceipt"], session_id
+            )
             if (
                 operation not in {"execute", "status"}
                 or not isinstance(receipt_identity, dict)
-                or not isinstance(target_bind_receipt, dict)
-                or target_bind_receipt.get("requested_session_id") != session_id
+                or target_bind_receipt is None
             ):
                 return self._terminal_receipt_refusal()
             terminal_receipt_db_hint = self.session_manager._get_db()
@@ -1966,12 +1988,13 @@ class HermesACPAgent(acp.Agent):
                 return self._terminal_receipt_refusal()
             operation = metadata["operation"]
             receipt_identity = metadata["receiptIdentity"]
-            target_bind_receipt = metadata["targetBindReceipt"]
+            target_bind_receipt = self._target_bind_receipt_from_wire(
+                metadata["targetBindReceipt"], session_id
+            )
             if (
                 operation not in {"execute", "status"}
                 or not isinstance(receipt_identity, dict)
-                or not isinstance(target_bind_receipt, dict)
-                or target_bind_receipt.get("requested_session_id") != session_id
+                or target_bind_receipt is None
             ):
                 return self._terminal_receipt_refusal()
             db = (

@@ -472,7 +472,23 @@ class TestAcpTerminalReceipt:
                 "executorSessionId": "executor-session",
                 "executorSessionIncarnation": "executor-incarnation",
             },
-            "targetBindReceipt": {"requested_session_id": session_id},
+            "targetBindReceipt": {
+                "domain": "hermes.target-bind",
+                "version": 1,
+                "actor_id": "target-actor",
+                "binding_generation": 1,
+                "executor_runtime_identity": "executor-runtime",
+                "requested_session_id": session_id,
+                "lineage_root_digest": "sha256:" + "d" * 64,
+                "receipt_digest": "sha256:" + "c" * 64,
+            }
+        }
+
+    @staticmethod
+    def _internal_target_bind_receipt(metadata: dict) -> dict:
+        return {
+            "schema": "hermes.target-bind-receipt",
+            **metadata["targetBindReceipt"],
         }
 
     @staticmethod
@@ -484,12 +500,12 @@ class TestAcpTerminalReceipt:
             "receiptIdentityDigest": "sha256:" + "a" * 64,
         }
 
-    @staticmethod
-    def _admission(metadata: dict) -> dict:
+    @classmethod
+    def _admission(cls, metadata: dict) -> dict:
         return {
             "receiptIdentity": metadata["receiptIdentity"],
             "receiptIdentityDigest": "sha256:" + "a" * 64,
-            "targetBindReceipt": metadata["targetBindReceipt"],
+            "targetBindReceipt": cls._internal_target_bind_receipt(metadata),
             "targetBindReceiptDigest": "sha256:" + "c" * 64,
         }
 
@@ -502,10 +518,15 @@ class TestAcpTerminalReceipt:
         metadata["targetBindReceipt"] = {
             key: record[key]
             for key in (
-                "schema", "domain", "version", "actor_id", "binding_generation",
+                "domain", "version", "actor_id", "binding_generation",
                 "executor_runtime_identity", "requested_session_id", "lineage_root_digest",
                 "receipt_digest",
             )
+        }
+        assert set(metadata["targetBindReceipt"]) == {
+            "domain", "version", "actor_id", "binding_generation",
+            "executor_runtime_identity", "requested_session_id", "lineage_root_digest",
+            "receipt_digest",
         }
         return metadata
 
@@ -580,6 +601,29 @@ class TestAcpTerminalReceipt:
             ] == history
             assert [row["id"] for row in db.list_sessions_rich(limit=10)] == [session_id]
             assert db.get_session(session_id)["source"] == "telegram"
+
+            internal_metadata = {
+                **metadata,
+                "targetBindReceipt": {
+                    "schema": "hermes.target-bind-receipt",
+                    **metadata["targetBindReceipt"],
+                },
+            }
+            assert set(internal_metadata["targetBindReceipt"]) == {
+                "schema", "domain", "version", "actor_id", "binding_generation",
+                "executor_runtime_identity", "requested_session_id", "lineage_root_digest",
+                "receipt_digest",
+            }
+            rejected = await HermesACPAgent(
+                session_manager=SessionManager(agent_factory=CanonicalAgent, db=db)
+            ).prompt(
+                prompt=[TextContentBlock(type="text", text=raw_text)],
+                session_id=session_id,
+                hermes={"acpTerminalReceipt": internal_metadata},
+            )
+            assert rejected.stop_reason == "refusal"
+            assert self._terminal_meta(rejected)["status"] == "REFUSED"
+            assert created_agents == [created_agents[0]]
         finally:
             db.close()
 
@@ -714,7 +758,7 @@ class TestAcpTerminalReceipt:
             assert db.get_acp_turn_receipt(
                 session_id,
                 metadata["receiptIdentity"],
-                metadata["targetBindReceipt"],
+                self._internal_target_bind_receipt(metadata),
             ) is None
         finally:
             db.close()
@@ -779,7 +823,7 @@ class TestAcpTerminalReceipt:
                 db.get_acp_turn_receipt(
                     target_session_id,
                     valid_metadata["receiptIdentity"],
-                    valid_metadata["targetBindReceipt"],
+                    self._internal_target_bind_receipt(valid_metadata),
                 )
                 is None
             )
@@ -823,7 +867,9 @@ class TestAcpTerminalReceipt:
             )
 
         db.prepare_acp_turn_receipt.assert_called_once_with(
-            state.session_id, metadata["receiptIdentity"], metadata["targetBindReceipt"]
+            state.session_id,
+            metadata["receiptIdentity"],
+            self._internal_target_bind_receipt(metadata),
         )
         receipt_adapter.claim_after_lease.assert_called_once_with(request)
         run_kwargs = state.agent.run_conversation.call_args.kwargs
@@ -831,7 +877,9 @@ class TestAcpTerminalReceipt:
         assert run_kwargs["persist_user_message"] == raw_text
         assert run_kwargs["turn_receipt"] is claimed
         db.get_acp_turn_receipt.assert_called_once_with(
-            state.session_id, metadata["receiptIdentity"], metadata["targetBindReceipt"]
+            state.session_id,
+            metadata["receiptIdentity"],
+            self._internal_target_bind_receipt(metadata),
         )
         assert self._terminal_meta(response) == {
             **completed,
@@ -927,7 +975,7 @@ class TestAcpTerminalReceipt:
         db.prepare_acp_turn_receipt.assert_called_once_with(
             state.session_id,
             exact_crlf_metadata["receiptIdentity"],
-            exact_crlf_metadata["targetBindReceipt"],
+            self._internal_target_bind_receipt(exact_crlf_metadata),
         )
         run_kwargs = state.agent.run_conversation.call_args.kwargs
         assert run_kwargs["user_message"] == crlf_text
@@ -1058,7 +1106,9 @@ class TestAcpTerminalReceipt:
         assert wrapper_response.stop_reason == "refusal"
         assert self._terminal_meta(wrapper_response)["status"] == "REFUSED"
         db.prepare_acp_turn_receipt.assert_called_once_with(
-            state.session_id, metadata["receiptIdentity"], metadata["targetBindReceipt"]
+            state.session_id,
+            metadata["receiptIdentity"],
+            self._internal_target_bind_receipt(metadata),
         )
         state.agent.run_conversation.assert_not_called()
 
@@ -1143,9 +1193,14 @@ class TestAcpTerminalReceipt:
         )
 
         assert response.stop_reason == "refusal"
-        db.validate_acp_turn_receipt_request.assert_called_once_with(
-            state.session_id, metadata["receiptIdentity"], metadata["targetBindReceipt"]
-        )
+        if set(metadata["targetBindReceipt"]) == {"requested_session_id"}:
+            db.validate_acp_turn_receipt_request.assert_not_called()
+        else:
+            db.validate_acp_turn_receipt_request.assert_called_once_with(
+                state.session_id,
+                metadata["receiptIdentity"],
+                self._internal_target_bind_receipt(metadata),
+            )
         db.prepare_acp_turn_receipt.assert_not_called()
         state.agent.run_conversation.assert_not_called()
 
@@ -1186,7 +1241,9 @@ class TestAcpTerminalReceipt:
             db.create_session(state.session_id, source="test")
             metadata = self._durable_metadata(db, state.session_id, raw_text)
             prepared = db.prepare_acp_turn_receipt(
-                state.session_id, metadata["receiptIdentity"], metadata["targetBindReceipt"]
+                state.session_id,
+                metadata["receiptIdentity"],
+                self._internal_target_bind_receipt(metadata),
             )
             assert db.claim_turn_receipt(
                 state.session_id,
@@ -1207,7 +1264,9 @@ class TestAcpTerminalReceipt:
             assert self._terminal_meta(response)["status"] == "CLAIMED"
             state.agent.run_conversation.assert_not_called()
             receipt = db.get_acp_turn_receipt(
-                state.session_id, metadata["receiptIdentity"], metadata["targetBindReceipt"]
+                state.session_id,
+                metadata["receiptIdentity"],
+                self._internal_target_bind_receipt(metadata),
             )
             assert receipt is not None
             assert receipt["status"] == "CLAIMED"
@@ -1237,7 +1296,9 @@ class TestAcpTerminalReceipt:
             assert self._terminal_meta(response)["status"] == "CLAIMED"
             state.agent.run_conversation.assert_called_once()
             receipt = db.get_acp_turn_receipt(
-                state.session_id, metadata["receiptIdentity"], metadata["targetBindReceipt"]
+                state.session_id,
+                metadata["receiptIdentity"],
+                self._internal_target_bind_receipt(metadata),
             )
             assert receipt is not None
             assert receipt["status"] != "COMPLETED"
@@ -1257,7 +1318,9 @@ class TestAcpTerminalReceipt:
             db.create_session(state.session_id, source="test")
             metadata = self._durable_metadata(db, state.session_id, raw_text)
             prepared = db.prepare_acp_turn_receipt(
-                state.session_id, metadata["receiptIdentity"], metadata["targetBindReceipt"]
+                state.session_id,
+                metadata["receiptIdentity"],
+                self._internal_target_bind_receipt(metadata),
             )
             assert db.claim_turn_receipt(
                 state.session_id,
