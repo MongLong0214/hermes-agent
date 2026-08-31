@@ -535,6 +535,89 @@ class TestAcpTerminalReceipt:
         return response.field_meta["hermes"]["acpTerminalReceipt"]
 
     @pytest.mark.anyio
+    @pytest.mark.parametrize("operation", ([], {}), ids=("list", "dict"))
+    async def test_terminal_receipt_non_string_operation_refuses_before_non_acp_restore(
+        self, tmp_path, operation
+    ):
+        """Malformed operations must not restore a non-ACP target or mutate receipts."""
+        db = SessionDB(tmp_path / "malformed-operation-cache-miss.db")
+        session_id = "canonical-gateway-malformed-operation"
+        raw_text = "malformed operation must fail closed"
+        agent_builds: list[None] = []
+
+        def fail_if_built():
+            agent_builds.append(None)
+            raise AssertionError("malformed terminal operation constructed an agent")
+
+        try:
+            db.create_session(session_id, source="gateway", model="canonical-model")
+            metadata = self._durable_metadata(db, session_id, raw_text)
+            metadata["operation"] = operation
+            with (
+                patch.object(
+                    db,
+                    "prepare_acp_turn_receipt",
+                    wraps=db.prepare_acp_turn_receipt,
+                ) as prepare_receipt,
+                patch.object(
+                    db,
+                    "claim_turn_receipt",
+                    wraps=db.claim_turn_receipt,
+                ) as claim_receipt,
+            ):
+                response = await HermesACPAgent(
+                    session_manager=SessionManager(agent_factory=fail_if_built, db=db)
+                ).prompt(
+                    prompt=[TextContentBlock(type="text", text=raw_text)],
+                    session_id=session_id,
+                    hermes={"acpTerminalReceipt": metadata},
+                )
+
+            assert response.stop_reason == "refusal"
+            assert self._terminal_meta(response)["status"] == "REFUSED"
+            assert agent_builds == []
+            prepare_receipt.assert_not_called()
+            claim_receipt.assert_not_called()
+            assert db.get_acp_turn_receipt(
+                session_id,
+                metadata["receiptIdentity"],
+                self._internal_target_bind_receipt(metadata),
+            ) is None
+        finally:
+            db.close()
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("operation", ([], {}), ids=("list", "dict"))
+    async def test_terminal_receipt_non_string_operation_refuses_cached_session_without_receipt_side_effects(
+        self, agent, mock_manager, operation
+    ):
+        """Malformed operations must not prepare, claim, or run a cached session."""
+        state = mock_manager.create_session(cwd="/tmp")
+        raw_text = "cached malformed operation must fail closed"
+        metadata = self._receipt_metadata(state.session_id, raw_text)
+        metadata["operation"] = operation
+        db = MagicMock()
+        state.agent._session_db = db
+        state.agent.run_conversation = MagicMock()
+
+        with patch("acp_adapter.server.TurnReceiptAdapter") as receipt_adapter:
+            response = await agent.prompt(
+                prompt=[TextContentBlock(type="text", text=raw_text)],
+                session_id=state.session_id,
+                hermes={"acpTerminalReceipt": metadata},
+            )
+
+        assert response.stop_reason == "refusal"
+        assert self._terminal_meta(response)["status"] == "REFUSED"
+        db.validate_acp_turn_receipt_request.assert_not_called()
+        db.prepare_acp_turn_receipt.assert_not_called()
+        db.claim_turn_receipt.assert_not_called()
+        receipt_adapter.assert_not_called()
+        state.agent.run_conversation.assert_not_called()
+        assert state.history == []
+        assert state.is_running is False
+
+    @pytest.mark.anyio
     async def test_terminal_receipt_prompt_restores_exact_persisted_non_acp_session(
         self, tmp_path
     ):

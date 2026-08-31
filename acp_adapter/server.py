@@ -1890,7 +1890,8 @@ class HermesACPAgent(acp.Agent):
                 metadata["targetBindReceipt"], session_id
             )
             if (
-                operation not in {"execute", "status"}
+                not isinstance(operation, str)
+                or operation not in {"execute", "status"}
                 or not isinstance(receipt_identity, dict)
                 or target_bind_receipt is None
             ):
@@ -1992,7 +1993,8 @@ class HermesACPAgent(acp.Agent):
                 metadata["targetBindReceipt"], session_id
             )
             if (
-                operation not in {"execute", "status"}
+                not isinstance(operation, str)
+                or operation not in {"execute", "status"}
                 or not isinstance(receipt_identity, dict)
                 or target_bind_receipt is None
             ):
