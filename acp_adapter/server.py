@@ -2086,6 +2086,13 @@ class HermesACPAgent(acp.Agent):
                 return await self._terminal_receipt_response(session_id, replay)
             if receipt.get("status") != "PREPARED":
                 return await self._terminal_receipt_response(session_id, receipt)
+            from run_agent import is_turn_receipt_runtime_supported
+
+            if not is_turn_receipt_runtime_supported(
+                getattr(state.agent, "api_mode", None),
+                getattr(state.agent, "provider", None),
+            ):
+                return await self._terminal_receipt_response(session_id, receipt)
             with state.runtime_lock:
                 if state.is_running:
                     busy = True

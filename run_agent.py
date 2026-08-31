@@ -103,6 +103,17 @@ def _session_source_for_agent(platform: Optional[str]) -> str:
     return platform or "cli"
 
 
+def is_turn_receipt_runtime_supported(
+    api_mode: object, provider: object, moa_config: object = None
+) -> bool:
+    """Whether a runtime can atomically finalize a durable turn receipt."""
+    return (
+        api_mode == "chat_completions"
+        and str(provider or "").strip().lower() != "moa"
+        and moa_config is None
+    )
+
+
 # OpenAI lazy proxy + safe stdio + proxy URL helpers — see agent/process_bootstrap.py.
 # `OpenAI` is re-exported here so `patch("run_agent.OpenAI", ...)` in tests works.
 # The other `# noqa: F401` re-exports below cover names accessed via
@@ -8886,11 +8897,10 @@ class AIAgent:
             # ahead of relay/task/model setup and, critically, ahead of the
             # claim so an unsupported runtime cannot leave a durable receipt
             # in CLAIMED without a compatible atomic finalizer.
-            if turn_receipt is not None and (
-                getattr(self, "api_mode", None) != "chat_completions"
-                or str(getattr(self, "provider", "") or "").strip().lower()
-                == "moa"
-                or moa_config is not None
+            if turn_receipt is not None and not is_turn_receipt_runtime_supported(
+                getattr(self, "api_mode", None),
+                getattr(self, "provider", None),
+                moa_config,
             ):
                 return {
                     "final_response": "",

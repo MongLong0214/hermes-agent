@@ -52,7 +52,13 @@ from tui_gateway.turn_receipts import ClaimedReceipt, ReceiptRequest, TurnReceip
 @pytest.fixture()
 def mock_manager():
     """SessionManager with a mock agent factory."""
-    return SessionManager(agent_factory=lambda: MagicMock(name="MockAIAgent"))
+    def agent_factory():
+        result = MagicMock(name="MockAIAgent")
+        result.api_mode = "chat_completions"
+        result.provider = "openrouter"
+        return result
+
+    return SessionManager(agent_factory=agent_factory)
 
 
 @pytest.fixture()
@@ -641,6 +647,7 @@ class TestAcpTerminalReceipt:
                 self.session_id = session_id
                 self.model = "canonical-model"
                 self.provider = "test"
+                self.api_mode = "chat_completions"
 
             def run_conversation(self, **kwargs):
                 captured.update(kwargs)
@@ -728,6 +735,7 @@ class TestAcpTerminalReceipt:
                 self.session_id = session_id
                 self.model = "canonical-model"
                 self.provider = "test"
+                self.api_mode = "chat_completions"
 
             def run_conversation(self, **kwargs):
                 run_calls.append(kwargs)
@@ -929,6 +937,8 @@ class TestAcpTerminalReceipt:
         state.agent._session_db = db
         db.get_conversation_root.return_value = state.session_id
         db.validate_acp_turn_receipt_request.return_value = self._admission(metadata)
+        state.agent.api_mode = "chat_completions"
+        state.agent.provider = "openrouter"
         request = ReceiptRequest(
             state.session_id, "turn-request-1", prepared["receiptIdentityDigest"]
         )
@@ -1354,6 +1364,63 @@ class TestAcpTerminalReceipt:
             )
             assert receipt is not None
             assert receipt["status"] == "CLAIMED"
+        finally:
+            db.close()
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("api_mode", "provider"),
+        (("codex_responses", "openrouter"), ("chat_completions", "moa")),
+        ids=("codex-responses", "moa-provider"),
+    )
+    async def test_acp_terminal_execute_unsupported_runtime_remains_prepared_before_claim(
+        self, agent, mock_manager, tmp_path, api_mode, provider
+    ):
+        """Unsupported restored runtimes prepare the durable receipt but never claim it."""
+        state = mock_manager.create_session(cwd="/tmp")
+        db = SessionDB(tmp_path / f"unsupported-{api_mode}-{provider}.db")
+        raw_text = "unsupported receipt runtime"
+        try:
+            db.create_session(state.session_id, source="test")
+            metadata = self._durable_metadata(db, state.session_id, raw_text)
+            state.agent._session_db = db
+            state.agent.session_id = state.session_id
+            state.agent.api_mode = api_mode
+            state.agent.provider = provider
+            state.agent.run_conversation = MagicMock(
+                return_value={"final_response": "unexpected", "messages": []}
+            )
+
+            with (
+                patch.object(
+                    db, "prepare_acp_turn_receipt", wraps=db.prepare_acp_turn_receipt
+                ) as prepare_receipt,
+                patch.object(db, "claim_turn_receipt", wraps=db.claim_turn_receipt) as claim_receipt,
+            ):
+                response = await agent.prompt(
+                    prompt=[TextContentBlock(type="text", text=raw_text)],
+                    session_id=state.session_id,
+                    hermes={"acpTerminalReceipt": metadata},
+                )
+                status_response = await agent.prompt(
+                    prompt=[TextContentBlock(type="text", text=raw_text)],
+                    session_id=state.session_id,
+                    hermes={
+                        "acpTerminalReceipt": {**metadata, "operation": "status"}
+                    },
+                )
+
+            assert self._terminal_meta(response)["status"] == "PREPARED"
+            prepare_receipt.assert_called_once_with(
+                state.session_id,
+                metadata["receiptIdentity"],
+                self._internal_target_bind_receipt(metadata),
+            )
+            claim_receipt.assert_not_called()
+            state.agent.run_conversation.assert_not_called()
+            assert state.is_running is False
+            assert db.get_messages(state.session_id) == []
+            assert self._terminal_meta(status_response)["status"] == "PREPARED"
         finally:
             db.close()
 
