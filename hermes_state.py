@@ -26,6 +26,7 @@ import os
 import queue
 import random
 import re
+import secrets
 import sqlite3
 import sys
 import threading
@@ -86,6 +87,9 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     MAX_FTS5_QUERY_CHARS,
     SCHEMA_SQL,
     SCHEMA_VERSION,
+    SESSION_PROCESS_AUTHORITY_MAX_RESERVATION_TTL_SECONDS,
+    SESSION_PROCESS_AUTHORITY_RESERVATION_TTL_SECONDS,
+    SESSION_PROCESS_AUTHORITY_STATE_FAMILY,
     TURN_FENCE_GENERATION,
     _PREVIEW_CONTENT_SQL,
     _PREVIEW_HEAD_CHARS,
@@ -6535,6 +6539,289 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """Create a new session record. Returns the session_id."""
         self._insert_session_row(session_id, source, **kwargs)
         return session_id
+
+    def issue_session_process_authority(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Return the current issued authority for one live session.
+
+        Issuance itself is a sessions-table SQLite trigger, so every writer —
+        including a legacy raw SQL call that bypasses this Python method —
+        receives the same single generation and durable ``SESSION_ISSUED``
+        evidence in the transaction that created the session.  This method is
+        deliberately a fail-closed read of that durable record, not a second
+        mutable issuance path.
+        """
+        if not isinstance(session_id, str) or not session_id.strip():
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT a.state_db_id, a.state_family, a.session_id,
+                          a.session_generation, a.authority_token, a.status,
+                          a.issued_at
+                   FROM session_process_authorities AS a
+                   JOIN sessions AS s ON s.id = a.session_id
+                   WHERE a.session_id = ?
+                     AND a.session_generation = s.session_generation
+                     AND s.ended_at IS NULL
+                     AND a.status = 'ISSUED'""",
+                (session_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    @staticmethod
+    def _session_process_authority_payload(
+        authority: Any,
+    ) -> Optional[Tuple[str, str, str, int, str, float]]:
+        """Validate the complete authority envelope before touching SQLite."""
+        if not isinstance(authority, dict):
+            return None
+        state_db_id = authority.get("state_db_id")
+        state_family = authority.get("state_family")
+        session_id = authority.get("session_id")
+        generation = authority.get("session_generation")
+        token = authority.get("authority_token")
+        issued_at = authority.get("issued_at")
+        if (
+            not isinstance(state_db_id, str)
+            or len(state_db_id) != 64
+            or state_db_id.lower() != state_db_id
+            or any(char not in "0123456789abcdef" for char in state_db_id)
+            or state_family != SESSION_PROCESS_AUTHORITY_STATE_FAMILY
+            or not isinstance(session_id, str)
+            or not session_id.strip()
+            or isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation < 1
+            or not isinstance(token, str)
+            or len(token) != 64
+            or token.lower() != token
+            or any(char not in "0123456789abcdef" for char in token)
+            or isinstance(issued_at, bool)
+            or not isinstance(issued_at, (int, float))
+            or not math.isfinite(float(issued_at))
+            or authority.get("status") != "ISSUED"
+        ):
+            return None
+        return (
+            state_db_id,
+            state_family,
+            session_id,
+            generation,
+            token,
+            float(issued_at),
+        )
+
+    def reserve_session_process_authority(
+        self, authority: Any, *, ttl_seconds: float = SESSION_PROCESS_AUTHORITY_RESERVATION_TTL_SECONDS
+    ) -> Optional[Dict[str, Any]]:
+        """Create one short-lived reservation for the current authority.
+
+        This is an issuance prerequisite only: it does not launch or attach a
+        real process.  The one-time reservation is persisted with only a token
+        digest; Producer-B can later consume it to bind a spawned process.
+        """
+        parsed = self._session_process_authority_payload(authority)
+        if (
+            parsed is None
+            or isinstance(ttl_seconds, bool)
+            or not isinstance(ttl_seconds, (int, float))
+            or not math.isfinite(float(ttl_seconds))
+        ):
+            return None
+        ttl = float(ttl_seconds)
+        if ttl <= 0 or ttl > SESSION_PROCESS_AUTHORITY_MAX_RESERVATION_TTL_SECONDS:
+            return None
+        state_db_id, state_family, session_id, generation, token, issued_at = parsed
+        now = time.time()
+        expires_at = now + ttl
+        reservation_id = secrets.token_urlsafe(24)
+        reservation_token = secrets.token_urlsafe(32)
+        reservation_token_sha256 = hashlib.sha256(
+            reservation_token.encode("ascii")
+        ).hexdigest()
+
+        def _do(conn):
+            current = conn.execute(
+                """SELECT 1
+                   FROM session_process_authorities AS a
+                   JOIN sessions AS s ON s.id = a.session_id
+                   WHERE a.session_id = ?
+                     AND a.session_generation = ?
+                     AND a.state_db_id = ?
+                     AND a.state_family = ?
+                     AND a.authority_token = ?
+                     AND a.issued_at = ?
+                     AND a.status = 'ISSUED'
+                     AND s.session_generation = a.session_generation
+                     AND s.ended_at IS NULL""",
+                (session_id, generation, state_db_id, state_family, token, issued_at),
+            ).fetchone()
+            if current is None:
+                return None
+            conn.execute(
+                """INSERT INTO session_process_reservations (
+                       reservation_id, reservation_token_sha256, session_id,
+                       session_generation, state_db_id, state_family, status,
+                       reserved_at, expires_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, 'RESERVED', ?, ?)""",
+                (
+                    reservation_id,
+                    reservation_token_sha256,
+                    session_id,
+                    generation,
+                    state_db_id,
+                    state_family,
+                    now,
+                    expires_at,
+                ),
+            )
+            return {
+                "reservation_id": reservation_id,
+                "reservation_token": reservation_token,
+                "state_db_id": state_db_id,
+                "state_family": state_family,
+                "session_id": session_id,
+                "session_generation": generation,
+                "status": "RESERVED",
+                "reserved_at": now,
+                "expires_at": expires_at,
+            }
+
+        return self._execute_write(_do)
+
+    @staticmethod
+    def _session_process_reservation_payload(
+        reservation: Any,
+    ) -> Optional[Tuple[str, str, str, str, int, float, float]]:
+        """Validate a presented reservation before its one-time consume."""
+        if not isinstance(reservation, dict):
+            return None
+        reservation_id = reservation.get("reservation_id")
+        reservation_token = reservation.get("reservation_token")
+        state_db_id = reservation.get("state_db_id")
+        state_family = reservation.get("state_family")
+        session_id = reservation.get("session_id")
+        generation = reservation.get("session_generation")
+        reserved_at = reservation.get("reserved_at")
+        expires_at = reservation.get("expires_at")
+        if (
+            not isinstance(reservation_id, str)
+            or len(reservation_id) < 32
+            or not isinstance(reservation_token, str)
+            or len(reservation_token) < 32
+            or not isinstance(state_db_id, str)
+            or len(state_db_id) != 64
+            or state_db_id.lower() != state_db_id
+            or any(char not in "0123456789abcdef" for char in state_db_id)
+            or state_family != SESSION_PROCESS_AUTHORITY_STATE_FAMILY
+            or not isinstance(session_id, str)
+            or not session_id.strip()
+            or isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation < 1
+            or isinstance(reserved_at, bool)
+            or not isinstance(reserved_at, (int, float))
+            or isinstance(expires_at, bool)
+            or not isinstance(expires_at, (int, float))
+            or not math.isfinite(float(reserved_at))
+            or not math.isfinite(float(expires_at))
+            or float(expires_at) <= float(reserved_at)
+            or reservation.get("status") != "RESERVED"
+        ):
+            return None
+        return (
+            reservation_id,
+            reservation_token,
+            state_db_id,
+            session_id,
+            generation,
+            float(reserved_at),
+            float(expires_at),
+        )
+
+    def consume_session_process_reservation(self, reservation: Any) -> bool:
+        """Atomically consume an unexpired reservation without binding a PID."""
+        parsed = self._session_process_reservation_payload(reservation)
+        if parsed is None:
+            return False
+        (
+            reservation_id,
+            reservation_token,
+            state_db_id,
+            session_id,
+            generation,
+            reserved_at,
+            expires_at,
+        ) = parsed
+        now = time.time()
+        if expires_at <= now:
+            return False
+        token_sha256 = hashlib.sha256(reservation_token.encode("ascii")).hexdigest()
+
+        def _do(conn):
+            row = conn.execute(
+                """SELECT r.reservation_token_sha256
+                   FROM session_process_reservations AS r
+                   JOIN session_process_authorities AS a
+                     ON a.session_id = r.session_id
+                    AND a.session_generation = r.session_generation
+                   JOIN sessions AS s ON s.id = r.session_id
+                   WHERE r.reservation_id = ?
+                     AND r.session_id = ?
+                     AND r.session_generation = ?
+                     AND r.state_db_id = ?
+                     AND r.state_family = ?
+                     AND r.reserved_at = ?
+                     AND r.expires_at = ?
+                     AND r.status = 'RESERVED'
+                     AND r.expires_at > ?
+                     AND a.status = 'ISSUED'
+                     AND s.session_generation = r.session_generation
+                     AND s.ended_at IS NULL""",
+                (
+                    reservation_id,
+                    session_id,
+                    generation,
+                    state_db_id,
+                    SESSION_PROCESS_AUTHORITY_STATE_FAMILY,
+                    reserved_at,
+                    expires_at,
+                    now,
+                ),
+            ).fetchone()
+            if row is None or not secrets.compare_digest(row[0], token_sha256):
+                return False
+            cursor = conn.execute(
+                """UPDATE session_process_reservations
+                   SET status = 'BOUND', consumed_at = ?
+                   WHERE reservation_id = ? AND status = 'RESERVED'""",
+                (now, reservation_id),
+            )
+            return bool(cursor.rowcount)
+
+        return bool(self._execute_write(_do))
+
+    def revoke_session_process_authority(self, session_id: str) -> bool:
+        """Revoke the live authority once by closing its owning session.
+
+        The normal session-close trigger changes the authority state and emits
+        ``SESSION_REVOKED`` in the exact ``BEGIN IMMEDIATE`` transaction.  A
+        duplicate, unknown, or already-closed request makes no write and is
+        rejected by returning ``False``.
+        """
+        if not isinstance(session_id, str) or not session_id.strip():
+            return False
+
+        now = time.time()
+
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE sessions SET ended_at = ?, end_reason = 'authority_revoked' "
+                "WHERE id = ? AND ended_at IS NULL",
+                (now, session_id),
+            )
+            return bool(cursor.rowcount)
+
+        return bool(self._execute_write(_do))
 
     def create_session_strict(
         self,

@@ -11,6 +11,7 @@ module-level constants live in hermes_state_common.
 import logging
 import json
 import re
+import secrets
 import sqlite3
 from typing import Dict, Optional
 
@@ -26,6 +27,8 @@ from hermes_state_common import (
     LEGACY_FTS_TRIGRAM_SQL,
     SCHEMA_SQL,
     SCHEMA_VERSION,
+    SESSION_PROCESS_AUTHORITY_STATE_DB_ID_BYTES,
+    SESSION_PROCESS_AUTHORITY_STATE_FAMILY,
     TURN_FENCE_GENERATION,
     TURN_FENCE_GOVERNED_TABLES,
     TURN_FENCE_OPERATIONS,
@@ -89,6 +92,110 @@ def schema_read_probe_statements() -> tuple:
 
 class SessionSchemaMixin:
     """See module docstring — mixin for SessionDB (Schema cluster)."""
+
+    @staticmethod
+    def _initialize_session_process_authority_state(cursor: sqlite3.Cursor) -> None:
+        """Provision and verify the durable SessionDB authority identity.
+
+        A database instance is identified by random persistent bytes instead of
+        its path so copied or moved stores cannot silently share capability
+        authority.  Existing session rows are backfilled exactly once; their
+        historical lifecycle is represented by append-only events before any
+        caller can issue a reservation from the reopened database.
+        """
+        identity_key = "session_process_state_db_id"
+        family_key = "session_process_state_family"
+        identity_row = cursor.execute(
+            "SELECT value FROM state_meta WHERE key = ?", (identity_key,)
+        ).fetchone()
+        if identity_row is None:
+            state_db_id = secrets.token_hex(SESSION_PROCESS_AUTHORITY_STATE_DB_ID_BYTES)
+            cursor.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, ?)",
+                (identity_key, state_db_id),
+            )
+        else:
+            state_db_id = identity_row[0]
+        if (
+            not isinstance(state_db_id, str)
+            or len(state_db_id) != SESSION_PROCESS_AUTHORITY_STATE_DB_ID_BYTES * 2
+            or state_db_id.lower() != state_db_id
+            or any(char not in "0123456789abcdef" for char in state_db_id)
+        ):
+            raise sqlite3.DatabaseError(
+                "STATE_DB_AUTHORITY_IDENTITY_INCOMPATIBLE: malformed state_db_id"
+            )
+
+        family_row = cursor.execute(
+            "SELECT value FROM state_meta WHERE key = ?", (family_key,)
+        ).fetchone()
+        if family_row is None:
+            cursor.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, ?)",
+                (family_key, SESSION_PROCESS_AUTHORITY_STATE_FAMILY),
+            )
+        elif family_row[0] != SESSION_PROCESS_AUTHORITY_STATE_FAMILY:
+            raise sqlite3.DatabaseError(
+                "STATE_DB_AUTHORITY_IDENTITY_INCOMPATIBLE: unknown state family"
+            )
+
+        # Rows predating the authority schema did not have a generation.  They
+        # receive their first authority epoch atomically with the schema open;
+        # a genuine reopen advances from there through the sessions trigger.
+        cursor.execute(
+            "UPDATE sessions SET session_generation = 1 "
+            "WHERE session_generation IS NULL OR session_generation < 1"
+        )
+        cursor.execute(
+            """INSERT OR IGNORE INTO session_process_authorities (
+                   session_id, session_generation, state_db_id, state_family,
+                   authority_token, status, issued_at, terminal_at
+               )
+               SELECT s.id, s.session_generation, ?, ?, lower(hex(randomblob(32))),
+                      CASE WHEN s.ended_at IS NULL THEN 'ISSUED'
+                           WHEN s.end_reason = 'authority_revoked' THEN 'REVOKED'
+                           ELSE 'CLOSED' END,
+                      s.started_at, s.ended_at
+               FROM sessions AS s""",
+            (state_db_id, SESSION_PROCESS_AUTHORITY_STATE_FAMILY),
+        )
+        cursor.execute(
+            """INSERT INTO session_process_authority_events (
+                   session_id, session_generation, state_db_id, state_family,
+                   event_type, occurred_at
+               )
+               SELECT a.session_id, a.session_generation, a.state_db_id,
+                      a.state_family, 'SESSION_ISSUED', a.issued_at
+               FROM session_process_authorities AS a
+               WHERE NOT EXISTS (
+                   SELECT 1 FROM session_process_authority_events AS e
+                   WHERE e.session_id = a.session_id
+                     AND e.session_generation = a.session_generation
+                     AND e.event_type = 'SESSION_ISSUED'
+               )"""
+        )
+        cursor.execute(
+            """INSERT INTO session_process_authority_events (
+                   session_id, session_generation, state_db_id, state_family,
+                   event_type, occurred_at
+               )
+               SELECT a.session_id, a.session_generation, a.state_db_id,
+                      a.state_family,
+                      CASE a.status WHEN 'REVOKED' THEN 'SESSION_REVOKED'
+                                    ELSE 'SESSION_CLOSED' END,
+                      a.terminal_at
+               FROM session_process_authorities AS a
+               WHERE a.status IN ('CLOSED', 'REVOKED')
+                 AND a.terminal_at IS NOT NULL
+                 AND NOT EXISTS (
+                     SELECT 1 FROM session_process_authority_events AS e
+                     WHERE e.session_id = a.session_id
+                       AND e.session_generation = a.session_generation
+                       AND e.event_type = CASE a.status
+                           WHEN 'REVOKED' THEN 'SESSION_REVOKED'
+                           ELSE 'SESSION_CLOSED' END
+                 )"""
+        )
 
     def _dedupe_legacy_system_prompts(self, cursor: sqlite3.Cursor) -> None:
         """Move inline prompt snapshots into the shared content-addressed table.
@@ -1316,6 +1423,10 @@ class SessionSchemaMixin:
         # migration was skipped (e.g. due to version renumbering), the
         # column gets created here.
         self._reconcile_columns(cursor)
+
+        # The identity must exist before a raw SQL writer can insert a session
+        # and fire the authority issuance trigger declared in SCHEMA_SQL.
+        self._initialize_session_process_authority_state(cursor)
 
         # Rebuild gateway_routing if it still carries the pre-scope PRIMARY
         # KEY (session_key alone). ADD COLUMN cannot fix a PK, so this is
