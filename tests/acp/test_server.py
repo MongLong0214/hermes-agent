@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+import sqlite3
 from types import SimpleNamespace
 from unittest.mock import MagicMock, AsyncMock, patch
 
@@ -1357,7 +1358,7 @@ class TestAcpTerminalReceipt:
             db.close()
 
     @pytest.mark.anyio
-    async def test_acp_terminal_receipt_run_exception_keeps_claimed_without_assistant_row(
+    async def test_acp_terminal_receipt_run_exception_returns_durable_aborted_without_assistant_row(
         self, agent, mock_manager, tmp_path
     ):
         state = mock_manager.create_session(cwd="/tmp")
@@ -1370,13 +1371,34 @@ class TestAcpTerminalReceipt:
             state.agent.session_id = state.session_id
             state.agent.run_conversation = MagicMock(side_effect=RuntimeError("settlement failed"))
 
-            response = await agent.prompt(
-                prompt=[TextContentBlock(type="text", text=raw_text)],
-                session_id=state.session_id,
-                hermes={"acpTerminalReceipt": metadata},
-            )
+            with patch.object(
+                db,
+                "abort_acp_turn_receipt",
+                wraps=db.abort_acp_turn_receipt,
+            ) as abort_receipt:
+                response = await agent.prompt(
+                    prompt=[TextContentBlock(type="text", text=raw_text)],
+                    session_id=state.session_id,
+                    hermes={"acpTerminalReceipt": metadata},
+                )
 
-            assert self._terminal_meta(response)["status"] == "CLAIMED"
+            terminal = self._terminal_meta(response)
+            assert set(terminal) == {
+                "status",
+                "turnRequestId",
+                "sessionId",
+                "receiptIdentity",
+                "receiptIdentityDigest",
+                "targetBindReceipt",
+                "targetBindReceiptDigest",
+                "receiptId",
+                "evidenceDigest",
+                "reasonCode",
+            }
+            assert terminal["status"] == "ABORTED"
+            assert terminal["reasonCode"] == "HERMES_AGENT_RUN_EXCEPTION"
+            assert "settlement failed" not in json.dumps(terminal, sort_keys=True)
+            abort_receipt.assert_called_once()
             state.agent.run_conversation.assert_called_once()
             receipt = db.get_acp_turn_receipt(
                 state.session_id,
@@ -1384,7 +1406,46 @@ class TestAcpTerminalReceipt:
                 self._internal_target_bind_receipt(metadata),
             )
             assert receipt is not None
-            assert receipt["status"] != "COMPLETED"
+            assert receipt == terminal
+            assert db.get_messages(state.session_id) == []
+        finally:
+            db.close()
+
+    @pytest.mark.anyio
+    async def test_acp_terminal_receipt_abort_write_failure_keeps_claimed_without_assistant_row(
+        self, agent, mock_manager, tmp_path
+    ):
+        """The server re-reads a still-claimed receipt when abort persistence refuses."""
+        state = mock_manager.create_session(cwd="/tmp")
+        db = SessionDB(tmp_path / "abort-write-failure.db")
+        raw_text = "abort write fails after run exception"
+        try:
+            db.create_session(state.session_id, source="test")
+            metadata = self._durable_metadata(db, state.session_id, raw_text)
+            state.agent._session_db = db
+            state.agent.session_id = state.session_id
+            state.agent.run_conversation = MagicMock(side_effect=RuntimeError("hidden failure"))
+
+            with patch.object(
+                db,
+                "abort_acp_turn_receipt",
+                side_effect=sqlite3.DatabaseError("abort write refused"),
+            ) as abort_receipt:
+                response = await agent.prompt(
+                    prompt=[TextContentBlock(type="text", text=raw_text)],
+                    session_id=state.session_id,
+                    hermes={"acpTerminalReceipt": metadata},
+                )
+
+            abort_receipt.assert_called_once()
+            assert self._terminal_meta(response)["status"] == "CLAIMED"
+            receipt = db.get_acp_turn_receipt(
+                state.session_id,
+                metadata["receiptIdentity"],
+                self._internal_target_bind_receipt(metadata),
+            )
+            assert receipt is not None
+            assert receipt["status"] == "CLAIMED"
             assert db.get_messages(state.session_id) == []
         finally:
             db.close()

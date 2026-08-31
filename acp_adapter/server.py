@@ -2423,6 +2423,28 @@ class HermesACPAgent(acp.Agent):
                 return result
             except Exception as e:
                 logger.exception("Agent error in session %s", session_id)
+                if terminal_receipt is not None:
+                    if (
+                        terminal_receipt_db is not None
+                        and isinstance(terminal_receipt_identity, dict)
+                        and isinstance(terminal_receipt_target, dict)
+                    ):
+                        try:
+                            terminal_receipt_db.abort_acp_turn_receipt(
+                                session_id,
+                                terminal_receipt_identity,
+                                terminal_receipt_target,
+                                terminal_receipt.claim_token,
+                                "HERMES_AGENT_RUN_EXCEPTION",
+                            )
+                        except Exception:
+                            logger.debug(
+                                "ACP terminal receipt abort persistence refused",
+                                exc_info=True,
+                            )
+                    # Terminal callers receive only the outcome subsequently
+                    # reread from durable receipt state, never exception text.
+                    return {"final_response": "", "messages": state.history}
                 return {"final_response": f"Error: {e}", "messages": state.history}
             finally:
                 # Restore the interactive contextvar for this context.

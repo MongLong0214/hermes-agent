@@ -567,9 +567,13 @@ CREATE TABLE IF NOT EXISTS turn_receipts (
     claim_token TEXT,
     terminal_message_id INTEGER REFERENCES messages(id) ON DELETE CASCADE,
     response_digest TEXT,
+    abort_receipt_id TEXT,
+    abort_evidence_digest TEXT,
+    abort_reason_code TEXT,
     created_at REAL NOT NULL,
     claimed_at REAL,
-    completed_at REAL
+    completed_at REAL,
+    aborted_at REAL
 );
 
 CREATE TABLE IF NOT EXISTS async_delegations (
