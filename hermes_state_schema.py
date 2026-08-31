@@ -1424,6 +1424,24 @@ class SessionSchemaMixin:
         # column gets created here.
         self._reconcile_columns(cursor)
 
+        # The v28 trigger barrier must replace a retained older-generation
+        # barrier before any data migration or initialization writes a governed
+        # table.  Keep the entry version for the legacy data-migration gates
+        # below: _apply_turn_fence_generation_delta() publishes v28 eagerly.
+        initial_version_row = cursor.execute(
+            "SELECT version FROM schema_version LIMIT 1"
+        ).fetchone()
+        if initial_version_row is None:
+            current_version = 0
+        else:
+            current_version = (
+                initial_version_row["version"]
+                if isinstance(initial_version_row, sqlite3.Row)
+                else initial_version_row[0]
+            )
+        if current_version < SCHEMA_VERSION:
+            self._apply_turn_fence_generation_delta(cursor)
+
         # The identity must exist before a raw SQL writer can insert a session
         # and fire the authority issuance trigger declared in SCHEMA_SQL.
         self._initialize_session_process_authority_state(cursor)
@@ -1502,14 +1520,9 @@ class SessionSchemaMixin:
                     self._drop_fts_triggers(repair_conn)
 
         # ── Schema version bookkeeping ─────────────────────────────────
-        # Bump to current so future data migrations (if any) can gate on
-        # version.  No version-gated column additions remain.
-        cursor.execute("SELECT version FROM schema_version LIMIT 1")
-        row = cursor.fetchone()
-        if row is None:
-            current_version = 0
-        else:
-            current_version = row["version"] if isinstance(row, sqlite3.Row) else row[0]
+        # The entry version was captured before the v28 fence publication so
+        # legacy data migrations keep their established gates.
+        if initial_version_row is not None:
             # Data migrations that can't be expressed declaratively (row
             # backfills, index changes tied to a specific version step) stay
             # in a version-gated chain. Column additions are handled by
@@ -1779,8 +1792,9 @@ class SessionSchemaMixin:
                 and fts5_available
             ):
                 cursor.execute(
-                    "UPDATE schema_version SET version = ?",
-                    (TURN_FENCE_GENERATION - 1,),
+                    "UPDATE schema_version SET version = "
+                    "CASE WHEN version < ? THEN ? ELSE version END",
+                    (TURN_FENCE_GENERATION - 1, TURN_FENCE_GENERATION - 1),
                 )
 
         # Unique title index — always ensure it exists. Older databases may
@@ -1896,9 +1910,6 @@ class SessionSchemaMixin:
                 # AFTER UPDATE OF variants. IF NOT EXISTS cannot rewrite them.
                 if getattr(self, "_fts_enabled", False):
                     self._migrate_broad_fts_update_triggers(cursor)
-
-        if current_version < SCHEMA_VERSION:
-            self._apply_turn_fence_generation_delta(cursor)
 
     def _backfill_gateway_metadata_from_sessions_json(
         self, cursor: sqlite3.Cursor

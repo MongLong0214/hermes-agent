@@ -121,6 +121,25 @@ def _governed_write_cases(conn):
         "(delegation_id, origin_session, state, dispatched_at, updated_at) "
         "VALUES ('async-delete', 'origin', 'pending', 1, 1)"
     )
+    for session_id in ("authority-insert", "authority-update", "authority-delete"):
+        conn.execute(
+            "INSERT INTO sessions (id, source, started_at) VALUES (?, 'cli', 1)",
+            (session_id,),
+        )
+    conn.execute(
+        "DELETE FROM session_process_authorities WHERE session_id = 'authority-insert'"
+    )
+    state_db_id = conn.execute(
+        "SELECT value FROM state_meta WHERE key = 'session_process_state_db_id'"
+    ).fetchone()[0]
+    for reservation_id in ("reservation-update", "reservation-delete"):
+        conn.execute(
+            "INSERT INTO session_process_reservations "
+            "(reservation_id, reservation_token_sha256, session_id, session_generation, "
+            "state_db_id, state_family, status, reserved_at, expires_at) "
+            "VALUES (?, ?, 'authority-update', 1, ?, 'sessiondb-v1', 'RESERVED', 1, 2)",
+            (reservation_id, "a" * 64, state_db_id),
+        )
     return (
         ("messages", "INSERT", "INSERT INTO messages (session_id, role, content, timestamp) VALUES ('messages-parent', 'user', 'insert', 2)", "SELECT COUNT(*) FROM messages WHERE content = 'insert'"),
         ("messages", "UPDATE", f"UPDATE messages SET content = 'after' WHERE id = {message_id}", f"SELECT content FROM messages WHERE id = {message_id}"),
@@ -146,6 +165,12 @@ def _governed_write_cases(conn):
         ("async_delegations", "INSERT", "INSERT INTO async_delegations (delegation_id, origin_session, state, dispatched_at, updated_at) VALUES ('async-insert', 'origin', 'pending', 1, 1)", "SELECT COUNT(*) FROM async_delegations WHERE delegation_id = 'async-insert'"),
         ("async_delegations", "UPDATE", "UPDATE async_delegations SET state = 'done' WHERE delegation_id = 'async-update'", "SELECT state FROM async_delegations WHERE delegation_id = 'async-update'"),
         ("async_delegations", "DELETE", "DELETE FROM async_delegations WHERE delegation_id = 'async-delete'", "SELECT COUNT(*) FROM async_delegations WHERE delegation_id = 'async-delete'"),
+        ("session_process_authorities", "INSERT", f"INSERT INTO session_process_authorities (session_id, session_generation, state_db_id, state_family, authority_token, status, issued_at) VALUES ('authority-insert', 1, '{state_db_id}', 'sessiondb-v1', '{'b' * 64}', 'ISSUED', 1)", "SELECT COUNT(*) FROM session_process_authorities WHERE session_id = 'authority-insert'"),
+        ("session_process_authorities", "UPDATE", f"UPDATE session_process_authorities SET authority_token = '{'b' * 64}' WHERE session_id = 'authority-update'", "SELECT authority_token FROM session_process_authorities WHERE session_id = 'authority-update'"),
+        ("session_process_authorities", "DELETE", "DELETE FROM session_process_authorities WHERE session_id = 'authority-delete'", "SELECT COUNT(*) FROM session_process_authorities WHERE session_id = 'authority-delete'"),
+        ("session_process_reservations", "INSERT", f"INSERT INTO session_process_reservations (reservation_id, reservation_token_sha256, session_id, session_generation, state_db_id, state_family, status, reserved_at, expires_at) VALUES ('reservation-insert', '{'c' * 64}', 'authority-update', 1, '{state_db_id}', 'sessiondb-v1', 'RESERVED', 1, 2)", "SELECT COUNT(*) FROM session_process_reservations WHERE reservation_id = 'reservation-insert'"),
+        ("session_process_reservations", "UPDATE", "UPDATE session_process_reservations SET status = 'BOUND' WHERE reservation_id = 'reservation-update'", "SELECT status FROM session_process_reservations WHERE reservation_id = 'reservation-update'"),
+        ("session_process_reservations", "DELETE", "DELETE FROM session_process_reservations WHERE reservation_id = 'reservation-delete'", "SELECT COUNT(*) FROM session_process_reservations WHERE reservation_id = 'reservation-delete'"),
     )
 
 
@@ -228,3 +253,168 @@ def test_turn_fence_generation_wrong_or_throwing_function_fails_before_mutation(
             raw.close()
     finally:
         db.close()
+
+
+_LEGACY_V27_GOVERNED_TABLES = tuple(
+    table
+    for table in TURN_FENCE_GOVERNED_TABLES
+    if table not in {"session_process_authorities", "session_process_reservations"}
+)
+_LEGACY_TURN_FENCE_OPERATIONS = ("INSERT", "UPDATE", "DELETE")
+
+
+def _create_populated_v27_database(db_path, session_ids):
+    """Build the parent-v27 storage shape, including its generation-27 fence."""
+    initial = SessionDB(db_path)
+    initial.close()
+
+    legacy = sqlite3.connect(str(db_path))
+    try:
+        for name, in legacy.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+            "AND (name LIKE 'turn_fence_%' OR name LIKE 'session_process_%')"
+        ):
+            legacy.execute(f'DROP TRIGGER "{name}"')
+        legacy.execute("PRAGMA foreign_keys = OFF")
+        legacy.execute("DROP TABLE session_process_reservations")
+        legacy.execute("DROP TABLE session_process_authority_events")
+        legacy.execute("DROP TABLE session_process_authorities")
+        legacy.execute("ALTER TABLE sessions DROP COLUMN session_generation")
+        legacy.execute(
+            "DELETE FROM state_meta WHERE key IN "
+            "('session_process_state_db_id', 'session_process_state_family')"
+        )
+        legacy.execute("DELETE FROM schema_version")
+        legacy.execute("INSERT INTO schema_version (version) VALUES (27)")
+        legacy.create_function("hermes_turn_fence_generation", 0, lambda: 27)
+        for session_id in session_ids:
+            legacy.execute(
+                "INSERT INTO sessions (id, source, started_at) VALUES (?, 'cli', 1)",
+                (session_id,),
+            )
+        for table in _LEGACY_V27_GOVERNED_TABLES:
+            for operation in _LEGACY_TURN_FENCE_OPERATIONS:
+                legacy.execute(
+                    f"CREATE TRIGGER turn_fence_{table}_{operation.lower()} "
+                    f"BEFORE {operation} ON {table} BEGIN "
+                    "SELECT CASE "
+                    "WHEN typeof(hermes_turn_fence_generation()) != 'integer' "
+                    "OR hermes_turn_fence_generation() != 27 "
+                    "THEN RAISE(ABORT, 'state DB generation incompatible') "
+                    "END; END"
+                )
+        legacy.commit()
+    finally:
+        legacy.close()
+
+
+@pytest.mark.parametrize("session_ids", [(), ("v27-a", "v27-b")])
+def test_v28_migrates_empty_and_populated_v27_databases_before_authority_backfill(
+    tmp_path, session_ids
+):
+    """The v28 fence is live before it backfills authority over v27 sessions."""
+    db_path = tmp_path / "state.db"
+    _create_populated_v27_database(db_path, session_ids)
+
+    db = SessionDB(db_path)
+    try:
+        assert [
+            tuple(row)
+            for row in db._conn.execute("SELECT version FROM schema_version")
+        ] == [(28,)]
+        expected_sessions = [(session_id, 1) for session_id in session_ids]
+        assert [
+            tuple(row)
+            for row in db._conn.execute(
+                "SELECT id, session_generation FROM sessions ORDER BY id"
+            )
+        ] == expected_sessions
+        expected_authorities = [(session_id, 1, "ISSUED") for session_id in session_ids]
+        assert [
+            tuple(row)
+            for row in db._conn.execute(
+                "SELECT session_id, session_generation, status "
+                "FROM session_process_authorities ORDER BY session_id"
+            )
+        ] == expected_authorities
+        assert [
+            tuple(row)
+            for row in db._conn.execute(
+                "SELECT session_id, session_generation, event_type "
+                "FROM session_process_authority_events ORDER BY session_id, id"
+            )
+        ] == [(session_id, 1, "SESSION_ISSUED") for session_id in session_ids]
+    finally:
+        db.close()
+
+    reopened = SessionDB(db_path)
+    try:
+        assert tuple(
+            reopened._conn.execute(
+                "SELECT COUNT(*) FROM session_process_authorities"
+            ).fetchone()
+        ) == (len(session_ids),)
+        assert tuple(
+            reopened._conn.execute(
+                "SELECT COUNT(*) FROM session_process_authority_events"
+            ).fetchone()
+        ) == (len(session_ids),)
+    finally:
+        reopened.close()
+
+    for label, generation in (("unregistered", None), ("old-v27", 27)):
+        external = sqlite3.connect(str(db_path))
+        try:
+            if generation is not None:
+                external.create_function(
+                    "hermes_turn_fence_generation", 0, lambda: generation
+                )
+            with pytest.raises(sqlite3.DatabaseError):
+                external.execute(
+                    "INSERT INTO gateway_routing "
+                    "(scope, session_key, entry_json, updated_at) "
+                    "VALUES ('', ?, '{}', 1)",
+                    (label,),
+                )
+            assert external.execute(
+                "SELECT COUNT(*) FROM gateway_routing WHERE session_key = ?", (label,)
+            ).fetchone() == (0,)
+        finally:
+            external.close()
+
+
+def test_v28_fence_install_failure_rolls_back_a_populated_v27_upgrade(tmp_path, monkeypatch):
+    """A failed v28 fence install leaves no authority backfill or v28 DDL behind."""
+    db_path = tmp_path / "state.db"
+    _create_populated_v27_database(db_path, ("v27-a", "v27-b"))
+    _FailAfterOneTurnFenceTriggerCursor.trigger_creations = 0
+    real_connect = hermes_state._connect_tracked_db
+
+    def connect_with_v28_failure(*args, **kwargs):
+        kwargs["factory"] = _FailAfterOneTurnFenceTriggerConnection
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(hermes_state, "_connect_tracked_db", connect_with_v28_failure)
+
+    with pytest.raises(sqlite3.OperationalError, match="forced v27 trigger failure"):
+        SessionDB(db_path=db_path)
+
+    check = sqlite3.connect(str(db_path))
+    try:
+        assert check.execute("SELECT version FROM schema_version").fetchall() == [(27,)]
+        assert {
+            row[1] for row in check.execute("PRAGMA table_info(sessions)").fetchall()
+        }.isdisjoint({"session_generation"})
+        assert check.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name LIKE 'session_process_%'"
+        ).fetchall() == []
+        assert check.execute(
+            "SELECT key FROM state_meta WHERE key LIKE 'session_process_state_%'"
+        ).fetchall() == []
+        assert [
+            tuple(row)
+            for row in check.execute("SELECT id, source, started_at FROM sessions ORDER BY id")
+        ] == [("v27-a", "cli", 1.0), ("v27-b", "cli", 1.0)]
+    finally:
+        check.close()
