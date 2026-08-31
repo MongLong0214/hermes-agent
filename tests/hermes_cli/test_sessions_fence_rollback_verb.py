@@ -290,3 +290,199 @@ def test_refused_payload_carries_only_the_fields_the_run_actually_produced(
     assert set(payload["refused"]) == {"reason", "detail"}
     assert payload["refused"]["reason"] == "offline-authority-unknown"
     assert payload["store"] == str(store)
+
+
+# ---------------------------------------------------------------------------
+# N2a. Exact, fail-closed OFFLINE authority production and verification.
+# ---------------------------------------------------------------------------
+
+
+def _offline_authority_inputs(tmp_path):
+    """Persist the three existing authority surfaces in a disposable fixture."""
+    source_db = tmp_path / "offline-authority.db"
+    with sqlite3.connect(source_db) as conn:
+        conn.execute(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, git_metadata_generation INTEGER NOT NULL)"
+        )
+        conn.execute(
+            "CREATE TABLE session_turn_leases (conversation_id TEXT PRIMARY KEY)"
+        )
+        conn.execute(
+            "INSERT INTO sessions VALUES (?, ?)", ("session-offline", 7)
+        )
+
+    identity = {
+        "pid": 4242,
+        "create_time": 1700000000.25,
+        "argv": "/usr/bin/hermes serve",
+    }
+    ledger_path = tmp_path / "spawn-ledger.json"
+    ledger_path.write_text(
+        json.dumps([{**identity, "purpose": "serve", "install": "fixture"}]),
+        encoding="utf-8",
+    )
+    checkpoint_path = tmp_path / "processes.json"
+    checkpoint_path.write_text("[]", encoding="utf-8")
+    return source_db, identity, ledger_path, checkpoint_path
+
+
+def test_exact_offline_identity_produces_one_verifiable_authority(tmp_path):
+    from hermes_cli.session_fence_rollback import (
+        establish_offline_authority,
+        verify_offline_authority,
+    )
+
+    source_db, identity, ledger_path, checkpoint_path = _offline_authority_inputs(tmp_path)
+    authority = establish_offline_authority(
+        source_db,
+        session_id="session-offline",
+        process_identity=identity,
+        ledger_path=ledger_path,
+        checkpoint_path=checkpoint_path,
+        active_sessions=(),
+        liveness=lambda pid, create_time: False,
+        issued_at=1700000001.0,
+        nonce="n2a-fixture-nonce",
+    )
+
+    assert authority["schema_version"] == 1
+    assert authority["target"]["session_id"] == "session-offline"
+    assert authority["target"]["session_generation"] == 7
+    assert verify_offline_authority(
+        authority,
+        source_db,
+        session_id="session-offline",
+        process_identity=identity,
+        ledger_path=ledger_path,
+        checkpoint_path=checkpoint_path,
+        active_sessions=(),
+        liveness=lambda pid, create_time: False,
+    ) is True
+
+
+@pytest.mark.parametrize("case", ["live", "birth-reused"])
+def test_authority_refuses_live_or_birth_reused_process_identity(tmp_path, case):
+    from hermes_cli.session_fence_rollback import (
+        TurnFenceRollbackRefused,
+        establish_offline_authority,
+    )
+
+    source_db, identity, ledger_path, checkpoint_path = _offline_authority_inputs(tmp_path)
+    if case == "live":
+        candidate = identity
+        liveness = lambda pid, create_time: True
+        expected_reason = "offline-authority-active"
+    else:
+        candidate = {**identity, "create_time": identity["create_time"] + 1}
+        liveness = lambda pid, create_time: False
+        expected_reason = "offline-authority-identity-mismatch"
+
+    with pytest.raises(TurnFenceRollbackRefused) as refused:
+        establish_offline_authority(
+            source_db,
+            session_id="session-offline",
+            process_identity=candidate,
+            ledger_path=ledger_path,
+            checkpoint_path=checkpoint_path,
+            active_sessions=(),
+            liveness=liveness,
+        )
+    assert refused.value.reason == expected_reason
+
+
+def test_verifier_rejects_wrong_session_generation_and_source_identity(tmp_path):
+    from hermes_cli.session_fence_rollback import (
+        establish_offline_authority,
+        verify_offline_authority,
+    )
+
+    source_db, identity, ledger_path, checkpoint_path = _offline_authority_inputs(tmp_path)
+    authority = establish_offline_authority(
+        source_db,
+        session_id="session-offline",
+        process_identity=identity,
+        ledger_path=ledger_path,
+        checkpoint_path=checkpoint_path,
+        active_sessions=(),
+        liveness=lambda pid, create_time: False,
+        issued_at=1700000001.0,
+        nonce="n2a-verifier-nonce",
+    )
+
+    assert not verify_offline_authority(
+        authority,
+        source_db,
+        session_id="wrong-session",
+        process_identity=identity,
+        ledger_path=ledger_path,
+        checkpoint_path=checkpoint_path,
+        active_sessions=(),
+        liveness=lambda pid, create_time: False,
+    )
+    forged = json.loads(json.dumps(authority))
+    forged["source"]["db"]["sha256"] = "0" * 64
+    assert not verify_offline_authority(
+        forged,
+        source_db,
+        session_id="session-offline",
+        process_identity=identity,
+        ledger_path=ledger_path,
+        checkpoint_path=checkpoint_path,
+        active_sessions=(),
+        liveness=lambda pid, create_time: False,
+    )
+    with sqlite3.connect(source_db) as conn:
+        conn.execute(
+            "UPDATE sessions SET git_metadata_generation = git_metadata_generation + 1"
+        )
+    assert not verify_offline_authority(
+        authority,
+        source_db,
+        session_id="session-offline",
+        process_identity=identity,
+        ledger_path=ledger_path,
+        checkpoint_path=checkpoint_path,
+        active_sessions=(),
+        liveness=lambda pid, create_time: False,
+    )
+
+    copied_source = tmp_path / "same-content-different-identity.db"
+    copied_source.write_bytes(source_db.read_bytes())
+    assert not verify_offline_authority(
+        authority,
+        copied_source,
+        session_id="session-offline",
+        process_identity=identity,
+        ledger_path=ledger_path,
+        checkpoint_path=checkpoint_path,
+        active_sessions=(),
+        liveness=lambda pid, create_time: False,
+    )
+
+
+def test_authority_change_between_reads_refuses_stale(tmp_path):
+    from hermes_cli.session_fence_rollback import (
+        TurnFenceRollbackRefused,
+        establish_offline_authority,
+    )
+
+    source_db, identity, ledger_path, checkpoint_path = _offline_authority_inputs(tmp_path)
+
+    def mutate_on_liveness_check(pid, create_time):
+        with sqlite3.connect(source_db) as conn:
+            conn.execute(
+                "UPDATE sessions SET git_metadata_generation = git_metadata_generation + 1"
+            )
+        return False
+
+    with pytest.raises(TurnFenceRollbackRefused) as refused:
+        establish_offline_authority(
+            source_db,
+            session_id="session-offline",
+            process_identity=identity,
+            ledger_path=ledger_path,
+            checkpoint_path=checkpoint_path,
+            active_sessions=(),
+            liveness=mutate_on_liveness_check,
+        )
+    assert refused.value.reason == "offline-authority-stale"

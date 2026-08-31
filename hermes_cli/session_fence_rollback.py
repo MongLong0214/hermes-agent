@@ -11,9 +11,10 @@ WHO CALLS IT, AND WHAT IS CURRENTLY REACHABLE
     ``hermes sessions fence-rollback`` — :mod:`hermes_cli.session_fence_rollback_cmd`
     — and nothing else in the tree. Both entry points below —
     :func:`rollback_turn_fence` and :func:`rehearse_turn_fence_rollback` —
-    refuse before they observe the store: :func:`disqualify_the_target` and
-    :func:`establish_offline_authority` run first, and the second always
-    raises. The store is never opened, copied or written to.
+    refuse before they observe the store: their bare call to
+    :func:`establish_offline_authority` has no target session/process authority
+    bindings and therefore fails closed. The store is never opened, copied or
+    written to by the verb.
 
 THIS IS THE REACHABLE CONTRACT ONLY
     An earlier revision of this module also carried the backup/commit engine
@@ -52,9 +53,15 @@ THE RETURN LEG
 
 from __future__ import annotations
 
+import hashlib
+import json
+import math
 import os
+import secrets
+import sqlite3
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterable, Mapping
 
 import hermes_state_common
 
@@ -233,50 +240,407 @@ def disqualify_the_target(artifact: Path) -> None:
         )
 
 
-def establish_offline_authority(artifact: Path) -> None:
-    """The external route, and in this build it always refuses. Deliberately.
+_OFFLINE_AUTHORITY_SCHEMA_VERSION = 1
+_OFFLINE_AUTHORITY_KIND = "hermes.offline-session-authority"
+_OFFLINE_AUTHORITY_ROOT_KEYS = frozenset(
+    {"schema_version", "kind", "issued_at", "nonce", "target", "source", "digest"}
+)
+_OFFLINE_AUTHORITY_TARGET_KEYS = frozenset(
+    {"session_id", "session_generation", "process"}
+)
+_OFFLINE_AUTHORITY_PROCESS_KEYS = frozenset({"pid", "create_time", "argv"})
+_OFFLINE_AUTHORITY_SOURCE_KEYS = frozenset(
+    {
+        "db",
+        "schema_generation",
+        "ledger_digest",
+        "checkpoint_digest",
+        "active_sessions_digest",
+    }
+)
+_OFFLINE_AUTHORITY_DB_KEYS = frozenset({"device", "inode", "size", "sha256"})
 
-    WHAT WOULD HAVE TO BE TRUE
-        The success path is permitted on a detached artifact whose offline
-        authority was established elsewhere. The only producer of a detached
-        ``state.db`` in this tree is
-        :func:`hermes_cli.backup.create_quick_snapshot`, which copies through
-        the SQLite backup API into a staging directory and renames it into
-        place with a ``manifest.json`` beside it. That is a real detachment;
-        the manifest is not a binding.
 
-    WHY IT CANNOT BE READ AS ONE, MEASURED
-        ``manifest.json`` records ``files[rel] = SIZE`` and nothing else — see
-        ``hermes_cli/backup.py``, where ``manifest`` is a ``Dict[str, int]``.
-        Replacing a snapshot's ``state.db`` with a DIFFERENT database of the
-        same size leaves the id, the path and the size entry all agreeing while
-        the contents are another store. That was run against this exact tree,
-        not argued from the source. So a manifest entry cannot say which
-        database the artifact is, and provenance built on it would be a
-        capability in name only.
+def _authority_refusal(reason: str) -> None:
+    raise TurnFenceRollbackRefused(
+        "offline authority could not be established; nothing was changed",
+        reason=reason,
+    )
 
-    WHAT HAPPENS INSTEAD
-        This refuses, with its own reason, and the refusal is the deliverable.
-        Binding contents needs the PRODUCER to record something that identifies
-        them — a separate slice with its own evidence, not something to infer
-        here. Until then a verb that refuses what it cannot prove is worth more
-        than one whose success rests on a size field, and none of the shapes
-        that would manufacture a success are permitted to stand in for the
-        proof: not a flag, not a manifest path the caller chooses, not a lease
-        or process scan, and not "the path is outside HERMES_HOME". Every one
-        of those is an inference, and inference is the thing being withdrawn.
+
+def _canonical_authority_digest(payload: Mapping[str, Any]) -> str:
+    """Digest closed-schema authority bytes, excluding only its digest field."""
+    unsigned = {key: value for key, value in payload.items() if key != "digest"}
+    encoded = json.dumps(
+        unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _file_identity(path: Path) -> dict[str, Any]:
+    """Read one regular-file identity and content digest without authorising a race."""
+    try:
+        before = os.stat(path)
+        if not os.path.isfile(path):
+            _authority_refusal(DISQUALIFICATION_REASONS["unknown"])
+        data = path.read_bytes()
+        after = os.stat(path)
+    except OSError:
+        _authority_refusal(DISQUALIFICATION_REASONS["unknown"])
+    if (before.st_dev, before.st_ino, before.st_size) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+    ):
+        _authority_refusal("offline-authority-stale")
+    return {
+        "device": int(before.st_dev),
+        "inode": int(before.st_ino),
+        "size": int(before.st_size),
+        "sha256": hashlib.sha256(data).hexdigest(),
+    }
+
+
+def _read_json_authority(path: Path) -> tuple[list[dict[str, Any]], str]:
+    identity = _file_identity(path)
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        _authority_refusal(DISQUALIFICATION_REASONS["unknown"])
+    if not isinstance(parsed, list) or any(not isinstance(item, dict) for item in parsed):
+        _authority_refusal(DISQUALIFICATION_REASONS["unknown"])
+    if _file_identity(path) != identity:
+        _authority_refusal("offline-authority-stale")
+    return parsed, identity["sha256"]
+
+
+def _normalise_process_identity(process_identity: Mapping[str, Any]) -> dict[str, Any]:
+    if not isinstance(process_identity, Mapping):
+        _authority_refusal(DISQUALIFICATION_REASONS["unknown"])
+    pid = process_identity.get("pid")
+    create_time = process_identity.get("create_time")
+    argv = process_identity.get("argv")
+    if (
+        isinstance(pid, bool)
+        or not isinstance(pid, int)
+        or pid <= 0
+        or isinstance(create_time, bool)
+        or not isinstance(create_time, (int, float))
+        or not math.isfinite(float(create_time))
+        or float(create_time) <= 0
+        or not isinstance(argv, str)
+        or not argv.strip()
+    ):
+        _authority_refusal(DISQUALIFICATION_REASONS["unknown"])
+    return {"pid": pid, "create_time": float(create_time), "argv": argv}
+
+
+def _read_source_authority(source_db: Path, session_id: str) -> dict[str, Any]:
+    """Bind one session row and lease state to one read-only SQLite snapshot."""
+    identity_before = _file_identity(source_db)
+    try:
+        with sqlite3.connect(f"{source_db.resolve().as_uri()}?mode=ro", uri=True) as conn:
+            conn.execute("PRAGMA query_only = ON")
+            conn.execute("BEGIN")
+            schema_generation = conn.execute("PRAGMA schema_version").fetchone()[0]
+            row = conn.execute(
+                "SELECT id, git_metadata_generation FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            leased = conn.execute(
+                "SELECT 1 FROM session_turn_leases WHERE conversation_id = ? LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            conn.rollback()
+    except (OSError, sqlite3.Error, ValueError):
+        _authority_refusal(DISQUALIFICATION_REASONS["unknown"])
+    if (
+        row is None
+        or not isinstance(row[0], str)
+        or row[0] != session_id
+        or isinstance(row[1], bool)
+        or not isinstance(row[1], int)
+        or row[1] < 0
+        or leased is not None
+    ):
+        _authority_refusal(DISQUALIFICATION_REASONS["unknown"])
+    identity_after = _file_identity(source_db)
+    if identity_after != identity_before:
+        _authority_refusal("offline-authority-stale")
+    return {
+        "db": identity_after,
+        "schema_generation": int(schema_generation),
+        "session_generation": int(row[1]),
+    }
+
+
+def _default_authority_paths() -> tuple[Path, Path]:
+    from hermes_cli import process_identity
+    from tools import process_registry as registry_module
+
+    return Path(process_identity._ledger_path()), Path(registry_module.CHECKPOINT_PATH)
+
+
+def _default_active_sessions() -> tuple[dict[str, Any], ...]:
+    from tools.process_registry import process_registry
+
+    with process_registry._lock:
+        return tuple(
+            {
+                "session_id": session.id,
+                "parent_session_id": session.parent_session_id,
+                "pid": session.pid,
+                "create_time": session.host_start_time,
+                "argv": session.command,
+                "exited": session.exited,
+            }
+            for session in process_registry._running.values()
+        )
+
+
+def _active_sessions_digest(
+    active_sessions: Iterable[Mapping[str, Any]], session_id: str
+) -> str:
+    """Reject any active entry attached to the target; bind the observed set."""
+    observed = []
+    for entry in active_sessions:
+        if not isinstance(entry, Mapping):
+            _authority_refusal(DISQUALIFICATION_REASONS["unknown"])
+        if entry.get("parent_session_id") == session_id and not entry.get("exited", False):
+            _authority_refusal("offline-authority-active")
+        observed.append(
+            {
+                "session_id": str(entry.get("session_id", "")),
+                "parent_session_id": str(entry.get("parent_session_id", "")),
+                "pid": entry.get("pid"),
+                "create_time": entry.get("create_time"),
+                "argv": str(entry.get("argv", "")),
+                "exited": bool(entry.get("exited", False)),
+            }
+        )
+    return _canonical_authority_digest({"active_sessions": observed})
+
+
+def _capture_offline_authority(
+    source_db: Path,
+    *,
+    session_id: str,
+    process_identity: Mapping[str, Any],
+    ledger_path: Path,
+    checkpoint_path: Path,
+    active_sessions: Iterable[Mapping[str, Any]],
+    liveness: Callable[[int, float], bool | None],
+) -> dict[str, Any]:
+    """Read, cross-check, and generation-compare all persisted authorities."""
+    if not isinstance(session_id, str) or not session_id:
+        _authority_refusal(DISQUALIFICATION_REASONS["unknown"])
+    process = _normalise_process_identity(process_identity)
+    source_before = _read_source_authority(source_db, session_id)
+    ledger_before, ledger_digest_before = _read_json_authority(ledger_path)
+    checkpoint_before, checkpoint_digest_before = _read_json_authority(checkpoint_path)
+    active_digest_before = _active_sessions_digest(active_sessions, session_id)
+
+    matching_ledger = [
+        entry
+        for entry in ledger_before
+        if entry.get("pid") == process["pid"]
+        and entry.get("create_time") == process["create_time"]
+        and entry.get("argv") == process["argv"]
+    ]
+    if len(matching_ledger) != 1:
+        _authority_refusal("offline-authority-identity-mismatch")
+    if any(
+        entry.get("parent_session_id") == session_id
+        and not entry.get("exited", False)
+        for entry in checkpoint_before
+    ):
+        _authority_refusal("offline-authority-active")
+
+    alive = liveness(process["pid"], process["create_time"])
+    if alive is True:
+        _authority_refusal("offline-authority-active")
+    if alive is not False:
+        _authority_refusal(DISQUALIFICATION_REASONS["unknown"])
+
+    # No one SQLite transaction can include the ledger/checkpoint files.  Re-read
+    # every source and reject any changed generation/identity rather than joining
+    # incompatible observations into a plausible-looking authority.
+    source_after = _read_source_authority(source_db, session_id)
+    ledger_after, ledger_digest_after = _read_json_authority(ledger_path)
+    checkpoint_after, checkpoint_digest_after = _read_json_authority(checkpoint_path)
+    active_digest_after = _active_sessions_digest(active_sessions, session_id)
+    if (
+        source_after != source_before
+        or ledger_after != ledger_before
+        or checkpoint_after != checkpoint_before
+        or ledger_digest_after != ledger_digest_before
+        or checkpoint_digest_after != checkpoint_digest_before
+        or active_digest_after != active_digest_before
+    ):
+        _authority_refusal("offline-authority-stale")
+
+    return {
+        "target": {
+            "session_id": session_id,
+            "session_generation": source_before["session_generation"],
+            "process": process,
+        },
+        "source": {
+            "db": source_before["db"],
+            "schema_generation": source_before["schema_generation"],
+            "ledger_digest": ledger_digest_before,
+            "checkpoint_digest": checkpoint_digest_before,
+            "active_sessions_digest": active_digest_before,
+        },
+    }
+
+
+def establish_offline_authority(
+    artifact: Path,
+    *,
+    session_id: str | None = None,
+    process_identity: Mapping[str, Any] | None = None,
+    ledger_path: Path | None = None,
+    checkpoint_path: Path | None = None,
+    active_sessions: Iterable[Mapping[str, Any]] | None = None,
+    liveness: Callable[[int, float], bool | None] | None = None,
+    issued_at: float | None = None,
+    nonce: str | None = None,
+) -> dict[str, Any]:
+    """Produce a closed-schema OFFLINE authority, or refuse before rollback.
+
+    The public rollback verb provides none of the target bindings and continues
+    to refuse.  A later, separately-authorised consumer must present this
+    artifact to :func:`verify_offline_authority`; this producer never mutates a
+    store or invokes rollback work.
     """
     artifact = Path(artifact)
     disqualify_the_target(artifact)
-    raise TurnFenceRollbackRefused(
-        f"no capability in this build can establish that {artifact} is offline, "
-        "so the rollback is refused. The only producer of a detached state.db "
-        "here is the quick snapshot, whose manifest records file SIZE only — a "
-        "same-size replacement satisfies it while the contents are a different "
-        "database — so nothing available proves which store an artifact is or "
-        "that it is detached. Nothing was changed",
-        reason=DISQUALIFICATION_REASONS["unknown"],
+    if session_id is None or process_identity is None:
+        _authority_refusal(DISQUALIFICATION_REASONS["unknown"])
+    if ledger_path is None or checkpoint_path is None:
+        ledger_path, checkpoint_path = _default_authority_paths()
+    if active_sessions is None:
+        active_sessions = _default_active_sessions()
+    if liveness is None:
+        from hermes_cli.process_identity import _pid_alive_matches
+
+        liveness = _pid_alive_matches
+    captured = _capture_offline_authority(
+        artifact,
+        session_id=session_id,
+        process_identity=process_identity,
+        ledger_path=Path(ledger_path),
+        checkpoint_path=Path(checkpoint_path),
+        active_sessions=tuple(active_sessions),
+        liveness=liveness,
     )
+    if issued_at is None:
+        issued_at = time.time()
+    if (
+        isinstance(issued_at, bool)
+        or not isinstance(issued_at, (int, float))
+        or not math.isfinite(float(issued_at))
+        or not isinstance(nonce, (str, type(None)))
+        or (nonce is not None and not nonce)
+    ):
+        _authority_refusal(DISQUALIFICATION_REASONS["unknown"])
+    authority = {
+        "schema_version": _OFFLINE_AUTHORITY_SCHEMA_VERSION,
+        "kind": _OFFLINE_AUTHORITY_KIND,
+        "issued_at": float(issued_at),
+        "nonce": nonce if nonce is not None else secrets.token_hex(32),
+        **captured,
+    }
+    authority["digest"] = _canonical_authority_digest(authority)
+    return authority
+
+
+def _closed_authority(authority: object) -> bool:
+    if not isinstance(authority, dict) or set(authority) != _OFFLINE_AUTHORITY_ROOT_KEYS:
+        return False
+    if (
+        authority.get("schema_version") != _OFFLINE_AUTHORITY_SCHEMA_VERSION
+        or authority.get("kind") != _OFFLINE_AUTHORITY_KIND
+        or isinstance(authority.get("issued_at"), bool)
+        or not isinstance(authority.get("issued_at"), (int, float))
+        or not math.isfinite(float(authority["issued_at"]))
+        or not isinstance(authority.get("nonce"), str)
+        or not authority["nonce"]
+        or not isinstance(authority.get("digest"), str)
+        or len(authority["digest"]) != 64
+    ):
+        return False
+    target = authority.get("target")
+    source = authority.get("source")
+    if not isinstance(target, dict) or set(target) != _OFFLINE_AUTHORITY_TARGET_KEYS:
+        return False
+    if not isinstance(source, dict) or set(source) != _OFFLINE_AUTHORITY_SOURCE_KEYS:
+        return False
+    process = target.get("process")
+    db = source.get("db")
+    if not isinstance(process, dict) or set(process) != _OFFLINE_AUTHORITY_PROCESS_KEYS:
+        return False
+    if not isinstance(db, dict) or set(db) != _OFFLINE_AUTHORITY_DB_KEYS:
+        return False
+    try:
+        _normalise_process_identity(process)
+    except TurnFenceRollbackRefused:
+        return False
+    return (
+        isinstance(target.get("session_id"), str)
+        and bool(target["session_id"])
+        and isinstance(target.get("session_generation"), int)
+        and not isinstance(target.get("session_generation"), bool)
+        and target["session_generation"] >= 0
+        and isinstance(source.get("schema_generation"), int)
+        and not isinstance(source.get("schema_generation"), bool)
+        and all(isinstance(source.get(key), str) and len(source[key]) == 64 for key in (
+            "ledger_digest", "checkpoint_digest", "active_sessions_digest"
+        ))
+        and all(isinstance(db.get(key), int) and not isinstance(db.get(key), bool) and db[key] >= 0 for key in (
+            "device", "inode", "size"
+        ))
+        and isinstance(db.get("sha256"), str)
+        and len(db["sha256"]) == 64
+        and _canonical_authority_digest(authority) == authority["digest"]
+    )
+
+
+def verify_offline_authority(
+    authority: object,
+    artifact: Path,
+    *,
+    session_id: str,
+    process_identity: Mapping[str, Any],
+    ledger_path: Path | None = None,
+    checkpoint_path: Path | None = None,
+    active_sessions: Iterable[Mapping[str, Any]] | None = None,
+    liveness: Callable[[int, float], bool | None] | None = None,
+) -> bool:
+    """Recompute an authority from live sources without enabling mutation."""
+    if not _closed_authority(authority):
+        return False
+    try:
+        expected_process = _normalise_process_identity(process_identity)
+    except TurnFenceRollbackRefused:
+        return False
+    if authority["target"]["session_id"] != session_id or authority["target"]["process"] != expected_process:
+        return False
+    try:
+        current = establish_offline_authority(
+            artifact,
+            session_id=session_id,
+            process_identity=expected_process,
+            ledger_path=ledger_path,
+            checkpoint_path=checkpoint_path,
+            active_sessions=active_sessions,
+            liveness=liveness,
+            issued_at=authority["issued_at"],
+            nonce=authority["nonce"],
+        )
+    except TurnFenceRollbackRefused:
+        return False
+    return current == authority
 
 
 class RollbackOutcome:
