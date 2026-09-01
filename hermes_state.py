@@ -5740,10 +5740,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return "no more rows available" in str(exc).lower()
 
         def _is_explicit_fts_commit_error(exc: BaseException) -> bool:
-            """A commit replay needs FTS-specific error evidence, not SQLITE_CORRUPT."""
+            """A commit replay needs one direct, exact supported FTS5 signature."""
             return (
-                isinstance(exc, sqlite3.DatabaseError)
-                and "fts5:" in str(exc).lower()
+                type(exc) is sqlite3.DatabaseError
+                and str(exc)
+                in {
+                    'fts5: corrupt structure record for table "messages_fts"',
+                    'fts5: corrupt structure record for table "messages_fts_trigram"',
+                    'fts5: corrupt structure record for table "messages_fts_cjk"',
+                }
             )
 
         def _recovery_is_replay_safe(exc: BaseException) -> bool:
@@ -5764,7 +5769,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     )
                     or (
                         commit_failure_definitely_rolled_back
-                        and isinstance(exc, sqlite3.DatabaseError)
                         and _is_explicit_fts_commit_error(exc)
                     )
                 )
@@ -5803,7 +5807,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         # callback can safely be replayed.
                         commit_failure_had_active_transaction = (
                             commit_attempted
-                            and isinstance(exc, sqlite3.DatabaseError)
                             and _is_explicit_fts_commit_error(exc)
                             and conn.in_transaction
                         )
