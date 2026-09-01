@@ -339,7 +339,12 @@ def _copy_direct_tables(
         if not source_columns:
             continue
         dest_columns = _table_columns(dest, table)
-        columns = [c for c in dest_columns if c in source_columns]
+        columns = [
+            column
+            for column in dest_columns
+            if column in source_columns
+            and not (table == "sessions" and column == "session_generation")
+        ]
         if not columns:
             continue
         quoted = ", ".join(f'"{c}"' for c in columns)

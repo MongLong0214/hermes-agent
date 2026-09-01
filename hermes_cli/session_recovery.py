@@ -60,6 +60,8 @@ _TOPIC_TABLES = (
 # table. A fresh destination must generate them from its own current schema.
 _GENERATED_META_KEYS = frozenset({
     _OFFLINE_REBUILD_EPOCH_KEY,
+    "session_process_state_db_id",
+    "session_process_state_family",
     "fts_storage_version",
     "fts_optimize_available",
     "fts_rebuild_high_water",
@@ -786,7 +788,12 @@ def _copy_table(
 ) -> dict[str, Any]:
     source_columns = _table_columns(source, table)
     destination_columns = _table_columns(destination, table)
-    columns = [column for column in destination_columns if column in source_columns]
+    columns = [
+        column
+        for column in destination_columns
+        if column in source_columns
+        and not (table == "sessions" and column == "session_generation")
+    ]
     result: dict[str, Any] = {
         "source_rows": source_rows,
         "copied_rows": 0,
@@ -982,7 +989,12 @@ def _copy_table_salvage(
 
     source_columns = _table_columns(source, table)
     destination_columns = _table_columns(destination, table)
-    columns = [column for column in destination_columns if column in source_columns]
+    columns = [
+        column
+        for column in destination_columns
+        if column in source_columns
+        and not (table == "sessions" and column == "session_generation")
+    ]
     result: dict[str, Any] = {
         "mode": "rowid_range_salvage",
         "source_rows": source_rows,
