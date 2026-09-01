@@ -136,13 +136,17 @@ def test_cli_close_preflush_resumed_prefix_is_not_duplicated(tmp_path, monkeypat
     entered_flush = threading.Event()
     release_flush = threading.Event()
     flush_calls = 0
+    terminal_receipt_holds = []
 
     def _pause_before_flush(
         messages: list[dict[str, Any]],
         conversation_history: list[dict[str, Any]] | None = None,
+        *,
+        terminal_receipt_hold=None,
     ) -> None:
         nonlocal flush_calls
         flush_calls += 1
+        terminal_receipt_holds.append(terminal_receipt_hold)
         if flush_calls == 1:
             # The worker has assigned its snapshot and is now paused before its
             # regular DB write. The concurrent close call must stay live.
@@ -156,6 +160,7 @@ def test_cli_close_preflush_resumed_prefix_is_not_duplicated(tmp_path, monkeypat
             agent,
             messages,
             conversation_history if conversation_history is not None else [],
+            terminal_receipt_hold=terminal_receipt_hold,
         )
 
     agent._flush_messages_to_session_db = _pause_before_flush
@@ -190,6 +195,9 @@ def test_cli_close_preflush_resumed_prefix_is_not_duplicated(tmp_path, monkeypat
     close_worker.join(timeout=5)
     assert not worker.is_alive()
     assert not close_worker.is_alive()
+    # Both the turn-start and close persistence paths cross the strict spy.
+    assert flush_calls == 2
+    assert terminal_receipt_holds == [None, None]
 
     stored = db.get_messages_as_conversation(session_id)
     assert [m["content"] for m in stored] == [
