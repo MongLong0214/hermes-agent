@@ -641,21 +641,185 @@ class TestWebServerEndpoints:
         assert response.json()["sessions"] == []
         assert response.json()["total"] == 0
 
-    def test_concurrent_first_load_reads_all_succeed_on_fresh_store(self):
-        from concurrent.futures import ThreadPoolExecutor
+    def test_concurrent_first_load_reads_all_succeed_on_fresh_store(self, monkeypatch, tmp_path):
+        """Followers must not probe the SQLite file before its first DDL."""
+        from concurrent.futures import ThreadPoolExecutor, wait
 
+        import sqlite3
+
+        import hermes_state
+        from hermes_cli import web_server
+        from hermes_constants import get_hermes_home
+        from starlette.testclient import TestClient
+
+        db_path = (get_hermes_home() / "state.db").resolve()
+        init_entered = threading.Event()
+        release_init = threading.Event()
+        readers_arrived = threading.Event()
+        allow_readers = threading.Event()
+        observed_lock = threading.Lock()
+        reader_open_calls = 0
+        original_init_schema = hermes_state.SessionDB._init_schema
+        original_open = web_server._open_session_db_at_path
+
+        def hold_first_schema_ddl(self, *args, **kwargs):
+            if (
+                not self.read_only
+                and Path(self.db_path).resolve() == db_path
+                and not init_entered.is_set()
+            ):
+                init_entered.set()
+                assert release_init.wait(timeout=30), "test did not release bootstrap"
+            return original_init_schema(self, *args, **kwargs)
+
+        def observe_read_only_open(path, *, read_only):
+            nonlocal reader_open_calls
+            if (
+                read_only
+                and init_entered.is_set()
+                and not release_init.is_set()
+                and Path(path).resolve() == db_path
+            ):
+                with observed_lock:
+                    reader_open_calls += 1
+                    if reader_open_calls == 7:
+                        readers_arrived.set()
+                assert allow_readers.wait(timeout=10), "test did not release readers"
+            return original_open(path, read_only=read_only)
+
+        monkeypatch.setattr(hermes_state.SessionDB, "_init_schema", hold_first_schema_ddl)
+        monkeypatch.setattr(web_server, "_open_session_db_at_path", observe_read_only_open)
+        client = TestClient(web_server.app, raise_server_exceptions=False)
+        client.headers[web_server._SESSION_HEADER_NAME] = web_server._SESSION_TOKEN
         paths = [
             "/api/sessions?limit=50&offset=0",
             "/api/sessions/stats",
             "/api/sessions/empty/count",
             "/api/sessions?limit=10&offset=0&order=recent",
         ] * 2
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            responses = list(pool.map(self.client.get, paths))
+        try:
+            with ThreadPoolExecutor(max_workers=len(paths)) as pool:
+                bootstrap = pool.submit(client.get, paths[0])
+                assert init_entered.wait(timeout=10), "bootstrap did not reach schema init"
+                readers = [pool.submit(client.get, path) for path in paths[1:]]
+                assert readers_arrived.wait(timeout=10), "not every follower reached the real open"
+                assert reader_open_calls == len(readers)
 
-        assert [response.status_code for response in responses] == [
-            200
-        ] * len(paths)
+                allow_readers.set()
+                done, pending = wait(readers, timeout=10)
+                if done:
+                    release_init.set()
+                assert not done, [future.result().status_code for future in done]
+                assert len(pending) == len(readers)
+
+                release_init.set()
+                responses = [future.result(timeout=10) for future in readers]
+                assert bootstrap.result(timeout=10).status_code == 200
+        finally:
+            allow_readers.set()
+            release_init.set()
+            client.close()
+
+        assert [response.status_code for response in responses] == [200] * len(paths[1:])
+
+        failure_path = (tmp_path / "failed-bootstrap.db").resolve()
+        failure_init_entered = threading.Event()
+        release_failure = threading.Event()
+        follower_waiting = threading.Event()
+
+        class ObservedReadiness:
+            def __init__(self):
+                self.done = self.Done()
+                self.error = None
+
+            class Done:
+                def __init__(self):
+                    self.event = threading.Event()
+
+                def set(self):
+                    self.event.set()
+
+                def wait(self, timeout=None):
+                    follower_waiting.set()
+                    return self.event.wait(timeout)
+
+        def fail_first_schema_ddl(self, *args, **kwargs):
+            if (
+                not self.read_only
+                and Path(self.db_path).resolve() == failure_path
+            ):
+                failure_init_entered.set()
+                assert release_failure.wait(timeout=30), "test did not release failed bootstrap"
+                raise sqlite3.OperationalError("forced fresh-store bootstrap failure")
+            return original_init_schema(self, *args, **kwargs)
+
+        monkeypatch.setattr(
+            web_server, "_SessionDBFreshStoreReadiness", ObservedReadiness
+        )
+        monkeypatch.setattr(hermes_state.SessionDB, "_init_schema", fail_first_schema_ddl)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            failed_owner = pool.submit(
+                web_server._open_session_db_at_path, failure_path, read_only=True
+            )
+            assert failure_init_entered.wait(timeout=10), "failed writer did not start"
+            failed_follower = pool.submit(
+                web_server._open_session_db_at_path, failure_path, read_only=True
+            )
+            assert follower_waiting.wait(timeout=10), "follower did not wait for failure"
+            release_failure.set()
+            for future in (failed_owner, failed_follower):
+                with pytest.raises(
+                    sqlite3.OperationalError, match="forced fresh-store bootstrap failure"
+                ):
+                    future.result(timeout=10)
+
+        assert str(failure_path) not in getattr(
+            web_server, "_session_db_fresh_store_readiness"
+        )
+
+        blocked_path = (tmp_path / "blocked.db").resolve()
+        independent_path = (tmp_path / "independent.db").resolve()
+        healthy_path = (tmp_path / "healthy.db").resolve()
+        blocked_init_entered = threading.Event()
+        independent_init_entered = threading.Event()
+        release_blocked_init = threading.Event()
+        healthy_seed = hermes_state.SessionDB(db_path=healthy_path)
+        healthy_seed.close()
+
+        def hold_only_blocked_schema_ddl(self, *args, **kwargs):
+            path = Path(self.db_path).resolve()
+            if not self.read_only and path == blocked_path:
+                blocked_init_entered.set()
+                assert release_blocked_init.wait(timeout=30), "test did not release blocked path"
+            if not self.read_only and path == independent_path:
+                independent_init_entered.set()
+            return original_init_schema(self, *args, **kwargs)
+
+        monkeypatch.setattr(
+            hermes_state.SessionDB, "_init_schema", hold_only_blocked_schema_ddl
+        )
+        pool = ThreadPoolExecutor(max_workers=3)
+        try:
+            blocked_open = pool.submit(
+                web_server._open_session_db_at_path, blocked_path, read_only=True
+            )
+            assert blocked_init_entered.wait(timeout=10), "blocked writer did not start"
+            independent_open = pool.submit(
+                web_server._open_session_db_at_path, independent_path, read_only=True
+            )
+            assert independent_init_entered.wait(timeout=10), "independent path was blocked"
+            independent_db = independent_open.result(timeout=10)
+            independent_db.close()
+            healthy_db = pool.submit(
+                web_server._open_session_db_at_path, healthy_path, read_only=True
+            ).result(timeout=10)
+            healthy_db.close()
+        finally:
+            release_blocked_init.set()
+            pool.shutdown(wait=True)
+
+        blocked_db = blocked_open.result(timeout=10)
+        blocked_db.close()
 
 
 
