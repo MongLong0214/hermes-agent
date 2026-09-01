@@ -1105,6 +1105,172 @@ def test_mapper_rebuilds_sessiondb_from_synthetic_lost_and_found(
         db.close()
 
 
+def test_mapper_schema_less_current_session_mints_destination_authority(
+    tmp_path: Path,
+) -> None:
+    """A current page-level row must not import its source generation/capabilities."""
+    source_session_id = "20260831_235959_abc123"
+    source_authority_token = "a" * 64
+    source_reservation_token = "b" * 64
+    source_reservation_id = "source-reservation-id"
+
+    lf_path = tmp_path / "current-layout-lost-and-found.db"
+    SessionDB(db_path=lf_path).close()
+    lf_conn = sqlite3.connect(str(lf_path), isolation_level=None)
+    output = tmp_path / "mapped.db"
+    SessionDB(db_path=output).close()
+    dest = sqlite3.connect(str(output), isolation_level=None)
+    try:
+        register_turn_fence_generation(lf_conn)
+        session_columns = [
+            str(row[1]) for row in dest.execute("PRAGMA table_info(sessions)")
+        ]
+        generation_index = session_columns.index("session_generation")
+        assert len(session_columns) == 57
+        assert generation_index == 29
+
+        source_state_db_id = lf_conn.execute(
+            "SELECT value FROM state_meta WHERE key = 'session_process_state_db_id'"
+        ).fetchone()[0]
+        lf_conn.execute(
+            "INSERT INTO session_process_authorities "
+            "(session_id, session_generation, state_db_id, state_family, "
+            "authority_token, status, issued_at) VALUES (?, 2, ?, 'sessiondb-v1', "
+            "?, 'ISSUED', 1)",
+            (source_session_id, source_state_db_id, source_authority_token),
+        )
+        lf_conn.execute(
+            "INSERT INTO session_process_authority_events "
+            "(session_id, session_generation, state_db_id, state_family, "
+            "event_type, reservation_id, occurred_at) "
+            "VALUES (?, 2, ?, 'sessiondb-v1', 'SESSION_ISSUED', ?, 1)",
+            (source_session_id, source_state_db_id, source_reservation_id),
+        )
+        lf_conn.execute(
+            "INSERT INTO session_process_reservations "
+            "(reservation_id, reservation_token_sha256, session_id, "
+            "session_generation, state_db_id, state_family, status, reserved_at, "
+            "expires_at) VALUES (?, ?, ?, 2, ?, 'sessiondb-v1', 'RESERVED', 1, 2)",
+            (
+                source_reservation_id,
+                source_reservation_token,
+                source_session_id,
+                source_state_db_id,
+            ),
+        )
+
+        cells = ", ".join(f"c{index}" for index in range(len(session_columns)))
+        lf_conn.execute(
+            "CREATE TABLE lost_and_found "
+            f"(rootpgno INTEGER, pgno INTEGER, nfield INTEGER, id INTEGER, {cells})"
+        )
+        source_values = {
+            "id": source_session_id,
+            "source": "telegram",
+            "started_at": 1_754_000_000.0,
+            "message_count": 7,
+            "session_generation": 2,
+            "billing_provider": "source-billing-provider",
+            "billing_base_url": "https://source.invalid/api",
+            "billing_mode": "source-billing-mode",
+            "estimated_cost_usd": 12.5,
+            "actual_cost_usd": 9.25,
+            "cost_status": "source-cost-status",
+            "cost_source": "source-cost-source",
+            "pricing_version": "source-pricing-version",
+            "title": "schema-less current-layout title",
+            "title_source": "source-title",
+            "last_activity_at": 1_754_000_001.0,
+            "last_activity_description": "aligned later field",
+            "last_activity_provenance": "source-provenance",
+            "api_call_count": 11,
+            "handoff_state": "source-handoff-state",
+            "handoff_platform": "source-handoff-platform",
+            "handoff_error": "source-handoff-error",
+            "profile_name": "source-profile",
+            "rewind_count": 3,
+        }
+        recovered_row = [source_values.get(column) for column in session_columns]
+        assert recovered_row[generation_index] == 2
+        placeholders = ", ".join("?" for _ in range(4 + len(recovered_row)))
+        lf_conn.execute(
+            f"INSERT INTO lost_and_found VALUES ({placeholders})",
+            [2, 5, len(recovered_row), 1, *recovered_row],
+        )
+
+        # The real recovery path reopens a SessionDB destination and registers
+        # the generation UDF before mapping page-level lost-and-found rows.
+        register_turn_fence_generation(dest)
+        mapping = map_lost_and_found_rows(lf_conn, dest)
+
+        assert mapping["mapped"]["sessions"] == 1
+        assert mapping["unmapped_rows"] == 0
+        assert dest.execute(
+            "SELECT session_generation FROM sessions WHERE id = ?",
+            (source_session_id,),
+        ).fetchone() == (1,)
+        assert dest.execute(
+            "SELECT billing_provider, billing_base_url, billing_mode, "
+            "estimated_cost_usd, actual_cost_usd, cost_status, cost_source, "
+            "pricing_version, title, title_source, last_activity_at, "
+            "last_activity_description, last_activity_provenance, api_call_count, "
+            "handoff_state, handoff_platform, handoff_error, profile_name, "
+            "rewind_count FROM sessions WHERE id = ?",
+            (source_session_id,),
+        ).fetchone() == (
+            "source-billing-provider",
+            "https://source.invalid/api",
+            "source-billing-mode",
+            12.5,
+            9.25,
+            "source-cost-status",
+            "source-cost-source",
+            "source-pricing-version",
+            "schema-less current-layout title",
+            "source-title",
+            1_754_000_001.0,
+            "aligned later field",
+            "source-provenance",
+            11,
+            "source-handoff-state",
+            "source-handoff-platform",
+            "source-handoff-error",
+            "source-profile",
+            3,
+        )
+
+        destination_state_db_id = dest.execute(
+            "SELECT value FROM state_meta WHERE key = 'session_process_state_db_id'"
+        ).fetchone()[0]
+        authority = dest.execute(
+            "SELECT session_generation, state_db_id, state_family, authority_token, "
+            "status FROM session_process_authorities WHERE session_id = ?",
+            (source_session_id,),
+        ).fetchone()
+        assert authority[:3] == (1, destination_state_db_id, "sessiondb-v1")
+        assert authority[3] != source_authority_token
+        assert len(authority[3]) == 64
+        assert authority[4] == "ISSUED"
+        assert dest.execute(
+            "SELECT session_generation, state_db_id, event_type, reservation_id "
+            "FROM session_process_authority_events WHERE session_id = ?",
+            (source_session_id,),
+        ).fetchall() == [(1, destination_state_db_id, "SESSION_ISSUED", None)]
+        assert dest.execute(
+            "SELECT COUNT(*) FROM session_process_reservations WHERE session_id = ?",
+            (source_session_id,),
+        ).fetchone() == (0,)
+    finally:
+        lf_conn.close()
+        dest.close()
+
+    recovered_db = SessionDB(db_path=output)
+    try:
+        assert len(recovered_db.list_sessions_rich(limit=10)) == 1
+    finally:
+        recovered_db.close()
+
+
 # ── issue #72291: source-fingerprint error must name the parent CLI ─────────
 
 

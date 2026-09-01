@@ -465,10 +465,26 @@ def map_lost_and_found_rows(
                         if inserted:
                             report["legacy_minimal_sessions"] += 1
                     else:
-                        values = list(cells[: min(nfield, len(sessions_columns))])
+                        source_values = cells[: min(nfield, len(sessions_columns))]
+                        session_pairs = [
+                            (column, value)
+                            for column, value in zip(sessions_columns, source_values)
+                            if column != "session_generation"
+                        ]
+                        columns = [column for column, _value in session_pairs]
+                        values = [value for _column, value in session_pairs]
+                        session_defaults_by_column = {
+                            sessions_columns[index]: substitute
+                            for index, substitute in sessions_defaults.items()
+                        }
+                        paired_session_defaults = {
+                            index: session_defaults_by_column[column]
+                            for index, (column, _value) in enumerate(session_pairs)
+                            if column in session_defaults_by_column
+                        }
                         inserted = _insert_prefix_row(
-                            dest, "sessions", sessions_columns, values,
-                            sessions_defaults,
+                            dest, "sessions", columns, values,
+                            paired_session_defaults,
                         )
                 except sqlite3.DatabaseError:
                     report["unmapped_rows"] += 1
