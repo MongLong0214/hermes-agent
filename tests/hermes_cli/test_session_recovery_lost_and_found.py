@@ -913,9 +913,14 @@ def _make_synthetic_lost_and_found(
                 "message_count": 2,
                 "title": f"synthetic {session_id}",
             }
-            return [base.get(column) for column in sessions_columns[:ncols]]
+            source_columns = (
+                _REAL_52_SESSION_COLUMNS
+                if ncols == len(_REAL_52_SESSION_COLUMNS)
+                else sessions_columns
+            )
+            return [base.get(column) for column in source_columns[:ncols]]
 
-        # Current layout (dynamic width) and historical 52-column layout.
+        # Current layout (dynamic width) and literal real 52-column layout.
         insert(max_fields, 1, session_row("20260101_010101_aaa001", max_fields))
         insert(52, 2, session_row("20260202_020202_bbb002", 52))
         # 14-column legacy layout: identity + a plausible epoch timestamp.
@@ -1267,6 +1272,238 @@ def test_mapper_schema_less_current_session_mints_destination_authority(
     recovered_db = SessionDB(db_path=output)
     try:
         assert len(recovered_db.list_sessions_rich(limit=10)) == 1
+    finally:
+        recovered_db.close()
+
+
+# Literal layouts from the immutable schema DDLs, deliberately independent of
+# the current destination schema and production mapper layout declarations.
+_REAL_52_SESSION_COLUMNS = (
+    "id", "source", "user_id", "session_key", "chat_id", "chat_type",
+    "thread_id", "display_name", "origin_json", "expiry_finalized", "model",
+    "model_config", "system_prompt", "system_prompt_hash", "parent_session_id",
+    "started_at", "ended_at", "end_reason", "message_count", "tool_call_count",
+    "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
+    "reasoning_tokens", "cwd", "git_branch", "git_repo_root",
+    "billing_provider", "billing_base_url", "billing_mode", "estimated_cost_usd",
+    "actual_cost_usd", "cost_status", "cost_source", "pricing_version", "title",
+    "last_activity_at", "last_activity_description", "last_activity_provenance",
+    "api_call_count", "handoff_state", "handoff_platform", "handoff_error",
+    "compression_failure_cooldown_until", "compression_failure_error",
+    "compression_fallback_streak", "compression_ineffective_count", "profile_name",
+    "rewind_count", "archived", "pinned",
+)
+
+_IMMEDIATE_PRE_V28_56_SESSION_COLUMNS = (
+    "id", "source", "user_id", "session_key", "chat_id", "chat_type",
+    "thread_id", "display_name", "origin_json", "expiry_finalized", "model",
+    "model_config", "system_prompt", "system_prompt_hash", "parent_session_id",
+    "started_at", "ended_at", "end_reason", "message_count", "tool_call_count",
+    "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
+    "reasoning_tokens", "cwd", "git_branch", "git_repo_root",
+    "git_metadata_generation", "billing_provider", "billing_base_url", "billing_mode",
+    "estimated_cost_usd", "actual_cost_usd", "cost_status", "cost_source",
+    "pricing_version", "title", "title_source", "last_activity_at",
+    "last_activity_description", "last_activity_provenance", "api_call_count",
+    "handoff_state", "handoff_platform", "handoff_error",
+    "compression_failure_cooldown_until", "compression_failure_error",
+    "compression_fallback_streak", "compression_ineffective_count", "profile_name",
+    "rewind_count", "archived", "pinned", "hidden", "last_read_at",
+)
+
+
+@pytest.mark.parametrize(
+    ("source_columns", "layout_name"),
+    [
+        pytest.param(
+            _REAL_52_SESSION_COLUMNS,
+            "real-52",
+            id="real-52-7d066c3c-layout",
+        ),
+        pytest.param(
+            _IMMEDIATE_PRE_V28_56_SESSION_COLUMNS,
+            "pre-v28-56",
+            id="pre-v28-56-30a0f23-layout",
+        ),
+    ],
+)
+def test_mapper_schema_less_historical_session_layout_preserves_field_meanings(
+    tmp_path: Path,
+    source_columns: tuple[str, ...],
+    layout_name: str,
+) -> None:
+    """Historical schema-less rows retain each source field's named meaning."""
+    width = len(source_columns)
+    assert width in {52, 56}
+    assert "session_generation" not in source_columns
+    if width == 52:
+        assert "git_metadata_generation" not in source_columns
+    else:
+        assert source_columns[28] == "git_metadata_generation"
+
+    source_session_id = f"20260901_1200{width:02d}_abc{width:03d}"
+    source_authority_token = ("a" if width == 52 else "b") * 64
+    source_reservation_token = ("c" if width == 52 else "d") * 64
+    source_reservation_id = f"source-reservation-{layout_name}"
+    source_values = {
+        "id": source_session_id,
+        "source": "telegram" if width == 52 else "discord",
+        "user_id": f"source-user-{layout_name}",
+        "session_key": f"source-key-{layout_name}",
+        "chat_id": f"source-chat-{layout_name}",
+        "chat_type": "group",
+        "thread_id": f"source-thread-{layout_name}",
+        "display_name": f"source-display-{layout_name}",
+        "origin_json": f'{{"layout": "{layout_name}"}}',
+        "expiry_finalized": 1,
+        "model": f"source-model-{layout_name}",
+        "model_config": f'{{"model": "{layout_name}"}}',
+        "system_prompt": None,
+        "system_prompt_hash": None,
+        "parent_session_id": None,
+        "started_at": 1_754_000_000.0 + width,
+        "ended_at": 1_754_000_100.0 + width,
+        "end_reason": f"source-end-{layout_name}",
+        "message_count": width,
+        "tool_call_count": width + 1,
+        "input_tokens": width + 2,
+        "output_tokens": width + 3,
+        "cache_read_tokens": width + 4,
+        "cache_write_tokens": width + 5,
+        "reasoning_tokens": width + 6,
+        "cwd": f"/source/{layout_name}",
+        "git_branch": f"source-branch-{layout_name}",
+        "git_repo_root": f"/source/repo-{layout_name}",
+        "git_metadata_generation": width + 7,
+        "billing_provider": f"source-provider-{layout_name}",
+        "billing_base_url": f"https://{layout_name}.invalid/api",
+        "billing_mode": f"source-billing-mode-{layout_name}",
+        "estimated_cost_usd": width + 0.125,
+        "actual_cost_usd": width + 0.25,
+        "cost_status": f"source-cost-status-{layout_name}",
+        "cost_source": f"source-cost-source-{layout_name}",
+        "pricing_version": f"source-pricing-{layout_name}",
+        "title": f"source-title-{layout_name}",
+        "title_source": f"source-title-source-{layout_name}",
+        "last_activity_at": 1_754_000_200.0 + width,
+        "last_activity_description": f"source-activity-{layout_name}",
+        "last_activity_provenance": f"source-provenance-{layout_name}",
+        "api_call_count": width + 8,
+        "handoff_state": f"source-handoff-state-{layout_name}",
+        "handoff_platform": f"source-handoff-platform-{layout_name}",
+        "handoff_error": f"source-handoff-error-{layout_name}",
+        "compression_failure_cooldown_until": 1_754_000_300.0 + width,
+        "compression_failure_error": f"source-compression-error-{layout_name}",
+        "compression_fallback_streak": width + 9,
+        "compression_ineffective_count": width + 10,
+        "profile_name": f"source-profile-{layout_name}",
+        "rewind_count": width + 11,
+        "archived": 1 if width == 52 else 0,
+        "pinned": 0 if width == 52 else 1,
+        "hidden": 1,
+        "last_read_at": 1_754_000_400.0 + width,
+    }
+    recovered_row = [source_values[column] for column in source_columns]
+
+    lf_path = tmp_path / f"{layout_name}-lost-and-found.db"
+    SessionDB(db_path=lf_path).close()
+    output = tmp_path / f"{layout_name}-mapped.db"
+    SessionDB(db_path=output).close()
+    lf_conn = sqlite3.connect(str(lf_path), isolation_level=None)
+    dest = sqlite3.connect(str(output), isolation_level=None)
+    try:
+        register_turn_fence_generation(lf_conn)
+        source_state_db_id = lf_conn.execute(
+            "SELECT value FROM state_meta WHERE key = 'session_process_state_db_id'"
+        ).fetchone()[0]
+        lf_conn.execute(
+            "INSERT INTO session_process_authorities "
+            "(session_id, session_generation, state_db_id, state_family, "
+            "authority_token, status, issued_at) VALUES (?, 2, ?, 'sessiondb-v1', "
+            "?, 'ISSUED', 1)",
+            (source_session_id, source_state_db_id, source_authority_token),
+        )
+        lf_conn.execute(
+            "INSERT INTO session_process_authority_events "
+            "(session_id, session_generation, state_db_id, state_family, "
+            "event_type, reservation_id, occurred_at) "
+            "VALUES (?, 2, ?, 'sessiondb-v1', 'SESSION_ISSUED', ?, 1)",
+            (source_session_id, source_state_db_id, source_reservation_id),
+        )
+        lf_conn.execute(
+            "INSERT INTO session_process_reservations "
+            "(reservation_id, reservation_token_sha256, session_id, "
+            "session_generation, state_db_id, state_family, status, reserved_at, "
+            "expires_at) VALUES (?, ?, ?, 2, ?, 'sessiondb-v1', 'RESERVED', 1, 2)",
+            (
+                source_reservation_id,
+                source_reservation_token,
+                source_session_id,
+                source_state_db_id,
+            ),
+        )
+        cells = ", ".join(f"c{index}" for index in range(width))
+        lf_conn.execute(
+            "CREATE TABLE lost_and_found "
+            f"(rootpgno INTEGER, pgno INTEGER, nfield INTEGER, id INTEGER, {cells})"
+        )
+        placeholders = ", ".join("?" for _ in range(4 + width))
+        lf_conn.execute(
+            f"INSERT INTO lost_and_found VALUES ({placeholders})",
+            [2, 5, width, 1, *recovered_row],
+        )
+
+        register_turn_fence_generation(dest)
+        mapping = map_lost_and_found_rows(lf_conn, dest)
+
+        assert mapping["mapped"]["sessions"] == 1
+        assert mapping["unmapped_rows"] == 0
+        quoted = ", ".join(f'"{column}"' for column in source_columns)
+        assert dest.execute(
+            f"SELECT {quoted} FROM sessions WHERE id = ?", (source_session_id,)
+        ).fetchone() == tuple(source_values[column] for column in source_columns)
+        assert dest.execute(
+            "SELECT session_generation FROM sessions WHERE id = ?",
+            (source_session_id,),
+        ).fetchone() == (1,)
+        if width == 52:
+            assert dest.execute(
+                "SELECT git_metadata_generation, title_source, hidden, last_read_at "
+                "FROM sessions WHERE id = ?",
+                (source_session_id,),
+            ).fetchone() == (0, None, 0, None)
+
+        destination_state_db_id = dest.execute(
+            "SELECT value FROM state_meta WHERE key = 'session_process_state_db_id'"
+        ).fetchone()[0]
+        assert destination_state_db_id != source_state_db_id
+        authority = dest.execute(
+            "SELECT session_generation, state_db_id, state_family, authority_token, "
+            "status FROM session_process_authorities WHERE session_id = ?",
+            (source_session_id,),
+        ).fetchone()
+        assert authority[:3] == (1, destination_state_db_id, "sessiondb-v1")
+        assert authority[3] != source_authority_token
+        assert len(authority[3]) == 64
+        assert authority[4] == "ISSUED"
+        assert dest.execute(
+            "SELECT session_generation, state_db_id, event_type, reservation_id "
+            "FROM session_process_authority_events WHERE session_id = ?",
+            (source_session_id,),
+        ).fetchall() == [(1, destination_state_db_id, "SESSION_ISSUED", None)]
+        assert dest.execute(
+            "SELECT COUNT(*) FROM session_process_reservations WHERE session_id = ?",
+            (source_session_id,),
+        ).fetchone() == (0,)
+    finally:
+        lf_conn.close()
+        dest.close()
+
+    recovered_db = SessionDB(db_path=output)
+    try:
+        assert recovered_db._conn.execute(
+            "SELECT COUNT(*) FROM sessions"
+        ).fetchone()[0] == 1
     finally:
         recovered_db.close()
 

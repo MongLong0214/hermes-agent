@@ -44,10 +44,48 @@ KNOWN_SOURCES = frozenset({
     "tool", "subagent", "cron", "recovered", "imported", "acp",
 })
 
-# Historical physical layouts of the sessions table. Columns are only ever
-# appended (ALTER TABLE ADD COLUMN), so an older record is a strict prefix of
-# the current column order.
-SESSIONS_LAYOUT_NFIELDS = frozenset({55, 54, 52})
+# Known physical source layouts. The 52-column schema at 7d066c3c predates
+# git_metadata_generation, session_generation, title_source, hidden, and
+# last_read_at; the 56-column schema at 30a0f23f predates only
+# session_generation. These are not prefixes of the current layout because
+# the generations were inserted before billing metadata.
+SESSIONS_LAYOUT_NFIELDS = frozenset({52, 56, 57})
+_SESSIONS_REAL_52_COLUMNS = (
+    "id", "source", "user_id", "session_key", "chat_id", "chat_type",
+    "thread_id", "display_name", "origin_json", "expiry_finalized", "model",
+    "model_config", "system_prompt", "system_prompt_hash", "parent_session_id",
+    "started_at", "ended_at", "end_reason", "message_count", "tool_call_count",
+    "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
+    "reasoning_tokens", "cwd", "git_branch", "git_repo_root",
+    "billing_provider", "billing_base_url", "billing_mode", "estimated_cost_usd",
+    "actual_cost_usd", "cost_status", "cost_source", "pricing_version", "title",
+    "last_activity_at", "last_activity_description", "last_activity_provenance",
+    "api_call_count", "handoff_state", "handoff_platform", "handoff_error",
+    "compression_failure_cooldown_until", "compression_failure_error",
+    "compression_fallback_streak", "compression_ineffective_count", "profile_name",
+    "rewind_count", "archived", "pinned",
+)
+_SESSIONS_PRE_V28_56_COLUMNS = (
+    "id", "source", "user_id", "session_key", "chat_id", "chat_type",
+    "thread_id", "display_name", "origin_json", "expiry_finalized", "model",
+    "model_config", "system_prompt", "system_prompt_hash", "parent_session_id",
+    "started_at", "ended_at", "end_reason", "message_count", "tool_call_count",
+    "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
+    "reasoning_tokens", "cwd", "git_branch", "git_repo_root",
+    "git_metadata_generation", "billing_provider", "billing_base_url", "billing_mode",
+    "estimated_cost_usd", "actual_cost_usd", "cost_status", "cost_source",
+    "pricing_version", "title", "title_source", "last_activity_at",
+    "last_activity_description", "last_activity_provenance", "api_call_count",
+    "handoff_state", "handoff_platform", "handoff_error",
+    "compression_failure_cooldown_until", "compression_failure_error",
+    "compression_fallback_streak", "compression_ineffective_count", "profile_name",
+    "rewind_count", "archived", "pinned", "hidden", "last_read_at",
+)
+_SESSIONS_HISTORICAL_LAYOUTS = {
+    len(_SESSIONS_REAL_52_COLUMNS): _SESSIONS_REAL_52_COLUMNS,
+    len(_SESSIONS_PRE_V28_56_COLUMNS): _SESSIONS_PRE_V28_56_COLUMNS,
+}
+_CURRENT_SESSIONS_NFIELD = 57
 SESSIONS_LEGACY_MINIMAL_NFIELD = 14
 SESSION_MODEL_USAGE_NFIELD = 18
 
@@ -288,6 +326,16 @@ def classify_lost_and_found_row(
     return None
 
 
+def _session_source_columns(
+    nfield: int,
+    destination_columns: list[str],
+) -> Optional[tuple[str, ...]]:
+    """Return the proven source layout, never a positional destination guess."""
+    if nfield == _CURRENT_SESSIONS_NFIELD and len(destination_columns) == nfield:
+        return tuple(destination_columns)
+    return _SESSIONS_HISTORICAL_LAYOUTS.get(nfield)
+
+
 def _heuristic_started_at(cells: tuple[Any, ...]) -> float:
     for value in cells:
         if isinstance(value, (int, float)) and _EPOCH_LOW <= float(value) <= _EPOCH_HIGH:
@@ -465,11 +513,24 @@ def map_lost_and_found_rows(
                         if inserted:
                             report["legacy_minimal_sessions"] += 1
                     else:
-                        source_values = cells[: min(nfield, len(sessions_columns))]
+                        source_columns = _session_source_columns(
+                            nfield, sessions_columns
+                        )
+                        if (
+                            source_columns is None
+                            or len(cells) < len(source_columns)
+                        ):
+                            # A session-shaped row without one proven complete
+                            # layout must not be reinterpreted against the
+                            # destination's positional order.
+                            report["unmapped_rows"] += 1
+                            continue
+                        source_by_column = dict(zip(source_columns, cells))
                         session_pairs = [
-                            (column, value)
-                            for column, value in zip(sessions_columns, source_values)
-                            if column != "session_generation"
+                            (column, source_by_column[column])
+                            for column in sessions_columns
+                            if column in source_by_column
+                            and column != "session_generation"
                         ]
                         columns = [column for column, _value in session_pairs]
                         values = [value for _column, value in session_pairs]
