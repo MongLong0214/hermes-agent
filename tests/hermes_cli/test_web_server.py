@@ -773,9 +773,10 @@ class TestWebServerEndpoints:
                 ):
                     future.result(timeout=10)
 
-        assert str(failure_path) not in getattr(
-            web_server, "_session_db_fresh_store_readiness"
-        )
+        failed_readiness = web_server._session_db_fresh_store_readiness[
+            str(failure_path)
+        ]
+        assert isinstance(failed_readiness.error, sqlite3.OperationalError)
 
         blocked_path = (tmp_path / "blocked.db").resolve()
         independent_path = (tmp_path / "independent.db").resolve()
@@ -820,6 +821,182 @@ class TestWebServerEndpoints:
 
         blocked_db = blocked_open.result(timeout=10)
         blocked_db.close()
+
+    def test_fresh_store_claim_rechecks_map_before_partial_file_bypass(
+        self, monkeypatch, tmp_path
+    ):
+        """A caller that saw no map entry must not bypass a newly claimed owner.
+
+        This forces the old map-read/stat gap: the follower sees an absent map,
+        then an owner claims the path and creates the nonzero pre-DDL file.
+        The corrected claim keeps that observation and freshness decision under
+        the same lock, so the follower becomes the owner before file creation
+        rather than returning a bypass ``None`` result.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        from hermes_cli import web_server
+
+        db_path = (tmp_path / "fresh.db").resolve()
+        follower_map_read = threading.Event()
+        owner_partial_file_created = threading.Event()
+        owner_start = threading.Event()
+        follower_thread = {"id": 0}
+
+        class TrackingLock:
+            def __init__(self):
+                self._lock = threading.Lock()
+                self._owner = None
+
+            def __enter__(self):
+                self._lock.acquire()
+                self._owner = threading.get_ident()
+                return self
+
+            def __exit__(self, *_args):
+                self._owner = None
+                self._lock.release()
+
+            def held_by_current_thread(self):
+                return self._owner == threading.get_ident()
+
+        lock = TrackingLock()
+
+        class InterleavingReadinessMap(dict):
+            def get(self, key, default=None):
+                observed = super().get(key, default)
+                if (
+                    threading.get_ident() == follower_thread["id"]
+                    and not follower_map_read.is_set()
+                ):
+                    follower_map_read.set()
+                    owner_start.set()
+                    # The old implementation reads the map outside the state
+                    # lock, letting the owner create its partial SQLite file
+                    # before this caller reaches stat().
+                    if not lock.held_by_current_thread():
+                        assert owner_partial_file_created.wait(timeout=10)
+                return observed
+
+        readiness_map = InterleavingReadinessMap()
+        monkeypatch.setattr(web_server, "_session_db_fresh_store_readiness", readiness_map)
+        monkeypatch.setattr(web_server, "_session_db_fresh_store_readiness_lock", lock)
+
+        def owner_claims_then_creates_partial_file():
+            assert owner_start.wait(timeout=10)
+            slot = web_server._claim_fresh_session_db_readiness(db_path)
+            if slot is not None:
+                db_path.write_bytes(b"SQLite format 3\x00")
+                owner_partial_file_created.set()
+            return slot
+
+        def follower_claims():
+            follower_thread["id"] = threading.get_ident()
+            return web_server._claim_fresh_session_db_readiness(db_path)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            owner = pool.submit(owner_claims_then_creates_partial_file)
+            follower = pool.submit(follower_claims)
+            follower_slot = follower.result(timeout=10)
+
+            # The old map/stat TOCTOU returned None here. A corrected caller
+            # owns a generation before any other caller may create the file.
+            assert follower_slot is not None
+            db_path.write_bytes(b"SQLite format 3\x00")
+            web_server._finish_fresh_session_db_readiness(*follower_slot)
+            assert owner.result(timeout=10) is None
+
+        assert follower_map_read.is_set()
+        assert not owner_partial_file_created.is_set()
+
+    def test_failed_fresh_store_tombstone_blocks_late_repeated_alias_followers(
+        self, monkeypatch, tmp_path
+    ):
+        """A failed partial store remains terminal for late/repeated aliases."""
+        import sqlite3
+
+        import hermes_state
+        from hermes_cli import web_server
+
+        db_path = (tmp_path / "failed-bootstrap.db").resolve()
+        alias_parent = tmp_path / "alias-parent"
+        alias_parent.symlink_to(tmp_path, target_is_directory=True)
+        alias_path = alias_parent / db_path.name
+        bootstrap_attempts = 0
+        original_init_schema = hermes_state.SessionDB._init_schema
+
+        monkeypatch.setattr(web_server, "_session_db_fresh_store_readiness", {})
+
+        def fail_bootstrap(self, *args, **kwargs):
+            nonlocal bootstrap_attempts
+            if not self.read_only and Path(self.db_path).resolve() == db_path:
+                bootstrap_attempts += 1
+                raise sqlite3.OperationalError("forced terminal bootstrap failure")
+            return original_init_schema(self, *args, **kwargs)
+
+        monkeypatch.setattr(hermes_state.SessionDB, "_init_schema", fail_bootstrap)
+
+        with pytest.raises(
+            sqlite3.OperationalError, match="forced terminal bootstrap failure"
+        ) as owner_failure:
+            web_server._open_session_db_at_path(db_path, read_only=True)
+
+        assert db_path.stat().st_size > 0
+        late_failures = []
+        for late_follower in (alias_path, db_path):
+            with pytest.raises(BaseException) as late_failure:
+                web_server._open_session_db_at_path(late_follower, read_only=True)
+            late_failures.append(late_failure.value)
+
+        assert [type(error) for error in late_failures] == [
+            type(owner_failure.value),
+            type(owner_failure.value),
+        ]
+        assert [str(error) for error in late_failures] == [
+            str(owner_failure.value),
+            str(owner_failure.value),
+        ]
+        assert bootstrap_attempts == 1
+        tombstone = web_server._session_db_fresh_store_readiness[str(db_path)]
+        assert isinstance(tombstone.error, sqlite3.OperationalError)
+        assert tombstone.done.is_set()
+
+    def test_fresh_store_readiness_timeout_does_not_start_another_bootstrap(
+        self, monkeypatch, tmp_path
+    ):
+        """A follower times out at the fixed bound without opening the store."""
+        from hermes_cli import web_server
+
+        db_path = (tmp_path / "pending.db").resolve()
+        wait_timeouts = []
+        session_db_opens = []
+
+        class TimedOutReadiness:
+            error = None
+
+            class Done:
+                def wait(self, timeout=None):
+                    wait_timeouts.append(timeout)
+                    return False
+
+            done = Done()
+
+        def fail_if_opened(*_args, **_kwargs):
+            session_db_opens.append(True)
+            raise AssertionError("timed-out follower must not open SessionDB")
+
+        monkeypatch.setattr(
+            web_server,
+            "_session_db_fresh_store_readiness",
+            {str(db_path): TimedOutReadiness()},
+        )
+        monkeypatch.setattr("hermes_state.SessionDB", fail_if_opened)
+
+        with pytest.raises(TimeoutError, match="timed out waiting for fresh session DB"):
+            web_server._open_session_db_at_path(db_path, read_only=True)
+
+        assert wait_timeouts == [web_server._SESSION_DB_FRESH_STORE_READY_TIMEOUT_S]
+        assert session_db_opens == []
 
 
 

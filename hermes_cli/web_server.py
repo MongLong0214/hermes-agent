@@ -12164,8 +12164,10 @@ from hermes_cli.web_routers.sessions import (  # noqa: E402,F401 — legacy re-e
 
 # A first writable SQLite open creates a non-empty file before running its
 # schema DDL.  Readers must therefore join the writer by database path, not by
-# observing file size alone.  The dictionary lock only protects state changes;
-# a ready store takes no lock and unrelated stores never wait for each other.
+# observing file size alone.  The dictionary lock protects the map lookup and
+# file-state decision only; it never covers SessionDB work or endpoint reads.
+# A failed generation stays as a process-lifetime tombstone, so a partial file
+# cannot later be mistaken for a ready store without an explicit process reset.
 _SESSION_DB_FRESH_STORE_READY_TIMEOUT_S = 30.0
 
 
@@ -12179,46 +12181,44 @@ _session_db_fresh_store_readiness: Dict[str, _SessionDBFreshStoreReadiness] = {}
 _session_db_fresh_store_readiness_lock = threading.Lock()
 
 
-def _claim_fresh_session_db_readiness(db_path: Path):
-    """Return this caller's bootstrap slot, or wait for an active one."""
-    canonical_path = str(Path(db_path).resolve())
-    readiness = _session_db_fresh_store_readiness.get(canonical_path)
-    if readiness is not None:
-        if not readiness.done.wait(_SESSION_DB_FRESH_STORE_READY_TIMEOUT_S):
-            raise TimeoutError(f"timed out waiting for fresh session DB: {canonical_path}")
-        if readiness.error is not None:
-            raise readiness.error
-        return None
-
-    try:
-        needs_bootstrap = db_path.stat().st_size == 0
-    except FileNotFoundError:
-        needs_bootstrap = True
-    except OSError:
-        needs_bootstrap = False
-    if not needs_bootstrap:
-        return None
-
-    with _session_db_fresh_store_readiness_lock:
-        readiness = _session_db_fresh_store_readiness.get(canonical_path)
-        if readiness is None:
-            readiness = _SessionDBFreshStoreReadiness()
-            _session_db_fresh_store_readiness[canonical_path] = readiness
-            return canonical_path, readiness
-
+def _wait_for_fresh_session_db_readiness(canonical_path, readiness) -> None:
+    """Wait outside the state lock and propagate a completed generation result."""
     if not readiness.done.wait(_SESSION_DB_FRESH_STORE_READY_TIMEOUT_S):
         raise TimeoutError(f"timed out waiting for fresh session DB: {canonical_path}")
     if readiness.error is not None:
         raise readiness.error
+
+
+def _claim_fresh_session_db_readiness(db_path: Path):
+    """Claim a fresh-store generation or wait for the exact one in progress."""
+    canonical_path = str(Path(db_path).resolve())
+    with _session_db_fresh_store_readiness_lock:
+        readiness = _session_db_fresh_store_readiness.get(canonical_path)
+        if readiness is None:
+            try:
+                needs_bootstrap = Path(canonical_path).stat().st_size == 0
+            except FileNotFoundError:
+                needs_bootstrap = True
+            except OSError:
+                needs_bootstrap = False
+            if needs_bootstrap:
+                readiness = _SessionDBFreshStoreReadiness()
+                _session_db_fresh_store_readiness[canonical_path] = readiness
+                return canonical_path, readiness
+
+    if readiness is not None:
+        _wait_for_fresh_session_db_readiness(canonical_path, readiness)
     return None
 
 
 def _finish_fresh_session_db_readiness(canonical_path, readiness, error=None):
-    """Publish bootstrap success/failure before allowing another claimant."""
-    readiness.error = error
-    readiness.done.set()
+    """Publish a generation; only completed successes leave the map."""
     with _session_db_fresh_store_readiness_lock:
-        if _session_db_fresh_store_readiness.get(canonical_path) is readiness:
+        # Set error before the event while holding the same lock that published
+        # this generation. Registered followers observe both after wait().
+        readiness.error = error
+        readiness.done.set()
+        if error is None and _session_db_fresh_store_readiness.get(canonical_path) is readiness:
             del _session_db_fresh_store_readiness[canonical_path]
 
 
