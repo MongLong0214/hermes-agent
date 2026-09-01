@@ -5739,6 +5739,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         def _is_no_more_rows(exc: sqlite3.Error) -> bool:
             return "no more rows available" in str(exc).lower()
 
+        def _is_explicit_fts_commit_error(exc: BaseException) -> bool:
+            """A commit replay needs FTS-specific error evidence, not SQLITE_CORRUPT."""
+            return (
+                isinstance(exc, sqlite3.DatabaseError)
+                and "fts5:" in str(exc).lower()
+            )
+
         def _recovery_is_replay_safe(exc: BaseException) -> bool:
             """Allow recovery only after rollback proves replay safety."""
             return (
@@ -5758,7 +5765,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     or (
                         commit_failure_definitely_rolled_back
                         and isinstance(exc, sqlite3.DatabaseError)
-                        and self._is_fts_write_corruption_error(exc)
+                        and _is_explicit_fts_commit_error(exc)
                     )
                 )
             )
@@ -5797,7 +5804,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         commit_failure_had_active_transaction = (
                             commit_attempted
                             and isinstance(exc, sqlite3.DatabaseError)
-                            and self._is_fts_write_corruption_error(exc)
+                            and _is_explicit_fts_commit_error(exc)
                             and conn.in_transaction
                         )
                         self._rollback_or_retire_failed_transaction(conn, exc)

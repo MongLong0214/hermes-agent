@@ -88,12 +88,13 @@ def _base_fts_triggers(db_path):
 
 
 class _FtsCommitErrorConnection(sqlite3.Connection):
-    """One-shot commit seam for pre- and post-commit FTS-shaped faults."""
+    """One-shot commit seam for FTS-shaped and generic corruption faults."""
 
     fail_next_fts_commit: str | None
     fts_commit_transaction_states: list[bool]
 
     def commit(self):
+        self.commit_call_count = getattr(self, "commit_call_count", 0) + 1
         mode = getattr(self, "fail_next_fts_commit", None)
         if mode is None:
             return super().commit()
@@ -107,7 +108,13 @@ class _FtsCommitErrorConnection(sqlite3.Connection):
             states.append(self.in_transaction)
             raise sqlite3.DatabaseError("fts5: corrupt structure record")
         states.append(self.in_transaction)
+        if mode == "before_generic_malformed":
+            raise sqlite3.DatabaseError("database disk image is malformed")
         raise sqlite3.DatabaseError("fts5: corrupt structure record")
+
+    def rollback(self):
+        self.rollback_call_count = getattr(self, "rollback_call_count", 0) + 1
+        return super().rollback()
 
 
 def _db_with_fts_commit_error_seam(tmp_path, monkeypatch, *, db_path=None):
@@ -589,6 +596,47 @@ class TestRuntimeFtsRebuild:
             assert _message_contents(tmp_path / "state.db") == [
                 "rollback-gated canonical write"
             ]
+        finally:
+            db.close()
+
+    def test_commit_time_generic_malformed_image_rolls_back_without_fts_recovery(
+        self, tmp_path, monkeypatch
+    ):
+        """A generic corrupt-image commit error is never FTS recovery evidence."""
+        db = _db_with_fts_commit_error_seam(tmp_path, monkeypatch)
+        try:
+            db.create_session("s1", source="test")
+            conn = db._conn
+            assert isinstance(conn, _FtsCommitErrorConnection)
+            conn.fts_commit_transaction_states = []
+            conn.commit_call_count = 0
+            conn.rollback_call_count = 0
+            conn.fail_next_fts_commit = "before_generic_malformed"
+            rebuild_calls = []
+            fail_open_calls = []
+            monkeypatch.setattr(
+                db,
+                "_try_runtime_fts_rebuild",
+                lambda exc: rebuild_calls.append(exc) or True,
+            )
+            monkeypatch.setattr(
+                db,
+                "_enter_fts_fail_open",
+                lambda exc: fail_open_calls.append(exc) or True,
+            )
+
+            with pytest.raises(
+                sqlite3.DatabaseError, match="database disk image is malformed"
+            ):
+                db.append_message("s1", "user", "must not replay generic corruption")
+
+            assert conn.fts_commit_transaction_states == [True]
+            assert conn.rollback_call_count == 1
+            assert conn.in_transaction is False
+            assert rebuild_calls == []
+            assert fail_open_calls == []
+            assert conn.commit_call_count == 1
+            assert _message_contents(tmp_path / "state.db") == []
         finally:
             db.close()
 
