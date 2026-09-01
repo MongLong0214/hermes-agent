@@ -243,8 +243,28 @@ def test_legacy_v22_optimize_lands_on_cjk(cjk_so, tmp_path, monkeypatch):
                 COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
             );
         END;
+        CREATE TRIGGER messages_fts_delete AFTER DELETE ON messages BEGIN
+            DELETE FROM messages_fts WHERE rowid = old.id;
+        END;
+        CREATE TRIGGER messages_fts_update AFTER UPDATE ON messages BEGIN
+            DELETE FROM messages_fts WHERE rowid = old.id;
+            INSERT INTO messages_fts(rowid, content) VALUES (
+                new.id,
+                COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
+            );
+        END;
         CREATE VIRTUAL TABLE messages_fts_trigram USING fts5(content, tokenize='trigram');
         CREATE TRIGGER messages_fts_trigram_insert AFTER INSERT ON messages BEGIN
+            INSERT INTO messages_fts_trigram(rowid, content) VALUES (
+                new.id,
+                COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
+            );
+        END;
+        CREATE TRIGGER messages_fts_trigram_delete AFTER DELETE ON messages BEGIN
+            DELETE FROM messages_fts_trigram WHERE rowid = old.id;
+        END;
+        CREATE TRIGGER messages_fts_trigram_update AFTER UPDATE ON messages BEGIN
+            DELETE FROM messages_fts_trigram WHERE rowid = old.id;
             INSERT INTO messages_fts_trigram(rowid, content) VALUES (
                 new.id,
                 COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
@@ -267,6 +287,23 @@ def test_legacy_v22_optimize_lands_on_cjk(cjk_so, tmp_path, monkeypatch):
             (_time.time(), role, content),
         )
     conn.commit()
+    trigger_names = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'messages'"
+        )
+    }
+    expected_trigger_names = {
+        "messages_fts_insert",
+        "messages_fts_delete",
+        "messages_fts_update",
+        "messages_fts_trigram_insert",
+        "messages_fts_trigram_delete",
+        "messages_fts_trigram_update",
+    }
+    assert trigger_names == expected_trigger_names, (
+        f"pre-startup raw v22 trigger names: {sorted(trigger_names)!r}"
+    )
     conn.close()
 
     d = SessionDB(db_path=db_path)
