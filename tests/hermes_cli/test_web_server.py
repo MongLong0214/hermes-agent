@@ -642,7 +642,7 @@ class TestWebServerEndpoints:
         assert response.json()["total"] == 0
 
     def test_concurrent_first_load_reads_all_succeed_on_fresh_store(self, monkeypatch, tmp_path):
-        """Followers must not probe the SQLite file before its first DDL."""
+        """Eager startup owns the fresh-store generation before dashboard reads."""
         from concurrent.futures import ThreadPoolExecutor, wait
 
         import sqlite3
@@ -657,6 +657,7 @@ class TestWebServerEndpoints:
         release_init = threading.Event()
         readers_arrived = threading.Event()
         allow_readers = threading.Event()
+        reader_barrier = threading.Barrier(9)
         observed_lock = threading.Lock()
         reader_open_calls = 0
         original_init_schema = hermes_state.SessionDB._init_schema
@@ -682,8 +683,9 @@ class TestWebServerEndpoints:
             ):
                 with observed_lock:
                     reader_open_calls += 1
-                    if reader_open_calls == 7:
+                    if reader_open_calls == 8:
                         readers_arrived.set()
+                reader_barrier.wait(timeout=10)
                 assert allow_readers.wait(timeout=10), "test did not release readers"
             return original_open(path, read_only=read_only)
 
@@ -698,12 +700,14 @@ class TestWebServerEndpoints:
             "/api/sessions?limit=10&offset=0&order=recent",
         ] * 2
         try:
-            with ThreadPoolExecutor(max_workers=len(paths)) as pool:
-                bootstrap = pool.submit(client.get, paths[0])
-                assert init_entered.wait(timeout=10), "bootstrap did not reach schema init"
-                readers = [pool.submit(client.get, path) for path in paths[1:]]
-                assert readers_arrived.wait(timeout=10), "not every follower reached the real open"
+            with ThreadPoolExecutor(max_workers=len(paths) + 1) as pool:
+                eager = pool.submit(web_server._eager_reconcile_own_session_db)
+                assert init_entered.wait(timeout=10), "eager writer did not reach schema init"
+                readers = [pool.submit(client.get, path) for path in paths]
+                assert readers_arrived.wait(timeout=10), "not every reader entered the real open"
                 assert reader_open_calls == len(readers)
+                assert not any(future.done() for future in readers)
+                reader_barrier.wait(timeout=10)
 
                 allow_readers.set()
                 done, pending = wait(readers, timeout=10)
@@ -713,14 +717,14 @@ class TestWebServerEndpoints:
                 assert len(pending) == len(readers)
 
                 release_init.set()
+                assert eager.result(timeout=10) is None
                 responses = [future.result(timeout=10) for future in readers]
-                assert bootstrap.result(timeout=10).status_code == 200
         finally:
             allow_readers.set()
             release_init.set()
             client.close()
 
-        assert [response.status_code for response in responses] == [200] * len(paths[1:])
+        assert [response.status_code for response in responses] == [200] * len(paths)
 
         failure_path = (tmp_path / "failed-bootstrap.db").resolve()
         failure_init_entered = threading.Event()

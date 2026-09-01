@@ -136,6 +136,7 @@ class _SecondaryRecoveryAdapter:
         self.fatal_error_retryable = retryable
         self.fatal_error_code = "transport_stale" if retryable else "auth_failed"
         self.fatal_error_message = "Gateway transport stale"
+        self.has_fatal_error = False
         self.connected = False
         self.disconnected = False
 
@@ -206,6 +207,58 @@ def _install_secondary_reconnect_context(monkeypatch, runner, adapter, scoped_ho
     monkeypatch.setattr(runner, "_create_adapter", lambda platform, config: adapter)
 
 
+class TestPrimaryReplacementRedelivery:
+    @pytest.mark.asyncio
+    async def test_primary_replacement_reconnect_signals_runtime_redelivery(
+        self, monkeypatch
+    ):
+        """The real primary watcher signals the default adapter once installed."""
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner._running = True
+        runner._failed_platforms = {
+            Platform.DISCORD: {
+                "config": PlatformConfig(enabled=True, token="primary-token"),
+                "attempts": 0,
+                "next_retry": 0,
+            }
+        }
+        runner.adapters = {}
+        runner.delivery_router = MagicMock()
+        runner.session_store = MagicMock()
+        runner._busy_text_mode = "queue"
+        runner._primary_message_handler = lambda: object()
+        runner._primary_platform_event_handler = lambda: object()
+        runner._make_adapter_auth_check = lambda _platform: object()
+        runner._handle_adapter_fatal_error = AsyncMock()
+        runner._handle_active_session_busy_message = AsyncMock()
+        runner._recover_telegram_topic_thread_id = AsyncMock()
+        runner._sync_voice_mode_state_to_adapter = MagicMock()
+        runner._update_platform_runtime_status = MagicMock()
+        runner._schedule_resume_pending_sessions = MagicMock()
+        runner._redeliver_failed_obligations_for_platform = AsyncMock(return_value=0)
+        replacement = _SecondaryRecoveryAdapter()
+        runner._create_adapter = MagicMock(return_value=replacement)
+        runner._connect_adapter_with_timeout = AsyncMock(return_value=True)
+        real_sleep = asyncio.sleep
+        calls = 0
+
+        async def no_delay(_seconds):
+            nonlocal calls
+            calls += 1
+            if calls >= 2:
+                runner._running = False
+            await real_sleep(0)
+
+        with monkeypatch.context() as context:
+            context.setattr(gateway_run.asyncio, "sleep", no_delay)
+            await runner._platform_reconnect_watcher()
+
+        assert runner.adapters[Platform.DISCORD] is replacement
+        runner._redeliver_failed_obligations_for_platform.assert_awaited_once_with(
+            Platform.DISCORD
+        )
+
+
 class TestSecondaryProfileFatalRecovery:
     @pytest.mark.asyncio
     async def test_retryable_secondary_fatal_reconnects_with_its_profile_scope(
@@ -240,6 +293,68 @@ class TestSecondaryProfileFatalRecovery:
         assert runner._profile_adapters["reviewer"][Platform.DISCORD] is replacement
         assert scoped_homes
         assert all(path == Path("/profiles/reviewer") for path in scoped_homes)
+
+    @pytest.mark.asyncio
+    async def test_secondary_reconnect_redelivery_is_scoped_to_successful_installation(
+        self, monkeypatch
+    ):
+        """Only the installed secondary identity signals a runtime replay."""
+        success_runner = _secondary_recovery_runner()
+        success_adapter = _SecondaryRecoveryAdapter()
+        success_runner._redeliver_failed_obligations_for_platform = AsyncMock()
+        _install_secondary_reconnect_context(monkeypatch, success_runner, success_adapter)
+
+        async def successful_connect(adapter, platform, *, is_reconnect=False):
+            assert adapter is success_adapter
+            assert platform is Platform.DISCORD
+            assert is_reconnect is True
+            return True
+
+        monkeypatch.setattr(success_runner, "_connect_adapter_with_timeout", successful_connect)
+        await success_runner._run_secondary_profile_reconnect("reviewer", Platform.DISCORD)
+
+        assert success_runner._redeliver_failed_obligations_for_platform.await_count == 1
+        redelivery_call = success_runner._redeliver_failed_obligations_for_platform.await_args
+        assert redelivery_call is not None
+        assert redelivery_call.args == (
+            Platform.DISCORD,
+        )
+        assert redelivery_call.kwargs == {
+            "profile": "reviewer"
+        }
+
+        failed_runner = _secondary_recovery_runner()
+        failed_adapter = _SecondaryRecoveryAdapter(retryable=False)
+        failed_adapter.has_fatal_error = True
+        failed_runner._redeliver_failed_obligations_for_platform = AsyncMock()
+        _install_secondary_reconnect_context(monkeypatch, failed_runner, failed_adapter)
+        monkeypatch.setattr(
+            failed_runner, "_connect_adapter_with_timeout", AsyncMock(return_value=False)
+        )
+        await failed_runner._run_secondary_profile_reconnect("reviewer", Platform.DISCORD)
+        failed_runner._redeliver_failed_obligations_for_platform.assert_not_awaited()
+
+        shutdown_runner = _secondary_recovery_runner()
+        shutdown_adapter = _SecondaryRecoveryAdapter()
+        shutdown_runner._redeliver_failed_obligations_for_platform = AsyncMock()
+        _install_secondary_reconnect_context(monkeypatch, shutdown_runner, shutdown_adapter)
+        connect_started = asyncio.Event()
+        release_connect = asyncio.Event()
+
+        async def shutdown_connect(adapter, platform, *, is_reconnect=False):
+            connect_started.set()
+            await release_connect.wait()
+            return True
+
+        monkeypatch.setattr(shutdown_runner, "_connect_adapter_with_timeout", shutdown_connect)
+        task = asyncio.create_task(
+            shutdown_runner._run_secondary_profile_reconnect("reviewer", Platform.DISCORD)
+        )
+        await connect_started.wait()
+        shutdown_runner._running = False
+        release_connect.set()
+        await task
+        shutdown_runner._redeliver_failed_obligations_for_platform.assert_not_awaited()
 
 
     @pytest.mark.asyncio

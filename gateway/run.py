@@ -6756,6 +6756,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _profile_failed_platforms: Optional[Dict[str, Dict[Platform, asyncio.Task]]] = None
     _systemd_watchdog: Optional[Any] = None
     _startup_restore_in_progress: bool = False
+    # A bounded pending exact-token authority set must never outgrow the
+    # durable delivery ledger's retention denominator.
+    _RUNTIME_CLAIM_COMPENSATION_CAP = 500
+    _runtime_claim_pending_compensations: set[tuple[str, str, tuple[str, str]]]
+    _runtime_claim_compensation_reservations: set[tuple[str, tuple[str, str]]]
+    _runtime_claim_compensation_retrying: set[tuple[str, str, tuple[str, str]]]
+    _runtime_claim_compensation_lock: asyncio.Lock
 
     # ------------------------------------------------------------------
     # Legacy per-session dict adapters.  All per-session state lives in
@@ -12088,13 +12095,53 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 RECOVERED_MARKER,
                 mark_delivered,
                 mark_failed,
+                release_runtime_claim,
+                settle_runtime_claim,
+                settle_runtime_claim_after_send_started,
             )
         except Exception:
             logger.debug("delivery ledger import failed", exc_info=True)
             return 0
 
+        async def release_unsent_runtime_claim(row: dict, claim_token: str) -> None:
+            if not row.get("runtime_recovery"):
+                return
+            try:
+                await asyncio.to_thread(
+                    release_runtime_claim,
+                    row["obligation_id"],
+                    claim_token=claim_token,
+                )
+            except Exception:
+                logger.debug("runtime delivery claim release failed", exc_info=True)
+
+        async def settle_started_runtime_claim(row: dict, claim_token: str) -> bool:
+            if not row.get("runtime_recovery"):
+                return False
+            return await asyncio.to_thread(
+                settle_runtime_claim_after_send_started,
+                row["obligation_id"],
+                claim_token=claim_token,
+            )
+
         redelivered = 0
         for row in claimed:
+            runtime_claim_token = ""
+            if row.get("runtime_recovery"):
+                candidate_token = row.get("runtime_claim_token")
+                if not (
+                    isinstance(candidate_token, str)
+                    and len(candidate_token) >= 32
+                    and candidate_token.isascii()
+                    and candidate_token.strip() == candidate_token
+                ):
+                    logger.warning("Runtime delivery claim lacks authority")
+                    return redelivered
+                runtime_claim_token = candidate_token
+            if not getattr(self, "_running", True):
+                if runtime_claim_token:
+                    await release_unsent_runtime_claim(row, runtime_claim_token)
+                continue
             try:
                 platform = Platform(row["platform"])
             except Exception:
@@ -12103,48 +12150,102 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     row["obligation_id"], row.get("platform"),
                 )
                 continue
-            adapter = self.adapters.get(platform)
+            profile = row.get("profile")
+            if profile and profile != "default":
+                profile_adapters = getattr(self, "_profile_adapters", {})
+                profile_map = (
+                    profile_adapters.get(profile, {})
+                    if isinstance(profile_adapters, dict)
+                    else {}
+                )
+                adapter = profile_map.get(platform)
+            else:
+                adapter = self.adapters.get(platform)
             if adapter is None:
-                # Platform not connected this boot — leave the row claimed;
-                # attempts cap + stale cutoff bound the retries on later boots.
+                if runtime_claim_token:
+                    await release_unsent_runtime_claim(row, runtime_claim_token)
                 continue
             content = row["content"]
             if row.get("needs_marker"):
-                content = RECOVERED_MARKER + content
+                content = row.get("marker", RECOVERED_MARKER) + content
             metadata = (
                 {"thread_id": row["thread_id"]} if row.get("thread_id") else None
             )
 
+            runtime_claim_settled = False
+            runtime_claim_fallback_attempted = False
             try:
-                result = await adapter.send(
-                    chat_id=row["chat_id"],
-                    content=content,
-                    metadata=metadata,
+                try:
+                    result = await adapter.send(
+                        chat_id=row["chat_id"],
+                        content=content,
+                        metadata=metadata,
+                    )
+                except Exception:
+                    logger.warning("Recovered delivery send failed")
+                    result = None
+                delivered = result is not None and getattr(result, "success", False)
+                error = (
+                    ""
+                    if delivered
+                    else str(getattr(result, "error", "") or "send failed")
                 )
-            except Exception as send_err:
-                logger.warning(
-                    "obligation %s: redelivery send raised: %s",
-                    row["obligation_id"], send_err,
-                )
-                result = None
-            try:
-                if result is not None and getattr(result, "success", False):
-                    await asyncio.to_thread(mark_delivered, row["obligation_id"])
+                if row.get("runtime_recovery"):
+                    try:
+                        runtime_claim_settled = await asyncio.to_thread(
+                            settle_runtime_claim,
+                            row["obligation_id"],
+                            claim_token=runtime_claim_token,
+                            delivered=delivered,
+                            error=error,
+                        )
+                    except Exception:
+                        runtime_claim_fallback_attempted = True
+                        try:
+                            await settle_started_runtime_claim(
+                                row, runtime_claim_token
+                            )
+                        except BaseException:
+                            logger.warning("Runtime delivery settlement recovery failed")
+                            raise
+                        logger.warning(
+                            "Runtime delivery settlement failed; no delivery count recorded"
+                        )
+                        return redelivered
+                    if not runtime_claim_settled:
+                        logger.debug("Runtime delivery settlement lost ownership")
+                        return redelivered
+                else:
+                    try:
+                        if delivered:
+                            await asyncio.to_thread(mark_delivered, row["obligation_id"])
+                        else:
+                            await asyncio.to_thread(mark_failed, row["obligation_id"], error)
+                    except Exception:
+                        logger.debug("delivery ledger update failed")
+                        continue
+                if delivered:
                     redelivered += 1
                     logger.info(
-                        "Redelivered recovered final response to %s:%s "
-                        "(obligation %s, attempt %d)",
-                        row["platform"], row["chat_id"],
-                        row["obligation_id"], row["attempts"],
+                        "Recovered delivery succeeded (attempt %d)", row["attempts"]
                     )
-                else:
-                    await asyncio.to_thread(
-                        mark_failed,
-                        row["obligation_id"],
-                        str(getattr(result, "error", "") or "send failed"),
-                    )
-            except Exception:
-                logger.debug("delivery ledger update failed", exc_info=True)
+                elif row.get("runtime_recovery"):
+                    # The just-failed row is eligible only at a later reconnect;
+                    # this signal never reclaims it or advances to another row.
+                    return redelivered
+            except BaseException:
+                if (
+                    not runtime_claim_settled
+                    and not runtime_claim_fallback_attempted
+                ):
+                    runtime_claim_fallback_attempted = True
+                    try:
+                        await settle_started_runtime_claim(
+                            row, runtime_claim_token
+                        )
+                    except BaseException:
+                        logger.warning("Runtime delivery cancellation settlement failed")
+                raise
         return redelivered
 
     async def _redeliver_pending_obligations(self) -> int:
@@ -12159,6 +12260,221 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return await self._redeliver_claimed_obligations(
             await self._claim_pending_obligations()
         )
+
+    async def _redeliver_failed_obligations_for_platform(
+        self, platform: Platform, *, profile: Optional[str] = None
+    ) -> int:
+        """Replay this adapter identity's transient rows after a reconnect."""
+        try:
+            from gateway.delivery_ledger import (
+                claim_failed_for_runtime,
+                ledger_enabled,
+                peek_failed_for_runtime,
+                release_runtime_claim,
+            )
+        except Exception:
+            logger.debug("runtime delivery ledger import failed")
+            return 0
+
+        scope_profile = str(profile or "").strip() or "default"
+        scope = (platform.value, scope_profile)
+        pending_compensations = getattr(
+            self, "_runtime_claim_pending_compensations", None
+        )
+        if pending_compensations is None:
+            pending_compensations = set()
+            self._runtime_claim_pending_compensations = pending_compensations
+        reservations = getattr(self, "_runtime_claim_compensation_reservations", None)
+        if reservations is None:
+            reservations = set()
+            self._runtime_claim_compensation_reservations = reservations
+        retrying_compensations = getattr(
+            self, "_runtime_claim_compensation_retrying", None
+        )
+        if retrying_compensations is None:
+            retrying_compensations = set()
+            self._runtime_claim_compensation_retrying = retrying_compensations
+        compensation_lock = getattr(self, "_runtime_claim_compensation_lock", None)
+        if compensation_lock is None:
+            compensation_lock = asyncio.Lock()
+            self._runtime_claim_compensation_lock = compensation_lock
+
+        async def release_reservation(reservation: tuple[str, tuple[str, str]]) -> None:
+            async with compensation_lock:
+                reservations.discard(reservation)
+
+        async def retain_compensation(
+            reservation: tuple[str, tuple[str, str]],
+            compensation: tuple[str, str, tuple[str, str]],
+        ) -> None:
+            # Transfer exactly one occupied slot, atomically: a cancellation
+            # must not briefly free capacity before its exact token is pending.
+            async with compensation_lock:
+                reservations.discard(reservation)
+                pending_compensations.add(compensation)
+
+        blocked_obligations = set()
+        # Retry each exact pending authority once before peeking new work. A
+        # False result proves this token no longer owns a row, while any other
+        # unknown result must remain pending and cannot be sent this signal.
+        retry_compensations = []
+        async with compensation_lock:
+            for compensation in tuple(pending_compensations):
+                obligation_id, _claim_token, pending_scope = compensation
+                if pending_scope != scope:
+                    continue
+                if compensation in retrying_compensations:
+                    blocked_obligations.add(obligation_id)
+                    continue
+                retrying_compensations.add(compensation)
+                retry_compensations.append(compensation)
+        for compensation in retry_compensations:
+            obligation_id, claim_token, _pending_scope = compensation
+            released = None
+            try:
+                released = await asyncio.to_thread(
+                    release_runtime_claim,
+                    obligation_id,
+                    claim_token=claim_token,
+                )
+            except Exception:
+                blocked_obligations.add(obligation_id)
+                logger.debug("runtime delivery cancellation release retry failed")
+            else:
+                if released is not True and released is not False:
+                    blocked_obligations.add(obligation_id)
+                    logger.debug("runtime delivery cancellation release retry uncertain")
+            finally:
+                async with compensation_lock:
+                    retrying_compensations.discard(compensation)
+                    if released is True or released is False:
+                        pending_compensations.discard(compensation)
+
+        try:
+            if not await asyncio.to_thread(ledger_enabled):
+                return 0
+            candidates = await asyncio.to_thread(
+                peek_failed_for_runtime, platform.value, profile=profile
+            )
+        except Exception:
+            logger.debug("runtime delivery ledger sweep failed")
+            return 0
+        if not candidates:
+            return 0
+        candidates = [
+            candidate
+            for candidate in candidates
+            if candidate.get("obligation_id") not in blocked_obligations
+        ]
+        if not candidates:
+            return 0
+
+        cleared = []
+        for candidate in candidates:
+            session_key = candidate.get("session_key") or ""
+            if not session_key:
+                cleared.append(candidate)
+                continue
+            try:
+                await self.async_session_store.clear_resume_pending(session_key)
+            except Exception:
+                logger.debug("runtime resume clearance failed")
+            else:
+                cleared.append(candidate)
+
+        redelivered = 0
+        for candidate in cleared:
+            obligation_id = candidate["obligation_id"]
+            reservation = (obligation_id, scope)
+            async with compensation_lock:
+                if (
+                    reservation in reservations
+                    or any(
+                        pending_obligation_id == obligation_id
+                        and pending_scope == scope
+                        for pending_obligation_id, _pending_token, pending_scope
+                        in pending_compensations
+                    )
+                    or len(pending_compensations) + len(reservations)
+                    >= self._RUNTIME_CLAIM_COMPENSATION_CAP
+                ):
+                    continue
+                reservations.add(reservation)
+            claim_task = asyncio.create_task(
+                asyncio.to_thread(
+                    claim_failed_for_runtime,
+                    obligation_id,
+                    platform.value,
+                    profile=profile,
+                )
+            )
+            try:
+                row = await asyncio.shield(claim_task)
+            except asyncio.CancelledError:
+                # A cancelled await does not stop the SQLite worker. Keep its
+                # task alive until the committed row returns, then refund only
+                # that row's token before honoring the original cancellation.
+                while not claim_task.done():
+                    try:
+                        await asyncio.shield(claim_task)
+                    except asyncio.CancelledError:
+                        pass
+                try:
+                    row = claim_task.result()
+                except BaseException:
+                    row = None
+                if isinstance(row, dict):
+                    claim_token = row.get("runtime_claim_token")
+                    obligation_id = row.get("obligation_id")
+                    if (
+                        isinstance(obligation_id, str)
+                        and isinstance(claim_token, str)
+                        and len(claim_token) >= 32
+                        and claim_token.isascii()
+                        and claim_token.strip() == claim_token
+                    ):
+                        compensation = (obligation_id, claim_token, scope)
+                        release_task = asyncio.create_task(
+                            asyncio.to_thread(
+                                release_runtime_claim,
+                                obligation_id,
+                                claim_token=claim_token,
+                            )
+                        )
+                        while not release_task.done():
+                            try:
+                                await asyncio.shield(release_task)
+                            except asyncio.CancelledError:
+                                pass
+                            except BaseException:
+                                break
+                        try:
+                            released = release_task.result()
+                        except BaseException:
+                            await retain_compensation(reservation, compensation)
+                            logger.debug("runtime delivery claim cancellation release failed")
+                        else:
+                            if released is not True:
+                                await retain_compensation(reservation, compensation)
+                            else:
+                                await release_reservation(reservation)
+                    else:
+                        await release_reservation(reservation)
+                else:
+                    await release_reservation(reservation)
+                raise
+            except Exception:
+                await release_reservation(reservation)
+                logger.debug("runtime delivery claim failed")
+                continue
+            if row is None:
+                await release_reservation(reservation)
+                continue
+            # The normal send/settlement path now owns this durable claim; the
+            # finite admission slot was only needed through acquisition.
+            await release_reservation(reservation)
+            redelivered += await self._redeliver_claimed_obligations([row])
+        return redelivered
 
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
         """Auto-continue fresh restart-interrupted sessions after startup.
@@ -14567,6 +14883,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             needs_attention=False,
                             retrying_since=None,
                         )
+                        if self._running and self.adapters.get(platform) is adapter:
+                            await self._redeliver_failed_obligations_for_platform(platform)
                         logger.info("✓ %s reconnected successfully", platform.value)
 
                         # Rebuild channel directory with the new adapter
@@ -15679,6 +15997,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "✓ %s reconnected (profile: %s)",
                                 platform.value,
                                 profile_name,
+                            )
+                            await self._redeliver_failed_obligations_for_platform(
+                                platform, profile=profile_name
                             )
                             return
                         # A newer reconnect already won the slot while this

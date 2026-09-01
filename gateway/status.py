@@ -42,6 +42,8 @@ _IS_WINDOWS = sys.platform == "win32"
 _UNSET = object()
 _GATEWAY_LOCK_FILENAME = "gateway.lock"
 _gateway_lock_handle = None
+_gateway_lock_path: Optional[Path] = None
+_gateway_lock_guard = threading.RLock()
 # Windows byte-range locks are mandatory for other readers. Lock a byte well
 # past the JSON payload so runtime status / PID readers can still read the file
 # while another process holds the mutual-exclusion lock.
@@ -60,6 +62,18 @@ class StormInfo(NamedTuple):
     count: int
     window_s: float
     backoff_s: float
+
+
+@dataclass
+class _GatewayRuntimeMigrationLease:
+    """Opaque temporary ownership of the default gateway runtime lock.
+
+    ``_handle is None`` means this process already owns the default runtime
+    lock and the lease is borrowed; an owned private handle must be unlocked
+    and closed by :func:`release_gateway_runtime_migration_lease`.
+    """
+
+    _handle: Any = None
 
 
 def _get_starts_log_path() -> Path:
@@ -226,6 +240,11 @@ def _get_gateway_lock_path(pid_path: Optional[Path] = None) -> Path:
         return pid_path.with_name(_GATEWAY_LOCK_FILENAME)
     home = _get_process_hermes_home()
     return home / _GATEWAY_LOCK_FILENAME
+
+
+def _gateway_runtime_lock_path_for_home(canonical_home: os.PathLike[str] | str) -> Path:
+    """Return the runtime-lock path for one explicit canonical Hermes home."""
+    return Path(canonical_home) / _GATEWAY_LOCK_FILENAME
 
 
 def _get_runtime_status_path() -> Path:
@@ -947,55 +966,122 @@ def _release_file_lock(handle) -> None:
         pass
 
 
+def acquire_gateway_runtime_migration_lease(
+    _target_lock_path: Optional[os.PathLike[str] | str] = None,
+) -> Optional[_GatewayRuntimeMigrationLease]:
+    """Atomically reserve a runtime lock for a schema migration.
+
+    A gateway that already owns the requested process-global runtime lock
+    receives a borrowed lease, so migration cleanup cannot release that gateway
+    or alter its identity record. Otherwise this takes a private nonblocking
+    flock on the requested lock file. It deliberately never rewrites or unlinks
+    that file: migration admission must not disturb the gateway's identity
+    metadata. With no explicit target, direct callers retain the default
+    process-home behavior.
+    """
+    try:
+        lock_path = (
+            _get_gateway_lock_path()
+            if _target_lock_path is None
+            else Path(_target_lock_path).expanduser().resolve(strict=False)
+        )
+    except OSError:
+        return None
+    with _gateway_lock_guard:
+        if _gateway_lock_handle is not None and _gateway_lock_path == lock_path:
+            return _GatewayRuntimeMigrationLease()
+
+    try:
+        handle = open(lock_path, "a+", encoding="utf-8")
+    except OSError:
+        return None
+    if not _try_acquire_file_lock(handle):
+        try:
+            handle.close()
+        except OSError:
+            pass
+        return None
+    return _GatewayRuntimeMigrationLease(handle)
+
+
+def release_gateway_runtime_migration_lease(
+    lease: Optional[_GatewayRuntimeMigrationLease],
+) -> None:
+    """Release an owned migration lease; a borrowed gateway lease is a no-op."""
+    if lease is None:
+        return
+    handle, lease._handle = lease._handle, None
+    if handle is None:
+        return
+    try:
+        _release_file_lock(handle)
+    except OSError:
+        pass
+    finally:
+        try:
+            handle.close()
+        except OSError:
+            pass
+
+
 def acquire_gateway_runtime_lock() -> bool:
     """Claim the cross-process runtime lock for the gateway.
 
     Unlike the PID file, the lock is owned by the live process itself. If the
     process dies abruptly, the OS releases the lock automatically.
     """
-    global _gateway_lock_handle
-    if _gateway_lock_handle is not None:
-        return True
+    global _gateway_lock_handle, _gateway_lock_path
+    with _gateway_lock_guard:
+        if _gateway_lock_handle is not None:
+            return True
 
-    path = _get_gateway_lock_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        handle = open(path, "a+", encoding="utf-8")
-    except PermissionError:
-        # Stale root-owned lock file from a previous launchd Background
-        # session that ran as root (same failure mode handled in
-        # is_gateway_runtime_lock_active).  The parent directory owner can
-        # unlink files even when they don't own them, so remove the stale
-        # lock and retry once with a fresh file.
-        try:
-            path.unlink()
-        except OSError:
-            return False
+        path = _get_gateway_lock_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
         try:
             handle = open(path, "a+", encoding="utf-8")
-        except OSError:
+        except PermissionError:
+            # Stale root-owned lock file from a previous launchd Background
+            # session that ran as root (same failure mode handled in
+            # is_gateway_runtime_lock_active).  The parent directory owner can
+            # unlink files even when they don't own them, so remove the stale
+            # lock and retry once with a fresh file.
+            try:
+                path.unlink()
+            except OSError:
+                return False
+            try:
+                handle = open(path, "a+", encoding="utf-8")
+            except OSError:
+                return False
+        if not _try_acquire_file_lock(handle):
+            handle.close()
             return False
-    if not _try_acquire_file_lock(handle):
-        handle.close()
-        return False
-    _write_gateway_lock_record(handle)
-    _gateway_lock_handle = handle
+        _write_gateway_lock_record(handle)
+        _gateway_lock_handle = handle
+        _gateway_lock_path = path
     _clear_running_pid_cache()
     return True
 
 
 def release_gateway_runtime_lock() -> None:
     """Release the gateway runtime lock when owned by this process."""
-    global _gateway_lock_handle
-    handle = _gateway_lock_handle
-    if handle is None:
-        return
-    _gateway_lock_handle = None
-    _release_file_lock(handle)
-    try:
-        handle.close()
-    except OSError:
-        pass
+    global _gateway_lock_handle, _gateway_lock_path
+    with _gateway_lock_guard:
+        handle = _gateway_lock_handle
+        if handle is None:
+            return
+        try:
+            _release_file_lock(handle)
+        except OSError:
+            pass
+        finally:
+            try:
+                handle.close()
+            except OSError:
+                pass
+            if _gateway_lock_handle is handle:
+                _gateway_lock_handle = None
+                _gateway_lock_path = None
     _clear_running_pid_cache()
 
 
@@ -1003,8 +1089,9 @@ def is_gateway_runtime_lock_active(lock_path: Optional[Path] = None) -> bool:
     """Return True when some process currently owns the gateway runtime lock."""
     global _gateway_lock_handle
     resolved_lock_path = lock_path or _get_gateway_lock_path()
-    if _gateway_lock_handle is not None and resolved_lock_path == _get_gateway_lock_path():
-        return True
+    with _gateway_lock_guard:
+        if _gateway_lock_handle is not None and resolved_lock_path == _gateway_lock_path:
+            return True
 
     if not resolved_lock_path.exists():
         return False

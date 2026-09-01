@@ -62,7 +62,8 @@ def _event(text="hello agent"):
 def _rows():
     with dl._connect() as conn:
         return conn.execute(
-            "SELECT obligation_id, state, content FROM delivery_obligations"
+            """SELECT obligation_id, state, content, adapter_profile
+               FROM delivery_obligations"""
         ).fetchall()
 
 
@@ -121,6 +122,34 @@ class TestProducerHook:
         rows = _rows()
         assert len(rows) == 1
         assert rows[0][1] == "failed"
+
+    @pytest.mark.asyncio
+    async def test_selected_adapter_profile_survives_late_replacement_signal(self):
+        """A replacement between failure and marking reclaims only its owner."""
+        source_adapter = _Adapter()
+        source_adapter._owner_profile = "routed-profile"
+        selected_adapter = _Adapter()
+        selected_adapter._owner_profile = "credential-owner"
+        replacement = _Adapter()
+        replacement._owner_profile = "credential-owner"
+        runner = MagicMock()
+        runner._adapter_for_source.side_effect = [selected_adapter, replacement]
+        runner._redeliver_failed_obligations_for_platform = AsyncMock(return_value=1)
+        source_adapter.gateway_runner = runner
+        selected_adapter._send_with_retry = AsyncMock(
+            return_value=SendResult(
+                success=False, error="send_path_degraded", retryable=True
+            )
+        )
+
+        await _run(source_adapter, _event())
+
+        rows = _rows()
+        assert rows[0][1] == "failed"
+        assert rows[0][3] == "credential-owner"
+        runner._redeliver_failed_obligations_for_platform.assert_awaited_once_with(
+            Platform.SLACK, profile="credential-owner"
+        )
 
 
     @pytest.mark.asyncio

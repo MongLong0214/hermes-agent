@@ -1355,8 +1355,10 @@ class SessionSchemaMixin:
             # The full initialization transaction below then covers every
             # remaining schema, reconciliation, migration, and FTS mutation.
             with self.write_transaction(immediate=False):
+                self._assert_forward_schema_migration_admission()
                 self._heal_session_turn_leases_legacy_epoch(conn.cursor())
             with self.write_transaction():
+                self._assert_forward_schema_migration_admission()
                 self._init_schema_mutations()
         except BaseException as exc:
             primary_exc = exc

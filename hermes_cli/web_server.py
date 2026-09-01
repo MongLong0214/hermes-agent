@@ -340,9 +340,9 @@ def _eager_reconcile_own_session_db() -> None:
     :func:`_open_session_db_at_path`, which retries on every poll.
     """
     try:
-        from hermes_state import SessionDB, _default_db_path
+        from hermes_state import _default_db_path
 
-        SessionDB(db_path=Path(_default_db_path()), read_only=False).close()
+        _open_session_db_at_path(Path(_default_db_path()), read_only=False).close()
     except Exception as exc:
         _log.warning(
             "startup schema reconcile of state.db failed (%s); session "

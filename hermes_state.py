@@ -185,11 +185,78 @@ class SessionExportTooLargeError(ValueError):
 class IncompatibleSchemaError(RuntimeError):
     """The on-disk session state cannot be safely opened by this version."""
 
-    __slots__ = ("code",)
+    __slots__ = (
+        "actual_generation",
+        "build_identity",
+        "code",
+        "expected_generation",
+    )
 
-    def __init__(self):
-        super().__init__("Session state is incompatible with this Hermes version.")
+    def __init__(
+        self,
+        *,
+        expected_generation: Optional[int] = None,
+        actual_generation: Optional[int] = None,
+    ):
+        self.expected_generation = expected_generation
+        self.actual_generation = actual_generation
+        self.build_identity = _state_schema_build_identity()
+        if expected_generation is None or actual_generation is None:
+            message = "Session state is incompatible with this Hermes version."
+        else:
+            message = (
+                "Session state schema is newer than this Hermes build "
+                f"(expected generation {expected_generation}, "
+                f"actual generation {actual_generation}, "
+                f"build identity {_format_state_schema_build_identity(self.build_identity)})."
+            )
+        super().__init__(message)
         self.code = "STATE_DB_SCHEMA_INCOMPATIBLE"
+
+
+class ForwardSchemaMigrationAdmissionError(RuntimeError):
+    """A live canonical runtime owns a DB that needs a forward migration."""
+
+    __slots__ = (
+        "actual_generation",
+        "build_identity",
+        "code",
+        "expected_generation",
+    )
+
+    def __init__(self, *, expected_generation: int, actual_generation: int):
+        self.expected_generation = expected_generation
+        self.actual_generation = actual_generation
+        self.build_identity = _state_schema_build_identity()
+        super().__init__(
+            "Refusing forward state-schema migration while the canonical Hermes "
+            "runtime lock is active "
+            f"(expected generation {expected_generation}, "
+            f"actual generation {actual_generation}, "
+            f"build identity {_format_state_schema_build_identity(self.build_identity)})."
+        )
+        self.code = "STATE_DB_FORWARD_MIGRATION_ADMISSION_BLOCKED"
+
+
+def _state_schema_build_identity() -> dict[str, str]:
+    """Return support-safe build identity without exposing checkout locations."""
+    try:
+        from hermes_cli.build_info import get_code_identity
+
+        identity = get_code_identity()
+        version = identity.get("version")
+        short_sha = identity.get("short_sha")
+    except Exception:
+        version = None
+        short_sha = None
+    return {
+        "version": str(version) if version else "unknown",
+        "short_sha": str(short_sha) if short_sha else "unknown",
+    }
+
+
+def _format_state_schema_build_identity(identity: dict[str, str]) -> str:
+    return f"version={identity['version']}, sha={identity['short_sha']}"
 
 
 _COMPRESSION_LOCK_HOLDER_PID_RE = re.compile(r"(?:^|:)pid=(\d+)(?::|$)")
@@ -1772,11 +1839,19 @@ def _validate_schema_version_scalar(conn: sqlite3.Connection) -> int:
         raise IncompatibleSchemaError()
     version, value_type = rows[0]
     if (
+        value_type == "integer"
+        and type(version) is int
+        and version > SCHEMA_VERSION
+    ):
+        raise IncompatibleSchemaError(
+            expected_generation=SCHEMA_VERSION,
+            actual_generation=version,
+        )
+    if (
         value_type != "integer"
         or type(version) is not int
         or version < 0
         or version > (2**63 - 1)
-        or version > SCHEMA_VERSION
     ):
         raise IncompatibleSchemaError()
     return version
@@ -1863,6 +1938,41 @@ def _probe_existing_state_db_schema(
         raise
     except sqlite3.DatabaseError:
         raise IncompatibleSchemaError() from None
+
+
+def _canonical_state_db_home(db_path: Path) -> Optional[Path]:
+    """Return the immutable canonical-home snapshot for *db_path*, if any."""
+    try:
+        home = Path(get_hermes_home()).expanduser().resolve(strict=False)
+        canonical_db = (home / "state.db").resolve(strict=False)
+        candidate = Path(db_path).expanduser().resolve(strict=False)
+    except OSError:
+        return None
+    if os.path.normcase(str(candidate)) != os.path.normcase(str(canonical_db)):
+        return None
+    return home
+
+
+def _is_canonical_state_db(db_path: Path) -> bool:
+    """Whether *db_path* is the active profile's canonical ``state.db``."""
+    return _canonical_state_db_home(db_path) is not None
+
+
+def _canonical_live_state_db_has_active_gateway_runtime(db_path: Path) -> bool:
+    """Whether this exact profile's canonical state DB has a live gateway lock.
+
+    The runtime lock is OS-owned by the gateway process and is released by the
+    kernel on death. It is deliberately checked only for the profile-safe
+    ``get_hermes_home() / 'state.db'`` target: private/temp databases retain
+    their independent migration path.
+    """
+    if not _is_canonical_state_db(db_path):
+        return False
+    try:
+        from gateway.status import is_gateway_runtime_lock_active
+    except Exception as exc:
+        raise RuntimeError("canonical gateway runtime lock inspection is unavailable") from exc
+    return is_gateway_runtime_lock_active()
 
 
 # Markers that mean the host filesystem cannot accept another write. Kept as
@@ -4677,6 +4787,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._fts_cjk_available = False
         self._fts_unavailable_warned = False
         self._conn = None
+        self._existing_schema_version: Optional[int] = None
+        self._forward_schema_migration_lease = None
         self._offline_rebuild_marker: Optional[str] = None
         self._offline_rebuild_depth = 0
         self._offline_rebuild_transition = False
@@ -4793,6 +4905,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 existing_schema_version = _probe_existing_state_db_schema(
                     self.db_path, allow_malformed_repair=True
                 )
+            self._existing_schema_version = existing_schema_version
+            # Reject a live old runtime before its successor can change journal
+            # mode, run reconciliation, or publish any migration/fence DDL.
+            self._assert_forward_schema_migration_admission()
 
             def _connect_and_init():
                 self._conn = _connect_tracked_db(
@@ -4908,11 +5024,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # an unattended open. (An interrupted optimize resumes when the
             # user re-runs the command.)
             initialization_complete = True
-        except IncompatibleSchemaError:
-            _set_last_init_error(
-                "STATE_DB_SCHEMA_INCOMPATIBLE: "
-                "Session state is incompatible with this Hermes version."
-            )
+        except IncompatibleSchemaError as exc:
+            _set_last_init_error(f"{exc.code}: {exc}")
             raise
         except Exception as exc:
             # Capture the cause so /resume and friends can surface WHY the
@@ -4933,6 +5046,64 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if not initialization_complete:
                 conn, self._conn = self._conn, None
                 self._close_connection_quietly(conn)
+            self._release_forward_schema_migration_lease()
+
+    def _assert_forward_schema_migration_admission(self) -> None:
+        """Reserve the canonical runtime lock through a lower-schema migration."""
+        if getattr(self, "_forward_schema_migration_lease", None) is not None:
+            return
+        actual_generation = self._existing_schema_version
+        if (
+            self.read_only
+            or actual_generation is None
+            or actual_generation >= SCHEMA_VERSION
+        ):
+            return
+        canonical_home = _canonical_state_db_home(self.db_path)
+        if canonical_home is None:
+            return
+        try:
+            from gateway.status import (
+                _gateway_runtime_lock_path_for_home,
+                acquire_gateway_runtime_migration_lease,
+            )
+            target_lock_path = _gateway_runtime_lock_path_for_home(canonical_home)
+        except Exception as exc:
+            raise RuntimeError("canonical gateway runtime migration lease is unavailable") from exc
+
+        lease = acquire_gateway_runtime_migration_lease(target_lock_path)
+        if lease is None:
+            raise ForwardSchemaMigrationAdmissionError(
+                expected_generation=SCHEMA_VERSION,
+                actual_generation=actual_generation,
+            )
+        self._forward_schema_migration_lease = lease
+        try:
+            # The first SELECT-only observation only selects the admission
+            # branch. Re-probe while the flock is held so a lock claimant or
+            # concurrent migrator cannot make its generation stale before any
+            # writable SQLite connection, WAL transition, or DDL publication.
+            actual_generation = _probe_existing_state_db_schema(
+                self.db_path, allow_malformed_repair=True
+            )
+            self._existing_schema_version = actual_generation
+            if actual_generation is None or actual_generation >= SCHEMA_VERSION:
+                self._release_forward_schema_migration_lease()
+        except BaseException:
+            self._release_forward_schema_migration_lease()
+            raise
+
+    def _release_forward_schema_migration_lease(self) -> None:
+        lease = getattr(self, "_forward_schema_migration_lease", None)
+        self._forward_schema_migration_lease = None
+        if lease is None:
+            return
+        try:
+            from gateway.status import release_gateway_runtime_migration_lease
+
+            release_gateway_runtime_migration_lease(lease)
+        except Exception:
+            logger.exception("Could not release the canonical migration lease")
 
     def ensure_compatible_schema(self) -> None:
         """Recheck this open connection without repairing or mutating state."""

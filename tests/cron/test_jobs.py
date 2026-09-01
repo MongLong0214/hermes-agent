@@ -1055,6 +1055,21 @@ class TestClaimDispatch:
             "repeat": {"times": times, "completed": completed},
         }
 
+    def _issue_resume_from_due(self, job_id="os1"):
+        due = [job for job in get_due_jobs() if job["id"] == job_id]
+        candidate = due[0] if due else get_job(job_id)
+        assert isinstance(candidate, dict)
+        run_claim = candidate.get("run_claim")
+        assert isinstance(run_claim, dict)
+        owner = run_claim.get("by")
+        assert isinstance(owner, str) and owner
+        claimed = claim_job_for_fire(
+            job_id, expected_run_owner=owner, return_job=True
+        )
+        assert isinstance(claimed, dict)
+        assert claim_dispatch(job_id, claimed_job=claimed) is True
+        return claimed
+
     def test_claim_increments_and_persists(self, tmp_cron_dir):
         save_jobs([self._oneshot(times=1, completed=0)])
         assert claim_dispatch("os1") is True
@@ -1100,6 +1115,908 @@ class TestClaimDispatch:
         due = get_due_jobs()
         assert due == []
         assert load_jobs() == []  # cleaned up
+
+    def test_resume_oneshot_reserves_stable_occurrence_without_preclaiming(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        """Opt-in resume keeps the logical one-shot live before side effects."""
+        now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        save_jobs([{
+            **self._oneshot(times=1, completed=0),
+            "restart_policy": "resume",
+            "next_run_at": now.isoformat(),
+        }])
+
+        assert self._issue_resume_from_due("os1")
+        reserved = get_job("os1")
+        assert reserved is not None
+        assert reserved["repeat"]["completed"] == 0
+        assert reserved["resume_reservation"]["owner"] == reserved["fire_claim"]["by"]
+        assert reserved["run_claim"]["fire_owner"] == reserved["fire_claim"]["by"]
+        assert isinstance(reserved["resume_reservation"]["occurrence_id"], str)
+        assert reserved["resume_reservation"]["occurrence_id"]
+        # A concurrent caller cannot duplicate the still-running occurrence.
+        assert claim_dispatch("os1") is False
+
+    def test_resume_settlement_is_owner_fenced_and_consumes_once(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        save_jobs([{
+            **self._oneshot(times=1, completed=0),
+            "restart_policy": "resume",
+            "next_run_at": now.isoformat(),
+        }])
+        assert self._issue_resume_from_due("os1")
+        current = get_job("os1")
+        assert current is not None
+        reservation = current["resume_reservation"]
+
+        assert mark_job_run(
+            "os1", success=True, expected_resume_owner="stale-owner"
+        ) is False
+        stale = get_job("os1")
+        assert stale is not None
+        assert stale["repeat"]["completed"] == 0
+
+        assert mark_job_run(
+            "os1", success=True, expected_resume_owner=reservation["owner"]
+        ) is True
+        settled = get_job("os1")
+        assert settled is not None
+        assert settled["repeat"]["completed"] == 1
+        assert settled["state"] == "completed"
+        assert settled["enabled"] is False
+        assert "resume_reservation" not in settled
+
+        # A duplicate completion cannot overwrite the terminal result or count.
+        assert mark_job_run(
+            "os1", success=False, error="late", expected_resume_owner=reservation["owner"]
+        ) is False
+        duplicate = get_job("os1")
+        assert duplicate is not None
+        assert duplicate["repeat"]["completed"] == 1
+        assert duplicate["last_status"] == "ok"
+
+    def test_interrupted_resume_oneshot_rearms_without_consuming_occurrence(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        save_jobs([{
+            **self._oneshot(times=1, completed=0),
+            "restart_policy": "resume",
+            "next_run_at": now.isoformat(),
+        }])
+        assert self._issue_resume_from_due("os1")
+        reserved = get_job("os1")
+        assert reserved is not None
+        occurrence_id = reserved["resume_reservation"]["occurrence_id"]
+        owner = reserved["resume_reservation"]["owner"]
+
+        assert mark_job_run(
+            "os1",
+            success=False,
+            error="forced shutdown",
+            status="interrupted",
+            expected_resume_owner=owner,
+        ) is True
+        rearmed = get_job("os1")
+        assert rearmed is not None
+        assert rearmed["repeat"]["completed"] == 0
+        assert rearmed["enabled"] is True
+        assert rearmed["state"] == "retry_pending"
+        assert rearmed["next_run_at"] > now.isoformat()
+        assert rearmed["run_claim"] is None
+        assert rearmed["resume_reservation"]["occurrence_id"] == occurrence_id
+        assert rearmed["resume_reservation"]["state"] == "retry_pending"
+        assert rearmed["resume_reservation"]["owner"] is None
+
+    def test_resume_retry_reclaims_the_same_occurrence_after_restart_boundary(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        save_jobs([{
+            **self._oneshot(times=1, completed=0),
+            "restart_policy": "resume",
+            "next_run_at": now.isoformat(),
+        }])
+        assert self._issue_resume_from_due("os1")
+        first = get_job("os1")
+        assert first is not None
+        occurrence_id = first["resume_reservation"]["occurrence_id"]
+        owner = first["resume_reservation"]["owner"]
+        assert mark_job_run(
+            "os1",
+            success=False,
+            error="forced shutdown",
+            status="interrupted",
+            expected_resume_owner=owner,
+        ) is True
+
+        pending = get_job("os1")
+        assert pending is not None
+        retry_at = datetime.fromisoformat(pending["next_run_at"])
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: retry_at)
+
+        due = get_due_jobs()
+        assert [job["id"] for job in due] == ["os1"]
+        assert self._issue_resume_from_due("os1")
+        retried = get_job("os1")
+        assert retried is not None
+        assert retried["repeat"]["completed"] == 0
+        assert retried["resume_reservation"]["occurrence_id"] == occurrence_id
+        assert retried["resume_reservation"]["state"] == "running"
+        assert retried["resume_reservation"]["attempt"] == 2
+        assert retried["resume_reservation"]["owner"] == retried["run_claim"]["fire_owner"]
+
+    def test_resume_running_reservation_rearms_after_stale_run_claim_ttl(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        """A hard-dead resumable one-shot retries its same occurrence once safe."""
+        now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+        clock = [now]
+        ttl_seconds = 30
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: clock[0])
+        monkeypatch.setattr(
+            "cron.jobs._oneshot_run_claim_ttl_seconds", lambda: ttl_seconds
+        )
+        save_jobs([{
+            **self._oneshot(times=1, completed=0),
+            "restart_policy": "resume",
+            "next_run_at": now.isoformat(),
+        }])
+
+        first_due = get_due_jobs()
+        assert [job["id"] for job in first_due] == ["os1"]
+        assert self._issue_resume_from_due("os1")
+        abandoned = get_job("os1")
+        assert abandoned is not None
+        occurrence_id = abandoned["resume_reservation"]["occurrence_id"]
+        dead_owner = abandoned["resume_reservation"]["owner"]
+        run_owner = abandoned["run_claim"]["by"]
+        assert abandoned["resume_reservation"]["state"] == "running"
+        assert abandoned["repeat"]["completed"] == 0
+
+        # A live heartbeat remains authoritative: this is only a hard-death
+        # recovery after the existing run-claim TTL semantics prove staleness.
+        clock[0] = now + timedelta(seconds=ttl_seconds - 1)
+        assert heartbeat_run_claim("os1", expected_owner=run_owner) is True
+        assert get_due_jobs() == []
+        fresh = get_job("os1")
+        assert fresh is not None
+        assert fresh["resume_reservation"]["state"] == "running"
+        assert fresh["resume_reservation"]["owner"] == dead_owner
+
+        # The original claim timestamp has crossed its TTL, but the fresh
+        # heartbeat has not: a live process is never rearmed.
+        clock[0] = now + timedelta(seconds=ttl_seconds + 1)
+        assert get_due_jobs() == []
+        still_live = get_job("os1")
+        assert still_live is not None
+        assert still_live["resume_reservation"]["state"] == "running"
+        assert still_live["resume_reservation"]["owner"] == dead_owner
+
+        # No settlement occurs: model a process death after that heartbeat and
+        # a later scheduler scan. It must rearm, not immediately re-dispatch
+        # before its bounded backoff.
+        clock[0] = now + timedelta(seconds=(2 * ttl_seconds) + 1)
+        assert get_due_jobs() == []
+        rearmed = get_job("os1")
+        assert rearmed is not None
+        reservation = rearmed["resume_reservation"]
+        assert rearmed["repeat"]["completed"] == 0
+        assert rearmed["enabled"] is True
+        assert rearmed["state"] == "retry_pending"
+        assert rearmed["run_claim"] is None
+        assert rearmed.get("fire_claim") is None
+        assert reservation["occurrence_id"] == occurrence_id
+        assert reservation["state"] == "retry_pending"
+        assert reservation["owner"] is None
+        retry_at = datetime.fromisoformat(reservation["retry_not_before"])
+        assert rearmed["next_run_at"] == reservation["retry_not_before"]
+
+        clock[0] = retry_at - timedelta(microseconds=1)
+        assert get_due_jobs() == []
+        clock[0] = retry_at
+        retry_due = get_due_jobs()
+        assert [job["id"] for job in retry_due] == ["os1"]
+        assert self._issue_resume_from_due("os1")
+        retried = get_job("os1")
+        assert retried is not None
+        retried_reservation = retried["resume_reservation"]
+        assert retried_reservation["occurrence_id"] == occurrence_id
+        assert retried_reservation["state"] == "running"
+        assert retried_reservation["attempt"] == 2
+        assert retried_reservation["owner"] == retried["run_claim"]["fire_owner"]
+        assert retried_reservation["owner"] != dead_owner
+        assert mark_job_run(
+            "os1", success=True, expected_resume_owner=dead_owner
+        ) is False
+        assert get_job("os1")["repeat"]["completed"] == 0
+
+    def test_resume_real_fire_chain_rearms_same_occurrence_after_hard_death(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        """The real due→fire→dispatch chain publishes a recoverable proof."""
+        now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+        clock = [now]
+        ttl_seconds = 30
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: clock[0])
+        monkeypatch.setattr(
+            "cron.jobs._oneshot_run_claim_ttl_seconds", lambda: ttl_seconds
+        )
+        save_jobs([{
+            **self._oneshot(times=1, completed=0),
+            "restart_policy": "resume",
+            "next_run_at": now.isoformat(),
+        }])
+
+        initial_due = get_due_jobs()
+        assert [job["id"] for job in initial_due] == ["os1"]
+        claimed = claim_job_for_fire(
+            "os1",
+            expected_run_owner=initial_due[0]["run_claim"]["by"],
+            return_job=True,
+        )
+        assert isinstance(claimed, dict)
+        before_dispatch = get_job("os1")
+        assert before_dispatch is not None
+        run_owner = before_dispatch["run_claim"]["by"]
+        fire_owner = before_dispatch["fire_claim"]["by"]
+        assert fire_owner != run_owner
+        assert before_dispatch["fire_claim"]["source_run_owner"] == run_owner
+        assert before_dispatch["run_claim"]["fire_owner"] == fire_owner
+
+        assert claim_dispatch("os1", claimed_job=claimed) is True
+        abandoned = get_job("os1")
+        assert abandoned is not None
+        reservation = abandoned["resume_reservation"]
+        occurrence_id = reservation["occurrence_id"]
+        assert reservation["owner"] == fire_owner
+        assert abandoned["run_claim"] == {
+            "at": now.isoformat(),
+            "by": run_owner,
+            "fire_owner": fire_owner,
+            "occurrence_id": occurrence_id,
+        }
+        assert abandoned["fire_claim"] == {
+            "at": now.isoformat(),
+            "by": fire_owner,
+            "source_run_owner": run_owner,
+            "occurrence_id": occurrence_id,
+        }
+
+        # No settlement or reload: a hard-dead run becomes a bounded retry only
+        # after the existing run-claim TTL has elapsed.
+        clock[0] = now + timedelta(seconds=ttl_seconds + 1)
+        assert get_due_jobs() == []
+        rearmed = get_job("os1")
+        assert rearmed is not None
+        assert rearmed["repeat"] == {"times": 1, "completed": 0}
+        assert rearmed["enabled"] is True
+        assert rearmed["state"] == "retry_pending"
+        assert rearmed["run_claim"] is None
+        assert rearmed["fire_claim"] is None
+        assert rearmed["resume_reservation"]["occurrence_id"] == occurrence_id
+        assert rearmed["resume_reservation"]["owner"] is None
+        assert rearmed["resume_reservation"]["state"] == "retry_pending"
+
+        retry_at = datetime.fromisoformat(rearmed["next_run_at"])
+        clock[0] = retry_at - timedelta(microseconds=1)
+        assert get_due_jobs() == []
+        assert get_job("os1") == rearmed
+        clock[0] = retry_at
+        retry_due = get_due_jobs()
+        assert [job["id"] for job in retry_due] == ["os1"]
+        retry_claimed = claim_job_for_fire(
+            "os1",
+            expected_run_owner=retry_due[0]["run_claim"]["by"],
+            return_job=True,
+        )
+        assert isinstance(retry_claimed, dict)
+        retry_fire_owner = retry_claimed["fire_claim"]["by"]
+        assert retry_fire_owner not in {run_owner, fire_owner}
+        assert claim_dispatch("os1", claimed_job=retry_claimed) is True
+        retried = get_job("os1")
+        assert retried is not None
+        assert retried["repeat"] == {"times": 1, "completed": 0}
+        assert retried["resume_reservation"]["occurrence_id"] == occurrence_id
+        assert retried["resume_reservation"]["owner"] == retry_fire_owner
+        assert retried["resume_reservation"]["attempt"] == 2
+
+        # The dead attempt's fire owner cannot settle or overwrite the retry.
+        assert mark_job_run(
+            "os1", success=False, error="late old owner", expected_resume_owner=fire_owner
+        ) is False
+        assert get_job("os1") == retried
+
+    @pytest.mark.parametrize(
+        "linkage",
+        (
+            "unrelated-stale-run-owner",
+            "mismatched-fire-source-run-owner",
+            "mismatched-run-fire-owner",
+            "mismatched-occurrence",
+            "missing-linkage",
+            "fresh-run-claim",
+        ),
+    )
+    def test_resume_real_fire_chain_recovery_fails_closed_without_exact_linkage(
+        self, tmp_cron_dir, monkeypatch, linkage
+    ):
+        """Only the exact production-order proof may rearm a running occurrence."""
+        import cron.jobs as jobs_mod
+
+        now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+        clock = [now]
+        ttl_seconds = 30
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: clock[0])
+        monkeypatch.setattr(
+            "cron.jobs._oneshot_run_claim_ttl_seconds", lambda: ttl_seconds
+        )
+        save_jobs([{
+            **self._oneshot(times=1, completed=0),
+            "restart_policy": "resume",
+            "next_run_at": now.isoformat(),
+        }])
+        due = get_due_jobs()
+        assert [job["id"] for job in due] == ["os1"]
+        claimed = claim_job_for_fire(
+            "os1", expected_run_owner=due[0]["run_claim"]["by"], return_job=True
+        )
+        assert isinstance(claimed, dict)
+        assert claim_dispatch("os1", claimed_job=claimed) is True
+
+        corrupted = get_job("os1")
+        assert corrupted is not None
+        if linkage == "unrelated-stale-run-owner":
+            corrupted["run_claim"]["by"] = "old-run-owner"
+        elif linkage == "mismatched-fire-source-run-owner":
+            corrupted["fire_claim"]["source_run_owner"] = "different-run-owner"
+        elif linkage == "mismatched-run-fire-owner":
+            corrupted["run_claim"]["fire_owner"] = "different-fire-owner"
+        elif linkage == "mismatched-occurrence":
+            corrupted["run_claim"]["occurrence_id"] = "different-occurrence"
+        elif linkage == "missing-linkage":
+            corrupted["fire_claim"].pop("source_run_owner")
+        else:
+            assert linkage == "fresh-run-claim"
+
+        if linkage != "fresh-run-claim":
+            save_jobs([corrupted])
+            clock[0] = now + timedelta(seconds=ttl_seconds + 1)
+
+        before = get_job("os1")
+        assert before is not None
+        before_bytes = jobs_mod._current_cron_store().jobs_file.read_bytes()
+        assert get_due_jobs() == []
+        after = get_job("os1")
+        assert after == before
+        assert after is not None
+        assert jobs_mod._current_cron_store().jobs_file.read_bytes() == before_bytes
+        assert after["resume_reservation"] == before["resume_reservation"]
+        assert after["fire_claim"] == before["fire_claim"]
+        assert after["run_claim"] == before["run_claim"]
+        assert after["repeat"] == before["repeat"]
+        assert after["next_run_at"] == before["next_run_at"]
+        assert after["state"] == before["state"]
+        assert after.get("last_status") == before.get("last_status")
+
+    def test_resume_fire_dispatch_rejects_missing_run_identity_without_mutation(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        """A fire claim cannot publish a body from an unprovable run identity."""
+        import cron.jobs as jobs_mod
+
+        now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        save_jobs([{
+            **self._oneshot(times=1, completed=0),
+            "restart_policy": "resume",
+            "next_run_at": now.isoformat(),
+        }])
+        due = get_due_jobs()
+        assert [job["id"] for job in due] == ["os1"]
+        claimed = claim_job_for_fire(
+            "os1", expected_run_owner=due[0]["run_claim"]["by"], return_job=True
+        )
+        assert isinstance(claimed, dict)
+
+        malformed = get_job("os1")
+        assert malformed is not None
+        malformed["run_claim"]["by"] = None
+        malformed["fire_claim"]["source_run_owner"] = None
+        save_jobs([malformed])
+        before = get_job("os1")
+        assert before is not None
+        before_bytes = jobs_mod._current_cron_store().jobs_file.read_bytes()
+
+        assert claim_dispatch("os1", claimed_job=claimed) is False
+        assert get_job("os1") == before
+        assert jobs_mod._current_cron_store().jobs_file.read_bytes() == before_bytes
+        assert before["resume_reservation"] == claimed["resume_reservation"]
+
+    def test_resume_running_reservation_ignores_unrelated_stale_claim(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        """A stale prior owner cannot rearm or fence a live resume occurrence."""
+        now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        monkeypatch.setattr("cron.jobs._oneshot_run_claim_ttl_seconds", lambda: 30)
+        current_owner = "current-owner"
+        occurrence_id = "current-occurrence"
+        stale_claim = {
+            "at": (now - timedelta(seconds=31)).isoformat(),
+            "by": "old-owner",
+            "occurrence_id": "old-occurrence",
+        }
+        reservation = {
+            "occurrence_id": occurrence_id,
+            "owner": current_owner,
+            "state": "running",
+            "attempt": 1,
+            "reserved_at": now.isoformat(),
+        }
+        fire_claim = {"at": now.isoformat(), "by": current_owner}
+        save_jobs([{
+            **self._oneshot(times=1, completed=0),
+            "restart_policy": "resume",
+            "next_run_at": (now - timedelta(seconds=1)).isoformat(),
+            "state": "scheduled",
+            "resume_reservation": reservation,
+            "fire_claim": fire_claim,
+            "run_claim": stale_claim,
+        }])
+
+        assert get_due_jobs() == []
+
+        after = get_job("os1")
+        assert after is not None
+        assert after["run_claim"] == stale_claim
+        assert after["fire_claim"] == fire_claim
+        assert after["resume_reservation"] == reservation
+        assert after["repeat"] == {"times": 1, "completed": 0}
+        assert after["state"] != "retry_pending"
+        assert after.get("next_run_at") != after["resume_reservation"].get(
+            "retry_not_before"
+        )
+
+    @pytest.mark.parametrize(
+        ("claim_owner", "claim_occurrence", "fire_owner"),
+        [
+            ("current-owner", "different-occurrence", "current-owner"),
+            ("current-owner", "current-occurrence", "different-fire-owner"),
+        ],
+        ids=("different-occurrence", "different-fire-owner"),
+    )
+    def test_resume_running_reservation_requires_exact_claim_chain(
+        self,
+        tmp_cron_dir,
+        monkeypatch,
+        claim_owner,
+        claim_occurrence,
+        fire_owner,
+    ):
+        """Recovery fails closed unless run, reservation, and fire owners match."""
+        now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        monkeypatch.setattr("cron.jobs._oneshot_run_claim_ttl_seconds", lambda: 30)
+        reservation = {
+            "occurrence_id": "current-occurrence",
+            "owner": "current-owner",
+            "state": "running",
+            "attempt": 1,
+            "reserved_at": now.isoformat(),
+        }
+        run_claim = {
+            "at": (now - timedelta(seconds=31)).isoformat(),
+            "by": claim_owner,
+            "occurrence_id": claim_occurrence,
+        }
+        fire_claim = {"at": now.isoformat(), "by": fire_owner}
+        save_jobs([{
+            **self._oneshot(times=1, completed=0),
+            "restart_policy": "resume",
+            "next_run_at": (now - timedelta(seconds=1)).isoformat(),
+            "state": "scheduled",
+            "resume_reservation": reservation,
+            "fire_claim": fire_claim,
+            "run_claim": run_claim,
+        }])
+
+        assert get_due_jobs() == []
+        after = get_job("os1")
+        assert after is not None
+        assert after["run_claim"] == run_claim
+        assert after["fire_claim"] == fire_claim
+        assert after["resume_reservation"] == reservation
+        assert after["state"] == "scheduled"
+        assert after["repeat"] == {"times": 1, "completed": 0}
+
+    def test_resume_running_reservation_rearms_same_occurrence_when_persisted_fire_claim_is_missing(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        """A vanished fire claim cannot wedge an exact published A→B→O run."""
+        now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+        clock = [now]
+        ttl_seconds = 30
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: clock[0])
+        monkeypatch.setattr(
+            "cron.jobs._oneshot_run_claim_ttl_seconds", lambda: ttl_seconds
+        )
+        save_jobs([{
+            **self._oneshot(times=1, completed=0),
+            "restart_policy": "resume",
+            "next_run_at": now.isoformat(),
+        }])
+
+        due = get_due_jobs()
+        assert [job["id"] for job in due] == ["os1"]
+        claimed = claim_job_for_fire(
+            "os1", expected_run_owner=due[0]["run_claim"]["by"], return_job=True
+        )
+        assert isinstance(claimed, dict)
+        assert claim_dispatch("os1", claimed_job=claimed) is True
+        abandoned = get_job("os1")
+        assert abandoned is not None
+        run_claim = abandoned["run_claim"]
+        reservation = abandoned["resume_reservation"]
+        fire_claim = abandoned["fire_claim"]
+        run_owner = run_claim["by"]
+        fire_owner = reservation["owner"]
+        occurrence_id = reservation["occurrence_id"]
+        assert run_claim["fire_owner"] == fire_owner
+        assert run_claim["occurrence_id"] == occurrence_id
+        assert fire_claim["by"] == fire_owner
+        assert fire_claim["source_run_owner"] == run_owner
+        assert fire_claim["occurrence_id"] == occurrence_id
+
+        # A real process death may lose the separate fire-claim record while
+        # the atomically published run A/B/O and running reservation survive.
+        abandoned.pop("fire_claim")
+        save_jobs([abandoned])
+        clock[0] = now + timedelta(seconds=ttl_seconds + 1)
+
+        assert get_due_jobs() == []
+        rearmed = get_job("os1")
+        assert rearmed is not None
+        assert rearmed["repeat"] == {"times": 1, "completed": 0}
+        assert rearmed["enabled"] is True
+        assert rearmed["state"] == "retry_pending"
+        assert rearmed["run_claim"] is None
+        assert rearmed.get("fire_claim") is None
+        assert rearmed["resume_reservation"]["occurrence_id"] == occurrence_id
+        assert rearmed["resume_reservation"]["owner"] is None
+        assert rearmed["resume_reservation"]["state"] == "retry_pending"
+        assert rearmed["next_run_at"] == rearmed["resume_reservation"]["retry_not_before"]
+
+    def test_resume_running_reservation_requires_persisted_occurrence_link(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        """Legacy stale claims without an occurrence link cannot rearm a run."""
+        now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        monkeypatch.setattr("cron.jobs._oneshot_run_claim_ttl_seconds", lambda: 30)
+        reservation = {
+            "occurrence_id": "current-occurrence",
+            "owner": "current-owner",
+            "state": "running",
+            "attempt": 1,
+            "reserved_at": now.isoformat(),
+        }
+        run_claim = {
+            "at": (now - timedelta(seconds=31)).isoformat(),
+            "by": "current-owner",
+        }
+        fire_claim = {"at": now.isoformat(), "by": "current-owner"}
+        save_jobs([{
+            **self._oneshot(times=1, completed=0),
+            "restart_policy": "resume",
+            "next_run_at": (now - timedelta(seconds=1)).isoformat(),
+            "state": "scheduled",
+            "resume_reservation": reservation,
+            "fire_claim": fire_claim,
+            "run_claim": run_claim,
+        }])
+
+        assert get_due_jobs() == []
+        after = get_job("os1")
+        assert after is not None
+        assert after["run_claim"] == run_claim
+        assert after["fire_claim"] == fire_claim
+        assert after["resume_reservation"] == reservation
+        assert after["state"] == "scheduled"
+        assert after["repeat"] == {"times": 1, "completed": 0}
+
+
+class TestResumeAuthorityIssuance:
+    """Resume ownership must be issued once, not adopted or repaired later."""
+
+    @staticmethod
+    def _resume_oneshot(now):
+        return {
+            "id": "resume-authority",
+            "name": "resume authority",
+            "enabled": True,
+            "state": "scheduled",
+            "schedule": {"kind": "once", "run_at": now.isoformat()},
+            "next_run_at": now.isoformat(),
+            "repeat": {"times": 1, "completed": 0},
+            "restart_policy": "resume",
+        }
+
+    @pytest.mark.parametrize("case", ("stale", "fresh", "malformed", "running"))
+    def test_manual_resume_never_adopts_or_overwrites_existing_authority(
+        self, tmp_cron_dir, monkeypatch, case
+    ):
+        """No-due callers may mint only from an entirely authority-free row."""
+        import cron.jobs as jobs_mod
+
+        now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        job = self._resume_oneshot(now)
+        if case == "stale":
+            job["run_claim"] = {
+                "at": (now - timedelta(seconds=31)).isoformat(),
+                "by": "unrelated-stale-a",
+            }
+        elif case == "fresh":
+            job["run_claim"] = {"at": now.isoformat(), "by": "fresh-a"}
+        elif case == "malformed":
+            job["run_claim"] = {
+                "at": (now - timedelta(seconds=31)).isoformat(),
+                "by": "malformed-a",
+                "fire_owner": "orphan-b",
+            }
+        else:
+            assert case == "running"
+            job["run_claim"] = {
+                "at": (now - timedelta(seconds=31)).isoformat(),
+                "by": "run-a",
+                "fire_owner": "running-b",
+                "occurrence_id": "occurrence-o",
+            }
+            job["fire_claim"] = {
+                "at": (now - timedelta(seconds=301)).isoformat(),
+                "by": "running-b",
+                "source_run_owner": "run-a",
+                "occurrence_id": "occurrence-o",
+            }
+            job["resume_reservation"] = {
+                "owner": "running-b",
+                "occurrence_id": "occurrence-o",
+                "state": "running",
+                "attempt": 1,
+                "reserved_at": now.isoformat(),
+            }
+        save_jobs([job])
+        before = get_job(job["id"])
+        before_bytes = jobs_mod._current_cron_store().jobs_file.read_bytes()
+
+        assert claim_job_for_fire(job["id"], return_job=True) is False
+        assert get_job(job["id"]) == before
+        assert jobs_mod._current_cron_store().jobs_file.read_bytes() == before_bytes
+
+    @pytest.mark.parametrize("corruption", ("missing-fire", "wrong-owner", "wrong-occurrence"))
+    def test_resume_dispatch_refuses_to_repair_incomplete_authority(
+        self, tmp_cron_dir, monkeypatch, corruption
+    ):
+        """Dispatch is a validator: invalid A↔B↔O leaves store bytes untouched."""
+        import cron.jobs as jobs_mod
+
+        now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        job = self._resume_oneshot(now)
+        job["run_claim"] = {
+            "at": now.isoformat(),
+            "by": "run-a",
+            "fire_owner": "fire-b",
+            "occurrence_id": "occurrence-o",
+        }
+        job["fire_claim"] = {
+            "at": now.isoformat(),
+            "by": "fire-b",
+            "source_run_owner": "run-a",
+            "occurrence_id": "occurrence-o",
+        }
+        if corruption == "missing-fire":
+            job.pop("fire_claim")
+        elif corruption == "wrong-owner":
+            job["fire_claim"]["by"] = "other-b"
+        else:
+            assert corruption == "wrong-occurrence"
+            job["fire_claim"]["occurrence_id"] = "other-o"
+        save_jobs([job])
+        before = get_job(job["id"])
+        before_bytes = jobs_mod._current_cron_store().jobs_file.read_bytes()
+
+        assert claim_dispatch(job["id"]) is False
+        assert get_job(job["id"]) == before
+        assert jobs_mod._current_cron_store().jobs_file.read_bytes() == before_bytes
+
+    def test_resume_claim_publishes_complete_authority_and_dispatch_only_validates(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        """The due handoff atomically publishes A→B→O before dispatch runs."""
+        import cron.jobs as jobs_mod
+
+        now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        job = self._resume_oneshot(now)
+        save_jobs([job])
+
+        due = get_due_jobs()
+        assert [candidate["id"] for candidate in due] == [job["id"]]
+        run_owner = due[0]["run_claim"]["by"]
+        claimed_snapshot = claim_job_for_fire(
+            job["id"], expected_run_owner=run_owner, return_job=True
+        )
+        assert isinstance(claimed_snapshot, dict)
+
+        # Before dispatch, both the durable store and returned capability carry
+        # the complete exactly-linked authority published by the due handoff.
+        published = get_job(job["id"])
+        assert published is not None
+        assert published["run_claim"] == claimed_snapshot["run_claim"]
+        assert published["fire_claim"] == claimed_snapshot["fire_claim"]
+        assert published["resume_reservation"] == claimed_snapshot["resume_reservation"]
+        assert published["run_claim"]["by"] == run_owner
+        assert published["run_claim"]["fire_owner"] == published["fire_claim"]["by"]
+        assert published["fire_claim"]["source_run_owner"] == run_owner
+        assert published["run_claim"]["occurrence_id"] == published["fire_claim"]["occurrence_id"]
+        assert published["resume_reservation"] == {
+            "owner": published["fire_claim"]["by"],
+            "occurrence_id": published["run_claim"]["occurrence_id"],
+            "state": "running",
+            "attempt": 1,
+            "reserved_at": now.isoformat(),
+        }
+
+        authority = {
+            key: published[key]
+            for key in ("run_claim", "fire_claim", "resume_reservation")
+        }
+        before_exact_dispatch_bytes = jobs_mod._current_cron_store().jobs_file.read_bytes()
+        assert claim_dispatch(job["id"], claimed_job=claimed_snapshot) is True
+        after_exact_dispatch = get_job(job["id"])
+        assert after_exact_dispatch is not None
+        assert {
+            key: after_exact_dispatch[key]
+            for key in ("run_claim", "fire_claim", "resume_reservation")
+        } == authority
+        assert jobs_mod._current_cron_store().jobs_file.read_bytes() == before_exact_dispatch_bytes
+
+        # Dispatch is validation-only: a missing or mismatched reservation is
+        # never minted, repaired, or adopted from the exact claimed snapshot.
+        for corruption, reservation in (
+            ("missing", None),
+            ("wrong-owner", {**authority["resume_reservation"], "owner": "other-b"}),
+            (
+                "wrong-occurrence",
+                {**authority["resume_reservation"], "occurrence_id": "other-o"},
+            ),
+        ):
+            corrupted = dict(claimed_snapshot)
+            if reservation is None:
+                corrupted.pop("resume_reservation", None)
+            else:
+                corrupted["resume_reservation"] = reservation
+            save_jobs([corrupted])
+            before = get_job(job["id"])
+            assert before is not None
+            before_bytes = jobs_mod._current_cron_store().jobs_file.read_bytes()
+
+            assert claim_dispatch(job["id"], claimed_job=claimed_snapshot) is False, corruption
+            assert get_job(job["id"]) == before
+            assert jobs_mod._current_cron_store().jobs_file.read_bytes() == before_bytes
+
+    def test_resume_dispatch_without_snapshot_cannot_adopt_fresh_authority(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        """A job id alone is never enough to spend another worker's A→B→O."""
+        import cron.jobs as jobs_mod
+
+        now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        job = self._resume_oneshot(now)
+        job["run_claim"] = {
+            "at": now.isoformat(),
+            "by": "run-a",
+            "fire_owner": "fire-b",
+            "occurrence_id": "occurrence-o",
+        }
+        job["fire_claim"] = {
+            "at": now.isoformat(),
+            "by": "fire-b",
+            "source_run_owner": "run-a",
+            "occurrence_id": "occurrence-o",
+        }
+        save_jobs([job])
+        before = get_job(job["id"])
+        before_bytes = jobs_mod._current_cron_store().jobs_file.read_bytes()
+
+        assert claim_dispatch(job["id"]) is False
+        assert get_job(job["id"]) == before
+        assert jobs_mod._current_cron_store().jobs_file.read_bytes() == before_bytes
+
+    def test_stale_resume_snapshot_cannot_reclassify_or_consume(self, tmp_cron_dir, monkeypatch):
+        """A stale resume capability cannot reach terminal mutation branches."""
+        import cron.jobs as jobs_mod
+
+        now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        job = self._resume_oneshot(now)
+        job["run_claim"] = {
+            "at": now.isoformat(),
+            "by": "run-a",
+            "fire_owner": "fire-b",
+            "occurrence_id": "occurrence-o",
+        }
+        job["fire_claim"] = {
+            "at": now.isoformat(),
+            "by": "fire-b",
+            "source_run_owner": "run-a",
+            "occurrence_id": "occurrence-o",
+        }
+        save_jobs([job])
+        claimed_snapshot = get_job(job["id"])
+        assert claimed_snapshot is not None
+        changed = get_job(job["id"])
+        assert changed is not None
+        changed["restart_policy"] = "terminal"
+        save_jobs([changed])
+        before = get_job(job["id"])
+        before_bytes = jobs_mod._current_cron_store().jobs_file.read_bytes()
+
+        assert claim_dispatch(job["id"], claimed_job=claimed_snapshot) is False
+        assert get_job(job["id"]) == before
+        assert jobs_mod._current_cron_store().jobs_file.read_bytes() == before_bytes
+
+    def test_manual_fire_cannot_replace_running_chain_and_hard_death_rearms_same_occurrence(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        """A stale fire TTL never authorizes replacing a running A→B→O."""
+        now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+        clock = [now]
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: clock[0])
+        monkeypatch.setattr("cron.jobs._oneshot_run_claim_ttl_seconds", lambda: 30)
+        save_jobs([self._resume_oneshot(now)])
+
+        due = get_due_jobs()
+        assert [candidate["id"] for candidate in due] == ["resume-authority"]
+        observed_run_owner = due[0]["run_claim"]["by"]
+        claimed = claim_job_for_fire(
+            "resume-authority",
+            expected_run_owner=observed_run_owner,
+            return_job=True,
+        )
+        assert isinstance(claimed, dict)
+        assert claim_dispatch("resume-authority", claimed_job=claimed) is True
+        running = get_job("resume-authority")
+        assert running is not None
+        occurrence_id = running["resume_reservation"]["occurrence_id"]
+        fire_owner = running["fire_claim"]["by"]
+
+        clock[0] = now + timedelta(seconds=301)
+        before = get_job("resume-authority")
+        assert before is not None
+        assert claim_job_for_fire("resume-authority", return_job=True) is False
+        assert get_job("resume-authority") == before
+
+        assert get_due_jobs() == []
+        rearmed = get_job("resume-authority")
+        assert rearmed is not None
+        assert rearmed["resume_reservation"]["occurrence_id"] == occurrence_id
+        assert rearmed["resume_reservation"]["state"] == "retry_pending"
+        assert rearmed["resume_reservation"]["owner"] is None
+        assert rearmed["run_claim"] is None
+        assert rearmed["fire_claim"] is None
+        assert rearmed["repeat"] == {"times": 1, "completed": 0}
+        assert fire_owner != rearmed["resume_reservation"]["owner"]
 
 
 class TestLateEnvRepointScopesStore:

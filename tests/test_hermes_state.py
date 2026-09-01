@@ -2,7 +2,10 @@
 
 import hashlib
 import json
+import os
 import sqlite3
+import subprocess
+import sys
 import time
 import threading
 from contextlib import contextmanager
@@ -14,7 +17,7 @@ import pytest
 import hermes_state
 from agent.session_activity import ActivityProvenance
 from hermes_state import SCHEMA_SQL, SCHEMA_VERSION, SessionDB
-from hermes_state_common import register_turn_fence_generation
+from hermes_state_common import TURN_FENCE_GOVERNED_TABLES, register_turn_fence_generation
 
 
 class _NoFtsCursor(sqlite3.Cursor):
@@ -106,35 +109,152 @@ def _no_fts_rebuild_throttle(monkeypatch):
     monkeypatch.setattr(SessionDB, "_FTS_REBUILD_DUTY_FACTOR", 0.0)
 
 
+def _state_store_snapshot(db_path: Path):
+    """Capture bytes plus the public schema graph without opening a writer."""
+    def digest(path: Path):
+        return hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
+
+    conn = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        version = tuple(conn.execute("SELECT version FROM schema_version"))
+        graph = tuple(
+            conn.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                "WHERE type IN ('table', 'index', 'trigger', 'view') "
+                "ORDER BY type, name"
+            )
+        )
+    finally:
+        conn.close()
+    return {
+        "files": {
+            suffix: digest(db_path.with_name(db_path.name + suffix))
+            for suffix in ("", "-wal", "-shm")
+        },
+        "schema_version": version,
+        "graph": graph,
+    }
+
+
+def _seed_v27_state_store(db_path: Path) -> None:
+    """Build a complete pre-v28 store, rather than a scalar-only downgrade."""
+    current = SessionDB(db_path)
+    current.close()
+
+    legacy = sqlite3.connect(str(db_path))
+    try:
+        for (name,) in legacy.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+            "AND (name LIKE 'turn_fence_%' OR name LIKE 'session_process_%')"
+        ):
+            legacy.execute(f'DROP TRIGGER "{name}"')
+        legacy.execute("PRAGMA foreign_keys = OFF")
+        legacy.execute("DROP TABLE session_process_reservations")
+        legacy.execute("DROP TABLE session_process_authority_events")
+        legacy.execute("DROP TABLE session_process_authorities")
+        legacy.execute("ALTER TABLE sessions DROP COLUMN session_generation")
+        legacy.execute(
+            "DELETE FROM state_meta WHERE key IN "
+            "('session_process_state_db_id', 'session_process_state_family')"
+        )
+        legacy.execute("DELETE FROM schema_version")
+        legacy.execute(
+            "INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION - 1,)
+        )
+        legacy.create_function(
+            "hermes_turn_fence_generation", 0, lambda: SCHEMA_VERSION - 1
+        )
+        for table in TURN_FENCE_GOVERNED_TABLES:
+            if table in {"session_process_authorities", "session_process_reservations"}:
+                continue
+            for operation in ("INSERT", "UPDATE", "DELETE"):
+                legacy.execute(
+                    f"CREATE TRIGGER turn_fence_{table}_{operation.lower()} "
+                    f"BEFORE {operation} ON {table} BEGIN "
+                    "SELECT CASE "
+                    "WHEN typeof(hermes_turn_fence_generation()) != 'integer' "
+                    f"OR hermes_turn_fence_generation() != {SCHEMA_VERSION - 1} "
+                    "THEN RAISE(ABORT, 'state DB generation incompatible') "
+                    "END; END"
+                )
+        legacy.commit()
+    finally:
+        legacy.close()
+
+
+_LEGACY_CANONICAL_WRITER_PATH = (
+    Path(__file__).resolve().parent / "fixtures" / "legacy_v27_canonical_writer.py"
+)
+
+
+def _start_legacy_canonical_writer_attempt(home: Path, db_path: Path):
+    """Start the tracked v27-compatible writer outside the project import path."""
+    assert _LEGACY_CANONICAL_WRITER_PATH.is_file()
+    writer_cwd = home / "legacy-writer-cwd"
+    writer_cwd.mkdir()
+    env = {
+        "HERMES_HOME": str(home),
+        "LEGACY_SCHEMA_GENERATION": str(SCHEMA_VERSION - 1),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONPATH": "",
+        "PYTHONSAFEPATH": "1",
+        "STATE_DB_PATH": str(db_path),
+    }
+    for name in ("PATH", "SYSTEMROOT", "WINDIR"):
+        value = os.environ.get(name)
+        if value:
+            env[name] = value
+    process = subprocess.Popen(
+        [sys.executable, "-B", str(_LEGACY_CANONICAL_WRITER_PATH)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        cwd=writer_cwd,
+    )
+    assert process.stdout is not None
+    assert process.stderr is not None
+    return process, process.stdout.readline().strip()
+
+
+def _start_legacy_canonical_writer(home: Path, db_path: Path):
+    process, outcome = _start_legacy_canonical_writer_attempt(home, db_path)
+    assert outcome == "READY:READBACK", process.stderr.read()
+    return process
+
+
+def _stop_legacy_canonical_writer(process):
+    try:
+        if process.stdin is not None and not process.stdin.closed:
+            process.stdin.close()
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.terminate()
+        process.wait(timeout=5)
+    finally:
+        if process.stderr is not None:
+            stderr = process.stderr.read()
+            assert process.returncode == 0, stderr
+
+
 # =========================================================================
 # Connection lifecycle
 # =========================================================================
 
 
 class TestConnectionLifecycle:
-    def test_schema_version_existing_future_fails_before_package_mutation(
-        self, tmp_path, monkeypatch
-    ):
+    def test_schema_version_existing_future_fails_before_package_mutation(self, tmp_path):
         """An existing future store is rejected before SessionDB can write it."""
         db_path = tmp_path / "future-state.db"
-        seed = sqlite3.connect(str(db_path))
-        seed.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
-        seed.execute(
-            "INSERT INTO schema_version (version) VALUES (?)",
-            (SCHEMA_VERSION + 1,),
-        )
-        seed.commit()
+        seed = SessionDB(db_path)
         seed.close()
-
-        statements = []
-        real_connect = hermes_state._connect_tracked_db
-
-        def trace_connection(*args, **kwargs):
-            conn = real_connect(*args, **kwargs)
-            conn.set_trace_callback(statements.append)
-            return conn
-
-        monkeypatch.setattr(hermes_state, "_connect_tracked_db", trace_connection)
+        seed = sqlite3.connect(str(db_path), isolation_level=None)
+        seed.execute("PRAGMA journal_mode=WAL")
+        seed.execute(
+            "UPDATE schema_version SET version = ?", (SCHEMA_VERSION + 1,)
+        )
+        before = _state_store_snapshot(db_path)
 
         with pytest.raises(RuntimeError) as raised:
             SessionDB(db_path=db_path)
@@ -142,18 +262,186 @@ class TestConnectionLifecycle:
         error = raised.value
         assert isinstance(error, hermes_state.IncompatibleSchemaError)
         assert error.code == "STATE_DB_SCHEMA_INCOMPATIBLE"
-        assert error.args == ("Session state is incompatible with this Hermes version.",)
-        assert str(error) == "Session state is incompatible with this Hermes version."
-        assert hermes_state.get_last_init_error() == (
-            "STATE_DB_SCHEMA_INCOMPATIBLE: "
-            "Session state is incompatible with this Hermes version."
-        )
-        assert not any(
-            statement.lstrip().upper().startswith(
-                ("PRAGMA", "CREATE", "ALTER", "INSERT", "UPDATE", "DELETE")
+        assert error.expected_generation == SCHEMA_VERSION
+        assert error.actual_generation == SCHEMA_VERSION + 1
+        assert error.build_identity["version"]
+        assert "expected generation" in str(error)
+        assert "actual generation" in str(error)
+        assert "build identity" in str(error)
+        assert str(db_path) not in str(error)
+        assert str(tmp_path) not in (hermes_state.get_last_init_error() or "")
+        assert _state_store_snapshot(db_path) == before
+        seed.close()
+
+    def test_forward_schema_migration_refuses_active_legacy_canonical_writer(
+        self, tmp_path, monkeypatch
+    ):
+        """Only the live canonical store refuses a forward-fence publication."""
+        home = tmp_path / "profile-home"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        canonical = home / "state.db"
+        temporary = tmp_path / "temporary-v27.db"
+        _seed_v27_state_store(canonical)
+        _seed_v27_state_store(temporary)
+        writer = _start_legacy_canonical_writer(home, canonical)
+        try:
+            # The tracked legacy fixture both wrote and read its v27 row before
+            # the new migrator was admitted.
+            check = sqlite3.connect(str(canonical))
+            try:
+                assert check.execute(
+                    "SELECT entry_json FROM gateway_routing WHERE session_key = 'legacy-writer'"
+                ).fetchall() == [('{}',)]
+            finally:
+                check.close()
+            # A test/private DB stays migratable while the live profile is owned.
+            temp_db = SessionDB(temporary)
+            temp_db.close()
+            assert _state_store_snapshot(temporary)["schema_version"] == (
+                (SCHEMA_VERSION,),
             )
-            for statement in statements
+
+            before = _state_store_snapshot(canonical)
+            with pytest.raises(hermes_state.ForwardSchemaMigrationAdmissionError) as raised:
+                SessionDB(canonical)
+            error = raised.value
+            assert error.expected_generation == SCHEMA_VERSION
+            assert error.actual_generation == SCHEMA_VERSION - 1
+            assert str(canonical) not in str(error)
+            assert _state_store_snapshot(canonical) == before
+        finally:
+            _stop_legacy_canonical_writer(writer)
+
+        # Once that precise live owner is gone, normal forward migration and
+        # equal-version reopen remain available.
+        upgraded = SessionDB(canonical)
+        upgraded.close()
+        equal_version = SessionDB(canonical)
+        equal_version.close()
+        assert _state_store_snapshot(canonical)["schema_version"] == ((SCHEMA_VERSION,),)
+
+        new_home = tmp_path / "empty-profile-home"
+        new_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(new_home))
+        fresh = SessionDB(new_home / "state.db")
+        fresh.close()
+        assert _state_store_snapshot(new_home / "state.db")["schema_version"] == (
+            (SCHEMA_VERSION,),
         )
+
+    def test_forward_migration_keeps_canonical_lock_target_when_home_changes_before_lease(
+        self, tmp_path, monkeypatch
+    ):
+        """A frozen canonical home must keep admission on that home's runtime lock."""
+        from gateway import status
+
+        home_a = tmp_path / "home-a"
+        home_b = tmp_path / "home-b"
+        home_a.mkdir()
+        home_b.mkdir()
+        canonical = home_b / "state.db"
+        canonical_lock_path = home_b / "gateway.lock"
+        monkeypatch.setenv("HERMES_HOME", str(home_b))
+        _seed_v27_state_store(canonical)
+        writer = _start_legacy_canonical_writer(home_b, canonical)
+        before = _state_store_snapshot(canonical)
+        observed_lock_targets = []
+        original_acquire = status.acquire_gateway_runtime_migration_lease
+        original_init_schema = SessionDB._init_schema
+        reached_v28_publication = []
+
+        def switch_home_after_target_snapshot(target_lock_path=None):
+            observed_lock_targets.append(target_lock_path)
+            monkeypatch.setenv("HERMES_HOME", str(home_a))
+            if target_lock_path is None:
+                return original_acquire()
+            return original_acquire(target_lock_path)
+
+        def record_v28_publication(db):
+            reached_v28_publication.append(True)
+            return original_init_schema(db)
+
+        monkeypatch.setattr(
+            status,
+            "acquire_gateway_runtime_migration_lease",
+            switch_home_after_target_snapshot,
+        )
+        monkeypatch.setattr(SessionDB, "_init_schema", record_v28_publication)
+        db = None
+        error = None
+        try:
+            try:
+                db = SessionDB(canonical)
+            except BaseException as exc:
+                error = exc
+            finally:
+                if db is not None:
+                    db.close()
+
+            # The predecessor takes a private home-a lease and reaches DDL;
+            # refusal must happen before the first writable publication step.
+            assert reached_v28_publication == []
+            assert isinstance(error, hermes_state.ForwardSchemaMigrationAdmissionError)
+            assert observed_lock_targets == [canonical_lock_path]
+            assert os.environ["HERMES_HOME"] == str(home_a)
+            assert _state_store_snapshot(canonical) == before
+        finally:
+            _stop_legacy_canonical_writer(writer)
+
+    def test_forward_schema_migration_holds_gateway_lock_until_v28_publication(
+        self, tmp_path, monkeypatch
+    ):
+        """A migration lease excludes a late old-runtime lock claimant until v28 commits."""
+        home = tmp_path / "profile-home"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        canonical = home / "state.db"
+        _seed_v27_state_store(canonical)
+        before_v28_publication = threading.Event()
+        allow_v28_publication = threading.Event()
+        migration_result = []
+        original_init_schema = SessionDB._init_schema
+
+        def pause_before_v28_publication(db):
+            before_v28_publication.set()
+            assert allow_v28_publication.wait(timeout=5), "test did not release v28 publication"
+            return original_init_schema(db)
+
+        monkeypatch.setattr(SessionDB, "_init_schema", pause_before_v28_publication)
+
+        def migrate():
+            try:
+                migration_result.append(("db", SessionDB(canonical)))
+            except BaseException as exc:
+                migration_result.append(("error", exc))
+
+        migration = threading.Thread(target=migrate)
+        migration.start()
+        assert before_v28_publication.wait(timeout=5), "migration never reached publication barrier"
+        claimant, outcome = _start_legacy_canonical_writer_attempt(home, canonical)
+        try:
+            # On the predecessor, the admission probe completed before this
+            # exact old runtime could claim, start, and write to the canonical
+            # store, exposing the check→DDL gap.
+            assert outcome == "REFUSED"
+        finally:
+            allow_v28_publication.set()
+            migration.join(timeout=10)
+            _stop_legacy_canonical_writer(claimant)
+
+        assert not migration.is_alive(), "migration did not complete after publication release"
+        kind, result = migration_result.pop()
+        assert kind == "db", result
+        result.close()
+        assert _state_store_snapshot(canonical)["schema_version"] == ((SCHEMA_VERSION,),)
+        check = sqlite3.connect(str(canonical))
+        try:
+            assert check.execute(
+                "SELECT COUNT(*) FROM gateway_routing WHERE session_key = 'legacy-writer'"
+            ).fetchone() == (0,)
+        finally:
+            check.close()
 
     @pytest.mark.parametrize(
         "values",
