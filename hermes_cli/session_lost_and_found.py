@@ -85,7 +85,18 @@ _SESSIONS_HISTORICAL_LAYOUTS = {
     len(_SESSIONS_REAL_52_COLUMNS): _SESSIONS_REAL_52_COLUMNS,
     len(_SESSIONS_PRE_V28_56_COLUMNS): _SESSIONS_PRE_V28_56_COLUMNS,
 }
+# A v28 open of a real pre-v28 database adds session_generation with generic
+# ALTER TABLE ADD COLUMN. SQLite appends that physical cell after the immutable
+# 56-column layout; it does not rewrite the row into current logical order.
+_SESSIONS_PRE_V28_56_PLUS_APPENDED_GENERATION_COLUMNS = (
+    *_SESSIONS_PRE_V28_56_COLUMNS,
+    "session_generation",
+)
 _CURRENT_SESSIONS_NFIELD = 57
+_CURRENT_SESSIONS_GENERATION_INDEX = 29
+_APPENDED_HISTORICAL_SESSIONS_GENERATION_INDEX = (
+    len(_SESSIONS_PRE_V28_56_COLUMNS)
+)
 SESSIONS_LEGACY_MINIMAL_NFIELD = 14
 SESSION_MODEL_USAGE_NFIELD = 18
 
@@ -326,14 +337,53 @@ def classify_lost_and_found_row(
     return None
 
 
+def _is_positive_sqlite_integer(value: Any) -> bool:
+    """True for a recovered SQLite INTEGER that can be a session generation."""
+    return type(value) is int and value > 0
+
+
+def _is_explicit_current_sessions_layout(destination_columns: list[str]) -> bool:
+    """Whether the destination's known physical order is the current 57 layout."""
+    return (
+        len(destination_columns) == _CURRENT_SESSIONS_NFIELD
+        and destination_columns[_CURRENT_SESSIONS_GENERATION_INDEX]
+        == "session_generation"
+        and destination_columns[_CURRENT_SESSIONS_GENERATION_INDEX + 1]
+        == "billing_provider"
+        and destination_columns[-1] == "last_read_at"
+    )
+
+
 def _session_source_columns(
     nfield: int,
+    cells: tuple[Any, ...],
     destination_columns: list[str],
 ) -> Optional[tuple[str, ...]]:
-    """Return the proven source layout, never a positional destination guess."""
-    if nfield == _CURRENT_SESSIONS_NFIELD and len(destination_columns) == nfield:
-        return tuple(destination_columns)
-    return _SESSIONS_HISTORICAL_LAYOUTS.get(nfield)
+    """Return one uniquely proven source layout, never a width-only guess.
+
+    A 57-cell record may be either current logical order (generation at cell
+    29) or a real pre-v28 physical 56-column record to which migration appended
+    generation at cell 56.  The discrete positive SQLite INTEGER generation is
+    a source-row invariant at each candidate's physical slot.  If both
+    candidates validate, or neither does, the record is intentionally unmapped.
+    """
+    if nfield != _CURRENT_SESSIONS_NFIELD:
+        return _SESSIONS_HISTORICAL_LAYOUTS.get(nfield)
+    if len(cells) < nfield:
+        return None
+
+    candidates: list[tuple[str, ...]] = []
+    if (
+        _is_explicit_current_sessions_layout(destination_columns)
+        and _is_positive_sqlite_integer(cells[_CURRENT_SESSIONS_GENERATION_INDEX])
+    ):
+        candidates.append(tuple(destination_columns))
+    if _is_positive_sqlite_integer(
+        cells[_APPENDED_HISTORICAL_SESSIONS_GENERATION_INDEX]
+    ):
+        candidates.append(_SESSIONS_PRE_V28_56_PLUS_APPENDED_GENERATION_COLUMNS)
+
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def _heuristic_started_at(cells: tuple[Any, ...]) -> float:
@@ -514,7 +564,7 @@ def map_lost_and_found_rows(
                             report["legacy_minimal_sessions"] += 1
                     else:
                         source_columns = _session_source_columns(
-                            nfield, sessions_columns
+                            nfield, cells, sessions_columns
                         )
                         if (
                             source_columns is None

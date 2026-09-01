@@ -911,6 +911,9 @@ def _make_synthetic_lost_and_found(
                 "source": "telegram",
                 "started_at": 1_754_000_000.0,
                 "message_count": 2,
+                # A current 57-column source must carry a real physical
+                # generation at its current-layout slot; literal 52 ignores it.
+                "session_generation": 2,
                 "title": f"synthetic {session_id}",
             }
             source_columns = (
@@ -1506,6 +1509,309 @@ def test_mapper_schema_less_historical_session_layout_preserves_field_meanings(
         ).fetchone()[0] == 1
     finally:
         recovered_db.close()
+
+
+def test_mapper_schema_less_pre_v28_56_with_appended_generation_preserves_named_fields(
+    tmp_path: Path,
+) -> None:
+    """Generic ALTER appends generation after the immutable pre-v28 layout."""
+    source_columns = (
+        *_IMMEDIATE_PRE_V28_56_SESSION_COLUMNS,
+        "session_generation",
+    )
+    assert len(source_columns) == 57
+    assert source_columns[28] == "git_metadata_generation"
+    assert source_columns[29] == "billing_provider"
+    assert source_columns[-2:] == ("last_read_at", "session_generation")
+
+    source_session_id = "20260901_120057_abc057"
+    source_authority_token = "e" * 64
+    source_reservation_token = "f" * 64
+    source_reservation_id = "source-appended-generation-reservation"
+    source_values = {
+        "id": source_session_id,
+        "source": "discord",
+        "user_id": "appended-source-user",
+        "session_key": "appended-source-key",
+        "chat_id": "appended-source-chat",
+        "chat_type": "group",
+        "thread_id": "appended-source-thread",
+        "display_name": "appended-source-display",
+        "origin_json": '{"layout": "pre-v28-56-appended-generation"}',
+        "expiry_finalized": 1,
+        "model": "appended-source-model",
+        "model_config": '{"model": "appended-source"}',
+        "system_prompt": None,
+        "system_prompt_hash": None,
+        "parent_session_id": None,
+        "started_at": 1_754_000_057.0,
+        "ended_at": 1_754_000_157.0,
+        "end_reason": "appended-source-end",
+        "message_count": 57,
+        "tool_call_count": 58,
+        "input_tokens": 59,
+        "output_tokens": 60,
+        "cache_read_tokens": 61,
+        "cache_write_tokens": 62,
+        "reasoning_tokens": 63,
+        "cwd": "/source/pre-v28-appended",
+        "git_branch": "source-appended-branch",
+        "git_repo_root": "/source/appended/repo",
+        "git_metadata_generation": 64,
+        "billing_provider": "appended-billing-provider",
+        "billing_base_url": "https://appended.invalid/api",
+        "billing_mode": "appended-billing-mode",
+        "estimated_cost_usd": 57.125,
+        "actual_cost_usd": 57.25,
+        "cost_status": "appended-cost-status",
+        "cost_source": "appended-cost-source",
+        "pricing_version": "appended-pricing-version",
+        "title": "appended-source-title",
+        "title_source": "appended-source-title-source",
+        "last_activity_at": 1_754_000_257.0,
+        "last_activity_description": "appended-source-activity",
+        "last_activity_provenance": "appended-source-provenance",
+        "api_call_count": 65,
+        "handoff_state": "appended-handoff-state",
+        "handoff_platform": "appended-handoff-platform",
+        "handoff_error": "appended-handoff-error",
+        "compression_failure_cooldown_until": 1_754_000_357.0,
+        "compression_failure_error": "appended-compression-error",
+        "compression_fallback_streak": 66,
+        "compression_ineffective_count": 67,
+        "profile_name": "appended-source-profile",
+        "rewind_count": 68,
+        "archived": 1,
+        "pinned": 0,
+        "hidden": 1,
+        "last_read_at": 1_754_000_457.0,
+        # This is physical cell 56 because generic ALTER TABLE ADD COLUMN
+        # appends it; it is not current-layout physical cell 29.
+        "session_generation": 2,
+    }
+    recovered_row = [source_values[column] for column in source_columns]
+    assert recovered_row[-1] == 2
+
+    lf_path = tmp_path / "pre-v28-appended-generation-lost-and-found.db"
+    SessionDB(db_path=lf_path).close()
+    output = tmp_path / "pre-v28-appended-generation-mapped.db"
+    SessionDB(db_path=output).close()
+    lf_conn = sqlite3.connect(str(lf_path), isolation_level=None)
+    dest = sqlite3.connect(str(output), isolation_level=None)
+    try:
+        register_turn_fence_generation(lf_conn)
+        source_state_db_id = lf_conn.execute(
+            "SELECT value FROM state_meta WHERE key = 'session_process_state_db_id'"
+        ).fetchone()[0]
+        lf_conn.execute(
+            "INSERT INTO session_process_authorities "
+            "(session_id, session_generation, state_db_id, state_family, "
+            "authority_token, status, issued_at) VALUES (?, 2, ?, 'sessiondb-v1', "
+            "?, 'ISSUED', 1)",
+            (source_session_id, source_state_db_id, source_authority_token),
+        )
+        lf_conn.execute(
+            "INSERT INTO session_process_authority_events "
+            "(session_id, session_generation, state_db_id, state_family, "
+            "event_type, reservation_id, occurred_at) "
+            "VALUES (?, 2, ?, 'sessiondb-v1', 'SESSION_ISSUED', ?, 1)",
+            (source_session_id, source_state_db_id, source_reservation_id),
+        )
+        lf_conn.execute(
+            "INSERT INTO session_process_reservations "
+            "(reservation_id, reservation_token_sha256, session_id, "
+            "session_generation, state_db_id, state_family, status, reserved_at, "
+            "expires_at) VALUES (?, ?, ?, 2, ?, 'sessiondb-v1', 'RESERVED', 1, 2)",
+            (
+                source_reservation_id,
+                source_reservation_token,
+                source_session_id,
+                source_state_db_id,
+            ),
+        )
+        cells = ", ".join(f"c{index}" for index in range(len(recovered_row)))
+        lf_conn.execute(
+            "CREATE TABLE lost_and_found "
+            f"(rootpgno INTEGER, pgno INTEGER, nfield INTEGER, id INTEGER, {cells})"
+        )
+        placeholders = ", ".join("?" for _ in range(4 + len(recovered_row)))
+        lf_conn.execute(
+            f"INSERT INTO lost_and_found VALUES ({placeholders})",
+            [2, 5, len(recovered_row), 1, *recovered_row],
+        )
+
+        register_turn_fence_generation(dest)
+        mapping = map_lost_and_found_rows(lf_conn, dest)
+
+        assert mapping["mapped"]["sessions"] == 1
+        assert mapping["unmapped_rows"] == 0
+        assert dest.execute(
+            "SELECT billing_provider, billing_base_url, billing_mode, title, "
+            "title_source, last_activity_at, last_activity_description, "
+            "last_activity_provenance, handoff_state, handoff_platform, "
+            "handoff_error, profile_name, rewind_count, last_read_at "
+            "FROM sessions WHERE id = ?",
+            (source_session_id,),
+        ).fetchone() == (
+            "appended-billing-provider",
+            "https://appended.invalid/api",
+            "appended-billing-mode",
+            "appended-source-title",
+            "appended-source-title-source",
+            1_754_000_257.0,
+            "appended-source-activity",
+            "appended-source-provenance",
+            "appended-handoff-state",
+            "appended-handoff-platform",
+            "appended-handoff-error",
+            "appended-source-profile",
+            68,
+            1_754_000_457.0,
+        )
+        # The trailing source generation is excluded instead of being mapped
+        # to last_read_at, while the fresh destination mints generation 1.
+        assert dest.execute(
+            "SELECT session_generation, last_read_at FROM sessions WHERE id = ?",
+            (source_session_id,),
+        ).fetchone() == (1, 1_754_000_457.0)
+
+        destination_state_db_id = dest.execute(
+            "SELECT value FROM state_meta WHERE key = 'session_process_state_db_id'"
+        ).fetchone()[0]
+        assert destination_state_db_id != source_state_db_id
+        authority = dest.execute(
+            "SELECT session_generation, state_db_id, state_family, authority_token, "
+            "status FROM session_process_authorities WHERE session_id = ?",
+            (source_session_id,),
+        ).fetchone()
+        assert authority[:3] == (1, destination_state_db_id, "sessiondb-v1")
+        assert authority[3] != source_authority_token
+        assert len(authority[3]) == 64
+        assert authority[4] == "ISSUED"
+        assert dest.execute(
+            "SELECT session_generation, state_db_id, event_type, reservation_id "
+            "FROM session_process_authority_events WHERE session_id = ?",
+            (source_session_id,),
+        ).fetchall() == [(1, destination_state_db_id, "SESSION_ISSUED", None)]
+        assert dest.execute(
+            "SELECT COUNT(*) FROM session_process_reservations WHERE session_id = ?",
+            (source_session_id,),
+        ).fetchone() == (0,)
+    finally:
+        lf_conn.close()
+        dest.close()
+
+
+def test_mapper_schema_less_ambiguous_57_layout_refuses_without_partial_insert(
+    tmp_path: Path,
+) -> None:
+    """A row whose two physical generation slots both validate is unmapped."""
+    source_session_id = "20260901_120058_abc058"
+    lf_path = tmp_path / "ambiguous-57-lost-and-found.db"
+    SessionDB(db_path=lf_path).close()
+    output = tmp_path / "ambiguous-57-mapped.db"
+    SessionDB(db_path=output).close()
+    lf_conn = sqlite3.connect(str(lf_path), isolation_level=None)
+    dest = sqlite3.connect(str(output), isolation_level=None)
+    try:
+        session_columns = [
+            str(row[1]) for row in dest.execute("PRAGMA table_info(sessions)")
+        ]
+        assert len(session_columns) == 57
+        assert session_columns[29] == "session_generation"
+        assert session_columns[-1] == "last_read_at"
+        cells = ", ".join(f"c{index}" for index in range(len(session_columns)))
+        lf_conn.execute(
+            "CREATE TABLE lost_and_found "
+            f"(rootpgno INTEGER, pgno INTEGER, nfield INTEGER, id INTEGER, {cells})"
+        )
+        recovered_row = [None] * len(session_columns)
+        recovered_row[0] = source_session_id
+        recovered_row[1] = "cli"
+        recovered_row[15] = 1_754_000_058.0
+        recovered_row[29] = 2
+        # A damaged current-layout last_read_at can resemble the appended
+        # historical generation slot. Both candidates must therefore be
+        # rejected rather than silently preferring current order.
+        recovered_row[-1] = 2
+        placeholders = ", ".join("?" for _ in range(4 + len(recovered_row)))
+        lf_conn.execute(
+            f"INSERT INTO lost_and_found VALUES ({placeholders})",
+            [2, 5, len(recovered_row), 1, *recovered_row],
+        )
+
+        register_turn_fence_generation(dest)
+        mapping = map_lost_and_found_rows(lf_conn, dest)
+
+        assert mapping["mapped"]["sessions"] == 0
+        assert mapping["unmapped_rows"] == 1
+        assert dest.execute("SELECT COUNT(*) FROM sessions").fetchone() == (0,)
+        assert dest.execute(
+            "SELECT COUNT(*) FROM session_process_authorities WHERE session_id = ?",
+            (source_session_id,),
+        ).fetchone() == (0,)
+    finally:
+        lf_conn.close()
+        dest.close()
+
+
+def test_mapper_schema_less_unknown_or_short_57_layouts_refuse_without_insert(
+    tmp_path: Path,
+) -> None:
+    """Neither an unproven 57 layout nor a truncated one reaches INSERT."""
+    unknown_session_id = "20260901_120059_abc059"
+    short_session_id = "20260901_120100_abc100"
+    lf_path = tmp_path / "unknown-short-57-lost-and-found.db"
+    SessionDB(db_path=lf_path).close()
+    output = tmp_path / "unknown-short-57-mapped.db"
+    SessionDB(db_path=output).close()
+    lf_conn = sqlite3.connect(str(lf_path), isolation_level=None)
+    dest = sqlite3.connect(str(output), isolation_level=None)
+    try:
+        session_columns = [
+            str(row[1]) for row in dest.execute("PRAGMA table_info(sessions)")
+        ]
+        assert len(session_columns) == 57
+        full_cells = ", ".join(f"c{index}" for index in range(57))
+        short_cells = ", ".join(f"c{index}" for index in range(56))
+        lf_conn.execute(
+            "CREATE TABLE lost_and_found_unknown "
+            f"(rootpgno INTEGER, pgno INTEGER, nfield INTEGER, id INTEGER, {full_cells})"
+        )
+        lf_conn.execute(
+            "CREATE TABLE lost_and_found_short "
+            f"(rootpgno INTEGER, pgno INTEGER, nfield INTEGER, id INTEGER, {short_cells})"
+        )
+        unknown_row = [None] * 57
+        unknown_row[0] = unknown_session_id
+        unknown_row[1] = "cli"
+        # Neither physical generation cell is a positive SQLite INTEGER.
+        unknown_row[29] = "not-a-generation"
+        unknown_row[-1] = None
+        short_row = [None] * 56
+        short_row[0] = short_session_id
+        short_row[1] = "cli"
+        short_row[29] = 2
+        placeholders = ", ".join("?" for _ in range(4 + 57))
+        lf_conn.execute(
+            f"INSERT INTO lost_and_found_unknown VALUES ({placeholders})",
+            [2, 5, 57, 1, *unknown_row],
+        )
+        placeholders = ", ".join("?" for _ in range(4 + 56))
+        lf_conn.execute(
+            f"INSERT INTO lost_and_found_short VALUES ({placeholders})",
+            [2, 5, 57, 2, *short_row],
+        )
+
+        register_turn_fence_generation(dest)
+        mapping = map_lost_and_found_rows(lf_conn, dest)
+
+        assert mapping["mapped"]["sessions"] == 0
+        assert mapping["unmapped_rows"] == 2
+        assert dest.execute("SELECT COUNT(*) FROM sessions").fetchone() == (0,)
+    finally:
+        lf_conn.close()
+        dest.close()
 
 
 # ── issue #72291: source-fingerprint error must name the parent CLI ─────────
