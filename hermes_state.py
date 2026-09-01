@@ -5743,12 +5743,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             """Allow recovery only after rollback proves replay safety."""
             return (
                 transaction_rolled_back
-                and not commit_attempted
                 and not getattr(exc, "_hermes_transaction_started", False)
                 and (
-                    not callback_mutated
+                    (
+                        not commit_attempted
+                        and (
+                            not callback_mutated
+                            or (
+                                isinstance(exc, sqlite3.DatabaseError)
+                                and self._is_fts_write_corruption_error(exc)
+                            )
+                        )
+                    )
                     or (
-                        isinstance(exc, sqlite3.DatabaseError)
+                        commit_failure_definitely_rolled_back
+                        and isinstance(exc, sqlite3.DatabaseError)
                         and self._is_fts_write_corruption_error(exc)
                     )
                 )
@@ -5759,6 +5768,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             transaction_rolled_back = False
             callback_mutated = False
             commit_attempted = False
+            commit_failure_definitely_rolled_back = False
             try:
                 with self._same_connection_transaction_boundary() as conn:
                     try:
@@ -5778,8 +5788,24 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     except BaseException as exc:
                         if callback_total_changes is not None:
                             callback_mutated = conn.total_changes != callback_total_changes
+                        # A raised commit is normally ambiguous: it may have
+                        # durably committed before SQLite reported the error.
+                        # The sole exception is an FTS-corruption DatabaseError
+                        # observed while the same transaction remains active;
+                        # only a successful rollback to autocommit proves this
+                        # callback can safely be replayed.
+                        commit_failure_had_active_transaction = (
+                            commit_attempted
+                            and isinstance(exc, sqlite3.DatabaseError)
+                            and self._is_fts_write_corruption_error(exc)
+                            and conn.in_transaction
+                        )
                         self._rollback_or_retire_failed_transaction(conn, exc)
                         transaction_rolled_back = True
+                        commit_failure_definitely_rolled_back = (
+                            commit_failure_had_active_transaction
+                            and not conn.in_transaction
+                        )
                         raise
                 # Success — periodic best-effort checkpoint + FTS merge.
                 if _count_write:
@@ -5840,7 +5866,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # Non-lock error or patience exhausted — propagate.
                 raise
             except sqlite3.DatabaseError as exc:
-                if commit_attempted or getattr(exc, "_hermes_transaction_started", False):
+                if (
+                    commit_attempted
+                    and not _recovery_is_replay_safe(exc)
+                ) or getattr(exc, "_hermes_transaction_started", False):
                     raise
                 if transaction_started and not _recovery_is_replay_safe(exc):
                     raise
