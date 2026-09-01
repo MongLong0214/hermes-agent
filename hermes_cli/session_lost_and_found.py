@@ -92,7 +92,26 @@ _SESSIONS_PRE_V28_56_PLUS_APPENDED_GENERATION_COLUMNS = (
     *_SESSIONS_PRE_V28_56_COLUMNS,
     "session_generation",
 )
-_CURRENT_SESSIONS_NFIELD = 57
+# The current v28 CREATE TABLE physical order is immutable source-schema data,
+# not a destination PRAGMA projection. Unlike generic ALTER TABLE, v28 places
+# session_generation between git metadata and billing metadata.
+_CURRENT_SESSIONS_COLUMNS = (
+    "id", "source", "user_id", "session_key", "chat_id", "chat_type",
+    "thread_id", "display_name", "origin_json", "expiry_finalized", "model",
+    "model_config", "system_prompt", "system_prompt_hash", "parent_session_id",
+    "started_at", "ended_at", "end_reason", "message_count", "tool_call_count",
+    "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
+    "reasoning_tokens", "cwd", "git_branch", "git_repo_root",
+    "git_metadata_generation", "session_generation", "billing_provider",
+    "billing_base_url", "billing_mode", "estimated_cost_usd", "actual_cost_usd",
+    "cost_status", "cost_source", "pricing_version", "title", "title_source",
+    "last_activity_at", "last_activity_description", "last_activity_provenance",
+    "api_call_count", "handoff_state", "handoff_platform", "handoff_error",
+    "compression_failure_cooldown_until", "compression_failure_error",
+    "compression_fallback_streak", "compression_ineffective_count", "profile_name",
+    "rewind_count", "archived", "pinned", "hidden", "last_read_at",
+)
+_CURRENT_SESSIONS_NFIELD = len(_CURRENT_SESSIONS_COLUMNS)
 _CURRENT_SESSIONS_GENERATION_INDEX = 29
 _APPENDED_HISTORICAL_SESSIONS_GENERATION_INDEX = (
     len(_SESSIONS_PRE_V28_56_COLUMNS)
@@ -342,16 +361,14 @@ def _is_positive_sqlite_integer(value: Any) -> bool:
     return type(value) is int and value > 0
 
 
+def _is_nullable_sqlite_text(value: Any) -> bool:
+    """True for a recovered NULL or value from a SQLite TEXT-affinity cell."""
+    return value is None or isinstance(value, str)
+
+
 def _is_explicit_current_sessions_layout(destination_columns: list[str]) -> bool:
-    """Whether the destination's known physical order is the current 57 layout."""
-    return (
-        len(destination_columns) == _CURRENT_SESSIONS_NFIELD
-        and destination_columns[_CURRENT_SESSIONS_GENERATION_INDEX]
-        == "session_generation"
-        and destination_columns[_CURRENT_SESSIONS_GENERATION_INDEX + 1]
-        == "billing_provider"
-        and destination_columns[-1] == "last_read_at"
-    )
+    """Whether the destination exactly matches the immutable current layout."""
+    return tuple(destination_columns) == _CURRENT_SESSIONS_COLUMNS
 
 
 def _session_source_columns(
@@ -363,23 +380,30 @@ def _session_source_columns(
 
     A 57-cell record may be either current logical order (generation at cell
     29) or a real pre-v28 physical 56-column record to which migration appended
-    generation at cell 56.  The discrete positive SQLite INTEGER generation is
-    a source-row invariant at each candidate's physical slot.  If both
-    candidates validate, or neither does, the record is intentionally unmapped.
+    generation at cell 56. The current candidate requires the exact destination
+    schema and a positive recovered SQLite INTEGER at its generation cell. The
+    appended candidate instead requires its cell 29 billing_provider to retain
+    its TEXT-affinity storage semantics (NULL or str) plus a positive trailing
+    SQLite INTEGER generation. Thus a current INTEGER last_read_at never shifts
+    the row into the appended layout. Unsupported or ambiguous candidates are
+    intentionally unmapped.
     """
     if nfield != _CURRENT_SESSIONS_NFIELD:
         return _SESSIONS_HISTORICAL_LAYOUTS.get(nfield)
-    if len(cells) < nfield:
+    if (
+        len(cells) < nfield
+        or not _is_explicit_current_sessions_layout(destination_columns)
+    ):
         return None
 
     candidates: list[tuple[str, ...]] = []
+    if _is_positive_sqlite_integer(cells[_CURRENT_SESSIONS_GENERATION_INDEX]):
+        candidates.append(_CURRENT_SESSIONS_COLUMNS)
     if (
-        _is_explicit_current_sessions_layout(destination_columns)
-        and _is_positive_sqlite_integer(cells[_CURRENT_SESSIONS_GENERATION_INDEX])
-    ):
-        candidates.append(tuple(destination_columns))
-    if _is_positive_sqlite_integer(
-        cells[_APPENDED_HISTORICAL_SESSIONS_GENERATION_INDEX]
+        _is_nullable_sqlite_text(cells[_CURRENT_SESSIONS_GENERATION_INDEX])
+        and _is_positive_sqlite_integer(
+            cells[_APPENDED_HISTORICAL_SESSIONS_GENERATION_INDEX]
+        )
     ):
         candidates.append(_SESSIONS_PRE_V28_56_PLUS_APPENDED_GENERATION_COLUMNS)
 

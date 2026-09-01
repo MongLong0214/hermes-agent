@@ -24,6 +24,8 @@ from hermes_state import (
 )
 from hermes_cli import session_recovery
 from hermes_cli.session_lost_and_found import (
+    _is_positive_sqlite_integer,
+    _session_source_columns,
     classify_lost_and_found_row,
     map_lost_and_found_rows,
     rebuild_fts_indexes,
@@ -1113,7 +1115,27 @@ def test_mapper_rebuilds_sessiondb_from_synthetic_lost_and_found(
         db.close()
 
 
-def test_mapper_schema_less_current_session_mints_destination_authority(
+# Literal current layout from ``hermes_state_common.SCHEMA_SQL``. It is a
+# source-schema witness, deliberately not a PRAGMA result or mapper constant.
+_CURRENT_57_SESSION_COLUMNS = (
+    "id", "source", "user_id", "session_key", "chat_id", "chat_type",
+    "thread_id", "display_name", "origin_json", "expiry_finalized", "model",
+    "model_config", "system_prompt", "system_prompt_hash", "parent_session_id",
+    "started_at", "ended_at", "end_reason", "message_count", "tool_call_count",
+    "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
+    "reasoning_tokens", "cwd", "git_branch", "git_repo_root",
+    "git_metadata_generation", "session_generation", "billing_provider",
+    "billing_base_url", "billing_mode", "estimated_cost_usd", "actual_cost_usd",
+    "cost_status", "cost_source", "pricing_version", "title", "title_source",
+    "last_activity_at", "last_activity_description", "last_activity_provenance",
+    "api_call_count", "handoff_state", "handoff_platform", "handoff_error",
+    "compression_failure_cooldown_until", "compression_failure_error",
+    "compression_fallback_streak", "compression_ineffective_count", "profile_name",
+    "rewind_count", "archived", "pinned", "hidden", "last_read_at",
+)
+
+
+def test_mapper_literal_current_57_integer_last_read_at_mints_destination_authority(
     tmp_path: Path,
 ) -> None:
     """A current page-level row must not import its source generation/capabilities."""
@@ -1130,12 +1152,10 @@ def test_mapper_schema_less_current_session_mints_destination_authority(
     dest = sqlite3.connect(str(output), isolation_level=None)
     try:
         register_turn_fence_generation(lf_conn)
-        session_columns = [
-            str(row[1]) for row in dest.execute("PRAGMA table_info(sessions)")
-        ]
-        generation_index = session_columns.index("session_generation")
-        assert len(session_columns) == 57
-        assert generation_index == 29
+        source_columns = _CURRENT_57_SESSION_COLUMNS
+        assert len(source_columns) == 57
+        assert source_columns[29:31] == ("session_generation", "billing_provider")
+        assert source_columns[-1] == "last_read_at"
 
         source_state_db_id = lf_conn.execute(
             "SELECT value FROM state_meta WHERE key = 'session_process_state_db_id'"
@@ -1167,7 +1187,7 @@ def test_mapper_schema_less_current_session_mints_destination_authority(
             ),
         )
 
-        cells = ", ".join(f"c{index}" for index in range(len(session_columns)))
+        cells = ", ".join(f"c{index}" for index in range(len(source_columns)))
         lf_conn.execute(
             "CREATE TABLE lost_and_found "
             f"(rootpgno INTEGER, pgno INTEGER, nfield INTEGER, id INTEGER, {cells})"
@@ -1197,9 +1217,16 @@ def test_mapper_schema_less_current_session_mints_destination_authority(
             "handoff_error": "source-handoff-error",
             "profile_name": "source-profile",
             "rewind_count": 3,
+            "archived": 0,
+            "pinned": 1,
+            "hidden": 0,
+            # A recovered SQLite cell can be an INTEGER timestamp; it is not
+            # an appended-layout generation merely because it is positive.
+            "last_read_at": 1_754_000_002,
         }
-        recovered_row = [source_values.get(column) for column in session_columns]
-        assert recovered_row[generation_index] == 2
+        recovered_row = [source_values.get(column) for column in source_columns]
+        assert recovered_row[29] == 2
+        assert type(recovered_row[-1]) is int
         placeholders = ", ".join("?" for _ in range(4 + len(recovered_row)))
         lf_conn.execute(
             f"INSERT INTO lost_and_found VALUES ({placeholders})",
@@ -1222,8 +1249,8 @@ def test_mapper_schema_less_current_session_mints_destination_authority(
             "estimated_cost_usd, actual_cost_usd, cost_status, cost_source, "
             "pricing_version, title, title_source, last_activity_at, "
             "last_activity_description, last_activity_provenance, api_call_count, "
-            "handoff_state, handoff_platform, handoff_error, profile_name, "
-            "rewind_count FROM sessions WHERE id = ?",
+            "handoff_state, handoff_platform, handoff_error, profile_name, rewind_count, "
+            "archived, pinned, hidden, last_read_at FROM sessions WHERE id = ?",
             (source_session_id,),
         ).fetchone() == (
             "source-billing-provider",
@@ -1245,11 +1272,16 @@ def test_mapper_schema_less_current_session_mints_destination_authority(
             "source-handoff-error",
             "source-profile",
             3,
+            0,
+            1,
+            0,
+            1_754_000_002.0,
         )
 
         destination_state_db_id = dest.execute(
             "SELECT value FROM state_meta WHERE key = 'session_process_state_db_id'"
         ).fetchone()[0]
+        assert destination_state_db_id != source_state_db_id
         authority = dest.execute(
             "SELECT session_generation, state_db_id, state_family, authority_token, "
             "status FROM session_process_authorities WHERE session_id = ?",
@@ -1277,6 +1309,83 @@ def test_mapper_schema_less_current_session_mints_destination_authority(
         assert len(recovered_db.list_sessions_rich(limit=10)) == 1
     finally:
         recovered_db.close()
+
+
+def test_session_source_columns_rejects_invented_current_destination_layout() -> None:
+    """A matching width and three sentinels cannot invent a source layout."""
+    recovered_row = [None] * len(_CURRENT_57_SESSION_COLUMNS)
+    recovered_row[29] = 2
+    invented_destination = list(_CURRENT_57_SESSION_COLUMNS)
+    invented_destination[3] = "invented_source_field"
+
+    assert _session_source_columns(
+        len(recovered_row), tuple(recovered_row), invented_destination
+    ) is None
+
+
+def test_session_layout_disambiguation_uses_sqlite_storage_classes(
+    tmp_path: Path,
+) -> None:
+    """Only real SQLite INTEGER generations and TEXT-affinity providers classify."""
+    storage = sqlite3.connect(str(tmp_path / "storage-classes.db"))
+    try:
+        storage.execute(
+            "CREATE TABLE source_cells "
+            "(name TEXT PRIMARY KEY, generation INTEGER, provider TEXT, last_read_at)"
+        )
+        storage.executemany(
+            "INSERT INTO source_cells VALUES (?, ?, ?, ?)",
+            (
+                ("positive", 2, None, 1_754_000_000),
+                ("zero", 0, None, 1_754_000_000),
+                ("negative", -1, None, 1_754_000_000),
+                ("float", 2.5, None, 1_754_000_000),
+                ("text", "not-an-integer", None, 1_754_000_000),
+                # SQLite stores TRUE in an INTEGER-affinity column as INTEGER
+                # 1, so recovery sees an ordinary positive int, not bool.
+                ("sqlite-true", True, None, 1_754_000_000),
+                ("provider-string", 2, "source-provider", 1_754_000_000),
+            ),
+        )
+        rows = {
+            row[0]: row[1:]
+            for row in storage.execute(
+                "SELECT name, generation, typeof(generation), provider, "
+                "typeof(provider), last_read_at, typeof(last_read_at) "
+                "FROM source_cells"
+            )
+        }
+    finally:
+        storage.close()
+
+    assert rows["positive"] == (
+        2, "integer", None, "null", 1_754_000_000, "integer"
+    )
+    assert rows["sqlite-true"] == (
+        1, "integer", None, "null", 1_754_000_000, "integer"
+    )
+    assert rows["float"][1] == "real"
+    assert rows["text"][1] == "text"
+    assert rows["provider-string"][2:4] == ("source-provider", "text")
+    assert [_is_positive_sqlite_integer(rows[name][0]) for name in (
+        "positive", "zero", "negative", "float", "text", "sqlite-true"
+    )] == [True, False, False, False, False, True]
+
+    current_row = [None] * len(_CURRENT_57_SESSION_COLUMNS)
+    current_row[29] = rows["positive"][0]
+    current_row[-1] = rows["positive"][4]
+    assert _session_source_columns(
+        57, tuple(current_row), list(_CURRENT_57_SESSION_COLUMNS)
+    ) == _CURRENT_57_SESSION_COLUMNS
+
+    appended_columns = (*_IMMEDIATE_PRE_V28_56_SESSION_COLUMNS, "session_generation")
+    for provider_row in ("positive", "provider-string"):
+        appended_row = [None] * len(appended_columns)
+        appended_row[29] = rows[provider_row][2]
+        appended_row[-1] = rows[provider_row][0]
+        assert _session_source_columns(
+            57, tuple(appended_row), list(_CURRENT_57_SESSION_COLUMNS)
+        ) == appended_columns
 
 
 # Literal layouts from the immutable schema DDLs, deliberately independent of
@@ -1702,10 +1811,10 @@ def test_mapper_schema_less_pre_v28_56_with_appended_generation_preserves_named_
         dest.close()
 
 
-def test_mapper_schema_less_ambiguous_57_layout_refuses_without_partial_insert(
+def test_mapper_schema_less_both_positive_slots_remain_current_without_shift(
     tmp_path: Path,
 ) -> None:
-    """A row whose two physical generation slots both validate is unmapped."""
+    """An INTEGER last_read_at does not turn an exact current row into appended order."""
     source_session_id = "20260901_120058_abc058"
     lf_path = tmp_path / "ambiguous-57-lost-and-found.db"
     SessionDB(db_path=lf_path).close()
@@ -1714,25 +1823,22 @@ def test_mapper_schema_less_ambiguous_57_layout_refuses_without_partial_insert(
     lf_conn = sqlite3.connect(str(lf_path), isolation_level=None)
     dest = sqlite3.connect(str(output), isolation_level=None)
     try:
-        session_columns = [
-            str(row[1]) for row in dest.execute("PRAGMA table_info(sessions)")
-        ]
-        assert len(session_columns) == 57
-        assert session_columns[29] == "session_generation"
-        assert session_columns[-1] == "last_read_at"
-        cells = ", ".join(f"c{index}" for index in range(len(session_columns)))
+        source_columns = _CURRENT_57_SESSION_COLUMNS
+        assert len(source_columns) == 57
+        assert source_columns[29:31] == ("session_generation", "billing_provider")
+        assert source_columns[-1] == "last_read_at"
+        cells = ", ".join(f"c{index}" for index in range(len(source_columns)))
         lf_conn.execute(
             "CREATE TABLE lost_and_found "
             f"(rootpgno INTEGER, pgno INTEGER, nfield INTEGER, id INTEGER, {cells})"
         )
-        recovered_row = [None] * len(session_columns)
+        recovered_row = [None] * len(source_columns)
         recovered_row[0] = source_session_id
         recovered_row[1] = "cli"
         recovered_row[15] = 1_754_000_058.0
         recovered_row[29] = 2
-        # A damaged current-layout last_read_at can resemble the appended
-        # historical generation slot. Both candidates must therefore be
-        # rejected rather than silently preferring current order.
+        # These are both positive INTEGER cells, but cell 29 has current
+        # generation semantics; cell 56 is the current INTEGER timestamp.
         recovered_row[-1] = 2
         placeholders = ", ".join("?" for _ in range(4 + len(recovered_row)))
         lf_conn.execute(
@@ -1743,13 +1849,17 @@ def test_mapper_schema_less_ambiguous_57_layout_refuses_without_partial_insert(
         register_turn_fence_generation(dest)
         mapping = map_lost_and_found_rows(lf_conn, dest)
 
-        assert mapping["mapped"]["sessions"] == 0
-        assert mapping["unmapped_rows"] == 1
-        assert dest.execute("SELECT COUNT(*) FROM sessions").fetchone() == (0,)
+        assert mapping["mapped"]["sessions"] == 1
+        assert mapping["unmapped_rows"] == 0
+        assert dest.execute(
+            "SELECT session_generation, last_read_at FROM sessions WHERE id = ?",
+            (source_session_id,),
+        ).fetchone() == (1, 2.0)
+        assert dest.execute("SELECT COUNT(*) FROM sessions").fetchone() == (1,)
         assert dest.execute(
             "SELECT COUNT(*) FROM session_process_authorities WHERE session_id = ?",
             (source_session_id,),
-        ).fetchone() == (0,)
+        ).fetchone() == (1,)
     finally:
         lf_conn.close()
         dest.close()
