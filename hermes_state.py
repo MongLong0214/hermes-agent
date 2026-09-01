@@ -3725,6 +3725,13 @@ def _assert_offline_rebuild_write_authority(
 ) -> None:
     """Refuse writes unless the durable rebuild claim matches this owner."""
     try:
+        state_meta_object = conn.execute(
+            "SELECT type FROM sqlite_master WHERE name = 'state_meta'"
+        ).fetchone()
+        if state_meta_object is not None and state_meta_object[0] != "table":
+            raise SessionTurnLeaseLostError(
+                "refusing write without provable offline rebuild authority"
+            )
         rows = conn.execute(
             "SELECT value FROM state_meta WHERE key = ?",
             (_OFFLINE_REBUILD_EPOCH_KEY,),
@@ -3769,6 +3776,21 @@ def _assert_offline_rebuild_write_authority(
     )
 
 
+def _is_minimal_legacy_state_db_without_metadata(conn: sqlite3.Connection) -> bool:
+    """Whether ``conn`` has only the pre-``state_meta`` repair tables."""
+    try:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+            if not str(row[0]).startswith("sqlite_")
+        }
+    except sqlite3.Error:
+        return False
+    return tables == {"sessions", "messages"}
+
+
 def _assert_repair_state_db_write_authority(
     conn: sqlite3.Connection, *, local_marker: Optional[str]
 ) -> None:
@@ -3781,11 +3803,12 @@ def _assert_repair_state_db_write_authority(
     damaged state_meta shape/value still cannot establish no-owner authority
     and is fenced.
     """
+    require_metadata_table = not _is_minimal_legacy_state_db_without_metadata(conn)
     try:
         _assert_offline_rebuild_write_authority(
             conn,
             local_marker,
-            require_metadata_table=True,
+            require_metadata_table=require_metadata_table,
         )
         return
     except SessionTurnLeaseLostError as exc:

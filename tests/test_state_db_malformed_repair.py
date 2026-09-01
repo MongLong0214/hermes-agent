@@ -607,6 +607,55 @@ def test_existing_repair_with_deleted_state_meta_refuses_before_mutation(
     assert not hermes_state._repair_ledger_path(db_path).exists()
 
 
+def test_repair_refuses_zero_row_state_meta_view_before_mutation(tmp_path, monkeypatch):
+    """A replacement metadata relation is not the legacy no-metadata case."""
+    db_path = tmp_path / "state.db"
+    with sqlite3.connect(str(db_path), isolation_level=None) as conn:
+        conn.execute(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, started_at REAL)"
+        )
+        conn.execute(
+            "CREATE TABLE messages ("
+            "id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, "
+            "content TEXT, timestamp REAL)"
+        )
+        conn.execute(
+            "CREATE VIEW state_meta AS "
+            "SELECT CAST(NULL AS TEXT) AS key, CAST(NULL AS TEXT) AS value WHERE 0"
+        )
+        objects = conn.execute(
+            "SELECT type, name FROM sqlite_master "
+            "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+        ).fetchall()
+        assert objects == [
+            ("table", "messages"),
+            ("table", "sessions"),
+            ("view", "state_meta"),
+        ]
+        assert conn.execute("SELECT key, value FROM state_meta").fetchall() == []
+
+    before = _repair_artifact_snapshot(db_path)
+    statements: list[str] = []
+    original_connect = hermes_state._connect_repair_durable
+
+    def traced_repair_connect(path):
+        conn = original_connect(path)
+        conn.set_trace_callback(statements.append)
+        return conn
+
+    monkeypatch.setattr(
+        hermes_state, "_connect_repair_durable", traced_repair_connect
+    )
+
+    with pytest.raises(hermes_state.SessionTurnLeaseLostError, match="provable"):
+        repair_state_db_schema(db_path, backup=False)
+
+    assert _repair_mutations(statements) == []
+    assert _repair_artifact_snapshot(db_path) == before
+    assert not hermes_state._repair_ledger_path(db_path).exists()
+    assert not list(tmp_path.glob("state.db.malformed-backup-*"))
+
+
 def test_fresh_state_db_bootstrap_still_initializes_metadata(tmp_path):
     """Only ordinary initialization may create metadata for a fresh database."""
     db_path = tmp_path / "fresh-state.db"
