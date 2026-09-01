@@ -5739,8 +5739,25 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         def _is_no_more_rows(exc: sqlite3.Error) -> bool:
             return "no more rows available" in str(exc).lower()
 
+        def _recovery_is_replay_safe(exc: BaseException) -> bool:
+            """Allow recovery only after rollback proves replay safety."""
+            return (
+                transaction_rolled_back
+                and not commit_attempted
+                and not getattr(exc, "_hermes_transaction_started", False)
+                and (
+                    not callback_mutated
+                    or (
+                        isinstance(exc, sqlite3.DatabaseError)
+                        and self._is_fts_write_corruption_error(exc)
+                    )
+                )
+            )
+
         while True:
             transaction_started = False
+            transaction_rolled_back = False
+            callback_mutated = False
             commit_attempted = False
             try:
                 with self._same_connection_transaction_boundary() as conn:
@@ -5751,13 +5768,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         if getattr(exc, "_hermes_transaction_started", False):
                             self._rollback_or_retire_failed_transaction(conn, exc)
                         raise
+                    callback_total_changes: Optional[int] = None
                     try:
                         self._assert_offline_rebuild_write_authority(conn)
+                        callback_total_changes = conn.total_changes
                         result = fn(conn)
                         commit_attempted = True
                         conn.commit()
                     except BaseException as exc:
+                        if callback_total_changes is not None:
+                            callback_mutated = conn.total_changes != callback_total_changes
                         self._rollback_or_retire_failed_transaction(conn, exc)
+                        transaction_rolled_back = True
                         raise
                 # Success — periodic best-effort checkpoint + FTS merge.
                 if _count_write:
@@ -5794,14 +5816,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     continue
                 raise
             except sqlite3.OperationalError as exc:
-                if (
-                    commit_attempted
-                    or transaction_started
-                    or getattr(exc, "_hermes_transaction_started", False)
-                ):
+                if commit_attempted or getattr(exc, "_hermes_transaction_started", False):
                     raise
                 err_msg = str(exc).lower()
                 if "locked" in err_msg or "busy" in err_msg:
+                    if transaction_started:
+                        raise
                     if self._sleep_before_write_retry(deadline, patience_s):
                         continue
                     # Patience exhausted — say what actually happened so the
@@ -5813,16 +5833,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         "a large WAL checkpoint, or an older pre-update "
                         "process; the database itself is healthy)"
                     ) from exc
+                if transaction_started and not _recovery_is_replay_safe(exc):
+                    raise
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
                     continue
                 # Non-lock error or patience exhausted — propagate.
                 raise
             except sqlite3.DatabaseError as exc:
-                if (
-                    commit_attempted
-                    or transaction_started
-                    or getattr(exc, "_hermes_transaction_started", False)
-                ):
+                if commit_attempted or getattr(exc, "_hermes_transaction_started", False):
+                    raise
+                if transaction_started and not _recovery_is_replay_safe(exc):
                     raise
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
                     continue
@@ -5844,11 +5864,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # subclass) or another sqlite3.Error class outside the two
                 # handlers above. Message-scoped: anything else propagates
                 # untouched.
-                if (
-                    commit_attempted
-                    or transaction_started
-                    or getattr(exc, "_hermes_transaction_started", False)
-                ):
+                if commit_attempted or getattr(exc, "_hermes_transaction_started", False):
+                    raise
+                if transaction_started and not _recovery_is_replay_safe(exc):
                     raise
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
                     continue
