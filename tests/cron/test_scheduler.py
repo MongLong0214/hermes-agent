@@ -549,7 +549,6 @@ class TestRunJobSessionPersistence:
              patch("cron.scheduler._resolve_origin", return_value=None), \
              patch("hermes_cli.env_loader.load_hermes_dotenv"), \
              patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-             patch("hermes_state.SessionDB", return_value=fake_db), \
              patch(
                  "hermes_cli.runtime_provider.resolve_runtime_provider",
                  return_value={
@@ -564,7 +563,10 @@ class TestRunJobSessionPersistence:
             mock_agent.run_conversation.return_value = {"final_response": "ok"}
             mock_agent_cls.return_value = mock_agent
 
-            success, output, final_response, error = run_job(job)
+            with patch("hermes_state.SessionDB", return_value=fake_db) as session_db_factory:
+                success, output, final_response, error = run_job(job)
+
+        session_db_factory.assert_called_once_with()
 
         assert success is True
         assert error is None
