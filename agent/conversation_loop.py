@@ -26,6 +26,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
+from agent.codex_runtime import _CodexStreamTerminalFailure
 from agent.conversation_compression import (
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
     COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE,
@@ -74,6 +75,13 @@ from agent.model_metadata import (
     parse_available_output_tokens_from_error,
     save_context_length,
 )
+from agent.native_compaction import (
+    cancel_native_compaction_preflight_request,
+    consume_native_compaction_preflight_fallback,
+    defer_local_preflight_for_native_compaction,
+    observe_native_compaction_preflight_response,
+    start_native_compaction_preflight_request,
+)
 from agent.process_bootstrap import _install_safe_stdio
 from agent.prompt_caching import (
     build_prompt_cache_plan,
@@ -104,6 +112,10 @@ logger = logging.getLogger(__name__)
 
 class _ReceiptExecutionProfileError(RuntimeError):
     """Fail closed before a receipt reaches a mutable/unsupported call path."""
+
+
+class _NativeCompactionPreflightFallback(RuntimeError):
+    """Restart the outer loop so existing local preflight owns this request."""
 
 
 def _receipt_admitted_text(turn_receipt: Any, user_message: Any) -> Any:
@@ -2048,6 +2060,8 @@ def run_conversation(
     api_call_count = 0
     final_response = None
     interrupted = False
+    accepted_stream_failure = False
+    accepted_stream_failure_error = None
     failed = False
     codex_ack_continuations = 0
     length_continue_retries = 0
@@ -2835,6 +2849,7 @@ def run_conversation(
         if receipt_raw_text_only:
             _defer_preflight = lambda _tokens: False
             _compression_cooldown = None
+            _native_preflight_deferred = False
         else:
             _defer_preflight = getattr(
                 _compressor, "should_defer_preflight_to_real_usage", lambda _t: False
@@ -2842,13 +2857,27 @@ def run_conversation(
             _compression_cooldown = getattr(
                 _compressor, "get_active_compression_failure_cooldown", lambda: None
             )()
+            _native_preflight_deferred = defer_local_preflight_for_native_compaction(
+                agent, request_pressure_tokens, messages=messages
+            )
+            _native_preflight_fallback = consume_native_compaction_preflight_fallback(
+                agent
+            )
+            if _native_preflight_fallback:
+                _defer_preflight = lambda _tokens: False
         if (
             not receipt_raw_text_only
             and agent.compression_enabled
-            and len(messages) > 1
+            # A consumed native grace is a one-shot local-preflight obligation.
+            # Let that fallback run even if normalization collapsed history to
+            # one message, before the native-disabled retry can reach the wire.
+            and (len(messages) > 1 or _native_preflight_fallback)
             and compression_attempts < max_compression_attempts
             and not _preflight_compression_blocked
-            and not _defer_preflight(request_pressure_tokens)
+            and not (
+                _native_preflight_deferred
+                or _defer_preflight(request_pressure_tokens)
+            )
             and not _compression_cooldown
             and _compressor.should_compress(request_pressure_tokens)
         ):
@@ -3347,6 +3376,7 @@ def run_conversation(
                         _use_streaming = False
 
                 def _perform_api_call(next_api_kwargs):
+                    nonlocal accepted_stream_failure_outcome
                     if receipt_raw_text_only:
                         receipt_error = _receipt_pre_call_invariant_error(
                             agent,
@@ -3372,32 +3402,43 @@ def run_conversation(
                             is_github_responses=agent._is_copilot_url(),
                             sanitize_harmony_tokens=agent._is_codex_backend(),
                         )
+                    if not start_native_compaction_preflight_request(
+                        agent, next_api_kwargs
+                    ):
+                        raise _NativeCompactionPreflightFallback()
                     if _use_streaming:
-                        return agent._interruptible_streaming_api_call(
+                        response = agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
                         )
-                    from agent import relay_llm
+                    else:
+                        from agent import relay_llm
 
-                    return relay_llm.execute(
-                        next_api_kwargs,
-                        agent._interruptible_api_call,
-                        session_id=str(agent.session_id or ""),
-                        name=str(agent.provider or "provider"),
-                        model_name=str(agent.model or ""),
-                        metadata={
-                            "api_mode": agent.api_mode,
-                            "api_request_id": api_request_id,
-                            "call_role": (
-                                "delegated"
-                                if getattr(agent, "is_subagent", False)
-                                else "fallback"
-                                if int(getattr(agent, "_fallback_index", 0) or 0) > 0
-                                else "primary"
-                            ),
-                            "retry_count": retry_count,
-                        },
-                        defer_logical_completion=True,
-                    )
+                        response = relay_llm.execute(
+                            next_api_kwargs,
+                            agent._interruptible_api_call,
+                            session_id=str(agent.session_id or ""),
+                            name=str(agent.provider or "provider"),
+                            model_name=str(agent.model or ""),
+                            metadata={
+                                "api_mode": agent.api_mode,
+                                "api_request_id": api_request_id,
+                                "call_role": (
+                                    "delegated"
+                                    if getattr(agent, "is_subagent", False)
+                                    else "fallback"
+                                    if int(getattr(agent, "_fallback_index", 0) or 0) > 0
+                                    else "primary"
+                                ),
+                                "retry_count": retry_count,
+                            },
+                            defer_logical_completion=True,
+                        )
+                    if isinstance(response, _CodexStreamTerminalFailure):
+                        # Capture the actual runtime outcome before it crosses
+                        # execution middleware.  The later identity check is
+                        # therefore unforgeable by a middleware return value.
+                        accepted_stream_failure_outcome = response
+                    return response
 
                 _model_request_active = getattr(agent, "_model_request_active", None)
                 _redirect_lock = getattr(agent, "_pending_redirect_lock", None)
@@ -3408,6 +3449,8 @@ def run_conversation(
                 elif _model_request_active is not None:
                     _model_request_active.set()
                 _redirect_crossed_response = False
+                accepted_stream_failure_error = None
+                accepted_stream_failure_outcome = None
                 try:
                     if receipt_raw_text_only:
                         response = _perform_api_call(api_kwargs)
@@ -3442,6 +3485,20 @@ def run_conversation(
                         if _model_request_active is not None:
                             _model_request_active.clear()
                         _redirect_crossed_response = agent._has_pending_redirect()
+                if (
+                    accepted_stream_failure_outcome is not None
+                    and response is accepted_stream_failure_outcome
+                ):
+                    # Accept only the exact outcome created by this invocation.
+                    # Re-raise its exact original error into the existing
+                    # terminal path; a middleware-created lookalike is generic.
+                    accepted_stream_failure_error = response.error
+                    raise accepted_stream_failure_error
+                if isinstance(response, _CodexStreamTerminalFailure):
+                    # An untrusted middleware return may look like the private
+                    # outcome, but it has no accepted-event provenance. Route
+                    # its payload through ordinary error recovery instead.
+                    raise response.error
                 if _redirect_crossed_response:
                     # The response and redirect can cross on different threads:
                     # redirect() observed the request as active just before this
@@ -4309,6 +4366,7 @@ def run_conversation(
                         }
                 
                 # Track actual token usage from response for context management
+                _native_preflight_prompt_tokens = 0
                 if hasattr(response, 'usage') and response.usage:
                     canonical_usage = normalize_usage(
                         response.usage,
@@ -4354,6 +4412,7 @@ def run_conversation(
                         except Exception as _moa_trace_exc:  # pragma: no cover - defensive
                             logger.debug("MoA trace flush failed: %s", _moa_trace_exc)
                     prompt_tokens = canonical_usage.prompt_tokens
+                    _native_preflight_prompt_tokens = prompt_tokens
                     completion_tokens = canonical_usage.output_tokens
                     total_tokens = canonical_usage.total_tokens
                     # Forward canonical token + cache buckets so context engines
@@ -4433,6 +4492,12 @@ def run_conversation(
                     # charged to that old compaction, and so preflight deferral
                     # does not remain latched indefinitely.
                     agent.context_compressor.update_from_response({})
+
+                observe_native_compaction_preflight_response(
+                    agent,
+                    response,
+                    prompt_tokens=_native_preflight_prompt_tokens,
+                )
 
                 if hasattr(response, 'usage') and response.usage:
                     # Cache discovered context length after successful call.
@@ -4612,6 +4677,12 @@ def run_conversation(
                 break  # Success, exit retry loop
 
             except InterruptedError:
+                # The stop can land after native preflight arms but before the
+                # streaming helper reaches the physical Responses wire. Release
+                # that exact request so a later turn cannot inherit its grace.
+                _native_preflight_fallback = cancel_native_compaction_preflight_request(agent)
+                if _native_preflight_fallback and agent.api_mode == "codex_responses":
+                    agent.codex_responses_native_compaction = False
                 if thinking_spinner:
                     thinking_spinner.stop("")
                     thinking_spinner = None
@@ -4646,6 +4717,7 @@ def run_conversation(
                 break
 
             except Exception as api_error:
+                _native_preflight_fallback = cancel_native_compaction_preflight_request(agent)
                 # Stop spinner silently — retry status is buffered and
                 # only flushed when every retry+fallback is exhausted.
                 if thinking_spinner:
@@ -4662,6 +4734,61 @@ def run_conversation(
                     )
                     failed = True
                     _turn_exit_reason = "receipt_execution_profile_rejected"
+                    break
+
+                if api_error is accepted_stream_failure_error:
+                    # The Responses decoder accepted at least one event from
+                    # this physical request.  Do not spend another inner or
+                    # outer retry on the same native-bearing (or bare) payload:
+                    # retain any visible fragment already delivered.
+                    _partial = agent._strip_think_blocks(
+                        getattr(agent, "_current_streamed_assistant_text", "") or ""
+                    ).strip()
+                    if _partial:
+                        append_message(messages, {"role": "assistant", "content": _partial})
+                        final_response = _partial
+                        # The same text already crossed the streaming callback;
+                        # final delivery must not emit it a second time.
+                        agent._response_was_previewed = True
+                    if agent._has_pending_redirect() and agent.clear_interrupt(
+                        preserve_redirect=True
+                    ):
+                        # A correction queued just before transport loss is
+                        # still actionable. Restart only after the streamed
+                        # fragment has an assistant history owner; native
+                        # preflight cancellation above forces the next wire
+                        # through local compaction and a bare request.
+                        if _native_preflight_fallback and agent.api_mode == "codex_responses":
+                            agent.codex_responses_native_compaction = False
+                        _retry.restart_with_redirected_messages = True
+                        break
+                    accepted_stream_failure = True
+                    failed = True
+                    _turn_exit_reason = "partial_stream_recovery"
+                    break
+
+                if isinstance(api_error, _NativeCompactionPreflightFallback):
+                    _retry.restart_with_rebuilt_messages = True
+                    break
+
+                if _native_preflight_fallback:
+                    if agent.api_mode == "codex_responses":
+                        # A native-bearing request failed before any usage could
+                        # certify it.  The rebuilt local-preflight retry must
+                        # fail closed instead of placing the same native field
+                        # on another over-threshold wire.
+                        agent.codex_responses_native_compaction = False
+                        from agent.native_compaction import is_native_compaction_rejection
+
+                        if is_native_compaction_rejection(
+                            api_error, getattr(api_error, "status_code", None)
+                        ):
+                            logger.warning(
+                                "%sNative compaction rejection recovery: disabled "
+                                "codex_responses_native for this session; rebuilding through local preflight",
+                                agent.log_prefix,
+                            )
+                    _retry.restart_with_rebuilt_messages = True
                     break
 
                 # -----------------------------------------------------------
@@ -6850,6 +6977,9 @@ def run_conversation(
             _retry.restart_with_redirected_messages = False
             continue
 
+        if accepted_stream_failure:
+            break
+
         # If the API call was interrupted, skip response processing
         if interrupted:
             _turn_exit_reason = "interrupted_during_api_call"
@@ -7729,10 +7859,24 @@ def run_conversation(
                         messages, tools=agent.tools or None
                     )
 
+                _native_post_tool_deferred = False
+                if (
+                    not receipt_raw_text_only
+                    and agent.compression_enabled
+                    and _real_tokens >= int(getattr(_compressor, "threshold_tokens", 0) or 0)
+                ):
+                    _native_post_tool_pressure = estimate_request_tokens_rough(
+                        messages, tools=agent.tools or None
+                    )
+                    _native_post_tool_deferred = defer_local_preflight_for_native_compaction(
+                        agent, _native_post_tool_pressure, messages=messages
+                    )
+
                 if (
                     not receipt_raw_text_only
                     and agent.compression_enabled
                     and compression_attempts < max_compression_attempts
+                    and not _native_post_tool_deferred
                     and _compressor.should_compress(_real_tokens)
                 ):
                     compression_attempts += 1
@@ -8729,6 +8873,7 @@ def run_conversation(
         _turn_exit_reason=_turn_exit_reason,
         _pending_verification_response=_pending_verification_response,
         _pending_verification_response_previewed=_pending_verification_response_previewed,
+        accepted_stream_failure_error=accepted_stream_failure_error,
         terminal_receipt_hold=terminal_receipt_hold,
         claimed_receipt=turn_receipt,
     )
