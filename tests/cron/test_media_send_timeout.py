@@ -15,6 +15,7 @@ Covers two salvaged fixes:
 import pytest
 
 from cron.scheduler import (
+    _CRON_DELIVERY_FAILURE,
     _DEFAULT_MEDIA_SEND_TIMEOUT,
     _get_media_send_timeout,
     _send_media_via_adapter,
@@ -86,13 +87,12 @@ class TestEmptyReasonFallback:
         assert len(errors) == 1
         return errors[0]
 
-    def test_timeout_error_names_the_class(self, tmp_path, monkeypatch):
-        # TimeoutError() has an empty str() — the recorded reason must not
-        # be blank (the trailing-colon-nothing log from the field report).
+    def test_timeout_error_is_normalized(self, tmp_path, monkeypatch):
+        # TimeoutError() has an empty str(); its type must not cross the
+        # delivery-error boundary either.
         err = self._run(tmp_path, monkeypatch, TimeoutError())
-        assert err.rstrip() != f"failed to send media {tmp_path / 'clip.mp3'}:"
-        assert "TimeoutError" in err
+        assert err == _CRON_DELIVERY_FAILURE
 
-    def test_exception_with_message_keeps_it(self, tmp_path, monkeypatch):
+    def test_exception_message_is_normalized(self, tmp_path, monkeypatch):
         err = self._run(tmp_path, monkeypatch, RuntimeError("bridge closed"))
-        assert "bridge closed" in err
+        assert err == _CRON_DELIVERY_FAILURE

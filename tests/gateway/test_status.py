@@ -2,6 +2,7 @@
 
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -412,6 +413,169 @@ class TestTerminatePid:
         assert calls == [
             (["taskkill", "/PID", "123", "/T", "/F"], True, True, 10, windows_hide_flags())
         ]
+
+
+class TestGatewayRuntimeMigrationLease:
+    @staticmethod
+    def _subprocess_lease_outcome(home: Path) -> str:
+        repo_root = Path(__file__).resolve().parents[2]
+        code = """
+from gateway.status import (
+    acquire_gateway_runtime_migration_lease,
+    release_gateway_runtime_migration_lease,
+)
+lease = acquire_gateway_runtime_migration_lease()
+print("CLAIMED" if lease is not None else "REFUSED", flush=True)
+if lease is not None:
+    release_gateway_runtime_migration_lease(lease)
+"""
+        result = subprocess.run(
+            [sys.executable, "-B", "-c", code],
+            capture_output=True,
+            text=True,
+            check=False,
+            env={
+                "HERMES_HOME": str(home),
+                "PATH": os.environ["PATH"],
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "PYTHONPATH": str(repo_root),
+            },
+            timeout=5,
+        )
+        assert result.returncode == 0, result.stderr
+        return result.stdout.strip()
+
+    def test_migration_lease_borrows_runtime_ownership_without_identity_overwrite(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        assert status.acquire_gateway_runtime_lock() is True
+        runtime_handle = status._gateway_lock_handle
+        lock_path = status._get_gateway_lock_path()
+        before = lock_path.read_bytes()
+        try:
+            lease = status.acquire_gateway_runtime_migration_lease()
+            assert lease is not None
+            assert lease._handle is None
+            status.release_gateway_runtime_migration_lease(lease)
+            assert status._gateway_lock_handle is runtime_handle
+            assert lock_path.read_bytes() == before
+            assert status.is_gateway_runtime_lock_active() is True
+        finally:
+            status.release_gateway_runtime_lock()
+
+    def test_migration_lease_explicit_target_does_not_borrow_runtime_lock_from_other_home(
+        self, tmp_path, monkeypatch
+    ):
+        home_a = tmp_path / "home-a"
+        home_b = tmp_path / "home-b"
+        home_b.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home_a))
+        assert status.acquire_gateway_runtime_lock() is True
+        runtime_handle = status._gateway_lock_handle
+        home_a_lock_path = status._get_gateway_lock_path()
+        lease = None
+        try:
+            monkeypatch.setenv("HERMES_HOME", str(home_b))
+            home_b_lock_path = status._get_gateway_lock_path()
+            assert home_b_lock_path != home_a_lock_path
+            # Freeze the B target, then restore an unrelated ambient home;
+            # explicit admission must remain on B rather than borrow A.
+            monkeypatch.setenv("HERMES_HOME", str(home_a))
+            lease = status.acquire_gateway_runtime_migration_lease(home_b_lock_path)
+            assert lease is not None
+            other_process_claimed_canonical_lock = (
+                self._subprocess_lease_outcome(home_b) == "CLAIMED"
+            )
+            assert (
+                lease._handle is not None,
+                other_process_claimed_canonical_lock,
+            ) == (True, False)
+            assert status._gateway_lock_handle is runtime_handle
+            assert status._gateway_lock_path == home_a_lock_path
+            assert self._subprocess_lease_outcome(home_a) == "REFUSED"
+
+            status.release_gateway_runtime_migration_lease(lease)
+            lease = None
+            assert self._subprocess_lease_outcome(home_b) == "CLAIMED"
+            assert self._subprocess_lease_outcome(home_a) == "REFUSED"
+        finally:
+            status.release_gateway_runtime_migration_lease(lease)
+            status.release_gateway_runtime_lock()
+
+        assert status._gateway_lock_handle is None
+        assert status._gateway_lock_path is None
+        assert self._subprocess_lease_outcome(home_a) == "CLAIMED"
+
+        try_acquire_file_lock = status._try_acquire_file_lock
+        monkeypatch.setattr(status, "_try_acquire_file_lock", lambda _handle: False)
+        assert status.acquire_gateway_runtime_lock() is False
+        assert status._gateway_lock_handle is None
+        assert status._gateway_lock_path is None
+        monkeypatch.setattr(status, "_try_acquire_file_lock", try_acquire_file_lock)
+
+        monkeypatch.setenv("HERMES_HOME", str(home_a))
+        assert status.acquire_gateway_runtime_lock() is True
+        reacquired_handle = status._gateway_lock_handle
+        assert reacquired_handle is not None
+        assert status._gateway_lock_path == home_a_lock_path
+
+        def fail_release(_handle):
+            raise OSError("release failed")
+
+        monkeypatch.setattr(status, "_release_file_lock", fail_release)
+        status.release_gateway_runtime_lock()
+        assert reacquired_handle.closed is True
+        assert status._gateway_lock_handle is None
+        assert status._gateway_lock_path is None
+        assert self._subprocess_lease_outcome(home_a) == "CLAIMED"
+
+    def test_migration_lease_owns_without_identity_overwrite_and_releases(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        lock_path = status._get_gateway_lock_path()
+        lock_path.write_text('{"legacy":"identity"}', encoding="utf-8")
+        before = lock_path.read_bytes()
+
+        lease = status.acquire_gateway_runtime_migration_lease()
+        assert lease is not None
+        assert lease._handle is not None
+        assert status._gateway_lock_handle is None
+        assert lock_path.read_bytes() == before
+        try:
+            assert self._subprocess_lease_outcome(tmp_path) == "REFUSED"
+        finally:
+            status.release_gateway_runtime_migration_lease(lease)
+
+        assert self._subprocess_lease_outcome(tmp_path) == "CLAIMED"
+        assert lock_path.read_bytes() == before
+
+    def test_migration_lease_fails_closed_when_another_process_owns_the_lock(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        assert status.acquire_gateway_runtime_lock() is True
+        try:
+            assert self._subprocess_lease_outcome(tmp_path) == "REFUSED"
+        finally:
+            status.release_gateway_runtime_lock()
+
+    def test_migration_lease_release_failure_still_closes_its_private_handle(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        lease = status.acquire_gateway_runtime_migration_lease()
+        assert lease is not None
+        handle = lease._handle
+        assert handle is not None
+
+        def fail_release(_handle):
+            raise OSError("release failed")
+
+        monkeypatch.setattr(status, "_release_file_lock", fail_release)
+        status.release_gateway_runtime_migration_lease(lease)
+
+        assert handle.closed is True
+        assert self._subprocess_lease_outcome(tmp_path) == "CLAIMED"
 
 
 class TestScopedLocks:

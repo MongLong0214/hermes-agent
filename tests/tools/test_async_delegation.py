@@ -17,6 +17,7 @@ import pytest
 
 from tools import async_delegation as ad
 from tools.process_registry import process_registry, format_process_notification
+from hermes_state_common import SCHEMA_VERSION
 
 
 @pytest.fixture(autouse=True)
@@ -73,7 +74,9 @@ def test_async_connect_registers_generation_before_writing_delegations(
 
     conn = ad._connect()
     try:
-        assert conn.execute("SELECT version FROM schema_version").fetchall() == [(27,)]
+        assert conn.execute("SELECT version FROM schema_version").fetchall() == [
+            (SCHEMA_VERSION,)
+        ]
         conn.execute(
             "INSERT INTO async_delegations "
             "(delegation_id, origin_session, state, dispatched_at, updated_at) "

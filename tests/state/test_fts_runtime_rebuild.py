@@ -25,6 +25,7 @@ from hermes_state import (
     LEGACY_FTS_SQL,
     LEGACY_FTS_TRIGRAM_SQL,
     SCHEMA_SQL,
+    SCHEMA_VERSION,
     SessionDB,
     _FTS_TRIGGERS,
 )
@@ -84,6 +85,59 @@ def _base_fts_triggers(db_path):
     ).fetchall()
     raw.close()
     return {row[0] for row in rows}
+
+
+class _FtsCommitErrorConnection(sqlite3.Connection):
+    """One-shot commit seam for FTS-shaped and generic corruption faults."""
+
+    fail_next_fts_commit: str | None
+    injected_commit_error: BaseException | None
+    fts_commit_transaction_states: list[bool]
+
+    def commit(self):
+        self.commit_call_count = getattr(self, "commit_call_count", 0) + 1
+        mode = getattr(self, "fail_next_fts_commit", None)
+        injected_error = getattr(self, "injected_commit_error", None)
+        if mode is None and injected_error is None:
+            return super().commit()
+        self.fail_next_fts_commit = None
+        self.injected_commit_error = None
+        states = getattr(self, "fts_commit_transaction_states", None)
+        if states is None:
+            states = []
+            self.fts_commit_transaction_states = states
+        if injected_error is not None:
+            states.append(self.in_transaction)
+            raise injected_error
+        if mode == "after_real_commit":
+            super().commit()
+            states.append(self.in_transaction)
+            raise sqlite3.DatabaseError(
+                'fts5: corrupt structure record for table "messages_fts"'
+            )
+        states.append(self.in_transaction)
+        if mode == "before_generic_malformed":
+            raise sqlite3.DatabaseError("database disk image is malformed")
+        raise sqlite3.DatabaseError(
+            'fts5: corrupt structure record for table "messages_fts"'
+        )
+
+    def rollback(self):
+        self.rollback_call_count = getattr(self, "rollback_call_count", 0) + 1
+        return super().rollback()
+
+
+def _db_with_fts_commit_error_seam(tmp_path, monkeypatch, *, db_path=None):
+    original_connect = hermes_state._connect_tracked_db
+
+    def connect_with_fts_commit_error(*args, **kwargs):
+        kwargs["factory"] = _FtsCommitErrorConnection
+        return original_connect(*args, **kwargs)
+
+    monkeypatch.setattr(
+        hermes_state, "_connect_tracked_db", connect_with_fts_commit_error
+    )
+    return SessionDB(db_path=db_path or tmp_path / "state.db")
 
 
 class TestRuntimeFtsRebuild:
@@ -519,24 +573,240 @@ class TestRuntimeFtsRebuild:
         finally:
             reopened.close()
 
+    @pytest.mark.parametrize(
+        "table_name",
+        ("messages_fts", "messages_fts_trigram", "messages_fts_cjk"),
+    )
+    def test_commit_time_fts_error_recovers_only_after_definite_rollback(
+        self, tmp_path, monkeypatch, table_name
+    ):
+        """An active commit-time FTS failure may replay only after rollback."""
+        db = _db_with_fts_commit_error_seam(tmp_path, monkeypatch)
+        try:
+            db.create_session("s1", source="test")
+            conn = db._conn
+            assert isinstance(conn, _FtsCommitErrorConnection)
+            conn.fts_commit_transaction_states = []
+            conn.injected_commit_error = sqlite3.DatabaseError(
+                f'fts5: corrupt structure record for table "{table_name}"'
+            )
+            rebuild_transaction_states = []
+            fail_open_calls = []
+
+            def rebuilt_after_rollback(exc):
+                assert SessionDB._is_fts_write_corruption_error(exc)
+                rebuild_transaction_states.append(db._conn.in_transaction)
+                return True
+
+            monkeypatch.setattr(db, "_try_runtime_fts_rebuild", rebuilt_after_rollback)
+            monkeypatch.setattr(
+                db,
+                "_enter_fts_fail_open",
+                lambda exc: fail_open_calls.append(exc) or False,
+            )
+
+            assert db.append_message("s1", "user", "rollback-gated canonical write")
+            assert conn.fts_commit_transaction_states == [True]
+            assert rebuild_transaction_states == [False]
+            assert fail_open_calls == []
+            assert _message_contents(tmp_path / "state.db") == [
+                "rollback-gated canonical write"
+            ]
+        finally:
+            db.close()
+
+    def test_commit_time_generic_malformed_image_rolls_back_without_fts_recovery(
+        self, tmp_path, monkeypatch
+    ):
+        """A generic corrupt-image commit error is never FTS recovery evidence."""
+        db = _db_with_fts_commit_error_seam(tmp_path, monkeypatch)
+        try:
+            db.create_session("s1", source="test")
+            conn = db._conn
+            assert isinstance(conn, _FtsCommitErrorConnection)
+            conn.fts_commit_transaction_states = []
+            conn.commit_call_count = 0
+            conn.rollback_call_count = 0
+            conn.fail_next_fts_commit = "before_generic_malformed"
+            rebuild_calls = []
+            fail_open_calls = []
+            monkeypatch.setattr(
+                db,
+                "_try_runtime_fts_rebuild",
+                lambda exc: rebuild_calls.append(exc) or True,
+            )
+            monkeypatch.setattr(
+                db,
+                "_enter_fts_fail_open",
+                lambda exc: fail_open_calls.append(exc) or True,
+            )
+
+            with pytest.raises(
+                sqlite3.DatabaseError, match="database disk image is malformed"
+            ):
+                db.append_message("s1", "user", "must not replay generic corruption")
+
+            assert conn.fts_commit_transaction_states == [True]
+            assert conn.rollback_call_count == 1
+            assert conn.in_transaction is False
+            assert rebuild_calls == []
+            assert fail_open_calls == []
+            assert conn.commit_call_count == 1
+            assert _message_contents(tmp_path / "state.db") == []
+        finally:
+            db.close()
+
+    @pytest.mark.parametrize(
+        ("case_id", "message", "outer_unrelated"),
+        (
+            (
+                "uppercase-fts5",
+                'FTS5: corrupt structure record for table "messages_fts"',
+                False,
+            ),
+            (
+                "arbitrary-prefix",
+                'prefix fts5: corrupt structure record for table "messages_fts"',
+                False,
+            ),
+            (
+                "arbitrary-suffix",
+                'fts5: corrupt structure record for table "messages_fts" suffix',
+                False,
+            ),
+            (
+                "leading-whitespace",
+                ' fts5: corrupt structure record for table "messages_fts"',
+                False,
+            ),
+            (
+                "trailing-whitespace",
+                'fts5: corrupt structure record for table "messages_fts" ',
+                False,
+            ),
+            ("bare-fts5", "fts5: corrupt structure record", False),
+            (
+                "foreign-table",
+                'fts5: corrupt structure record for table "foreign_fts"',
+                False,
+            ),
+            ("non-corruption-fts5", "fts5: syntax error", False),
+            (
+                "nested-cause-outer-unrelated",
+                'fts5: corrupt structure record for table "messages_fts"',
+                True,
+            ),
+            ("generic-malformed-image", "database disk image is malformed", False),
+        ),
+    )
+    def test_commit_time_fts_text_spoofs_never_recover_or_replay(
+        self, tmp_path, monkeypatch, case_id, message, outer_unrelated
+    ):
+        """Only a direct, exact supported-table commit signature may recover."""
+        db = _db_with_fts_commit_error_seam(tmp_path, monkeypatch)
+        try:
+            db.create_session("s1", source="test")
+            conn = db._conn
+            assert isinstance(conn, _FtsCommitErrorConnection)
+            conn.fts_commit_transaction_states = []
+            conn.commit_call_count = 0
+            conn.rollback_call_count = 0
+            if outer_unrelated:
+                original_error = RuntimeError("outer unrelated commit error")
+                original_error.__cause__ = sqlite3.DatabaseError(message)
+            else:
+                original_error = sqlite3.DatabaseError(message)
+            conn.injected_commit_error = original_error
+            rebuild_calls = []
+            fail_open_calls = []
+            monkeypatch.setattr(
+                db,
+                "_try_runtime_fts_rebuild",
+                lambda exc: rebuild_calls.append(exc) or True,
+            )
+            monkeypatch.setattr(
+                db,
+                "_enter_fts_fail_open",
+                lambda exc: fail_open_calls.append(exc) or True,
+            )
+
+            with pytest.raises(type(original_error)) as raised:
+                db.append_message("s1", "user", f"spoofed {case_id}")
+
+            assert raised.value is original_error
+            assert conn.fts_commit_transaction_states == [True]
+            assert conn.rollback_call_count == 1
+            assert conn.in_transaction is False
+            assert rebuild_calls == []
+            assert fail_open_calls == []
+            assert conn.commit_call_count == 1
+            assert _message_contents(tmp_path / "state.db") == []
+        finally:
+            db.close()
+
+    def test_fts_shaped_error_after_real_commit_never_replays_canonical_row(
+        self, tmp_path, monkeypatch
+    ):
+        """A commit ambiguity is terminal even when its error looks like FTS."""
+        db = _db_with_fts_commit_error_seam(tmp_path, monkeypatch)
+        try:
+            db.create_session("s1", source="test")
+            conn = db._conn
+            assert isinstance(conn, _FtsCommitErrorConnection)
+            conn.fts_commit_transaction_states = []
+            conn.fail_next_fts_commit = "after_real_commit"
+            rebuild_calls = []
+            fail_open_calls = []
+            monkeypatch.setattr(
+                db,
+                "_try_runtime_fts_rebuild",
+                lambda exc: rebuild_calls.append(exc) or False,
+            )
+            monkeypatch.setattr(
+                db,
+                "_enter_fts_fail_open",
+                lambda exc: fail_open_calls.append(exc) or False,
+            )
+
+            with pytest.raises(sqlite3.DatabaseError, match="fts5: corrupt"):
+                db.append_message("s1", "user", "committed exactly once")
+
+            assert conn.fts_commit_transaction_states == [False]
+            assert rebuild_calls == []
+            assert fail_open_calls == []
+            assert _message_contents(tmp_path / "state.db") == ["committed exactly once"]
+        finally:
+            db.close()
+
     def test_legacy_inline_fts_fails_open_and_recovers(self, tmp_path, monkeypatch):
         db_path = tmp_path / "legacy-state.db"
         raw = sqlite3.connect(str(db_path))
         raw.executescript(SCHEMA_SQL)
+        raw.execute(
+            "INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,)
+        )
         try:
             raw.executescript(LEGACY_FTS_SQL + LEGACY_FTS_TRIGRAM_SQL)
         except sqlite3.OperationalError as exc:
             raw.close()
             pytest.skip(f"required FTS tokenizer unavailable: {exc}")
+        assert raw.execute(
+            "SELECT version, typeof(version) FROM schema_version"
+        ).fetchall() == [(SCHEMA_VERSION, "integer")]
         raw.commit()
         raw.close()
 
-        legacy = SessionDB(db_path=db_path)
+        legacy = _db_with_fts_commit_error_seam(
+            tmp_path, monkeypatch, db_path=db_path
+        )
         try:
             assert legacy._db_has_legacy_inline_fts(legacy._conn.cursor())
+            assert isinstance(legacy._conn, _FtsCommitErrorConnection)
             legacy.create_session("s1", source="test")
             legacy.append_message("s1", "user", "legacy seed")
             _corrupt_fts(db_path)
+            legacy._conn.fts_commit_transaction_states = []
+            legacy._conn.fail_next_fts_commit = "before_real_commit"
             monkeypatch.setattr(
                 legacy,
                 "rebuild_fts",
@@ -545,6 +815,7 @@ class TestRuntimeFtsRebuild:
                 ),
             )
             legacy.append_message("s1", "user", "legacy canonical survives")
+            assert legacy._conn.fts_commit_transaction_states == [True]
             assert _message_contents(db_path)[-1] == "legacy canonical survives"
             assert _meta_value(db_path, FTS_STALE_KEY) == "1"
         finally:

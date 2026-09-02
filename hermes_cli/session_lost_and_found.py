@@ -44,10 +44,78 @@ KNOWN_SOURCES = frozenset({
     "tool", "subagent", "cron", "recovered", "imported", "acp",
 })
 
-# Historical physical layouts of the sessions table. Columns are only ever
-# appended (ALTER TABLE ADD COLUMN), so an older record is a strict prefix of
-# the current column order.
-SESSIONS_LAYOUT_NFIELDS = frozenset({55, 54, 52})
+# Known physical source layouts. The 52-column schema at 7d066c3c predates
+# git_metadata_generation, session_generation, title_source, hidden, and
+# last_read_at; the 56-column schema at 30a0f23f predates only
+# session_generation. These are not prefixes of the current layout because
+# the generations were inserted before billing metadata.
+SESSIONS_LAYOUT_NFIELDS = frozenset({52, 56, 57})
+_SESSIONS_REAL_52_COLUMNS = (
+    "id", "source", "user_id", "session_key", "chat_id", "chat_type",
+    "thread_id", "display_name", "origin_json", "expiry_finalized", "model",
+    "model_config", "system_prompt", "system_prompt_hash", "parent_session_id",
+    "started_at", "ended_at", "end_reason", "message_count", "tool_call_count",
+    "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
+    "reasoning_tokens", "cwd", "git_branch", "git_repo_root",
+    "billing_provider", "billing_base_url", "billing_mode", "estimated_cost_usd",
+    "actual_cost_usd", "cost_status", "cost_source", "pricing_version", "title",
+    "last_activity_at", "last_activity_description", "last_activity_provenance",
+    "api_call_count", "handoff_state", "handoff_platform", "handoff_error",
+    "compression_failure_cooldown_until", "compression_failure_error",
+    "compression_fallback_streak", "compression_ineffective_count", "profile_name",
+    "rewind_count", "archived", "pinned",
+)
+_SESSIONS_PRE_V28_56_COLUMNS = (
+    "id", "source", "user_id", "session_key", "chat_id", "chat_type",
+    "thread_id", "display_name", "origin_json", "expiry_finalized", "model",
+    "model_config", "system_prompt", "system_prompt_hash", "parent_session_id",
+    "started_at", "ended_at", "end_reason", "message_count", "tool_call_count",
+    "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
+    "reasoning_tokens", "cwd", "git_branch", "git_repo_root",
+    "git_metadata_generation", "billing_provider", "billing_base_url", "billing_mode",
+    "estimated_cost_usd", "actual_cost_usd", "cost_status", "cost_source",
+    "pricing_version", "title", "title_source", "last_activity_at",
+    "last_activity_description", "last_activity_provenance", "api_call_count",
+    "handoff_state", "handoff_platform", "handoff_error",
+    "compression_failure_cooldown_until", "compression_failure_error",
+    "compression_fallback_streak", "compression_ineffective_count", "profile_name",
+    "rewind_count", "archived", "pinned", "hidden", "last_read_at",
+)
+_SESSIONS_HISTORICAL_LAYOUTS = {
+    len(_SESSIONS_REAL_52_COLUMNS): _SESSIONS_REAL_52_COLUMNS,
+    len(_SESSIONS_PRE_V28_56_COLUMNS): _SESSIONS_PRE_V28_56_COLUMNS,
+}
+# A v28 open of a real pre-v28 database adds session_generation with generic
+# ALTER TABLE ADD COLUMN. SQLite appends that physical cell after the immutable
+# 56-column layout; it does not rewrite the row into current logical order.
+_SESSIONS_PRE_V28_56_PLUS_APPENDED_GENERATION_COLUMNS = (
+    *_SESSIONS_PRE_V28_56_COLUMNS,
+    "session_generation",
+)
+# The current v28 CREATE TABLE physical order is immutable source-schema data,
+# not a destination PRAGMA projection. Unlike generic ALTER TABLE, v28 places
+# session_generation between git metadata and billing metadata.
+_CURRENT_SESSIONS_COLUMNS = (
+    "id", "source", "user_id", "session_key", "chat_id", "chat_type",
+    "thread_id", "display_name", "origin_json", "expiry_finalized", "model",
+    "model_config", "system_prompt", "system_prompt_hash", "parent_session_id",
+    "started_at", "ended_at", "end_reason", "message_count", "tool_call_count",
+    "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
+    "reasoning_tokens", "cwd", "git_branch", "git_repo_root",
+    "git_metadata_generation", "session_generation", "billing_provider",
+    "billing_base_url", "billing_mode", "estimated_cost_usd", "actual_cost_usd",
+    "cost_status", "cost_source", "pricing_version", "title", "title_source",
+    "last_activity_at", "last_activity_description", "last_activity_provenance",
+    "api_call_count", "handoff_state", "handoff_platform", "handoff_error",
+    "compression_failure_cooldown_until", "compression_failure_error",
+    "compression_fallback_streak", "compression_ineffective_count", "profile_name",
+    "rewind_count", "archived", "pinned", "hidden", "last_read_at",
+)
+_CURRENT_SESSIONS_NFIELD = len(_CURRENT_SESSIONS_COLUMNS)
+_CURRENT_SESSIONS_GENERATION_INDEX = 29
+_APPENDED_HISTORICAL_SESSIONS_GENERATION_INDEX = (
+    len(_SESSIONS_PRE_V28_56_COLUMNS)
+)
 SESSIONS_LEGACY_MINIMAL_NFIELD = 14
 SESSION_MODEL_USAGE_NFIELD = 18
 
@@ -288,6 +356,60 @@ def classify_lost_and_found_row(
     return None
 
 
+def _is_positive_sqlite_integer(value: Any) -> bool:
+    """True for a recovered SQLite INTEGER that can be a session generation."""
+    return type(value) is int and value > 0
+
+
+def _is_nullable_sqlite_text(value: Any) -> bool:
+    """True for a recovered NULL or value from a SQLite TEXT-affinity cell."""
+    return value is None or isinstance(value, str)
+
+
+def _is_explicit_current_sessions_layout(destination_columns: list[str]) -> bool:
+    """Whether the destination exactly matches the immutable current layout."""
+    return tuple(destination_columns) == _CURRENT_SESSIONS_COLUMNS
+
+
+def _session_source_columns(
+    nfield: int,
+    cells: tuple[Any, ...],
+    destination_columns: list[str],
+) -> Optional[tuple[str, ...]]:
+    """Return one uniquely proven source layout, never a width-only guess.
+
+    A 57-cell record may be either current logical order (generation at cell
+    29) or a real pre-v28 physical 56-column record to which migration appended
+    generation at cell 56. The current candidate requires the exact destination
+    schema and a positive recovered SQLite INTEGER at its generation cell. The
+    appended candidate instead requires its cell 29 billing_provider to retain
+    its TEXT-affinity storage semantics (NULL or str) plus a positive trailing
+    SQLite INTEGER generation. Thus a current INTEGER last_read_at never shifts
+    the row into the appended layout. Unsupported or ambiguous candidates are
+    intentionally unmapped.
+    """
+    if nfield != _CURRENT_SESSIONS_NFIELD:
+        return _SESSIONS_HISTORICAL_LAYOUTS.get(nfield)
+    if (
+        len(cells) < nfield
+        or not _is_explicit_current_sessions_layout(destination_columns)
+    ):
+        return None
+
+    candidates: list[tuple[str, ...]] = []
+    if _is_positive_sqlite_integer(cells[_CURRENT_SESSIONS_GENERATION_INDEX]):
+        candidates.append(_CURRENT_SESSIONS_COLUMNS)
+    if (
+        _is_nullable_sqlite_text(cells[_CURRENT_SESSIONS_GENERATION_INDEX])
+        and _is_positive_sqlite_integer(
+            cells[_APPENDED_HISTORICAL_SESSIONS_GENERATION_INDEX]
+        )
+    ):
+        candidates.append(_SESSIONS_PRE_V28_56_PLUS_APPENDED_GENERATION_COLUMNS)
+
+    return candidates[0] if len(candidates) == 1 else None
+
+
 def _heuristic_started_at(cells: tuple[Any, ...]) -> float:
     for value in cells:
         if isinstance(value, (int, float)) and _EPOCH_LOW <= float(value) <= _EPOCH_HIGH:
@@ -339,7 +461,12 @@ def _copy_direct_tables(
         if not source_columns:
             continue
         dest_columns = _table_columns(dest, table)
-        columns = [c for c in dest_columns if c in source_columns]
+        columns = [
+            column
+            for column in dest_columns
+            if column in source_columns
+            and not (table == "sessions" and column == "session_generation")
+        ]
         if not columns:
             continue
         quoted = ", ".join(f'"{c}"' for c in columns)
@@ -460,10 +587,39 @@ def map_lost_and_found_rows(
                         if inserted:
                             report["legacy_minimal_sessions"] += 1
                     else:
-                        values = list(cells[: min(nfield, len(sessions_columns))])
+                        source_columns = _session_source_columns(
+                            nfield, cells, sessions_columns
+                        )
+                        if (
+                            source_columns is None
+                            or len(cells) < len(source_columns)
+                        ):
+                            # A session-shaped row without one proven complete
+                            # layout must not be reinterpreted against the
+                            # destination's positional order.
+                            report["unmapped_rows"] += 1
+                            continue
+                        source_by_column = dict(zip(source_columns, cells))
+                        session_pairs = [
+                            (column, source_by_column[column])
+                            for column in sessions_columns
+                            if column in source_by_column
+                            and column != "session_generation"
+                        ]
+                        columns = [column for column, _value in session_pairs]
+                        values = [value for _column, value in session_pairs]
+                        session_defaults_by_column = {
+                            sessions_columns[index]: substitute
+                            for index, substitute in sessions_defaults.items()
+                        }
+                        paired_session_defaults = {
+                            index: session_defaults_by_column[column]
+                            for index, (column, _value) in enumerate(session_pairs)
+                            if column in session_defaults_by_column
+                        }
                         inserted = _insert_prefix_row(
-                            dest, "sessions", sessions_columns, values,
-                            sessions_defaults,
+                            dest, "sessions", columns, values,
+                            paired_session_defaults,
                         )
                 except sqlite3.DatabaseError:
                     report["unmapped_rows"] += 1

@@ -43,6 +43,7 @@ import hashlib
 import json
 import logging
 import os
+import secrets
 import sqlite3
 import threading
 import time
@@ -69,6 +70,26 @@ RECOVERED_MARKER = (
     "♻️ Recovered reply — the gateway restarted during delivery, "
     "so this may be a duplicate:\n\n"
 )
+
+
+# Runtime replay is deliberately fail-closed. Only errors whose send contract
+# proves they are transient reconnect failures belong here; permanent rejects
+# must not be retried merely because an adapter reconnected.
+_RUNTIME_RETRYABLE_ERRORS = frozenset({"send_path_degraded"})
+
+# Runtime recovery uses a distinct marker because no gateway restart occurred.
+RECONNECTED_MARKER = (
+    "♻️ Recovered reply — the messaging platform reconnected after the original "
+    "delivery failed, so this may be a duplicate:\n\n"
+)
+
+
+def _runtime_adapter_profile(adapter_profile: Any) -> str:
+    """Canonicalize only legacy blank profile values at runtime row handoff."""
+    if adapter_profile is None:
+        return "default"
+    profile = str(adapter_profile)
+    return profile if profile.strip() else "default"
 
 
 def _db_path():
@@ -120,8 +141,49 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
                 updated_at REAL NOT NULL,
                 owner_pid INTEGER,
                 owner_started_at INTEGER,
-                last_error TEXT
+                last_error TEXT,
+                adapter_profile TEXT NOT NULL DEFAULT 'default',
+                runtime_claim_token TEXT
             )"""
+        )
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")
+        }
+        if "adapter_profile" not in columns:
+            try:
+                # Legacy rows predate multiplexing, so their only deterministic
+                # transport owner is the default adapter profile.  Do not infer
+                # ownership from a routed session profile.
+                conn.execute(
+                    "ALTER TABLE delivery_obligations ADD COLUMN "
+                    "adapter_profile TEXT NOT NULL DEFAULT 'default'"
+                )
+            except sqlite3.OperationalError as exc:
+                # Concurrent first-use connections can both see the old schema.
+                if "duplicate column" not in str(exc).lower():
+                    raise
+        if "runtime_claim_token" not in columns:
+            try:
+                conn.execute(
+                    "ALTER TABLE delivery_obligations ADD COLUMN "
+                    "runtime_claim_token TEXT"
+                )
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise
+        # Some deployments acquired the column before its default/non-null
+        # contract existed. Treat their NULL and blank values as the legacy
+        # default profile without changing an explicit multiplex identity.
+        conn.execute(
+            """UPDATE delivery_obligations
+               SET adapter_profile='default'
+               WHERE adapter_profile IS NULL OR trim(adapter_profile)=''"""
+        )
+        conn.execute(
+            """UPDATE delivery_obligations
+               SET runtime_claim_token=NULL
+               WHERE runtime_claim_token IS NOT NULL
+                 AND (state != 'attempting' OR trim(runtime_claim_token)='')"""
         )
         conn.execute("COMMIT")
     except BaseException as exc:
@@ -242,20 +304,22 @@ def record_obligation(
     chat_id: str,
     thread_id: Optional[str],
     content: str,
+    adapter_profile: Optional[str] = None,
 ) -> None:
-    """Record a final response as owed to the platform (state='pending')."""
+    """Record a final response as owed to the owning adapter profile."""
     now = time.time()
+    stored_profile = str(adapter_profile or "").strip() or "default"
     pid, started = _owner_stamp()
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
             """INSERT OR REPLACE INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
                 content, state, attempts, created_at, updated_at,
-                owner_pid, owner_started_at)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)""",
+                owner_pid, owner_started_at, adapter_profile)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?)""",
             (obligation_id, session_key, platform, str(chat_id),
              str(thread_id) if thread_id else None, content, now, now,
-             pid, started),
+             pid, started, stored_profile),
         )
     _prune()
 
@@ -272,13 +336,127 @@ def mark_failed(obligation_id: str, error: str = "") -> None:
     _update_state(obligation_id, "failed", error=error)
 
 
+def _valid_runtime_claim_token(claim_token: Any) -> bool:
+    return (
+        isinstance(claim_token, str)
+        and len(claim_token) >= 32
+        and claim_token.isascii()
+        and claim_token.strip() == claim_token
+    )
+
+
+def _mint_runtime_claim_token() -> str:
+    """Return a fresh opaque authority for exactly one runtime claim."""
+    return secrets.token_urlsafe(32)
+
+
+def release_runtime_claim(
+    obligation_id: str, *, claim_token: str, error: str = ""
+) -> bool:
+    """Return this exact unsent runtime claim to ``failed`` atomically."""
+    if not _valid_runtime_claim_token(claim_token):
+        return False
+    pid, started = _owner_stamp()
+    if started is None:
+        return False
+    retryable_errors = tuple(sorted(_RUNTIME_RETRYABLE_ERRORS))
+    placeholders = ", ".join("?" for _ in retryable_errors)
+    with _DB_LOCK, _transaction() as conn:
+        cursor = conn.execute(
+            f"""UPDATE delivery_obligations
+                SET state='failed',
+                    attempts=CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END,
+                    updated_at=?, last_error=COALESCE(?, last_error),
+                    runtime_claim_token=NULL
+                WHERE obligation_id=? AND state='attempting'
+                  AND owner_pid IS ? AND owner_started_at IS ?
+                  AND runtime_claim_token=?
+                  AND lower(trim(COALESCE(last_error, ''))) IN ({placeholders})""",
+            (
+                time.time(),
+                error[:500] if error else None,
+                obligation_id,
+                pid,
+                started,
+                claim_token,
+                *retryable_errors,
+            ),
+        )
+    return bool(cursor.rowcount)
+
+
+def _settle_runtime_claim(
+    obligation_id: str, *, claim_token: str, state: str, error: Optional[str]
+) -> bool:
+    """Settle only this process's exact still-current runtime claim."""
+    if not _valid_runtime_claim_token(claim_token):
+        return False
+    pid, started = _owner_stamp()
+    if started is None:
+        return False
+    retryable_errors = tuple(sorted(_RUNTIME_RETRYABLE_ERRORS))
+    placeholders = ", ".join("?" for _ in retryable_errors)
+    with _DB_LOCK, _transaction() as conn:
+        cursor = conn.execute(
+            f"""UPDATE delivery_obligations
+                SET state=?, updated_at=?, last_error=?, runtime_claim_token=NULL
+                WHERE obligation_id=? AND state='attempting'
+                  AND owner_pid IS ? AND owner_started_at IS ?
+                  AND runtime_claim_token=?
+                  AND lower(trim(COALESCE(last_error, ''))) IN ({placeholders})""",
+            (
+                state,
+                time.time(),
+                error[:500] if error else None,
+                obligation_id,
+                pid,
+                started,
+                claim_token,
+                *retryable_errors,
+            ),
+        )
+    return bool(cursor.rowcount)
+
+
+def settle_runtime_claim(
+    obligation_id: str, *, claim_token: str, delivered: bool, error: str = ""
+) -> bool:
+    """Atomically settle this exact runtime claim's normal send result."""
+    return _settle_runtime_claim(
+        obligation_id,
+        claim_token=claim_token,
+        state="delivered" if delivered else "failed",
+        error=None if delivered else error,
+    )
+
+
+def settle_runtime_claim_after_send_started(
+    obligation_id: str, *, claim_token: str
+) -> bool:
+    """Fence an ambiguous runtime send back to failed without refunding it."""
+    return _settle_runtime_claim(
+        obligation_id,
+        claim_token=claim_token,
+        state="failed",
+        error="send_path_degraded",
+    )
+
+
 def _update_state(obligation_id: str, state: str, error: str = "") -> None:
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
             """UPDATE delivery_obligations
-               SET state=?, updated_at=?, last_error=?
+               SET state=?, updated_at=?, last_error=?,
+                   runtime_claim_token=CASE
+                       WHEN ?='attempting' THEN runtime_claim_token ELSE NULL END
                WHERE obligation_id=?""",
-            (state, time.time(), error[:500] if error else None, obligation_id),
+            (
+                state,
+                time.time(),
+                error[:500] if error else None,
+                state,
+                obligation_id,
+            ),
         )
 
 
@@ -321,7 +499,8 @@ def sweep_recoverable(
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
                 conn.execute(
                     """UPDATE delivery_obligations
-                       SET state='abandoned', updated_at=? WHERE obligation_id=?""",
+                       SET state='abandoned', updated_at=?, runtime_claim_token=NULL
+                       WHERE obligation_id=?""",
                     (now, oid),
                 )
                 continue
@@ -335,7 +514,7 @@ def sweep_recoverable(
             cursor = conn.execute(
                 """UPDATE delivery_obligations
                    SET owner_pid=?, owner_started_at=?, attempts=attempts+1,
-                       updated_at=?
+                       updated_at=?, runtime_claim_token=NULL
                    WHERE obligation_id=? AND (owner_pid IS ? OR owner_pid=?)""",
                 (pid, started, now, oid, owner_pid, owner_pid),
             )
@@ -351,6 +530,199 @@ def sweep_recoverable(
                     # attempting/failed = ambiguous or rejected, carry marker.
                     "needs_marker": state != "pending",
                     "attempts": attempts + 1,
+                })
+    return claimed
+
+
+def peek_failed_for_runtime(
+    platform: str,
+    now: Optional[float] = None,
+    *,
+    profile: Optional[str] = None,
+) -> List[Dict[str, str]]:
+    """Return a non-mutating snapshot of this owner's eligible runtime rows.
+
+    This is deliberately advisory: callers must use
+    :func:`claim_failed_for_runtime` after any async precondition.  The
+    claim repeats every predicate atomically, so a reconnect race cannot
+    convert a snapshot into a duplicate send.
+    """
+    expected_profile = str(profile or "").strip() or "default"
+    now = now if now is not None else time.time()
+    pid, started = _owner_stamp()
+    if started is None:
+        return []
+    retryable_errors = tuple(sorted(_RUNTIME_RETRYABLE_ERRORS))
+    placeholders = ", ".join("?" for _ in retryable_errors)
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            f"""SELECT obligation_id, session_key, adapter_profile
+                  FROM delivery_obligations
+                 WHERE state='failed' AND platform=?
+                   AND COALESCE(NULLIF(trim(adapter_profile), ''), 'default')=?
+                   AND owner_pid IS ? AND owner_started_at IS ?
+                   AND lower(trim(COALESCE(last_error, ''))) IN ({placeholders})
+                   AND attempts < ? AND created_at >= ?""",
+            (
+                platform,
+                expected_profile,
+                pid,
+                started,
+                *retryable_errors,
+                MAX_ATTEMPTS,
+                now - STALE_AFTER_SECONDS,
+            ),
+        ).fetchall()
+    return [
+        {
+            "obligation_id": oid,
+            "session_key": session_key,
+            "profile": _runtime_adapter_profile(adapter_profile),
+        }
+        for oid, session_key, adapter_profile in rows
+    ]
+
+
+def claim_failed_for_runtime(
+    obligation_id: str,
+    platform: str,
+    now: Optional[float] = None,
+    *,
+    profile: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Atomically claim one eligible runtime row after its preconditions hold."""
+    expected_profile = str(profile or "").strip() or "default"
+    now = now if now is not None else time.time()
+    pid, started = _owner_stamp()
+    if started is None:
+        return None
+    retryable_errors = tuple(sorted(_RUNTIME_RETRYABLE_ERRORS))
+    placeholders = ", ".join("?" for _ in retryable_errors)
+    claim_token = _mint_runtime_claim_token()
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            f"""UPDATE delivery_obligations
+                   SET state='attempting', attempts=attempts+1, updated_at=?,
+                       runtime_claim_token=?
+                 WHERE obligation_id=? AND state='failed' AND platform=?
+                   AND COALESCE(NULLIF(trim(adapter_profile), ''), 'default')=?
+                   AND owner_pid IS ? AND owner_started_at IS ?
+                   AND lower(trim(COALESCE(last_error, ''))) IN ({placeholders})
+                   AND attempts < ? AND created_at >= ?
+             RETURNING obligation_id, session_key, platform, chat_id, thread_id,
+                       content, adapter_profile, attempts""",
+            (
+                now,
+                claim_token,
+                obligation_id,
+                platform,
+                expected_profile,
+                pid,
+                started,
+                *retryable_errors,
+                MAX_ATTEMPTS,
+                now - STALE_AFTER_SECONDS,
+            ),
+        ).fetchone()
+    if row is None:
+        return None
+    (
+        oid,
+        session_key,
+        row_platform,
+        chat_id,
+        thread_id,
+        content,
+        adapter_profile,
+        attempts,
+    ) = row
+    return {
+        "obligation_id": oid,
+        "session_key": session_key,
+        "platform": row_platform,
+        "chat_id": chat_id,
+        "thread_id": thread_id,
+        "content": content,
+        "needs_marker": True,
+        "marker": RECONNECTED_MARKER,
+        "profile": _runtime_adapter_profile(adapter_profile),
+        "runtime_recovery": True,
+        "attempts": attempts,
+        "runtime_claim_token": claim_token,
+    }
+
+
+def sweep_failed_for_runtime(
+    platform: str,
+    now: Optional[float] = None,
+    *,
+    profile: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Atomically claim this process's transient failed rows after reconnect."""
+    expected_profile = str(profile or "").strip() or "default"
+    now = now if now is not None else time.time()
+    pid, started = _owner_stamp()
+    if started is None:
+        return []
+    claimed: List[Dict[str, Any]] = []
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            """SELECT obligation_id, session_key, platform, chat_id, thread_id,
+                      content, attempts, created_at, owner_pid,
+                      owner_started_at, last_error, adapter_profile
+               FROM delivery_obligations
+               WHERE state='failed' AND platform=?
+                 AND COALESCE(NULLIF(trim(adapter_profile), ''), 'default')=?""",
+            (platform, expected_profile),
+        ).fetchall()
+        for (oid, session_key, row_platform, chat_id, thread_id, content,
+             attempts, created_at, owner_pid, owner_started_at, last_error,
+             adapter_profile) in rows:
+            if owner_pid != pid or owner_started_at != started:
+                continue
+            if str(last_error or "").strip().lower() not in _RUNTIME_RETRYABLE_ERRORS:
+                continue
+            if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
+                conn.execute(
+                    """UPDATE delivery_obligations
+                       SET state='abandoned', updated_at=?, runtime_claim_token=NULL
+                       WHERE obligation_id=? AND state='failed'
+                         AND COALESCE(NULLIF(trim(adapter_profile), ''), 'default')=?
+                         AND owner_pid IS ? AND owner_started_at IS ?""",
+                    (now, oid, expected_profile, owner_pid, owner_started_at),
+                )
+                continue
+            claim_token = _mint_runtime_claim_token()
+            cursor = conn.execute(
+                """UPDATE delivery_obligations
+                   SET state='attempting', attempts=attempts+1, updated_at=?,
+                       runtime_claim_token=?
+                   WHERE obligation_id=? AND state='failed'
+                     AND COALESCE(NULLIF(trim(adapter_profile), ''), 'default')=?
+                     AND owner_pid IS ? AND owner_started_at IS ?""",
+                (
+                    now,
+                    claim_token,
+                    oid,
+                    expected_profile,
+                    owner_pid,
+                    owner_started_at,
+                ),
+            )
+            if cursor.rowcount:
+                claimed.append({
+                    "obligation_id": oid,
+                    "session_key": session_key,
+                    "platform": row_platform,
+                    "chat_id": chat_id,
+                    "thread_id": thread_id,
+                    "content": content,
+                    "needs_marker": True,
+                    "marker": RECONNECTED_MARKER,
+                    "profile": _runtime_adapter_profile(adapter_profile),
+                    "runtime_recovery": True,
+                    "attempts": attempts + 1,
+                    "runtime_claim_token": claim_token,
                 })
     return claimed
 

@@ -758,9 +758,14 @@ class TestSessionTurnLeasesEpochHeal:
         after = _lease_store_snapshot(db_path)
         assert after == snapshot_before_heal
         assert caught.value.__cause__ is None
-        assert len(opened) == 1
-        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
-            opened[0].execute("PRAGMA foreign_keys")
+        assert opened
+        # Startup may retire a provisional connection before opening the
+        # long-lived writer (for example, after a successful WAL transition).
+        # The safety contract is that every connection opened for this refused
+        # migration is closed, not that a particular startup path opens one.
+        for conn in opened:
+            with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+                conn.execute("PRAGMA foreign_keys")
 
     def test_modern_locked_drop_retries_through_open_boundary(self, tmp_path, monkeypatch):
         """A real busy DROP reaches SessionDB's existing open-time retry loop."""

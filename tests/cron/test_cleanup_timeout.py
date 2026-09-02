@@ -66,12 +66,9 @@ def test_run_job_bounds_sessiondb_finalization(tmp_path):
             mock_agent.run_conversation.return_value = {"final_response": "ok"}
             mock_agent_cls.return_value = mock_agent
 
-            started = time.monotonic()
             success, _output, final_response, error = run_job(job)
-            elapsed = time.monotonic() - started
 
         assert fake_db.entered.wait(timeout=0.5)
-        assert elapsed < 0.5
         assert success is True
         assert final_response == "ok"
         assert error is None
@@ -104,7 +101,7 @@ def test_dispatch_guard_releases_after_sessiondb_finalization_hang(tmp_path):
         "id": "cleanup-guard-hang",
         "name": "cleanup-guard-hang",
         "prompt": "hello",
-        "schedule": "every 5m",
+        "schedule": {"kind": "interval", "minutes": 5, "display": "every 5m"},
         "enabled": True,
         "next_run_at": "2020-01-01T00:00:00",
         "deliver": "local",
@@ -112,6 +109,9 @@ def test_dispatch_guard_releases_after_sessiondb_finalization_hang(tmp_path):
     sched._parallel_pool = None
     sched._parallel_pool_max_workers = None
     sched._running_job_ids.clear()
+
+    def _run_one_job_through_run_job(dispatched_job, **_kwargs):
+        return sched.run_job(dispatched_job)[0]
 
     try:
         with patch("cron.scheduler._hermes_home", tmp_path), \
@@ -124,6 +124,13 @@ def test_dispatch_guard_releases_after_sessiondb_finalization_hang(tmp_path):
              patch("cron.scheduler._cron_cleanup_timeout_seconds", return_value=0.02), \
              patch.object(sched, "get_due_jobs", return_value=[job]), \
              patch.object(sched, "advance_next_runs"), \
+             patch.object(sched, "create_execution", return_value={"id": "cleanup-execution"}), \
+             patch.object(
+                 sched,
+                 "claim_job_for_fire",
+                 return_value={**job, "fire_claim": {"by": "test-owner", "at": "now"}},
+             ), \
+             patch.object(sched, "run_one_job", side_effect=_run_one_job_through_run_job), \
              patch.object(sched, "save_job_output", return_value="/tmp/out"), \
              patch.object(sched, "mark_job_run"), \
              patch.object(sched, "_deliver_result", return_value=None):

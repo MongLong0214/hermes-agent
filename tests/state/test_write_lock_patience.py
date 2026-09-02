@@ -24,7 +24,7 @@ import time
 
 import pytest
 
-from hermes_state import SessionDB
+from hermes_state import IncompatibleSchemaError, SessionDB
 
 
 def _hold_write_lock(db_path, hold_s, started_evt):
@@ -144,7 +144,7 @@ class TestOpenLockPatience:
         bad_path = tmp_path / "state.db"
         bad_path.mkdir()
         t0 = time.monotonic()
-        with pytest.raises(sqlite3.Error):
+        with pytest.raises(IncompatibleSchemaError):
             SessionDB(db_path=bad_path)
         # Must fail well before a full patience window (loose bound).
         assert time.monotonic() - t0 < 15.0

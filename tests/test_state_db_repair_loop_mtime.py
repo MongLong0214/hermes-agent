@@ -33,6 +33,7 @@ from hermes_state import (
     _MAX_MALFORMED_BACKUPS,
     _MAX_PERSISTENT_REPAIR_ATTEMPTS,
     _REPAIR_BACKUP_MIN_FREE_BYTES,
+    SessionDB,
     _backup_content_identity,
     _backup_db_file,
     _db_fingerprint,
@@ -47,6 +48,14 @@ def _damaged_db(tmp_path: Path, size: int = 200_000) -> Path:
     db = tmp_path / "state.db"
     db.write_bytes(b"SQLite format 3\x00" + os.urandom(size))
     return db
+
+
+def _canonical_db(tmp_path: Path) -> Path:
+    """Return the smallest supported state store for authority-bound helpers."""
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path=db_path)
+    db.close()
+    return db_path
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +95,7 @@ def test_fingerprint_changes_on_truncation(tmp_path):
 
 def test_attempt_budget_exhausts_despite_mtime_churn(tmp_path):
     """The loop must terminate even when every pass touches the file."""
-    db = _damaged_db(tmp_path)
+    db = _canonical_db(tmp_path)
     for _ in range(_MAX_PERSISTENT_REPAIR_ATTEMPTS):
         assert not _persistent_repair_attempts_exhausted(db)
         _record_repair_outcome(db, repaired=False)
@@ -96,7 +105,7 @@ def test_attempt_budget_exhausts_despite_mtime_churn(tmp_path):
 
 
 def test_successful_repair_clears_budget(tmp_path):
-    db = _damaged_db(tmp_path)
+    db = _canonical_db(tmp_path)
     for _ in range(_MAX_PERSISTENT_REPAIR_ATTEMPTS):
         _record_repair_outcome(db, repaired=False)
     assert _persistent_repair_attempts_exhausted(db)
@@ -250,11 +259,13 @@ def test_backup_allowed_with_ample_disk(tmp_path):
 
 def test_repair_aborts_when_backup_refused_for_disk(tmp_path):
     """Refused backup is a HARD STOP — never mutate the only damaged copy."""
-    db = _damaged_db(tmp_path)
+    db = _canonical_db(tmp_path)
     tight = type(
         "Usage", (), {"total": 0, "used": 0, "free": _REPAIR_BACKUP_MIN_FREE_BYTES // 2}
     )()
-    with patch("shutil.disk_usage", return_value=tight):
+    with patch.object(
+        hermes_state, "_db_opens_cleanly", return_value="forced repair failure"
+    ), patch("shutil.disk_usage", return_value=tight):
         report = hermes_state.repair_state_db_schema(db)
     assert not report.get("repaired")
     assert "free" in (report.get("error") or "").lower()
@@ -482,11 +493,7 @@ def test_budget_exhausts_when_liveness_alternates_across_passes(tmp_path):
     """
     from hermes_cli.sqlite_safe_read import connect_tracked
 
-    db = tmp_path / "state.db"
-    conn = sqlite3.connect(str(db))
-    conn.execute("CREATE TABLE t(a)")
-    conn.commit()
-    conn.close()
+    db = _canonical_db(tmp_path)
 
     for index in range(_MAX_PERSISTENT_REPAIR_ATTEMPTS):
         live = None
@@ -539,11 +546,13 @@ def test_fingerprint_returns_none_rather_than_a_mtime_shaped_key(tmp_path):
 
 def _populated_db(path: Path, journal_mode: str, rows: int = 600) -> None:
     """A DB comfortably larger than the fingerprint sample window (~270KB)."""
+    bootstrap = SessionDB(db_path=path)
+    bootstrap.close()
     conn = sqlite3.connect(str(path))
     conn.execute(f"PRAGMA journal_mode={journal_mode}")
-    conn.execute("CREATE TABLE sessions(id TEXT, blob TEXT)")
+    conn.execute("CREATE TABLE repair_payload(id TEXT PRIMARY KEY, blob TEXT)")
     conn.executemany(
-        "INSERT INTO sessions VALUES(?,?)",
+        "INSERT INTO repair_payload VALUES(?,?)",
         [(str(i), "x" * 400) for i in range(rows)],
     )
     conn.commit()
@@ -566,7 +575,7 @@ def test_ordinary_commit_does_not_rekey_the_fingerprint(tmp_path):
 
         writer = sqlite3.connect(str(db), isolation_level=None)
         try:
-            writer.execute("UPDATE sessions SET blob='peer' WHERE id='20000'")
+            writer.execute("UPDATE repair_payload SET blob='peer' WHERE id='200'")
         finally:
             writer.close()
 
@@ -585,7 +594,9 @@ def test_budget_exhausts_while_a_writer_commits_between_passes(tmp_path):
         _record_repair_outcome(db, repaired=False)
         writer = sqlite3.connect(str(db), isolation_level=None)
         try:
-            writer.execute("UPDATE sessions SET blob=? WHERE id='20000'", (f"v{index}",))
+            writer.execute(
+                "UPDATE repair_payload SET blob=? WHERE id='200'", (f"v{index}",)
+            )
         finally:
             writer.close()
 

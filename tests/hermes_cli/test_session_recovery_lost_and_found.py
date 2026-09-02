@@ -24,6 +24,8 @@ from hermes_state import (
 )
 from hermes_cli import session_recovery
 from hermes_cli.session_lost_and_found import (
+    _is_positive_sqlite_integer,
+    _session_source_columns,
     classify_lost_and_found_row,
     map_lost_and_found_rows,
     rebuild_fts_indexes,
@@ -626,7 +628,12 @@ def test_lost_and_found_copy_refusal_retains_the_real_stage(
                 ),
             )
         assert stage is not None
-        session_recovery._refresh_stage_children(stage, require_main=True)
+        # The marker write legitimately changes the same staged SQLite child
+        # (normally its WAL metadata); retain that child for the authority
+        # refusal rather than treating content evolution as substitution.
+        session_recovery._refresh_stage_children(
+            stage, require_main=True, rebaseline=True
+        )
         return original_map_rows(lf_conn, destination)
 
     def record_real_cleanup(destination_stage) -> None:
@@ -911,11 +918,19 @@ def _make_synthetic_lost_and_found(
                 "source": "telegram",
                 "started_at": 1_754_000_000.0,
                 "message_count": 2,
+                # A current 57-column source must carry a real physical
+                # generation at its current-layout slot; literal 52 ignores it.
+                "session_generation": 2,
                 "title": f"synthetic {session_id}",
             }
-            return [base.get(column) for column in sessions_columns[:ncols]]
+            source_columns = (
+                _REAL_52_SESSION_COLUMNS
+                if ncols == len(_REAL_52_SESSION_COLUMNS)
+                else sessions_columns
+            )
+            return [base.get(column) for column in source_columns[:ncols]]
 
-        # Current layout (dynamic width) and historical 52-column layout.
+        # Current layout (dynamic width) and literal real 52-column layout.
         insert(max_fields, 1, session_row("20260101_010101_aaa001", max_fields))
         insert(52, 2, session_row("20260202_020202_bbb002", 52))
         # 14-column legacy layout: identity + a plausible epoch timestamp.
@@ -1103,6 +1118,815 @@ def test_mapper_rebuilds_sessiondb_from_synthetic_lost_and_found(
         assert len(db.list_sessions_rich(limit=20)) == 5
     finally:
         db.close()
+
+
+# Literal current layout from ``hermes_state_common.SCHEMA_SQL``. It is a
+# source-schema witness, deliberately not a PRAGMA result or mapper constant.
+_CURRENT_57_SESSION_COLUMNS = (
+    "id", "source", "user_id", "session_key", "chat_id", "chat_type",
+    "thread_id", "display_name", "origin_json", "expiry_finalized", "model",
+    "model_config", "system_prompt", "system_prompt_hash", "parent_session_id",
+    "started_at", "ended_at", "end_reason", "message_count", "tool_call_count",
+    "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
+    "reasoning_tokens", "cwd", "git_branch", "git_repo_root",
+    "git_metadata_generation", "session_generation", "billing_provider",
+    "billing_base_url", "billing_mode", "estimated_cost_usd", "actual_cost_usd",
+    "cost_status", "cost_source", "pricing_version", "title", "title_source",
+    "last_activity_at", "last_activity_description", "last_activity_provenance",
+    "api_call_count", "handoff_state", "handoff_platform", "handoff_error",
+    "compression_failure_cooldown_until", "compression_failure_error",
+    "compression_fallback_streak", "compression_ineffective_count", "profile_name",
+    "rewind_count", "archived", "pinned", "hidden", "last_read_at",
+)
+
+
+def test_mapper_literal_current_57_integer_last_read_at_mints_destination_authority(
+    tmp_path: Path,
+) -> None:
+    """A current page-level row must not import its source generation/capabilities."""
+    source_session_id = "20260831_235959_abc123"
+    source_authority_token = "a" * 64
+    source_reservation_token = "b" * 64
+    source_reservation_id = "source-reservation-id"
+
+    lf_path = tmp_path / "current-layout-lost-and-found.db"
+    SessionDB(db_path=lf_path).close()
+    lf_conn = sqlite3.connect(str(lf_path), isolation_level=None)
+    output = tmp_path / "mapped.db"
+    SessionDB(db_path=output).close()
+    dest = sqlite3.connect(str(output), isolation_level=None)
+    try:
+        register_turn_fence_generation(lf_conn)
+        source_columns = _CURRENT_57_SESSION_COLUMNS
+        assert len(source_columns) == 57
+        assert source_columns[29:31] == ("session_generation", "billing_provider")
+        assert source_columns[-1] == "last_read_at"
+
+        source_state_db_id = lf_conn.execute(
+            "SELECT value FROM state_meta WHERE key = 'session_process_state_db_id'"
+        ).fetchone()[0]
+        lf_conn.execute(
+            "INSERT INTO session_process_authorities "
+            "(session_id, session_generation, state_db_id, state_family, "
+            "authority_token, status, issued_at) VALUES (?, 2, ?, 'sessiondb-v1', "
+            "?, 'ISSUED', 1)",
+            (source_session_id, source_state_db_id, source_authority_token),
+        )
+        lf_conn.execute(
+            "INSERT INTO session_process_authority_events "
+            "(session_id, session_generation, state_db_id, state_family, "
+            "event_type, reservation_id, occurred_at) "
+            "VALUES (?, 2, ?, 'sessiondb-v1', 'SESSION_ISSUED', ?, 1)",
+            (source_session_id, source_state_db_id, source_reservation_id),
+        )
+        lf_conn.execute(
+            "INSERT INTO session_process_reservations "
+            "(reservation_id, reservation_token_sha256, session_id, "
+            "session_generation, state_db_id, state_family, status, reserved_at, "
+            "expires_at) VALUES (?, ?, ?, 2, ?, 'sessiondb-v1', 'RESERVED', 1, 2)",
+            (
+                source_reservation_id,
+                source_reservation_token,
+                source_session_id,
+                source_state_db_id,
+            ),
+        )
+
+        cells = ", ".join(f"c{index}" for index in range(len(source_columns)))
+        lf_conn.execute(
+            "CREATE TABLE lost_and_found "
+            f"(rootpgno INTEGER, pgno INTEGER, nfield INTEGER, id INTEGER, {cells})"
+        )
+        source_values = {
+            "id": source_session_id,
+            "source": "telegram",
+            "started_at": 1_754_000_000.0,
+            "message_count": 7,
+            "session_generation": 2,
+            "billing_provider": "source-billing-provider",
+            "billing_base_url": "https://source.invalid/api",
+            "billing_mode": "source-billing-mode",
+            "estimated_cost_usd": 12.5,
+            "actual_cost_usd": 9.25,
+            "cost_status": "source-cost-status",
+            "cost_source": "source-cost-source",
+            "pricing_version": "source-pricing-version",
+            "title": "schema-less current-layout title",
+            "title_source": "source-title",
+            "last_activity_at": 1_754_000_001.0,
+            "last_activity_description": "aligned later field",
+            "last_activity_provenance": "source-provenance",
+            "api_call_count": 11,
+            "handoff_state": "source-handoff-state",
+            "handoff_platform": "source-handoff-platform",
+            "handoff_error": "source-handoff-error",
+            "profile_name": "source-profile",
+            "rewind_count": 3,
+            "archived": 0,
+            "pinned": 1,
+            "hidden": 0,
+            # A recovered SQLite cell can be an INTEGER timestamp; it is not
+            # an appended-layout generation merely because it is positive.
+            "last_read_at": 1_754_000_002,
+        }
+        recovered_row = [source_values.get(column) for column in source_columns]
+        assert recovered_row[29] == 2
+        assert type(recovered_row[-1]) is int
+        placeholders = ", ".join("?" for _ in range(4 + len(recovered_row)))
+        lf_conn.execute(
+            f"INSERT INTO lost_and_found VALUES ({placeholders})",
+            [2, 5, len(recovered_row), 1, *recovered_row],
+        )
+
+        # The real recovery path reopens a SessionDB destination and registers
+        # the generation UDF before mapping page-level lost-and-found rows.
+        register_turn_fence_generation(dest)
+        mapping = map_lost_and_found_rows(lf_conn, dest)
+
+        assert mapping["mapped"]["sessions"] == 1
+        assert mapping["unmapped_rows"] == 0
+        assert dest.execute(
+            "SELECT session_generation FROM sessions WHERE id = ?",
+            (source_session_id,),
+        ).fetchone() == (1,)
+        assert dest.execute(
+            "SELECT billing_provider, billing_base_url, billing_mode, "
+            "estimated_cost_usd, actual_cost_usd, cost_status, cost_source, "
+            "pricing_version, title, title_source, last_activity_at, "
+            "last_activity_description, last_activity_provenance, api_call_count, "
+            "handoff_state, handoff_platform, handoff_error, profile_name, rewind_count, "
+            "archived, pinned, hidden, last_read_at FROM sessions WHERE id = ?",
+            (source_session_id,),
+        ).fetchone() == (
+            "source-billing-provider",
+            "https://source.invalid/api",
+            "source-billing-mode",
+            12.5,
+            9.25,
+            "source-cost-status",
+            "source-cost-source",
+            "source-pricing-version",
+            "schema-less current-layout title",
+            "source-title",
+            1_754_000_001.0,
+            "aligned later field",
+            "source-provenance",
+            11,
+            "source-handoff-state",
+            "source-handoff-platform",
+            "source-handoff-error",
+            "source-profile",
+            3,
+            0,
+            1,
+            0,
+            1_754_000_002.0,
+        )
+
+        destination_state_db_id = dest.execute(
+            "SELECT value FROM state_meta WHERE key = 'session_process_state_db_id'"
+        ).fetchone()[0]
+        assert destination_state_db_id != source_state_db_id
+        authority = dest.execute(
+            "SELECT session_generation, state_db_id, state_family, authority_token, "
+            "status FROM session_process_authorities WHERE session_id = ?",
+            (source_session_id,),
+        ).fetchone()
+        assert authority[:3] == (1, destination_state_db_id, "sessiondb-v1")
+        assert authority[3] != source_authority_token
+        assert len(authority[3]) == 64
+        assert authority[4] == "ISSUED"
+        assert dest.execute(
+            "SELECT session_generation, state_db_id, event_type, reservation_id "
+            "FROM session_process_authority_events WHERE session_id = ?",
+            (source_session_id,),
+        ).fetchall() == [(1, destination_state_db_id, "SESSION_ISSUED", None)]
+        assert dest.execute(
+            "SELECT COUNT(*) FROM session_process_reservations WHERE session_id = ?",
+            (source_session_id,),
+        ).fetchone() == (0,)
+    finally:
+        lf_conn.close()
+        dest.close()
+
+    recovered_db = SessionDB(db_path=output)
+    try:
+        assert len(recovered_db.list_sessions_rich(limit=10)) == 1
+    finally:
+        recovered_db.close()
+
+
+def test_session_source_columns_rejects_invented_current_destination_layout() -> None:
+    """A matching width and three sentinels cannot invent a source layout."""
+    recovered_row = [None] * len(_CURRENT_57_SESSION_COLUMNS)
+    recovered_row[29] = 2
+    invented_destination = list(_CURRENT_57_SESSION_COLUMNS)
+    invented_destination[3] = "invented_source_field"
+
+    assert _session_source_columns(
+        len(recovered_row), tuple(recovered_row), invented_destination
+    ) is None
+
+
+def test_session_layout_disambiguation_uses_sqlite_storage_classes(
+    tmp_path: Path,
+) -> None:
+    """Only real SQLite INTEGER generations and TEXT-affinity providers classify."""
+    storage = sqlite3.connect(str(tmp_path / "storage-classes.db"))
+    try:
+        storage.execute(
+            "CREATE TABLE source_cells "
+            "(name TEXT PRIMARY KEY, generation INTEGER, provider TEXT, last_read_at)"
+        )
+        storage.executemany(
+            "INSERT INTO source_cells VALUES (?, ?, ?, ?)",
+            (
+                ("positive", 2, None, 1_754_000_000),
+                ("zero", 0, None, 1_754_000_000),
+                ("negative", -1, None, 1_754_000_000),
+                ("float", 2.5, None, 1_754_000_000),
+                ("text", "not-an-integer", None, 1_754_000_000),
+                # SQLite stores TRUE in an INTEGER-affinity column as INTEGER
+                # 1, so recovery sees an ordinary positive int, not bool.
+                ("sqlite-true", True, None, 1_754_000_000),
+                ("provider-string", 2, "source-provider", 1_754_000_000),
+            ),
+        )
+        rows = {
+            row[0]: row[1:]
+            for row in storage.execute(
+                "SELECT name, generation, typeof(generation), provider, "
+                "typeof(provider), last_read_at, typeof(last_read_at) "
+                "FROM source_cells"
+            )
+        }
+    finally:
+        storage.close()
+
+    assert rows["positive"] == (
+        2, "integer", None, "null", 1_754_000_000, "integer"
+    )
+    assert rows["sqlite-true"] == (
+        1, "integer", None, "null", 1_754_000_000, "integer"
+    )
+    assert rows["float"][1] == "real"
+    assert rows["text"][1] == "text"
+    assert rows["provider-string"][2:4] == ("source-provider", "text")
+    assert [_is_positive_sqlite_integer(rows[name][0]) for name in (
+        "positive", "zero", "negative", "float", "text", "sqlite-true"
+    )] == [True, False, False, False, False, True]
+
+    current_row = [None] * len(_CURRENT_57_SESSION_COLUMNS)
+    current_row[29] = rows["positive"][0]
+    current_row[-1] = rows["positive"][4]
+    assert _session_source_columns(
+        57, tuple(current_row), list(_CURRENT_57_SESSION_COLUMNS)
+    ) == _CURRENT_57_SESSION_COLUMNS
+
+    appended_columns = (*_IMMEDIATE_PRE_V28_56_SESSION_COLUMNS, "session_generation")
+    for provider_row in ("positive", "provider-string"):
+        appended_row = [None] * len(appended_columns)
+        appended_row[29] = rows[provider_row][2]
+        appended_row[-1] = rows[provider_row][0]
+        assert _session_source_columns(
+            57, tuple(appended_row), list(_CURRENT_57_SESSION_COLUMNS)
+        ) == appended_columns
+
+
+# Literal layouts from the immutable schema DDLs, deliberately independent of
+# the current destination schema and production mapper layout declarations.
+_REAL_52_SESSION_COLUMNS = (
+    "id", "source", "user_id", "session_key", "chat_id", "chat_type",
+    "thread_id", "display_name", "origin_json", "expiry_finalized", "model",
+    "model_config", "system_prompt", "system_prompt_hash", "parent_session_id",
+    "started_at", "ended_at", "end_reason", "message_count", "tool_call_count",
+    "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
+    "reasoning_tokens", "cwd", "git_branch", "git_repo_root",
+    "billing_provider", "billing_base_url", "billing_mode", "estimated_cost_usd",
+    "actual_cost_usd", "cost_status", "cost_source", "pricing_version", "title",
+    "last_activity_at", "last_activity_description", "last_activity_provenance",
+    "api_call_count", "handoff_state", "handoff_platform", "handoff_error",
+    "compression_failure_cooldown_until", "compression_failure_error",
+    "compression_fallback_streak", "compression_ineffective_count", "profile_name",
+    "rewind_count", "archived", "pinned",
+)
+
+_IMMEDIATE_PRE_V28_56_SESSION_COLUMNS = (
+    "id", "source", "user_id", "session_key", "chat_id", "chat_type",
+    "thread_id", "display_name", "origin_json", "expiry_finalized", "model",
+    "model_config", "system_prompt", "system_prompt_hash", "parent_session_id",
+    "started_at", "ended_at", "end_reason", "message_count", "tool_call_count",
+    "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
+    "reasoning_tokens", "cwd", "git_branch", "git_repo_root",
+    "git_metadata_generation", "billing_provider", "billing_base_url", "billing_mode",
+    "estimated_cost_usd", "actual_cost_usd", "cost_status", "cost_source",
+    "pricing_version", "title", "title_source", "last_activity_at",
+    "last_activity_description", "last_activity_provenance", "api_call_count",
+    "handoff_state", "handoff_platform", "handoff_error",
+    "compression_failure_cooldown_until", "compression_failure_error",
+    "compression_fallback_streak", "compression_ineffective_count", "profile_name",
+    "rewind_count", "archived", "pinned", "hidden", "last_read_at",
+)
+
+
+@pytest.mark.parametrize(
+    ("source_columns", "layout_name"),
+    [
+        pytest.param(
+            _REAL_52_SESSION_COLUMNS,
+            "real-52",
+            id="real-52-7d066c3c-layout",
+        ),
+        pytest.param(
+            _IMMEDIATE_PRE_V28_56_SESSION_COLUMNS,
+            "pre-v28-56",
+            id="pre-v28-56-30a0f23-layout",
+        ),
+    ],
+)
+def test_mapper_schema_less_historical_session_layout_preserves_field_meanings(
+    tmp_path: Path,
+    source_columns: tuple[str, ...],
+    layout_name: str,
+) -> None:
+    """Historical schema-less rows retain each source field's named meaning."""
+    width = len(source_columns)
+    assert width in {52, 56}
+    assert "session_generation" not in source_columns
+    if width == 52:
+        assert "git_metadata_generation" not in source_columns
+    else:
+        assert source_columns[28] == "git_metadata_generation"
+
+    source_session_id = f"20260901_1200{width:02d}_abc{width:03d}"
+    source_authority_token = ("a" if width == 52 else "b") * 64
+    source_reservation_token = ("c" if width == 52 else "d") * 64
+    source_reservation_id = f"source-reservation-{layout_name}"
+    source_values = {
+        "id": source_session_id,
+        "source": "telegram" if width == 52 else "discord",
+        "user_id": f"source-user-{layout_name}",
+        "session_key": f"source-key-{layout_name}",
+        "chat_id": f"source-chat-{layout_name}",
+        "chat_type": "group",
+        "thread_id": f"source-thread-{layout_name}",
+        "display_name": f"source-display-{layout_name}",
+        "origin_json": f'{{"layout": "{layout_name}"}}',
+        "expiry_finalized": 1,
+        "model": f"source-model-{layout_name}",
+        "model_config": f'{{"model": "{layout_name}"}}',
+        "system_prompt": None,
+        "system_prompt_hash": None,
+        "parent_session_id": None,
+        "started_at": 1_754_000_000.0 + width,
+        "ended_at": 1_754_000_100.0 + width,
+        "end_reason": f"source-end-{layout_name}",
+        "message_count": width,
+        "tool_call_count": width + 1,
+        "input_tokens": width + 2,
+        "output_tokens": width + 3,
+        "cache_read_tokens": width + 4,
+        "cache_write_tokens": width + 5,
+        "reasoning_tokens": width + 6,
+        "cwd": f"/source/{layout_name}",
+        "git_branch": f"source-branch-{layout_name}",
+        "git_repo_root": f"/source/repo-{layout_name}",
+        "git_metadata_generation": width + 7,
+        "billing_provider": f"source-provider-{layout_name}",
+        "billing_base_url": f"https://{layout_name}.invalid/api",
+        "billing_mode": f"source-billing-mode-{layout_name}",
+        "estimated_cost_usd": width + 0.125,
+        "actual_cost_usd": width + 0.25,
+        "cost_status": f"source-cost-status-{layout_name}",
+        "cost_source": f"source-cost-source-{layout_name}",
+        "pricing_version": f"source-pricing-{layout_name}",
+        "title": f"source-title-{layout_name}",
+        "title_source": f"source-title-source-{layout_name}",
+        "last_activity_at": 1_754_000_200.0 + width,
+        "last_activity_description": f"source-activity-{layout_name}",
+        "last_activity_provenance": f"source-provenance-{layout_name}",
+        "api_call_count": width + 8,
+        "handoff_state": f"source-handoff-state-{layout_name}",
+        "handoff_platform": f"source-handoff-platform-{layout_name}",
+        "handoff_error": f"source-handoff-error-{layout_name}",
+        "compression_failure_cooldown_until": 1_754_000_300.0 + width,
+        "compression_failure_error": f"source-compression-error-{layout_name}",
+        "compression_fallback_streak": width + 9,
+        "compression_ineffective_count": width + 10,
+        "profile_name": f"source-profile-{layout_name}",
+        "rewind_count": width + 11,
+        "archived": 1 if width == 52 else 0,
+        "pinned": 0 if width == 52 else 1,
+        "hidden": 1,
+        "last_read_at": 1_754_000_400.0 + width,
+    }
+    recovered_row = [source_values[column] for column in source_columns]
+
+    lf_path = tmp_path / f"{layout_name}-lost-and-found.db"
+    SessionDB(db_path=lf_path).close()
+    output = tmp_path / f"{layout_name}-mapped.db"
+    SessionDB(db_path=output).close()
+    lf_conn = sqlite3.connect(str(lf_path), isolation_level=None)
+    dest = sqlite3.connect(str(output), isolation_level=None)
+    try:
+        register_turn_fence_generation(lf_conn)
+        source_state_db_id = lf_conn.execute(
+            "SELECT value FROM state_meta WHERE key = 'session_process_state_db_id'"
+        ).fetchone()[0]
+        lf_conn.execute(
+            "INSERT INTO session_process_authorities "
+            "(session_id, session_generation, state_db_id, state_family, "
+            "authority_token, status, issued_at) VALUES (?, 2, ?, 'sessiondb-v1', "
+            "?, 'ISSUED', 1)",
+            (source_session_id, source_state_db_id, source_authority_token),
+        )
+        lf_conn.execute(
+            "INSERT INTO session_process_authority_events "
+            "(session_id, session_generation, state_db_id, state_family, "
+            "event_type, reservation_id, occurred_at) "
+            "VALUES (?, 2, ?, 'sessiondb-v1', 'SESSION_ISSUED', ?, 1)",
+            (source_session_id, source_state_db_id, source_reservation_id),
+        )
+        lf_conn.execute(
+            "INSERT INTO session_process_reservations "
+            "(reservation_id, reservation_token_sha256, session_id, "
+            "session_generation, state_db_id, state_family, status, reserved_at, "
+            "expires_at) VALUES (?, ?, ?, 2, ?, 'sessiondb-v1', 'RESERVED', 1, 2)",
+            (
+                source_reservation_id,
+                source_reservation_token,
+                source_session_id,
+                source_state_db_id,
+            ),
+        )
+        cells = ", ".join(f"c{index}" for index in range(width))
+        lf_conn.execute(
+            "CREATE TABLE lost_and_found "
+            f"(rootpgno INTEGER, pgno INTEGER, nfield INTEGER, id INTEGER, {cells})"
+        )
+        placeholders = ", ".join("?" for _ in range(4 + width))
+        lf_conn.execute(
+            f"INSERT INTO lost_and_found VALUES ({placeholders})",
+            [2, 5, width, 1, *recovered_row],
+        )
+
+        register_turn_fence_generation(dest)
+        mapping = map_lost_and_found_rows(lf_conn, dest)
+
+        assert mapping["mapped"]["sessions"] == 1
+        assert mapping["unmapped_rows"] == 0
+        quoted = ", ".join(f'"{column}"' for column in source_columns)
+        assert dest.execute(
+            f"SELECT {quoted} FROM sessions WHERE id = ?", (source_session_id,)
+        ).fetchone() == tuple(source_values[column] for column in source_columns)
+        assert dest.execute(
+            "SELECT session_generation FROM sessions WHERE id = ?",
+            (source_session_id,),
+        ).fetchone() == (1,)
+        if width == 52:
+            assert dest.execute(
+                "SELECT git_metadata_generation, title_source, hidden, last_read_at "
+                "FROM sessions WHERE id = ?",
+                (source_session_id,),
+            ).fetchone() == (0, None, 0, None)
+
+        destination_state_db_id = dest.execute(
+            "SELECT value FROM state_meta WHERE key = 'session_process_state_db_id'"
+        ).fetchone()[0]
+        assert destination_state_db_id != source_state_db_id
+        authority = dest.execute(
+            "SELECT session_generation, state_db_id, state_family, authority_token, "
+            "status FROM session_process_authorities WHERE session_id = ?",
+            (source_session_id,),
+        ).fetchone()
+        assert authority[:3] == (1, destination_state_db_id, "sessiondb-v1")
+        assert authority[3] != source_authority_token
+        assert len(authority[3]) == 64
+        assert authority[4] == "ISSUED"
+        assert dest.execute(
+            "SELECT session_generation, state_db_id, event_type, reservation_id "
+            "FROM session_process_authority_events WHERE session_id = ?",
+            (source_session_id,),
+        ).fetchall() == [(1, destination_state_db_id, "SESSION_ISSUED", None)]
+        assert dest.execute(
+            "SELECT COUNT(*) FROM session_process_reservations WHERE session_id = ?",
+            (source_session_id,),
+        ).fetchone() == (0,)
+    finally:
+        lf_conn.close()
+        dest.close()
+
+    recovered_db = SessionDB(db_path=output)
+    try:
+        assert recovered_db._conn.execute(
+            "SELECT COUNT(*) FROM sessions"
+        ).fetchone()[0] == 1
+    finally:
+        recovered_db.close()
+
+
+def test_mapper_schema_less_pre_v28_56_with_appended_generation_preserves_named_fields(
+    tmp_path: Path,
+) -> None:
+    """Generic ALTER appends generation after the immutable pre-v28 layout."""
+    source_columns = (
+        *_IMMEDIATE_PRE_V28_56_SESSION_COLUMNS,
+        "session_generation",
+    )
+    assert len(source_columns) == 57
+    assert source_columns[28] == "git_metadata_generation"
+    assert source_columns[29] == "billing_provider"
+    assert source_columns[-2:] == ("last_read_at", "session_generation")
+
+    source_session_id = "20260901_120057_abc057"
+    source_authority_token = "e" * 64
+    source_reservation_token = "f" * 64
+    source_reservation_id = "source-appended-generation-reservation"
+    source_values = {
+        "id": source_session_id,
+        "source": "discord",
+        "user_id": "appended-source-user",
+        "session_key": "appended-source-key",
+        "chat_id": "appended-source-chat",
+        "chat_type": "group",
+        "thread_id": "appended-source-thread",
+        "display_name": "appended-source-display",
+        "origin_json": '{"layout": "pre-v28-56-appended-generation"}',
+        "expiry_finalized": 1,
+        "model": "appended-source-model",
+        "model_config": '{"model": "appended-source"}',
+        "system_prompt": None,
+        "system_prompt_hash": None,
+        "parent_session_id": None,
+        "started_at": 1_754_000_057.0,
+        "ended_at": 1_754_000_157.0,
+        "end_reason": "appended-source-end",
+        "message_count": 57,
+        "tool_call_count": 58,
+        "input_tokens": 59,
+        "output_tokens": 60,
+        "cache_read_tokens": 61,
+        "cache_write_tokens": 62,
+        "reasoning_tokens": 63,
+        "cwd": "/source/pre-v28-appended",
+        "git_branch": "source-appended-branch",
+        "git_repo_root": "/source/appended/repo",
+        "git_metadata_generation": 64,
+        "billing_provider": "appended-billing-provider",
+        "billing_base_url": "https://appended.invalid/api",
+        "billing_mode": "appended-billing-mode",
+        "estimated_cost_usd": 57.125,
+        "actual_cost_usd": 57.25,
+        "cost_status": "appended-cost-status",
+        "cost_source": "appended-cost-source",
+        "pricing_version": "appended-pricing-version",
+        "title": "appended-source-title",
+        "title_source": "appended-source-title-source",
+        "last_activity_at": 1_754_000_257.0,
+        "last_activity_description": "appended-source-activity",
+        "last_activity_provenance": "appended-source-provenance",
+        "api_call_count": 65,
+        "handoff_state": "appended-handoff-state",
+        "handoff_platform": "appended-handoff-platform",
+        "handoff_error": "appended-handoff-error",
+        "compression_failure_cooldown_until": 1_754_000_357.0,
+        "compression_failure_error": "appended-compression-error",
+        "compression_fallback_streak": 66,
+        "compression_ineffective_count": 67,
+        "profile_name": "appended-source-profile",
+        "rewind_count": 68,
+        "archived": 1,
+        "pinned": 0,
+        "hidden": 1,
+        "last_read_at": 1_754_000_457.0,
+        # This is physical cell 56 because generic ALTER TABLE ADD COLUMN
+        # appends it; it is not current-layout physical cell 29.
+        "session_generation": 2,
+    }
+    recovered_row = [source_values[column] for column in source_columns]
+    assert recovered_row[-1] == 2
+
+    lf_path = tmp_path / "pre-v28-appended-generation-lost-and-found.db"
+    SessionDB(db_path=lf_path).close()
+    output = tmp_path / "pre-v28-appended-generation-mapped.db"
+    SessionDB(db_path=output).close()
+    lf_conn = sqlite3.connect(str(lf_path), isolation_level=None)
+    dest = sqlite3.connect(str(output), isolation_level=None)
+    try:
+        register_turn_fence_generation(lf_conn)
+        source_state_db_id = lf_conn.execute(
+            "SELECT value FROM state_meta WHERE key = 'session_process_state_db_id'"
+        ).fetchone()[0]
+        lf_conn.execute(
+            "INSERT INTO session_process_authorities "
+            "(session_id, session_generation, state_db_id, state_family, "
+            "authority_token, status, issued_at) VALUES (?, 2, ?, 'sessiondb-v1', "
+            "?, 'ISSUED', 1)",
+            (source_session_id, source_state_db_id, source_authority_token),
+        )
+        lf_conn.execute(
+            "INSERT INTO session_process_authority_events "
+            "(session_id, session_generation, state_db_id, state_family, "
+            "event_type, reservation_id, occurred_at) "
+            "VALUES (?, 2, ?, 'sessiondb-v1', 'SESSION_ISSUED', ?, 1)",
+            (source_session_id, source_state_db_id, source_reservation_id),
+        )
+        lf_conn.execute(
+            "INSERT INTO session_process_reservations "
+            "(reservation_id, reservation_token_sha256, session_id, "
+            "session_generation, state_db_id, state_family, status, reserved_at, "
+            "expires_at) VALUES (?, ?, ?, 2, ?, 'sessiondb-v1', 'RESERVED', 1, 2)",
+            (
+                source_reservation_id,
+                source_reservation_token,
+                source_session_id,
+                source_state_db_id,
+            ),
+        )
+        cells = ", ".join(f"c{index}" for index in range(len(recovered_row)))
+        lf_conn.execute(
+            "CREATE TABLE lost_and_found "
+            f"(rootpgno INTEGER, pgno INTEGER, nfield INTEGER, id INTEGER, {cells})"
+        )
+        placeholders = ", ".join("?" for _ in range(4 + len(recovered_row)))
+        lf_conn.execute(
+            f"INSERT INTO lost_and_found VALUES ({placeholders})",
+            [2, 5, len(recovered_row), 1, *recovered_row],
+        )
+
+        register_turn_fence_generation(dest)
+        mapping = map_lost_and_found_rows(lf_conn, dest)
+
+        assert mapping["mapped"]["sessions"] == 1
+        assert mapping["unmapped_rows"] == 0
+        assert dest.execute(
+            "SELECT billing_provider, billing_base_url, billing_mode, title, "
+            "title_source, last_activity_at, last_activity_description, "
+            "last_activity_provenance, handoff_state, handoff_platform, "
+            "handoff_error, profile_name, rewind_count, last_read_at "
+            "FROM sessions WHERE id = ?",
+            (source_session_id,),
+        ).fetchone() == (
+            "appended-billing-provider",
+            "https://appended.invalid/api",
+            "appended-billing-mode",
+            "appended-source-title",
+            "appended-source-title-source",
+            1_754_000_257.0,
+            "appended-source-activity",
+            "appended-source-provenance",
+            "appended-handoff-state",
+            "appended-handoff-platform",
+            "appended-handoff-error",
+            "appended-source-profile",
+            68,
+            1_754_000_457.0,
+        )
+        # The trailing source generation is excluded instead of being mapped
+        # to last_read_at, while the fresh destination mints generation 1.
+        assert dest.execute(
+            "SELECT session_generation, last_read_at FROM sessions WHERE id = ?",
+            (source_session_id,),
+        ).fetchone() == (1, 1_754_000_457.0)
+
+        destination_state_db_id = dest.execute(
+            "SELECT value FROM state_meta WHERE key = 'session_process_state_db_id'"
+        ).fetchone()[0]
+        assert destination_state_db_id != source_state_db_id
+        authority = dest.execute(
+            "SELECT session_generation, state_db_id, state_family, authority_token, "
+            "status FROM session_process_authorities WHERE session_id = ?",
+            (source_session_id,),
+        ).fetchone()
+        assert authority[:3] == (1, destination_state_db_id, "sessiondb-v1")
+        assert authority[3] != source_authority_token
+        assert len(authority[3]) == 64
+        assert authority[4] == "ISSUED"
+        assert dest.execute(
+            "SELECT session_generation, state_db_id, event_type, reservation_id "
+            "FROM session_process_authority_events WHERE session_id = ?",
+            (source_session_id,),
+        ).fetchall() == [(1, destination_state_db_id, "SESSION_ISSUED", None)]
+        assert dest.execute(
+            "SELECT COUNT(*) FROM session_process_reservations WHERE session_id = ?",
+            (source_session_id,),
+        ).fetchone() == (0,)
+    finally:
+        lf_conn.close()
+        dest.close()
+
+
+def test_mapper_schema_less_both_positive_slots_remain_current_without_shift(
+    tmp_path: Path,
+) -> None:
+    """An INTEGER last_read_at does not turn an exact current row into appended order."""
+    source_session_id = "20260901_120058_abc058"
+    lf_path = tmp_path / "ambiguous-57-lost-and-found.db"
+    SessionDB(db_path=lf_path).close()
+    output = tmp_path / "ambiguous-57-mapped.db"
+    SessionDB(db_path=output).close()
+    lf_conn = sqlite3.connect(str(lf_path), isolation_level=None)
+    dest = sqlite3.connect(str(output), isolation_level=None)
+    try:
+        source_columns = _CURRENT_57_SESSION_COLUMNS
+        assert len(source_columns) == 57
+        assert source_columns[29:31] == ("session_generation", "billing_provider")
+        assert source_columns[-1] == "last_read_at"
+        cells = ", ".join(f"c{index}" for index in range(len(source_columns)))
+        lf_conn.execute(
+            "CREATE TABLE lost_and_found "
+            f"(rootpgno INTEGER, pgno INTEGER, nfield INTEGER, id INTEGER, {cells})"
+        )
+        recovered_row = [None] * len(source_columns)
+        recovered_row[0] = source_session_id
+        recovered_row[1] = "cli"
+        recovered_row[15] = 1_754_000_058.0
+        recovered_row[29] = 2
+        # These are both positive INTEGER cells, but cell 29 has current
+        # generation semantics; cell 56 is the current INTEGER timestamp.
+        recovered_row[-1] = 2
+        placeholders = ", ".join("?" for _ in range(4 + len(recovered_row)))
+        lf_conn.execute(
+            f"INSERT INTO lost_and_found VALUES ({placeholders})",
+            [2, 5, len(recovered_row), 1, *recovered_row],
+        )
+
+        register_turn_fence_generation(dest)
+        mapping = map_lost_and_found_rows(lf_conn, dest)
+
+        assert mapping["mapped"]["sessions"] == 1
+        assert mapping["unmapped_rows"] == 0
+        assert dest.execute(
+            "SELECT session_generation, last_read_at FROM sessions WHERE id = ?",
+            (source_session_id,),
+        ).fetchone() == (1, 2.0)
+        assert dest.execute("SELECT COUNT(*) FROM sessions").fetchone() == (1,)
+        assert dest.execute(
+            "SELECT COUNT(*) FROM session_process_authorities WHERE session_id = ?",
+            (source_session_id,),
+        ).fetchone() == (1,)
+    finally:
+        lf_conn.close()
+        dest.close()
+
+
+def test_mapper_schema_less_unknown_or_short_57_layouts_refuse_without_insert(
+    tmp_path: Path,
+) -> None:
+    """Neither an unproven 57 layout nor a truncated one reaches INSERT."""
+    unknown_session_id = "20260901_120059_abc059"
+    short_session_id = "20260901_120100_abc100"
+    lf_path = tmp_path / "unknown-short-57-lost-and-found.db"
+    SessionDB(db_path=lf_path).close()
+    output = tmp_path / "unknown-short-57-mapped.db"
+    SessionDB(db_path=output).close()
+    lf_conn = sqlite3.connect(str(lf_path), isolation_level=None)
+    dest = sqlite3.connect(str(output), isolation_level=None)
+    try:
+        session_columns = [
+            str(row[1]) for row in dest.execute("PRAGMA table_info(sessions)")
+        ]
+        assert len(session_columns) == 57
+        full_cells = ", ".join(f"c{index}" for index in range(57))
+        short_cells = ", ".join(f"c{index}" for index in range(56))
+        lf_conn.execute(
+            "CREATE TABLE lost_and_found_unknown "
+            f"(rootpgno INTEGER, pgno INTEGER, nfield INTEGER, id INTEGER, {full_cells})"
+        )
+        lf_conn.execute(
+            "CREATE TABLE lost_and_found_short "
+            f"(rootpgno INTEGER, pgno INTEGER, nfield INTEGER, id INTEGER, {short_cells})"
+        )
+        unknown_row = [None] * 57
+        unknown_row[0] = unknown_session_id
+        unknown_row[1] = "cli"
+        # Neither physical generation cell is a positive SQLite INTEGER.
+        unknown_row[29] = "not-a-generation"
+        unknown_row[-1] = None
+        short_row = [None] * 56
+        short_row[0] = short_session_id
+        short_row[1] = "cli"
+        short_row[29] = 2
+        placeholders = ", ".join("?" for _ in range(4 + 57))
+        lf_conn.execute(
+            f"INSERT INTO lost_and_found_unknown VALUES ({placeholders})",
+            [2, 5, 57, 1, *unknown_row],
+        )
+        placeholders = ", ".join("?" for _ in range(4 + 56))
+        lf_conn.execute(
+            f"INSERT INTO lost_and_found_short VALUES ({placeholders})",
+            [2, 5, 57, 2, *short_row],
+        )
+
+        register_turn_fence_generation(dest)
+        mapping = map_lost_and_found_rows(lf_conn, dest)
+
+        assert mapping["mapped"]["sessions"] == 0
+        assert mapping["unmapped_rows"] == 2
+        assert dest.execute("SELECT COUNT(*) FROM sessions").fetchone() == (0,)
+    finally:
+        lf_conn.close()
+        dest.close()
 
 
 # ── issue #72291: source-fingerprint error must name the parent CLI ─────────

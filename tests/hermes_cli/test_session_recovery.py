@@ -825,6 +825,107 @@ def test_recover_exact_path_copies_rows_into_a_real_v27_store(
     assert message_count == expected["messages"]
 
 
+def test_normal_recovery_regenerates_destination_session_process_authority(
+    tmp_path: Path,
+) -> None:
+    """Recovery must not import another database's session capability state."""
+    source = tmp_path / "authority-source.db"
+    output = tmp_path / "authority-recovered.db"
+    session_id = "authority-recovery-session"
+    source_db = SessionDB(db_path=source)
+    try:
+        source_db.create_session(session_id, "cli", cwd="/tmp/authority-recovery")
+        source_db.end_session(session_id, "test-authority-generation")
+        source_db.reopen_session(session_id)
+        source_authority = source_db.issue_session_process_authority(session_id)
+        assert source_authority is not None
+        assert source_authority["session_generation"] == 2
+        source_reservation = source_db.reserve_session_process_authority(
+            source_authority
+        )
+        assert source_reservation is not None
+        source_events = source_db._conn.execute(
+            "SELECT event_type FROM session_process_authority_events "
+            "WHERE state_db_id = ? ORDER BY id",
+            (source_authority["state_db_id"],),
+        ).fetchall()
+        assert any(row[0] == "PROCESS_RESERVATION" for row in source_events)
+    finally:
+        source_db.close()
+
+    report = recover_session_database(source, output, work_dir=tmp_path)
+
+    assert report["complete"] is True, report["copy"]["sessions"]
+    assert report["verified"] is True
+    recovered_db = SessionDB(db_path=output)
+    try:
+        destination_authority = recovered_db.issue_session_process_authority(session_id)
+        assert destination_authority is not None
+        destination_meta = {
+            str(row[0]): row[1]
+            for row in recovered_db._conn.execute(
+                "SELECT key, value FROM state_meta "
+                "WHERE key IN (?, ?)",
+                (
+                    "session_process_state_db_id",
+                    "session_process_state_family",
+                ),
+            ).fetchall()
+        }
+        assert (
+            destination_meta["session_process_state_db_id"],
+            destination_meta["session_process_state_family"],
+        ) == (
+            destination_authority["state_db_id"],
+            destination_authority["state_family"],
+        )
+        assert destination_authority["session_generation"] == 1
+        assert (
+            destination_authority["state_db_id"],
+            destination_authority["state_family"],
+        ) != (
+            source_authority["state_db_id"],
+            source_authority["state_family"],
+        )
+        assert destination_authority["authority_token"] != source_authority["authority_token"]
+        assert recovered_db.consume_session_process_reservation(source_reservation) is False
+        assert (
+            recovered_db._conn.execute(
+                "SELECT COUNT(*) FROM session_process_authorities "
+                "WHERE state_db_id = ? OR authority_token = ?",
+                (
+                    source_authority["state_db_id"],
+                    source_authority["authority_token"],
+                ),
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            recovered_db._conn.execute(
+                "SELECT COUNT(*) FROM session_process_reservations "
+                "WHERE reservation_id = ? OR state_db_id = ?",
+                (
+                    source_reservation["reservation_id"],
+                    source_authority["state_db_id"],
+                ),
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            recovered_db._conn.execute(
+                "SELECT COUNT(*) FROM session_process_authority_events "
+                "WHERE state_db_id = ? OR reservation_id = ?",
+                (
+                    source_authority["state_db_id"],
+                    source_reservation["reservation_id"],
+                ),
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        recovered_db.close()
+
+
 def test_normal_recovery_stops_before_later_dml_when_marker_is_replaced(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1543,7 +1644,9 @@ def test_normal_recovery_copy_refusal_retains_the_real_stage(
                     ),
                 )
             assert stage is not None
-            session_recovery._refresh_stage_children(stage, require_main=True)
+            session_recovery._refresh_stage_children(
+                stage, require_main=True, rebaseline=True
+            )
         return original_copy_table(source_conn, destination, table, **kwargs)
 
     def record_real_cleanup(destination_stage) -> None:
@@ -1703,6 +1806,57 @@ def test_recovery_publication_refuses_substituted_stage_identity(
     assert replacement.read_bytes() == replacement_bytes
     current = replacement.stat()
     assert (current.st_dev, current.st_ino) == replacement_identity
+    assert not output.exists()
+    assert _sha256(source) == source_hash
+
+
+def test_recovery_publication_refuses_inode_reused_same_size_stage_substitution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reused inode cannot make a substituted staged database publish."""
+    source = tmp_path / "source.db"
+    output = tmp_path / "recovered.db"
+    _make_source(source)
+    source_hash = _sha256(source)
+    replacement: Path | None = None
+    original_stat: os.stat_result | None = None
+    real_lstat = os.lstat
+
+    def substitute(candidate: Path, _final: Path) -> None:
+        nonlocal original_stat, replacement
+        original_stat = candidate.stat()
+        candidate.unlink()
+        # Preserve size: ctime must still distinguish an inode-reuse attack.
+        candidate.write_bytes(b"x" * original_stat.st_size)
+        replacement = candidate
+
+    def lstat_with_reused_inode(path, *args, **kwargs):
+        result = real_lstat(path, *args, **kwargs)
+        if (
+            replacement is not None
+            and original_stat is not None
+            and Path(path) in (replacement, output)
+        ):
+            return SimpleNamespace(
+                st_dev=original_stat.st_dev,
+                st_ino=original_stat.st_ino,
+                st_mode=result.st_mode,
+                st_nlink=result.st_nlink,
+                st_ctime_ns=max(result.st_ctime_ns, original_stat.st_ctime_ns + 1),
+                st_size=result.st_size,
+            )
+        return result
+
+    monkeypatch.setattr(session_recovery.os, "lstat", lstat_with_reused_inode)
+    monkeypatch.setattr(session_recovery, "_publication_barrier", substitute)
+
+    with pytest.raises(SessionRecoverySafetyError):
+        recover_session_database(source, output, work_dir=tmp_path)
+
+    assert replacement is not None and replacement.exists()
+    assert original_stat is not None
+    assert replacement.stat().st_size == original_stat.st_size
     assert not output.exists()
     assert _sha256(source) == source_hash
 

@@ -2,7 +2,10 @@
 
 import hashlib
 import json
+import os
 import sqlite3
+import subprocess
+import sys
 import time
 import threading
 from contextlib import contextmanager
@@ -14,7 +17,7 @@ import pytest
 import hermes_state
 from agent.session_activity import ActivityProvenance
 from hermes_state import SCHEMA_SQL, SCHEMA_VERSION, SessionDB
-from hermes_state_common import register_turn_fence_generation
+from hermes_state_common import TURN_FENCE_GOVERNED_TABLES, register_turn_fence_generation
 
 
 class _NoFtsCursor(sqlite3.Cursor):
@@ -106,35 +109,152 @@ def _no_fts_rebuild_throttle(monkeypatch):
     monkeypatch.setattr(SessionDB, "_FTS_REBUILD_DUTY_FACTOR", 0.0)
 
 
+def _state_store_snapshot(db_path: Path):
+    """Capture bytes plus the public schema graph without opening a writer."""
+    def digest(path: Path):
+        return hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
+
+    conn = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        version = tuple(conn.execute("SELECT version FROM schema_version"))
+        graph = tuple(
+            conn.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                "WHERE type IN ('table', 'index', 'trigger', 'view') "
+                "ORDER BY type, name"
+            )
+        )
+    finally:
+        conn.close()
+    return {
+        "files": {
+            suffix: digest(db_path.with_name(db_path.name + suffix))
+            for suffix in ("", "-wal", "-shm")
+        },
+        "schema_version": version,
+        "graph": graph,
+    }
+
+
+def _seed_v27_state_store(db_path: Path) -> None:
+    """Build a complete pre-v28 store, rather than a scalar-only downgrade."""
+    current = SessionDB(db_path)
+    current.close()
+
+    legacy = sqlite3.connect(str(db_path))
+    try:
+        for (name,) in legacy.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+            "AND (name LIKE 'turn_fence_%' OR name LIKE 'session_process_%')"
+        ):
+            legacy.execute(f'DROP TRIGGER "{name}"')
+        legacy.execute("PRAGMA foreign_keys = OFF")
+        legacy.execute("DROP TABLE session_process_reservations")
+        legacy.execute("DROP TABLE session_process_authority_events")
+        legacy.execute("DROP TABLE session_process_authorities")
+        legacy.execute("ALTER TABLE sessions DROP COLUMN session_generation")
+        legacy.execute(
+            "DELETE FROM state_meta WHERE key IN "
+            "('session_process_state_db_id', 'session_process_state_family')"
+        )
+        legacy.execute("DELETE FROM schema_version")
+        legacy.execute(
+            "INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION - 1,)
+        )
+        legacy.create_function(
+            "hermes_turn_fence_generation", 0, lambda: SCHEMA_VERSION - 1
+        )
+        for table in TURN_FENCE_GOVERNED_TABLES:
+            if table in {"session_process_authorities", "session_process_reservations"}:
+                continue
+            for operation in ("INSERT", "UPDATE", "DELETE"):
+                legacy.execute(
+                    f"CREATE TRIGGER turn_fence_{table}_{operation.lower()} "
+                    f"BEFORE {operation} ON {table} BEGIN "
+                    "SELECT CASE "
+                    "WHEN typeof(hermes_turn_fence_generation()) != 'integer' "
+                    f"OR hermes_turn_fence_generation() != {SCHEMA_VERSION - 1} "
+                    "THEN RAISE(ABORT, 'state DB generation incompatible') "
+                    "END; END"
+                )
+        legacy.commit()
+    finally:
+        legacy.close()
+
+
+_LEGACY_CANONICAL_WRITER_PATH = (
+    Path(__file__).resolve().parent / "fixtures" / "legacy_v27_canonical_writer.py"
+)
+
+
+def _start_legacy_canonical_writer_attempt(home: Path, db_path: Path):
+    """Start the tracked v27-compatible writer outside the project import path."""
+    assert _LEGACY_CANONICAL_WRITER_PATH.is_file()
+    writer_cwd = home / "legacy-writer-cwd"
+    writer_cwd.mkdir()
+    env = {
+        "HERMES_HOME": str(home),
+        "LEGACY_SCHEMA_GENERATION": str(SCHEMA_VERSION - 1),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONPATH": "",
+        "PYTHONSAFEPATH": "1",
+        "STATE_DB_PATH": str(db_path),
+    }
+    for name in ("PATH", "SYSTEMROOT", "WINDIR"):
+        value = os.environ.get(name)
+        if value:
+            env[name] = value
+    process = subprocess.Popen(
+        [sys.executable, "-B", str(_LEGACY_CANONICAL_WRITER_PATH)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        cwd=writer_cwd,
+    )
+    assert process.stdout is not None
+    assert process.stderr is not None
+    return process, process.stdout.readline().strip()
+
+
+def _start_legacy_canonical_writer(home: Path, db_path: Path):
+    process, outcome = _start_legacy_canonical_writer_attempt(home, db_path)
+    assert outcome == "READY:READBACK", process.stderr.read()
+    return process
+
+
+def _stop_legacy_canonical_writer(process):
+    try:
+        if process.stdin is not None and not process.stdin.closed:
+            process.stdin.close()
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.terminate()
+        process.wait(timeout=5)
+    finally:
+        if process.stderr is not None:
+            stderr = process.stderr.read()
+            assert process.returncode == 0, stderr
+
+
 # =========================================================================
 # Connection lifecycle
 # =========================================================================
 
 
 class TestConnectionLifecycle:
-    def test_schema_version_existing_future_fails_before_package_mutation(
-        self, tmp_path, monkeypatch
-    ):
+    def test_schema_version_existing_future_fails_before_package_mutation(self, tmp_path):
         """An existing future store is rejected before SessionDB can write it."""
         db_path = tmp_path / "future-state.db"
-        seed = sqlite3.connect(str(db_path))
-        seed.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
-        seed.execute(
-            "INSERT INTO schema_version (version) VALUES (?)",
-            (SCHEMA_VERSION + 1,),
-        )
-        seed.commit()
+        seed = SessionDB(db_path)
         seed.close()
-
-        statements = []
-        real_connect = hermes_state._connect_tracked_db
-
-        def trace_connection(*args, **kwargs):
-            conn = real_connect(*args, **kwargs)
-            conn.set_trace_callback(statements.append)
-            return conn
-
-        monkeypatch.setattr(hermes_state, "_connect_tracked_db", trace_connection)
+        seed = sqlite3.connect(str(db_path), isolation_level=None)
+        seed.execute("PRAGMA journal_mode=WAL")
+        seed.execute(
+            "UPDATE schema_version SET version = ?", (SCHEMA_VERSION + 1,)
+        )
+        before = _state_store_snapshot(db_path)
 
         with pytest.raises(RuntimeError) as raised:
             SessionDB(db_path=db_path)
@@ -142,18 +262,186 @@ class TestConnectionLifecycle:
         error = raised.value
         assert isinstance(error, hermes_state.IncompatibleSchemaError)
         assert error.code == "STATE_DB_SCHEMA_INCOMPATIBLE"
-        assert error.args == ("Session state is incompatible with this Hermes version.",)
-        assert str(error) == "Session state is incompatible with this Hermes version."
-        assert hermes_state.get_last_init_error() == (
-            "STATE_DB_SCHEMA_INCOMPATIBLE: "
-            "Session state is incompatible with this Hermes version."
-        )
-        assert not any(
-            statement.lstrip().upper().startswith(
-                ("PRAGMA", "CREATE", "ALTER", "INSERT", "UPDATE", "DELETE")
+        assert error.expected_generation == SCHEMA_VERSION
+        assert error.actual_generation == SCHEMA_VERSION + 1
+        assert error.build_identity["version"]
+        assert "expected generation" in str(error)
+        assert "actual generation" in str(error)
+        assert "build identity" in str(error)
+        assert str(db_path) not in str(error)
+        assert str(tmp_path) not in (hermes_state.get_last_init_error() or "")
+        assert _state_store_snapshot(db_path) == before
+        seed.close()
+
+    def test_forward_schema_migration_refuses_active_legacy_canonical_writer(
+        self, tmp_path, monkeypatch
+    ):
+        """Only the live canonical store refuses a forward-fence publication."""
+        home = tmp_path / "profile-home"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        canonical = home / "state.db"
+        temporary = tmp_path / "temporary-v27.db"
+        _seed_v27_state_store(canonical)
+        _seed_v27_state_store(temporary)
+        writer = _start_legacy_canonical_writer(home, canonical)
+        try:
+            # The tracked legacy fixture both wrote and read its v27 row before
+            # the new migrator was admitted.
+            check = sqlite3.connect(str(canonical))
+            try:
+                assert check.execute(
+                    "SELECT entry_json FROM gateway_routing WHERE session_key = 'legacy-writer'"
+                ).fetchall() == [('{}',)]
+            finally:
+                check.close()
+            # A test/private DB stays migratable while the live profile is owned.
+            temp_db = SessionDB(temporary)
+            temp_db.close()
+            assert _state_store_snapshot(temporary)["schema_version"] == (
+                (SCHEMA_VERSION,),
             )
-            for statement in statements
+
+            before = _state_store_snapshot(canonical)
+            with pytest.raises(hermes_state.ForwardSchemaMigrationAdmissionError) as raised:
+                SessionDB(canonical)
+            error = raised.value
+            assert error.expected_generation == SCHEMA_VERSION
+            assert error.actual_generation == SCHEMA_VERSION - 1
+            assert str(canonical) not in str(error)
+            assert _state_store_snapshot(canonical) == before
+        finally:
+            _stop_legacy_canonical_writer(writer)
+
+        # Once that precise live owner is gone, normal forward migration and
+        # equal-version reopen remain available.
+        upgraded = SessionDB(canonical)
+        upgraded.close()
+        equal_version = SessionDB(canonical)
+        equal_version.close()
+        assert _state_store_snapshot(canonical)["schema_version"] == ((SCHEMA_VERSION,),)
+
+        new_home = tmp_path / "empty-profile-home"
+        new_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(new_home))
+        fresh = SessionDB(new_home / "state.db")
+        fresh.close()
+        assert _state_store_snapshot(new_home / "state.db")["schema_version"] == (
+            (SCHEMA_VERSION,),
         )
+
+    def test_forward_migration_keeps_canonical_lock_target_when_home_changes_before_lease(
+        self, tmp_path, monkeypatch
+    ):
+        """A frozen canonical home must keep admission on that home's runtime lock."""
+        from gateway import status
+
+        home_a = tmp_path / "home-a"
+        home_b = tmp_path / "home-b"
+        home_a.mkdir()
+        home_b.mkdir()
+        canonical = home_b / "state.db"
+        canonical_lock_path = home_b / "gateway.lock"
+        monkeypatch.setenv("HERMES_HOME", str(home_b))
+        _seed_v27_state_store(canonical)
+        writer = _start_legacy_canonical_writer(home_b, canonical)
+        before = _state_store_snapshot(canonical)
+        observed_lock_targets = []
+        original_acquire = status.acquire_gateway_runtime_migration_lease
+        original_init_schema = SessionDB._init_schema
+        reached_v28_publication = []
+
+        def switch_home_after_target_snapshot(target_lock_path=None):
+            observed_lock_targets.append(target_lock_path)
+            monkeypatch.setenv("HERMES_HOME", str(home_a))
+            if target_lock_path is None:
+                return original_acquire()
+            return original_acquire(target_lock_path)
+
+        def record_v28_publication(db):
+            reached_v28_publication.append(True)
+            return original_init_schema(db)
+
+        monkeypatch.setattr(
+            status,
+            "acquire_gateway_runtime_migration_lease",
+            switch_home_after_target_snapshot,
+        )
+        monkeypatch.setattr(SessionDB, "_init_schema", record_v28_publication)
+        db = None
+        error = None
+        try:
+            try:
+                db = SessionDB(canonical)
+            except BaseException as exc:
+                error = exc
+            finally:
+                if db is not None:
+                    db.close()
+
+            # The predecessor takes a private home-a lease and reaches DDL;
+            # refusal must happen before the first writable publication step.
+            assert reached_v28_publication == []
+            assert isinstance(error, hermes_state.ForwardSchemaMigrationAdmissionError)
+            assert observed_lock_targets == [canonical_lock_path]
+            assert os.environ["HERMES_HOME"] == str(home_a)
+            assert _state_store_snapshot(canonical) == before
+        finally:
+            _stop_legacy_canonical_writer(writer)
+
+    def test_forward_schema_migration_holds_gateway_lock_until_v28_publication(
+        self, tmp_path, monkeypatch
+    ):
+        """A migration lease excludes a late old-runtime lock claimant until v28 commits."""
+        home = tmp_path / "profile-home"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        canonical = home / "state.db"
+        _seed_v27_state_store(canonical)
+        before_v28_publication = threading.Event()
+        allow_v28_publication = threading.Event()
+        migration_result = []
+        original_init_schema = SessionDB._init_schema
+
+        def pause_before_v28_publication(db):
+            before_v28_publication.set()
+            assert allow_v28_publication.wait(timeout=5), "test did not release v28 publication"
+            return original_init_schema(db)
+
+        monkeypatch.setattr(SessionDB, "_init_schema", pause_before_v28_publication)
+
+        def migrate():
+            try:
+                migration_result.append(("db", SessionDB(canonical)))
+            except BaseException as exc:
+                migration_result.append(("error", exc))
+
+        migration = threading.Thread(target=migrate)
+        migration.start()
+        assert before_v28_publication.wait(timeout=5), "migration never reached publication barrier"
+        claimant, outcome = _start_legacy_canonical_writer_attempt(home, canonical)
+        try:
+            # On the predecessor, the admission probe completed before this
+            # exact old runtime could claim, start, and write to the canonical
+            # store, exposing the check→DDL gap.
+            assert outcome == "REFUSED"
+        finally:
+            allow_v28_publication.set()
+            migration.join(timeout=10)
+            _stop_legacy_canonical_writer(claimant)
+
+        assert not migration.is_alive(), "migration did not complete after publication release"
+        kind, result = migration_result.pop()
+        assert kind == "db", result
+        result.close()
+        assert _state_store_snapshot(canonical)["schema_version"] == ((SCHEMA_VERSION,),)
+        check = sqlite3.connect(str(canonical))
+        try:
+            assert check.execute(
+                "SELECT COUNT(*) FROM gateway_routing WHERE session_key = 'legacy-writer'"
+            ).fetchone() == (0,)
+        finally:
+            check.close()
 
     @pytest.mark.parametrize(
         "values",
@@ -3251,32 +3539,213 @@ class TestFTSExternalContentMigration:
 
     @staticmethod
     def _build_v22_db(db_path):
-        """Build a v22-shaped DB by hand: inline FTS tables + concat triggers."""
-        conn = sqlite3.connect(str(db_path))
-        conn.executescript(SCHEMA_SQL)
-        # Replace the current (v23) FTS objects with the v22 inline shape.
-        conn.executescript("""
-            DROP TABLE IF EXISTS messages_fts;
-            DROP TABLE IF EXISTS messages_fts_trigram;
-            DROP VIEW IF EXISTS messages_fts_trigram_src;
+        """Build the immutable historical v22 persisted surface by hand.
 
-            CREATE VIRTUAL TABLE messages_fts USING fts5(content);
-            CREATE TRIGGER messages_fts_insert AFTER INSERT ON messages BEGIN
+        Source: 505fb587512301346c7408ba840c3d269bb94519:hermes_state.py.
+        It deliberately contains no post-v22 authority/process objects; callers
+        open it through SessionDB so supported initialization owns those upgrades.
+        """
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS schema_version (
+                version INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS sessions (
+                id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                user_id TEXT,
+                session_key TEXT,
+                chat_id TEXT,
+                chat_type TEXT,
+                thread_id TEXT,
+                display_name TEXT,
+                origin_json TEXT,
+                expiry_finalized INTEGER DEFAULT 0,
+                model TEXT,
+                model_config TEXT,
+                system_prompt TEXT,
+                parent_session_id TEXT,
+                started_at REAL NOT NULL,
+                ended_at REAL,
+                end_reason TEXT,
+                message_count INTEGER DEFAULT 0,
+                tool_call_count INTEGER DEFAULT 0,
+                input_tokens INTEGER DEFAULT 0,
+                output_tokens INTEGER DEFAULT 0,
+                cache_read_tokens INTEGER DEFAULT 0,
+                cache_write_tokens INTEGER DEFAULT 0,
+                reasoning_tokens INTEGER DEFAULT 0,
+                cwd TEXT,
+                git_branch TEXT,
+                git_repo_root TEXT,
+                billing_provider TEXT,
+                billing_base_url TEXT,
+                billing_mode TEXT,
+                estimated_cost_usd REAL,
+                actual_cost_usd REAL,
+                cost_status TEXT,
+                cost_source TEXT,
+                pricing_version TEXT,
+                title TEXT,
+                api_call_count INTEGER DEFAULT 0,
+                handoff_state TEXT,
+                handoff_platform TEXT,
+                handoff_error TEXT,
+                compression_failure_cooldown_until REAL,
+                compression_failure_error TEXT,
+                compression_fallback_streak INTEGER NOT NULL DEFAULT 0,
+                profile_name TEXT,
+                rewind_count INTEGER NOT NULL DEFAULT 0,
+                archived INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL REFERENCES sessions(id),
+                role TEXT NOT NULL,
+                content TEXT,
+                tool_call_id TEXT,
+                tool_calls TEXT,
+                tool_name TEXT,
+                effect_disposition TEXT,
+                timestamp REAL NOT NULL,
+                token_count INTEGER,
+                finish_reason TEXT,
+                reasoning TEXT,
+                reasoning_content TEXT,
+                reasoning_details TEXT,
+                codex_reasoning_items TEXT,
+                codex_message_items TEXT,
+                platform_message_id TEXT,
+                observed INTEGER DEFAULT 0,
+                active INTEGER NOT NULL DEFAULT 1,
+                compacted INTEGER NOT NULL DEFAULT 0,
+                api_content TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS session_model_usage (
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                model TEXT NOT NULL,
+                billing_provider TEXT NOT NULL DEFAULT '',
+                billing_base_url TEXT NOT NULL DEFAULT '',
+                billing_mode TEXT NOT NULL DEFAULT '',
+                task TEXT NOT NULL DEFAULT '',
+                api_call_count INTEGER NOT NULL DEFAULT 0,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+                reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+                estimated_cost_usd REAL NOT NULL DEFAULT 0,
+                actual_cost_usd REAL NOT NULL DEFAULT 0,
+                cost_status TEXT,
+                cost_source TEXT,
+                first_seen REAL,
+                last_seen REAL,
+                PRIMARY KEY (session_id, model, billing_provider, billing_base_url, billing_mode, task)
+            );
+
+            CREATE TABLE IF NOT EXISTS state_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS gateway_routing (
+                scope TEXT NOT NULL DEFAULT '',
+                session_key TEXT NOT NULL,
+                entry_json TEXT NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY (scope, session_key)
+            );
+
+            CREATE TABLE IF NOT EXISTS compression_locks (
+                session_id TEXT PRIMARY KEY,
+                holder TEXT NOT NULL,
+                acquired_at REAL NOT NULL,
+                expires_at REAL NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS async_delegations (
+                delegation_id TEXT PRIMARY KEY,
+                origin_session TEXT NOT NULL,
+                origin_ui_session_id TEXT NOT NULL DEFAULT '',
+                parent_session_id TEXT,
+                state TEXT NOT NULL,
+                dispatched_at REAL NOT NULL,
+                completed_at REAL,
+                updated_at REAL NOT NULL,
+                event_json TEXT,
+                result_json TEXT,
+                delivery_state TEXT NOT NULL DEFAULT 'pending',
+                delivery_attempts INTEGER NOT NULL DEFAULT 0,
+                delivered_at REAL,
+                owner_pid INTEGER,
+                owner_started_at INTEGER,
+                task_json TEXT,
+                delivery_claim TEXT,
+                delivery_claimed_at REAL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
+            CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
+            CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
+            CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
+            CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
+            CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usage(session_id);
+            CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
+            CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
+                ON async_delegations(delivery_state, completed_at);
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+                content
+            );
+
+            CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
                 INSERT INTO messages_fts(rowid, content) VALUES (
                     new.id,
                     COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
                 );
             END;
 
-            CREATE VIRTUAL TABLE messages_fts_trigram USING fts5(content, tokenize='trigram');
-            CREATE TRIGGER messages_fts_trigram_insert AFTER INSERT ON messages BEGIN
+            CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
+                DELETE FROM messages_fts WHERE rowid = old.id;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE ON messages BEGIN
+                DELETE FROM messages_fts WHERE rowid = old.id;
+                INSERT INTO messages_fts(rowid, content) VALUES (
+                    new.id,
+                    COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
+                );
+            END;
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts_trigram USING fts5(
+                content,
+                tokenize='trigram'
+            );
+
+            CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_insert AFTER INSERT ON messages BEGIN
+                INSERT INTO messages_fts_trigram(rowid, content) VALUES (
+                    new.id,
+                    COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
+                );
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_delete AFTER DELETE ON messages BEGIN
+                DELETE FROM messages_fts_trigram WHERE rowid = old.id;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_update AFTER UPDATE ON messages BEGIN
+                DELETE FROM messages_fts_trigram WHERE rowid = old.id;
                 INSERT INTO messages_fts_trigram(rowid, content) VALUES (
                     new.id,
                     COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
                 );
             END;
         """)
-        conn.execute("DELETE FROM schema_version")
         conn.execute("INSERT INTO schema_version (version) VALUES (22)")
         conn.execute(
             "INSERT INTO sessions (id, source, started_at) VALUES ('s1', 'cli', ?)",
@@ -3312,6 +3781,18 @@ class TestFTSExternalContentMigration:
 
         db = SessionDB(db_path=db_path)
         try:
+            # The real opener, not the historical fixture, initializes durable
+            # current-generation authority identity and backfills this session.
+            state_db_id = db.get_meta("session_process_state_db_id")
+            assert state_db_id is not None and len(state_db_id) == 64
+            assert db._conn is not None
+            authority = db._conn.execute(
+                "SELECT state_db_id, state_family FROM session_process_authorities "
+                "WHERE session_id = 's1'"
+            ).fetchone()
+            assert authority is not None
+            assert authority[0] == state_db_id
+            assert authority[1] == hermes_state.SESSION_PROCESS_AUTHORITY_STATE_FAMILY
             # DECOUPLED: the main schema_version advances to current even though
             # the FTS layout stays legacy — future migrations must not be gated
             # behind the FTS opt-in.

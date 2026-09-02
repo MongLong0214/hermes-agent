@@ -11,6 +11,7 @@ module-level constants live in hermes_state_common.
 import logging
 import json
 import re
+import secrets
 import sqlite3
 from typing import Dict, Optional
 
@@ -26,6 +27,8 @@ from hermes_state_common import (
     LEGACY_FTS_TRIGRAM_SQL,
     SCHEMA_SQL,
     SCHEMA_VERSION,
+    SESSION_PROCESS_AUTHORITY_STATE_DB_ID_BYTES,
+    SESSION_PROCESS_AUTHORITY_STATE_FAMILY,
     TURN_FENCE_GENERATION,
     TURN_FENCE_GOVERNED_TABLES,
     TURN_FENCE_OPERATIONS,
@@ -89,6 +92,110 @@ def schema_read_probe_statements() -> tuple:
 
 class SessionSchemaMixin:
     """See module docstring — mixin for SessionDB (Schema cluster)."""
+
+    @staticmethod
+    def _initialize_session_process_authority_state(cursor: sqlite3.Cursor) -> None:
+        """Provision and verify the durable SessionDB authority identity.
+
+        A database instance is identified by random persistent bytes instead of
+        its path so copied or moved stores cannot silently share capability
+        authority.  Existing session rows are backfilled exactly once; their
+        historical lifecycle is represented by append-only events before any
+        caller can issue a reservation from the reopened database.
+        """
+        identity_key = "session_process_state_db_id"
+        family_key = "session_process_state_family"
+        identity_row = cursor.execute(
+            "SELECT value FROM state_meta WHERE key = ?", (identity_key,)
+        ).fetchone()
+        if identity_row is None:
+            state_db_id = secrets.token_hex(SESSION_PROCESS_AUTHORITY_STATE_DB_ID_BYTES)
+            cursor.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, ?)",
+                (identity_key, state_db_id),
+            )
+        else:
+            state_db_id = identity_row[0]
+        if (
+            not isinstance(state_db_id, str)
+            or len(state_db_id) != SESSION_PROCESS_AUTHORITY_STATE_DB_ID_BYTES * 2
+            or state_db_id.lower() != state_db_id
+            or any(char not in "0123456789abcdef" for char in state_db_id)
+        ):
+            raise sqlite3.DatabaseError(
+                "STATE_DB_AUTHORITY_IDENTITY_INCOMPATIBLE: malformed state_db_id"
+            )
+
+        family_row = cursor.execute(
+            "SELECT value FROM state_meta WHERE key = ?", (family_key,)
+        ).fetchone()
+        if family_row is None:
+            cursor.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, ?)",
+                (family_key, SESSION_PROCESS_AUTHORITY_STATE_FAMILY),
+            )
+        elif family_row[0] != SESSION_PROCESS_AUTHORITY_STATE_FAMILY:
+            raise sqlite3.DatabaseError(
+                "STATE_DB_AUTHORITY_IDENTITY_INCOMPATIBLE: unknown state family"
+            )
+
+        # Rows predating the authority schema did not have a generation.  They
+        # receive their first authority epoch atomically with the schema open;
+        # a genuine reopen advances from there through the sessions trigger.
+        cursor.execute(
+            "UPDATE sessions SET session_generation = 1 "
+            "WHERE session_generation IS NULL OR session_generation < 1"
+        )
+        cursor.execute(
+            """INSERT OR IGNORE INTO session_process_authorities (
+                   session_id, session_generation, state_db_id, state_family,
+                   authority_token, status, issued_at, terminal_at
+               )
+               SELECT s.id, s.session_generation, ?, ?, lower(hex(randomblob(32))),
+                      CASE WHEN s.ended_at IS NULL THEN 'ISSUED'
+                           WHEN s.end_reason = 'authority_revoked' THEN 'REVOKED'
+                           ELSE 'CLOSED' END,
+                      s.started_at, s.ended_at
+               FROM sessions AS s""",
+            (state_db_id, SESSION_PROCESS_AUTHORITY_STATE_FAMILY),
+        )
+        cursor.execute(
+            """INSERT INTO session_process_authority_events (
+                   session_id, session_generation, state_db_id, state_family,
+                   event_type, occurred_at
+               )
+               SELECT a.session_id, a.session_generation, a.state_db_id,
+                      a.state_family, 'SESSION_ISSUED', a.issued_at
+               FROM session_process_authorities AS a
+               WHERE NOT EXISTS (
+                   SELECT 1 FROM session_process_authority_events AS e
+                   WHERE e.session_id = a.session_id
+                     AND e.session_generation = a.session_generation
+                     AND e.event_type = 'SESSION_ISSUED'
+               )"""
+        )
+        cursor.execute(
+            """INSERT INTO session_process_authority_events (
+                   session_id, session_generation, state_db_id, state_family,
+                   event_type, occurred_at
+               )
+               SELECT a.session_id, a.session_generation, a.state_db_id,
+                      a.state_family,
+                      CASE a.status WHEN 'REVOKED' THEN 'SESSION_REVOKED'
+                                    ELSE 'SESSION_CLOSED' END,
+                      a.terminal_at
+               FROM session_process_authorities AS a
+               WHERE a.status IN ('CLOSED', 'REVOKED')
+                 AND a.terminal_at IS NOT NULL
+                 AND NOT EXISTS (
+                     SELECT 1 FROM session_process_authority_events AS e
+                     WHERE e.session_id = a.session_id
+                       AND e.session_generation = a.session_generation
+                       AND e.event_type = CASE a.status
+                           WHEN 'REVOKED' THEN 'SESSION_REVOKED'
+                           ELSE 'SESSION_CLOSED' END
+                 )"""
+        )
 
     def _dedupe_legacy_system_prompts(self, cursor: sqlite3.Cursor) -> None:
         """Move inline prompt snapshots into the shared content-addressed table.
@@ -1248,8 +1355,10 @@ class SessionSchemaMixin:
             # The full initialization transaction below then covers every
             # remaining schema, reconciliation, migration, and FTS mutation.
             with self.write_transaction(immediate=False):
+                self._assert_forward_schema_migration_admission()
                 self._heal_session_turn_leases_legacy_epoch(conn.cursor())
             with self.write_transaction():
+                self._assert_forward_schema_migration_admission()
                 self._init_schema_mutations()
         except BaseException as exc:
             primary_exc = exc
@@ -1316,6 +1425,28 @@ class SessionSchemaMixin:
         # migration was skipped (e.g. due to version renumbering), the
         # column gets created here.
         self._reconcile_columns(cursor)
+
+        # The v28 trigger barrier must replace a retained older-generation
+        # barrier before any data migration or initialization writes a governed
+        # table.  Keep the entry version for the legacy data-migration gates
+        # below: _apply_turn_fence_generation_delta() publishes v28 eagerly.
+        initial_version_row = cursor.execute(
+            "SELECT version FROM schema_version LIMIT 1"
+        ).fetchone()
+        if initial_version_row is None:
+            current_version = 0
+        else:
+            current_version = (
+                initial_version_row["version"]
+                if isinstance(initial_version_row, sqlite3.Row)
+                else initial_version_row[0]
+            )
+        if current_version < SCHEMA_VERSION:
+            self._apply_turn_fence_generation_delta(cursor)
+
+        # The identity must exist before a raw SQL writer can insert a session
+        # and fire the authority issuance trigger declared in SCHEMA_SQL.
+        self._initialize_session_process_authority_state(cursor)
 
         # Rebuild gateway_routing if it still carries the pre-scope PRIMARY
         # KEY (session_key alone). ADD COLUMN cannot fix a PK, so this is
@@ -1391,14 +1522,9 @@ class SessionSchemaMixin:
                     self._drop_fts_triggers(repair_conn)
 
         # ── Schema version bookkeeping ─────────────────────────────────
-        # Bump to current so future data migrations (if any) can gate on
-        # version.  No version-gated column additions remain.
-        cursor.execute("SELECT version FROM schema_version LIMIT 1")
-        row = cursor.fetchone()
-        if row is None:
-            current_version = 0
-        else:
-            current_version = row["version"] if isinstance(row, sqlite3.Row) else row[0]
+        # The entry version was captured before the v28 fence publication so
+        # legacy data migrations keep their established gates.
+        if initial_version_row is not None:
             # Data migrations that can't be expressed declaratively (row
             # backfills, index changes tied to a specific version step) stay
             # in a version-gated chain. Column additions are handled by
@@ -1668,8 +1794,9 @@ class SessionSchemaMixin:
                 and fts5_available
             ):
                 cursor.execute(
-                    "UPDATE schema_version SET version = ?",
-                    (TURN_FENCE_GENERATION - 1,),
+                    "UPDATE schema_version SET version = "
+                    "CASE WHEN version < ? THEN ? ELSE version END",
+                    (TURN_FENCE_GENERATION - 1, TURN_FENCE_GENERATION - 1),
                 )
 
         # Unique title index — always ensure it exists. Older databases may
@@ -1785,9 +1912,6 @@ class SessionSchemaMixin:
                 # AFTER UPDATE OF variants. IF NOT EXISTS cannot rewrite them.
                 if getattr(self, "_fts_enabled", False):
                     self._migrate_broad_fts_update_triggers(cursor)
-
-        if current_version < SCHEMA_VERSION:
-            self._apply_turn_fence_generation_delta(cursor)
 
     def _backfill_gateway_metadata_from_sessions_json(
         self, cursor: sqlite3.Cursor

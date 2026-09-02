@@ -26,6 +26,7 @@ import os
 import queue
 import random
 import re
+import secrets
 import sqlite3
 import sys
 import threading
@@ -86,6 +87,9 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     MAX_FTS5_QUERY_CHARS,
     SCHEMA_SQL,
     SCHEMA_VERSION,
+    SESSION_PROCESS_AUTHORITY_MAX_RESERVATION_TTL_SECONDS,
+    SESSION_PROCESS_AUTHORITY_RESERVATION_TTL_SECONDS,
+    SESSION_PROCESS_AUTHORITY_STATE_FAMILY,
     TURN_FENCE_GENERATION,
     _PREVIEW_CONTENT_SQL,
     _PREVIEW_HEAD_CHARS,
@@ -181,11 +185,78 @@ class SessionExportTooLargeError(ValueError):
 class IncompatibleSchemaError(RuntimeError):
     """The on-disk session state cannot be safely opened by this version."""
 
-    __slots__ = ("code",)
+    __slots__ = (
+        "actual_generation",
+        "build_identity",
+        "code",
+        "expected_generation",
+    )
 
-    def __init__(self):
-        super().__init__("Session state is incompatible with this Hermes version.")
+    def __init__(
+        self,
+        *,
+        expected_generation: Optional[int] = None,
+        actual_generation: Optional[int] = None,
+    ):
+        self.expected_generation = expected_generation
+        self.actual_generation = actual_generation
+        self.build_identity = _state_schema_build_identity()
+        if expected_generation is None or actual_generation is None:
+            message = "Session state is incompatible with this Hermes version."
+        else:
+            message = (
+                "Session state schema is newer than this Hermes build "
+                f"(expected generation {expected_generation}, "
+                f"actual generation {actual_generation}, "
+                f"build identity {_format_state_schema_build_identity(self.build_identity)})."
+            )
+        super().__init__(message)
         self.code = "STATE_DB_SCHEMA_INCOMPATIBLE"
+
+
+class ForwardSchemaMigrationAdmissionError(RuntimeError):
+    """A live canonical runtime owns a DB that needs a forward migration."""
+
+    __slots__ = (
+        "actual_generation",
+        "build_identity",
+        "code",
+        "expected_generation",
+    )
+
+    def __init__(self, *, expected_generation: int, actual_generation: int):
+        self.expected_generation = expected_generation
+        self.actual_generation = actual_generation
+        self.build_identity = _state_schema_build_identity()
+        super().__init__(
+            "Refusing forward state-schema migration while the canonical Hermes "
+            "runtime lock is active "
+            f"(expected generation {expected_generation}, "
+            f"actual generation {actual_generation}, "
+            f"build identity {_format_state_schema_build_identity(self.build_identity)})."
+        )
+        self.code = "STATE_DB_FORWARD_MIGRATION_ADMISSION_BLOCKED"
+
+
+def _state_schema_build_identity() -> dict[str, str]:
+    """Return support-safe build identity without exposing checkout locations."""
+    try:
+        from hermes_cli.build_info import get_code_identity
+
+        identity = get_code_identity()
+        version = identity.get("version")
+        short_sha = identity.get("short_sha")
+    except Exception:
+        version = None
+        short_sha = None
+    return {
+        "version": str(version) if version else "unknown",
+        "short_sha": str(short_sha) if short_sha else "unknown",
+    }
+
+
+def _format_state_schema_build_identity(identity: dict[str, str]) -> str:
+    return f"version={identity['version']}, sha={identity['short_sha']}"
 
 
 _COMPRESSION_LOCK_HOLDER_PID_RE = re.compile(r"(?:^|:)pid=(\d+)(?::|$)")
@@ -1135,13 +1206,12 @@ def _same_connection_raw_maintenance_fence(
             "raw SQLite maintenance fence requires an autocommit connection"
         )
 
-    mode = conn.execute("PRAGMA locking_mode=EXCLUSIVE").fetchone()
-    if mode is None or str(mode[0]).strip().lower() != "exclusive":
-        raise sqlite3.OperationalError(
-            "could not request exclusive SQLite maintenance locking mode"
-        )
-
     try:
+        mode = conn.execute("PRAGMA locking_mode=EXCLUSIVE").fetchone()
+        if mode is None or str(mode[0]).strip().lower() != "exclusive":
+            raise sqlite3.OperationalError(
+                "could not request exclusive SQLite maintenance locking mode"
+            )
         conn.execute("BEGIN EXCLUSIVE")
         conn.execute("COMMIT")
     except BaseException as acquire_exc:
@@ -1768,11 +1838,19 @@ def _validate_schema_version_scalar(conn: sqlite3.Connection) -> int:
         raise IncompatibleSchemaError()
     version, value_type = rows[0]
     if (
+        value_type == "integer"
+        and type(version) is int
+        and version > SCHEMA_VERSION
+    ):
+        raise IncompatibleSchemaError(
+            expected_generation=SCHEMA_VERSION,
+            actual_generation=version,
+        )
+    if (
         value_type != "integer"
         or type(version) is not int
         or version < 0
         or version > (2**63 - 1)
-        or version > SCHEMA_VERSION
     ):
         raise IncompatibleSchemaError()
     return version
@@ -1859,6 +1937,41 @@ def _probe_existing_state_db_schema(
         raise
     except sqlite3.DatabaseError:
         raise IncompatibleSchemaError() from None
+
+
+def _canonical_state_db_home(db_path: Path) -> Optional[Path]:
+    """Return the immutable canonical-home snapshot for *db_path*, if any."""
+    try:
+        home = Path(get_hermes_home()).expanduser().resolve(strict=False)
+        canonical_db = (home / "state.db").resolve(strict=False)
+        candidate = Path(db_path).expanduser().resolve(strict=False)
+    except OSError:
+        return None
+    if os.path.normcase(str(candidate)) != os.path.normcase(str(canonical_db)):
+        return None
+    return home
+
+
+def _is_canonical_state_db(db_path: Path) -> bool:
+    """Whether *db_path* is the active profile's canonical ``state.db``."""
+    return _canonical_state_db_home(db_path) is not None
+
+
+def _canonical_live_state_db_has_active_gateway_runtime(db_path: Path) -> bool:
+    """Whether this exact profile's canonical state DB has a live gateway lock.
+
+    The runtime lock is OS-owned by the gateway process and is released by the
+    kernel on death. It is deliberately checked only for the profile-safe
+    ``get_hermes_home() / 'state.db'`` target: private/temp databases retain
+    their independent migration path.
+    """
+    if not _is_canonical_state_db(db_path):
+        return False
+    try:
+        from gateway.status import is_gateway_runtime_lock_active
+    except Exception as exc:
+        raise RuntimeError("canonical gateway runtime lock inspection is unavailable") from exc
+    return is_gateway_runtime_lock_active()
 
 
 # Markers that mean the host filesystem cannot accept another write. Kept as
@@ -3721,6 +3834,13 @@ def _assert_offline_rebuild_write_authority(
 ) -> None:
     """Refuse writes unless the durable rebuild claim matches this owner."""
     try:
+        state_meta_object = conn.execute(
+            "SELECT type FROM sqlite_master WHERE name = 'state_meta'"
+        ).fetchone()
+        if state_meta_object is not None and state_meta_object[0] != "table":
+            raise SessionTurnLeaseLostError(
+                "refusing write without provable offline rebuild authority"
+            )
         rows = conn.execute(
             "SELECT value FROM state_meta WHERE key = ?",
             (_OFFLINE_REBUILD_EPOCH_KEY,),
@@ -3765,6 +3885,21 @@ def _assert_offline_rebuild_write_authority(
     )
 
 
+def _is_minimal_legacy_state_db_without_metadata(conn: sqlite3.Connection) -> bool:
+    """Whether ``conn`` has only the pre-``state_meta`` repair tables."""
+    try:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+            if not str(row[0]).startswith("sqlite_")
+        }
+    except sqlite3.Error:
+        return False
+    return tables == {"sessions", "messages"}
+
+
 def _assert_repair_state_db_write_authority(
     conn: sqlite3.Connection, *, local_marker: Optional[str]
 ) -> None:
@@ -3777,11 +3912,12 @@ def _assert_repair_state_db_write_authority(
     damaged state_meta shape/value still cannot establish no-owner authority
     and is fenced.
     """
+    require_metadata_table = not _is_minimal_legacy_state_db_without_metadata(conn)
     try:
         _assert_offline_rebuild_write_authority(
             conn,
             local_marker,
-            require_metadata_table=True,
+            require_metadata_table=require_metadata_table,
         )
         return
     except SessionTurnLeaseLostError as exc:
@@ -4650,6 +4786,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._fts_cjk_available = False
         self._fts_unavailable_warned = False
         self._conn = None
+        self._existing_schema_version: Optional[int] = None
+        self._forward_schema_migration_lease = None
         self._offline_rebuild_marker: Optional[str] = None
         self._offline_rebuild_depth = 0
         self._offline_rebuild_transition = False
@@ -4766,6 +4904,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 existing_schema_version = _probe_existing_state_db_schema(
                     self.db_path, allow_malformed_repair=True
                 )
+            self._existing_schema_version = existing_schema_version
+            # Reject a live old runtime before its successor can change journal
+            # mode, run reconciliation, or publish any migration/fence DDL.
+            self._assert_forward_schema_migration_admission()
 
             def _connect_and_init():
                 self._conn = _connect_tracked_db(
@@ -4824,6 +4966,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         ),
                     )
                     self._assert_offline_rebuild_write_authority(self._conn)
+                    _apply_wal_size_limit(self._conn)
+                    _apply_macos_checkpoint_barrier(self._conn)
+                    _enforce_macos_synchronous_full(self._conn)
                 apply_database_pragmas(self._conn, db_label="state.db")
                 self._conn.execute("PRAGMA foreign_keys=ON")
                 self._fts_cjk_loaded = load_fts5_cjk_extension(self._conn)
@@ -4878,11 +5023,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # an unattended open. (An interrupted optimize resumes when the
             # user re-runs the command.)
             initialization_complete = True
-        except IncompatibleSchemaError:
-            _set_last_init_error(
-                "STATE_DB_SCHEMA_INCOMPATIBLE: "
-                "Session state is incompatible with this Hermes version."
-            )
+        except IncompatibleSchemaError as exc:
+            _set_last_init_error(f"{exc.code}: {exc}")
             raise
         except Exception as exc:
             # Capture the cause so /resume and friends can surface WHY the
@@ -4903,6 +5045,64 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if not initialization_complete:
                 conn, self._conn = self._conn, None
                 self._close_connection_quietly(conn)
+            self._release_forward_schema_migration_lease()
+
+    def _assert_forward_schema_migration_admission(self) -> None:
+        """Reserve the canonical runtime lock through a lower-schema migration."""
+        if getattr(self, "_forward_schema_migration_lease", None) is not None:
+            return
+        actual_generation = self._existing_schema_version
+        if (
+            self.read_only
+            or actual_generation is None
+            or actual_generation >= SCHEMA_VERSION
+        ):
+            return
+        canonical_home = _canonical_state_db_home(self.db_path)
+        if canonical_home is None:
+            return
+        try:
+            from gateway.status import (
+                _gateway_runtime_lock_path_for_home,
+                acquire_gateway_runtime_migration_lease,
+            )
+            target_lock_path = _gateway_runtime_lock_path_for_home(canonical_home)
+        except Exception as exc:
+            raise RuntimeError("canonical gateway runtime migration lease is unavailable") from exc
+
+        lease = acquire_gateway_runtime_migration_lease(target_lock_path)
+        if lease is None:
+            raise ForwardSchemaMigrationAdmissionError(
+                expected_generation=SCHEMA_VERSION,
+                actual_generation=actual_generation,
+            )
+        self._forward_schema_migration_lease = lease
+        try:
+            # The first SELECT-only observation only selects the admission
+            # branch. Re-probe while the flock is held so a lock claimant or
+            # concurrent migrator cannot make its generation stale before any
+            # writable SQLite connection, WAL transition, or DDL publication.
+            actual_generation = _probe_existing_state_db_schema(
+                self.db_path, allow_malformed_repair=True
+            )
+            self._existing_schema_version = actual_generation
+            if actual_generation is None or actual_generation >= SCHEMA_VERSION:
+                self._release_forward_schema_migration_lease()
+        except BaseException:
+            self._release_forward_schema_migration_lease()
+            raise
+
+    def _release_forward_schema_migration_lease(self) -> None:
+        lease = getattr(self, "_forward_schema_migration_lease", None)
+        self._forward_schema_migration_lease = None
+        if lease is None:
+            return
+        try:
+            from gateway.status import release_gateway_runtime_migration_lease
+
+            release_gateway_runtime_migration_lease(lease)
+        except Exception:
+            logger.exception("Could not release the canonical migration lease")
 
     def ensure_compatible_schema(self) -> None:
         """Recheck this open connection without repairing or mutating state."""
@@ -5735,9 +5935,47 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         def _is_no_more_rows(exc: sqlite3.Error) -> bool:
             return "no more rows available" in str(exc).lower()
 
+        def _is_explicit_fts_commit_error(exc: BaseException) -> bool:
+            """A commit replay needs one direct, exact supported FTS5 signature."""
+            return (
+                type(exc) is sqlite3.DatabaseError
+                and str(exc)
+                in {
+                    'fts5: corrupt structure record for table "messages_fts"',
+                    'fts5: corrupt structure record for table "messages_fts_trigram"',
+                    'fts5: corrupt structure record for table "messages_fts_cjk"',
+                }
+            )
+
+        def _recovery_is_replay_safe(exc: BaseException) -> bool:
+            """Allow recovery only after rollback proves replay safety."""
+            return (
+                transaction_rolled_back
+                and not getattr(exc, "_hermes_transaction_started", False)
+                and (
+                    (
+                        not commit_attempted
+                        and (
+                            not callback_mutated
+                            or (
+                                isinstance(exc, sqlite3.DatabaseError)
+                                and self._is_fts_write_corruption_error(exc)
+                            )
+                        )
+                    )
+                    or (
+                        commit_failure_definitely_rolled_back
+                        and _is_explicit_fts_commit_error(exc)
+                    )
+                )
+            )
+
         while True:
             transaction_started = False
+            transaction_rolled_back = False
+            callback_mutated = False
             commit_attempted = False
+            commit_failure_definitely_rolled_back = False
             try:
                 with self._same_connection_transaction_boundary() as conn:
                     try:
@@ -5747,13 +5985,33 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         if getattr(exc, "_hermes_transaction_started", False):
                             self._rollback_or_retire_failed_transaction(conn, exc)
                         raise
+                    callback_total_changes: Optional[int] = None
                     try:
                         self._assert_offline_rebuild_write_authority(conn)
+                        callback_total_changes = conn.total_changes
                         result = fn(conn)
                         commit_attempted = True
                         conn.commit()
                     except BaseException as exc:
+                        if callback_total_changes is not None:
+                            callback_mutated = conn.total_changes != callback_total_changes
+                        # A raised commit is normally ambiguous: it may have
+                        # durably committed before SQLite reported the error.
+                        # The sole exception is an FTS-corruption DatabaseError
+                        # observed while the same transaction remains active;
+                        # only a successful rollback to autocommit proves this
+                        # callback can safely be replayed.
+                        commit_failure_had_active_transaction = (
+                            commit_attempted
+                            and _is_explicit_fts_commit_error(exc)
+                            and conn.in_transaction
+                        )
                         self._rollback_or_retire_failed_transaction(conn, exc)
+                        transaction_rolled_back = True
+                        commit_failure_definitely_rolled_back = (
+                            commit_failure_had_active_transaction
+                            and not conn.in_transaction
+                        )
                         raise
                 # Success — periodic best-effort checkpoint + FTS merge.
                 if _count_write:
@@ -5790,14 +6048,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     continue
                 raise
             except sqlite3.OperationalError as exc:
-                if (
-                    commit_attempted
-                    or transaction_started
-                    or getattr(exc, "_hermes_transaction_started", False)
-                ):
+                if commit_attempted or getattr(exc, "_hermes_transaction_started", False):
                     raise
                 err_msg = str(exc).lower()
                 if "locked" in err_msg or "busy" in err_msg:
+                    if transaction_started:
+                        raise
                     if self._sleep_before_write_retry(deadline, patience_s):
                         continue
                     # Patience exhausted — say what actually happened so the
@@ -5809,6 +6065,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         "a large WAL checkpoint, or an older pre-update "
                         "process; the database itself is healthy)"
                     ) from exc
+                if transaction_started and not _recovery_is_replay_safe(exc):
+                    raise
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
                     continue
                 # Non-lock error or patience exhausted — propagate.
@@ -5816,9 +6074,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             except sqlite3.DatabaseError as exc:
                 if (
                     commit_attempted
-                    or transaction_started
-                    or getattr(exc, "_hermes_transaction_started", False)
-                ):
+                    and not _recovery_is_replay_safe(exc)
+                ) or getattr(exc, "_hermes_transaction_started", False):
+                    raise
+                if transaction_started and not _recovery_is_replay_safe(exc):
                     raise
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
                     continue
@@ -5840,11 +6099,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # subclass) or another sqlite3.Error class outside the two
                 # handlers above. Message-scoped: anything else propagates
                 # untouched.
-                if (
-                    commit_attempted
-                    or transaction_started
-                    or getattr(exc, "_hermes_transaction_started", False)
-                ):
+                if commit_attempted or getattr(exc, "_hermes_transaction_started", False):
+                    raise
+                if transaction_started and not _recovery_is_replay_safe(exc):
                     raise
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
                     continue
@@ -6535,6 +6792,289 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """Create a new session record. Returns the session_id."""
         self._insert_session_row(session_id, source, **kwargs)
         return session_id
+
+    def issue_session_process_authority(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Return the current issued authority for one live session.
+
+        Issuance itself is a sessions-table SQLite trigger, so every writer —
+        including a legacy raw SQL call that bypasses this Python method —
+        receives the same single generation and durable ``SESSION_ISSUED``
+        evidence in the transaction that created the session.  This method is
+        deliberately a fail-closed read of that durable record, not a second
+        mutable issuance path.
+        """
+        if not isinstance(session_id, str) or not session_id.strip():
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT a.state_db_id, a.state_family, a.session_id,
+                          a.session_generation, a.authority_token, a.status,
+                          a.issued_at
+                   FROM session_process_authorities AS a
+                   JOIN sessions AS s ON s.id = a.session_id
+                   WHERE a.session_id = ?
+                     AND a.session_generation = s.session_generation
+                     AND s.ended_at IS NULL
+                     AND a.status = 'ISSUED'""",
+                (session_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    @staticmethod
+    def _session_process_authority_payload(
+        authority: Any,
+    ) -> Optional[Tuple[str, str, str, int, str, float]]:
+        """Validate the complete authority envelope before touching SQLite."""
+        if not isinstance(authority, dict):
+            return None
+        state_db_id = authority.get("state_db_id")
+        state_family = authority.get("state_family")
+        session_id = authority.get("session_id")
+        generation = authority.get("session_generation")
+        token = authority.get("authority_token")
+        issued_at = authority.get("issued_at")
+        if (
+            not isinstance(state_db_id, str)
+            or len(state_db_id) != 64
+            or state_db_id.lower() != state_db_id
+            or any(char not in "0123456789abcdef" for char in state_db_id)
+            or state_family != SESSION_PROCESS_AUTHORITY_STATE_FAMILY
+            or not isinstance(session_id, str)
+            or not session_id.strip()
+            or isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation < 1
+            or not isinstance(token, str)
+            or len(token) != 64
+            or token.lower() != token
+            or any(char not in "0123456789abcdef" for char in token)
+            or isinstance(issued_at, bool)
+            or not isinstance(issued_at, (int, float))
+            or not math.isfinite(float(issued_at))
+            or authority.get("status") != "ISSUED"
+        ):
+            return None
+        return (
+            state_db_id,
+            state_family,
+            session_id,
+            generation,
+            token,
+            float(issued_at),
+        )
+
+    def reserve_session_process_authority(
+        self, authority: Any, *, ttl_seconds: float = SESSION_PROCESS_AUTHORITY_RESERVATION_TTL_SECONDS
+    ) -> Optional[Dict[str, Any]]:
+        """Create one short-lived reservation for the current authority.
+
+        This is an issuance prerequisite only: it does not launch or attach a
+        real process.  The one-time reservation is persisted with only a token
+        digest; Producer-B can later consume it to bind a spawned process.
+        """
+        parsed = self._session_process_authority_payload(authority)
+        if (
+            parsed is None
+            or isinstance(ttl_seconds, bool)
+            or not isinstance(ttl_seconds, (int, float))
+            or not math.isfinite(float(ttl_seconds))
+        ):
+            return None
+        ttl = float(ttl_seconds)
+        if ttl <= 0 or ttl > SESSION_PROCESS_AUTHORITY_MAX_RESERVATION_TTL_SECONDS:
+            return None
+        state_db_id, state_family, session_id, generation, token, issued_at = parsed
+        now = time.time()
+        expires_at = now + ttl
+        reservation_id = secrets.token_urlsafe(24)
+        reservation_token = secrets.token_urlsafe(32)
+        reservation_token_sha256 = hashlib.sha256(
+            reservation_token.encode("ascii")
+        ).hexdigest()
+
+        def _do(conn):
+            current = conn.execute(
+                """SELECT 1
+                   FROM session_process_authorities AS a
+                   JOIN sessions AS s ON s.id = a.session_id
+                   WHERE a.session_id = ?
+                     AND a.session_generation = ?
+                     AND a.state_db_id = ?
+                     AND a.state_family = ?
+                     AND a.authority_token = ?
+                     AND a.issued_at = ?
+                     AND a.status = 'ISSUED'
+                     AND s.session_generation = a.session_generation
+                     AND s.ended_at IS NULL""",
+                (session_id, generation, state_db_id, state_family, token, issued_at),
+            ).fetchone()
+            if current is None:
+                return None
+            conn.execute(
+                """INSERT INTO session_process_reservations (
+                       reservation_id, reservation_token_sha256, session_id,
+                       session_generation, state_db_id, state_family, status,
+                       reserved_at, expires_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, 'RESERVED', ?, ?)""",
+                (
+                    reservation_id,
+                    reservation_token_sha256,
+                    session_id,
+                    generation,
+                    state_db_id,
+                    state_family,
+                    now,
+                    expires_at,
+                ),
+            )
+            return {
+                "reservation_id": reservation_id,
+                "reservation_token": reservation_token,
+                "state_db_id": state_db_id,
+                "state_family": state_family,
+                "session_id": session_id,
+                "session_generation": generation,
+                "status": "RESERVED",
+                "reserved_at": now,
+                "expires_at": expires_at,
+            }
+
+        return self._execute_write(_do)
+
+    @staticmethod
+    def _session_process_reservation_payload(
+        reservation: Any,
+    ) -> Optional[Tuple[str, str, str, str, int, float, float]]:
+        """Validate a presented reservation before its one-time consume."""
+        if not isinstance(reservation, dict):
+            return None
+        reservation_id = reservation.get("reservation_id")
+        reservation_token = reservation.get("reservation_token")
+        state_db_id = reservation.get("state_db_id")
+        state_family = reservation.get("state_family")
+        session_id = reservation.get("session_id")
+        generation = reservation.get("session_generation")
+        reserved_at = reservation.get("reserved_at")
+        expires_at = reservation.get("expires_at")
+        if (
+            not isinstance(reservation_id, str)
+            or len(reservation_id) < 32
+            or not isinstance(reservation_token, str)
+            or len(reservation_token) < 32
+            or not isinstance(state_db_id, str)
+            or len(state_db_id) != 64
+            or state_db_id.lower() != state_db_id
+            or any(char not in "0123456789abcdef" for char in state_db_id)
+            or state_family != SESSION_PROCESS_AUTHORITY_STATE_FAMILY
+            or not isinstance(session_id, str)
+            or not session_id.strip()
+            or isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation < 1
+            or isinstance(reserved_at, bool)
+            or not isinstance(reserved_at, (int, float))
+            or isinstance(expires_at, bool)
+            or not isinstance(expires_at, (int, float))
+            or not math.isfinite(float(reserved_at))
+            or not math.isfinite(float(expires_at))
+            or float(expires_at) <= float(reserved_at)
+            or reservation.get("status") != "RESERVED"
+        ):
+            return None
+        return (
+            reservation_id,
+            reservation_token,
+            state_db_id,
+            session_id,
+            generation,
+            float(reserved_at),
+            float(expires_at),
+        )
+
+    def consume_session_process_reservation(self, reservation: Any) -> bool:
+        """Atomically consume an unexpired reservation without binding a PID."""
+        parsed = self._session_process_reservation_payload(reservation)
+        if parsed is None:
+            return False
+        (
+            reservation_id,
+            reservation_token,
+            state_db_id,
+            session_id,
+            generation,
+            reserved_at,
+            expires_at,
+        ) = parsed
+        now = time.time()
+        if expires_at <= now:
+            return False
+        token_sha256 = hashlib.sha256(reservation_token.encode("ascii")).hexdigest()
+
+        def _do(conn):
+            row = conn.execute(
+                """SELECT r.reservation_token_sha256
+                   FROM session_process_reservations AS r
+                   JOIN session_process_authorities AS a
+                     ON a.session_id = r.session_id
+                    AND a.session_generation = r.session_generation
+                   JOIN sessions AS s ON s.id = r.session_id
+                   WHERE r.reservation_id = ?
+                     AND r.session_id = ?
+                     AND r.session_generation = ?
+                     AND r.state_db_id = ?
+                     AND r.state_family = ?
+                     AND r.reserved_at = ?
+                     AND r.expires_at = ?
+                     AND r.status = 'RESERVED'
+                     AND r.expires_at > ?
+                     AND a.status = 'ISSUED'
+                     AND s.session_generation = r.session_generation
+                     AND s.ended_at IS NULL""",
+                (
+                    reservation_id,
+                    session_id,
+                    generation,
+                    state_db_id,
+                    SESSION_PROCESS_AUTHORITY_STATE_FAMILY,
+                    reserved_at,
+                    expires_at,
+                    now,
+                ),
+            ).fetchone()
+            if row is None or not secrets.compare_digest(row[0], token_sha256):
+                return False
+            cursor = conn.execute(
+                """UPDATE session_process_reservations
+                   SET status = 'BOUND', consumed_at = ?
+                   WHERE reservation_id = ? AND status = 'RESERVED'""",
+                (now, reservation_id),
+            )
+            return bool(cursor.rowcount)
+
+        return bool(self._execute_write(_do))
+
+    def revoke_session_process_authority(self, session_id: str) -> bool:
+        """Revoke the live authority once by closing its owning session.
+
+        The normal session-close trigger changes the authority state and emits
+        ``SESSION_REVOKED`` in the exact ``BEGIN IMMEDIATE`` transaction.  A
+        duplicate, unknown, or already-closed request makes no write and is
+        rejected by returning ``False``.
+        """
+        if not isinstance(session_id, str) or not session_id.strip():
+            return False
+
+        now = time.time()
+
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE sessions SET ended_at = ?, end_reason = 'authority_revoked' "
+                "WHERE id = ? AND ended_at IS NULL",
+                (now, session_id),
+            )
+            return bool(cursor.rowcount)
+
+        return bool(self._execute_write(_do))
 
     def create_session_strict(
         self,

@@ -10,6 +10,8 @@ The first test characterizes the sequence as driven through `tick()` (proving
 the extraction didn't change `tick`'s behavior); the rest unit-test the
 extracted helper directly.
 """
+import logging
+
 import pytest
 
 import cron.scheduler as s
@@ -115,18 +117,16 @@ def test_run_one_job_exception_delivers_failure_alert(monkeypatch):
     ok = s.run_one_job({"id": "j3", "name": "morning", "deliver": "telegram"})
 
     assert ok is False
-    assert delivered == [
-        ("j3", "⚠️ Cron 'morning' failed: Gemini HTTP 503 (UNAVAILABLE)")
-    ]
+    assert delivered == [("j3", s._CRON_EXECUTION_FAILURE)]
     assert marked == [
-        (("j3", False, "Gemini HTTP 503 (UNAVAILABLE)"), {"delivery_error": None})
+        (("j3", False, s._CRON_EXECUTION_FAILURE), {"delivery_error": None})
     ]
     assert finished == [
         (
             ("exec-j3",),
             {
                 "success": False,
-                "error": "Gemini HTTP 503 (UNAVAILABLE)",
+                "error": s._CRON_EXECUTION_FAILURE,
                 "delivery_outcome": "delivered",
             },
         )
@@ -157,7 +157,8 @@ def test_run_one_job_exception_records_failure_alert_delivery_error(monkeypatch)
 
     assert s.run_one_job({"id": "j4", "deliver": "telegram"}) is False
     assert marked == [
-        (("j4", False, "provider failed"), {"delivery_error": "send failed: 502"})
+        (("j4", False, s._CRON_EXECUTION_FAILURE),
+        {"delivery_error": s._CRON_DELIVERY_FAILURE})
     ]
 
 
@@ -182,18 +183,8 @@ def _patch_escaped_failure(monkeypatch, delivered, *, exec_id, err):
     monkeypatch.setattr(s, "load_config", lambda: {})
 
 
-def test_escaped_failure_delivery_carries_the_streak_nudge(monkeypatch):
-    """A repeatedly-failing job must be nudged even when it fails at the
-    scheduler layer (#88655).
-
-    ``mark_job_run`` increments ``failure_streak`` for an escaped failure just
-    as it does for an agent failure, so the counter climbs either way. But the
-    nudge that spends it was only composed on the normal delivery path, so a
-    job that raises before the run body on every tick - a bad import from a
-    half-applied update, a provider client that cannot construct - alerts
-    forever and is never told it should be reviewed or paused. Nothing else
-    surfaces the streak in chat.
-    """
+def test_escaped_failure_delivery_hides_streak_and_exception_detail(monkeypatch):
+    """The public alert is neutral even when the internal streak advances."""
     delivered = []
     _patch_escaped_failure(
         monkeypatch, delivered, exec_id="exec-j5", err="cannot import name X"
@@ -210,14 +201,11 @@ def test_escaped_failure_delivery_carries_the_streak_nudge(monkeypatch):
     )
 
     assert ok is False
-    assert len(delivered) == 1
-    assert "cannot import name X" in delivered[0]
-    assert "failed 3 runs in a row" in delivered[0]
-    assert "hermes cron pause scout" in delivered[0]
+    assert delivered == [s._CRON_EXECUTION_FAILURE]
 
 
-def test_escaped_failure_delivery_stays_quiet_below_the_threshold(monkeypatch):
-    """The nudge is appended, not always-on: a first failure reads as before."""
+def test_escaped_failure_delivery_is_neutral_below_the_threshold(monkeypatch):
+    """A first escaped failure uses the same public-neutral contract."""
     delivered = []
     _patch_escaped_failure(
         monkeypatch, delivered, exec_id="exec-j6", err="provider failed"
@@ -234,7 +222,7 @@ def test_escaped_failure_delivery_stays_quiet_below_the_threshold(monkeypatch):
     )
 
     assert ok is False
-    assert delivered == ["⚠️ Cron 'scout' failed: provider failed"]
+    assert delivered == [s._CRON_EXECUTION_FAILURE]
 
 
 def test_run_one_job_exception_after_delivery_does_not_redeliver(monkeypatch):
@@ -273,7 +261,7 @@ def test_run_one_job_exception_after_delivery_does_not_redeliver(monkeypatch):
     assert delivered == [("j5", "final response")]
     assert mark_calls[0] == (("j5", True, None), {"delivery_error": None})
     assert mark_calls[1] == (
-        ("j5", False, "bookkeeping boom"),
+        ("j5", False, s._CRON_EXECUTION_FAILURE),
         {"delivery_error": None},
     )
 
@@ -314,13 +302,13 @@ def test_run_one_job_keyboard_interrupt_skips_delivery_and_reraises(monkeypatch)
         s.run_one_job({"id": "j6", "name": "interrupt", "deliver": "telegram"})
 
     assert delivered == []
-    assert marked == [(("j6", False, "KeyboardInterrupt"), {})]
+    assert marked == [(("j6", False, s._CRON_EXECUTION_FAILURE), {})]
     assert finished == [
         (
             ("exec-j6",),
             {
                 "success": False,
-                "error": "KeyboardInterrupt",
+                "error": s._CRON_EXECUTION_FAILURE,
                 "delivery_outcome": "suppressed",
             },
         )
@@ -370,3 +358,159 @@ def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path
     assert ss.current_secret_scope() is None
 
 
+def _run_real_failure_through_all_public_sinks(monkeypatch, job):
+    """Capture the real run_job result before every durable/public sink."""
+    observed = {
+        "returned": [],
+        "saved": [],
+        "delivered": [],
+        "marked": [],
+        "finished": [],
+    }
+    real_run_job = s.run_job
+
+    def capture_run_job(*args, **kwargs):
+        result = real_run_job(*args, **kwargs)
+        observed["returned"].append(result)
+        return result
+
+    monkeypatch.setattr(s, "create_execution", lambda *_a, **_kw: {"id": "exec-public"})
+    monkeypatch.setattr(s, "claim_dispatch", lambda *_a, **_kw: True)
+    monkeypatch.setattr(s, "mark_execution_running", lambda *_a, **_kw: None)
+    monkeypatch.setattr(s, "run_job", capture_run_job)
+    monkeypatch.setattr(
+        s,
+        "save_job_output",
+        lambda job_id, output: observed["saved"].append((job_id, output)) or "/tmp/output.md",
+    )
+    monkeypatch.setattr(
+        s,
+        "_deliver_result",
+        lambda current_job, content, **_kw: observed["delivered"].append(
+            (current_job["id"], content)
+        )
+        or None,
+    )
+    monkeypatch.setattr(
+        s,
+        "mark_job_run",
+        lambda *args, **kwargs: observed["marked"].append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        s,
+        "finish_execution",
+        lambda *args, **kwargs: observed["finished"].append((args, kwargs)),
+    )
+
+    assert s.run_one_job(job) is True
+    return observed
+
+
+def _assert_only_fixed_public_failure(observed, caplog, private_text, job_id):
+    """Every returned, saved, delivered, ledger, and log failure is neutral."""
+    public = s._CRON_DELIVERY_FAILURE
+    assert observed["returned"] == [(False, public, public, public)]
+    assert observed["saved"] == [(job_id, public)]
+    assert observed["delivered"] == [(job_id, public)]
+    assert observed["marked"] == [
+        ((job_id, False, public), {"delivery_error": None})
+    ]
+    assert observed["finished"] == [
+        (
+            ("exec-public",),
+            {
+                "success": False,
+                "error": public,
+                "delivery_outcome": "delivered",
+            },
+        )
+    ]
+    assert private_text not in caplog.text
+    for record in caplog.records:
+        if record.name == s.__name__ and record.levelno >= logging.ERROR:
+            assert record.getMessage() == public
+            assert record.args == ()
+            assert record.exc_info is None
+
+
+def test_no_agent_script_failure_is_fixed_before_return_and_durable_sinks(
+    monkeypatch, tmp_path, caplog
+):
+    """A nonzero script's private stderr/path never reaches a public failure sink."""
+    private_path_and_stderr = "/private/no-agent-script/DO-NOT-DISCLOSE"
+    home = tmp_path / "home"
+    scripts = home / "scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "failure.py").write_text(
+        "import sys\n"
+        f"sys.stderr.write({private_path_and_stderr!r})\n"
+        "sys.exit(7)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(s, "_get_hermes_home", lambda: home)
+    caplog.set_level(logging.ERROR, logger=s.__name__)
+
+    job = {
+        "id": "public-script-failure",
+        "name": "public script failure",
+        "no_agent": True,
+        "script": "failure.py",
+        "deliver": "telegram",
+    }
+    observed = _run_real_failure_through_all_public_sinks(monkeypatch, job)
+
+    _assert_only_fixed_public_failure(
+        observed, caplog, private_path_and_stderr, job["id"]
+    )
+
+
+def test_no_agent_missing_script_failure_is_fixed_before_return_and_durable_sinks(
+    monkeypatch, tmp_path, caplog
+):
+    """A missing no-agent script never reaches public failure sinks verbatim."""
+    raw_missing_script_reason = "no_agent=True but no script is set for this job"
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(s, "_get_hermes_home", lambda: home)
+    caplog.set_level(logging.ERROR, logger=s.__name__)
+
+    job = {
+        "id": "public-missing-script-failure",
+        "name": "public missing script failure",
+        "no_agent": True,
+        "deliver": "telegram",
+    }
+    observed = _run_real_failure_through_all_public_sinks(monkeypatch, job)
+
+    _assert_only_fixed_public_failure(
+        observed, caplog, raw_missing_script_reason, job["id"]
+    )
+
+
+def test_monitor_source_failure_is_fixed_before_return_and_durable_sinks(
+    monkeypatch, tmp_path, caplog
+):
+    """A monitor exception string cannot reach any public/durable failure sink."""
+    from cron.monitor import MonitorOutcome
+    import cron.monitor as monitor
+
+    private_exception = "PRIVATE_MONITOR_EXCEPTION_DO_NOT_DISCLOSE"
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(s, "_get_hermes_home", lambda: home)
+    monkeypatch.setattr(
+        monitor,
+        "check_monitor",
+        lambda _job: MonitorOutcome(ok=False, error=private_exception),
+    )
+    caplog.set_level(logging.ERROR, logger=s.__name__)
+
+    job = {
+        "id": "public-monitor-failure",
+        "name": "public monitor failure",
+        "monitor_script": "source.py",
+        "deliver": "telegram",
+    }
+    observed = _run_real_failure_through_all_public_sinks(monkeypatch, job)
+
+    _assert_only_fixed_public_failure(observed, caplog, private_exception, job["id"])

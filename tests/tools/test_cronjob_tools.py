@@ -246,6 +246,80 @@ class TestUnifiedCronjobTool:
         assert listing["jobs"][0]["name"] == "Server Check"
         assert listing["jobs"][0]["state"] == "scheduled"
 
+    def test_missing_restart_policy_defaults_to_terminal_in_create_and_list(self):
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Check server status",
+                schedule="every 1h",
+            )
+        )
+
+        assert created["job"]["restart_policy"] == "terminal"
+        listing = json.loads(cronjob(action="list"))
+        assert listing["jobs"][0]["restart_policy"] == "terminal"
+
+    def test_create_resume_restart_policy_round_trips_through_list(self):
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Check server status",
+                schedule="30m",
+                restart_policy="resume",
+            )
+        )
+
+        assert created["success"] is True
+        assert created["job"]["restart_policy"] == "resume"
+        listing = json.loads(cronjob(action="list"))
+        assert listing["jobs"][0]["restart_policy"] == "resume"
+
+    def test_update_restart_policy_round_trips_to_terminal(self):
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Check server status",
+                schedule="30m",
+                restart_policy="resume",
+            )
+        )
+
+        updated = json.loads(
+            cronjob(
+                action="update",
+                job_id=created["job_id"],
+                restart_policy="terminal",
+            )
+        )
+
+        assert updated["success"] is True
+        assert updated["job"]["restart_policy"] == "terminal"
+        listing = json.loads(cronjob(action="list"))
+        assert listing["jobs"][0]["restart_policy"] == "terminal"
+
+    @pytest.mark.parametrize("invalid_policy", ["retry", False])
+    def test_invalid_restart_policy_fails_closed_without_mutating_job(self, invalid_policy):
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Check server status",
+                schedule="30m",
+                restart_policy="resume",
+            )
+        )
+
+        rejected = json.loads(
+            cronjob(
+                action="update",
+                job_id=created["job_id"],
+                restart_policy=invalid_policy,
+            )
+        )
+
+        assert rejected["success"] is False
+        listing = json.loads(cronjob(action="list"))
+        assert listing["jobs"][0]["restart_policy"] == "resume"
+
     def test_list_handles_partial_legacy_job_records(self):
         from cron.jobs import save_jobs
 
@@ -391,6 +465,58 @@ class TestUnifiedCronjobTool:
 # =========================================================================
 # Agent-facing surface: per-job model pins are user-owned
 # =========================================================================
+
+
+class TestBackgroundRunClaimSnapshot:
+    def test_pool_fallback_runs_the_exact_claimed_snapshot(self, monkeypatch):
+        """The background fallback must preserve A/B/O returned by the store."""
+        import tools.async_delegation as async_delegation
+        import tools.cronjob_tools as cronjob_tools
+        import tools.approval as approval
+        import cron.executions as executions
+        import cron.scheduler as scheduler
+
+        job = {"id": "background-resume", "name": "background resume", "deliver": "local"}
+        claimed_job = {
+            **job,
+            "run_claim": {
+                "by": "run-a",
+                "fire_owner": "fire-b",
+                "occurrence_id": "occurrence-o",
+            },
+            "fire_claim": {
+                "by": "fire-b",
+                "source_run_owner": "run-a",
+                "occurrence_id": "occurrence-o",
+            },
+        }
+        monkeypatch.setattr(approval, "get_current_session_key", lambda **_kwargs: "route")
+        monkeypatch.setattr(executions, "recover_interrupted_executions", lambda: 0)
+        monkeypatch.setattr(scheduler, "get_running_job_ids", lambda: set())
+        monkeypatch.setattr(
+            cronjob_tools,
+            "claim_job_for_fire",
+            lambda _job_id, **_kwargs: claimed_job,
+        )
+        monkeypatch.setattr(async_delegation, "_current_origin_session_id", lambda: "origin")
+        monkeypatch.setattr(
+            async_delegation,
+            "dispatch_async_delegation",
+            lambda **_kwargs: {"status": "rejected", "error": "pool full"},
+        )
+        received = []
+        monkeypatch.setattr(
+            cronjob_tools,
+            "_run_claimed_job",
+            lambda snapshot, **_kwargs: received.append(snapshot)
+            or {"claimed": True, "success": True, "error": None},
+        )
+
+        result = cronjob_tools._try_dispatch_background_run(job, session_id="session")
+
+        assert result == {"claimed": True, "success": True, "error": None, "dispatched": False}
+        assert received == [claimed_job]
+        assert received[0] is claimed_job
 
 
 class TestAgentCannotSetModelPin:

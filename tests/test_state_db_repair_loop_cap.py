@@ -28,6 +28,7 @@ import hermes_state
 from hermes_state import (
     _MAX_MALFORMED_BACKUPS,
     _MAX_PERSISTENT_REPAIR_ATTEMPTS,
+    SessionDB,
     _backup_db_file,
     _existing_malformed_backups,
     _persistent_repair_attempts_exhausted,
@@ -46,12 +47,10 @@ def _make_unprovable_db(tmp_path: Path) -> Path:
 
 
 def _make_healthy_db(tmp_path: Path) -> Path:
+    """Build a supported state store so repair reaches its real outcome seam."""
     db = tmp_path / "state.db"
-    conn = sqlite3.connect(str(db))
-    conn.execute("CREATE TABLE t (x)")
-    conn.execute("INSERT INTO t VALUES (1)")
-    conn.commit()
-    conn.close()
+    session_db = SessionDB(db_path=db)
+    session_db.close()
     return db
 
 

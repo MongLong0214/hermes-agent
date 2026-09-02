@@ -60,7 +60,7 @@ class TestRunningJobGuard:
             "id": "guard-job",
             "name": "guard-test",
             "prompt": "test",
-            "schedule": "every 5m",
+            "schedule": {"kind": "interval", "minutes": 5, "display": "every 5m"},
             "enabled": True,
             "next_run_at": "2020-01-01T00:00:00",
             "deliver": "local",
@@ -72,7 +72,7 @@ class TestRunningJobGuard:
         dispatched = []
         monkeypatch.setattr(sched, "get_due_jobs", lambda: [job])
         monkeypatch.setattr(sched, "claim_job_for_fire", lambda *_a, **_kw: True)
-        monkeypatch.setattr(sched, "run_job", lambda j, **_kw: dispatched.append(j["id"]) or (True, "out", "resp", None))
+        monkeypatch.setattr(sched, "run_one_job", lambda j, **_kw: dispatched.append(j["id"]) or True)
         monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: None)
         monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
         monkeypatch.setattr(sched, "_deliver_result", lambda *_a, **_kw: None)
@@ -94,7 +94,7 @@ class TestRunningJobGuard:
             "id": "queued-job",
             "name": "queued",
             "prompt": "test",
-            "schedule": "every 5m",
+            "schedule": {"kind": "interval", "minutes": 5, "display": "every 5m"},
             "enabled": True,
             "next_run_at": "2020-01-01T00:00:00",
             "deliver": "local",
@@ -147,7 +147,7 @@ class TestRunningJobGuard:
             "id": "failing-job",
             "name": "failing-job",
             "prompt": "test",
-            "schedule": "every 5m",
+            "schedule": {"kind": "interval", "minutes": 5, "display": "every 5m"},
             "enabled": True,
             "next_run_at": "2020-01-01T00:00:00",
             "deliver": "local",
@@ -156,7 +156,7 @@ class TestRunningJobGuard:
             "id": "healthy-job",
             "name": "healthy-job",
             "prompt": "test",
-            "schedule": "every 5m",
+            "schedule": {"kind": "interval", "minutes": 5, "display": "every 5m"},
             "enabled": True,
             "next_run_at": "2020-01-01T00:00:00",
             "deliver": "local",
@@ -172,7 +172,7 @@ class TestRunningJobGuard:
         monkeypatch.setattr(sched, "get_due_jobs", lambda: [failing_job, healthy_job])
         monkeypatch.setattr(sched, "advance_next_runs", lambda *_a, **_kw: 0)
         monkeypatch.setattr(sched, "create_execution", create_execution_side_effect)
-        monkeypatch.setattr(sched, "run_job", lambda j, **_kw: called.append(j["id"]) or (True, "out", "resp", None))
+        monkeypatch.setattr(sched, "run_one_job", lambda j, **_kw: called.append(j["id"]) or True)
         monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: None)
         monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
         monkeypatch.setattr(sched, "_deliver_result", lambda *_a, **_kw: None)
@@ -213,14 +213,14 @@ class TestSyncMode:
 
         jobs = [
             {"id": f"job-{i}", "name": f"Job {i}", "prompt": "test",
-             "schedule": "every 5m", "enabled": True,
+             "schedule": {"kind": "interval", "minutes": 5, "display": "every 5m"}, "enabled": True,
              "next_run_at": "2020-01-01T00:00:00", "deliver": "local"}
             for i in range(3)
         ]
 
         monkeypatch.setattr(sched, "get_due_jobs", lambda: jobs)
         monkeypatch.setattr(sched, "claim_job_for_fire", lambda *_a, **_kw: True)
-        monkeypatch.setattr(sched, "run_job", lambda j, **_kw: (True, "out", "resp", None))
+        monkeypatch.setattr(sched, "run_one_job", lambda j, **_kw: True)
         monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: "/tmp/out")
         monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
         monkeypatch.setattr(sched, "_deliver_result", lambda *_a, **_kw: None)
@@ -242,7 +242,7 @@ class TestSyncMode:
             "id": "slow-job",
             "name": "slow",
             "prompt": "test",
-            "schedule": "every 5m",
+            "schedule": {"kind": "interval", "minutes": 5, "display": "every 5m"},
             "enabled": True,
             "next_run_at": "2020-01-01T00:00:00",
             "deliver": "local",
@@ -250,13 +250,13 @@ class TestSyncMode:
 
         barrier = threading.Barrier(2, timeout=5)
 
-        def slow_run(j, *, defer_agent_teardown=None, **_kw):
+        def slow_run(j, **_kw):
             barrier.wait()  # blocks until test thread also waits
-            return True, "out", "resp", None
+            return True
 
         monkeypatch.setattr(sched, "get_due_jobs", lambda: [job])
         monkeypatch.setattr(sched, "claim_job_for_fire", lambda *_a, **_kw: True)
-        monkeypatch.setattr(sched, "run_job", slow_run)
+        monkeypatch.setattr(sched, "run_one_job", slow_run)
         monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: "/tmp/out")
         monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
         monkeypatch.setattr(sched, "_deliver_result", lambda *_a, **_kw: None)
@@ -295,7 +295,7 @@ class TestSequentialPool:
             "id": "slow-workdir",
             "name": "slow-workdir",
             "prompt": "test",
-            "schedule": "every 5m",
+            "schedule": {"kind": "interval", "minutes": 5, "display": "every 5m"},
             "enabled": True,
             "next_run_at": "2020-01-01T00:00:00",
             "deliver": "local",
@@ -304,13 +304,13 @@ class TestSequentialPool:
 
         barrier = threading.Barrier(2, timeout=5)
 
-        def slow_run(j, *, defer_agent_teardown=None, **_kw):
+        def slow_run(j, **_kw):
             barrier.wait()
-            return True, "out", "resp", None
+            return True
 
         monkeypatch.setattr(sched, "get_due_jobs", lambda: [job])
         monkeypatch.setattr(sched, "claim_job_for_fire", lambda *_a, **_kw: True)
-        monkeypatch.setattr(sched, "run_job", slow_run)
+        monkeypatch.setattr(sched, "run_one_job", slow_run)
         monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: "/tmp/out")
         monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
         monkeypatch.setattr(sched, "_deliver_result", lambda *_a, **_kw: None)
@@ -339,7 +339,7 @@ class TestSequentialPool:
             "id": "guard-seq",
             "name": "guard-seq",
             "prompt": "test",
-            "schedule": "every 5m",
+            "schedule": {"kind": "interval", "minutes": 5, "display": "every 5m"},
             "enabled": True,
             "next_run_at": "2020-01-01T00:00:00",
             "deliver": "local",
@@ -352,7 +352,7 @@ class TestSequentialPool:
         dispatched = []
         monkeypatch.setattr(sched, "get_due_jobs", lambda: [job])
         monkeypatch.setattr(sched, "claim_job_for_fire", lambda *_a, **_kw: True)
-        monkeypatch.setattr(sched, "run_job", lambda j, **_kw: dispatched.append(j["id"]) or (True, "out", "resp", None))
+        monkeypatch.setattr(sched, "run_one_job", lambda j, **_kw: dispatched.append(j["id"]) or True)
         monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: None)
         monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
         monkeypatch.setattr(sched, "_deliver_result", lambda *_a, **_kw: None)
@@ -392,7 +392,7 @@ class TestTickBatchAdvance:
 
         jobs = [
             {"id": f"job-{i}", "name": f"Job {i}", "prompt": "test",
-             "schedule": "every 5m", "enabled": True,
+             "schedule": {"kind": "interval", "minutes": 5, "display": "every 5m"}, "enabled": True,
              "next_run_at": "2020-01-01T00:00:00", "deliver": "local"}
             for i in range(4)
         ]
@@ -402,7 +402,7 @@ class TestTickBatchAdvance:
         monkeypatch.setattr(
             sched, "advance_next_runs",
             lambda ids: advance_calls.append(list(ids)) or len(list(ids)))
-        monkeypatch.setattr(sched, "run_job", lambda j, **_kw: (True, "out", "resp", None))
+        monkeypatch.setattr(sched, "run_one_job", lambda j, **_kw: True)
         monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: "/tmp/out")
         monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
         monkeypatch.setattr(sched, "_deliver_result", lambda *_a, **_kw: None)
