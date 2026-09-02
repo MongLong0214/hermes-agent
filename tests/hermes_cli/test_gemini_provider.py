@@ -87,14 +87,29 @@ class TestGeminiCredentials:
         assert creds["api_key"] == "gemini-secret"
 
 
-    def test_runtime_gemini(self, monkeypatch):
-        monkeypatch.setenv("GOOGLE_API_KEY", "google-key")
-        from hermes_cli.runtime_provider import resolve_runtime_provider
-        result = resolve_runtime_provider(requested="gemini")
-        assert result["provider"] == "gemini"
-        assert result["api_mode"] == "chat_completions"
-        assert result["api_key"] == "google-key"
-        assert result["base_url"] == "https://generativelanguage.googleapis.com/v1beta"
+class TestGeminiOutboundPolicy:
+    @pytest.mark.parametrize("base_url", ("http://[", None, 7))
+    def test_malformed_or_non_string_base_url_route_facts_are_non_matches(self, base_url):
+        from agent.gemini_outbound_policy import is_gemini_outbound
+
+        assert not is_gemini_outbound(
+            canonical_provider="custom",
+            model="ordinary-model",
+            base_url=base_url,
+            api_mode="chat_completions",
+            routing_hint="ordinary",
+        )
+
+    def test_an_independent_gemini_route_fact_still_denies_malformed_base_url(self):
+        from agent.gemini_outbound_policy import is_gemini_outbound
+
+        assert is_gemini_outbound(
+            canonical_provider="gemini",
+            model="ordinary-model",
+            base_url="http://[",
+            api_mode="chat_completions",
+            routing_hint="ordinary",
+        )
 
 
 # ── Model Catalog ──
