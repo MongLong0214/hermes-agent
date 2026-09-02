@@ -4,7 +4,7 @@ import base64
 import json
 import logging
 import time
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from unittest.mock import patch, MagicMock, AsyncMock
 
 import pytest
@@ -861,10 +861,10 @@ class TestResolveProviderClientUniversalModelFallback:
 
 
 class TestExpiredCodexFallback:
-    """Test that expired Codex tokens don't block the auto chain."""
+    """Expired Codex tokens must not fall through to a Gemini route."""
 
-    def test_expired_codex_falls_through_to_next(self, tmp_path, monkeypatch):
-        """When Codex token is expired, auto chain should skip it and try next provider."""
+    def test_expired_codex_denies_before_gemini_fallback(self, tmp_path, monkeypatch):
+        """An expired Codex token cannot make auto routing use Gemini."""
         import base64
         import time as _time
 
@@ -891,9 +891,14 @@ class TestExpiredCodexFallback:
         with patch("agent.anthropic_adapter.build_anthropic_client") as mock_build:
             mock_build.return_value = MagicMock()
             from agent.auxiliary_client import _resolve_auto
-            client, model = _resolve_auto()
-            # Should NOT be Codex, should be Anthropic (or another available provider)
-            assert not isinstance(client, type(None)), "Should find a provider after expired Codex"
+            from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+            with pytest.raises(GeminiOutboundDenied) as exc_info:
+                _resolve_auto()
+
+        assert exc_info.type is GeminiOutboundDenied
+        assert exc_info.value.code == "gemini_outbound_denied"
+        mock_build.assert_not_called()
 
 
     def test_expired_codex_openrouter_wins(self, tmp_path, monkeypatch):
@@ -1270,44 +1275,30 @@ class TestAuxiliaryPoolAwareness:
 
 
 
-    def test_cached_gmi_client_keeps_explicit_slash_model_override(self):
+    def test_cached_gmi_client_denies_before_resolver(self):
+        """A Gemini alias cannot reach the cached-client resolver."""
         import agent.auxiliary_client as aux
-
-        fake_client = MagicMock()
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
 
         with patch(
             "agent.auxiliary_client.resolve_provider_client",
-            return_value=(fake_client, "google/gemini-3.1-flash-lite-preview"),
+            side_effect=AssertionError("cached-client resolver reached"),
         ) as mock_resolve:
             aux.shutdown_cached_clients()
             try:
-                client, model = aux._get_cached_client(
-                    "gmi",
-                    "google/gemini-3.1-flash-lite-preview",
-                    base_url="https://api.gmi-serving.com/v1",
-                    api_key="gmi-key",
-                )
-                assert client is fake_client
-                assert model == "google/gemini-3.1-flash-lite-preview"
-
-                client, model = aux._get_cached_client(
-                    "gmi",
-                    "openai/gpt-5.4-mini",
-                    base_url="https://api.gmi-serving.com/v1",
-                    api_key="gmi-key",
-                )
+                with pytest.raises(GeminiOutboundDenied) as exc_info:
+                    aux._get_cached_client(
+                        "gmi",
+                        "google/gemini-3.1-flash-lite-preview",
+                        base_url="https://api.gmi-serving.com/v1",
+                        api_key="gmi-key",
+                    )
             finally:
                 aux.shutdown_cached_clients()
 
-        assert client is fake_client
-        assert model == "openai/gpt-5.4-mini"
-        # A DIFFERENT model resolves its own client (model participates in the
-        # cache key). This isolation is what stops two concurrent advisors on
-        # the same provider/base_url/key (e.g. a MoA fan-out) from sharing — and
-        # racing the lifecycle of — one cached client. Same-model reuse is still
-        # a single resolve (verified elsewhere); distinct models => distinct
-        # resolves.
-        assert mock_resolve.call_count == 2
+        assert exc_info.type is GeminiOutboundDenied
+        assert exc_info.value.code == "gemini_outbound_denied"
+        mock_resolve.assert_not_called()
 
 
 # ── Payment / credit exhaustion fallback ─────────────────────────────────
@@ -2226,8 +2217,9 @@ class TestStaleBaseUrlWarning:
     """_resolve_auto() warns when OPENAI_BASE_URL conflicts with config provider (#5161)."""
 
     def test_warns_when_openai_base_url_set_with_named_provider(self, monkeypatch, caplog):
-        """Warning fires when OPENAI_BASE_URL is set but provider is a named provider."""
+        """The stale-base-url warning precedes a Gemini route denial."""
         import agent.auxiliary_client as mod
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
         # Reset the module-level flag so the warning fires
         monkeypatch.setattr(mod, "_stale_base_url_warned", False)
         monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:11434/v1")
@@ -2236,8 +2228,11 @@ class TestStaleBaseUrlWarning:
         with patch("agent.auxiliary_client._read_main_provider", return_value="openrouter"), \
              patch("agent.auxiliary_client._read_main_model", return_value="google/gemini-flash"), \
              caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
-            _resolve_auto()
+            with pytest.raises(GeminiOutboundDenied) as exc_info:
+                _resolve_auto()
 
+        assert exc_info.type is GeminiOutboundDenied
+        assert exc_info.value.code == "gemini_outbound_denied"
         assert any("OPENAI_BASE_URL is set" in rec.message for rec in caplog.records), \
             "Expected a warning about stale OPENAI_BASE_URL"
         assert mod._stale_base_url_warned is True
@@ -2532,13 +2527,27 @@ class TestAuxiliaryAuthRefreshRetry:
     def test_refresh_provider_credentials_force_refreshes_anthropic_oauth_and_evicts_cache(self, monkeypatch):
         stale_client = MagicMock()
         cache_key = ("anthropic", False, None, None, None)
+        cache = {
+            cache_key: (
+                stale_client,
+                "claude-haiku-4-5-20251001",
+                None,
+                MappingProxyType({
+                    "canonical_provider": "anthropic",
+                    "model": "claude-haiku-4-5-20251001",
+                    "base_url": "",
+                    "api_mode": "",
+                    "routing_hint": "anthropic",
+                }),
+            )
+        }
 
         monkeypatch.setenv("ANTHROPIC_TOKEN", "")
         monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "")
         monkeypatch.setenv("ANTHROPIC_API_KEY", "")
 
         with (
-            patch("agent.auxiliary_client._client_cache", {cache_key: (stale_client, "claude-haiku-4-5-20251001", None)}),
+            patch("agent.auxiliary_client._client_cache", cache),
             patch("agent.anthropic_adapter.read_claude_code_credentials", return_value={
                 "accessToken": "expired-token",
                 "refreshToken": "refresh-token",
@@ -2557,51 +2566,874 @@ class TestAuxiliaryAuthRefreshRetry:
 
         mock_refresh_oauth.assert_called_once_with("refresh-token", use_json=False)
         mock_write.assert_called_once_with("fresh-token", "refresh-token-2", 9999999999999)
-        stale_client.close.assert_called_once()
+        assert cache_key not in cache
+        stale_client.close.assert_not_called()
 
     def test_refresh_provider_credentials_remints_vertex_token_and_evicts_cache(self):
-        """Vertex tokens live ~1h; on a long-running gateway the cached
-        auxiliary client's bearer token expires mid-session and 401s.
-        _refresh_provider_credentials("vertex") must re-mint the token via
-        the adapter (which refreshes in place when near expiry) and evict
-        the stale cached client so the next call rebuilds with a fresh one —
-        previously there was no "vertex" branch here at all, so this fell
-        through to the final `return False` and the stale client (and its
-        dead token) stayed cached until process restart."""
+        """Vertex refresh denies before token minting or cache mutation."""
+        from agent.auxiliary_client import _refresh_provider_credentials
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+        class _VertexTokenMintReached(BaseException):
+            pass
+
         stale_client = MagicMock()
         cache_key = ("vertex", False, None, None, None)
-
         with (
-            patch("agent.auxiliary_client._client_cache", {cache_key: (stale_client, "google/gemini-3-flash-preview", None)}),
+            patch(
+                "agent.auxiliary_client._client_cache",
+                {
+                    cache_key: (
+                        stale_client,
+                        "google/gemini-3-flash-preview",
+                        None,
+                        MappingProxyType({
+                            "canonical_provider": "vertex",
+                            "model": "google/gemini-3-flash-preview",
+                            "base_url": "",
+                            "api_mode": "",
+                            "routing_hint": "vertex",
+                        }),
+                    )
+                },
+            ),
             patch(
                 "agent.vertex_adapter.get_vertex_config",
-                return_value=("ya29.FRESH", "https://aiplatform.googleapis.com/v1beta1/projects/p/locations/global/endpoints/openapi"),
+                side_effect=_VertexTokenMintReached("Vertex token mint reached"),
             ) as mock_get_config,
+            patch(
+                "agent.auxiliary_client._evict_cached_clients",
+                side_effect=AssertionError("cache eviction reached"),
+            ) as mock_evict,
         ):
-            from agent.auxiliary_client import _refresh_provider_credentials
+            with pytest.raises(GeminiOutboundDenied) as exc_info:
+                _refresh_provider_credentials("vertex")
 
-            assert _refresh_provider_credentials("vertex") is True
-
-        mock_get_config.assert_called_once()
-        stale_client.close.assert_called_once()
+        assert exc_info.type is GeminiOutboundDenied
+        assert exc_info.value.code == "gemini_outbound_denied"
+        assert str(exc_info.value) == "Gemini outbound requests are disabled."
+        mock_get_config.assert_not_called()
+        mock_evict.assert_not_called()
+        stale_client.close.assert_not_called()
 
     def test_refresh_provider_credentials_vertex_returns_false_when_unminted(self):
-        """No usable token/base_url (e.g. ADC and the service-account file
-        both failed) — refresh must report failure, not silently evict and
-        pretend the client is fixed."""
-        with patch("agent.vertex_adapter.get_vertex_config", return_value=(None, None)):
-            from agent.auxiliary_client import _refresh_provider_credentials
+        """A missing Vertex token may not downgrade default-deny to False."""
+        from agent.auxiliary_client import _refresh_provider_credentials
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
 
-            assert _refresh_provider_credentials("vertex") is False
+        class _VertexCacheMutationReached(BaseException):
+            pass
 
+        with (
+            patch(
+                "agent.vertex_adapter.get_vertex_config",
+                return_value=("token", "https://aiplatform.googleapis.com/v1beta1/projects/p"),
+            ) as mock_get_config,
+            patch(
+                "agent.auxiliary_client._evict_cached_clients",
+                side_effect=_VertexCacheMutationReached("cache eviction reached"),
+            ) as mock_evict,
+        ):
+            with pytest.raises(GeminiOutboundDenied) as exc_info:
+                _refresh_provider_credentials("vertex")
+
+        assert exc_info.type is GeminiOutboundDenied
+        assert exc_info.value.code == "gemini_outbound_denied"
+        assert str(exc_info.value) == "Gemini outbound requests are disabled."
+        mock_get_config.assert_not_called()
+        mock_evict.assert_not_called()
 
     def test_resolve_provider_client_vertex_none_when_no_credentials(self):
-        with patch("agent.vertex_adapter.has_vertex_credentials", return_value=False):
-            client, model = resolve_provider_client("vertex", "google/gemini-3-flash-preview")
+        """Vertex public resolution denies before probing credential presence."""
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
 
-        assert client is None
-        assert model is None
+        with patch(
+            "agent.vertex_adapter.has_vertex_credentials",
+            side_effect=AssertionError("Vertex credential probe reached"),
+        ) as mock_has_credentials:
+            with pytest.raises(GeminiOutboundDenied) as exc_info:
+                resolve_provider_client("vertex", "google/gemini-3-flash-preview")
 
+        assert exc_info.type is GeminiOutboundDenied
+        assert exc_info.value.code == "gemini_outbound_denied"
+        assert str(exc_info.value) == "Gemini outbound requests are disabled."
+        mock_has_credentials.assert_not_called()
+
+
+class TestGeminiAuxiliaryDirectFactories:
+    def test_custom_fallback_registry_gemini_denies_before_pool_or_native_client(self):
+        """The real custom fallback cannot route through a Gemini registry entry."""
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+        class _PoolReadReached(BaseException):
+            pass
+
+        gemini_profile = SimpleNamespace(
+            auth_type="api_key",
+            inference_base_url="https://generativelanguage.googleapis.com/v1beta",
+        )
+        with (
+            patch("agent.auxiliary_client._try_custom_endpoint", return_value=(None, None)),
+            patch("hermes_cli.auth.PROVIDER_REGISTRY", {"gemini": gemini_profile}),
+            patch(
+                "agent.auxiliary_client._select_pool_entry",
+                side_effect=_PoolReadReached("pool selection reached"),
+            ) as mock_pool,
+            patch(
+                "hermes_cli.auth.resolve_api_key_provider_credentials",
+                side_effect=AssertionError("credential resolver reached"),
+            ) as mock_credentials,
+            patch(
+                "agent.gemini_native_adapter.GeminiNativeClient",
+                side_effect=AssertionError("native Gemini client reached"),
+            ) as mock_native,
+            patch(
+                "agent.auxiliary_client._create_openai_client",
+                side_effect=AssertionError("OpenAI factory reached"),
+            ) as mock_openai,
+        ):
+            with pytest.raises(GeminiOutboundDenied) as exc_info:
+                resolve_provider_client("custom", "ordinary-model")
+
+        assert exc_info.type is GeminiOutboundDenied
+        assert exc_info.value.code == "gemini_outbound_denied"
+        assert str(exc_info.value) == "Gemini outbound requests are disabled."
+        mock_pool.assert_not_called()
+        mock_credentials.assert_not_called()
+        mock_native.assert_not_called()
+        mock_openai.assert_not_called()
+
+    def test_cached_gemini_client_hit_denies_before_cache_or_resolver(self):
+        """A preloaded Gemini cache entry cannot bypass public resolution."""
+        from agent.auxiliary_client import _client_cache_key, _get_cached_client
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+        class _CacheHitReached(BaseException):
+            pass
+
+        class _ExplodingCache(dict):
+            def __contains__(self, key):
+                raise _CacheHitReached("cache hit reached")
+
+        cache_key = _client_cache_key(
+            "gemini",
+            async_mode=False,
+            base_url=None,
+            api_key=None,
+            api_mode=None,
+            main_runtime=None,
+            is_vision=False,
+            task=None,
+            model="ordinary-model",
+        )
+        with (
+            patch(
+                "agent.auxiliary_client._client_cache",
+                _ExplodingCache({
+                    cache_key: (
+                        MagicMock(),
+                        "ordinary-model",
+                        None,
+                        MappingProxyType({
+                            "canonical_provider": "gemini",
+                            "model": "ordinary-model",
+                            "base_url": "",
+                            "api_mode": "",
+                            "routing_hint": "gemini",
+                        }),
+                    )
+                }),
+            ),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                side_effect=AssertionError("resolver reached"),
+            ) as mock_resolver,
+        ):
+            with pytest.raises(GeminiOutboundDenied) as exc_info:
+                _get_cached_client("gemini", "ordinary-model")
+
+        assert exc_info.type is GeminiOutboundDenied
+        assert exc_info.value.code == "gemini_outbound_denied"
+        assert str(exc_info.value) == "Gemini outbound requests are disabled."
+        mock_resolver.assert_not_called()
+
+    def test_google_openai_compatible_host_denies_before_httpx_or_openai(self):
+        """The sync generic factory rejects a Google OpenAI-compatible host."""
+        from agent.auxiliary_client import _create_openai_client
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+        class _HttpxSettingsReached(BaseException):
+            pass
+
+        with (
+            patch(
+                "agent.auxiliary_client._openai_http_client_kwargs",
+                side_effect=_HttpxSettingsReached("httpx settings reached"),
+            ) as mock_httpx,
+            patch(
+                "agent.auxiliary_client.OpenAI",
+                side_effect=AssertionError("OpenAI construction reached"),
+            ) as mock_openai,
+        ):
+            with pytest.raises(GeminiOutboundDenied) as exc_info:
+                _create_openai_client(
+                    api_key="test-key",
+                    base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+                )
+
+        assert exc_info.type is GeminiOutboundDenied
+        assert exc_info.value.code == "gemini_outbound_denied"
+        assert str(exc_info.value) == "Gemini outbound requests are disabled."
+        mock_httpx.assert_not_called()
+        mock_openai.assert_not_called()
+
+    def test_non_gemini_openai_client_construction_stays_once(self):
+        """Ordinary OpenAI-compatible auxiliary construction remains unchanged."""
+        from agent.auxiliary_client import _create_openai_client
+
+        expected_client = MagicMock()
+        with (
+            patch(
+                "agent.auxiliary_client._openai_http_client_kwargs",
+                return_value={"http_client": MagicMock()},
+            ),
+            patch("agent.auxiliary_client.OpenAI", return_value=expected_client) as mock_openai,
+        ):
+            result = _create_openai_client(
+                api_key="test-key",
+                base_url="https://ordinary.example.test/v1",
+            )
+
+        assert result is expected_client
+        mock_openai.assert_called_once()
+        assert mock_openai.call_args.kwargs["api_key"] == "test-key"
+        assert mock_openai.call_args.kwargs["base_url"] == "https://ordinary.example.test/v1"
+
+    def test_google_openai_host_async_conversion_denies_before_openai_import(self):
+        """The async conversion checks Gemini route facts before SDK import."""
+        import builtins
+        import openai
+
+        from agent.auxiliary_client import _to_async_client
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+        class _AsyncOpenAIImportReached(BaseException):
+            pass
+
+        real_import = builtins.__import__
+
+        def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "openai":
+                raise _AsyncOpenAIImportReached("AsyncOpenAI import reached")
+            return real_import(name, globals, locals, fromlist, level)
+
+        sync_client = SimpleNamespace(
+            api_key="test-key",
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        )
+        with (
+            patch("builtins.__import__", side_effect=guarded_import) as mock_import,
+            patch.object(
+                openai,
+                "AsyncOpenAI",
+                side_effect=AssertionError("AsyncOpenAI construction reached"),
+            ) as mock_async_openai,
+        ):
+            with pytest.raises(GeminiOutboundDenied) as exc_info:
+                _to_async_client(sync_client, "ordinary-model")
+
+        assert exc_info.type is GeminiOutboundDenied
+        assert exc_info.value.code == "gemini_outbound_denied"
+        assert str(exc_info.value) == "Gemini outbound requests are disabled."
+        mock_import.assert_not_called()
+        mock_async_openai.assert_not_called()
+
+    def test_nous_auxiliary_rebuild_denies_before_runtime_credentials(self):
+        """A Vertex-tagged Nous cache rebuild cannot mint or replace a client."""
+        from agent.auxiliary_client import _refresh_nous_auxiliary_client
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+        class _NousRuntimeLookupReached(BaseException):
+            pass
+
+        with (
+            patch(
+                "agent.auxiliary_client._resolve_nous_runtime_api",
+                side_effect=_NousRuntimeLookupReached("Nous runtime credential lookup reached"),
+            ) as mock_runtime,
+            patch(
+                "agent.auxiliary_client._create_openai_client",
+                side_effect=AssertionError("OpenAI reconstruction reached"),
+            ) as mock_openai,
+            patch(
+                "agent.auxiliary_client._store_cached_client",
+                side_effect=AssertionError("cache replacement reached"),
+            ) as mock_store,
+        ):
+            with pytest.raises(GeminiOutboundDenied) as exc_info:
+                _refresh_nous_auxiliary_client(
+                    cache_provider="vertex",
+                    model="ordinary-model",
+                    async_mode=False,
+                    base_url="https://ordinary.example.test/v1",
+                    api_mode="chat_completions",
+                )
+
+        assert exc_info.type is GeminiOutboundDenied
+        assert exc_info.value.code == "gemini_outbound_denied"
+        assert str(exc_info.value) == "Gemini outbound requests are disabled."
+        mock_runtime.assert_not_called()
+        mock_openai.assert_not_called()
+        mock_store.assert_not_called()
+
+
+class TestGeminiAuxiliaryIndependentReviewBlockers:
+    def test_named_custom_google_anthropic_denies_before_named_credentials_headers_and_native_client(self):
+        """Resolved named-custom Google facts deny before any named-route effect."""
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+        named_entry = {
+            "base_url": "https://generativelanguage.googleapis.com/v1beta",
+            "key_env": "NAMED_CUSTOM_KEY",
+            "key_cmd": "printf should-not-run",
+            "api_mode": "anthropic_messages",
+            "model": "ordinary-model",
+        }
+        with (
+            patch(
+                "hermes_cli.runtime_provider._get_named_custom_provider",
+                return_value=named_entry,
+            ),
+            patch(
+                "agent.auxiliary_client._scoped_key_env",
+                side_effect=AssertionError("named custom key environment read reached"),
+            ) as mock_key_env,
+            patch(
+                "agent.command_token_source.build_command_token_provider",
+                side_effect=AssertionError("named custom key command reached"),
+            ) as mock_key_cmd,
+            patch(
+                "agent.auxiliary_client._apply_user_default_headers",
+                side_effect=AssertionError("named custom headers reached"),
+            ) as mock_headers,
+            patch(
+                "agent.anthropic_adapter.build_anthropic_client",
+                side_effect=AssertionError("named custom native client reached"),
+            ) as mock_native,
+        ):
+            with pytest.raises(GeminiOutboundDenied) as exc_info:
+                resolve_provider_client("custom:local-route", "ordinary-model")
+
+        assert exc_info.type is GeminiOutboundDenied
+        assert exc_info.value.code == "gemini_outbound_denied"
+        assert str(exc_info.value) == "Gemini outbound requests are disabled."
+        mock_key_env.assert_not_called()
+        mock_key_cmd.assert_not_called()
+        mock_headers.assert_not_called()
+        mock_native.assert_not_called()
+
+    def test_named_custom_gemini_native_denies_before_httpx_or_client(self):
+        """A persisted native mode cannot use a generic named custom host."""
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+        named_entry = {
+            "base_url": "https://ordinary.example.test/v1",
+            "api_key": "test-key",
+            "api_mode": "gemini_native",
+            "model": "ordinary-model",
+        }
+        with (
+            patch(
+                "hermes_cli.runtime_provider._get_named_custom_provider",
+                return_value=named_entry,
+            ),
+            patch(
+                "agent.auxiliary_client._apply_user_default_headers",
+                return_value=None,
+            ) as mock_headers,
+            patch(
+                "agent.auxiliary_client._openai_http_client_kwargs",
+                side_effect=AssertionError("named custom httpx settings reached"),
+            ) as mock_httpx,
+            patch(
+                "agent.auxiliary_client.OpenAI",
+                side_effect=AssertionError("named custom OpenAI client reached"),
+            ) as mock_openai,
+        ):
+            with pytest.raises(GeminiOutboundDenied) as exc_info:
+                resolve_provider_client("custom:native-route", "ordinary-model")
+
+        assert exc_info.type is GeminiOutboundDenied
+        assert exc_info.value.code == "gemini_outbound_denied"
+        assert str(exc_info.value) == "Gemini outbound requests are disabled."
+        mock_headers.assert_not_called()
+        mock_httpx.assert_not_called()
+        mock_openai.assert_not_called()
+
+    def test_custom_runtime_gemini_native_denies_before_httpx_or_client(self):
+        """The directly callable custom endpoint checks persisted mode first."""
+        import agent.auxiliary_client as aux
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+        with (
+            patch(
+                "agent.auxiliary_client._resolve_custom_runtime",
+                return_value=("https://ordinary.example.test/v1", "test-key", "gemini_native"),
+            ),
+            patch(
+                "agent.auxiliary_client._read_main_model_for_aux",
+                return_value="ordinary-model",
+            ) as mock_model,
+            patch(
+                "agent.auxiliary_client._apply_user_default_headers",
+                return_value=None,
+            ) as mock_headers,
+            patch(
+                "agent.auxiliary_client._openai_http_client_kwargs",
+                side_effect=AssertionError("custom runtime httpx settings reached"),
+            ) as mock_httpx,
+            patch(
+                "agent.auxiliary_client.OpenAI",
+                side_effect=AssertionError("custom runtime OpenAI client reached"),
+            ) as mock_openai,
+        ):
+            with pytest.raises(GeminiOutboundDenied) as exc_info:
+                aux._try_custom_endpoint()
+
+        assert exc_info.type is GeminiOutboundDenied
+        assert exc_info.value.code == "gemini_outbound_denied"
+        assert str(exc_info.value) == "Gemini outbound requests are disabled."
+        mock_model.assert_not_called()
+        mock_headers.assert_not_called()
+        mock_httpx.assert_not_called()
+        mock_openai.assert_not_called()
+
+    def test_nonalias_registry_google_host_denies_before_pool_or_client(self):
+        """A registry label cannot authorize a discovered Google inference host."""
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+        google_profile = SimpleNamespace(
+            auth_type="api_key",
+            name="ordinary-label",
+            inference_base_url="https://generativelanguage.googleapis.com/v1beta",
+        )
+        with (
+            patch("agent.auxiliary_client._try_custom_endpoint", return_value=(None, None)),
+            patch("hermes_cli.auth.PROVIDER_REGISTRY", {"ordinary-label": google_profile}),
+            patch(
+                "agent.auxiliary_client._get_aux_model_for_provider",
+                return_value="ordinary-model",
+            ),
+            patch(
+                "agent.auxiliary_client._select_pool_entry",
+                side_effect=AssertionError("nonalias registry pool selection reached"),
+            ) as mock_pool,
+            patch(
+                "hermes_cli.auth.resolve_api_key_provider_credentials",
+                side_effect=AssertionError("nonalias registry credential resolver reached"),
+            ) as mock_credentials,
+            patch(
+                "agent.gemini_native_adapter.GeminiNativeClient",
+                side_effect=AssertionError("nonalias registry native client reached"),
+            ) as mock_native,
+            patch(
+                "agent.auxiliary_client._create_openai_client",
+                side_effect=AssertionError("nonalias registry OpenAI factory reached"),
+            ) as mock_openai,
+        ):
+            with pytest.raises(GeminiOutboundDenied) as exc_info:
+                resolve_provider_client("custom", "ordinary-model")
+
+        assert exc_info.type is GeminiOutboundDenied
+        assert exc_info.value.code == "gemini_outbound_denied"
+        assert str(exc_info.value) == "Gemini outbound requests are disabled."
+        mock_pool.assert_not_called()
+        mock_credentials.assert_not_called()
+        mock_native.assert_not_called()
+        mock_openai.assert_not_called()
+
+    @pytest.mark.parametrize("selected_provider", ("gemini", "vertex"))
+    def test_auto_selected_google_route_denies_before_proxy_credentials_or_client(self, selected_provider):
+        """Bare auto defers proxy validation until its selected route is denied."""
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+        selected_client = SimpleNamespace(base_url="https://ordinary.example.test/v1")
+        with (
+            patch(
+                "agent.auxiliary_client._resolve_auto_route",
+                return_value=(selected_client, "ordinary-model", selected_provider),
+            ) as mock_auto,
+            patch(
+                "agent.auxiliary_client._validate_proxy_env_urls",
+                side_effect=AssertionError("auto proxy validation reached"),
+            ) as mock_proxy,
+            patch(
+                "agent.auxiliary_client._resolve_api_key_provider",
+                side_effect=AssertionError("auto credential resolution reached"),
+            ) as mock_credentials,
+            patch(
+                "agent.auxiliary_client._create_openai_client",
+                side_effect=AssertionError("auto OpenAI factory reached"),
+            ) as mock_openai,
+            patch(
+                "agent.auxiliary_client._tag_effective_provider",
+                side_effect=AssertionError("auto client effect reached"),
+            ) as mock_tag,
+        ):
+            with pytest.raises(GeminiOutboundDenied) as exc_info:
+                resolve_provider_client("auto")
+
+        assert exc_info.type is GeminiOutboundDenied
+        assert exc_info.value.code == "gemini_outbound_denied"
+        assert str(exc_info.value) == "Gemini outbound requests are disabled."
+        mock_auto.assert_called_once_with(main_runtime=None, task=None)
+        mock_proxy.assert_not_called()
+        mock_credentials.assert_not_called()
+        mock_openai.assert_not_called()
+        mock_tag.assert_not_called()
+
+    def test_cached_gmi_non_gemini_slash_model_uses_own_cache_entry(self):
+        """Permitted GMI slash models retain isolated cache entries and resolve once each."""
+        import agent.auxiliary_client as aux
+
+        mini_client = MagicMock()
+        nano_client = MagicMock()
+        mini_model = "openai/gpt-5.4-mini"
+        nano_model = "openai/gpt-5.4-nano"
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            side_effect=[(mini_client, mini_model), (nano_client, nano_model)],
+        ) as mock_resolve:
+            aux.shutdown_cached_clients()
+            try:
+                first_client, first_model = aux._get_cached_client(
+                    "gmi", mini_model,
+                    base_url="https://api.gmi-serving.com/v1", api_key="test-key",
+                )
+                cached_client, cached_model = aux._get_cached_client(
+                    "gmi", mini_model,
+                    base_url="https://api.gmi-serving.com/v1", api_key="test-key",
+                )
+                second_client, second_model = aux._get_cached_client(
+                    "gmi", nano_model,
+                    base_url="https://api.gmi-serving.com/v1", api_key="test-key",
+                )
+            finally:
+                aux.shutdown_cached_clients()
+
+        assert first_client is mini_client
+        assert first_model == mini_model
+        assert cached_client is mini_client
+        assert cached_model == mini_model
+        assert second_client is nano_client
+        assert second_model == nano_model
+        assert mock_resolve.call_count == 2
+        assert [call.args[:2] for call in mock_resolve.call_args_list] == [
+            ("gmi", mini_model),
+            ("gmi", nano_model),
+        ]
+
+
+class TestGeminiAuxiliaryMetadataOrdering:
+    @pytest.mark.parametrize(
+        ("base_url", "transport"),
+        (
+            (
+                "https://generativelanguage.googleapis.com.:443/v1beta",
+                "anthropic_messages",
+            ),
+            ("https://ordinary.example.test/v1", "gemini_native"),
+        ),
+    )
+    def test_real_named_custom_route_denies_before_proxy_validation(
+        self, base_url, transport
+    ):
+        """Named custom policy facts must run before the resolver's proxy preflight."""
+        import hermes_cli.runtime_provider as rp
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+        class _ProxyValidationReached(BaseException):
+            pass
+
+        config = {
+            "providers": {
+                "local-route": {
+                    "name": "Local Route",
+                    "api": base_url,
+                    "key_env": "NAMED_CUSTOM_KEY",
+                    "default_model": "ordinary-model",
+                    "transport": transport,
+                },
+            },
+        }
+        with (
+            patch.object(rp, "load_config", return_value=config),
+            patch.object(
+                rp,
+                "_getenv",
+                side_effect=AssertionError("named custom key environment read reached"),
+            ) as mock_key_env,
+            patch(
+                "agent.auxiliary_client._validate_proxy_env_urls",
+                side_effect=_ProxyValidationReached("named custom proxy validation reached"),
+            ) as mock_proxy,
+        ):
+            with pytest.raises(GeminiOutboundDenied) as exc_info:
+                resolve_provider_client("custom:local-route", "ordinary-model")
+
+        assert exc_info.type is GeminiOutboundDenied
+        assert exc_info.value.code == "gemini_outbound_denied"
+        assert str(exc_info.value) == "Gemini outbound requests are disabled."
+        mock_proxy.assert_not_called()
+        mock_key_env.assert_not_called()
+
+    def test_real_named_custom_route_denies_before_key_env(self):
+        """The real named-provider lookup cannot fetch a credential before deny."""
+        import hermes_cli.runtime_provider as rp
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+        class _KeyEnvReadReached(BaseException):
+            pass
+
+        config = {
+            "providers": {
+                "local-route": {
+                    "name": "Local Route",
+                    "api": "https://generativelanguage.googleapis.com/v1beta",
+                    "key_env": "NAMED_CUSTOM_KEY",
+                    "default_model": "ordinary-model",
+                    "transport": "anthropic_messages",
+                },
+            },
+        }
+        with (
+            patch.object(rp, "load_config", return_value=config),
+            patch.object(
+                rp,
+                "_getenv",
+                side_effect=_KeyEnvReadReached("named custom key environment read reached"),
+            ) as mock_key_env,
+            patch(
+                "agent.auxiliary_client._validate_proxy_env_urls", return_value=None
+            ) as mock_proxy,
+        ):
+            with pytest.raises(GeminiOutboundDenied) as exc_info:
+                resolve_provider_client("custom:local-route", "ordinary-model")
+
+        assert exc_info.type is GeminiOutboundDenied
+        assert exc_info.value.code == "gemini_outbound_denied"
+        assert str(exc_info.value) == "Gemini outbound requests are disabled."
+        mock_proxy.assert_not_called()
+        mock_key_env.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("base_url", "transport"),
+        (
+            (
+                "https://generativelanguage.googleapis.com.:443/v1beta",
+                "anthropic_messages",
+            ),
+            (
+                "https://us-central1-aiplatform.googleapis.com:443/v1/projects/p",
+                "chat_completions",
+            ),
+            ("https://ordinary.example.test/v1", "gemini_native"),
+        ),
+    )
+    def test_real_auto_named_custom_route_denies_before_key_env_or_proxy(
+        self, base_url, transport
+    ):
+        """Auto classifies actual named Gemini, Vertex, and Google routes first."""
+        import hermes_cli.runtime_provider as rp
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+        class _KeyEnvReadReached(BaseException):
+            pass
+
+        config = {
+            "providers": {
+                "local-route": {
+                    "name": "Local Route",
+                    "api": base_url,
+                    "key_env": "NAMED_CUSTOM_KEY",
+                    "default_model": "ordinary-model",
+                    "transport": transport,
+                },
+            },
+        }
+        with (
+            patch.object(rp, "load_config", return_value=config),
+            patch.object(
+                rp,
+                "_getenv",
+                side_effect=_KeyEnvReadReached("auto named custom key environment read reached"),
+            ) as mock_key_env,
+            patch(
+                "agent.auxiliary_client._validate_proxy_env_urls",
+                side_effect=AssertionError("auto proxy validation reached"),
+            ) as mock_proxy,
+        ):
+            with pytest.raises(GeminiOutboundDenied) as exc_info:
+                resolve_provider_client(
+                    "auto",
+                    main_runtime={
+                        "provider": "custom:local-route",
+                        "model": "ordinary-model",
+                    },
+                )
+
+        assert exc_info.type is GeminiOutboundDenied
+        assert exc_info.value.code == "gemini_outbound_denied"
+        assert str(exc_info.value) == "Gemini outbound requests are disabled."
+        mock_key_env.assert_not_called()
+        mock_proxy.assert_not_called()
+
+    def test_allowed_real_named_custom_route_reads_key_env_once_after_policy(self):
+        """An ordinary named custom endpoint still delegates one credential lookup."""
+        import hermes_cli.runtime_provider as rp
+
+        expected_client = MagicMock()
+        config = {
+            "providers": {
+                "ordinary-route": {
+                    "name": "Ordinary Route",
+                    "api": "https://ordinary.example.test/v1",
+                    "key_env": "ORDINARY_CUSTOM_KEY",
+                    "default_model": "ordinary-model",
+                    "transport": "chat_completions",
+                },
+            },
+        }
+        with (
+            patch.object(rp, "load_config", return_value=config),
+            patch.object(rp, "_getenv", return_value="allowed-key") as mock_key_env,
+            patch(
+                "agent.auxiliary_client._validate_proxy_env_urls", return_value=None
+            ) as mock_proxy,
+            patch(
+                "agent.auxiliary_client._create_openai_client", return_value=expected_client
+            ) as mock_openai,
+        ):
+            client, model = resolve_provider_client(
+                "custom:ordinary-route", "ordinary-model"
+            )
+
+        assert client is expected_client
+        assert model == "ordinary-model"
+        mock_proxy.assert_called_once()
+        mock_key_env.assert_called_once_with("ORDINARY_CUSTOM_KEY", "")
+        mock_openai.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "resolver",
+        ("_resolve_custom_runtime", "_try_custom_endpoint"),
+    )
+    def test_custom_runtime_propagates_typed_gemini_denial(self, resolver):
+        """Custom-runtime callers must not turn the fixed deny into fallback."""
+        from agent import auxiliary_client as aux
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+        with patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            side_effect=GeminiOutboundDenied(),
+        ):
+            with pytest.raises(GeminiOutboundDenied) as exc_info:
+                getattr(aux, resolver)()
+
+        assert exc_info.type is GeminiOutboundDenied
+        assert exc_info.value.code == "gemini_outbound_denied"
+        assert str(exc_info.value) == "Gemini outbound requests are disabled."
+
+    def test_public_registry_google_pconfig_denies_before_proxy_or_credentials(self):
+        """A mutable ordinary label cannot authorize its inference endpoint."""
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+        google_profile = SimpleNamespace(
+            auth_type="api_key",
+            name="ordinary-label",
+            inference_base_url=(
+                "https://US-CENTRAL1.aiplatform.googleapis.com.:443/v1/projects/p"
+            ),
+            api_mode="chat_completions",
+            api_key_env_vars=(),
+        )
+        with (
+            patch("hermes_cli.auth.PROVIDER_REGISTRY", {"ordinary-label": google_profile}),
+            patch(
+                "agent.auxiliary_client._validate_proxy_env_urls", return_value=None
+            ) as mock_proxy,
+            patch(
+                "hermes_cli.auth.resolve_api_key_provider_credentials",
+                side_effect=AssertionError("registry API-key credential resolver reached"),
+            ) as mock_credentials,
+            patch(
+                "agent.auxiliary_client._create_openai_client",
+                side_effect=AssertionError("registry OpenAI client reached"),
+            ) as mock_openai,
+        ):
+            with pytest.raises(GeminiOutboundDenied) as exc_info:
+                resolve_provider_client("ordinary-label", "ordinary-model")
+
+        assert exc_info.type is GeminiOutboundDenied
+        assert exc_info.value.code == "gemini_outbound_denied"
+        assert str(exc_info.value) == "Gemini outbound requests are disabled."
+        mock_proxy.assert_not_called()
+        mock_credentials.assert_not_called()
+        mock_openai.assert_not_called()
+
+    def test_pool_runtime_google_base_denies_before_pool_key_or_client(self):
+        """Pool runtime endpoint metadata is a policy input before its key."""
+        import agent.auxiliary_client as aux
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+        safe_profile = SimpleNamespace(
+            auth_type="api_key",
+            name="ordinary-label",
+            inference_base_url="https://ordinary.example.test/v1",
+            api_mode="chat_completions",
+        )
+        pool_entry = SimpleNamespace(
+            runtime_base_url=(
+                "https://US-CENTRAL1.aiplatform.googleapis.com.:443/v1/projects/p"
+            ),
+        )
+        with (
+            patch("hermes_cli.auth.PROVIDER_REGISTRY", {"ordinary-label": safe_profile}),
+            patch(
+                "agent.auxiliary_client._get_aux_model_for_provider",
+                return_value="ordinary-model",
+            ),
+            patch(
+                "agent.auxiliary_client._select_pool_entry", return_value=(True, pool_entry)
+            ) as mock_pool,
+            patch(
+                "agent.auxiliary_client._pool_runtime_api_key",
+                side_effect=AssertionError("pool API-key read reached"),
+            ) as mock_pool_key,
+            patch(
+                "hermes_cli.auth.resolve_api_key_provider_credentials",
+                side_effect=AssertionError("fallback API-key resolver reached"),
+            ) as mock_credentials,
+            patch(
+                "agent.gemini_native_adapter.GeminiNativeClient",
+                side_effect=AssertionError("native Gemini client reached"),
+            ) as mock_native,
+            patch(
+                "agent.auxiliary_client._create_openai_client",
+                side_effect=AssertionError("OpenAI client reached"),
+            ) as mock_openai,
+        ):
+            with pytest.raises(GeminiOutboundDenied) as exc_info:
+                aux._resolve_api_key_provider()
+
+        assert exc_info.type is GeminiOutboundDenied
+        assert exc_info.value.code == "gemini_outbound_denied"
+        assert str(exc_info.value) == "Gemini outbound requests are disabled."
+        mock_pool.assert_called_once_with("ordinary-label")
+        mock_pool_key.assert_not_called()
+        mock_credentials.assert_not_called()
+        mock_native.assert_not_called()
+        mock_openai.assert_not_called()
 
 
 class TestAuxiliaryPoolRotationRetry:
@@ -3542,8 +4374,30 @@ class TestAuxiliaryClientPoisonedCacheEviction:
         async_wrapper = AsyncCodexAuxiliaryClient(sync_wrapper)
         with _client_cache_lock:
             _client_cache.clear()
-            _client_cache[("openai-codex", False, None, None, None)] = (sync_wrapper, "gpt-5.5", None)
-            _client_cache[("openai-codex", True, None, None, None)] = (async_wrapper, "gpt-5.5", None)
+            _client_cache[("openai-codex", False, None, None, None)] = (
+                sync_wrapper,
+                "gpt-5.5",
+                None,
+                MappingProxyType({
+                    "canonical_provider": "openai-codex",
+                    "model": "gpt-5.5",
+                    "base_url": "https://chatgpt.com/backend-api/codex",
+                    "api_mode": "",
+                    "routing_hint": "openai-codex",
+                }),
+            )
+            _client_cache[("openai-codex", True, None, None, None)] = (
+                async_wrapper,
+                "gpt-5.5",
+                None,
+                MappingProxyType({
+                    "canonical_provider": "openai-codex",
+                    "model": "gpt-5.5",
+                    "base_url": "https://chatgpt.com/backend-api/codex",
+                    "api_mode": "",
+                    "routing_hint": "openai-codex",
+                }),
+            )
         try:
             assert _evict_cached_client_instance(real) is True
             assert ("openai-codex", False, None, None, None) not in _client_cache
@@ -3575,7 +4429,18 @@ class TestAuxiliaryClientPoisonedCacheEviction:
         cache_key = ("openai-codex", False, None, None, None)
         with _client_cache_lock:
             _client_cache.clear()
-            _client_cache[cache_key] = (poisoned, "gpt-5.5", None)
+            _client_cache[cache_key] = (
+                poisoned,
+                "gpt-5.5",
+                None,
+                MappingProxyType({
+                    "canonical_provider": "openai-codex",
+                    "model": "gpt-5.5",
+                    "base_url": "https://chatgpt.com/backend-api/codex",
+                    "api_mode": "",
+                    "routing_hint": "openai-codex",
+                }),
+            )
 
         try:
             with patch(
@@ -4623,3 +5488,519 @@ class TestFastModelTier:
             _FAST_MODEL_TASKS
         )
         assert not overlap
+
+
+def test_named_custom_provider_consumes_the_authorized_config_snapshot_once(monkeypatch):
+    """A post-guard config swap cannot replace the route whose credentials are used."""
+    import agent.auxiliary_client as aux
+    from hermes_cli import runtime_provider as runtime
+
+    safe_config = {
+        "providers": {
+            "relay": {
+                "name": "relay",
+                "url": "https://safe-relay.example/v1",
+                "default_model": "ordinary-model",
+                "api_key": "safe-inline-key",
+            }
+        }
+    }
+    google_config = {
+        "providers": {
+            "relay": {
+                "name": "relay",
+                "url": "https://generativelanguage.googleapis.com/v1beta",
+                "default_model": "google/gemini-3-flash",
+                "api_key": "google-inline-key",
+            }
+        }
+    }
+    calls = {"config": 0, "proxy": 0, "client": []}
+
+    def swapping_config():
+        calls["config"] += 1
+        return safe_config if calls["config"] == 1 else google_config
+
+    client = MagicMock(name="safe-snapshot-client")
+    monkeypatch.setattr(runtime, "load_config", swapping_config)
+    monkeypatch.setattr(
+        aux,
+        "_validate_proxy_env_urls",
+        lambda: calls.__setitem__("proxy", calls["proxy"] + 1),
+    )
+    monkeypatch.setattr(
+        aux,
+        "_create_openai_client",
+        lambda **kwargs: calls["client"].append(kwargs) or client,
+    )
+    monkeypatch.setattr(
+        aux, "_wrap_if_needed", lambda created, *_args: created, raising=False
+    )
+
+    resolved_client, resolved_model = aux.resolve_provider_client(
+        "custom:relay", "ordinary-model"
+    )
+
+    assert resolved_client is client
+    assert resolved_model == "ordinary-model"
+    assert calls["config"] == 1
+    assert calls["proxy"] == 1
+    assert calls["client"] == [
+        {"api_key": "safe-inline-key", "base_url": "https://safe-relay.example/v1"}
+    ]
+
+
+def test_named_custom_rejects_mutable_snapshot_before_proxy_or_client_effects(monkeypatch):
+    """An externally mutable route snapshot can never authorize a named client."""
+    import agent.auxiliary_client as aux
+    from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+    calls = {"base_url": 0, "proxy": 0, "client": 0}
+
+    class TwoReadSnapshot(dict):
+        def get(self, key, default=None):
+            if key == "base_url":
+                calls["base_url"] += 1
+                return (
+                    "https://safe-relay.example/v1"
+                    if calls["base_url"] == 1
+                    else "https://generativelanguage.googleapis.com/v1beta"
+                )
+            return super().get(key, default)
+
+    hostile_snapshot = TwoReadSnapshot(
+        {
+            "kind": "providers",
+            "name": "relay",
+            "routing_hint": "custom:relay",
+            "base_url": "https://safe-relay.example/v1",
+            "api_key": "safe-inline-key",
+            "key_env": "",
+            "key_cmd": "",
+            "model": "ordinary-model",
+            "api_mode": "chat_completions",
+            "extra_body": {},
+            "extra_headers": {},
+            "max_output_tokens": None,
+        }
+    )
+
+    def unexpected_proxy():
+        calls["proxy"] += 1
+        raise AssertionError("proxy validation reached")
+
+    def unexpected_client(**_kwargs):
+        calls["client"] += 1
+        raise AssertionError("client construction reached")
+
+    monkeypatch.setattr(aux, "_validate_proxy_env_urls", unexpected_proxy)
+    monkeypatch.setattr(aux, "_create_openai_client", unexpected_client)
+
+    with pytest.raises(GeminiOutboundDenied) as exc_info:
+        aux.resolve_provider_client(
+            "custom:relay",
+            "ordinary-model",
+            named_custom_provider_snapshot=hostile_snapshot,
+        )
+
+    assert exc_info.type is GeminiOutboundDenied
+    assert exc_info.value.code == "gemini_outbound_denied"
+    assert str(exc_info.value) == "Gemini outbound requests are disabled."
+    assert vars(exc_info.value) == {}
+    assert calls == {"base_url": 0, "proxy": 0, "client": 0}
+
+
+def test_named_custom_rejects_caller_mapping_proxy_before_proxy_or_client_effects(monkeypatch):
+    """A caller-owned mapping proxy cannot stand in for selector route authority."""
+    import agent.auxiliary_client as aux
+    from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+    calls = {"proxy": 0, "client": 0}
+    mutable_nested = {"route": "safe-now-mutable-later"}
+    caller_owned_snapshot = MappingProxyType(
+        {
+            "kind": "providers",
+            "name": "relay",
+            "routing_hint": "custom:relay",
+            "base_url": "https://safe-relay.example/v1",
+            "api_key": "safe-inline-key",
+            "key_env": "",
+            "key_cmd": "",
+            "model": "ordinary-model",
+            "api_mode": "chat_completions",
+            "extra_body": MappingProxyType(mutable_nested),
+            "extra_headers": MappingProxyType({}),
+            "max_output_tokens": None,
+        }
+    )
+
+    def unexpected(effect):
+        def fail(*_args, **_kwargs):
+            calls[effect] += 1
+            raise AssertionError(f"caller mapping proxy {effect} effect reached")
+
+        return fail
+
+    monkeypatch.setattr(aux, "_validate_proxy_env_urls", unexpected("proxy"))
+    monkeypatch.setattr(aux, "_create_openai_client", unexpected("client"))
+
+    with pytest.raises(GeminiOutboundDenied) as exc_info:
+        aux.resolve_provider_client(
+            "custom:relay",
+            "ordinary-model",
+            named_custom_provider_snapshot=caller_owned_snapshot,
+        )
+
+    assert exc_info.type is GeminiOutboundDenied
+    assert exc_info.value.code == "gemini_outbound_denied"
+    assert str(exc_info.value) == "Gemini outbound requests are disabled."
+    assert vars(exc_info.value) == {}
+    assert calls == {"proxy": 0, "client": 0}
+
+
+def test_cached_client_denies_stored_google_route_not_safe_caller_arguments():
+    """A poisoned first miss must not return, store, or close a foreign client."""
+    import agent.auxiliary_client as aux
+    from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+    poisoned_client = SimpleNamespace(
+        base_url="https://generativelanguage.googleapis.com/v1beta",
+        close=MagicMock(name="foreign-poison-close"),
+    )
+    cache_key = aux._client_cache_key(
+        "ordinary-label",
+        async_mode=False,
+        base_url="https://safe-relay.example/v1",
+        api_key="safe-key",
+        model="ordinary-model",
+    )
+    with patch(
+        "agent.auxiliary_client.resolve_provider_client",
+        return_value=(poisoned_client, "ordinary-model"),
+    ) as resolve:
+        aux.shutdown_cached_clients()
+        try:
+            with pytest.raises(GeminiOutboundDenied) as exc_info:
+                aux._get_cached_client(
+                    "ordinary-label",
+                    "ordinary-model",
+                    base_url="https://safe-relay.example/v1",
+                    api_key="safe-key",
+                )
+            with aux._client_cache_lock:
+                assert cache_key not in aux._client_cache
+        finally:
+            aux.shutdown_cached_clients()
+
+    assert exc_info.type is GeminiOutboundDenied
+    assert exc_info.value.code == "gemini_outbound_denied"
+    assert str(exc_info.value) == "Gemini outbound requests are disabled."
+    assert vars(exc_info.value) == {}
+    assert resolve.call_count == 1
+    poisoned_client.close.assert_not_called()
+
+
+def test_cached_real_openai_google_url_denies_before_safe_key_cache_return():
+    """A real URL-valued Google endpoint is denied before first cache return."""
+    import agent.auxiliary_client as aux
+    from agent.gemini_outbound_policy import GeminiOutboundDenied
+    from openai import OpenAI
+
+    google_client = OpenAI(
+        api_key="safe-test-key",
+        base_url="https://generativelanguage.googleapis.com/v1beta",
+    )
+    with patch(
+        "agent.auxiliary_client.resolve_provider_client",
+        return_value=(google_client, "ordinary-model"),
+    ) as resolve:
+        aux.shutdown_cached_clients()
+        try:
+            with pytest.raises(GeminiOutboundDenied) as exc_info:
+                aux._get_cached_client(
+                    "ordinary-label",
+                    "ordinary-model",
+                    base_url="https://safe-relay.example/v1",
+                    api_key="safe-key",
+                )
+            with aux._client_cache_lock:
+                assert not aux._client_cache
+        finally:
+            aux.shutdown_cached_clients()
+
+    assert exc_info.type is GeminiOutboundDenied
+    assert exc_info.value.code == "gemini_outbound_denied"
+    assert str(exc_info.value) == "Gemini outbound requests are disabled."
+    assert vars(exc_info.value) == {}
+    assert resolve.call_count == 1
+
+
+def test_exact_cache_eviction_does_not_close_sibling_model_client():
+    """Recovery eviction owns one cache identity, not every provider sibling."""
+    import agent.auxiliary_client as aux
+
+    first = SimpleNamespace(
+        base_url="https://safe-relay.example/v1", close=MagicMock(name="first-close")
+    )
+    sibling = SimpleNamespace(
+        base_url="https://safe-relay.example/v1", close=MagicMock(name="sibling-close")
+    )
+    first_key = aux._client_cache_key(
+        "ordinary-label",
+        async_mode=False,
+        base_url="https://safe-relay.example/v1",
+        api_key="safe-key",
+        model="model-a",
+    )
+    sibling_key = aux._client_cache_key(
+        "ordinary-label",
+        async_mode=False,
+        base_url="https://safe-relay.example/v1",
+        api_key="safe-key",
+        api_mode="codex_responses",
+        model="model-b",
+    )
+
+    aux.shutdown_cached_clients()
+    try:
+        assert aux._store_cached_client(
+            first_key,
+            first,
+            "model-a",
+            route_facts=aux._frozen_cached_route_facts(
+                provider="ordinary-label",
+                model="model-a",
+                base_url="https://safe-relay.example/v1",
+                api_mode="chat_completions",
+                main_runtime=None,
+                client=first,
+                default_model="model-a",
+            ),
+        )
+        assert aux._store_cached_client(
+            sibling_key,
+            sibling,
+            "model-b",
+            route_facts=aux._frozen_cached_route_facts(
+                provider="ordinary-label",
+                model="model-b",
+                base_url="https://safe-relay.example/v1",
+                api_mode="codex_responses",
+                main_runtime=None,
+                client=sibling,
+                default_model="model-b",
+            ),
+        )
+
+        aux._evict_cached_clients("ordinary-label", cache_key=first_key)
+
+        first.close.assert_called_once_with()
+        sibling.close.assert_not_called()
+        with aux._client_cache_lock:
+            assert first_key not in aux._client_cache
+            assert sibling_key in aux._client_cache
+    finally:
+        aux.shutdown_cached_clients()
+
+
+def test_configured_fallback_google_route_denies_before_secret_and_escapes(monkeypatch):
+    """The real unavailable-client fallback cannot swallow a pre-secret Gemini denial."""
+    import agent.auxiliary_client as aux
+    from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+    effects = {"secret": 0, "proxy": 0, "client": 0}
+
+    def unexpected(effect):
+        def fail(*_args, **_kwargs):
+            effects[effect] += 1
+            raise AssertionError(f"configured fallback {effect} effect reached")
+
+        return fail
+
+    monkeypatch.setattr(aux, "_get_cached_client", lambda *_args, **_kwargs: (None, None))
+    monkeypatch.setattr(
+        aux,
+        "_get_auxiliary_task_config",
+        lambda _task: {
+            "fallback_chain": [
+                {
+                    "provider": "ordinary-fallback",
+                    "model": "ordinary-model",
+                    "base_url": "https://generativelanguage.googleapis.com/v1beta",
+                    "api_mode": "anthropic_messages",
+                    "key_env": "FALLBACK_KEY",
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(aux, "_fallback_entry_api_key", unexpected("secret"))
+    monkeypatch.setattr(aux, "_validate_proxy_env_urls", unexpected("proxy"))
+    monkeypatch.setattr(aux, "_create_openai_client", unexpected("client"))
+
+    with pytest.raises(GeminiOutboundDenied) as exc_info:
+        aux.call_llm(
+            task="title_generation",
+            provider="ordinary-primary",
+            model="ordinary-model",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+
+    assert exc_info.type is GeminiOutboundDenied
+    assert exc_info.value.code == "gemini_outbound_denied"
+    assert str(exc_info.value) == "Gemini outbound requests are disabled."
+    assert vars(exc_info.value) == {}
+    assert effects == {"secret": 0, "proxy": 0, "client": 0}
+
+
+def test_raw_named_custom_alias_and_auto_selected_raw_alias_deny_before_proxy_or_key(monkeypatch):
+    """Raw saved aliases are classified before either public path reaches effects."""
+    import agent.auxiliary_client as aux
+    from agent.gemini_outbound_policy import GeminiOutboundDenied
+    from hermes_cli import runtime_provider as runtime
+
+    config = {
+        "providers": {
+            "relay": {
+                "name": "Relay",
+                "api": "https://generativelanguage.googleapis.com/v1beta",
+                "key_env": "RELAY_KEY",
+                "default_model": "ordinary-model",
+                "transport": "anthropic_messages",
+            }
+        }
+    }
+    effects = {"proxy": 0, "key": 0, "client": 0}
+
+    def unexpected(effect):
+        def fail(*_args, **_kwargs):
+            effects[effect] += 1
+            raise AssertionError(f"raw alias {effect} effect reached")
+
+        return fail
+
+    monkeypatch.setattr(runtime, "load_config", lambda: config)
+    monkeypatch.setattr(runtime, "_getenv", unexpected("key"))
+    monkeypatch.setattr(aux, "_validate_proxy_env_urls", unexpected("proxy"))
+    monkeypatch.setattr(aux, "_create_openai_client", unexpected("client"))
+
+    for provider, main_runtime in (
+        ("relay", None),
+        ("auto", {"provider": "relay", "model": "ordinary-model"}),
+    ):
+        with pytest.raises(GeminiOutboundDenied) as exc_info:
+            aux.resolve_provider_client(
+                provider, "ordinary-model", main_runtime=main_runtime
+            )
+        assert exc_info.type is GeminiOutboundDenied
+        assert exc_info.value.code == "gemini_outbound_denied"
+        assert str(exc_info.value) == "Gemini outbound requests are disabled."
+        assert vars(exc_info.value) == {}
+
+    assert effects == {"proxy": 0, "key": 0, "client": 0}
+
+
+def test_cached_dynamic_pool_google_route_denies_before_pool_key_or_cache_write(monkeypatch):
+    """A cache miss classifies the active pool entry before reading its key."""
+    import agent.auxiliary_client as aux
+    from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+    effects = {"key": 0, "proxy": 0, "client": 0}
+
+    class Entry:
+        runtime_base_url = "https://generativelanguage.googleapis.com/v1beta"
+        api_mode = "anthropic_messages"
+
+        @property
+        def runtime_api_key(self):
+            effects["key"] += 1
+            raise AssertionError("cached pool runtime key read reached")
+
+    class Pool:
+        def has_credentials(self):
+            return True
+
+        def current(self):
+            return Entry()
+
+    def unexpected(effect):
+        def fail(*_args, **_kwargs):
+            effects[effect] += 1
+            raise AssertionError(f"cached pool {effect} effect reached")
+
+        return fail
+
+    monkeypatch.setattr(aux, "load_pool", lambda _provider: Pool())
+    monkeypatch.setattr(aux, "_validate_proxy_env_urls", unexpected("proxy"))
+    monkeypatch.setattr(aux, "_create_openai_client", unexpected("client"))
+
+    aux.shutdown_cached_clients()
+    try:
+        with pytest.raises(GeminiOutboundDenied) as exc_info:
+            aux._get_cached_client(
+                "ordinary-label",
+                "ordinary-model",
+                base_url="https://safe-relay.example/v1",
+                api_mode="chat_completions",
+            )
+        with aux._client_cache_lock:
+            assert not aux._client_cache
+    finally:
+        aux.shutdown_cached_clients()
+
+    assert exc_info.type is GeminiOutboundDenied
+    assert exc_info.value.code == "gemini_outbound_denied"
+    assert str(exc_info.value) == "Gemini outbound requests are disabled."
+    assert vars(exc_info.value) == {}
+    assert effects == {"key": 0, "proxy": 0, "client": 0}
+
+
+def test_aiagent_init_fallback_preserves_gemini_outbound_denial():
+    """A denied Gemini fallback must not become a generic missing-key error."""
+    from agent.gemini_outbound_policy import GeminiOutboundDenied
+    from run_agent import AIAgent
+
+    resolver_calls = []
+
+    def no_primary_client_then_gemini_denial(provider, *args, **kwargs):
+        resolver_calls.append((provider, args, kwargs))
+        if len(resolver_calls) == 1:
+            return None, None
+        raise GeminiOutboundDenied()
+
+    with (
+        patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            side_effect=no_primary_client_then_gemini_denial,
+        ) as resolve,
+        patch(
+            "hermes_cli.fallback_config.resolve_entry_api_key",
+            return_value=None,
+        ) as fallback_key,
+        patch(
+            "agent.auxiliary_client._validate_proxy_env_urls",
+            side_effect=AssertionError("proxy validation reached"),
+        ) as proxy,
+        patch(
+            "agent.auxiliary_client._create_openai_client",
+            side_effect=AssertionError("client construction reached"),
+        ) as client_factory,
+    ):
+        with pytest.raises(GeminiOutboundDenied) as exc_info:
+            AIAgent(
+                provider="ordinary-primary",
+                model="ordinary-model",
+                fallback_model=[
+                    {"provider": "gemini", "model": "gemini-2.5-flash"}
+                ],
+                quiet_mode=True,
+            )
+
+    assert exc_info.type is GeminiOutboundDenied
+    assert exc_info.value.code == "gemini_outbound_denied"
+    assert str(exc_info.value) == "Gemini outbound requests are disabled."
+    assert vars(exc_info.value) == {}
+    assert [call[0] for call in resolver_calls] == ["ordinary-primary"]
+    assert resolve.call_count == 1
+    fallback_key.assert_not_called()
+    proxy.assert_not_called()
+    client_factory.assert_not_called()

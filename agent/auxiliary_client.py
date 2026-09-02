@@ -47,6 +47,7 @@ Payment / credit exhaustion fallback:
 import contextlib
 import contextvars
 import copy
+from dataclasses import dataclass
 import functools
 import hashlib
 import inspect
@@ -58,9 +59,10 @@ import threading
 import time
 import uuid
 from pathlib import Path  # noqa: F401 — used by test mocks
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, TYPE_CHECKING
 from urllib.parse import urlparse, parse_qs, urlunparse
+from weakref import WeakSet
 
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
 # openai SDK pulls a large type tree (~240 ms cold, including responses/*,
@@ -161,6 +163,7 @@ def aux_probe_mode():
         _aux_probe_state.active = prev
 
 from agent.credential_pool import load_pool
+from agent.gemini_outbound_policy import GeminiOutboundDenied, deny_gemini_outbound
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length
 from hermes_cli.config import get_hermes_home
 from hermes_constants import OPENROUTER_BASE_URL
@@ -257,6 +260,7 @@ def _openai_http_client_kwargs(
     return {"http_client": client}
 
 def _create_openai_client(*, api_key: str, base_url: str, **kwargs: Any) -> Any:
+    deny_gemini_outbound(base_url=base_url)
     if _aux_probe_active():
         # Availability probe: credentials/base_url resolved — that is the
         # answer. Skip the openai import + httpx/SSL construction entirely.
@@ -1372,6 +1376,42 @@ def _pool_runtime_api_key(entry: Any) -> str:
     # provider-specific fallback (e.g. agent_key for nous).
     key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
     return str(key or "").strip()
+
+
+def _freeze_pool_route_facts(
+    entry: Any,
+    *,
+    provider: str,
+    model: Optional[str],
+    fallback_base_url: Optional[str],
+    fallback_api_mode: Optional[str],
+) -> MappingProxyType:
+    """Detach a selected pool entry's nonsecret route before reading its key."""
+    try:
+        runtime_base_url = getattr(entry, "runtime_base_url", None)
+        inference_base_url = getattr(entry, "inference_base_url", None)
+        entry_base_url = getattr(entry, "base_url", None)
+        entry_api_mode = getattr(entry, "api_mode", None)
+    except Exception as exc:
+        raise GeminiOutboundDenied() from exc
+    values = (runtime_base_url, inference_base_url, entry_base_url, entry_api_mode)
+    if any(value is not None and not isinstance(value, str) for value in values):
+        raise GeminiOutboundDenied()
+    return MappingProxyType(
+        {
+            "canonical_provider": provider,
+            "model": model or "",
+            "base_url": (
+                runtime_base_url
+                or inference_base_url
+                or entry_base_url
+                or fallback_base_url
+                or ""
+            ).strip().rstrip("/"),
+            "api_mode": (entry_api_mode or fallback_api_mode or "").strip(),
+            "routing_hint": provider,
+        }
+    )
 
 
 def _pool_runtime_base_url(entry: Any, fallback: str = "") -> str:
@@ -2724,6 +2764,14 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
     for provider_id, pconfig in PROVIDER_REGISTRY.items():
         if pconfig.auth_type != "api_key":
             continue
+        route_model = _get_aux_model_for_provider(provider_id) or ""
+        deny_gemini_outbound(
+            canonical_provider=provider_id,
+            model=route_model,
+            base_url=getattr(pconfig, "inference_base_url", ""),
+            api_mode=getattr(pconfig, "api_mode", ""),
+            routing_hint=provider_id,
+        )
         if _is_provider_unhealthy(provider_id):
             logger.debug("Auxiliary api-key chain: %s is unhealthy, skipping", provider_id)
             continue
@@ -2741,13 +2789,26 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
 
         pool_present, entry = _select_pool_entry(provider_id)
         if pool_present:
+            raw_base_url = (
+                _pool_runtime_base_url(entry, pconfig.inference_base_url)
+                or pconfig.inference_base_url
+            )
+            deny_gemini_outbound(
+                canonical_provider=provider_id,
+                model=route_model,
+                base_url=raw_base_url,
+                api_mode=(
+                    getattr(entry, "api_mode", "")
+                    or getattr(pconfig, "api_mode", "")
+                ),
+                routing_hint=provider_id,
+            )
             api_key = _pool_runtime_api_key(entry)
             if not api_key:
                 continue
 
-            raw_base_url = _pool_runtime_base_url(entry, pconfig.inference_base_url) or pconfig.inference_base_url
             base_url = _to_openai_base_url(raw_base_url)
-            model = _get_aux_model_for_provider(provider_id) or None
+            model = route_model or None
             if model is None:
                 continue  # skip provider if we don't know a valid aux model
             logger.debug("Auxiliary text client: %s (%s) via pool", pconfig.name, model)
@@ -2787,7 +2848,7 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
 
         raw_base_url = str(creds.get("base_url", "")).strip().rstrip("/") or pconfig.inference_base_url
         base_url = _to_openai_base_url(raw_base_url)
-        model = _get_aux_model_for_provider(provider_id) or None
+        model = route_model or None
         if model is None:
             continue  # skip provider if we don't know a valid aux model
         logger.debug("Auxiliary text client: %s (%s)", pconfig.name, model)
@@ -3573,22 +3634,28 @@ def _resolve_custom_runtime() -> Tuple[Optional[str], Optional[str], Optional[st
         from hermes_cli.runtime_provider import resolve_runtime_provider
 
         runtime = resolve_runtime_provider(requested="custom")
+    except GeminiOutboundDenied:
+        raise
     except Exception as exc:
         logger.debug("Auxiliary client: custom runtime resolution failed: %s", exc)
         runtime = None
 
     if not isinstance(runtime, dict):
         openai_base = os.getenv("OPENAI_BASE_URL", "").strip().rstrip("/")
-        openai_key = _scoped_key_env("OPENAI_API_KEY")
         if not openai_base:
             return None, None, None
+        deny_gemini_outbound(
+            canonical_provider="custom",
+            model=os.getenv("OPENAI_MODEL", ""),
+            base_url=openai_base,
+            routing_hint="custom",
+        )
         runtime = {
             "base_url": openai_base,
-            "api_key": openai_key,
+            "api_key": _scoped_key_env("OPENAI_API_KEY"),
         }
 
     custom_base = runtime.get("base_url")
-    custom_key = runtime.get("api_key")
     custom_mode = runtime.get("api_mode")
     if not isinstance(custom_base, str) or not custom_base.strip():
         return None, None, None
@@ -3599,15 +3666,27 @@ def _resolve_custom_runtime() -> Tuple[Optional[str], Optional[str], Optional[st
         # configured. Treat that as "no custom endpoint" for auxiliary routing.
         return None, None, None
 
+    if not isinstance(custom_mode, str) or not custom_mode.strip():
+        custom_mode = None
+
+    deny_gemini_outbound(
+        canonical_provider="custom",
+        model=runtime.get("model", ""),
+        base_url=custom_base,
+        api_mode=custom_mode,
+        routing_hint=(
+            runtime.get("requested_provider")
+            or runtime.get("provider")
+            or "custom"
+        ),
+    )
+    custom_key = runtime.get("api_key")
     # Local servers (Ollama, llama.cpp, vLLM, LM Studio) don't require auth.
     # Use a placeholder key — the OpenAI SDK requires a non-empty string but
     # local servers ignore the Authorization header.  Same fix as cli.py
     # _ensure_runtime_credentials() (PR #2556).
     if not isinstance(custom_key, str) or not custom_key.strip():
         custom_key = "no-key-required"
-
-    if not isinstance(custom_mode, str) or not custom_mode.strip():
-        custom_mode = None
 
     return custom_base, custom_key.strip(), custom_mode
 
@@ -3671,6 +3750,12 @@ def _try_custom_endpoint() -> Tuple[Optional[Any], Optional[str]]:
         custom_mode = None
     else:
         custom_base, custom_key, custom_mode = runtime
+    deny_gemini_outbound(
+        canonical_provider="custom",
+        base_url=custom_base,
+        api_mode=custom_mode,
+        routing_hint="custom",
+    )
     if not custom_base or not custom_key:
         return None, None
     if custom_base.lower().startswith(_CODEX_AUX_BASE_URL.lower()):
@@ -4579,19 +4664,38 @@ def _is_invalid_aux_response_error(exc: Exception) -> bool:
     )
 
 
-def _evict_cached_clients(provider: str) -> None:
-    """Drop cached auxiliary clients for a provider so fresh creds are used."""
+def _evict_cached_clients(provider: str, *, cache_key: Optional[tuple] = None) -> bool:
+    """Drop stale cache references without closing clients we do not own.
+
+    A recovery path may identify one exact cache key; only that entry is safe
+    to close.  Legacy provider-wide invalidation merely detaches matching
+    entries so in-flight sibling model/API-mode clients remain live.
+    """
     normalized = _normalize_aux_provider(provider)
+    to_close = []
     with _client_cache_lock:
-        stale_keys = [
-            key for key in _client_cache
-            if _normalize_aux_provider(str(key[0])) == normalized
-        ]
+        if cache_key is not None:
+            stale_keys = (
+                [cache_key]
+                if (
+                    cache_key in _client_cache
+                    and _normalize_aux_provider(str(cache_key[0])) == normalized
+                )
+                else []
+            )
+        else:
+            stale_keys = [
+                key for key in _client_cache
+                if _normalize_aux_provider(str(key[0])) == normalized
+            ]
         for key in stale_keys:
-            client = _client_cache.get(key, (None, None, None))[0]
-            if client is not None:
-                _close_cached_client(client)
+            entry = _cached_entry_parts(_client_cache.get(key))
             _client_cache.pop(key, None)
+            if cache_key is not None and entry is not None and entry[0] is not None:
+                to_close.append(entry[0])
+    for client in to_close:
+        _close_cached_client(client)
+    return bool(stale_keys)
 
 
 def _evict_cached_client_instance(target: Any) -> bool:
@@ -4616,8 +4720,9 @@ def _evict_cached_client_instance(target: Any) -> bool:
     evicted = False
     with _client_cache_lock:
         for key in list(_client_cache.keys()):
-            entry = _client_cache.get(key)
+            entry = _cached_entry_parts(_client_cache.get(key))
             if entry is None:
+                _client_cache.pop(key, None)
                 continue
             cached = entry[0]
             if cached is None:
@@ -4903,6 +5008,10 @@ async def _retry_same_provider_async(
 def _refresh_provider_credentials(provider: str) -> bool:
     """Refresh short-lived credentials for OAuth-backed auxiliary providers."""
     normalized = _normalize_aux_provider(provider)
+    deny_gemini_outbound(
+        canonical_provider=normalized,
+        routing_hint=provider,
+    )
     try:
         if normalized == "copilot":
             from hermes_cli.copilot_auth import (
@@ -5700,6 +5809,8 @@ def _try_configured_fallback_chain(
 
         try:
             fb_client, resolved_model = _resolve_fallback_entry(entry)
+        except GeminiOutboundDenied:
+            raise
         except Exception:
             fb_client, resolved_model = None, None
 
@@ -5774,8 +5885,15 @@ def _resolve_fallback_entry(entry: Dict[str, Any]) -> Tuple[Optional[Any], Optio
     if not provider or not model:
         return None, None
     base_url = str(entry.get("base_url") or "").strip() or None
-    api_key = _fallback_entry_api_key(entry)
     api_mode = str(entry.get("api_mode") or entry.get("transport") or "").strip() or None
+    deny_gemini_outbound(
+        canonical_provider=provider,
+        model=model,
+        base_url=base_url or "",
+        api_mode=api_mode or "",
+        routing_hint=provider,
+    )
+    api_key = _fallback_entry_api_key(entry)
     client, resolved_model = resolve_provider_client(
         provider,
         model=model,
@@ -5842,6 +5960,8 @@ def _try_main_fallback_chain(
             continue
         try:
             fb_client, resolved_model = _resolve_fallback_entry(entry)
+        except GeminiOutboundDenied:
+            raise
         except Exception as exc:
             logger.debug("Auxiliary %s: main fallback %s failed to resolve: %s", task or "call", label, exc)
             fb_client, resolved_model = None, None
@@ -5920,6 +6040,27 @@ def _resolve_auto_route(
     runtime_base_url = str(runtime.get("base_url") or "")
     runtime_api_key = runtime.get("api_key", "")
     runtime_api_mode = str(runtime.get("api_mode") or "")
+    main_provider = str(runtime_provider or _read_main_provider() or "")
+    named_custom_provider_snapshot = None
+    if main_provider:
+        named_custom_provider_snapshot = _select_named_custom_provider(main_provider)
+        if named_custom_provider_snapshot is not None:
+            deny_gemini_outbound(
+                canonical_provider="custom",
+                model=(
+                    runtime_model
+                    or named_custom_provider_snapshot.model
+                ),
+                base_url=named_custom_provider_snapshot.base_url,
+                api_mode=(
+                    runtime_api_mode
+                    or named_custom_provider_snapshot.api_mode
+                ),
+                routing_hint=(
+                    named_custom_provider_snapshot.routing_hint
+                    or main_provider
+                ),
+            )
 
     # ── Warn once if OPENAI_BASE_URL is set but config.yaml uses a named
     #    provider (not 'custom').  This catches the common "env poisoning"
@@ -5927,7 +6068,7 @@ def _resolve_auto_route(
     #    old OPENAI_BASE_URL lingers in ~/.hermes/.env. ──
     if not _stale_base_url_warned:
         _env_base = os.getenv("OPENAI_BASE_URL", "").strip()
-        _cfg_provider = runtime_provider or _read_main_provider()
+        _cfg_provider = main_provider
         if (_env_base and _cfg_provider
                 and _cfg_provider != "custom"
                 and not _cfg_provider.startswith("custom:")):
@@ -5947,7 +6088,6 @@ def _resolve_auto_route(
     # on aggregators (OpenRouter, Nous) who previously got routed to a
     # cheap provider-side default.  Explicit per-task overrides set via
     # config.yaml (auxiliary.<task>.provider) still win over this.
-    main_provider = str(runtime_provider or _read_main_provider() or "")
     main_model = str(runtime_model or _read_main_model() or "")
 
     # Latency-critical tasks can explicitly prefer the provider's registered
@@ -5997,35 +6137,21 @@ def _resolve_auto_route(
             resolved_provider = "custom"
             explicit_base_url = runtime_base_url
             explicit_api_key = runtime_api_key or None
-        elif main_provider.startswith("custom:"):
+        elif named_custom_provider_snapshot is not None:
             # Named custom provider (custom_providers / providers dict entry).
-            _has_named_entry = False
-            try:
-                from hermes_cli.runtime_provider import _get_named_custom_provider
-                _has_named_entry = _get_named_custom_provider(main_provider) is not None
-            except ImportError:
-                pass
-            if _has_named_entry:
-                # KEEP the full ``custom:<name>`` so resolve_provider_client
-                # lands in the named-custom-provider arm — that arm honours the
-                # entry's api_mode (e.g. anthropic_messages →
-                # AnthropicAuxiliaryClient, avoiding the /anthropic→/v1 rewrite
-                # that 404s against proxies like Palantir Foundry's Anthropic
-                # surface).  Do NOT collapse to plain "custom"; that path
-                # strips /anthropic and routes through OpenAI chat.completions.
-                # base_url and api_key come from the named entry itself, so
-                # leave the explicit_* overrides unset.
-                resolved_provider = main_provider
-                explicit_base_url = None
-            elif runtime_base_url:
-                # Config-less named custom provider (#34777): the entry only
-                # exists in the live runtime, so collapse to the anonymous
-                # custom arm with the runtime endpoint + key.
-                resolved_provider = "custom"
-                explicit_base_url = runtime_base_url
-                explicit_api_key = runtime_api_key or None
-            elif runtime_api_key:
-                explicit_api_key = runtime_api_key
+            # KEEP the full ``custom:<name>`` so resolve_provider_client lands
+            # in the named arm. The selected record carries all construction
+            # values, so no config re-read or second selection is permitted.
+            resolved_provider = main_provider
+            explicit_base_url = None
+        elif main_provider.startswith("custom:") and runtime_base_url:
+            # Config-less named custom provider (#34777): no selected record
+            # exists, so the live runtime is an anonymous custom endpoint.
+            resolved_provider = "custom"
+            explicit_base_url = runtime_base_url
+            explicit_api_key = runtime_api_key or None
+        elif main_provider.startswith("custom:") and runtime_api_key:
+            explicit_api_key = runtime_api_key
         elif runtime_api_key:
             # Pin auxiliary to the same api_key as the active main chat session
             # so that a working key is reused instead of re-selecting from the pool
@@ -6046,6 +6172,7 @@ def _resolve_auto_route(
                 explicit_base_url=explicit_base_url,
                 explicit_api_key=explicit_api_key,
                 api_mode=runtime_api_mode or None,
+                named_custom_provider_snapshot=named_custom_provider_snapshot,
             )
             if client is not None:
                 logger.info("Auxiliary auto-detect: using main provider %s (%s)",
@@ -6139,6 +6266,8 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
     header so the request is routed to Copilot's vision-capable
     infrastructure (otherwise vision payloads silently time out).
     """
+    sync_base_url = str(getattr(sync_client, "base_url", "") or "")
+    deny_gemini_outbound(model=model, base_url=sync_base_url)
     from openai import AsyncOpenAI
 
     if isinstance(sync_client, _AuxProbeClientStub):
@@ -6223,6 +6352,185 @@ def _normalize_resolved_model(model_name: Optional[str], provider: str) -> Optio
         return model_name
 
 
+_NAMED_CUSTOM_SNAPSHOT_BASE_FIELDS = frozenset(
+    {
+        "kind",
+        "name",
+        "routing_hint",
+        "base_url",
+        "api_key",
+        "key_env",
+        "model",
+        "api_mode",
+        "extra_body",
+        "extra_headers",
+        "max_output_tokens",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True, eq=False)
+class _SelectedNamedCustomProvider:
+    """Private, selector-issued authority for one named-provider resolution."""
+
+    kind: str
+    name: str
+    routing_hint: str
+    base_url: str
+    api_key: str
+    key_env: str
+    key_cmd: str
+    provider_key: str
+    model: str
+    api_mode: str
+    extra_body: MappingProxyType
+    extra_headers: MappingProxyType
+    max_output_tokens: Optional[int]
+
+
+# Being a frozen record is not authority on its own: the selector registers
+# each exact native object it issued. An arbitrary caller object, token, or
+# label can therefore never become an already-selected route.
+_SELECTED_NAMED_CUSTOM_PROVIDERS: WeakSet = WeakSet()
+
+
+def _freeze_named_custom_snapshot_value(value: Any) -> Any:
+    """Recursively detach selector data before it becomes route authority."""
+    if value is None or type(value) in {str, bool, int, float}:
+        return value
+    if type(value) is MappingProxyType or type(value) is dict:
+        copied = {}
+        for key, nested_value in value.items():
+            if not isinstance(key, str):
+                raise TypeError("named custom snapshot keys must be strings")
+            copied[key] = _freeze_named_custom_snapshot_value(nested_value)
+        return MappingProxyType(copied)
+    if type(value) is tuple or type(value) is list:
+        return tuple(_freeze_named_custom_snapshot_value(item) for item in value)
+    raise TypeError("named custom snapshot contains mutable or unsupported data")
+
+
+def _selected_named_custom_provider_from_runtime_snapshot(
+    snapshot: Any,
+) -> Optional[_SelectedNamedCustomProvider]:
+    """Convert one runtime-selector result into private, deep-frozen authority."""
+    if type(snapshot) is not MappingProxyType:
+        return None
+    try:
+        kind = snapshot["kind"]
+        extra_field = "key_cmd" if kind == "providers" else "provider_key"
+        if kind not in {"providers", "custom_providers"}:
+            return None
+        expected_fields = _NAMED_CUSTOM_SNAPSHOT_BASE_FIELDS | {extra_field}
+        if set(snapshot) != expected_fields:
+            return None
+        copied = {
+            key: _freeze_named_custom_snapshot_value(snapshot[key])
+            for key in expected_fields
+        }
+    except (KeyError, TypeError):
+        return None
+    if any(
+        not isinstance(copied[field], str)
+        for field in expected_fields - {"extra_body", "extra_headers", "max_output_tokens"}
+    ):
+        return None
+    if not isinstance(copied["extra_body"], MappingProxyType) or not isinstance(
+        copied["extra_headers"], MappingProxyType
+    ):
+        return None
+    if copied["max_output_tokens"] is not None and not isinstance(
+        copied["max_output_tokens"], int
+    ):
+        return None
+    selected = _SelectedNamedCustomProvider(
+        kind=copied["kind"],
+        name=copied["name"],
+        routing_hint=copied["routing_hint"],
+        base_url=copied["base_url"],
+        api_key=copied["api_key"],
+        key_env=copied["key_env"],
+        key_cmd=copied.get("key_cmd", ""),
+        provider_key=copied.get("provider_key", ""),
+        model=copied["model"],
+        api_mode=copied["api_mode"],
+        extra_body=copied["extra_body"],
+        extra_headers=copied["extra_headers"],
+        max_output_tokens=copied["max_output_tokens"],
+    )
+    _SELECTED_NAMED_CUSTOM_PROVIDERS.add(selected)
+    return selected
+
+
+def _select_named_custom_provider(requested_provider: str) -> Optional[_SelectedNamedCustomProvider]:
+    """Select exactly once, then return only native immutable route authority."""
+    from hermes_cli.runtime_provider import _get_named_custom_provider_snapshot
+
+    runtime_snapshot = _get_named_custom_provider_snapshot(requested_provider)
+    if runtime_snapshot is None:
+        return None
+    selected = _selected_named_custom_provider_from_runtime_snapshot(runtime_snapshot)
+    if selected is None:
+        raise GeminiOutboundDenied()
+    return selected
+
+
+def _validated_named_custom_snapshot(
+    snapshot: Any,
+) -> Optional[_SelectedNamedCustomProvider]:
+    """Accept only the exact private record issued by this module's selector."""
+    if type(snapshot) is not _SelectedNamedCustomProvider:
+        return None
+    if snapshot not in _SELECTED_NAMED_CUSTOM_PROVIDERS:
+        return None
+    return snapshot
+
+
+def _thaw_named_custom_snapshot_value(value: Any) -> Any:
+    """Make legacy construction values from the already authorized record."""
+    if type(value) is MappingProxyType:
+        return {key: _thaw_named_custom_snapshot_value(item) for key, item in value.items()}
+    if type(value) is tuple:
+        return [_thaw_named_custom_snapshot_value(item) for item in value]
+    return value
+
+
+def _materialize_selected_named_custom_provider(
+    selected: _SelectedNamedCustomProvider,
+) -> Dict[str, Any]:
+    """Resolve construction data from one selected record without reselecting."""
+    result: Dict[str, Any] = {
+        "name": selected.name,
+        "base_url": selected.base_url,
+        "api_key": selected.api_key,
+    }
+    if selected.kind == "providers":
+        from hermes_cli.runtime_provider import _getenv
+
+        resolved_api_key = _getenv(selected.key_env, "").strip() if selected.key_env else ""
+        result["api_key"] = resolved_api_key or result["api_key"]
+        if selected.key_cmd:
+            result["key_cmd"] = selected.key_cmd
+    else:
+        if selected.key_env:
+            result["key_env"] = selected.key_env
+        if selected.provider_key:
+            result["provider_key"] = selected.provider_key
+    extra_body = _thaw_named_custom_snapshot_value(selected.extra_body)
+    if extra_body:
+        result["extra_body"] = extra_body
+    extra_headers = _thaw_named_custom_snapshot_value(selected.extra_headers)
+    if extra_headers:
+        result["extra_headers"] = extra_headers
+    if selected.api_mode:
+        result["api_mode"] = selected.api_mode
+    if selected.model:
+        result["model"] = selected.model
+    if selected.max_output_tokens is not None:
+        result["max_output_tokens"] = selected.max_output_tokens
+    return result
+
+
 def resolve_provider_client(
     provider: str,
     model: str = None,
@@ -6234,6 +6542,7 @@ def resolve_provider_client(
     main_runtime: Optional[Dict[str, Any]] = None,
     is_vision: bool = False,
     task: Optional[str] = None,
+    named_custom_provider_snapshot: Optional[Any] = None,
 ) -> Tuple[Optional[Any], Optional[str]]:
     """Central router: given a provider name and optional model, return a
     configured client with the correct auth, base URL, and API format.
@@ -6265,7 +6574,18 @@ def resolve_provider_client(
     Returns:
         (client, resolved_model) or (None, None) if auth is unavailable.
     """
-    _validate_proxy_env_urls()
+    runtime_route = main_runtime if isinstance(main_runtime, dict) else {}
+    deny_gemini_outbound(
+        canonical_provider=provider,
+        model=model or runtime_route.get("model", ""),
+        base_url=explicit_base_url or runtime_route.get("base_url", ""),
+        api_mode=api_mode or runtime_route.get("api_mode", ""),
+        routing_hint=(
+            runtime_route.get("requested_provider")
+            or runtime_route.get("provider")
+            or provider
+        ),
+    )
     # Preserve the original provider name before alias normalization so a
     # user-declared ``custom_providers`` entry whose name coincidentally
     # matches a built-in alias (e.g. user names their custom provider "kimi"
@@ -6274,6 +6594,60 @@ def resolve_provider_client(
     original_provider = (provider or "").strip().lower()
     # Normalise aliases
     provider = _normalize_aux_provider(provider)
+    named_custom_metadata = None
+    if named_custom_provider_snapshot is None:
+        named_custom_provider_snapshot = _select_named_custom_provider(
+            original_provider or provider
+        )
+    else:
+        named_custom_provider_snapshot = _validated_named_custom_snapshot(
+            named_custom_provider_snapshot
+        )
+        if named_custom_provider_snapshot is None:
+            # An external mapping is not route authority. Do not re-read config
+            # or try a second value after its first safe-looking base URL.
+            raise GeminiOutboundDenied()
+    if named_custom_provider_snapshot is None and original_provider.startswith("custom:"):
+        # A named route without selector-issued provenance must not fall through
+        # to a later config read under a safe-looking caller label.
+        raise GeminiOutboundDenied()
+    if named_custom_provider_snapshot is not None:
+        named_custom_metadata = {
+            "provider": "custom",
+            "routing_hint": named_custom_provider_snapshot.routing_hint,
+            "model": named_custom_provider_snapshot.model,
+            "base_url": named_custom_provider_snapshot.base_url,
+            "api_mode": named_custom_provider_snapshot.api_mode,
+        }
+        deny_gemini_outbound(
+            canonical_provider=named_custom_metadata["provider"] or provider,
+            model=(
+                model
+                or named_custom_metadata["model"]
+                or runtime_route.get("model", "")
+            ),
+            base_url=named_custom_metadata["base_url"],
+            api_mode=api_mode or named_custom_metadata["api_mode"],
+            routing_hint=(
+                named_custom_metadata["routing_hint"] or original_provider or provider
+            ),
+        )
+    if original_provider != "auto":
+        try:
+            from hermes_cli.auth import PROVIDER_REGISTRY as _provider_registry
+        except ImportError:
+            _pconfig = None
+        else:
+            _pconfig = _provider_registry.get(provider)
+        if _pconfig is not None and getattr(_pconfig, "auth_type", "") == "api_key":
+            deny_gemini_outbound(
+                canonical_provider=provider,
+                model=model or runtime_route.get("model", ""),
+                base_url=explicit_base_url or getattr(_pconfig, "inference_base_url", ""),
+                api_mode=api_mode or getattr(_pconfig, "api_mode", ""),
+                routing_hint=original_provider or provider,
+            )
+        _validate_proxy_env_urls()
 
     # MoA virtual provider chokepoint: "moa" is not a real HTTP provider —
     # its acting model is the preset's aggregator slot. The two resolver
@@ -6406,6 +6780,14 @@ def resolve_provider_client(
         )
         if client is None:
             return None, None
+        deny_gemini_outbound(
+            canonical_provider=effective_provider,
+            model=resolved or model or "",
+            base_url=str(getattr(client, "base_url", "") or ""),
+            api_mode=api_mode or "",
+            routing_hint=effective_provider,
+        )
+        _validate_proxy_env_urls()
         # When auto-detection lands on a non-OpenRouter provider (e.g. a
         # local server), an OpenRouter-formatted model override like
         # "google/gemini-3-flash-preview" won't work.  Drop it and use
@@ -6615,21 +6997,31 @@ def resolve_provider_client(
 
     # ── Named custom providers (config.yaml providers dict / custom_providers list) ───
     try:
-        from hermes_cli.runtime_provider import _get_named_custom_provider
-        # When the raw requested name is an alias (``kimi`` → ``kimi-coding``)
-        # and the user defined a ``custom_providers`` entry under that alias
-        # name, the custom entry is the intended target — the built-in alias
-        # rewriting would otherwise hijack the request.  Only preferred when
-        # the raw name is an alias (not a canonical provider name) so custom
-        # entries that coincidentally match a canonical provider (e.g. ``nous``)
-        # still defer to the built-in per `_get_named_custom_provider`'s guard.
-        custom_entry = None
-        if original_provider and original_provider != provider:
-            custom_entry = _get_named_custom_provider(original_provider)
-        if custom_entry is None:
-            custom_entry = _get_named_custom_provider(provider)
+        # Only one selector-issued record may reach construction. Never reopen
+        # config here: policy and credentials must consume the same snapshot.
+        custom_entry = (
+            _materialize_selected_named_custom_provider(named_custom_provider_snapshot)
+            if named_custom_provider_snapshot is not None
+            else None
+        )
         if custom_entry:
             custom_base = (custom_entry.get("base_url") or "").strip()
+            # An explicit per-task api_mode override (from _resolve_task_provider_model)
+            # wins; otherwise fall back to what the provider entry declared.
+            entry_api_mode = (api_mode or custom_entry.get("api_mode") or "").strip()
+            entry_model = (
+                model
+                or custom_entry.get("model")
+                or (main_runtime.get("model") if main_runtime else None)
+                or ""
+            )
+            deny_gemini_outbound(
+                canonical_provider=provider,
+                model=entry_model,
+                base_url=custom_base,
+                api_mode=entry_api_mode,
+                routing_hint=original_provider or provider,
+            )
             custom_key = (custom_entry.get("api_key") or "").strip()
             custom_key_env = (custom_entry.get("key_env") or custom_entry.get("api_key_env") or "").strip()
             if not custom_key and custom_key_env:
@@ -6653,14 +7045,9 @@ def resolve_provider_client(
                     "and will 401 on auth-required endpoints",
                     custom_entry.get("name") or provider,
                 )
-            # An explicit per-task api_mode override (from _resolve_task_provider_model)
-            # wins; otherwise fall back to what the provider entry declared.
-            entry_api_mode = (api_mode or custom_entry.get("api_mode") or "").strip()
             if custom_base:
                 final_model = _normalize_resolved_model(
-                    model
-                    or custom_entry.get("model")
-                    or (main_runtime.get("model") if main_runtime else None)
+                    entry_model
                     or _read_main_model_for_aux()
                     or "gpt-4o-mini",
                     provider,
@@ -7641,16 +8028,199 @@ def _client_cache_key(
     return (provider, async_mode, base_url or "", api_key_key, api_mode or "", runtime_key, is_vision, task_key, pool_hint, model_key)
 
 
-def _store_cached_client(cache_key: tuple, client: Any, default_model: Optional[str], *, bound_loop: Any = None) -> None:
+_CACHED_ROUTE_FACT_KEYS = frozenset({
+    "canonical_provider", "model", "base_url", "api_mode", "routing_hint",
+})
+
+
+def _cached_client_base_url(client: Any) -> str:
+    """Return a canonical client endpoint without trusting a cache-key label."""
+    for candidate in (
+        client,
+        getattr(client, "_real_client", None),
+        getattr(client, "_client", None),
+        getattr(client, "client", None),
+    ):
+        base_url = getattr(candidate, "base_url", None)
+        if base_url is None:
+            continue
+        try:
+            canonical_base_url = str(base_url).strip()
+        except Exception:
+            continue
+        if canonical_base_url and base_url_hostname(canonical_base_url):
+            return canonical_base_url
+    return ""
+
+
+def _frozen_cached_route_facts(
+    *,
+    provider: str,
+    model: Optional[str],
+    base_url: Optional[str],
+    api_mode: Optional[str],
+    main_runtime: Optional[Dict[str, Any]],
+    client: Any,
+    default_model: Optional[str],
+) -> MappingProxyType:
+    """Bind a cache entry to the resolved route that produced its client."""
+    runtime = _normalize_main_runtime(main_runtime)
+    actual_base_url = _cached_client_base_url(client)
+    return MappingProxyType({
+        "canonical_provider": str(provider or ""),
+        "model": str(default_model or model or runtime.get("model", "") or ""),
+        # Cache provenance is the concrete endpoint on the client just built.
+        # Never reconstruct it from a caller-safe cache key or runtime label.
+        "base_url": actual_base_url,
+        "api_mode": str(api_mode or runtime.get("api_mode", "") or ""),
+        "routing_hint": str(
+            runtime.get("requested_provider") or runtime.get("provider") or provider or ""
+        ),
+    })
+
+
+def _validated_cache_admission_route_facts(
+    *,
+    provider: str,
+    model: Optional[str],
+    base_url: Optional[str],
+    api_mode: Optional[str],
+    main_runtime: Optional[Dict[str, Any]],
+    client: Any,
+    default_model: Optional[str],
+    bound_loop: Any,
+) -> MappingProxyType:
+    """Authorize one resolver-returned client before cache store or return.
+
+    The client endpoint is observed and canonicalized independently from the
+    caller cache key. The immutable route record must agree with that observed
+    endpoint before the central outbound guard runs; missing or changing
+    provenance is denied rather than returned uncached.
+    """
+    frozen_facts = _frozen_cached_route_facts(
+        provider=provider,
+        model=model,
+        base_url=base_url,
+        api_mode=api_mode,
+        main_runtime=main_runtime,
+        client=client,
+        default_model=default_model,
+    )
+    route_facts = _cached_entry_route_facts(
+        (client, default_model, bound_loop, frozen_facts)
+    )
+    if route_facts is None:
+        raise GeminiOutboundDenied()
+    deny_gemini_outbound(
+        canonical_provider=route_facts["canonical_provider"],
+        model=route_facts["model"],
+        base_url=route_facts["base_url"],
+        api_mode=route_facts["api_mode"],
+        routing_hint=route_facts["routing_hint"],
+    )
+    return route_facts
+
+
+def _cached_entry_route_facts(entry: Any) -> Optional[MappingProxyType]:
+    """Validate immutable route provenance before a cached client can be used."""
+    if not isinstance(entry, tuple) or len(entry) != 4:
+        return None
+    route_facts = entry[3]
+    if not isinstance(route_facts, MappingProxyType):
+        return None
+    if set(route_facts) != _CACHED_ROUTE_FACT_KEYS:
+        return None
+    if any(not isinstance(route_facts[key], str) for key in _CACHED_ROUTE_FACT_KEYS):
+        return None
+    stored_base_url = route_facts["base_url"].rstrip("/")
+    if (
+        not stored_base_url
+        or not base_url_hostname(stored_base_url)
+        or not route_facts["canonical_provider"]
+        or not route_facts["routing_hint"]
+    ):
+        return None
+    observed_base_url = _cached_client_base_url(entry[0]).rstrip("/")
+    if not observed_base_url or stored_base_url != observed_base_url:
+        return None
+    return route_facts
+
+
+def _cached_entry_parts(
+    entry: Any,
+) -> Optional[Tuple[Any, Optional[str], Any, MappingProxyType]]:
+    """Return one complete cache entry, or reject malformed provenance."""
+    route_facts = _cached_entry_route_facts(entry)
+    if route_facts is None:
+        return None
+    client, default_model, bound_loop, _ = entry
+    return client, default_model, bound_loop, route_facts
+
+
+def _validated_cached_entry(
+    cache_key: tuple,
+) -> Optional[Tuple[Any, Optional[str], Any, MappingProxyType]]:
+    """Load a cache hit only after its stored route facts pass central policy."""
+    with _client_cache_lock:
+        entry = _cached_entry_parts(_client_cache.get(cache_key))
+        if entry is None:
+            _client_cache.pop(cache_key, None)
+            return None
+        client, default_model, bound_loop, route_facts = entry
+        try:
+            deny_gemini_outbound(
+                canonical_provider=route_facts["canonical_provider"],
+                model=route_facts["model"],
+                base_url=route_facts["base_url"],
+                api_mode=route_facts["api_mode"],
+                routing_hint=route_facts["routing_hint"],
+            )
+        except GeminiOutboundDenied:
+            # Do not close an entry another caller may already be using. The
+            # cache must merely never hand its prohibited route out again.
+            _client_cache.pop(cache_key, None)
+            raise
+        return client, default_model, bound_loop, route_facts
+
+
+def _store_cached_client(
+    cache_key: tuple,
+    client: Any,
+    default_model: Optional[str],
+    *,
+    bound_loop: Any = None,
+    route_facts: Optional[MappingProxyType] = None,
+    replace: bool = True,
+    enforce_limit: bool = False,
+) -> Optional[Tuple[Any, Optional[str], Any, MappingProxyType]]:
     if isinstance(client, _AuxProbeClientStub):
         # Probe stubs must never enter the cache — a runtime caller would
         # receive a non-functional client on the next cache hit.
-        return
+        return None
+    frozen_facts = _cached_entry_route_facts(
+        (client, default_model, bound_loop, route_facts)
+    )
+    if frozen_facts is None:
+        return None
+    # Take a private copy before retaining the mapping proxy so no caller can
+    # mutate a referenced backing dict after cache admission.
+    cached_entry = (
+        client,
+        default_model,
+        bound_loop,
+        MappingProxyType(dict(frozen_facts)),
+    )
     with _client_cache_lock:
         old_entry = _client_cache.get(cache_key)
-        if old_entry is not None and old_entry[0] is not client:
-            _close_cached_client(old_entry[0])
-        _client_cache[cache_key] = (client, default_model, bound_loop)
+        if old_entry is not None and _cached_entry_parts(old_entry) is not None and not replace:
+            return _cached_entry_parts(old_entry)
+        if old_entry is None and enforce_limit:
+            # Cache references are not ownership of an active request. Never
+            # close a FIFO victim here; it may still be in use by a caller.
+            while len(_client_cache) >= _CLIENT_CACHE_MAX_SIZE:
+                del _client_cache[next(iter(_client_cache))]
+        _client_cache[cache_key] = cached_entry
+    return cached_entry
 
 
 def _refresh_nous_auxiliary_client(
@@ -7665,6 +8235,18 @@ def _refresh_nous_auxiliary_client(
     is_vision: bool = False,
 ) -> Tuple[Optional[Any], Optional[str]]:
     """Refresh Nous runtime creds, rebuild the client, and replace the cache entry."""
+    runtime_route = main_runtime if isinstance(main_runtime, dict) else {}
+    deny_gemini_outbound(
+        canonical_provider=cache_provider,
+        model=model or runtime_route.get("model", ""),
+        base_url=base_url or runtime_route.get("base_url", ""),
+        api_mode=api_mode or runtime_route.get("api_mode", ""),
+        routing_hint=(
+            runtime_route.get("requested_provider")
+            or runtime_route.get("provider")
+            or cache_provider
+        ),
+    )
     runtime = _resolve_nous_runtime_api(force_refresh=True)
     if runtime is None:
         return None, model
@@ -7694,7 +8276,21 @@ def _refresh_nous_auxiliary_client(
         is_vision=is_vision,
         model=final_model,
     )
-    _store_cached_client(cache_key, client, final_model, bound_loop=current_loop)
+    _store_cached_client(
+        cache_key,
+        client,
+        final_model,
+        bound_loop=current_loop,
+        route_facts=_frozen_cached_route_facts(
+            provider=cache_provider,
+            model=model,
+            base_url=fresh_base_url or base_url,
+            api_mode=api_mode,
+            main_runtime=main_runtime,
+            client=client,
+            default_model=final_model,
+        ),
+    )
     return client, final_model
 
 
@@ -7830,11 +8426,11 @@ def shutdown_cached_clients() -> None:
     and can turn teardown into a process-wide lock convoy.
     """
     with _client_cache_lock:
-        clients = [
-            (entry[0], entry[2])
-            for entry in _client_cache.values()
-            if entry[0] is not None
-        ]
+        clients = []
+        for raw_entry in _client_cache.values():
+            entry = _cached_entry_parts(raw_entry)
+            if entry is not None and entry[0] is not None:
+                clients.append((entry[0], entry[2]))
         _client_cache.clear()
     try:
         import asyncio as _aio
@@ -7865,7 +8461,11 @@ def cleanup_stale_async_clients() -> None:
     with _client_cache_lock:
         stale_keys = []
         for key, entry in _client_cache.items():
-            client, _default, cached_loop = entry
+            parts = _cached_entry_parts(entry)
+            if parts is None:
+                stale_keys.append(key)
+                continue
+            client, _default, cached_loop, _route_facts = parts
             if cached_loop is not None and cached_loop.is_closed():
                 stale_keys.append(key)
                 stale_clients.append(client)
@@ -7924,6 +8524,18 @@ def _get_cached_client(
     preventing the fd-exhaustion that previously occurred in long-running
     gateways where recycled worker threads created unbounded entries (#10200).
     """
+    runtime_route = main_runtime if isinstance(main_runtime, dict) else {}
+    deny_gemini_outbound(
+        canonical_provider=provider,
+        model=model or runtime_route.get("model", ""),
+        base_url=base_url or runtime_route.get("base_url", ""),
+        api_mode=api_mode or runtime_route.get("api_mode", ""),
+        routing_hint=(
+            runtime_route.get("requested_provider")
+            or runtime_route.get("provider")
+            or provider
+        ),
+    )
     # Resolve the current event loop for async clients so we can validate
     # cached entries.  Loop identity is NOT in the cache key — instead we
     # check at hit time whether the cached loop is still current and open.
@@ -7949,32 +8561,33 @@ def _get_cached_client(
         task=task,
         model=model,
     )
-    with _client_cache_lock:
-        if cache_key in _client_cache:
-            cached_client, cached_default, cached_loop = _client_cache[cache_key]
-            if async_mode:
-                # Validate: the cached client must be bound to the CURRENT,
-                # OPEN loop.  If the loop changed or was closed, the httpx
-                # transport inside is dead — force-close and replace.
-                loop_ok = (
-                    cached_loop is not None
-                    and cached_loop is current_loop
-                    and not cached_loop.is_closed()
-                )
-                if loop_ok:
-                    effective = _compat_model(cached_client, model, cached_default)
-                    return cached_client, effective
-                # Stale — evict and fall through to create a new client.
-                # Only a client whose owner loop is closed may be awaited from
-                # this thread; a live foreign loop remains force-neutered.
-                owner_loop_closed = (
-                    cached_loop is not None and cached_loop.is_closed()
-                )
-                _close_cached_client(cached_client, close_async=owner_loop_closed)
-                del _client_cache[cache_key]
-            else:
+    cached_entry = _validated_cached_entry(cache_key)
+    if cached_entry is not None:
+        cached_client, cached_default, cached_loop, _route_facts = cached_entry
+        if async_mode:
+            # Validate: the cached client must be bound to the CURRENT,
+            # OPEN loop.  If the loop changed or was closed, the httpx
+            # transport inside is dead — force-close and replace.
+            loop_ok = (
+                cached_loop is not None
+                and cached_loop is current_loop
+                and not cached_loop.is_closed()
+            )
+            if loop_ok:
                 effective = _compat_model(cached_client, model, cached_default)
                 return cached_client, effective
+            # Stale — evict and fall through to create a new client.
+            # Only a client whose owner loop is closed may be awaited from
+            # this thread; a live foreign loop remains force-neutered.
+            owner_loop_closed = (
+                cached_loop is not None and cached_loop.is_closed()
+            )
+            _close_cached_client(cached_client, close_async=owner_loop_closed)
+            with _client_cache_lock:
+                _client_cache.pop(cache_key, None)
+        else:
+            effective = _compat_model(cached_client, model, cached_default)
+            return cached_client, effective
     # Build outside the lock.
     # For pool-backed api_key providers, derive the active API key from the
     # pool entry rather than from env vars.  resolve_api_key_provider_credentials
@@ -7982,9 +8595,18 @@ def _get_cached_client(
     # after key #1 is marked exhausted the retry would still get key #1 from
     # the env var and fail again, causing the retry2_err handler to mark key #2.
     effective_api_key = api_key
+    pool_route_facts = None
     if not effective_api_key:
         _pe = _peek_pool_entry(_normalize_aux_provider(provider))
         if _pe is not None:
+            pool_route_facts = _freeze_pool_route_facts(
+                _pe,
+                provider=provider,
+                model=model,
+                fallback_base_url=base_url,
+                fallback_api_mode=api_mode,
+            )
+            deny_gemini_outbound(**pool_route_facts)
             _pk = _pool_runtime_api_key(_pe)
             if _pk:
                 effective_api_key = _pk
@@ -7992,9 +8614,9 @@ def _get_cached_client(
         provider,
         model,
         async_mode,
-        explicit_base_url=base_url,
+        explicit_base_url=base_url or (pool_route_facts or {}).get("base_url"),
         explicit_api_key=effective_api_key,
-        api_mode=api_mode,
+        api_mode=api_mode or (pool_route_facts or {}).get("api_mode"),
         main_runtime=runtime,
         is_vision=is_vision,
         task=task,
@@ -8003,24 +8625,38 @@ def _get_cached_client(
         # For async clients, remember which loop they were created on so we
         # can detect stale entries later.
         bound_loop = current_loop
-        with _client_cache_lock:
-            if cache_key not in _client_cache:
-                # Safety belt: if the cache has grown beyond the max, evict
-                # the oldest entries (FIFO — dict preserves insertion order).
-                # Do not close an evicted client here: another caller may be
-                # mid-request with the object it obtained from this cache.
-                # Dropping the cache reference lets normal refcount/GC cleanup
-                # happen after in-flight users release it.
-                while len(_client_cache) >= _CLIENT_CACHE_MAX_SIZE:
-                    evict_key = next(iter(_client_cache))
-                    del _client_cache[evict_key]
-                _client_cache[cache_key] = (client, default_model, bound_loop)
-            else:
-                built_client = client
-                client, default_model, _ = _client_cache[cache_key]
+        route_facts = _validated_cache_admission_route_facts(
+            provider=_effective_provider_for_client(client, provider),
+            model=model,
+            base_url=base_url,
+            api_mode=api_mode,
+            main_runtime=runtime,
+            client=client,
+            default_model=default_model,
+            bound_loop=bound_loop,
+        )
+        stored_entry = _store_cached_client(
+            cache_key,
+            client,
+            default_model,
+            bound_loop=bound_loop,
+            route_facts=route_facts,
+            replace=False,
+            enforce_limit=True,
+        )
+        if stored_entry is not None:
+            stored_client, stored_default, _stored_loop, _stored_facts = stored_entry
+            if stored_client is not client:
                 # This concurrently built loser was never exposed to a caller,
-                # so it is safe to close immediately.
-                _close_cached_client(built_client, close_async=async_mode)
+                # so it is safe to close immediately. Its concurrent winner is
+                # a cache hit, so validate the winner's stored route before
+                # returning it.
+                _close_cached_client(client, close_async=async_mode)
+                checked_entry = _validated_cached_entry(cache_key)
+                if checked_entry is not None:
+                    client, default_model, _checked_loop, _checked_facts = checked_entry
+                else:
+                    client, default_model = stored_client, stored_default
     return client, model or default_model
 
 
