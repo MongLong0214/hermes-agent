@@ -628,7 +628,12 @@ def test_lost_and_found_copy_refusal_retains_the_real_stage(
                 ),
             )
         assert stage is not None
-        session_recovery._refresh_stage_children(stage, require_main=True)
+        # The marker write legitimately changes the same staged SQLite child
+        # (normally its WAL metadata); retain that child for the authority
+        # refusal rather than treating content evolution as substitution.
+        session_recovery._refresh_stage_children(
+            stage, require_main=True, rebaseline=True
+        )
         return original_map_rows(lf_conn, destination)
 
     def record_real_cleanup(destination_stage) -> None:
