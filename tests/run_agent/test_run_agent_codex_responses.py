@@ -2034,6 +2034,252 @@ def test_native_preflight_stream_failure_rebuilds_before_bare_retry_and_keeps_no
     assert ordinary_compression == []
 
 
+def test_native_preflight_iterator_transport_failure_rebuilds_before_bare_retry(monkeypatch):
+    """A pre-output iterator failure must reach the native fallback owner."""
+    import httpx
+
+    class _FirstIterationFailure:
+        def __init__(self, error):
+            self.error = error
+
+        def __iter__(self):
+            def _events():
+                raise self.error
+                yield None  # pragma: no cover - makes this a lazy iterator
+
+            return _events()
+
+    class _PartialOutputThenFailure:
+        def __init__(self, error):
+            self.error = error
+
+        def __iter__(self):
+            yield SimpleNamespace(type="response.output_text.delta", delta="partial")
+            raise self.error
+
+    def _completed_stream():
+        item = SimpleNamespace(
+            type="message",
+            status="completed",
+            content=[SimpleNamespace(type="output_text", text="recovered")],
+        )
+        return _FakeCreateStream([SimpleNamespace(type="response.output_item.done", item=item)])
+
+    request = httpx.Request("POST", "https://example.test/responses")
+
+    def _transport_error(error_type):
+        if error_type is ConnectionError:
+            return error_type("usage-less stream connection dropped")
+        return error_type("usage-less stream connection dropped", request=request)
+
+    def _run_case(*, native, first_stream, deliver_events_directly=False):
+        agent = _build_agent(monkeypatch)
+        agent.model = "gpt-5.6"
+        agent.codex_responses_native_compaction = native
+        agent.context_compressor.context_length = 1_000_000
+        agent.context_compressor.threshold_tokens = 200_000 if native else 800_000
+        agent.context_compressor.last_prompt_tokens = 199_387
+        agent.context_compressor.last_real_prompt_tokens = 199_387
+        agent.context_compressor.last_rough_tokens_when_real_prompt_fit = 0
+        wire_calls, ordering, compression_calls, streamed = [], [], [], []
+
+        def _create(**api_kwargs):
+            payload = {
+                "context_management": tuple(
+                    item.get("type") for item in api_kwargs.get("context_management", [])
+                ),
+                "checkpoint": tuple(
+                    item.get("type")
+                    for item in api_kwargs.get("input", [])
+                    if isinstance(item, dict) and item.get("type") == "compaction"
+                ),
+                "stream": api_kwargs.get("stream"),
+            }
+            wire_calls.append(payload)
+            ordering.append("native_wire" if payload["context_management"] else "bare_wire")
+            if len(wire_calls) == 1:
+                return first_stream()
+            return _completed_stream()
+
+        client = SimpleNamespace(responses=SimpleNamespace(create=_create))
+        monkeypatch.setattr(agent, "_create_request_openai_client", lambda **_k: client)
+        monkeypatch.setattr(agent, "_fire_stream_delta", streamed.append)
+        if deliver_events_directly:
+            def _direct_stream(request_kwargs, stream_factory, **stream_options):
+                raw_stream = stream_factory(request_kwargs)
+                stream_options["on_stream_created"](raw_stream)
+
+                def _events():
+                    for event in raw_stream:
+                        stream_options["on_chunk"](event)
+                        yield event
+
+                return _events()
+
+            monkeypatch.setattr("agent.relay_llm.stream", _direct_stream)
+        monkeypatch.setattr(
+            "agent.turn_context.estimate_request_tokens_rough",
+            lambda *_a, **_k: 231_730 if native else 10_000,
+        )
+        monkeypatch.setattr(
+            "agent.conversation_loop.estimate_messages_tokens_rough",
+            lambda *_a, **_k: 231_730 if native else 10_000,
+        )
+        monkeypatch.setattr(
+            "agent.conversation_loop.estimate_request_tokens_rough",
+            lambda *_a, **_k: 231_730 if native else 10_000,
+        )
+        monkeypatch.setattr(agent, "_compress_context", lambda messages, system_message, **kwargs: (
+            ordering.append("compress") or compression_calls.append(kwargs["approx_tokens"]) or messages,
+            system_message,
+        ))
+
+        result = agent.run_conversation(
+            "continue",
+            conversation_history=[{"role": "user", "content": f"prior user {i}"} for i in range(30)],
+        )
+        assert result["completed"] is True
+        return wire_calls, ordering, compression_calls, streamed
+
+    retryable_transport_errors = (
+        httpx.ConnectError,
+        httpx.ReadTimeout,
+        httpx.RemoteProtocolError,
+        ConnectionError,
+    )
+    expected_native_wires = [
+        {"context_management": ("compaction",), "checkpoint": (), "stream": True},
+        {"context_management": (), "checkpoint": (), "stream": True},
+    ]
+    for error_type in retryable_transport_errors:
+        native_wires, native_order, native_compression, native_streamed = _run_case(
+            native=True,
+            first_stream=lambda error_type=error_type: _FirstIterationFailure(
+                _transport_error(error_type)
+            ),
+        )
+        assert native_wires == expected_native_wires
+        assert native_order == ["native_wire", "compress", "bare_wire"]
+        assert len(native_compression) == 1
+        assert native_compression[0] >= 231_730
+        assert native_streamed == []
+
+    ordinary_wires, ordinary_order, ordinary_compression, ordinary_streamed = _run_case(
+        native=False,
+        first_stream=lambda: _FirstIterationFailure(_transport_error(httpx.ConnectError)),
+    )
+    assert ordinary_wires == [
+        {"context_management": (), "checkpoint": (), "stream": True},
+        {"context_management": (), "checkpoint": (), "stream": True},
+    ]
+    assert ordinary_order == ["bare_wire", "bare_wire"]
+    assert ordinary_compression == []
+    assert ordinary_streamed == []
+
+    partial_wires, partial_order, partial_compression, partial_streamed = _run_case(
+        native=True,
+        first_stream=lambda: _PartialOutputThenFailure(_transport_error(httpx.ConnectError)),
+        deliver_events_directly=True,
+    )
+    assert partial_wires == [
+        {"context_management": ("compaction",), "checkpoint": (), "stream": True},
+        {"context_management": ("compaction",), "checkpoint": (), "stream": True},
+    ]
+    assert partial_order == ["native_wire", "native_wire"]
+    assert partial_compression == []
+    assert partial_streamed == ["partial"]
+
+
+def test_native_preflight_interrupt_before_wire_expires_state_before_next_turn(monkeypatch):
+    """An armed native request interrupted before create cannot own the next turn."""
+    agent = _build_agent(monkeypatch)
+    agent.model = "gpt-5.6"
+    agent.codex_responses_native_compaction = True
+    agent.codex_responses_compact_threshold = 200_000
+    agent.context_compressor.context_length = 1_000_000
+    agent.context_compressor.threshold_tokens = 200_000
+    agent.context_compressor.last_prompt_tokens = 199_387
+    agent.context_compressor.last_real_prompt_tokens = 199_387
+    agent.context_compressor.last_rough_tokens_when_real_prompt_fit = 0
+
+    identity = (agent.session_id, agent.model, agent.provider, agent.base_url)
+    wire_calls, ordering, compression_calls = [], [], []
+
+    def _completed_stream():
+        item = SimpleNamespace(
+            type="message",
+            status="completed",
+            content=[SimpleNamespace(type="output_text", text="recovered")],
+        )
+        return _FakeCreateStream([SimpleNamespace(type="response.output_item.done", item=item)])
+
+    def _create(**api_kwargs):
+        payload = {
+            "context_management": tuple(
+                item.get("type") for item in api_kwargs.get("context_management", [])
+            ),
+            "checkpoint": tuple(
+                item.get("type")
+                for item in api_kwargs.get("input", [])
+                if isinstance(item, dict) and item.get("type") == "compaction"
+            ),
+            "stream": api_kwargs.get("stream"),
+        }
+        wire_calls.append(payload)
+        ordering.append("native_wire" if payload["context_management"] else "bare_wire")
+        return _completed_stream()
+
+    client = SimpleNamespace(responses=SimpleNamespace(create=_create))
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **_k: client)
+    monkeypatch.setattr(
+        "agent.turn_context.estimate_request_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.estimate_messages_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.estimate_request_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop._estimate_tools_tokens_rough", lambda *_a, **_k: 0
+    )
+    monkeypatch.setattr(
+        agent,
+        "_compress_context",
+        lambda messages, system_message, **kwargs: (
+            ordering.append("compress") or compression_calls.append(kwargs["approx_tokens"]) or messages,
+            system_message,
+        ),
+    )
+
+    original_streaming_call = agent._interruptible_streaming_api_call
+
+    def _interrupt_before_wire(api_kwargs, **_kwargs):
+        assert api_kwargs["context_management"]
+        ordering.append("interrupted_before_wire")
+        agent.interrupt("/stop")
+        raise InterruptedError()
+
+    monkeypatch.setattr(agent, "_interruptible_streaming_api_call", _interrupt_before_wire)
+    history = [{"role": "user", "content": f"prior user {i}"} for i in range(30)]
+    agent.run_conversation("first turn", conversation_history=history)
+
+    assert wire_calls == []
+    assert ordering == ["interrupted_before_wire"]
+    assert identity == (agent.session_id, agent.model, agent.provider, agent.base_url)
+
+    agent.clear_interrupt()
+    monkeypatch.setattr(agent, "_interruptible_streaming_api_call", original_streaming_call)
+    result = agent.run_conversation("next turn", conversation_history=history)
+
+    assert result["completed"] is True
+    assert ordering == ["interrupted_before_wire", "compress", "bare_wire"]
+    assert compression_calls == [231_730]
+    assert wire_calls == [
+        {"context_management": (), "checkpoint": (), "stream": True},
+    ]
+
+
 def test_native_compaction_replay_payload_loss_reenters_local_preflight(monkeypatch):
     """A checkpoint replay is rejected before—not after—a malformed wire.
 

@@ -4650,6 +4650,12 @@ def run_conversation(
                 break  # Success, exit retry loop
 
             except InterruptedError:
+                # The stop can land after native preflight arms but before the
+                # streaming helper reaches the physical Responses wire. Release
+                # that exact request so a later turn cannot inherit its grace.
+                _native_preflight_fallback = cancel_native_compaction_preflight_request(agent)
+                if _native_preflight_fallback and agent.api_mode == "codex_responses":
+                    agent.codex_responses_native_compaction = False
                 if thinking_spinner:
                     thinking_spinner.stop("")
                     thinking_spinner = None

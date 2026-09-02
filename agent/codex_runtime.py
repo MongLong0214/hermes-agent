@@ -1400,6 +1400,11 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             raise InterruptedError("Agent interrupted before Codex stream retry")
 
         intercepted_events = []
+        native_preflight_grace = getattr(agent, "_native_compaction_preflight_grace", None)
+        native_preflight_in_flight = (
+            isinstance(native_preflight_grace, dict)
+            and native_preflight_grace.get("phase") == "in_flight"
+        )
         writer_token = {"value": None}
 
         def _open_codex_stream(next_api_kwargs: dict[str, Any]):
@@ -1468,6 +1473,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             _httpx.ConnectError,
             ConnectionError,
         ) as exc:
+            if native_preflight_in_flight and not intercepted_events:
+                raise
             if attempt < max_stream_retries:
                 logger.debug(
                     "Codex Responses stream connect failed (attempt %s/%s); "
@@ -1515,6 +1522,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     interrupt_check=_interrupt_or_superseded,
                 )
             except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
+                if native_preflight_in_flight and not intercepted_events:
+                    raise
                 if attempt < max_stream_retries:
                     logger.debug(
                         "Codex Responses stream transport failed mid-iteration "
