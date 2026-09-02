@@ -920,7 +920,18 @@ def build_turn_context(
             "should_defer_preflight_to_real_usage",
             lambda _tokens: False,
         )
-        _preflight_deferred = _defer_preflight(_preflight_tokens)
+        from agent.native_compaction import (
+            consume_native_compaction_preflight_fallback,
+            defer_local_preflight_for_native_compaction,
+        )
+
+        _native_preflight_deferred = defer_local_preflight_for_native_compaction(
+            agent, _preflight_tokens, messages=messages
+        )
+        _native_preflight_fallback = consume_native_compaction_preflight_fallback(agent)
+        _preflight_deferred = _native_preflight_deferred or (
+            not _native_preflight_fallback and _defer_preflight(_preflight_tokens)
+        )
         # Codex app-server threads are compacted by the codex agent itself;
         # Hermes only initiates compaction in "hermes" mode (#36801).
         _codex_native_auto = (

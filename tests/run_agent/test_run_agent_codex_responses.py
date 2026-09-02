@@ -1713,6 +1713,541 @@ def test_run_conversation_compresses_mid_turn_before_output_budget_exhaustion(mo
     assert len(requests) == 2
 
 
+def test_native_compaction_gets_turn_start_and_tool_followup_before_local_summary(monkeypatch):
+    """A direct native route gets one checkpoint-and-replay opportunity first.
+
+    The rough request estimate crosses the local threshold even though the
+    previous provider count fit below it.  The server then returns a native
+    checkpoint with a tool call; the tool-result follow-up must replay that
+    checkpoint without starting a local summary.  This is the live failure
+    shape where the local pre-API path used to block the first native request.
+    """
+    agent = _build_agent(monkeypatch)
+    agent.model = "gpt-5.6"
+    agent.codex_responses_native_compaction = True
+    agent.codex_responses_compact_threshold = 200_000
+    agent.context_compressor.context_length = 1_000_000
+    agent.context_compressor.threshold_tokens = 200_000
+    agent.context_compressor.last_prompt_tokens = 199_387
+    agent.context_compressor.last_real_prompt_tokens = 199_387
+    agent.context_compressor.last_rough_tokens_when_real_prompt_fit = 0
+
+    first_response = SimpleNamespace(
+        output=[
+            SimpleNamespace(type="compaction", encrypted_content="sealed_checkpoint"),
+            SimpleNamespace(
+                type="function_call",
+                id="fc_1",
+                call_id="call_1",
+                name="terminal",
+                arguments="{}",
+            ),
+        ],
+        usage=SimpleNamespace(
+            input_tokens=200_865,
+            output_tokens=4,
+            total_tokens=200_869,
+        ),
+        status="completed",
+        model="gpt-5.6",
+    )
+    final_response = SimpleNamespace(
+        output=[
+            SimpleNamespace(
+                type="message",
+                content=[SimpleNamespace(type="output_text", text="done")],
+            )
+        ],
+        usage=SimpleNamespace(
+            input_tokens=48_029,
+            output_tokens=3,
+            total_tokens=48_032,
+        ),
+        status="completed",
+        model="gpt-5.6",
+    )
+    responses = [first_response, final_response]
+    requests = []
+    monkeypatch.setattr(
+        agent,
+        "_interruptible_api_call",
+        lambda api_kwargs: requests.append(api_kwargs) or responses.pop(0),
+    )
+    monkeypatch.setattr(
+        "agent.turn_context.estimate_request_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.estimate_messages_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.estimate_request_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop._estimate_tools_tokens_rough", lambda *_a, **_k: 0
+    )
+
+    def _append_tool_result(assistant_message, messages, effective_task_id, api_call_count=0):
+        for call in assistant_message.tool_calls:
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": "tool result",
+                }
+            )
+
+    compression_calls = []
+
+    def _record_local_compression(messages, system_message, **kwargs):
+        compression_calls.append(kwargs.get("approx_tokens"))
+        return messages, system_message
+
+    monkeypatch.setattr(agent, "_execute_tool_calls", _append_tool_result)
+    monkeypatch.setattr(agent, "_compress_context", _record_local_compression)
+
+    history = [
+        {"role": "user", "content": f"prior user {i}"}
+        for i in range(30)
+    ]
+    result = agent.run_conversation("continue", conversation_history=history)
+
+    assert result["completed"] is True
+    assert compression_calls == []
+    assert len(requests) == 2
+    assert requests[0]["context_management"]
+    assert requests[1]["context_management"]
+    assert any(item.get("type") == "compaction" for item in requests[1]["input"])
+    assert agent.context_compressor.last_real_prompt_tokens == 48_029
+
+
+def test_native_compaction_rejection_rebuilds_through_local_preflight(monkeypatch):
+    """A rejected native first chance must not retry an over-threshold bare wire."""
+    agent = _build_agent(monkeypatch)
+    agent.model = "gpt-5.6"
+    agent.codex_responses_native_compaction = True
+    agent.codex_responses_compact_threshold = 200_000
+    agent.context_compressor.context_length = 1_000_000
+    agent.context_compressor.threshold_tokens = 200_000
+    agent.context_compressor.last_prompt_tokens = 199_387
+    agent.context_compressor.last_real_prompt_tokens = 199_387
+    agent.context_compressor.last_rough_tokens_when_real_prompt_fit = 0
+
+    class _NativeRejection(Exception):
+        status_code = 400
+
+    outcomes = [
+        _NativeRejection("Unknown parameter: context_management"),
+        _codex_message_response("recovered"),
+    ]
+    requests = []
+
+    def _call(api_kwargs):
+        requests.append(api_kwargs)
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    compression_calls = []
+    monkeypatch.setattr(agent, "_interruptible_api_call", _call)
+    monkeypatch.setattr(
+        "agent.turn_context.estimate_request_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.estimate_messages_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.estimate_request_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop._estimate_tools_tokens_rough", lambda *_a, **_k: 0
+    )
+    monkeypatch.setattr(
+        agent,
+        "_compress_context",
+        lambda messages, system_message, **kwargs: (
+            compression_calls.append(kwargs["approx_tokens"]) or messages,
+            system_message,
+        ),
+    )
+
+    result = agent.run_conversation(
+        "continue",
+        conversation_history=[{"role": "user", "content": f"prior user {i}"} for i in range(30)],
+    )
+
+    assert result["completed"] is True
+    assert len(requests) == 2
+    assert requests[0]["context_management"]
+    assert "context_management" not in requests[1]
+    assert compression_calls == [231_730]
+
+
+def test_native_compaction_usage_less_provider_retry_rebuilds_before_bare_wire(monkeypatch):
+    """A native-bearing request that raises without usage loses native ownership.
+
+    The retry may only reach the Responses wire after the normal local
+    preflight, and it must not carry the native field that owned the failed
+    request.  The compression observation and the payload inspection are
+    deliberately independent of the fake provider's successful output.
+    """
+    agent = _build_agent(monkeypatch)
+    agent.model = "gpt-5.6"
+    agent.codex_responses_native_compaction = True
+    agent.codex_responses_compact_threshold = 200_000
+    agent.context_compressor.context_length = 1_000_000
+    agent.context_compressor.threshold_tokens = 200_000
+    agent.context_compressor.last_prompt_tokens = 199_387
+    agent.context_compressor.last_real_prompt_tokens = 199_387
+    agent.context_compressor.last_rough_tokens_when_real_prompt_fit = 0
+
+    outcomes = [RuntimeError("provider connection dropped"), _codex_message_response("recovered")]
+    requests = []
+
+    def _call(api_kwargs):
+        requests.append(api_kwargs)
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    compression_calls = []
+    monkeypatch.setattr(agent, "_interruptible_api_call", _call)
+    monkeypatch.setattr(
+        "agent.turn_context.estimate_request_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.estimate_messages_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.estimate_request_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop._estimate_tools_tokens_rough", lambda *_a, **_k: 0
+    )
+    monkeypatch.setattr(
+        agent,
+        "_compress_context",
+        lambda messages, system_message, **kwargs: (
+            compression_calls.append(kwargs["approx_tokens"]) or messages,
+            system_message,
+        ),
+    )
+
+    result = agent.run_conversation(
+        "continue",
+        conversation_history=[{"role": "user", "content": f"prior user {i}"} for i in range(30)],
+    )
+
+    assert result["completed"] is True
+    assert compression_calls == [231_730]
+    assert len(requests) == 2
+    assert requests[0]["context_management"]
+    assert "context_management" not in requests[1]
+
+
+def test_native_compaction_replay_payload_loss_reenters_local_preflight(monkeypatch):
+    """A checkpoint replay is rejected before—not after—a malformed wire.
+
+    Both the native field and the opaque checkpoint are required at the final
+    Responses payload boundary.  Strip each once after capture to prove the
+    invalid replay never reaches the provider and the existing local fallback
+    owns the next dispatched request.
+    """
+    for missing in ("context_management", "checkpoint"):
+        agent = _build_agent(monkeypatch)
+        agent.model = "gpt-5.6"
+        agent.codex_responses_native_compaction = True
+        agent.codex_responses_compact_threshold = 200_000
+        agent.context_compressor.context_length = 1_000_000
+        agent.context_compressor.threshold_tokens = 200_000
+        agent.context_compressor.last_prompt_tokens = 199_387
+        agent.context_compressor.last_real_prompt_tokens = 199_387
+        agent.context_compressor.last_rough_tokens_when_real_prompt_fit = 0
+
+        capture = SimpleNamespace(
+            output=[
+                SimpleNamespace(type="compaction", encrypted_content="sealed_checkpoint"),
+                SimpleNamespace(
+                    type="function_call",
+                    id="fc_1",
+                    call_id="call_1",
+                    name="terminal",
+                    arguments="{}",
+                ),
+            ],
+            usage=SimpleNamespace(input_tokens=200_865, output_tokens=4, total_tokens=200_869),
+            status="completed",
+            model="gpt-5.6",
+        )
+        outcomes = [capture, _codex_message_response("recovered")]
+        requests = []
+        compression_calls = []
+        monkeypatch.setattr(
+            agent,
+            "_interruptible_api_call",
+            lambda api_kwargs: requests.append(api_kwargs) or outcomes.pop(0),
+        )
+        monkeypatch.setattr(
+            "agent.turn_context.estimate_request_tokens_rough", lambda *_a, **_k: 231_730
+        )
+        monkeypatch.setattr(
+            "agent.conversation_loop.estimate_messages_tokens_rough", lambda *_a, **_k: 231_730
+        )
+        monkeypatch.setattr(
+            "agent.conversation_loop.estimate_request_tokens_rough", lambda *_a, **_k: 231_730
+        )
+        monkeypatch.setattr(
+            "agent.conversation_loop._estimate_tools_tokens_rough", lambda *_a, **_k: 0
+        )
+        monkeypatch.setattr(
+            agent,
+            "_execute_tool_calls",
+            lambda assistant_message, messages, *_a: messages.append(
+                {"role": "tool", "tool_call_id": "call_1", "content": "tool result"}
+            ),
+        )
+        monkeypatch.setattr(
+            agent,
+            "_compress_context",
+            lambda messages, system_message, **kwargs: (
+                compression_calls.append(kwargs["approx_tokens"]) or messages,
+                system_message,
+            ),
+        )
+
+        transport = agent._get_transport()
+        original_preflight = transport.preflight_kwargs
+        stripped = False
+
+        def _strip_one_replay(api_kwargs, **kwargs):
+            nonlocal stripped
+            prepared = original_preflight(api_kwargs, **kwargs)
+            has_checkpoint = any(
+                item.get("type") == "compaction"
+                for item in prepared.get("input", [])
+                if isinstance(item, dict)
+            )
+            if stripped or not has_checkpoint:
+                return prepared
+            stripped = True
+            prepared = dict(prepared)
+            if missing == "context_management":
+                prepared.pop("context_management", None)
+            else:
+                prepared["input"] = [
+                    item for item in prepared["input"]
+                    if not (isinstance(item, dict) and item.get("type") == "compaction")
+                ]
+            return prepared
+
+        monkeypatch.setattr(transport, "preflight_kwargs", _strip_one_replay)
+        result = agent.run_conversation(
+            "continue",
+            conversation_history=[{"role": "user", "content": f"prior user {i}"} for i in range(30)],
+        )
+
+        assert result["completed"] is True
+        assert stripped is True
+        assert compression_calls == [231_730]
+        assert len(requests) == 2
+        assert all(request["context_management"] for request in requests)
+        assert any(item.get("type") == "compaction" for item in requests[1]["input"])
+
+
+def test_native_compaction_replay_without_proven_reduction_opens_local_fallback(monkeypatch):
+    """A replay checkpoint alone is not success without independent usage proof."""
+    for replay_usage in (None, 200_865):
+        agent = _build_agent(monkeypatch)
+        agent.model = "gpt-5.6"
+        agent.codex_responses_native_compaction = True
+        agent.codex_responses_compact_threshold = 200_000
+        agent.context_compressor.context_length = 1_000_000
+        agent.context_compressor.threshold_tokens = 200_000
+        agent.context_compressor.last_prompt_tokens = 199_387
+        agent.context_compressor.last_real_prompt_tokens = 199_387
+        agent.context_compressor.last_rough_tokens_when_real_prompt_fit = 0
+
+        def _checkpoint_tool_response(call_id, usage):
+            return SimpleNamespace(
+                output=[
+                    SimpleNamespace(type="compaction", encrypted_content=f"sealed_{call_id}"),
+                    SimpleNamespace(
+                        type="function_call",
+                        id=f"fc_{call_id}",
+                        call_id=call_id,
+                        name="terminal",
+                        arguments="{}",
+                    ),
+                ],
+                usage=(
+                    None
+                    if usage is None
+                    else SimpleNamespace(input_tokens=usage, output_tokens=4, total_tokens=usage + 4)
+                ),
+                status="completed",
+                model="gpt-5.6",
+            )
+
+        outcomes = [
+            _checkpoint_tool_response("call_1", 200_865),
+            _checkpoint_tool_response("call_2", replay_usage),
+            _codex_message_response("recovered"),
+        ]
+        requests = []
+        events = []
+        compression_calls = []
+
+        def _rough(messages, *_a, **_k):
+            return 10_000 if any(
+                isinstance(message, dict) and message.get("content") == "[local fallback]"
+                for message in messages
+            ) else 231_730
+
+        def _call(api_kwargs):
+            events.append("wire")
+            requests.append(api_kwargs)
+            return outcomes.pop(0)
+
+        def _compress(messages, system_message, **kwargs):
+            events.append("compress")
+            compression_calls.append(kwargs["approx_tokens"])
+            return [{"role": "user", "content": "[local fallback]"}], system_message
+
+        monkeypatch.setattr(agent, "_interruptible_api_call", _call)
+        monkeypatch.setattr("agent.turn_context.estimate_request_tokens_rough", _rough)
+        monkeypatch.setattr("agent.conversation_loop.estimate_messages_tokens_rough", _rough)
+        monkeypatch.setattr("agent.conversation_loop.estimate_request_tokens_rough", _rough)
+        monkeypatch.setattr("agent.conversation_loop._estimate_tools_tokens_rough", lambda *_a, **_k: 0)
+        monkeypatch.setattr(
+            agent,
+            "_execute_tool_calls",
+            lambda assistant_message, messages, *_a: messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": assistant_message.tool_calls[0].id,
+                    "content": "tool result",
+                }
+            ),
+        )
+        monkeypatch.setattr(agent, "_compress_context", _compress)
+
+        result = agent.run_conversation(
+            "continue",
+            conversation_history=[{"role": "user", "content": f"prior user {i}"} for i in range(30)],
+        )
+
+        assert result["completed"] is True
+        assert events == ["wire", "wire", "compress", "wire"]
+        assert compression_calls == [200_865]
+        assert len(requests) == 3
+        assert all(request["context_management"] for request in requests)
+        assert any(item.get("type") == "compaction" for item in requests[1]["input"])
+        assert not any(item.get("type") == "compaction" for item in requests[2]["input"])
+
+
+def test_native_preflight_grace_uses_provider_headroom_once_and_preserves_local_controls(monkeypatch):
+    """Provider input headroom, not the local 200k trigger, owns native grace."""
+    results = {}
+    for name, native_enabled, context_length, rough_tokens in (
+        ("safe_900k", True, 1_000_000, 900_000),
+        ("hard_headroom", True, 800_000, 900_000),
+        ("disabled", False, 1_000_000, 231_730),
+    ):
+        agent = _build_agent(monkeypatch)
+        agent.model = "gpt-5.6"
+        agent.codex_responses_native_compaction = native_enabled
+        agent.codex_responses_compact_threshold = 200_000
+        agent.context_compressor.context_length = context_length
+        agent.context_compressor.max_tokens = 50_000
+        agent.context_compressor.threshold_tokens = 200_000
+        agent.context_compressor.last_prompt_tokens = 199_387
+        agent.context_compressor.last_real_prompt_tokens = 199_387
+        agent.context_compressor.last_rough_tokens_when_real_prompt_fit = 0
+
+        events = []
+        requests = []
+        compression_calls = []
+
+        def _rough(messages, *_a, **_k):
+            return 10_000 if any(
+                isinstance(message, dict) and message.get("content") == "[local fallback]"
+                for message in messages
+            ) else rough_tokens
+
+        def _call(api_kwargs):
+            events.append("wire")
+            requests.append(api_kwargs)
+            return _codex_message_response("done")
+
+        def _compress(messages, system_message, **kwargs):
+            events.append("compress")
+            compression_calls.append(kwargs["approx_tokens"])
+            return [{"role": "user", "content": "[local fallback]"}], system_message
+
+        monkeypatch.setattr(agent, "_interruptible_api_call", _call)
+        monkeypatch.setattr("agent.turn_context.estimate_request_tokens_rough", _rough)
+        monkeypatch.setattr("agent.conversation_loop.estimate_messages_tokens_rough", _rough)
+        monkeypatch.setattr("agent.conversation_loop.estimate_request_tokens_rough", _rough)
+        monkeypatch.setattr("agent.conversation_loop._estimate_tools_tokens_rough", lambda *_a, **_k: 0)
+        monkeypatch.setattr(agent, "_compress_context", _compress)
+
+        if name == "safe_900k":
+            import agent.conversation_loop as conversation_loop
+            import agent.native_compaction as native_compaction
+
+            defer_calls = []
+            start_calls = []
+            original_defer = native_compaction.defer_local_preflight_for_native_compaction
+            original_start = conversation_loop.start_native_compaction_preflight_request
+
+            def _turn_defer(target, *args, **kwargs):
+                if target is agent:
+                    defer_calls.append("turn_start")
+                return original_defer(target, *args, **kwargs)
+
+            def _loop_defer(target, *args, **kwargs):
+                if target is agent:
+                    defer_calls.append("pre_api")
+                return original_defer(target, *args, **kwargs)
+
+            def _start(target, *args, **kwargs):
+                if target is agent:
+                    start_calls.append("wire")
+                return original_start(target, *args, **kwargs)
+
+            # turn_context imports the predicate inside build_turn_context;
+            # conversation_loop holds its own imported binding.
+            monkeypatch.setattr(native_compaction, "defer_local_preflight_for_native_compaction", _turn_defer)
+            monkeypatch.setattr(conversation_loop, "defer_local_preflight_for_native_compaction", _loop_defer)
+            monkeypatch.setattr(conversation_loop, "start_native_compaction_preflight_request", _start)
+
+        result = agent.run_conversation(
+            "continue",
+            conversation_history=[{"role": "user", "content": f"prior user {i}"} for i in range(30)],
+        )
+        assert result["completed"] is True
+        results[name] = (events, compression_calls, requests)
+        if name == "safe_900k":
+            assert defer_calls[:2] == ["turn_start", "pre_api"]
+            assert start_calls == ["wire"]
+
+    safe_events, safe_compression, safe_requests = results["safe_900k"]
+    assert safe_events == ["wire"]
+    assert safe_compression == []
+    assert safe_requests[0]["context_management"]
+
+    hard_events, hard_compression, hard_requests = results["hard_headroom"]
+    assert hard_events == ["compress", "wire"]
+    assert hard_compression == [900_000]
+    assert hard_requests[0]["context_management"]
+
+    disabled_events, disabled_compression, disabled_requests = results["disabled"]
+    assert disabled_events == ["compress", "wire"]
+    assert disabled_compression == [231_730]
+    assert "context_management" not in disabled_requests[0]
+
+
 def test_mid_turn_compaction_does_not_double_persist_in_place_rows(monkeypatch, tmp_path):
     """Mid-turn pre-API compaction must re-baseline the flush cursor.
 

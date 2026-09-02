@@ -74,6 +74,13 @@ from agent.model_metadata import (
     parse_available_output_tokens_from_error,
     save_context_length,
 )
+from agent.native_compaction import (
+    cancel_native_compaction_preflight_request,
+    consume_native_compaction_preflight_fallback,
+    defer_local_preflight_for_native_compaction,
+    observe_native_compaction_preflight_response,
+    start_native_compaction_preflight_request,
+)
 from agent.process_bootstrap import _install_safe_stdio
 from agent.prompt_caching import (
     build_prompt_cache_plan,
@@ -104,6 +111,10 @@ logger = logging.getLogger(__name__)
 
 class _ReceiptExecutionProfileError(RuntimeError):
     """Fail closed before a receipt reaches a mutable/unsupported call path."""
+
+
+class _NativeCompactionPreflightFallback(RuntimeError):
+    """Restart the outer loop so existing local preflight owns this request."""
 
 
 def _receipt_admitted_text(turn_receipt: Any, user_message: Any) -> Any:
@@ -2835,6 +2846,7 @@ def run_conversation(
         if receipt_raw_text_only:
             _defer_preflight = lambda _tokens: False
             _compression_cooldown = None
+            _native_preflight_deferred = False
         else:
             _defer_preflight = getattr(
                 _compressor, "should_defer_preflight_to_real_usage", lambda _t: False
@@ -2842,13 +2854,27 @@ def run_conversation(
             _compression_cooldown = getattr(
                 _compressor, "get_active_compression_failure_cooldown", lambda: None
             )()
+            _native_preflight_deferred = defer_local_preflight_for_native_compaction(
+                agent, request_pressure_tokens, messages=messages
+            )
+            _native_preflight_fallback = consume_native_compaction_preflight_fallback(
+                agent
+            )
+            if _native_preflight_fallback:
+                _defer_preflight = lambda _tokens: False
         if (
             not receipt_raw_text_only
             and agent.compression_enabled
-            and len(messages) > 1
+            # A consumed native grace is a one-shot local-preflight obligation.
+            # Let that fallback run even if normalization collapsed history to
+            # one message, before the native-disabled retry can reach the wire.
+            and (len(messages) > 1 or _native_preflight_fallback)
             and compression_attempts < max_compression_attempts
             and not _preflight_compression_blocked
-            and not _defer_preflight(request_pressure_tokens)
+            and not (
+                _native_preflight_deferred
+                or _defer_preflight(request_pressure_tokens)
+            )
             and not _compression_cooldown
             and _compressor.should_compress(request_pressure_tokens)
         ):
@@ -3372,6 +3398,10 @@ def run_conversation(
                             is_github_responses=agent._is_copilot_url(),
                             sanitize_harmony_tokens=agent._is_codex_backend(),
                         )
+                    if not start_native_compaction_preflight_request(
+                        agent, next_api_kwargs
+                    ):
+                        raise _NativeCompactionPreflightFallback()
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
@@ -4309,6 +4339,7 @@ def run_conversation(
                         }
                 
                 # Track actual token usage from response for context management
+                _native_preflight_prompt_tokens = 0
                 if hasattr(response, 'usage') and response.usage:
                     canonical_usage = normalize_usage(
                         response.usage,
@@ -4354,6 +4385,7 @@ def run_conversation(
                         except Exception as _moa_trace_exc:  # pragma: no cover - defensive
                             logger.debug("MoA trace flush failed: %s", _moa_trace_exc)
                     prompt_tokens = canonical_usage.prompt_tokens
+                    _native_preflight_prompt_tokens = prompt_tokens
                     completion_tokens = canonical_usage.output_tokens
                     total_tokens = canonical_usage.total_tokens
                     # Forward canonical token + cache buckets so context engines
@@ -4433,6 +4465,12 @@ def run_conversation(
                     # charged to that old compaction, and so preflight deferral
                     # does not remain latched indefinitely.
                     agent.context_compressor.update_from_response({})
+
+                observe_native_compaction_preflight_response(
+                    agent,
+                    response,
+                    prompt_tokens=_native_preflight_prompt_tokens,
+                )
 
                 if hasattr(response, 'usage') and response.usage:
                     # Cache discovered context length after successful call.
@@ -4646,6 +4684,7 @@ def run_conversation(
                 break
 
             except Exception as api_error:
+                _native_preflight_fallback = cancel_native_compaction_preflight_request(agent)
                 # Stop spinner silently — retry status is buffered and
                 # only flushed when every retry+fallback is exhausted.
                 if thinking_spinner:
@@ -4662,6 +4701,30 @@ def run_conversation(
                     )
                     failed = True
                     _turn_exit_reason = "receipt_execution_profile_rejected"
+                    break
+
+                if isinstance(api_error, _NativeCompactionPreflightFallback):
+                    _retry.restart_with_rebuilt_messages = True
+                    break
+
+                if _native_preflight_fallback:
+                    if agent.api_mode == "codex_responses":
+                        # A native-bearing request failed before any usage could
+                        # certify it.  The rebuilt local-preflight retry must
+                        # fail closed instead of placing the same native field
+                        # on another over-threshold wire.
+                        agent.codex_responses_native_compaction = False
+                        from agent.native_compaction import is_native_compaction_rejection
+
+                        if is_native_compaction_rejection(
+                            api_error, getattr(api_error, "status_code", None)
+                        ):
+                            logger.warning(
+                                "%sNative compaction rejection recovery: disabled "
+                                "codex_responses_native for this session; rebuilding through local preflight",
+                                agent.log_prefix,
+                            )
+                    _retry.restart_with_rebuilt_messages = True
                     break
 
                 # -----------------------------------------------------------
@@ -7729,10 +7792,24 @@ def run_conversation(
                         messages, tools=agent.tools or None
                     )
 
+                _native_post_tool_deferred = False
+                if (
+                    not receipt_raw_text_only
+                    and agent.compression_enabled
+                    and _real_tokens >= int(getattr(_compressor, "threshold_tokens", 0) or 0)
+                ):
+                    _native_post_tool_pressure = estimate_request_tokens_rough(
+                        messages, tools=agent.tools or None
+                    )
+                    _native_post_tool_deferred = defer_local_preflight_for_native_compaction(
+                        agent, _native_post_tool_pressure, messages=messages
+                    )
+
                 if (
                     not receipt_raw_text_only
                     and agent.compression_enabled
                     and compression_attempts < max_compression_attempts
+                    and not _native_post_tool_deferred
                     and _compressor.should_compress(_real_tokens)
                 ):
                     compression_attempts += 1
