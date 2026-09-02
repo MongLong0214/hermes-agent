@@ -923,6 +923,43 @@ def _bedrock_reasoning_stale_floor(model_id: object) -> "float | None":
     return None
 
 
+def _guard_native_preflight_stream_retry(agent, request_client) -> None:
+    """Let a native-preflight transport failure reach the outer rebuild path.
+
+    ``run_codex_stream`` owns a narrow physical-stream retry loop below the
+    conversation loop.  While a native preflight is in flight, that retry would
+    resend the same over-threshold native payload before the outer loop can
+    cancel the grace and run local preflight.  Reclassify only the errors that
+    loop retries so the existing outer cancellation/rebuild owner sees them.
+    """
+    state = getattr(agent, "_native_compaction_preflight_grace", None)
+    if not isinstance(state, dict) or state.get("phase") != "in_flight":
+        return
+    responses = getattr(request_client, "responses", None)
+    create = getattr(responses, "create", None)
+    if not callable(create) or getattr(create, "_native_preflight_retry_guard", False):
+        return
+
+    import httpx as _httpx
+
+    def _create(*args, **kwargs):
+        try:
+            return create(*args, **kwargs)
+        except (
+            _httpx.RemoteProtocolError,
+            _httpx.ReadTimeout,
+            _httpx.ConnectError,
+            ConnectionError,
+        ) as exc:
+            current = getattr(agent, "_native_compaction_preflight_grace", None)
+            if isinstance(current, dict) and current.get("phase") == "in_flight":
+                raise RuntimeError("native preflight stream retry requires rebuild") from exc
+            raise
+
+    _create._native_preflight_retry_guard = True
+    responses.create = _create
+
+
 def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     """Run one non-streaming LLM request for the active api_mode and return it.
 
@@ -941,6 +978,7 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     """
     if agent.api_mode == "codex_responses":
         request_client = make_client("codex_stream_request")
+        _guard_native_preflight_stream_retry(agent, request_client)
         return agent._run_codex_stream(
             api_kwargs,
             client=request_client,
