@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from types import MappingProxyType
 from urllib.parse import urlparse
 from typing import Any, Dict, Optional
 
@@ -62,6 +63,38 @@ def _getenv(name: str, default: str = "") -> str:
     """
     val = _get_secret(name, default)
     return val if val is not None else default
+
+
+# Static source census: these runtime URL overrides are consumed by auth
+# helpers but are not declared on the matching auth-provider registry entry.
+# Keep the mapping immutable and read each name only through profile-scoped
+# ``_getenv``; values are route facts and must never be logged.
+_NON_REGISTRY_PRE_CREDENTIAL_BASE_URL_ENVS = MappingProxyType(
+    {
+        "nous": ("NOUS_INFERENCE_BASE_URL",),
+        "openai-codex": ("HERMES_CODEX_BASE_URL",),
+        "qwen-oauth": ("HERMES_QWEN_BASE_URL",),
+        "xai-oauth": ("HERMES_XAI_BASE_URL", "XAI_BASE_URL"),
+        "openrouter": ("CUSTOM_BASE_URL",),
+        "custom": ("CUSTOM_BASE_URL",),
+    }
+)
+
+
+def _pre_credential_runtime_base_url_facts(provider: str, provider_config: object) -> tuple[str, ...]:
+    """Return every locally knowable effective runtime URL for a provider.
+
+    Registry-declared URL names and the source-censused auth-helper overrides
+    share one profile-scoped read path. Dynamic credential/pool metadata is
+    intentionally not represented here; it is checked by the final-result
+    guard after the resolver has materialized it.
+    """
+    names = []
+    declared = getattr(provider_config, "base_url_env_var", "")
+    if isinstance(declared, str) and declared:
+        names.append(declared)
+    names.extend(_NON_REGISTRY_PRE_CREDENTIAL_BASE_URL_ENVS.get(provider, ()))
+    return tuple(_getenv(name, "") for name in dict.fromkeys(names))
 
 
 def _normalize_custom_provider_name(value: str) -> str:
@@ -604,7 +637,7 @@ def _resolve_runtime_from_pool_entry(
     if provider == "lmstudio":
         base_url = auth_mod._normalize_lmstudio_runtime_base_url(base_url)
 
-    return {
+    result = {
         "provider": provider,
         "api_mode": api_mode,
         "base_url": base_url,
@@ -613,6 +646,7 @@ def _resolve_runtime_from_pool_entry(
         "credential_pool": pool,
         "requested_provider": requested_provider,
     }
+    return _guard_resolved_runtime(result)
 
 
 def resolve_requested_provider(requested: Optional[str] = None) -> str:
@@ -632,6 +666,38 @@ def resolve_requested_provider(requested: Optional[str] = None) -> str:
         return env_provider
 
     return "auto"
+
+
+def _deny_gemini_runtime_route(
+    *,
+    canonical_provider: object = "",
+    model: object = "",
+    base_url: object = "",
+    api_mode: object = "",
+    routing_hint: object = "",
+) -> None:
+    """Deny a known Gemini-family route before resolution reads credentials."""
+    from agent.gemini_outbound_policy import deny_gemini_outbound
+
+    deny_gemini_outbound(
+        canonical_provider=canonical_provider,
+        model=model,
+        base_url=base_url,
+        api_mode=api_mode,
+        routing_hint=routing_hint,
+    )
+
+
+def _guard_resolved_runtime(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Deny a final Gemini/Vertex route while preserving safe result identity."""
+    _deny_gemini_runtime_route(
+        canonical_provider=result.get("provider", ""),
+        model=result.get("model", ""),
+        base_url=result.get("base_url", ""),
+        api_mode=result.get("api_mode", ""),
+        routing_hint=result.get("requested_provider", ""),
+    )
+    return result
 
 
 def _try_resolve_from_custom_pool(
@@ -1119,6 +1185,12 @@ def _resolve_named_custom_runtime(
             pass
     if requested_norm == "custom" and explicit_base_url:
         base_url = explicit_base_url.strip().rstrip("/")
+        _deny_gemini_runtime_route(
+            canonical_provider="custom",
+            model=target_model or _get_model_config().get("default"),
+            base_url=base_url,
+            routing_hint=requested_provider,
+        )
         # Check credential pool first — mirrors the named-custom-provider path
         # so bare `provider: custom` with a configured custom_providers entry
         # also gets its api_key from the pool instead of env var fallbacks.
@@ -1161,6 +1233,18 @@ def _resolve_named_custom_runtime(
     ).rstrip("/")
     if not base_url:
         return None
+
+    _deny_gemini_runtime_route(
+        canonical_provider="custom",
+        model=(
+            target_model
+            or custom_provider.get("model")
+            or _get_model_config().get("default")
+        ),
+        base_url=base_url,
+        api_mode=custom_provider.get("api_mode"),
+        routing_hint=requested_provider,
+    )
 
     # Check if a credential pool exists for this custom endpoint
     pool_result = _try_resolve_from_custom_pool(base_url, "custom", custom_provider.get("api_mode"), provider_name=custom_provider.get("name"))
@@ -1334,6 +1418,14 @@ def _resolve_openrouter_runtime(
         or OPENROUTER_BASE_URL
     ).rstrip("/")
 
+    _deny_gemini_runtime_route(
+        canonical_provider="custom" if requested_norm == "custom" else "openrouter",
+        model=model_cfg.get("default") or model_cfg.get("model"),
+        base_url=base_url,
+        api_mode=model_cfg.get("api_mode"),
+        routing_hint=requested_provider,
+    )
+
     # Choose API key based on whether the resolved base_url targets OpenRouter.
     # When hitting OpenRouter, prefer OPENROUTER_API_KEY (issue #289).
     # When hitting a custom endpoint (e.g. Z.ai, local LLM), prefer
@@ -1486,6 +1578,14 @@ def _resolve_azure_foundry_runtime(
             "Azure Foundry requires a base URL. Set it via 'hermes model' or "
             "the AZURE_FOUNDRY_BASE_URL environment variable."
         )
+
+    _deny_gemini_runtime_route(
+        canonical_provider=requested_provider,
+        model=effective_model,
+        base_url=base_url,
+        api_mode=cfg_api_mode,
+        routing_hint=requested_provider,
+    )
 
     # Anthropic SDK appends /v1/messages itself, so strip any trailing /v1
     # we inherited from the configured base_url to avoid double-/v1 paths.
@@ -1780,7 +1880,34 @@ def resolve_runtime_provider(
     persisted default. Other callers can leave it None to preserve existing
     behavior (api_mode derived from config).
     """
+    return _guard_resolved_runtime(
+        _resolve_runtime_provider_impl(
+            requested=requested,
+            explicit_api_key=explicit_api_key,
+            explicit_base_url=explicit_base_url,
+            target_model=target_model,
+        )
+    )
+
+
+def _resolve_runtime_provider_impl(
+    *,
+    requested: Optional[str] = None,
+    explicit_api_key: Optional[str] = None,
+    explicit_base_url: Optional[str] = None,
+    target_model: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Internal implementation guarded by :func:`resolve_runtime_provider`."""
     requested_provider = resolve_requested_provider(requested)
+    model_cfg = _get_model_config()
+
+    _deny_gemini_runtime_route(
+        canonical_provider=requested_provider,
+        model=target_model or model_cfg.get("default") or model_cfg.get("model"),
+        base_url=explicit_base_url or model_cfg.get("base_url"),
+        api_mode=model_cfg.get("api_mode"),
+        routing_hint=requested or requested_provider,
+    )
 
     # Honour ``providers.<name>.enabled: false`` for BOTH user-defined
     # custom providers and the built-in ones (openai / anthropic /
@@ -1934,6 +2061,25 @@ def resolve_runtime_provider(
         explicit_base_url=explicit_base_url,
     )
     model_cfg = _get_model_config()
+    provider_config = PROVIDER_REGISTRY.get(provider)
+
+    _deny_gemini_runtime_route(
+        canonical_provider=provider,
+        model=target_model or model_cfg.get("default") or model_cfg.get("model"),
+        base_url=explicit_base_url or model_cfg.get("base_url"),
+        api_mode=model_cfg.get("api_mode"),
+        routing_hint=requested_provider,
+    )
+    for provider_env_base_url in _pre_credential_runtime_base_url_facts(
+        provider, provider_config
+    ):
+        _deny_gemini_runtime_route(
+            canonical_provider=provider,
+            model=target_model or model_cfg.get("default") or model_cfg.get("model"),
+            base_url=provider_env_base_url,
+            api_mode=model_cfg.get("api_mode"),
+            routing_hint=requested_provider,
+        )
 
     # OpenCode Zen free tier (*-free slugs, e.g. x-preview-f-free /
     # "Ox Alpha"): served ANONYMOUSLY on the Zen relay ONLY. Any bearer the
