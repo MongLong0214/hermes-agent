@@ -464,6 +464,29 @@ def test_no_agent_script_failure_is_fixed_before_return_and_durable_sinks(
     )
 
 
+def test_no_agent_missing_script_failure_is_fixed_before_return_and_durable_sinks(
+    monkeypatch, tmp_path, caplog
+):
+    """A missing no-agent script never reaches public failure sinks verbatim."""
+    raw_missing_script_reason = "no_agent=True but no script is set for this job"
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(s, "_get_hermes_home", lambda: home)
+    caplog.set_level(logging.ERROR, logger=s.__name__)
+
+    job = {
+        "id": "public-missing-script-failure",
+        "name": "public missing script failure",
+        "no_agent": True,
+        "deliver": "telegram",
+    }
+    observed = _run_real_failure_through_all_public_sinks(monkeypatch, job)
+
+    _assert_only_fixed_public_failure(
+        observed, caplog, raw_missing_script_reason, job["id"]
+    )
+
+
 def test_monitor_source_failure_is_fixed_before_return_and_durable_sinks(
     monkeypatch, tmp_path, caplog
 ):

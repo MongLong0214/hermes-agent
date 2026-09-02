@@ -4762,8 +4762,14 @@ def run_job(
         script_path = job.get("script")
         if not script_path:
             err = "no_agent=True but no script is set for this job"
-            logger.error("Job '%s': %s", job_id, err)
-            return False, "", "", err
+            logger.debug("Job '%s': %s", job_id, err)
+            logger.error(_CRON_DELIVERY_FAILURE)
+            return (
+                False,
+                _CRON_DELIVERY_FAILURE,
+                _CRON_DELIVERY_FAILURE,
+                _CRON_DELIVERY_FAILURE,
+            )
 
         # Apply workdir if configured — lets scripts use predictable relative
         # paths. For no_agent jobs this is passed as the subprocess cwd so the
