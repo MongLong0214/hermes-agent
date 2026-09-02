@@ -26,6 +26,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
+from agent.codex_runtime import _CodexStreamTerminalFailure
 from agent.conversation_compression import (
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
     COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE,
@@ -2059,6 +2060,8 @@ def run_conversation(
     api_call_count = 0
     final_response = None
     interrupted = False
+    accepted_stream_failure = False
+    accepted_stream_failure_error = None
     failed = False
     codex_ack_continuations = 0
     length_continue_retries = 0
@@ -3373,6 +3376,7 @@ def run_conversation(
                         _use_streaming = False
 
                 def _perform_api_call(next_api_kwargs):
+                    nonlocal accepted_stream_failure_outcome
                     if receipt_raw_text_only:
                         receipt_error = _receipt_pre_call_invariant_error(
                             agent,
@@ -3403,31 +3407,38 @@ def run_conversation(
                     ):
                         raise _NativeCompactionPreflightFallback()
                     if _use_streaming:
-                        return agent._interruptible_streaming_api_call(
+                        response = agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
                         )
-                    from agent import relay_llm
+                    else:
+                        from agent import relay_llm
 
-                    return relay_llm.execute(
-                        next_api_kwargs,
-                        agent._interruptible_api_call,
-                        session_id=str(agent.session_id or ""),
-                        name=str(agent.provider or "provider"),
-                        model_name=str(agent.model or ""),
-                        metadata={
-                            "api_mode": agent.api_mode,
-                            "api_request_id": api_request_id,
-                            "call_role": (
-                                "delegated"
-                                if getattr(agent, "is_subagent", False)
-                                else "fallback"
-                                if int(getattr(agent, "_fallback_index", 0) or 0) > 0
-                                else "primary"
-                            ),
-                            "retry_count": retry_count,
-                        },
-                        defer_logical_completion=True,
-                    )
+                        response = relay_llm.execute(
+                            next_api_kwargs,
+                            agent._interruptible_api_call,
+                            session_id=str(agent.session_id or ""),
+                            name=str(agent.provider or "provider"),
+                            model_name=str(agent.model or ""),
+                            metadata={
+                                "api_mode": agent.api_mode,
+                                "api_request_id": api_request_id,
+                                "call_role": (
+                                    "delegated"
+                                    if getattr(agent, "is_subagent", False)
+                                    else "fallback"
+                                    if int(getattr(agent, "_fallback_index", 0) or 0) > 0
+                                    else "primary"
+                                ),
+                                "retry_count": retry_count,
+                            },
+                            defer_logical_completion=True,
+                        )
+                    if isinstance(response, _CodexStreamTerminalFailure):
+                        # Capture the actual runtime outcome before it crosses
+                        # execution middleware.  The later identity check is
+                        # therefore unforgeable by a middleware return value.
+                        accepted_stream_failure_outcome = response
+                    return response
 
                 _model_request_active = getattr(agent, "_model_request_active", None)
                 _redirect_lock = getattr(agent, "_pending_redirect_lock", None)
@@ -3438,6 +3449,8 @@ def run_conversation(
                 elif _model_request_active is not None:
                     _model_request_active.set()
                 _redirect_crossed_response = False
+                accepted_stream_failure_error = None
+                accepted_stream_failure_outcome = None
                 try:
                     if receipt_raw_text_only:
                         response = _perform_api_call(api_kwargs)
@@ -3472,6 +3485,20 @@ def run_conversation(
                         if _model_request_active is not None:
                             _model_request_active.clear()
                         _redirect_crossed_response = agent._has_pending_redirect()
+                if (
+                    accepted_stream_failure_outcome is not None
+                    and response is accepted_stream_failure_outcome
+                ):
+                    # Accept only the exact outcome created by this invocation.
+                    # Re-raise its exact original error into the existing
+                    # terminal path; a middleware-created lookalike is generic.
+                    accepted_stream_failure_error = response.error
+                    raise accepted_stream_failure_error
+                if isinstance(response, _CodexStreamTerminalFailure):
+                    # An untrusted middleware return may look like the private
+                    # outcome, but it has no accepted-event provenance. Route
+                    # its payload through ordinary error recovery instead.
+                    raise response.error
                 if _redirect_crossed_response:
                     # The response and redirect can cross on different threads:
                     # redirect() observed the request as active just before this
@@ -4707,6 +4734,37 @@ def run_conversation(
                     )
                     failed = True
                     _turn_exit_reason = "receipt_execution_profile_rejected"
+                    break
+
+                if api_error is accepted_stream_failure_error:
+                    # The Responses decoder accepted at least one event from
+                    # this physical request.  Do not spend another inner or
+                    # outer retry on the same native-bearing (or bare) payload:
+                    # retain any visible fragment already delivered.
+                    _partial = agent._strip_think_blocks(
+                        getattr(agent, "_current_streamed_assistant_text", "") or ""
+                    ).strip()
+                    if _partial:
+                        append_message(messages, {"role": "assistant", "content": _partial})
+                        final_response = _partial
+                        # The same text already crossed the streaming callback;
+                        # final delivery must not emit it a second time.
+                        agent._response_was_previewed = True
+                    if agent._has_pending_redirect() and agent.clear_interrupt(
+                        preserve_redirect=True
+                    ):
+                        # A correction queued just before transport loss is
+                        # still actionable. Restart only after the streamed
+                        # fragment has an assistant history owner; native
+                        # preflight cancellation above forces the next wire
+                        # through local compaction and a bare request.
+                        if _native_preflight_fallback and agent.api_mode == "codex_responses":
+                            agent.codex_responses_native_compaction = False
+                        _retry.restart_with_redirected_messages = True
+                        break
+                    accepted_stream_failure = True
+                    failed = True
+                    _turn_exit_reason = "partial_stream_recovery"
                     break
 
                 if isinstance(api_error, _NativeCompactionPreflightFallback):
@@ -6919,6 +6977,9 @@ def run_conversation(
             _retry.restart_with_redirected_messages = False
             continue
 
+        if accepted_stream_failure:
+            break
+
         # If the API call was interrupted, skip response processing
         if interrupted:
             _turn_exit_reason = "interrupted_during_api_call"
@@ -8812,6 +8873,7 @@ def run_conversation(
         _turn_exit_reason=_turn_exit_reason,
         _pending_verification_response=_pending_verification_response,
         _pending_verification_response_previewed=_pending_verification_response_previewed,
+        accepted_stream_failure_error=accepted_stream_failure_error,
         terminal_receipt_hold=terminal_receipt_hold,
         claimed_receipt=turn_receipt,
     )

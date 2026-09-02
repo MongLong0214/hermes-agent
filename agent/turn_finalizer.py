@@ -136,6 +136,7 @@ def finalize_turn(
     _turn_exit_reason,
     _pending_verification_response=None,
     _pending_verification_response_previewed=False,
+    accepted_stream_failure_error=None,
     terminal_receipt_hold=None,
     claimed_receipt=None,
 ):
@@ -609,43 +610,60 @@ def finalize_turn(
     #     punctuation (e.g. "The").  A real short answer keeps its text.
     if not interrupted:
         try:
-            if agent._turn_completion_explainer_enabled():
-                _stripped = (final_response or "").strip()
-                _is_empty_terminal = _stripped == "" or _stripped == "(empty)"
-                # A short fragment that is not a normal text_response exit
-                # and lacks sentence-ending punctuation is treated as a
-                # truncated partial (the "The" case from #34452).
-                _is_partial_fragment = (
-                    not _is_empty_terminal
-                    and not preserved_verification_fallback
-                    and not str(_turn_exit_reason).startswith("text_response")
-                    and len(_stripped) <= 24
-                    and _stripped[-1:] not in {".", "!", "?", "。", "！", "？", "`", ")"}
+            _stripped = (final_response or "").strip()
+            _is_empty_terminal = _stripped == "" or _stripped == "(empty)"
+            # A short fragment that is not a normal text_response exit
+            # and lacks sentence-ending punctuation is treated as a
+            # truncated partial (the "The" case from #34452).
+            _is_partial_fragment = (
+                not _is_empty_terminal
+                and not preserved_verification_fallback
+                and not str(_turn_exit_reason).startswith("text_response")
+                and len(_stripped) <= 24
+                and _stripped[-1:] not in {".", "!", "?", "。", "！", "？", "`", ")"}
+            )
+            _is_partial_stream_recovery = (
+                str(_turn_exit_reason) == "partial_stream_recovery"
+            )
+            if _is_partial_stream_recovery:
+                # A provider event was already accepted, so the visible
+                # fragment cannot safely be replayed.  This terminal notice is
+                # intentionally fixed and metadata-free: transport details are
+                # retained only by internal control and diagnostics.
+                _explanation = (
+                    "⚠️ No reply: streaming stopped early. "
+                    "Send `continue` to resume."
                 )
-                _is_partial_stream_recovery = (
-                    str(_turn_exit_reason) == "partial_stream_recovery"
+            elif agent._turn_completion_explainer_enabled() and (
+                _is_empty_terminal or _is_partial_fragment
+            ):
+                _explanation = agent._format_turn_completion_explanation(
+                    _turn_exit_reason,
+                    getattr(agent, "_last_persistence_error_cause", None),
                 )
-                if (
-                    _is_empty_terminal
-                    or _is_partial_fragment
-                    or _is_partial_stream_recovery
+            else:
+                _explanation = None
+            if _explanation:
+                if _is_empty_terminal:
+                    # Replace the bare "(empty)"/blank sentinel with
+                    # the actionable explanation.
+                    final_response = _explanation
+                elif (
+                    _is_partial_stream_recovery
+                    and getattr(agent, "_response_was_previewed", False)
                 ):
-                    _explanation = agent._format_turn_completion_explanation(
-                        _turn_exit_reason,
-                        getattr(agent, "_last_persistence_error_cause", None),
+                    # The partial fragment already crossed the live
+                    # stream and is the sole assistant history item.
+                    # Return only the new terminal notice so gateway
+                    # final delivery cannot replay that fragment.
+                    final_response = _explanation
+                else:
+                    # Keep the partial fragment, append the reason so
+                    # the user sees both what arrived and why it
+                    # stopped.
+                    final_response = (
+                        _stripped + "\n\n" + _explanation
                     )
-                    if _explanation:
-                        if _is_empty_terminal:
-                            # Replace the bare "(empty)"/blank sentinel with
-                            # the actionable explanation.
-                            final_response = _explanation
-                        else:
-                            # Keep the partial fragment, append the reason so
-                            # the user sees both what arrived and why it
-                            # stopped.
-                            final_response = (
-                                _stripped + "\n\n" + _explanation
-                            )
         except Exception as _exp_err:
             logger.debug("turn-completion explainer failed: %s", _exp_err)
 

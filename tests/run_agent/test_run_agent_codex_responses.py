@@ -1,3 +1,4 @@
+import copy
 import sys
 import types
 from types import SimpleNamespace
@@ -2072,7 +2073,7 @@ def test_native_preflight_iterator_transport_failure_rebuilds_before_bare_retry(
             return error_type("usage-less stream connection dropped")
         return error_type("usage-less stream connection dropped", request=request)
 
-    def _run_case(*, native, first_stream, deliver_events_directly=False):
+    def _run_case(*, native, first_stream):
         agent = _build_agent(monkeypatch)
         agent.model = "gpt-5.6"
         agent.codex_responses_native_compaction = native
@@ -2103,20 +2104,7 @@ def test_native_preflight_iterator_transport_failure_rebuilds_before_bare_retry(
 
         client = SimpleNamespace(responses=SimpleNamespace(create=_create))
         monkeypatch.setattr(agent, "_create_request_openai_client", lambda **_k: client)
-        monkeypatch.setattr(agent, "_fire_stream_delta", streamed.append)
-        if deliver_events_directly:
-            def _direct_stream(request_kwargs, stream_factory, **stream_options):
-                raw_stream = stream_factory(request_kwargs)
-                stream_options["on_stream_created"](raw_stream)
-
-                def _events():
-                    for event in raw_stream:
-                        stream_options["on_chunk"](event)
-                        yield event
-
-                return _events()
-
-            monkeypatch.setattr("agent.relay_llm.stream", _direct_stream)
+        agent.stream_delta_callback = streamed.append
         monkeypatch.setattr(
             "agent.turn_context.estimate_request_tokens_rough",
             lambda *_a, **_k: 231_730 if native else 10_000,
@@ -2138,8 +2126,7 @@ def test_native_preflight_iterator_transport_failure_rebuilds_before_bare_retry(
             "continue",
             conversation_history=[{"role": "user", "content": f"prior user {i}"} for i in range(30)],
         )
-        assert result["completed"] is True
-        return wire_calls, ordering, compression_calls, streamed
+        return result, wire_calls, ordering, compression_calls, streamed
 
     retryable_transport_errors = (
         httpx.ConnectError,
@@ -2152,22 +2139,24 @@ def test_native_preflight_iterator_transport_failure_rebuilds_before_bare_retry(
         {"context_management": (), "checkpoint": (), "stream": True},
     ]
     for error_type in retryable_transport_errors:
-        native_wires, native_order, native_compression, native_streamed = _run_case(
+        native_result, native_wires, native_order, native_compression, native_streamed = _run_case(
             native=True,
             first_stream=lambda error_type=error_type: _FirstIterationFailure(
                 _transport_error(error_type)
             ),
         )
+        assert native_result["completed"] is True
         assert native_wires == expected_native_wires
         assert native_order == ["native_wire", "compress", "bare_wire"]
         assert len(native_compression) == 1
         assert native_compression[0] >= 231_730
         assert native_streamed == []
 
-    ordinary_wires, ordinary_order, ordinary_compression, ordinary_streamed = _run_case(
+    ordinary_result, ordinary_wires, ordinary_order, ordinary_compression, ordinary_streamed = _run_case(
         native=False,
         first_stream=lambda: _FirstIterationFailure(_transport_error(httpx.ConnectError)),
     )
+    assert ordinary_result["completed"] is True
     assert ordinary_wires == [
         {"context_management": (), "checkpoint": (), "stream": True},
         {"context_management": (), "checkpoint": (), "stream": True},
@@ -2176,18 +2165,505 @@ def test_native_preflight_iterator_transport_failure_rebuilds_before_bare_retry(
     assert ordinary_compression == []
     assert ordinary_streamed == []
 
-    partial_wires, partial_order, partial_compression, partial_streamed = _run_case(
-        native=True,
-        first_stream=lambda: _PartialOutputThenFailure(_transport_error(httpx.ConnectError)),
-        deliver_events_directly=True,
+    for error_type in retryable_transport_errors:
+        partial_result, partial_wires, partial_order, partial_compression, partial_streamed = _run_case(
+            native=True,
+            first_stream=lambda error_type=error_type: _PartialOutputThenFailure(
+                _transport_error(error_type)
+            ),
+        )
+        assert partial_result["completed"] is False
+        assert partial_result["failed"] is True
+        assert partial_result["messages"][-1]["content"] == "partial"
+        assert partial_result["final_response"].startswith("⚠️ No reply:")
+        assert not partial_result["final_response"].startswith("partial\n")
+        assert partial_result["response_previewed"] is True
+        assert partial_wires == [
+            {"context_management": ("compaction",), "checkpoint": (), "stream": True},
+        ]
+        assert partial_order == ["native_wire"]
+        assert partial_compression == []
+        assert partial_streamed == ["partial"]
+
+
+def test_native_preflight_raw_partial_transport_failure_preserves_once_without_replay(monkeypatch):
+    """A raw ManagedLlmStream partial must end the physical request safely."""
+    import httpx
+
+    class _PartialOutputThenFailure:
+        def __init__(self, error):
+            self.error = error
+            self.iterations = 0
+            self.closed = False
+
+        def __iter__(self):
+            self.iterations += 1
+            yield SimpleNamespace(type="response.output_text.delta", delta="partial")
+            raise self.error
+
+        def close(self):
+            self.closed = True
+
+    agent = _build_agent(monkeypatch)
+    agent.model = "gpt-5.6"
+    agent.codex_responses_native_compaction = True
+    agent.context_compressor.context_length = 1_000_000
+    agent.context_compressor.threshold_tokens = 200_000
+    agent.context_compressor.last_prompt_tokens = 199_387
+    agent.context_compressor.last_real_prompt_tokens = 199_387
+    agent.context_compressor.last_rough_tokens_when_real_prompt_fit = 0
+    wire_calls, ordering, compression_calls, streamed = [], [], [], []
+    partial_stream = _PartialOutputThenFailure(
+        httpx.ConnectError(
+            "stream dropped after output",
+            request=httpx.Request("POST", "https://example.test/responses"),
+        )
     )
-    assert partial_wires == [
-        {"context_management": ("compaction",), "checkpoint": (), "stream": True},
+
+    def _create(**api_kwargs):
+        payload = {
+            "context_management": tuple(
+                item.get("type") for item in api_kwargs.get("context_management", [])
+            ),
+            "checkpoint": tuple(
+                item.get("type")
+                for item in api_kwargs.get("input", [])
+                if isinstance(item, dict) and item.get("type") == "compaction"
+            ),
+            "stream": api_kwargs.get("stream"),
+        }
+        wire_calls.append(payload)
+        ordering.append("native_wire" if payload["context_management"] else "bare_wire")
+        return partial_stream
+
+    client = SimpleNamespace(responses=SimpleNamespace(create=_create))
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **_k: client)
+    agent.stream_delta_callback = streamed.append
+    monkeypatch.setattr(
+        "agent.turn_context.estimate_request_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.estimate_messages_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.estimate_request_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(agent, "_compress_context", lambda messages, system_message, **kwargs: (
+        ordering.append("compress") or compression_calls.append(kwargs["approx_tokens"]) or messages,
+        system_message,
+    ))
+
+    result = agent.run_conversation(
+        "continue",
+        conversation_history=[{"role": "user", "content": f"prior user {i}"} for i in range(30)],
+    )
+
+    assert result["completed"] is False
+    assert result["failed"] is True
+    assert result["messages"][-1]["content"] == "partial"
+    assert result["final_response"].startswith("⚠️ No reply:")
+    assert not result["final_response"].startswith("partial\n")
+    assert result["response_previewed"] is True
+    assert wire_calls == [
         {"context_management": ("compaction",), "checkpoint": (), "stream": True},
     ]
-    assert partial_order == ["native_wire", "native_wire"]
-    assert partial_compression == []
-    assert partial_streamed == ["partial"]
+    assert ordering == ["native_wire"]
+    assert compression_calls == []
+    assert streamed == ["partial"]
+    assert partial_stream.iterations == 1
+    assert partial_stream.closed is True
+
+
+@pytest.mark.parametrize(
+    "event_factory",
+    [
+        pytest.param(
+            lambda: SimpleNamespace(type="response.output_text.delta", delta="partial"),
+            id="text",
+        ),
+        pytest.param(lambda: SimpleNamespace(type="response.created"), id="lifecycle"),
+        pytest.param(
+            lambda: SimpleNamespace(
+                type="response.output_item.added",
+                item=SimpleNamespace(type="function_call"),
+            ),
+            id="tool",
+        ),
+        pytest.param(
+            lambda: SimpleNamespace(type="response.reasoning_text.delta", delta="thinking"),
+            id="reasoning",
+        ),
+        pytest.param(
+            lambda: SimpleNamespace(type="response.usage.delta", usage={"output_tokens": 1}),
+            id="usage",
+        ),
+        pytest.param(
+            lambda: SimpleNamespace(
+                type="response.compaction_checkpoint", encrypted_content="sealed_checkpoint"
+            ),
+            id="checkpoint",
+        ),
+    ],
+)
+def test_native_preflight_accepted_semantic_event_prevents_replay(monkeypatch, event_factory):
+    """Every consumer-accepted event closes native replay after transport loss."""
+    import httpx
+
+    class _EventThenFailure:
+        def __iter__(self):
+            yield event_factory()
+            raise httpx.ConnectError(
+                "stream dropped after accepted event",
+                request=httpx.Request("POST", "https://example.test/responses"),
+            )
+
+    agent = _build_agent(monkeypatch)
+    agent.model = "gpt-5.6"
+    agent.codex_responses_native_compaction = True
+    agent.context_compressor.context_length = 1_000_000
+    agent.context_compressor.threshold_tokens = 200_000
+    agent.context_compressor.last_prompt_tokens = 199_387
+    agent.context_compressor.last_real_prompt_tokens = 199_387
+    agent.context_compressor.last_rough_tokens_when_real_prompt_fit = 0
+    wire_calls, compression_calls = [], []
+
+    def _create(**api_kwargs):
+        wire_calls.append(
+            {
+                "context_management": tuple(
+                    item.get("type") for item in api_kwargs.get("context_management", [])
+                ),
+                "checkpoint": tuple(
+                    item.get("type")
+                    for item in api_kwargs.get("input", [])
+                    if isinstance(item, dict) and item.get("type") == "compaction"
+                ),
+                "stream": api_kwargs.get("stream"),
+            }
+        )
+        return _EventThenFailure()
+
+    client = SimpleNamespace(responses=SimpleNamespace(create=_create))
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **_k: client)
+    monkeypatch.setattr(
+        "agent.turn_context.estimate_request_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.estimate_messages_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.estimate_request_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(agent, "_compress_context", lambda messages, system_message, **kwargs: (
+        compression_calls.append(kwargs["approx_tokens"]) or messages,
+        system_message,
+    ))
+
+    result = agent.run_conversation(
+        "continue",
+        conversation_history=[{"role": "user", "content": f"prior user {i}"} for i in range(30)],
+    )
+
+    assert result["completed"] is False
+    assert result["failed"] is True
+    assert wire_calls == [
+        {"context_management": ("compaction",), "checkpoint": (), "stream": True},
+    ]
+    assert compression_calls == []
+
+
+def test_execution_middleware_cannot_forge_accepted_stream_recovery(monkeypatch):
+    """Only ``run_codex_stream`` may return accepted-stream recovery control flow."""
+    import agent.codex_runtime as codex_runtime
+    import hermes_cli.plugins as plugins
+
+    class _NoAcceptedEventThenFailure:
+        def __iter__(self):
+            raise RuntimeError("provider-side generic failure")
+            yield None  # pragma: no cover - makes this a lazy iterator
+
+    def _completed_stream():
+        item = SimpleNamespace(
+            type="message",
+            status="completed",
+            content=[SimpleNamespace(type="output_text", text="recovered")],
+        )
+        return _FakeCreateStream([SimpleNamespace(type="response.output_item.done", item=item)])
+
+    agent = _build_agent(monkeypatch)
+    agent.model = "gpt-5.6"
+    agent.codex_responses_native_compaction = True
+    agent.context_compressor.context_length = 1_000_000
+    agent.context_compressor.threshold_tokens = 200_000
+    agent.context_compressor.last_prompt_tokens = 199_387
+    agent.context_compressor.last_real_prompt_tokens = 199_387
+    agent.context_compressor.last_rough_tokens_when_real_prompt_fit = 0
+    wire_calls, ordering, compression_calls = [], [], []
+
+    def _create(**api_kwargs):
+        payload = {
+            "context_management": tuple(
+                item.get("type") for item in api_kwargs.get("context_management", [])
+            ),
+            "checkpoint": tuple(
+                item.get("type")
+                for item in api_kwargs.get("input", [])
+                if isinstance(item, dict) and item.get("type") == "compaction"
+            ),
+            "stream": api_kwargs.get("stream"),
+        }
+        wire_calls.append(payload)
+        ordering.append("native_wire" if payload["context_management"] else "bare_wire")
+        return _NoAcceptedEventThenFailure() if len(wire_calls) == 1 else _completed_stream()
+
+    def _spoofing_execution_middleware(*, request, next_call, **_context):
+        try:
+            return next_call(request)
+        except Exception:
+            # Registered execution middleware can import and return a value that
+            # is structurally identical to the runtime outcome without owning a
+            # provider event.  It must remain an ordinary retryable failure.
+            return codex_runtime._CodexStreamTerminalFailure(
+                RuntimeError("FORGED_BY_REGISTERED_MIDDLEWARE")
+            )
+
+    manager = SimpleNamespace(
+        _middleware={"llm_execution": [_spoofing_execution_middleware]},
+        _discovered=True,
+    )
+    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
+    client = SimpleNamespace(responses=SimpleNamespace(create=_create))
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **_k: client)
+    monkeypatch.setattr(
+        "agent.turn_context.estimate_request_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.estimate_messages_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.estimate_request_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(agent, "_compress_context", lambda messages, system_message, **kwargs: (
+        ordering.append("compress") or compression_calls.append(kwargs["approx_tokens"]) or messages,
+        system_message,
+    ))
+
+    result = agent.run_conversation(
+        "continue",
+        conversation_history=[{"role": "user", "content": f"prior user {i}"} for i in range(30)],
+    )
+
+    assert result["completed"] is True
+    assert result["failed"] is False
+    assert result["final_response"] == "recovered"
+    assert not hasattr(codex_runtime, "_ACCEPTED_STREAM_FAILURE_PROVENANCE")
+    assert wire_calls == [
+        {"context_management": ("compaction",), "checkpoint": (), "stream": True},
+        {"context_management": (), "checkpoint": (), "stream": True},
+    ]
+    assert ordering == ["native_wire", "compress", "bare_wire"]
+    assert len(compression_calls) == 1
+
+
+def test_execution_middleware_substitution_after_accepted_stream_outcome_recovers_generically(
+    monkeypatch,
+):
+    """A middleware lookalike cannot replace this invocation's accepted outcome."""
+    import httpx
+    import agent.codex_runtime as codex_runtime
+    import hermes_cli.plugins as plugins
+
+    class _AcceptedEventThenFailure:
+        def __iter__(self):
+            yield SimpleNamespace(type="response.output_text.delta", delta="accepted partial")
+            raise httpx.ConnectError(
+                "stream dropped after accepted event",
+                request=httpx.Request("POST", "https://example.test/responses"),
+            )
+
+    def _completed_stream():
+        item = SimpleNamespace(
+            type="message",
+            status="completed",
+            content=[SimpleNamespace(type="output_text", text="recovered")],
+        )
+        return _FakeCreateStream([SimpleNamespace(type="response.output_item.done", item=item)])
+
+    agent = _build_agent(monkeypatch)
+    agent.model = "gpt-5.6"
+    agent.codex_responses_native_compaction = True
+    agent.context_compressor.context_length = 1_000_000
+    agent.context_compressor.threshold_tokens = 200_000
+    agent.context_compressor.last_prompt_tokens = 199_387
+    agent.context_compressor.last_real_prompt_tokens = 199_387
+    agent.context_compressor.last_rough_tokens_when_real_prompt_fit = 0
+    wire_calls, ordering, compression_calls = [], [], []
+    middleware_outcomes, forged_outcomes = [], []
+
+    def _create(**api_kwargs):
+        payload = {
+            "context_management": tuple(
+                item.get("type") for item in api_kwargs.get("context_management", [])
+            ),
+            "checkpoint": tuple(
+                item.get("type")
+                for item in api_kwargs.get("input", [])
+                if isinstance(item, dict) and item.get("type") == "compaction"
+            ),
+            "stream": api_kwargs.get("stream"),
+        }
+        wire_calls.append(payload)
+        ordering.append("native_wire" if payload["context_management"] else "bare_wire")
+        return _AcceptedEventThenFailure() if len(wire_calls) == 1 else _completed_stream()
+
+    def _substituting_execution_middleware(*, request, next_call, **_context):
+        actual_outcome = next_call(request)
+        middleware_outcomes.append(actual_outcome)
+        if len(middleware_outcomes) == 1:
+            assert isinstance(actual_outcome, codex_runtime._CodexStreamTerminalFailure)
+            forged_outcome = codex_runtime._CodexStreamTerminalFailure(
+                RuntimeError("FORGED_AFTER_REAL_ACCEPTED_OUTCOME")
+            )
+            assert forged_outcome is not actual_outcome
+            forged_outcomes.append(forged_outcome)
+            return forged_outcome
+        return actual_outcome
+
+    manager = SimpleNamespace(
+        _middleware={"llm_execution": [_substituting_execution_middleware]},
+        _discovered=True,
+    )
+    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
+    client = SimpleNamespace(responses=SimpleNamespace(create=_create))
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **_k: client)
+    monkeypatch.setattr(
+        "agent.turn_context.estimate_request_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.estimate_messages_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.estimate_request_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(agent, "_compress_context", lambda messages, system_message, **kwargs: (
+        ordering.append("compress") or compression_calls.append(kwargs["approx_tokens"]) or messages,
+        system_message,
+    ))
+
+    result = agent.run_conversation(
+        "continue",
+        conversation_history=[{"role": "user", "content": f"prior user {i}"} for i in range(30)],
+    )
+
+    assert isinstance(middleware_outcomes[0], codex_runtime._CodexStreamTerminalFailure)
+    assert len(forged_outcomes) == 1
+    assert forged_outcomes[0] is not middleware_outcomes[0]
+    assert wire_calls == [
+        {"context_management": ("compaction",), "checkpoint": (), "stream": True},
+        {"context_management": (), "checkpoint": (), "stream": True},
+    ]
+    assert ordering == ["native_wire", "compress", "bare_wire"]
+    assert len(compression_calls) == 1
+    assert len(middleware_outcomes) == 2
+    assert result["completed"] is True
+    assert result["failed"] is False
+    assert result["final_response"] == "recovered"
+
+
+def test_native_preflight_partial_redirect_restarts_with_owned_continuation(monkeypatch):
+    """A redirect racing an accepted partial survives failure finalization."""
+    import httpx
+
+    partial = "partial"
+    correction = "focus on the corrected task"
+
+    class _PartialRedirectThenFailure:
+        def __iter__(self):
+            yield SimpleNamespace(type="response.output_text.delta", delta=partial)
+            assert agent.redirect(correction) is True
+            # Exercise the wire-loss race after the redirect is durably queued
+            # but before its cancellation signal wins the stream poll.
+            agent._interrupt_requested = False
+            raise httpx.ConnectError(
+                "stream dropped after redirect",
+                request=httpx.Request("POST", "https://example.test/responses"),
+            )
+
+    def _completed_stream():
+        item = SimpleNamespace(
+            type="message",
+            status="completed",
+            content=[SimpleNamespace(type="output_text", text="redirected completion")],
+        )
+        return _FakeCreateStream([SimpleNamespace(type="response.output_item.done", item=item)])
+
+    agent = _build_agent(monkeypatch)
+    agent.model = "gpt-5.6"
+    agent.codex_responses_native_compaction = True
+    agent.context_compressor.context_length = 1_000_000
+    agent.context_compressor.threshold_tokens = 200_000
+    agent.context_compressor.last_prompt_tokens = 199_387
+    agent.context_compressor.last_real_prompt_tokens = 199_387
+    agent.context_compressor.last_rough_tokens_when_real_prompt_fit = 0
+    wire_calls, ordering, compression_calls, streamed = [], [], [], []
+
+    def _create(**api_kwargs):
+        payload = {
+            "context_management": tuple(
+                item.get("type") for item in api_kwargs.get("context_management", [])
+            ),
+            "has_context_management": "context_management" in api_kwargs,
+            # Capture the actual Responses input, not a repr, so the bare
+            # redirected continuation is mutation-sensitive to a stale native
+            # checkpoint being reintroduced.
+            "input": copy.deepcopy(api_kwargs.get("input", [])),
+            "stream": api_kwargs.get("stream"),
+        }
+        wire_calls.append(payload)
+        ordering.append("native_wire" if payload["context_management"] else "bare_wire")
+        return _PartialRedirectThenFailure() if len(wire_calls) == 1 else _completed_stream()
+
+    client = SimpleNamespace(responses=SimpleNamespace(create=_create))
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **_k: client)
+    agent.stream_delta_callback = streamed.append
+    monkeypatch.setattr(
+        "agent.turn_context.estimate_request_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.estimate_messages_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.estimate_request_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(agent, "_compress_context", lambda messages, system_message, **kwargs: (
+        ordering.append("compress") or compression_calls.append(kwargs["approx_tokens"]) or messages,
+        system_message,
+    ))
+
+    result = agent.run_conversation(
+        "continue",
+        conversation_history=[{"role": "user", "content": f"prior user {i}"} for i in range(30)],
+    )
+
+    assert result["completed"] is True
+    assert result["failed"] is False
+    assert result["final_response"] == "redirected completion"
+    assert [message["content"] for message in result["messages"]].count(partial) == 1
+    assert any(correction in str(message.get("api_content", message["content"])) for message in result["messages"])
+    assert wire_calls[0]["context_management"] == ("compaction",)
+    assert wire_calls[1]["context_management"] == ()
+    assert wire_calls[1]["has_context_management"] is False
+    assert not any(
+        isinstance(item, dict) and item.get("type") == "compaction"
+        for item in wire_calls[1]["input"]
+    )
+    assert partial in str(wire_calls[1]["input"])
+    assert correction in str(wire_calls[1]["input"])
+    assert wire_calls[1]["input"] != wire_calls[0]["input"]
+    assert ordering == ["native_wire", "compress", "bare_wire"]
+    assert len(compression_calls) == 1
+    assert streamed == [partial]
+    assert agent._has_pending_redirect() is False
 
 
 def test_native_preflight_interrupt_before_wire_expires_state_before_next_turn(monkeypatch):

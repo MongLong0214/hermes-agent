@@ -19,12 +19,24 @@ from __future__ import annotations
 import json
 import logging
 import time
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
 
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 
 logger = logging.getLogger(__name__)
+
+@dataclass(frozen=True)
+class _CodexStreamTerminalFailure:
+    """Closed result for an accepted Responses stream that then lost transport.
+
+    The original exception object remains the outcome payload so the caller can
+    retain its class and identity without teaching a generic exception handler
+    to trust an attribute supplied by middleware.
+    """
+
+    error: BaseException
 
 
 def _codex_request_failure_details(error: BaseException) -> tuple[int | None, str]:
@@ -1405,7 +1417,16 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             isinstance(native_preflight_grace, dict)
             and native_preflight_grace.get("phase") == "in_flight"
         )
+        attempt_state = {"accepted_event": False}
         writer_token = {"value": None}
+
+        def _on_accepted_event(event: Any) -> None:
+            # ``ManagedLlmStream``'s raw iterator deliberately does not use
+            # Relay's ``on_chunk`` callback.  Count at this consumer boundary
+            # instead: every event passed to the Responses decoder, including
+            # lifecycle-only frames, makes this physical attempt non-replayable.
+            attempt_state["accepted_event"] = True
+            _on_event(event)
 
         def _open_codex_stream(next_api_kwargs: dict[str, Any]):
             stream_kwargs = _sanitize_consumer_codex_request(
@@ -1436,6 +1457,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             return _consume_codex_event_stream(
                 list(intercepted_events),
                 model=api_kwargs.get("model"),
+                on_event=_on_accepted_event,
             )
 
         try:
@@ -1473,7 +1495,9 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             _httpx.ConnectError,
             ConnectionError,
         ) as exc:
-            if native_preflight_in_flight and not intercepted_events:
+            if attempt_state["accepted_event"]:
+                return _CodexStreamTerminalFailure(exc)
+            if native_preflight_in_flight and not attempt_state["accepted_event"]:
                 raise
             if attempt < max_stream_retries:
                 logger.debug(
@@ -1518,11 +1542,13 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                         else None
                     ),
                     on_first_delta=on_first_delta,
-                    on_event=_on_event,
+                    on_event=_on_accepted_event,
                     interrupt_check=_interrupt_or_superseded,
                 )
             except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
-                if native_preflight_in_flight and not intercepted_events:
+                if attempt_state["accepted_event"]:
+                    return _CodexStreamTerminalFailure(exc)
+                if native_preflight_in_flight and not attempt_state["accepted_event"]:
                     raise
                 if attempt < max_stream_retries:
                     logger.debug(
