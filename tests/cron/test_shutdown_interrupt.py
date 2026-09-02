@@ -528,7 +528,7 @@ class TestBaseExceptionThroughOwnerFencedFlow:
         private_prompt_sentinel = "private-prompt-sentinel-93f1b7"
         credential_sentinel = "api_key=crn_test_private_credential_9f31b6c4a8e2"
         private_marker = "## Private Cron Execution Context"
-        public_error = "Cron resumed execution failed"
+        public_error = "Cron delivery failed"
         job = {
             "id": "resume-baseexception-private",
             "name": "resume BaseException private",
@@ -656,7 +656,7 @@ class TestBaseExceptionThroughOwnerFencedFlow:
         import cron.scheduler as sched
         from cron.executions import list_executions
 
-        public_error = "Cron execution failed"
+        public_error = "Cron delivery failed"
         private_prompt_sentinel = "private-prompt-sentinel-ordinary-93f1b7"
         credential_sentinel = "api_key=crn_test_ordinary_credential_9f31b6c4a8e2"
         path_sentinel = "/private/cron/ordinary-error-sentinel"
@@ -792,7 +792,7 @@ class TestBaseExceptionThroughOwnerFencedFlow:
         import cron.scheduler as sched
         from cron.executions import list_executions
 
-        public_error = "Cron execution failed"
+        public_error = "Cron delivery failed"
         private_prompt_sentinel = "private-prompt-sentinel-outer-93f1b7"
         credential_sentinel = "api_key=crn_test_outer_credential_9f31b6c4a8e2"
         path_sentinel = "/private/cron/outer-error-sentinel"
@@ -920,7 +920,7 @@ class TestCronCompletionPublicFailureRedaction:
         import cron.scheduler as sched
         from cron.executions import list_executions
 
-        public_error = "Cron execution failed"
+        public_error = "Cron delivery failed"
         sentinels = (
             "private-prompt-no-agent-script-93f1b7",
             "api_key=crn_test_no_agent_script_9f31b6c4a8e2",
@@ -1155,7 +1155,7 @@ class TestCronCompletionPublicFailureRedaction:
         import cron.scheduler as sched
         from cron.executions import list_executions
 
-        public_error = "Cron execution failed"
+        public_error = "Cron delivery failed"
         public_delivery_error = "Cron delivery failed"
         outer_sentinels = (
             "private-prompt-outer-delivery-93f1b7",
@@ -1419,8 +1419,6 @@ class TestCronDeliveryBoundary:
         """Delivery diagnostics must be literal-only and traceback-free."""
         fixed = {
             "Cron delivery failed",
-            "Cron execution failed",
-            "Cron resumed execution failed",
             "Cron job future failed",
             "Cron job future failed in async mode",
         }
@@ -2522,22 +2520,15 @@ class TestRunOneJobHonoursInterruptedFlag:
                  return_value=(True, "full output", "a plausible final response", None),
              ), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
-             patch(
-                 "cron.scheduler._summarize_cron_failure_for_delivery",
-                 return_value="This run was interrupted.",
-             ) as mock_summarize, \
              patch("cron.scheduler._is_cron_silence_response", return_value=False), \
              patch("cron.scheduler._deliver_result", return_value=None) as mock_deliver, \
              patch("cron.scheduler.mark_job_run"):
             result = sched.run_one_job(job)
 
         assert result is True
-        mock_summarize.assert_called_once()
-        # The summarizer's error argument must mention the interruption,
-        # not be silently None / the agent's own (possibly absent) error.
-        assert "interrupt" in mock_summarize.call_args.args[1].lower()
+        mock_deliver.assert_called_once()
         delivered_content = mock_deliver.call_args.args[1]
-        assert delivered_content == "This run was interrupted."
+        assert delivered_content == "Cron delivery failed"
         assert "plausible final response" not in delivered_content
 
 

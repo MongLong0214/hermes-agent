@@ -6628,6 +6628,15 @@ def _run_one_job_body(
         # source diagnostics, or an exception string.  Normalize at this
         # dependency-closed boundary before output persistence, audit rows,
         # logging, alert construction, returns, or delivery can observe it.
+        # Preserve pre-normalization control state for the durable internal
+        # taxonomy. The public string below is intentionally generic and must
+        # never be used to infer why a run failed.
+        blocked_config_silent = (
+            bool(error) and BLOCKED_CONFIG_SILENT_MARKER in str(error)
+        )
+        blocked_config = blocked_config_silent or (
+            bool(error) and BLOCKED_CONFIG_MARKER in str(error)
+        )
         if not success:
             output = _CRON_DELIVERY_FAILURE
             final_response = _CRON_DELIVERY_FAILURE
@@ -6663,7 +6672,6 @@ def _run_one_job_body(
         # / empty-response computation, or _deliver_result itself — raises, the
         # deferred agent is still torn down. Otherwise the outer `except` would
         # swallow the error and leak the agent's subprocesses/clients (#10200).
-        blocked_config = False
         side_effect_ownership_lost = False
         try:
             with _side_effect_fence() as owns_output:
@@ -6700,12 +6708,6 @@ def _run_one_job_body(
             # operator was already told on a previous tick, so re-delivering
             # the same alert every tick would be spam (#73506 alert-once
             # shape).
-            blocked_config_silent = (
-                bool(error) and BLOCKED_CONFIG_SILENT_MARKER in str(error)
-            )
-            blocked_config = blocked_config_silent or (
-                bool(error) and BLOCKED_CONFIG_MARKER in str(error)
-            )
             # Drift-guard skip (#44585): same alert-once contract as
             # blocked_config — the silent marker means the operator already
             # got the alert on a previous tick.
