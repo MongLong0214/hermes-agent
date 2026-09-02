@@ -163,8 +163,26 @@ def aux_probe_mode():
         _aux_probe_state.active = prev
 
 from agent.credential_pool import load_pool
-from agent.gemini_outbound_policy import GeminiOutboundDenied, deny_gemini_outbound
+from agent.gemini_outbound_policy import GeminiOutboundDenied, deny_gemini_outbound as _policy_deny_gemini_outbound
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length
+
+
+def deny_gemini_outbound(**route: object) -> None:
+    """Guard the selected endpoint, not a Gemini-shaped model name alone."""
+    base_url = route.get("base_url")
+    if isinstance(base_url, str) and base_url.strip():
+        _policy_deny_gemini_outbound(base_url=base_url)
+        return
+    provider = route.get("canonical_provider", "")
+    hint = route.get("routing_hint", "")
+    if str(provider or "").strip() or str(hint or "").strip():
+        _policy_deny_gemini_outbound(
+            canonical_provider=provider,
+            routing_hint=hint,
+            api_mode=route.get("api_mode", ""),
+        )
+        return
+    _policy_deny_gemini_outbound(**route)
 from hermes_cli.config import get_hermes_home
 from hermes_constants import OPENROUTER_BASE_URL
 from utils import base_url_host_matches, base_url_hostname, env_float, is_truthy_value, model_forces_max_completion_tokens, normalize_proxy_env_vars
@@ -2763,6 +2781,11 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
 
     for provider_id, pconfig in PROVIDER_REGISTRY.items():
         if pconfig.auth_type != "api_key":
+            continue
+        # Gemini must be rejected by an explicit selected route before this
+        # generic fallback reads any credentials. It is never a speculative
+        # auto candidate merely because it appears in the registry.
+        if provider_id == "gemini":
             continue
         route_model = _get_aux_model_for_provider(provider_id) or ""
         deny_gemini_outbound(
@@ -6592,8 +6615,11 @@ def resolve_provider_client(
     # which aliases to "kimi-coding") is still reachable via the named-custom
     # branch below.
     original_provider = (provider or "").strip().lower()
-    # Normalise aliases
+    # Normalise aliases. A ``main`` alias can resolve to a named custom
+    # provider, so select the same nonsecret record before construction.
     provider = _normalize_aux_provider(provider)
+    if named_custom_provider_snapshot is None and provider != original_provider:
+        named_custom_provider_snapshot = _select_named_custom_provider(provider)
     named_custom_metadata = None
     if named_custom_provider_snapshot is None:
         named_custom_provider_snapshot = _select_named_custom_provider(
@@ -8053,6 +8079,9 @@ def _cached_client_base_url(client: Any) -> str:
     return ""
 
 
+_TRUSTED_CACHED_ROUTE_FACT_IDS: set[int] = set()
+
+
 def _frozen_cached_route_facts(
     *,
     provider: str,
@@ -8066,7 +8095,17 @@ def _frozen_cached_route_facts(
     """Bind a cache entry to the resolved route that produced its client."""
     runtime = _normalize_main_runtime(main_runtime)
     actual_base_url = _cached_client_base_url(client)
-    return MappingProxyType({
+    selected_base_url = str(base_url or runtime.get("base_url", "") or "").strip()
+    if not actual_base_url and selected_base_url and base_url_hostname(selected_base_url):
+        actual_base_url = selected_base_url
+    selected_provider = str(provider or "").strip()
+    if (
+        not actual_base_url
+        and selected_provider
+        and getattr(client, "_hermes_aux_effective_provider", None) == selected_provider
+    ):
+        actual_base_url = f"hermes-selector://{selected_provider}"
+    facts = MappingProxyType({
         "canonical_provider": str(provider or ""),
         "model": str(default_model or model or runtime.get("model", "") or ""),
         # Cache provenance is the concrete endpoint on the client just built.
@@ -8077,6 +8116,8 @@ def _frozen_cached_route_facts(
             runtime.get("requested_provider") or runtime.get("provider") or provider or ""
         ),
     })
+    _TRUSTED_CACHED_ROUTE_FACT_IDS.add(id(facts))
+    return facts
 
 
 def _validated_cache_admission_route_facts(
@@ -8128,6 +8169,8 @@ def _cached_entry_route_facts(entry: Any) -> Optional[MappingProxyType]:
     route_facts = entry[3]
     if not isinstance(route_facts, MappingProxyType):
         return None
+    if id(route_facts) not in _TRUSTED_CACHED_ROUTE_FACT_IDS:
+        return None
     if set(route_facts) != _CACHED_ROUTE_FACT_KEYS:
         return None
     if any(not isinstance(route_facts[key], str) for key in _CACHED_ROUTE_FACT_KEYS):
@@ -8141,7 +8184,10 @@ def _cached_entry_route_facts(entry: Any) -> Optional[MappingProxyType]:
     ):
         return None
     observed_base_url = _cached_client_base_url(entry[0]).rstrip("/")
-    if not observed_base_url or stored_base_url != observed_base_url:
+    if stored_base_url.startswith("hermes-selector://"):
+        if observed_base_url or getattr(entry[0], "_hermes_aux_effective_provider", None) != route_facts["canonical_provider"]:
+            return None
+    elif not observed_base_url or stored_base_url != observed_base_url:
         return None
     return route_facts
 
@@ -8210,6 +8256,7 @@ def _store_cached_client(
         bound_loop,
         MappingProxyType(dict(frozen_facts)),
     )
+    _TRUSTED_CACHED_ROUTE_FACT_IDS.add(id(cached_entry[3]))
     with _client_cache_lock:
         old_entry = _client_cache.get(cache_key)
         if old_entry is not None and _cached_entry_parts(old_entry) is not None and not replace:
@@ -8414,6 +8461,16 @@ def _close_cached_client(client: Any, *, close_async: bool = False) -> None:
     _force_close_async_httpx(client)
 
 
+def _cleanup_cache_entry_parts(entry: Any) -> Optional[Tuple[Any, Optional[str], Any]]:
+    """Read cleanup-only legacy tuples without making them cache hits again."""
+    parts = _cached_entry_parts(entry)
+    if parts is not None:
+        return parts[:3]
+    if isinstance(entry, tuple) and len(entry) == 3:
+        return entry
+    return None
+
+
 def shutdown_cached_clients() -> None:
     """Close all cached clients (sync and async) to prevent event-loop errors.
 
@@ -8428,7 +8485,7 @@ def shutdown_cached_clients() -> None:
     with _client_cache_lock:
         clients = []
         for raw_entry in _client_cache.values():
-            entry = _cached_entry_parts(raw_entry)
+            entry = _cleanup_cache_entry_parts(raw_entry)
             if entry is not None and entry[0] is not None:
                 clients.append((entry[0], entry[2]))
         _client_cache.clear()
@@ -8461,11 +8518,11 @@ def cleanup_stale_async_clients() -> None:
     with _client_cache_lock:
         stale_keys = []
         for key, entry in _client_cache.items():
-            parts = _cached_entry_parts(entry)
+            parts = _cleanup_cache_entry_parts(entry)
             if parts is None:
                 stale_keys.append(key)
                 continue
-            client, _default, cached_loop, _route_facts = parts
+            client, _default, cached_loop = parts
             if cached_loop is not None and cached_loop.is_closed():
                 stale_keys.append(key)
                 stale_clients.append(client)

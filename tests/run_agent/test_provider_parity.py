@@ -203,19 +203,19 @@ class TestBuildApiKwargsOpenRouter:
         }
 
     def test_gemini_native_passes_base_url_for_top_level_thinking_config(self, monkeypatch):
-        agent = _make_agent(
-            monkeypatch,
-            "gemini",
-            base_url="https://generativelanguage.googleapis.com/v1beta",
-            model="gemini-3-flash-preview",
-        )
-        agent.reasoning_config = {"enabled": True, "effort": "high"}
-        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
-        assert kwargs["extra_body"]["thinking_config"] == {
-            "includeThoughts": True,
-            "thinkingLevel": "high",
-        }
-        assert "extra_body" not in kwargs["extra_body"]
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+        with pytest.raises(GeminiOutboundDenied) as exc_info:
+            _make_agent(
+                monkeypatch,
+                "gemini",
+                base_url="https://generativelanguage.googleapis.com/v1beta",
+                model="gemini-3-flash-preview",
+            )
+
+        assert str(exc_info.value) == "Gemini outbound requests are disabled."
+        assert exc_info.value.code == "gemini_outbound_denied"
+        assert vars(exc_info.value) == {}
 
 
     def test_should_sanitize_tool_calls_codex_vs_chat(self, monkeypatch):
