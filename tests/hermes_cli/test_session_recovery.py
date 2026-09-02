@@ -1644,7 +1644,9 @@ def test_normal_recovery_copy_refusal_retains_the_real_stage(
                     ),
                 )
             assert stage is not None
-            session_recovery._refresh_stage_children(stage, require_main=True)
+            session_recovery._refresh_stage_children(
+                stage, require_main=True, rebaseline=True
+            )
         return original_copy_table(source_conn, destination, table, **kwargs)
 
     def record_real_cleanup(destination_stage) -> None:
@@ -1804,6 +1806,57 @@ def test_recovery_publication_refuses_substituted_stage_identity(
     assert replacement.read_bytes() == replacement_bytes
     current = replacement.stat()
     assert (current.st_dev, current.st_ino) == replacement_identity
+    assert not output.exists()
+    assert _sha256(source) == source_hash
+
+
+def test_recovery_publication_refuses_inode_reused_same_size_stage_substitution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reused inode cannot make a substituted staged database publish."""
+    source = tmp_path / "source.db"
+    output = tmp_path / "recovered.db"
+    _make_source(source)
+    source_hash = _sha256(source)
+    replacement: Path | None = None
+    original_stat: os.stat_result | None = None
+    real_lstat = os.lstat
+
+    def substitute(candidate: Path, _final: Path) -> None:
+        nonlocal original_stat, replacement
+        original_stat = candidate.stat()
+        candidate.unlink()
+        # Preserve size: ctime must still distinguish an inode-reuse attack.
+        candidate.write_bytes(b"x" * original_stat.st_size)
+        replacement = candidate
+
+    def lstat_with_reused_inode(path, *args, **kwargs):
+        result = real_lstat(path, *args, **kwargs)
+        if (
+            replacement is not None
+            and original_stat is not None
+            and Path(path) in (replacement, output)
+        ):
+            return SimpleNamespace(
+                st_dev=original_stat.st_dev,
+                st_ino=original_stat.st_ino,
+                st_mode=result.st_mode,
+                st_nlink=result.st_nlink,
+                st_ctime_ns=max(result.st_ctime_ns, original_stat.st_ctime_ns + 1),
+                st_size=result.st_size,
+            )
+        return result
+
+    monkeypatch.setattr(session_recovery.os, "lstat", lstat_with_reused_inode)
+    monkeypatch.setattr(session_recovery, "_publication_barrier", substitute)
+
+    with pytest.raises(SessionRecoverySafetyError):
+        recover_session_database(source, output, work_dir=tmp_path)
+
+    assert replacement is not None and replacement.exists()
+    assert original_stat is not None
+    assert replacement.stat().st_size == original_stat.st_size
     assert not output.exists()
     assert _sha256(source) == source_hash
 

@@ -133,8 +133,10 @@ def test_no_agent_forwards_cancel_event_to_script_runner(monkeypatch):
     cancel = threading.Event()
     observed = []
 
-    def _script_runner(job, script_path, workdir=None, cancel_event=None):
-        observed.append(cancel_event)
+    def _script_runner(
+        job, script_path, workdir=None, cancel_event=None, occurrence_id=None
+    ):
+        observed.append((cancel_event, occurrence_id))
         return True, ""
 
     monkeypatch.setattr(
@@ -155,7 +157,7 @@ def test_no_agent_forwards_cancel_event_to_script_runner(monkeypatch):
 
     assert success is True
     assert error is None
-    assert observed == [cancel]
+    assert observed == [(cancel, None)]
 
 
 @pytest.mark.parametrize(
@@ -510,10 +512,70 @@ def test_heartbeat_thread_start_failure_does_not_start_execution(monkeypatch):
 
 
 def test_repeated_heartbeat_errors_cancel_after_bounded_grace(monkeypatch):
-    """Store uncertainty cannot let a run outlive its last confirmed lease forever."""
+    """One transient renewal error is tolerated, but continued errors stop at grace."""
     import cron.scheduler as scheduler
 
+    heartbeat_interval = 10.0
+    grace = 30.0
     calls = 0
+    clock_samples = []
+    heartbeat_waits = []
+    events = []
+    threads = []
+    execution_completed_at = []
+
+    class _StopEvent:
+        def wait(self, timeout):
+            heartbeat_waits.append(timeout)
+            if len(heartbeat_waits) == 2:
+                # The first renewal error was inside the grace window, so it
+                # must not have cancelled the execution before retrying.
+                assert calls == 2
+                assert events[1].is_set() is False
+            return False
+
+        def set(self):
+            pass
+
+    class _LostEvent:
+        def __init__(self):
+            self._set = False
+
+        def is_set(self):
+            return self._set
+
+        def set(self):
+            self._set = True
+
+    class _InlineHeartbeatThread:
+        def __init__(self, *, target, args, name, daemon):
+            assert name == "cron-fire-claim-heartbeat"
+            assert daemon is True
+            self.target = target
+            self.args = args
+            self.started = False
+            self.join_timeouts = []
+            threads.append(self)
+
+        def start(self):
+            self.started = True
+
+        def join(self, timeout):
+            self.join_timeouts.append(timeout)
+
+        def run_inline(self):
+            assert self.started is True
+            self.target(*self.args)
+
+    def event_factory():
+        event = _StopEvent() if not events else _LostEvent()
+        events.append(event)
+        return event
+
+    def monotonic():
+        sample = (0.0, grace / 2.0, grace)[len(clock_samples)]
+        clock_samples.append(sample)
+        return sample
 
     def heartbeat(*_args, **_kwargs):
         nonlocal calls
@@ -522,8 +584,11 @@ def test_repeated_heartbeat_errors_cancel_after_bounded_grace(monkeypatch):
             return True
         raise OSError("store unavailable")
 
-    def run_body(_job, **kwargs):
-        assert kwargs["fire_claim_lost"].wait(timeout=0.5)
+    def run_body(fire_claim_lost):
+        assert fire_claim_lost is events[1]
+        threads[0].run_inline()
+        assert fire_claim_lost.is_set() is True
+        execution_completed_at.append(clock_samples[-1])
         return True
 
     job = {
@@ -531,12 +596,18 @@ def test_repeated_heartbeat_errors_cancel_after_bounded_grace(monkeypatch):
         "fire_claim": {"at": "2026-07-12T12:00:00+00:00", "by": "owner"},
     }
     monkeypatch.setattr(scheduler, "heartbeat_fire_claim", heartbeat)
-    monkeypatch.setattr(scheduler, "_run_one_job_body", run_body)
-    monkeypatch.setattr(scheduler, "_RUN_CLAIM_HEARTBEAT_SECONDS", 0.01)
-    monkeypatch.setattr(scheduler, "_FIRE_CLAIM_HEARTBEAT_GRACE_SECONDS", 0.03)
+    monkeypatch.setattr(scheduler.threading, "Event", event_factory)
+    monkeypatch.setattr(scheduler.threading, "Thread", _InlineHeartbeatThread)
+    monkeypatch.setattr(scheduler.time, "monotonic", monotonic)
+    monkeypatch.setattr(scheduler, "_RUN_CLAIM_HEARTBEAT_SECONDS", heartbeat_interval)
+    monkeypatch.setattr(scheduler, "_FIRE_CLAIM_HEARTBEAT_GRACE_SECONDS", grace)
 
-    assert scheduler.run_one_job(job) is True
+    assert scheduler._run_with_fire_claim_heartbeat(job, run_body) is True
     assert calls >= 3
+    assert heartbeat_waits == [heartbeat_interval, heartbeat_interval]
+    assert clock_samples == [0.0, grace / 2.0, grace]
+    assert execution_completed_at == [grace]
+    assert threads[0].join_timeouts == [1.0]
 
 
 def test_terminal_owner_cas_failure_marks_ledger_ownership_lost(monkeypatch):

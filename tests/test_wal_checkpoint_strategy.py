@@ -6,8 +6,9 @@ transient per-cron-run connections closing many times an hour would race
 the live gateway writer and corrupt B-tree pages (#45383).
 """
 
-import sqlite3
 import logging
+import sqlite3
+from contextlib import nullcontext
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -47,24 +48,21 @@ class TestTryWalCheckpointPassive:
 
     def test_checkpoint_uses_passive_mode(self, db):
         """PASSIVE checkpoint does not require exclusive lock — safe for large DBs."""
-        # Capture the real connection's execute before mocking
-        real_conn = db._conn
-        execute_calls = []
+        maintenance_conn = TrackingConnection(db._conn)
+        with patch.object(
+            db,
+            "_raw_maintenance_fence",
+            return_value=nullcontext(maintenance_conn),
+        ) as maintenance_fence:
+            db._try_wal_checkpoint()
 
-        def tracking_execute(sql, *args, **kwargs):
-            execute_calls.append(sql)
-            return real_conn.execute(sql, *args, **kwargs)
-
-        # sqlite3.Connection.execute is read-only (C extension) — replace _conn
-        mock_conn = MagicMock()
-        mock_conn.execute.side_effect = tracking_execute
-        mock_conn.fetchone.return_value = None
-        db._conn = mock_conn
-
-        db._try_wal_checkpoint()
-
-        passive_calls = [c for c in execute_calls if "wal_checkpoint(PASSIVE)" in c]
-        truncate_calls = [c for c in execute_calls if "wal_checkpoint(TRUNCATE)" in c]
+        maintenance_fence.assert_called_once_with()
+        passive_calls = [
+            c for c in maintenance_conn.execute_calls if "wal_checkpoint(PASSIVE)" in c
+        ]
+        truncate_calls = [
+            c for c in maintenance_conn.execute_calls if "wal_checkpoint(TRUNCATE)" in c
+        ]
         assert len(passive_calls) == 1, (
             f"Expected 1 PASSIVE checkpoint call, got {len(passive_calls)}"
         )
@@ -97,21 +95,21 @@ class TestCloseUsesPassive:
 
     def test_close_uses_passive_mode(self, db):
         """close() checkpoints PASSIVE, never TRUNCATE."""
-        real_conn = db._conn
-        execute_calls = []
+        maintenance_conn = TrackingConnection(db._conn)
+        with patch.object(
+            db,
+            "_raw_maintenance_fence",
+            return_value=nullcontext(maintenance_conn),
+        ) as maintenance_fence:
+            db.close()
 
-        def tracking_execute(sql, *args, **kwargs):
-            execute_calls.append(sql)
-            return real_conn.execute(sql, *args, **kwargs)
-
-        mock_conn = MagicMock()
-        mock_conn.execute.side_effect = tracking_execute
-        db._conn = mock_conn
-
-        db.close()
-
-        truncate_calls = [c for c in execute_calls if "wal_checkpoint(TRUNCATE)" in c]
-        passive_calls = [c for c in execute_calls if "wal_checkpoint(PASSIVE)" in c]
+        maintenance_fence.assert_called_once_with()
+        truncate_calls = [
+            c for c in maintenance_conn.execute_calls if "wal_checkpoint(TRUNCATE)" in c
+        ]
+        passive_calls = [
+            c for c in maintenance_conn.execute_calls if "wal_checkpoint(PASSIVE)" in c
+        ]
         assert len(truncate_calls) == 0, (
             "close() must NOT TRUNCATE (races the live gateway writer, #45383)"
         )

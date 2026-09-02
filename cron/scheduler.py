@@ -193,154 +193,8 @@ def _failure_streak_nudge(job: dict) -> str:
 
 
 def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
-    """Return a compact one-line failure message for chat delivery.
-
-    Full details stay in the cron output directory and the logs. Chat should
-    show the operator what broke without dumping provider JSON, retry noise, or
-    stack traces into the delivery channel.
-    """
-    job_name = job.get("name") or job.get("id") or "cron job"
-    text = (error or "unknown error").strip()
-    lower = text.lower()
-
-    if "skipped to prevent unintended spend: global inference config drifted" in lower:
-        if "finite one-shot job is consumed" in lower:
-            remediation = (
-                "This finite one-shot is consumed; create a new one-shot job at "
-                "a future time with an explicit provider and model."
-            )
-        else:
-            job_id = job.get("id") or "<job_id>"
-            remediation = (
-                "On the host running Hermes, pin it explicitly: "
-                f"`hermes cron edit {job_id} --provider <provider> "
-                "--model <model>`."
-            )
-        return (
-            f"⚠️ Cron '{job_name}' skipped before inference to prevent "
-            f"unintended spend. {remediation}"
-        )
-
-    # A no_agent job IS its script — run_job short-circuits it before any model
-    # is reached ("no LLM involvement", see the no_agent branch in run_job). So
-    # provider timeouts, rate limits, auth errors and fallback chains are not
-    # merely unlikely for these jobs, they are structurally impossible. Classify
-    # on the job's MODE before pattern-matching its prose.
-    #
-    # Without this gate the branches below classify by substring, so a script's
-    # own wording decides which subsystem gets blamed. _run_job_script reports a
-    # timeout as "Script timed out after {n}s: {path}" — that contains "timed
-    # out", so it matched the provider branch and the operator was told
-    # "provider timeout. Fallback chain was exhausted or unavailable." for a job
-    # that never opened a socket. "429" or "authentication" appearing anywhere
-    # in a script's output misfires the same way.
-    #
-    # A delivery line that names the wrong subsystem is worse than no line at
-    # all: it does not merely fail to inform, it sends the reader to the wrong
-    # place.
-    #
-    # Falling through leaves the generic cleaner below to report what actually
-    # happened, naming the script. No new message text is needed.
-    provider_reachable = not job.get("no_agent")
-
-    # Script execution happens outside the LLM/provider path (also for
-    # agent-backed jobs that run a context script). Check the script runner's
-    # explicit error contract ("Script timed out after {n}s: {path}") before
-    # generic timeout matching so a script timeout never claims a provider
-    # fallback was attempted (#82460 @jbagdonas, #78503 @daxro).
-    if lower.startswith("script timed out"):
-        return (
-            f"⚠️ Cron '{job_name}' failed: script timed out. "
-            "No model was invoked. Full details saved in cron output."
-        )
-
-    # Provider/API failures are the common noisy path. Keep these short.
-    # Match 429 as a whole token (#83188 @cation98): bare substring matching
-    # let identifiers containing those digits (job ids, ports, hashes) trip
-    # a false "provider rate limit" alert.
-    if provider_reachable and (
-        re.search(r"\b429\b", text) or "rate limit" in lower or "usage limit" in lower
-    ):
-        reason = "rate limit"
-        if "weekly usage limit" in lower:
-            reason = "weekly usage limit"
-        elif "quota" in lower:
-            reason = "quota limit"
-        return (
-            f"⚠️ Cron '{job_name}' failed: provider {reason}. "
-            f"{_fallback_chain_phrase()} "
-            "Full details saved in cron output."
-        )
-
-    # The scheduler's own inactivity watchdog (see the TimeoutError raised
-    # above at "Cron job '{job_name}' idle for {secs}s (limit {limit}s) —
-    # last activity: {desc}") produces a message that contains the substring
-    # "timed out"/"timeout" nowhere, but DOES contain "idle for ... (limit
-    # ...)" — however older/other call sites can still phrase an inactivity
-    # abort using "timed out" wording, so match on the "idle for Ns (limit"
-    # shape specifically (case-insensitive) BEFORE the generic provider-
-    # timeout branch below. Without this, an inactivity timeout — the job's
-    # OWN tool call/turn going quiet, no provider or fallback chain ever
-    # involved — gets rewritten into a misleading "provider timeout /
-    # fallback chain exhausted" message, sending the operator to debug the
-    # wrong system entirely (field-reported: a stuck `terminal` tool call
-    # tripped the 600s inactivity limit and was reported as a
-    # provider/fallback failure). Mirrors the same reordering fix
-    # upstream issue #59549 applied for script timeouts vs provider timeouts
-    # — check the more specific, deterministic signature first.
-    if re.search(r"idle for \d+s\s*\(limit \d+s\)", lower):
-        return (
-            f"⚠️ Cron '{job_name}' failed: the job itself stalled — no tool/API "
-            "activity for the configured inactivity window. Not a provider or "
-            "fallback-chain issue; check what the job was doing when it went "
-            "quiet. Full details saved in cron output."
-        )
-
-    # Sibling scheduler-side timeout (#79768): the TERMINAL_CWD lock-wait
-    # abort also phrases itself with "Timed out ..." and would fall through
-    # to the generic provider-timeout branch below. Like the inactivity
-    # watchdog above, it is entirely scheduler-internal — no provider or
-    # fallback chain involved — so classify it before the generic match.
-    if "terminal_cwd" in lower and ("lock" in lower or "timed out" in lower):
-        return (
-            f"⚠️ Cron '{job_name}' failed: could not acquire the scheduler's "
-            "working-directory lock — another cron job (a workdir writer or "
-            "long-running readers) held it too long. Not a provider or "
-            "fallback-chain issue; stagger the holder's schedule or remove "
-            "its workdir. Full details saved in cron output."
-        )
-
-    if provider_reachable and (
-        "readtimeout" in lower or "timed out" in lower or "timeout" in lower
-    ):
-        return (
-            f"⚠️ Cron '{job_name}' failed: provider timeout. "
-            f"{_fallback_chain_phrase()} "
-            "Full details saved in cron output."
-        )
-
-    # Match authentication/authorization wording at a word boundary and the
-    # 401/403 status codes as whole tokens, so "oauth", "4015" and similar do
-    # not trip a misleading auth message.
-    if provider_reachable and (
-        re.search(r"authenticat|authoriz", lower) or re.search(r"\b(401|403)\b", text)
-    ):
-        return (
-            f"⚠️ Cron '{job_name}' failed: provider authentication error. "
-            "Full details saved in cron output."
-        )
-
-    # Strip common exception wrappers and collapse provider payloads. Bound
-    # the input first so a multi-KB provider blob cannot slow the
-    # substitutions.
-    cleaned = re.sub(
-        r"^(RuntimeError|Exception|ValueError|HTTPStatusError):\s*",
-        "", text[:2000],
-    )
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    if len(cleaned) > 180:
-        cleaned = cleaned[:177].rstrip() + "..."
-    return f"⚠️ Cron '{job_name}' failed: {cleaned}"
+    """Return the closed public failure value for a cron delivery."""
+    return _CRON_DELIVERY_FAILURE
 
 
 class CronPromptInjectionBlocked(Exception):
@@ -4408,6 +4262,7 @@ BLOCKED_CONFIG_SILENT_MARKER = "[blocked_config:silent]"
 # deliver again" (the drift_alerted bit on the job record, #73506 shape).
 DRIFT_SKIP_MARKER = "[drift_skip]"
 DRIFT_SKIP_SILENT_MARKER = "[drift_skip:silent]"
+_PRIVATE_CRON_DRIFT_SIGNAL = "_private_cron_drift_signal"
 
 
 
@@ -4941,23 +4796,15 @@ def run_job(
         now_iso = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
 
         if not ok:
-            # Script crashed / timed out / exited non-zero.  Deliver the
-            # error so the user knows the watchdog itself broke — silent
-            # failure for an alerting job is the worst-case outcome.
-            alert = (
-                f"⚠ Cron watchdog '{job_name}' script failed\n\n"
-                f"{output}\n\n"
-                f"Time: {now_iso}"
+            # Script stderr, paths, subprocess errors, and exception text are
+            # private diagnostics.  This is a public return boundary, so do
+            # not let any of them reach the scheduler's durable/output path.
+            return (
+                False,
+                _CRON_DELIVERY_FAILURE,
+                _CRON_DELIVERY_FAILURE,
+                _CRON_DELIVERY_FAILURE,
             )
-            doc = (
-                f"# Cron Job: {job_name}\n\n"
-                f"**Job ID:** {job_id}\n"
-                f"**Run Time:** {now_iso}\n"
-                f"**Mode:** no_agent (script)\n"
-                f"**Status:** script failed\n\n"
-                f"{output}\n"
-            )
-            return False, doc, alert, output
 
         # Honour the wakeAgent gate as a silent signal — `wakeAgent: false`
         # means "nothing to report this tick", same as empty stdout.
@@ -5010,21 +4857,13 @@ def run_job(
             # Source failure is an ERROR, never a change: alert the user so
             # a broken monitor can't silently stop watching. Stored hash is
             # untouched (check_monitor persists nothing on failure).
-            logger.error("Job '%s': monitor source failed: %s", job_id, _mon.error)
-            _mon_doc = (
-                f"# Cron Job: {job_name}\n\n"
-                f"**Job ID:** {job_id}\n"
-                f"**Run Time:** {_mon_now}\n"
-                f"**Mode:** monitor\n"
-                f"**Status:** monitor source failed\n\n"
-                f"{_mon.error}\n"
+            logger.error(_CRON_DELIVERY_FAILURE)
+            return (
+                False,
+                _CRON_DELIVERY_FAILURE,
+                _CRON_DELIVERY_FAILURE,
+                _CRON_DELIVERY_FAILURE,
             )
-            _mon_alert = (
-                f"⚠ Cron monitor '{job_name}' source failed\n\n"
-                f"{_mon.error}\n\n"
-                f"Time: {_mon_now}"
-            )
-            return False, _mon_doc, _mon_alert, _mon.error
         if not _mon.changed:
             # Unchanged output — suppress the agent run entirely. Recorded
             # as a silent no_change tick (visible in the executions ledger
@@ -5761,14 +5600,7 @@ def run_job(
                         "--model <model>` (or pin the original values to keep "
                         "them)."
                     )
-                logger.warning(
-                    "Job '%s': SKIPPED — global inference config drifted since "
-                    "creation (%s) and this job is unpinned. Skipped to prevent "
-                    "unintended spend. %s",
-                    job_id,
-                    _changes,
-                    _remediation,
-                )
+                logger.warning(_CRON_EXECUTION_FAILURE)
                 # Alert-once (#73506 shape): persist the drift_alerted bit so
                 # only the FIRST drifted tick delivers; run_one_job suppresses
                 # delivery on the silent marker. mark_job_run clears the bit
@@ -5784,6 +5616,7 @@ def run_job(
                     DRIFT_SKIP_SILENT_MARKER if _drift_already_alerted
                     else DRIFT_SKIP_MARKER
                 )
+                job[_PRIVATE_CRON_DRIFT_SIGNAL] = _drift_marker
                 raise RuntimeError(
                     f"{_drift_marker} Skipped to prevent unintended spend: global "
                     f"inference config drifted since this job was created "
@@ -6140,7 +5973,7 @@ def run_job(
             if occurrence_id
             else _CRON_EXECUTION_FAILURE
         )
-        logger.error("Job '%s' failed: %s", job_name, error_msg)
+        logger.error(error_msg)
         # Best-effort audit write on failure path. _audit_fire_id
         # may be unset if the exception fired before submit() — guard
         # with a None check so the audit write itself never raises.
@@ -6160,22 +5993,7 @@ def run_job(
                 "error": error_msg,
             })
         
-        output = f"""# Cron Job: {job_name} (FAILED)
-
-**Job ID:** {job_id}
-**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
-**Schedule:** {job.get('schedule_display', 'N/A')}
-
-## Prompt
-
-{prompt}
-
-## Error
-
-```
-{error_msg}
-```
-"""
+        output = error_msg
         return False, output, "", error_msg
 
     finally:
@@ -6433,8 +6251,8 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
 _PRIVATE_CRON_EXECUTION_CONTEXT_MARKER = "## Private Cron Execution Context"
 _PRIVATE_CRON_EXECUTION_CONTEXT_REDACTION = "[private cron execution context redacted]"
 _REDACTED_CRON_OCCURRENCE = "[cron occurrence redacted]"
-_RESUMED_CRON_EXECUTION_FAILURE = "Cron resumed execution failed"
-_CRON_EXECUTION_FAILURE = "Cron execution failed"
+_RESUMED_CRON_EXECUTION_FAILURE = "Cron delivery failed"
+_CRON_EXECUTION_FAILURE = "Cron delivery failed"
 _CRON_DELIVERY_FAILURE = "Cron delivery failed"
 
 
@@ -6800,6 +6618,15 @@ def _run_one_job_body(
         ) or ""
         error = _sanitize_resume_occurrence_public_text(error, resume_occurrence_id)
 
+        # A failed body may carry script stderr, a filesystem path, monitor
+        # source diagnostics, or an exception string.  Normalize at this
+        # dependency-closed boundary before output persistence, audit rows,
+        # logging, alert construction, returns, or delivery can observe it.
+        if not success:
+            output = _CRON_DELIVERY_FAILURE
+            final_response = _CRON_DELIVERY_FAILURE
+            error = _CRON_DELIVERY_FAILURE
+
         if _fire_claim_ownership_lost():
             for _deferred_agent in _deferred_agents:
                 _teardown_cron_agent(_deferred_agent, job["id"])
@@ -6852,6 +6679,12 @@ def _run_one_job_body(
                     "(tool subprocess was killed mid-flight)."
                 )
 
+            if not success:
+                error = _CRON_DELIVERY_FAILURE
+            elif not final_response.strip():
+                success = False
+                error = _CRON_EXECUTION_FAILURE
+
             # Deliver the final response to the origin/target chat.
             # If the agent responded with [SILENT], skip delivery (but
             # output is already saved above).  Failed jobs always deliver.
@@ -6870,47 +6703,12 @@ def _run_one_job_body(
             # Drift-guard skip (#44585): same alert-once contract as
             # blocked_config — the silent marker means the operator already
             # got the alert on a previous tick.
-            drift_skip_silent = (
-                bool(error) and DRIFT_SKIP_SILENT_MARKER in str(error)
+            _drift_signal = job.pop(_PRIVATE_CRON_DRIFT_SIGNAL, None)
+            drift_skip_silent = _drift_signal == DRIFT_SKIP_SILENT_MARKER
+            drift_skip = drift_skip_silent or _drift_signal == DRIFT_SKIP_MARKER
+            deliver_content = (
+                final_response if success else _CRON_DELIVERY_FAILURE
             )
-            drift_skip = drift_skip_silent or (
-                bool(error) and DRIFT_SKIP_MARKER in str(error)
-            )
-            if blocked_config and not success:
-                # Blocked-config alert: bypass the generic failure summarizer
-                # (whose auth/timeout heuristics would mislabel this as a
-                # provider runtime failure) — say plainly that config
-                # validation blocked the run and nothing was spent.
-                _pf_text = re.sub(
-                    r"\[blocked_config[^\]]*\]\s*", "", str(error)
-                ).strip()
-                deliver_content = (
-                    f"⛔ Cron '{job.get('name') or job['id']}' blocked by "
-                    f"configuration validation (no LLM call was made): "
-                    f"{_pf_text} "
-                    "This alert is sent once; the job stays blocked until "
-                    "the configuration is fixed."
-                )
-            else:
-                deliver_content = final_response if success else (
-                    _summarize_cron_failure_for_delivery(job, error)
-                    + _failure_streak_nudge(job)
-                )
-                if drift_skip and not success:
-                    # Drift-skip alert: bypass the generic summarizer's
-                    # 180-char truncation (it would eat the remediation
-                    # command) and strip the internal marker — deliver the
-                    # guard's own actionable message intact.
-                    _drift_text = re.sub(
-                        r"\[drift_skip[^\]]*\]\s*", "", str(error)
-                    ).strip()
-                    deliver_content = (
-                        f"⚠️ Cron '{job.get('name') or job['id']}' skipped: "
-                        f"{_drift_text}"
-                    )
-            # Treat whitespace-only final responses the same as empty
-            # responses: do not deliver a blank message, and let the
-            # empty-response guard below mark the run as a soft failure.
             should_deliver = bool(deliver_content.strip())
             if blocked_config_silent or drift_skip_silent:
                 should_deliver = False
@@ -6922,6 +6720,7 @@ def _run_one_job_body(
             # #46917).  Keeps the intentional bracketed-prefix / trailing-line
             # tolerance the cron contract relies on.
             if should_deliver and success and _is_cron_silence_response(deliver_content):
+                logger.info("Cron delivery suppressed: %s", SILENT_MARKER)
                 should_deliver = False
 
             if should_deliver and _fire_claim_ownership_lost():
@@ -6977,13 +6776,6 @@ def _run_one_job_body(
                     error="Fire claim ownership lost; stale result was discarded.",
                 )
             return True
-
-        # Treat empty final_response as a soft failure so last_status
-        # is not "ok" — the agent ran but produced nothing useful.
-        # (issue #8585)
-        if success and not final_response.strip():
-            success = False
-            error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
         interrupted = _consume_interrupted_flag(job["id"], execution_token)
         if interrupted:
@@ -7079,14 +6871,7 @@ def _run_one_job_body(
                 delivery_error = _normalize_cron_delivery_error(
                     _deliver_result(
                         job,
-                        # Composed exactly like the normal failure delivery above.
-                        # mark_job_run below records THIS run in failure_streak
-                        # whichever layer failed, so a job that fails before the
-                        # run body every tick builds a streak nobody is ever told
-                        # about: its alerts only ever leave through here, and the
-                        # nudge only ever left through there (#88655).
-                        _summarize_cron_failure_for_delivery(job, _err_text)
-                        + _failure_streak_nudge(job),
+                        _CRON_DELIVERY_FAILURE,
                         adapters=adapters,
                         loop=loop,
                     )

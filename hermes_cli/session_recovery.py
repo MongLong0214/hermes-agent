@@ -210,16 +210,32 @@ _DESTINATION_COLLISION_ERROR = "Recovery output already exists or changed during
 _DESTINATION_STAGE_CHANGED_ERROR = "Recovery staging candidate changed before publication."
 
 
-def _identity_from_stat(result: os.stat_result) -> tuple[int, int, int, int]:
+_PathIdentity = tuple[int, int, int, int, int, int]
+
+
+def _identity_from_stat(result: os.stat_result) -> _PathIdentity:
+    """Bind regular staged files to identity and replacement evidence.
+
+    Stage directories change ctime while children are created, so keep their
+    directory/child target semantics on the stable inode fields; regular files
+    additionally carry kernel-maintained ctime and byte length.
+    """
+    file_type = stat.S_IFMT(result.st_mode)
+    if stat.S_ISREG(file_type):
+        change_evidence = (int(result.st_ctime_ns), int(result.st_size))
+    else:
+        change_evidence = (0, 0)
     return (
         int(result.st_dev),
         int(result.st_ino),
-        stat.S_IFMT(result.st_mode),
+        file_type,
         int(result.st_nlink),
+        change_evidence[0],
+        change_evidence[1],
     )
 
 
-def _path_identity(path: Path) -> tuple[int, int, int, int]:
+def _path_identity(path: Path) -> _PathIdentity:
     return _identity_from_stat(os.lstat(path))
 
 
@@ -227,8 +243,8 @@ def _path_identity(path: Path) -> tuple[int, int, int, int]:
 class _DestinationStage:
     directory: Path
     candidate: Path
-    directory_identity: tuple[int, int, int, int]
-    children: dict[str, tuple[int, int, int, int]] = field(default_factory=dict)
+    directory_identity: _PathIdentity
+    children: dict[str, _PathIdentity] = field(default_factory=dict)
     retain_on_authority_refusal: bool = False
 
 
@@ -251,8 +267,13 @@ def _create_destination_stage(output: Path) -> _DestinationStage:
         raise SessionRecoveryDestinationError(_DESTINATION_STAGE_ERROR) from None
 
 
-def _stage_child_identity(stage: _DestinationStage, path: Path) -> None:
-    """Record one candidate child, rejecting substitution or hard-linking."""
+def _stage_child_identity(
+    stage: _DestinationStage,
+    path: Path,
+    *,
+    rebaseline: bool = False,
+) -> None:
+    """Record a staged child without treating normal writes as substitution."""
 
     try:
         identity = _path_identity(path)
@@ -262,15 +283,21 @@ def _stage_child_identity(stage: _DestinationStage, path: Path) -> None:
         raise SessionRecoverySafetyError(_DESTINATION_STAGE_CHANGED_ERROR)
     prior = stage.children.get(path.name)
     if prior is not None and prior != identity:
-        raise SessionRecoverySafetyError(_DESTINATION_STAGE_CHANGED_ERROR)
+        if not rebaseline or prior[:4] != identity[:4]:
+            raise SessionRecoverySafetyError(_DESTINATION_STAGE_CHANGED_ERROR)
     stage.children[path.name] = identity
 
 
-def _refresh_stage_children(stage: _DestinationStage, *, require_main: bool = False) -> None:
+def _refresh_stage_children(
+    stage: _DestinationStage,
+    *,
+    require_main: bool = False,
+    rebaseline: bool = False,
+) -> None:
     for suffix in _SIDECAR_SUFFIXES:
         child = _sidecar_path(stage.candidate, suffix)
         if os.path.lexists(child):
-            _stage_child_identity(stage, child)
+            _stage_child_identity(stage, child, rebaseline=rebaseline)
     if require_main and stage.candidate.name not in stage.children:
         raise SessionRecoverySafetyError(_DESTINATION_STAGE_CHANGED_ERROR)
 
@@ -381,7 +408,7 @@ def _seal_staged_database(stage: _DestinationStage) -> None:
         for suffix in ("-wal", "-shm", "-journal"):
             if os.path.lexists(_sidecar_path(stage.candidate, suffix)):
                 raise sqlite3.DatabaseError("staged sidecar remains")
-        _refresh_stage_children(stage, require_main=True)
+        _refresh_stage_children(stage, require_main=True, rebaseline=True)
         _fsync_path(stage.candidate)
         _fsync_path(stage.directory, directory=True)
     except SessionTurnLeaseLostError:
@@ -431,7 +458,11 @@ def _publish_staged_database(stage: _DestinationStage, output: Path) -> None:
     if any(os.path.lexists(_sidecar_path(output, suffix)) for suffix in _SIDECAR_SUFFIXES):
         raise SessionRecoverySafetyError(_DESTINATION_COLLISION_ERROR)
     _publication_barrier(stage.candidate, output)
-    if _path_identity(stage.candidate) != expected:
+    # A different stable identity is a substitution regardless of database
+    # contents.  Same-inode ctime/size changes may instead be a foreign claim;
+    # defer their generic rejection until the maintenance-authority proof.
+    identity_after_barrier = _path_identity(stage.candidate)
+    if identity_after_barrier[:4] != expected[:4]:
         raise SessionRecoverySafetyError(_DESTINATION_STAGE_CHANGED_ERROR)
     if any(os.path.lexists(_sidecar_path(output, suffix)) for suffix in _SIDECAR_SUFFIXES):
         raise SessionRecoverySafetyError(_DESTINATION_COLLISION_ERROR)
@@ -442,13 +473,13 @@ def _publish_staged_database(stage: _DestinationStage, output: Path) -> None:
     connection = sqlite3.connect(str(stage.candidate), isolation_level=None)
     try:
         connection.execute("BEGIN IMMEDIATE")
+        _assert_offline_rebuild_maintenance_authority(
+            connection, local_marker=None
+        )
         if _path_identity(stage.candidate) != expected:
             raise SessionRecoverySafetyError(_DESTINATION_STAGE_CHANGED_ERROR)
         if any(os.path.lexists(_sidecar_path(output, suffix)) for suffix in _SIDECAR_SUFFIXES):
             raise SessionRecoverySafetyError(_DESTINATION_COLLISION_ERROR)
-        _assert_offline_rebuild_maintenance_authority(
-            connection, local_marker=None
-        )
         _native_no_replace_publish(stage.candidate, output)
         connection.execute("ROLLBACK")
     except SessionTurnLeaseLostError:
@@ -457,6 +488,8 @@ def _publish_staged_database(stage: _DestinationStage, output: Path) -> None:
     except OSError:
         raise SessionRecoverySafetyError(_DESTINATION_COLLISION_ERROR) from None
     except sqlite3.Error:
+        if identity_after_barrier != expected:
+            raise SessionRecoverySafetyError(_DESTINATION_STAGE_CHANGED_ERROR) from None
         raise SessionRecoveryDestinationError(_DESTINATION_STAGE_ERROR) from None
     finally:
         if connection.in_transaction:
@@ -466,7 +499,10 @@ def _publish_staged_database(stage: _DestinationStage, output: Path) -> None:
                 pass
         connection.close()
     try:
-        if _path_identity(output) != expected or os.path.lexists(stage.candidate):
+        # rename(2) itself changes a regular file's ctime, so the pre-rename
+        # full identity proof carries substitution resistance; after publish
+        # confirm only that the same staged inode reached the output.
+        if _path_identity(output)[:4] != expected[:4] or os.path.lexists(stage.candidate):
             raise SessionRecoveryDestinationError(_DESTINATION_STAGE_ERROR)
         _fsync_path(output.parent, directory=True)
     except OSError:
@@ -1897,7 +1933,7 @@ def _recover_via_lost_and_found(
         lf_conn.close()
         destination_conn.close()
         destination_db.close()
-    _refresh_stage_children(stage, require_main=True)
+    _refresh_stage_children(stage, require_main=True, rebaseline=True)
 
     verification["loss_detected"] = True
     verification["warnings"].append(
@@ -2124,7 +2160,7 @@ def recover_session_database(
                 if destination_conn is not None:
                     destination_conn.close()
                 destination_db.close()
-        _refresh_stage_children(stage, require_main=True)
+        _refresh_stage_children(stage, require_main=True, rebaseline=True)
 
         source_unchanged = (
             _source_fingerprint(source) == inspection["source_fingerprint"]

@@ -1206,13 +1206,12 @@ def _same_connection_raw_maintenance_fence(
             "raw SQLite maintenance fence requires an autocommit connection"
         )
 
-    mode = conn.execute("PRAGMA locking_mode=EXCLUSIVE").fetchone()
-    if mode is None or str(mode[0]).strip().lower() != "exclusive":
-        raise sqlite3.OperationalError(
-            "could not request exclusive SQLite maintenance locking mode"
-        )
-
     try:
+        mode = conn.execute("PRAGMA locking_mode=EXCLUSIVE").fetchone()
+        if mode is None or str(mode[0]).strip().lower() != "exclusive":
+            raise sqlite3.OperationalError(
+                "could not request exclusive SQLite maintenance locking mode"
+            )
         conn.execute("BEGIN EXCLUSIVE")
         conn.execute("COMMIT")
     except BaseException as acquire_exc:
