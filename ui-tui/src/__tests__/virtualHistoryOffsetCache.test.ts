@@ -519,6 +519,7 @@ describe('useVirtualHistory offset cache reuse', () => {
     const expose = { current: null as Exposed | null }
     const streams = makeStreams()
     const initialHeights = new Map(items.map(item => [item.key, item.height]))
+
     const view = (heights: ReadonlyMap<string, number>) =>
       React.createElement(Harness, { expose, initialHeights: heights, items })
 
