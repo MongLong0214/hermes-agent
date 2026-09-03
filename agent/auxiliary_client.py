@@ -2839,6 +2839,7 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
                 from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
 
                 if is_native_gemini_base_url(base_url):
+                    deny_gemini_outbound(canonical_provider="gemini", routing_hint="gemini")
                     return GeminiNativeClient(api_key=api_key, base_url=base_url), model
             extra = {}
             if base_url_host_matches(base_url, "api.kimi.com"):
@@ -2879,6 +2880,7 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
             from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
 
             if is_native_gemini_base_url(base_url):
+                deny_gemini_outbound(canonical_provider="gemini", routing_hint="gemini")
                 return GeminiNativeClient(api_key=api_key, base_url=base_url), model
         extra = {}
         if base_url_host_matches(base_url, "api.kimi.com"):
@@ -3768,11 +3770,17 @@ def _validate_base_url(base_url: str) -> None:
 
 def _try_custom_endpoint() -> Tuple[Optional[Any], Optional[str]]:
     runtime = _resolve_custom_runtime()
+    if not isinstance(runtime, tuple) or len(runtime) not in {2, 3}:
+        raise GeminiOutboundDenied()
     if len(runtime) == 2:
         custom_base, custom_key = runtime
         custom_mode = None
     else:
         custom_base, custom_key, custom_mode = runtime
+    # A raw custom tuple cannot authorize the native Google transport. Named
+    # custom routes carry selector-issued endpoint facts through their own path.
+    if custom_mode == "gemini_native":
+        raise GeminiOutboundDenied()
     deny_gemini_outbound(
         canonical_provider="custom",
         base_url=custom_base,
@@ -4722,38 +4730,40 @@ def _evict_cached_clients(provider: str, *, cache_key: Optional[tuple] = None) -
 
 
 def _evict_cached_client_instance(target: Any) -> bool:
-    """Drop the cache entry whose stored client is *target*.
-
-    Used when a specific cached client has been poisoned (closed httpx
-    transport after a timeout, broken streaming session, etc.) so the next
-    auxiliary call rebuilds rather than reusing the dead instance.
-
-    Walks both sync and async wrappers (``CodexAuxiliaryClient``,
-    ``AnthropicAuxiliaryClient``, ``AsyncCodexAuxiliaryClient``, etc.) via
-    their ``_real_client`` attribute so a timeout that closes the underlying
-    ``OpenAI`` (or native provider) client evicts every cached shim that
-    exposed it. Async wrappers must mirror their sync sibling's
-    ``_real_client`` for this to work — otherwise the sync entry is evicted
-    but the async entry survives and keeps reusing the dead transport.
-
-    Returns True when at least one entry was evicted.
-    """
+    """Detach every cache wrapper that reaches a poisoned client instance."""
     if target is None:
         return False
     evicted = False
     with _client_cache_lock:
         for key in list(_client_cache.keys()):
-            entry = _cached_entry_parts(_client_cache.get(key))
+            raw_entry = _client_cache.get(key)
+            entry = _cleanup_cache_entry_parts(raw_entry)
             if entry is None:
-                _client_cache.pop(key, None)
-                continue
-            cached = entry[0]
-            if cached is None:
-                continue
-            real = getattr(cached, "_real_client", None)
-            if cached is target or real is target:
-                del _client_cache[key]
-                evicted = True
+                if not isinstance(raw_entry, tuple) or len(raw_entry) not in {3, 4}:
+                    _client_cache.pop(key, None)
+                    continue
+                # Detach-only invalidation must find a poisoned wrapper even
+                # when its metadata is malformed; it remains unauthorized.
+                current = raw_entry[0]
+            else:
+                current = entry[0]
+            seen: set[int] = set()
+            while current is not None and id(current) not in seen:
+                if current is target:
+                    del _client_cache[key]
+                    evicted = True
+                    break
+                seen.add(id(current))
+                next_client = None
+                for attr in ("_real_client", "_client", "client"):
+                    try:
+                        candidate = getattr(current, attr, None)
+                    except Exception:
+                        continue
+                    if candidate is not None and candidate is not current:
+                        next_client = candidate
+                        break
+                current = next_client
     return evicted
 
 
@@ -6305,6 +6315,7 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
         from agent.gemini_native_adapter import GeminiNativeClient, AsyncGeminiNativeClient
 
         if isinstance(sync_client, GeminiNativeClient):
+            deny_gemini_outbound(canonical_provider="gemini", routing_hint="gemini")
             return AsyncGeminiNativeClient(sync_client), model
     except ImportError:
         pass
@@ -6806,6 +6817,12 @@ def resolve_provider_client(
         )
         if client is None:
             return None, None
+        # The raw auto return is not endpoint provenance. Fail closed for a
+        # selected Google identity before inspecting proxy/client state.
+        deny_gemini_outbound(
+            canonical_provider=effective_provider,
+            routing_hint=effective_provider,
+        )
         deny_gemini_outbound(
             canonical_provider=effective_provider,
             model=resolved or model or "",
@@ -7269,6 +7286,7 @@ def resolve_provider_client(
             from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
 
             if is_native_gemini_base_url(base_url):
+                deny_gemini_outbound(canonical_provider="gemini", routing_hint="gemini")
                 client = GeminiNativeClient(api_key=api_key, base_url=base_url)
                 logger.debug("resolve_provider_client: %s (%s)", provider, final_model)
                 return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
@@ -8283,6 +8301,12 @@ def _refresh_nous_auxiliary_client(
 ) -> Tuple[Optional[Any], Optional[str]]:
     """Refresh Nous runtime creds, rebuild the client, and replace the cache entry."""
     runtime_route = main_runtime if isinstance(main_runtime, dict) else {}
+    # This direct rebuild entrypoint has no selector-issued route record. A
+    # Google/Vertex identity therefore fails closed before runtime credentials.
+    deny_gemini_outbound(
+        canonical_provider=cache_provider,
+        routing_hint=cache_provider,
+    )
     deny_gemini_outbound(
         canonical_provider=cache_provider,
         model=model or runtime_route.get("model", ""),

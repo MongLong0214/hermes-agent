@@ -186,47 +186,40 @@ class TestGeminiAgentInit:
         (
             ("gemini", "ordinary-model", {}),
             ("custom", "gemini-2.5-flash", {}),
-            (
-                "custom",
-                "ordinary-model",
-                {"explicit_base_url": "https://generativelanguage.googleapis.com/v1beta/openai"},
-            ),
+            ("custom", "ordinary-model", {"explicit_base_url": "https://generativelanguage.googleapis.com/v1beta/openai"}),
             ("custom", "ordinary-model", {"api_mode": "gemini_native"}),
-            (
-                "custom",
-                "ordinary-model",
-                {"main_runtime": {"requested_provider": "vertex"}},
-            ),
+            ("custom", "ordinary-model", {"main_runtime": {"requested_provider": "vertex"}}),
         ),
     )
-    def test_gemini_resolve_provider_client_uses_native_client(
-        self, provider, model, route_kwargs
-    ):
-        """Public auxiliary resolution denies every Gemini route fact first."""
+    def test_gemini_resolve_provider_client_uses_native_client(self, provider, model, route_kwargs):
+        """Google route facts deny before effects; a custom model spelling alone does not."""
         from agent.auxiliary_client import resolve_provider_client
         from agent.gemini_outbound_policy import GeminiOutboundDenied
 
+        safe_custom_model = provider == "custom" and model == "gemini-2.5-flash" and not route_kwargs
         with (
-            patch(
-                "agent.auxiliary_client._validate_proxy_env_urls",
-                side_effect=AssertionError("proxy validation reached"),
-            ) as mock_proxy,
-            patch(
-                "hermes_cli.auth.resolve_api_key_provider_credentials",
-                side_effect=AssertionError("credential resolver reached"),
-            ) as mock_credentials,
-            patch(
-                "agent.gemini_native_adapter.GeminiNativeClient",
-                side_effect=AssertionError("native Gemini client reached"),
-            ) as mock_native,
+            patch("agent.auxiliary_client._validate_proxy_env_urls", side_effect=None if safe_custom_model else AssertionError("proxy validation reached")) as mock_proxy,
+            patch("hermes_cli.auth.resolve_api_key_provider_credentials", side_effect=AssertionError("credential resolver reached")) as mock_credentials,
+            patch("agent.auxiliary_client._get_provider_chain", return_value=[] if safe_custom_model else None),
+            patch("agent.auxiliary_client._resolve_api_key_provider", return_value=(None, None)),
+            patch("agent.gemini_native_adapter.GeminiNativeClient", side_effect=AssertionError("native Gemini client reached")) as mock_native,
         ):
-            with pytest.raises(GeminiOutboundDenied) as exc_info:
-                resolve_provider_client(provider, model, **route_kwargs)
+            if safe_custom_model:
+                client, resolved = resolve_provider_client(provider, model, **route_kwargs)
+            else:
+                with pytest.raises(GeminiOutboundDenied) as exc_info:
+                    resolve_provider_client(provider, model, **route_kwargs)
 
-        assert exc_info.type is GeminiOutboundDenied
-        assert exc_info.value.code == "gemini_outbound_denied"
-        assert str(exc_info.value) == "Gemini outbound requests are disabled."
-        mock_proxy.assert_not_called()
+        if safe_custom_model:
+            assert client is None
+            assert resolved is None
+            assert mock_proxy.called
+        else:
+            assert exc_info.type is GeminiOutboundDenied
+            assert exc_info.value.code == "gemini_outbound_denied"
+            assert str(exc_info.value) == "Gemini outbound requests are disabled."
+            assert vars(exc_info.value) == {}
+            mock_proxy.assert_not_called()
         mock_credentials.assert_not_called()
         mock_native.assert_not_called()
 

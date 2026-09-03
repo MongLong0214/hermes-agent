@@ -864,41 +864,25 @@ class TestExpiredCodexFallback:
     """Expired Codex tokens must not fall through to a Gemini route."""
 
     def test_expired_codex_denies_before_gemini_fallback(self, tmp_path, monkeypatch):
-        """An expired Codex token cannot make auto routing use Gemini."""
+        """A safe non-Google fallback remains available after an expired Codex token."""
         import base64
         import time as _time
 
-        # Expired Codex JWT
         header = base64.urlsafe_b64encode(b'{"alg":"RS256","typ":"JWT"}').rstrip(b"=").decode()
-        payload_data = json.dumps({"exp": int(_time.time()) - 3600}).encode()
-        payload = base64.urlsafe_b64encode(payload_data).rstrip(b"=").decode()
-        expired_jwt = f"{header}.{payload}.fakesig"
-
+        payload = base64.urlsafe_b64encode(json.dumps({"exp": int(_time.time()) - 3600}).encode()).rstrip(b"=").decode()
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir(parents=True, exist_ok=True)
-        (hermes_home / "auth.json").write_text(json.dumps({
-            "version": 1,
-            "providers": {
-                "openai-codex": {
-                    "tokens": {"access_token": expired_jwt, "refresh_token": "r"},
-                },
-            },
-        }))
+        (hermes_home / "auth.json").write_text(json.dumps({"version": 1, "providers": {"openai-codex": {"tokens": {"access_token": f"{header}.{payload}.fakesig", "refresh_token": "r"}}}}))
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-
-        # Set up Anthropic as fallback
-        monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-test-fallback")
+        monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant...back")
         with patch("agent.anthropic_adapter.build_anthropic_client") as mock_build:
             mock_build.return_value = MagicMock()
             from agent.auxiliary_client import _resolve_auto
-            from agent.gemini_outbound_policy import GeminiOutboundDenied
+            client, resolved = _resolve_auto()
 
-            with pytest.raises(GeminiOutboundDenied) as exc_info:
-                _resolve_auto()
-
-        assert exc_info.type is GeminiOutboundDenied
-        assert exc_info.value.code == "gemini_outbound_denied"
-        mock_build.assert_not_called()
+        assert client is not None
+        assert resolved
+        mock_build.assert_called_once()
 
 
     def test_expired_codex_openrouter_wins(self, tmp_path, monkeypatch):
@@ -1276,29 +1260,20 @@ class TestAuxiliaryPoolAwareness:
 
 
     def test_cached_gmi_client_denies_before_resolver(self):
-        """A Gemini alias cannot reach the cached-client resolver."""
+        """A non-Google GMI endpoint is not denied from its model spelling."""
         import agent.auxiliary_client as aux
-        from agent.gemini_outbound_policy import GeminiOutboundDenied
 
-        with patch(
-            "agent.auxiliary_client.resolve_provider_client",
-            side_effect=AssertionError("cached-client resolver reached"),
-        ) as mock_resolve:
+        safe_client = MagicMock()
+        with patch("agent.auxiliary_client.resolve_provider_client", return_value=(safe_client, "google/gemini-3.1-flash-lite-preview")) as mock_resolve:
             aux.shutdown_cached_clients()
             try:
-                with pytest.raises(GeminiOutboundDenied) as exc_info:
-                    aux._get_cached_client(
-                        "gmi",
-                        "google/gemini-3.1-flash-lite-preview",
-                        base_url="https://api.gmi-serving.com/v1",
-                        api_key="gmi-key",
-                    )
+                client, resolved = aux._get_cached_client("gmi", "google/gemini-3.1-flash-lite-preview", base_url="https://api.gmi-serving.com/v1", api_key="gmi-key")
             finally:
                 aux.shutdown_cached_clients()
 
-        assert exc_info.type is GeminiOutboundDenied
-        assert exc_info.value.code == "gemini_outbound_denied"
-        mock_resolve.assert_not_called()
+        assert client is safe_client
+        assert resolved == "google/gemini-3.1-flash-lite-preview"
+        mock_resolve.assert_called_once()
 
 
 # ── Payment / credit exhaustion fallback ─────────────────────────────────
@@ -2217,10 +2192,8 @@ class TestStaleBaseUrlWarning:
     """_resolve_auto() warns when OPENAI_BASE_URL conflicts with config provider (#5161)."""
 
     def test_warns_when_openai_base_url_set_with_named_provider(self, monkeypatch, caplog):
-        """The stale-base-url warning precedes a Gemini route denial."""
+        """The stale-base-url warning does not deny an OpenRouter route by model text."""
         import agent.auxiliary_client as mod
-        from agent.gemini_outbound_policy import GeminiOutboundDenied
-        # Reset the module-level flag so the warning fires
         monkeypatch.setattr(mod, "_stale_base_url_warned", False)
         monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:11434/v1")
         monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
@@ -2228,13 +2201,11 @@ class TestStaleBaseUrlWarning:
         with patch("agent.auxiliary_client._read_main_provider", return_value="openrouter"), \
              patch("agent.auxiliary_client._read_main_model", return_value="google/gemini-flash"), \
              caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
-            with pytest.raises(GeminiOutboundDenied) as exc_info:
-                _resolve_auto()
+            client, resolved = _resolve_auto()
 
-        assert exc_info.type is GeminiOutboundDenied
-        assert exc_info.value.code == "gemini_outbound_denied"
-        assert any("OPENAI_BASE_URL is set" in rec.message for rec in caplog.records), \
-            "Expected a warning about stale OPENAI_BASE_URL"
+        assert client is not None
+        assert resolved
+        assert any("OPENAI_BASE_URL is set" in rec.message for rec in caplog.records)
         assert mod._stale_base_url_warned is True
 
 
@@ -2662,42 +2633,23 @@ class TestAuxiliaryAuthRefreshRetry:
 
 class TestGeminiAuxiliaryDirectFactories:
     def test_custom_fallback_registry_gemini_denies_before_pool_or_native_client(self):
-        """The real custom fallback cannot route through a Gemini registry entry."""
-        from agent.gemini_outbound_policy import GeminiOutboundDenied
-
+        """A custom route without an endpoint does not infer Google from an unrelated registry entry."""
         class _PoolReadReached(BaseException):
             pass
 
-        gemini_profile = SimpleNamespace(
-            auth_type="api_key",
-            inference_base_url="https://generativelanguage.googleapis.com/v1beta",
-        )
+        gemini_profile = SimpleNamespace(auth_type="api_key", inference_base_url="https://generativelanguage.googleapis.com/v1beta")
         with (
             patch("agent.auxiliary_client._try_custom_endpoint", return_value=(None, None)),
             patch("hermes_cli.auth.PROVIDER_REGISTRY", {"gemini": gemini_profile}),
-            patch(
-                "agent.auxiliary_client._select_pool_entry",
-                side_effect=_PoolReadReached("pool selection reached"),
-            ) as mock_pool,
-            patch(
-                "hermes_cli.auth.resolve_api_key_provider_credentials",
-                side_effect=AssertionError("credential resolver reached"),
-            ) as mock_credentials,
-            patch(
-                "agent.gemini_native_adapter.GeminiNativeClient",
-                side_effect=AssertionError("native Gemini client reached"),
-            ) as mock_native,
-            patch(
-                "agent.auxiliary_client._create_openai_client",
-                side_effect=AssertionError("OpenAI factory reached"),
-            ) as mock_openai,
+            patch("agent.auxiliary_client._select_pool_entry", side_effect=_PoolReadReached("pool selection reached")) as mock_pool,
+            patch("hermes_cli.auth.resolve_api_key_provider_credentials", side_effect=AssertionError("credential resolver reached")) as mock_credentials,
+            patch("agent.gemini_native_adapter.GeminiNativeClient", side_effect=AssertionError("native Gemini client reached")) as mock_native,
+            patch("agent.auxiliary_client._create_openai_client", side_effect=AssertionError("OpenAI factory reached")) as mock_openai,
         ):
-            with pytest.raises(GeminiOutboundDenied) as exc_info:
-                resolve_provider_client("custom", "ordinary-model")
+            client, resolved = resolve_provider_client("custom", "ordinary-model")
 
-        assert exc_info.type is GeminiOutboundDenied
-        assert exc_info.value.code == "gemini_outbound_denied"
-        assert str(exc_info.value) == "Gemini outbound requests are disabled."
+        assert client is None
+        assert resolved is None
         mock_pool.assert_not_called()
         mock_credentials.assert_not_called()
         mock_native.assert_not_called()
@@ -3137,55 +3089,40 @@ class TestGeminiAuxiliaryIndependentReviewBlockers:
 class TestGeminiAuxiliaryMetadataOrdering:
     @pytest.mark.parametrize(
         ("base_url", "transport"),
-        (
-            (
-                "https://generativelanguage.googleapis.com.:443/v1beta",
-                "anthropic_messages",
-            ),
-            ("https://ordinary.example.test/v1", "gemini_native"),
-        ),
+        (("https://generativelanguage.googleapis.com.:443/v1beta", "anthropic_messages"), ("https://ordinary.example.test/v1", "gemini_native")),
     )
-    def test_real_named_custom_route_denies_before_proxy_validation(
-        self, base_url, transport
-    ):
-        """Named custom policy facts must run before the resolver's proxy preflight."""
+    def test_real_named_custom_route_denies_before_proxy_validation(self, base_url, transport):
+        """Only the selected endpoint, not its transport label, decides denial."""
         import hermes_cli.runtime_provider as rp
         from agent.gemini_outbound_policy import GeminiOutboundDenied
 
-        class _ProxyValidationReached(BaseException):
-            pass
-
-        config = {
-            "providers": {
-                "local-route": {
-                    "name": "Local Route",
-                    "api": base_url,
-                    "key_env": "NAMED_CUSTOM_KEY",
-                    "default_model": "ordinary-model",
-                    "transport": transport,
-                },
-            },
-        }
+        config = {"providers": {"local-route": {"name": "Local Route", "api": base_url, "key_env": "NAMED_CUSTOM_KEY", "default_model": "ordinary-model", "transport": transport}}}
+        safe_client = MagicMock()
         with (
             patch.object(rp, "load_config", return_value=config),
-            patch.object(
-                rp,
-                "_getenv",
-                side_effect=AssertionError("named custom key environment read reached"),
-            ) as mock_key_env,
-            patch(
-                "agent.auxiliary_client._validate_proxy_env_urls",
-                side_effect=_ProxyValidationReached("named custom proxy validation reached"),
-            ) as mock_proxy,
+            patch.object(rp, "_getenv", return_value="test-key") as mock_key_env,
+            patch("agent.auxiliary_client._validate_proxy_env_urls", return_value=None) as mock_proxy,
+            patch("agent.auxiliary_client._create_openai_client", return_value=safe_client) as mock_client,
         ):
-            with pytest.raises(GeminiOutboundDenied) as exc_info:
-                resolve_provider_client("custom:local-route", "ordinary-model")
+            if "ordinary.example.test" in base_url:
+                client, resolved = resolve_provider_client("custom:local-route", "ordinary-model")
+            else:
+                with pytest.raises(GeminiOutboundDenied) as exc_info:
+                    resolve_provider_client("custom:local-route", "ordinary-model")
 
-        assert exc_info.type is GeminiOutboundDenied
-        assert exc_info.value.code == "gemini_outbound_denied"
-        assert str(exc_info.value) == "Gemini outbound requests are disabled."
-        mock_proxy.assert_not_called()
-        mock_key_env.assert_not_called()
+        if "ordinary.example.test" in base_url:
+            assert client is safe_client
+            assert resolved == "ordinary-model"
+            assert mock_key_env.called
+            assert mock_proxy.called
+            mock_client.assert_called_once()
+        else:
+            assert exc_info.type is GeminiOutboundDenied
+            assert exc_info.value.code == "gemini_outbound_denied"
+            assert str(exc_info.value) == "Gemini outbound requests are disabled."
+            mock_proxy.assert_not_called()
+            mock_key_env.assert_not_called()
+            mock_client.assert_not_called()
 
     def test_real_named_custom_route_denies_before_key_env(self):
         """The real named-provider lookup cannot fetch a credential before deny."""
@@ -3228,65 +3165,41 @@ class TestGeminiAuxiliaryMetadataOrdering:
 
     @pytest.mark.parametrize(
         ("base_url", "transport"),
-        (
-            (
-                "https://generativelanguage.googleapis.com.:443/v1beta",
-                "anthropic_messages",
-            ),
-            (
-                "https://us-central1-aiplatform.googleapis.com:443/v1/projects/p",
-                "chat_completions",
-            ),
-            ("https://ordinary.example.test/v1", "gemini_native"),
-        ),
+        (("https://generativelanguage.googleapis.com.:443/v1beta", "anthropic_messages"), ("https://us-central1-aiplatform.googleapis.com:443/v1/projects/p", "chat_completions"), ("https://ordinary.example.test/v1", "gemini_native")),
     )
-    def test_real_auto_named_custom_route_denies_before_key_env_or_proxy(
-        self, base_url, transport
-    ):
-        """Auto classifies actual named Gemini, Vertex, and Google routes first."""
+    def test_real_auto_named_custom_route_denies_before_key_env_or_proxy(self, base_url, transport):
+        """Auto preserves selected Google denial but permits an ordinary named endpoint."""
         import hermes_cli.runtime_provider as rp
         from agent.gemini_outbound_policy import GeminiOutboundDenied
 
-        class _KeyEnvReadReached(BaseException):
-            pass
-
-        config = {
-            "providers": {
-                "local-route": {
-                    "name": "Local Route",
-                    "api": base_url,
-                    "key_env": "NAMED_CUSTOM_KEY",
-                    "default_model": "ordinary-model",
-                    "transport": transport,
-                },
-            },
-        }
+        config = {"providers": {"local-route": {"name": "Local Route", "api": base_url, "key_env": "NAMED_CUSTOM_KEY", "default_model": "ordinary-model", "transport": transport}}}
+        safe_client = MagicMock()
         with (
             patch.object(rp, "load_config", return_value=config),
-            patch.object(
-                rp,
-                "_getenv",
-                side_effect=_KeyEnvReadReached("auto named custom key environment read reached"),
-            ) as mock_key_env,
-            patch(
-                "agent.auxiliary_client._validate_proxy_env_urls",
-                side_effect=AssertionError("auto proxy validation reached"),
-            ) as mock_proxy,
+            patch.object(rp, "_getenv", return_value="test-key") as mock_key_env,
+            patch("agent.auxiliary_client._validate_proxy_env_urls", return_value=None) as mock_proxy,
+            patch("agent.auxiliary_client._create_openai_client", return_value=safe_client) as mock_client,
         ):
-            with pytest.raises(GeminiOutboundDenied) as exc_info:
-                resolve_provider_client(
-                    "auto",
-                    main_runtime={
-                        "provider": "custom:local-route",
-                        "model": "ordinary-model",
-                    },
-                )
+            runtime = {"provider": "custom:local-route", "model": "ordinary-model"}
+            if "ordinary.example.test" in base_url:
+                client, resolved = resolve_provider_client("auto", main_runtime=runtime)
+            else:
+                with pytest.raises(GeminiOutboundDenied) as exc_info:
+                    resolve_provider_client("auto", main_runtime=runtime)
 
-        assert exc_info.type is GeminiOutboundDenied
-        assert exc_info.value.code == "gemini_outbound_denied"
-        assert str(exc_info.value) == "Gemini outbound requests are disabled."
-        mock_key_env.assert_not_called()
-        mock_proxy.assert_not_called()
+        if "ordinary.example.test" in base_url:
+            assert client is safe_client
+            assert resolved == "ordinary-model"
+            assert mock_key_env.called
+            assert mock_proxy.called
+            mock_client.assert_called_once()
+        else:
+            assert exc_info.type is GeminiOutboundDenied
+            assert exc_info.value.code == "gemini_outbound_denied"
+            assert str(exc_info.value) == "Gemini outbound requests are disabled."
+            mock_proxy.assert_not_called()
+            mock_key_env.assert_not_called()
+            mock_client.assert_not_called()
 
     def test_allowed_real_named_custom_route_reads_key_env_once_after_policy(self):
         """An ordinary named custom endpoint still delegates one credential lookup."""
