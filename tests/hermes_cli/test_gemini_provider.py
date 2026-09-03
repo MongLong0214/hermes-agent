@@ -153,33 +153,134 @@ class TestGeminiContextLength:
 
 class TestGeminiAgentInit:
 
-    def test_gemini_agent_uses_chat_completions(self, monkeypatch):
-        """Gemini still reports chat_completions even though the transport is native."""
-        monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
-        with patch("agent.gemini_native_adapter.GeminiNativeClient") as mock_client:
-            mock_client.return_value = MagicMock()
-            from run_agent import AIAgent
-            agent = AIAgent(
-                model="gemini-2.5-flash",
-                provider="gemini",
-                api_key="test-key",
-                base_url="https://generativelanguage.googleapis.com/v1beta",
-            )
-            assert agent.api_mode == "chat_completions"
-            assert agent.provider == "gemini"
+    @pytest.mark.parametrize(
+        ("provider", "model"),
+        (("gemini", "gemini-2.5-flash"), ("vertex", "google/gemini-2.5-flash")),
+    )
+    def test_gemini_agent_uses_chat_completions(self, provider, model):
+        """Direct Gemini/Vertex AIAgent construction denies before credentials."""
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+        from run_agent import AIAgent
+
+        with (
+            patch(
+                "agent.credential_pool.credential_pool_matches_provider",
+                side_effect=AssertionError("credential pool matcher reached"),
+            ),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                side_effect=AssertionError("auxiliary resolver reached"),
+            ),
+        ):
+            with pytest.raises(GeminiOutboundDenied) as exc_info:
+                AIAgent(provider=provider, model=model, credential_pool=object())
+
+        assert exc_info.type is GeminiOutboundDenied
+        assert exc_info.value.code == "gemini_outbound_denied"
+        assert str(exc_info.value) == "Gemini outbound requests are disabled."
 
 
 
-    def test_gemini_resolve_provider_client_uses_native_client(self, monkeypatch):
-        """resolve_provider_client('gemini') should build GeminiNativeClient."""
-        monkeypatch.setenv("GEMINI_API_KEY", "AIzaSy_TEST_KEY")
-        with patch("agent.gemini_native_adapter.GeminiNativeClient") as mock_client, \
-             patch("agent.auxiliary_client.OpenAI") as mock_openai:
-            mock_client.return_value = MagicMock()
-            from agent.auxiliary_client import resolve_provider_client
-            resolve_provider_client("gemini")
-        assert mock_client.called
-        mock_openai.assert_not_called()
+    @pytest.mark.parametrize(
+        ("provider", "model", "route_kwargs"),
+        (
+            ("gemini", "ordinary-model", {}),
+            ("custom", "gemini-2.5-flash", {}),
+            ("custom", "ordinary-model", {"explicit_base_url": "https://generativelanguage.googleapis.com/v1beta/openai"}),
+            ("custom", "ordinary-model", {"api_mode": "gemini_native"}),
+            ("custom", "ordinary-model", {"main_runtime": {"requested_provider": "vertex"}}),
+        ),
+    )
+    def test_gemini_resolve_provider_client_uses_native_client(self, provider, model, route_kwargs):
+        """Google route facts deny before effects; a custom model spelling alone does not."""
+        from agent.auxiliary_client import resolve_provider_client
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+        safe_custom_model = provider == "custom" and model == "gemini-2.5-flash" and not route_kwargs
+        with (
+            patch("agent.auxiliary_client._validate_proxy_env_urls", side_effect=None if safe_custom_model else AssertionError("proxy validation reached")) as mock_proxy,
+            patch("hermes_cli.auth.resolve_api_key_provider_credentials", side_effect=AssertionError("credential resolver reached")) as mock_credentials,
+            patch("agent.auxiliary_client._get_provider_chain", return_value=[] if safe_custom_model else None),
+            patch("agent.auxiliary_client._resolve_api_key_provider", return_value=(None, None)),
+            patch("agent.gemini_native_adapter.GeminiNativeClient", side_effect=AssertionError("native Gemini client reached")) as mock_native,
+        ):
+            if safe_custom_model:
+                client, resolved = resolve_provider_client(provider, model, **route_kwargs)
+            else:
+                with pytest.raises(GeminiOutboundDenied) as exc_info:
+                    resolve_provider_client(provider, model, **route_kwargs)
+
+        if safe_custom_model:
+            assert client is None
+            assert resolved is None
+            assert mock_proxy.called
+        else:
+            assert exc_info.type is GeminiOutboundDenied
+            assert exc_info.value.code == "gemini_outbound_denied"
+            assert str(exc_info.value) == "Gemini outbound requests are disabled."
+            assert vars(exc_info.value) == {}
+            mock_proxy.assert_not_called()
+        mock_credentials.assert_not_called()
+        mock_native.assert_not_called()
+
+    def test_aiagent_gemini_fallback_denies_before_scoped_secret_read(self):
+        """Primary-none fallback policy is decided before fallback key resolution."""
+        from agent import auxiliary_client as aux
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+        from run_agent import AIAgent
+
+        resolver_calls = []
+        real_resolver = aux.resolve_provider_client
+
+        class FallbackSecretReadReached(BaseException):
+            pass
+
+        def primary_none_then_real(provider, *args, **kwargs):
+            resolver_calls.append(provider)
+            if provider == "ordinary-primary":
+                return None, None
+            return real_resolver(provider, *args, **kwargs)
+
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                side_effect=primary_none_then_real,
+            ),
+            patch(
+                "agent.secret_scope.get_secret",
+                side_effect=FallbackSecretReadReached("fallback scoped secret read reached"),
+            ) as secret_reader,
+            patch(
+                "agent.auxiliary_client._validate_proxy_env_urls",
+                side_effect=AssertionError("proxy validation reached"),
+            ) as proxy,
+            patch(
+                "agent.auxiliary_client._create_openai_client",
+                side_effect=AssertionError("client construction reached"),
+            ) as client_factory,
+        ):
+            with pytest.raises(GeminiOutboundDenied) as exc_info:
+                AIAgent(
+                    provider="ordinary-primary",
+                    model="ordinary-model",
+                    fallback_model=[
+                        {
+                            "provider": "gemini",
+                            "model": "gemini-2.5-flash",
+                            "key_env": "FORBIDDEN_FALLBACK_KEY",
+                        }
+                    ],
+                    quiet_mode=True,
+                )
+
+        assert exc_info.type is GeminiOutboundDenied
+        assert exc_info.value.code == "gemini_outbound_denied"
+        assert str(exc_info.value) == "Gemini outbound requests are disabled."
+        assert vars(exc_info.value) == {}
+        secret_reader.assert_not_called()
+        proxy.assert_not_called()
+        client_factory.assert_not_called()
+        assert resolver_calls == ["ordinary-primary"]
 
 
 # ── models.dev Integration ──
