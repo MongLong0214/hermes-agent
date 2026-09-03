@@ -5351,12 +5351,16 @@ class AIAgent:
         )
 
     def _replace_primary_openai_client(self, *, reason: str) -> bool:
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+
         with self._openai_client_lock():
             old_client = getattr(self, "client", None)
             try:
                 new_client = self._build_primary_client_for_active_provider(
                     reason=reason,
                 )
+            except GeminiOutboundDenied:
+                raise
             except Exception as exc:
                 logger.warning(
                     "Failed to rebuild shared primary client (%s) %s error=%s",
@@ -5376,6 +5380,17 @@ class AIAgent:
         return True
 
     def _ensure_primary_openai_client(self, *, reason: str) -> Any:
+        from agent.agent_runtime_helpers import deny_gemini_outbound_route
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+        _kwargs = getattr(self, "_client_kwargs", None) or {}
+        deny_gemini_outbound_route(
+            canonical_provider=getattr(self, "provider", ""),
+            model=getattr(self, "model", ""),
+            base_url=_kwargs.get("base_url") or getattr(self, "base_url", ""),
+            api_mode=getattr(self, "api_mode", ""),
+            routing_hint=getattr(self, "requested_provider", "") or getattr(self, "provider", ""),
+        )
         with self._openai_client_lock():
             client = getattr(self, "client", None)
             if client is not None and not self._is_openai_client_closed(client):
@@ -5385,6 +5400,8 @@ class AIAgent:
                 new_client = self._create_openai_client(
                     self._client_kwargs, reason=reason, shared=True
                 )
+            except GeminiOutboundDenied:
+                raise
             except Exception as exc:
                 logger.warning(
                     "Failed to recreate closed OpenAI client (%s) %s error=%s",
@@ -5462,8 +5479,17 @@ class AIAgent:
         return cache
 
     def _create_request_openai_client(self, *, reason: str, api_kwargs: Optional[dict] = None) -> Any:
+        from agent.agent_runtime_helpers import deny_gemini_outbound_route
         from unittest.mock import Mock
 
+        _kwargs = getattr(self, "_client_kwargs", None) or {}
+        deny_gemini_outbound_route(
+            canonical_provider=getattr(self, "provider", ""),
+            model=getattr(self, "model", ""),
+            base_url=_kwargs.get("base_url") or getattr(self, "base_url", ""),
+            api_mode=getattr(self, "api_mode", ""),
+            routing_hint=getattr(self, "requested_provider", "") or getattr(self, "provider", ""),
+        )
         primary_client = self._ensure_primary_openai_client(reason=reason)
         if self.provider == "moa":
             return primary_client
@@ -6192,6 +6218,19 @@ class AIAgent:
         new token into the client kwargs, and rebuilds the primary OpenAI
         client. Returns True when a usable token+base_url were obtained.
         """
+        from agent.agent_runtime_helpers import deny_gemini_outbound_route
+
+        # Provider identity, not a leftover non-Google URL, owns this refresh.
+        deny_gemini_outbound_route(
+            canonical_provider=getattr(self, "provider", ""),
+            model=getattr(self, "model", ""),
+            api_mode=getattr(self, "api_mode", ""),
+            routing_hint=getattr(self, "requested_provider", "") or getattr(self, "provider", ""),
+        )
+        deny_gemini_outbound_route(
+            base_url=(getattr(self, "_client_kwargs", None) or {}).get("base_url")
+            or getattr(self, "base_url", ""),
+        )
         if self.api_mode != "chat_completions" or self.provider != "vertex":
             return False
 
