@@ -665,6 +665,42 @@ def _get_provider(tts_config: Dict[str, Any]) -> str:
     return provider
 
 
+def _preflight_tts_outbound_route(provider: str, tts_config: Dict[str, Any]) -> None:
+    """Deny Gemini-family routes before public TTS dispatch has side effects."""
+    if provider == "gemini":
+        deny_gemini_outbound(canonical_provider="gemini")
+        return
+
+    if provider == "openai":
+        openai_config = tts_config.get("openai") if isinstance(tts_config, dict) else None
+        if not isinstance(openai_config, dict):
+            openai_config = {}
+        deny_gemini_outbound(
+            model=openai_config.get("model", DEFAULT_OPENAI_MODEL),
+            base_url=openai_config.get("base_url") or DEFAULT_OPENAI_BASE_URL,
+        )
+        return
+
+    if provider == "deepinfra":
+        deepinfra_config = tts_config.get("deepinfra") if isinstance(tts_config, dict) else None
+        if not isinstance(deepinfra_config, dict):
+            deepinfra_config = {}
+        from hermes_cli.models import deepinfra_base_url, deepinfra_model_ids
+
+        base_url = deepinfra_base_url(deepinfra_config)
+        model = deepinfra_config.get("model")
+        deny_gemini_outbound(model=model, base_url=base_url)
+        if not isinstance(model, str) or not model.strip():
+            candidates = deepinfra_model_ids("tts")
+            if not candidates:
+                raise ValueError(
+                    "No DeepInfra TTS model available. Pin one in config.yaml "
+                    "under tts.deepinfra.model, or check connectivity to "
+                    "api.deepinfra.com so the live catalog can be fetched."
+                )
+            deny_gemini_outbound(model=candidates[0], base_url=base_url)
+
+
 @dataclass(frozen=True)
 class _MiniMaxTTSRuntime:
     """A region-bound MiniMax endpoint and credential.
@@ -3192,6 +3228,8 @@ def _text_to_speech_single(
     else:
         provider = _get_provider(tts_config)
 
+    _preflight_tts_outbound_route(provider, tts_config)
+
     # User-declared command provider (type: command under tts.providers.<name>)
     # resolves BEFORE the built-in dispatch. Built-in names short-circuit here
     # so a user's ``tts.providers.openai.command`` can't override the real
@@ -3546,16 +3584,6 @@ def text_to_speech_tool(
     if not text or not text.strip():
         return tool_error("Text is required", success=False)
 
-    # Normalize text via the shared cleaner: markdown, emoji, think blocks,
-    # verifier footer, units, newline flattening.
-    try:
-        from tools.tts_text_normalize import prepare_spoken_text
-        text = prepare_spoken_text(text, max_chars=None)
-    except Exception:
-        text = text.strip()
-    if not text:
-        return tool_error("Text is empty after TTS cleanup", success=False)
-
     tts_config = _load_tts_config()
 
     # When the model supplies a speed parameter, inject it into the config
@@ -3570,6 +3598,18 @@ def text_to_speech_tool(
         provider = provider.lower().strip()
     else:
         provider = _get_provider(tts_config)
+
+    _preflight_tts_outbound_route(provider, tts_config)
+
+    # Normalize text via the shared cleaner: markdown, emoji, think blocks,
+    # verifier footer, units, newline flattening.
+    try:
+        from tools.tts_text_normalize import prepare_spoken_text
+        text = prepare_spoken_text(text, max_chars=None)
+    except Exception:
+        text = text.strip()
+    if not text:
+        return tool_error("Text is empty after TTS cleanup", success=False)
 
     command_provider_config = _resolve_command_provider_config(provider, tts_config)
     max_len = _resolve_max_text_length(provider, tts_config)
@@ -4007,6 +4047,8 @@ class _SyncSentencePipeline:
     def _synthesize_to_tmp(self, cleaned: str) -> Optional[str]:
         if self._stop.is_set():
             return None
+        tts_config = _load_tts_config()
+        _preflight_tts_outbound_route(_get_provider(tts_config), tts_config)
         tmp_path = None
         try:
             fd, tmp_path = tempfile.mkstemp(suffix=".mp3")
@@ -4083,6 +4125,10 @@ def stream_tts_to_speaker(
         _audio_queue = None  # type: ignore[assignment]
         _prefetch_threads = []
         tts_config = _load_tts_config()
+        effective_provider = (
+            provider.lower().strip() if provider else _get_provider(tts_config)
+        )
+        _preflight_tts_outbound_route(effective_provider, tts_config)
 
         # Prefer a chunked streamer for low time-to-first-audio; fall back to
         # per-sentence sync synthesis (universal — edge + every non-streamer).

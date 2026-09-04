@@ -154,6 +154,110 @@ class TestGeminiOutboundTts:
         }
         assert captured["closed"] is True
 
+    @pytest.mark.parametrize("entrypoint", ["single", "public"])
+    @pytest.mark.parametrize(
+        ("provider", "tts_config"),
+        [
+            ("gemini", {"provider": "gemini"}),
+            (
+                "openai",
+                {
+                    "provider": "openai",
+                    "openai": {"model": "gemini-2.5-flash-tts"},
+                },
+            ),
+            (
+                "openai",
+                {
+                    "provider": "openai",
+                    "openai": {"base_url": "https://aiplatform.googleapis.com/v1"},
+                },
+            ),
+            (
+                "deepinfra",
+                {
+                    "provider": "deepinfra",
+                    "deepinfra": {"model": "gemini-2.5-flash-tts"},
+                },
+            ),
+            (
+                "deepinfra",
+                {
+                    "provider": "deepinfra",
+                    "deepinfra": {"base_url": "https://vertexai.googleapis.com/v1"},
+                },
+            ),
+        ],
+        ids=[
+            "fixed-gemini",
+            "openai-gemini-model",
+            "openai-vertex-base",
+            "deepinfra-gemini-model",
+            "deepinfra-vertex-base",
+        ],
+    )
+    def test_public_dispatch_route_denies_before_output_or_client_side_effects(
+        self, tmp_path, monkeypatch, entrypoint, provider, tts_config
+    ):
+        """Public TTS entrypoints must reject configured Google routes first."""
+        from tools import tts_tool
+
+        output_dir = tmp_path / f"{entrypoint}-{provider}-denied"
+
+        def _explode(*_args, **_kwargs):
+            raise AssertionError("output, credential, or OpenAI client side effect reached")
+
+        monkeypatch.setattr(tts_tool, "DEFAULT_OUTPUT_DIR", str(output_dir))
+        monkeypatch.setattr(tts_tool, "_resolve_openai_audio_client_config", _explode)
+        monkeypatch.setattr(tts_tool, "_resolve_provider_key", _explode)
+        monkeypatch.setattr(tts_tool, "_import_openai_client", _explode)
+        monkeypatch.setattr(tts_tool, "_generate_gemini_tts", _explode)
+        monkeypatch.setattr(tts_tool.Path, "mkdir", _explode)
+        monkeypatch.setattr(builtins, "open", _explode)
+        if entrypoint == "public":
+            monkeypatch.setattr(tts_tool, "_load_tts_config", lambda: tts_config)
+
+        with pytest.raises(GeminiOutboundDenied) as exc_info:
+            if entrypoint == "single":
+                tts_tool._text_to_speech_single(
+                    "Hello", provider=provider, tts_config_override=tts_config
+                )
+            else:
+                tts_tool.text_to_speech_tool("Hello", provider=provider)
+
+        _assert_stable_denial(exc_info)
+        assert not output_dir.exists()
+
+    def test_public_deepinfra_dynamic_route_denies_before_output_credential_or_client(
+        self, tmp_path, monkeypatch
+    ):
+        """A discovered DeepInfra Gemini model is rejected before dispatch output."""
+        from hermes_cli import models
+        from tools import tts_tool
+
+        output_dir = tmp_path / "deepinfra-dynamic-denied"
+
+        def _explode(*_args, **_kwargs):
+            raise AssertionError("output, credential, or OpenAI client side effect reached")
+
+        monkeypatch.setattr(tts_tool, "DEFAULT_OUTPUT_DIR", str(output_dir))
+        monkeypatch.setattr(tts_tool, "_resolve_provider_key", _explode)
+        monkeypatch.setattr(tts_tool, "_import_openai_client", _explode)
+        monkeypatch.setattr(tts_tool.Path, "mkdir", _explode)
+        monkeypatch.setattr(builtins, "open", _explode)
+        monkeypatch.setattr(models, "deepinfra_model_ids", lambda _surface: ["gemini-2.5-flash-tts"])
+        monkeypatch.setattr(
+            tts_tool,
+            "_load_tts_config",
+            lambda: {"provider": "deepinfra", "deepinfra": {}},
+        )
+
+        with pytest.raises(GeminiOutboundDenied) as exc_info:
+            tts_tool.text_to_speech_tool("Hello", provider="deepinfra")
+
+        _assert_stable_denial(exc_info)
+        assert not output_dir.exists()
+
 
 class TestGeminiInCheckRequirements:
     def test_gemini_cannot_satisfy_requirements_without_key_lookup(self, monkeypatch):

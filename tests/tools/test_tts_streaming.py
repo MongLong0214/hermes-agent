@@ -139,6 +139,49 @@ def test_resolve_streaming_openai_google_route_denies_before_availability(monkey
     _assert_stable_denial(exc_info)
 
 
+def test_stream_tts_to_speaker_denies_canonical_route_before_streaming_or_fallback(
+    monkeypatch,
+):
+    """The integrated stream entrypoint cannot fall through from Gemini to audio."""
+    from tools import tts_tool
+
+    def _explode(*_args, **_kwargs):
+        raise AssertionError("streaming, fallback, speaker, or output side effect reached")
+
+    monkeypatch.setattr(tts_tool, "_load_tts_config", lambda: {"provider": "gemini"})
+    monkeypatch.setattr(ts, "resolve_streaming_provider", _explode)
+    monkeypatch.setattr(tts_tool, "_SyncSentencePipeline", _explode)
+    monkeypatch.setattr(tts_tool.tempfile, "mkstemp", _explode)
+    text_queue = _drain_queue(["A complete sentence. "])
+    stop_event, done_event = threading.Event(), threading.Event()
+
+    with pytest.raises(GeminiOutboundDenied) as exc_info:
+        tts_tool.stream_tts_to_speaker(text_queue, stop_event, done_event)
+
+    _assert_stable_denial(exc_info)
+    assert done_event.is_set()
+
+
+def test_sync_sentence_pipeline_denies_canonical_route_before_tempfile(monkeypatch):
+    """The sync fallback itself has no temporary-output window for Gemini."""
+    from tools import tts_tool
+
+    def _explode(*_args, **_kwargs):
+        raise AssertionError("tempfile or TTS fallback side effect reached")
+
+    monkeypatch.setattr(tts_tool, "_load_tts_config", lambda: {"provider": "gemini"})
+    monkeypatch.setattr(tts_tool.tempfile, "mkstemp", _explode)
+    monkeypatch.setattr(tts_tool, "text_to_speech_tool", _explode)
+    pipeline = tts_tool._SyncSentencePipeline(threading.Event())
+    try:
+        with pytest.raises(GeminiOutboundDenied) as exc_info:
+            pipeline._synthesize_to_tmp("A complete sentence.")
+    finally:
+        pipeline.close()
+
+    _assert_stable_denial(exc_info)
+
+
 def test_auto_streaming_skips_gemini(monkeypatch):
     calls = []
     allowed = _register_fake(monkeypatch, "allowed-openai")
