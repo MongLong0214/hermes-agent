@@ -147,6 +147,16 @@ jobs:
     if: needs.detect.outputs.event_name == 'pull_request'
     uses: ./.github/workflows/history-check.yml
 
+  # Deliberately not gated on a detect lane. Whitespace can be added to any file
+  # type, and the check is range-scoped: it stays silent unless this PR's own
+  # added lines carry the defect, so running it on every PR costs one cheap job
+  # and never reports on dirt the PR did not create.
+  whitespace-check:
+    name: Whitespace check
+    needs: detect
+    if: needs.detect.outputs.event_name == 'pull_request'
+    uses: ./.github/workflows/whitespace-check.yml
+
   contributor-check:
     name: Check contributors
     needs: detect
@@ -229,6 +239,7 @@ jobs:
       - e2e-desktop
       - docs-site
       - history-check
+      - whitespace-check
       - contributor-check
       - uv-lockfile
       - lockfile-diff
