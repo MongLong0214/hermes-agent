@@ -29,6 +29,7 @@ from typing import Any, Dict, Iterator, List, Optional
 import httpx
 
 from agent.bounded_response import read_streaming_error_body
+from agent.gemini_outbound_policy import deny_gemini_outbound
 from agent.gemini_schema import sanitize_gemini_tool_parameters
 
 logger = logging.getLogger(__name__)
@@ -110,6 +111,7 @@ def probe_gemini_tier(
     - ``"paid"``    -- key is on a paid tier
     - ``"unknown"`` -- probe failed; callers should proceed without blocking.
     """
+    deny_gemini_outbound(canonical_provider="gemini")
     key = (api_key or "").strip()
     if not key:
         return "unknown"
@@ -1055,6 +1057,7 @@ class GeminiNativeClient:
         http_client: Optional[httpx.Client] = None,
         **_: Any,
     ) -> None:
+        deny_gemini_outbound(canonical_provider="gemini")
         if not (api_key or "").strip():
             raise RuntimeError(
                 "Gemini native client requires an API key, but none was provided. "
