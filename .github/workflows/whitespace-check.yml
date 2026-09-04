@@ -1,0 +1,91 @@
+name: Whitespace Check
+
+# Blocks PRs whose range ADDS trailing whitespace, a blank line at end of file,
+# space-before-tab, or a conflict marker.
+#
+# Until this job existed, `git diff --check` had no enforcement site anywhere in
+# the repository — not a CI job, not a hook, not a script. The gate contributors
+# were handed reads "syntax / Ruff / diff check", but on a change touching only
+# tests/ that is one check, not three: the blocking Ruff job selects exactly one
+# rule (PLW1514) and per-file-ignores turns even that off under tests/. So a
+# commit carrying two "new blank line at EOF" defects passed everything its
+# author ran, and CI had nothing to say about it either — the usual "push it and
+# let CI tell us" fallback was void for this entire defect class.
+#
+# Turning the equivalent Ruff rules on instead was measured, not assumed:
+# W291/W293/W391 report thousands of findings across most of the tree, because
+# a linter rule is TREE-scoped. `git diff --check` is RANGE-scoped — it sees
+# only the lines a change adds — so it can be switched on today at blocking
+# severity with the existing dirt untouched, and stays silent about every
+# pre-existing offence even in a file the PR edits. That incrementality is not
+# a side benefit; it is the entire reason this instrument is adoptable and the
+# lint rule is not.
+
+on:
+  workflow_call:
+    outputs:
+      review_status:
+        description: "JSON array of review_status objects for the synthesizer."
+        value: ${{ jobs.diff-check.outputs.review_status }}
+
+permissions:
+  contents: read
+
+jobs:
+  diff-check:
+    name: Whitespace (blocking)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      review_status: ${{ steps.whitespace.outputs.review_status }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # Load-bearing, exactly as in history-check.yml. The default shallow
+          # clone has no merge base with the target branch, and a check with no
+          # range is the failure mode that looks most like a pass.
+          fetch-depth: 0
+
+      - id: whitespace
+        name: git diff --check over the PR range
+        env:
+          # Passed through the environment rather than interpolated into the
+          # script body, so a branch name can never be spliced into the shell.
+          BASE_REF: origin/${{ github.event.pull_request.base.ref || github.event.repository.default_branch || 'main' }}
+        run: |
+          # No --exit-zero, no `|| true`. `git diff --check` exits 2 on
+          # findings; check-whitespace.py propagates that code, and this step
+          # propagates it to the job and on to the required-check gate. Same
+          # precedent as lint.yml's ruff-blocking job.
+          #
+          # The script also exits 3 rather than 0 when it cannot resolve the
+          # range at all, so a shallow clone or a missing base ref fails the
+          # job instead of quietly reporting a comparison it never made.
+          set +e
+          python3 scripts/check-whitespace.py --base-ref "$BASE_REF"
+          RC=$?
+          set -e
+
+          if [ "$RC" -eq 0 ]; then
+            echo "review_status=[]" >> "$GITHUB_OUTPUT"
+            echo "review_status=[]" > review-status.json
+            exit 0
+          fi
+
+          STATUS='[{"source":"whitespace-check","results":[{"kind":"action_required","title":"Whitespace in added lines","summary":"This PR adds lines carrying whitespace git rejects (trailing whitespace, a blank line at end of file, space-before-tab, or a conflict marker).","detail":"The job log names every offending file and line, so no local reproduction is needed to find them.","how_to_fix":"Fix the lines the job log names, then verify locally:\n```\npython scripts/check-whitespace.py\n```\nThe check is range-scoped — it reports only whitespace this PR itself adds, so pre-existing dirt in the same file is not yours to clean up.\n"}]}]'
+          echo "review_status=${STATUS}" >> "$GITHUB_OUTPUT"
+          echo "review_status=${STATUS}" > review-status.json
+
+          echo "::error::git diff --check found whitespace defects in this PR's added lines."
+          exit "$RC"
+
+      - name: Upload review status artifact
+        if: always() && steps.whitespace.outcome != 'skipped'
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: review-status-whitespace-check
+          path: review-status.json
+          retention-days: 1
+          overwrite: true
+          if-no-files-found: ignore
