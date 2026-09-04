@@ -91,6 +91,7 @@ def _resolve_provider_key(env_var: str, provider_id: str) -> str:
         return str(get_env_value(env_var) or "").strip()
     return resolve_provider_secret(env_var, provider_id, env_getter=get_env_value)
 
+from agent.gemini_outbound_policy import GeminiOutboundDenied, deny_gemini_outbound
 from tools.managed_tool_gateway import resolve_managed_tool_gateway
 from tools.tool_backend_helpers import (
     NOUS_MANAGED_PROVIDER,
@@ -662,6 +663,42 @@ def _get_provider(tts_config: Dict[str, Any]) -> str:
     if provider == NOUS_MANAGED_PROVIDER:
         return "openai"
     return provider
+
+
+def _preflight_tts_outbound_route(provider: str, tts_config: Dict[str, Any]) -> None:
+    """Deny Gemini-family routes before public TTS dispatch has side effects."""
+    if provider == "gemini":
+        deny_gemini_outbound(canonical_provider="gemini")
+        return
+
+    if provider == "openai":
+        openai_config = tts_config.get("openai") if isinstance(tts_config, dict) else None
+        if not isinstance(openai_config, dict):
+            openai_config = {}
+        deny_gemini_outbound(
+            model=openai_config.get("model", DEFAULT_OPENAI_MODEL),
+            base_url=openai_config.get("base_url") or DEFAULT_OPENAI_BASE_URL,
+        )
+        return
+
+    if provider == "deepinfra":
+        deepinfra_config = tts_config.get("deepinfra") if isinstance(tts_config, dict) else None
+        if not isinstance(deepinfra_config, dict):
+            deepinfra_config = {}
+        from hermes_cli.models import deepinfra_base_url, deepinfra_model_ids
+
+        base_url = deepinfra_base_url(deepinfra_config)
+        model = deepinfra_config.get("model")
+        deny_gemini_outbound(model=model, base_url=base_url)
+        if not isinstance(model, str) or not model.strip():
+            candidates = deepinfra_model_ids("tts")
+            if not candidates:
+                raise ValueError(
+                    "No DeepInfra TTS model available. Pin one in config.yaml "
+                    "under tts.deepinfra.model, or check connectivity to "
+                    "api.deepinfra.com so the live catalog can be fetched."
+                )
+            deny_gemini_outbound(model=candidates[0], base_url=base_url)
 
 
 @dataclass(frozen=True)
@@ -1852,29 +1889,34 @@ def _generate_openai_tts(
     Returns:
         Path to the saved audio file.
     """
-    # Only resolve the OpenAI auth chain when the caller didn't pass explicit
-    # credentials. OpenAI-compatible backends (DeepInfra) pass api_key /
-    # base_url / model / voice through and never hit the managed-gateway path.
+    # Resolve only non-secret route metadata before the auth chain. Google/
+    # Vertex-bound OpenAI-compatible endpoints must be rejected before a
+    # credential resolver, SDK import, client, or request is reachable.
     fallback_base: Optional[str] = None
     is_managed = False
     explicit_base_url = base_url is not None
-    if api_key is None:
-        api_key, fallback_base, is_managed = _resolve_openai_audio_client_config()
-
     # ``tts.openai: null`` in YAML yields None — coalesce so .get() is safe.
     oai_config = (tts_config.get("openai") if isinstance(tts_config, dict) else None) or {}
     if model is None:
         model = oai_config.get("model", DEFAULT_OPENAI_MODEL)
-    if voice is None:
-        voice = oai_config.get("voice", DEFAULT_OPENAI_VOICE)
     config_base_url = oai_config.get("base_url")
     if base_url is None:
-        # Config override wins over the auth-chain fallback (restores the
-        # pre-refactor precedence, where tts.openai.base_url beat the resolved
-        # default); the auth-chain value is the last-resort default. An
-        # explicit base_url arg from an OpenAI-compatible caller (DeepInfra)
-        # skips this block entirely and always wins.
-        base_url = config_base_url or fallback_base or DEFAULT_OPENAI_BASE_URL
+        base_url = config_base_url or DEFAULT_OPENAI_BASE_URL
+    deny_gemini_outbound(model=model, base_url=base_url)
+
+    # Only resolve the OpenAI auth chain after the initial route preflight.
+    # OpenAI-compatible backends (DeepInfra) pass api_key / base_url / model /
+    # voice through and never hit the managed-gateway path.
+    if api_key is None:
+        api_key, fallback_base, is_managed = _resolve_openai_audio_client_config()
+    if not explicit_base_url and not config_base_url and fallback_base:
+        base_url = fallback_base
+        # A resolver can supply a concrete endpoint when the config did not;
+        # keep the guard immediately before SDK/client creation too.
+        deny_gemini_outbound(model=model, base_url=base_url)
+
+    if voice is None:
+        voice = oai_config.get("voice", DEFAULT_OPENAI_VOICE)
     if speed is None:
         speed_default = tts_config.get("speed", 1.0) if isinstance(tts_config, dict) else 1.0
         speed = float(oai_config.get("speed", speed_default))
@@ -1946,13 +1988,6 @@ def _generate_deepinfra_tts(text: str, output_path: str, tts_config: Dict[str, A
     the shared ``hermes_cli.models`` helpers so every DeepInfra surface
     resolves them identically.
     """
-    api_key = _resolve_provider_key("DEEPINFRA_API_KEY", "deepinfra")
-    if not api_key:
-        raise ValueError(
-            "DEEPINFRA_API_KEY not set. Run `hermes setup` to configure, "
-            "or set the env var directly."
-        )
-
     # ``tts.deepinfra: null`` in YAML yields None, not {} — coalesce so the
     # ``.get`` calls below don't raise AttributeError (there is no
     # tts.deepinfra block in DEFAULT_CONFIG to deep-merge over the null).
@@ -1962,7 +1997,11 @@ def _generate_deepinfra_tts(text: str, output_path: str, tts_config: Dict[str, A
 
     from hermes_cli.models import deepinfra_base_url, deepinfra_model_ids
 
+    base_url = deepinfra_base_url(di_config)
     model = di_config.get("model")
+    # A pinned model/base URL is non-secret route metadata and must be checked
+    # before either catalog/key resolution or OpenAI-compatible client setup.
+    deny_gemini_outbound(model=model, base_url=base_url)
     if not isinstance(model, str) or not model.strip():
         candidates = deepinfra_model_ids("tts")
         if not candidates:
@@ -1972,12 +2011,22 @@ def _generate_deepinfra_tts(text: str, output_path: str, tts_config: Dict[str, A
                 "api.deepinfra.com so the live catalog can be fetched."
             )
         model = candidates[0]
+        # Dynamic catalog results are concrete runtime route metadata too.
+        deny_gemini_outbound(model=model, base_url=base_url)
+
+    api_key = _resolve_provider_key("DEEPINFRA_API_KEY", "deepinfra")
+    if not api_key:
+        raise ValueError(
+            "DEEPINFRA_API_KEY not set. Run `hermes setup` to configure, "
+            "or set the env var directly."
+        )
+
     return _generate_openai_tts(
         text,
         output_path,
         tts_config,
         api_key=api_key,
-        base_url=deepinfra_base_url(di_config),
+        base_url=base_url,
         model=model,
         voice=di_config.get("voice", DEFAULT_DEEPINFRA_TTS_VOICE),
         speed=float(di_config.get("speed", tts_config.get("speed", 1.0))),
@@ -2622,6 +2671,8 @@ def _generate_gemini_tts(text: str, output_path: str, tts_config: Dict[str, Any]
     Returns:
         Path to the saved audio file.
     """
+    deny_gemini_outbound(canonical_provider="gemini")
+
     import requests
 
     api_key = (
@@ -3177,6 +3228,8 @@ def _text_to_speech_single(
     else:
         provider = _get_provider(tts_config)
 
+    _preflight_tts_outbound_route(provider, tts_config)
+
     # User-declared command provider (type: command under tts.providers.<name>)
     # resolves BEFORE the built-in dispatch. Built-in names short-circuit here
     # so a user's ``tts.providers.openai.command`` can't override the real
@@ -3476,6 +3529,8 @@ def _text_to_speech_single(
             "voice_compatible": voice_compatible,
         }, ensure_ascii=False)
 
+    except GeminiOutboundDenied:
+        raise
     except ValueError as e:
         # Configuration errors (missing API keys, etc.)
         error_msg = f"TTS configuration error ({provider}): {e}"
@@ -3529,16 +3584,6 @@ def text_to_speech_tool(
     if not text or not text.strip():
         return tool_error("Text is required", success=False)
 
-    # Normalize text via the shared cleaner: markdown, emoji, think blocks,
-    # verifier footer, units, newline flattening.
-    try:
-        from tools.tts_text_normalize import prepare_spoken_text
-        text = prepare_spoken_text(text, max_chars=None)
-    except Exception:
-        text = text.strip()
-    if not text:
-        return tool_error("Text is empty after TTS cleanup", success=False)
-
     tts_config = _load_tts_config()
 
     # When the model supplies a speed parameter, inject it into the config
@@ -3553,6 +3598,18 @@ def text_to_speech_tool(
         provider = provider.lower().strip()
     else:
         provider = _get_provider(tts_config)
+
+    _preflight_tts_outbound_route(provider, tts_config)
+
+    # Normalize text via the shared cleaner: markdown, emoji, think blocks,
+    # verifier footer, units, newline flattening.
+    try:
+        from tools.tts_text_normalize import prepare_spoken_text
+        text = prepare_spoken_text(text, max_chars=None)
+    except Exception:
+        text = text.strip()
+    if not text:
+        return tool_error("Text is empty after TTS cleanup", success=False)
 
     command_provider_config = _resolve_command_provider_config(provider, tts_config)
     max_len = _resolve_max_text_length(provider, tts_config)
@@ -3692,6 +3749,8 @@ def text_to_speech_tool(
                 "target_file_bytes": delivery_profile.target_file_bytes,
             },
         }, ensure_ascii=False)
+    except GeminiOutboundDenied:
+        raise
     except ValueError as exc:
         error_msg = f"TTS delivery error ({provider}): {exc}"
         logger.error("%s", error_msg)
@@ -3761,10 +3820,8 @@ def check_tts_requirements() -> bool:
         except Exception:
             return False
     if provider == "gemini":
-        return bool(
-            _resolve_provider_key("GEMINI_API_KEY", "gemini")
-            or _resolve_provider_key("GOOGLE_API_KEY", "gemini")
-        )
+        # Gemini TTS is immutable default-deny; do not touch either key path.
+        return False
     if provider == "mistral":
         try:
             _import_mistral_client()
@@ -3990,12 +4047,16 @@ class _SyncSentencePipeline:
     def _synthesize_to_tmp(self, cleaned: str) -> Optional[str]:
         if self._stop.is_set():
             return None
+        tts_config = _load_tts_config()
+        _preflight_tts_outbound_route(_get_provider(tts_config), tts_config)
         tmp_path = None
         try:
             fd, tmp_path = tempfile.mkstemp(suffix=".mp3")
             os.close(fd)
             text_to_speech_tool(text=cleaned, output_path=tmp_path)
             return tmp_path
+        except GeminiOutboundDenied:
+            raise
         except Exception as exc:
             logger.warning("Sync per-sentence TTS synthesis failed: %s", exc)
             if tmp_path:
@@ -4019,6 +4080,8 @@ class _SyncSentencePipeline:
                         and os.path.getsize(tmp_path) > 0):
                     from tools.voice_mode import play_audio_file
                     play_audio_file(tmp_path)
+            except GeminiOutboundDenied:
+                raise
             except Exception as exc:
                 logger.warning("Sync per-sentence TTS failed: %s", exc)
             finally:
@@ -4062,6 +4125,10 @@ def stream_tts_to_speaker(
         _audio_queue = None  # type: ignore[assignment]
         _prefetch_threads = []
         tts_config = _load_tts_config()
+        effective_provider = (
+            provider.lower().strip() if provider else _get_provider(tts_config)
+        )
+        _preflight_tts_outbound_route(effective_provider, tts_config)
 
         # Prefer a chunked streamer for low time-to-first-audio; fall back to
         # per-sentence sync synthesis (universal — edge + every non-streamer).
@@ -4147,6 +4214,8 @@ def stream_tts_to_speaker(
                         )
                         break
                     chunk_queue.put(chunk, timeout=30.0)
+            except GeminiOutboundDenied:
+                raise
             except Exception as exc:
                 logger.warning(
                     "TTS CUT: streaming TTS prefetch failed mid-sentence "
@@ -4292,6 +4361,8 @@ def stream_tts_to_speaker(
             assert streamer is not None
             try:
                 audio_iter = streamer.stream(text_to_speak)
+            except GeminiOutboundDenied:
+                raise
             except Exception as exc:
                 logger.warning("Streaming TTS synthesis failed: %s", exc)
                 return
@@ -4378,6 +4449,8 @@ def stream_tts_to_speaker(
                 tmp.close()
                 from tools.voice_mode import play_audio_file
                 play_audio_file(tmp_path)
+            except GeminiOutboundDenied:
+                raise
             except Exception as exc:
                 logger.warning("Temp-file TTS fallback failed: %s", exc)
             finally:
@@ -4421,6 +4494,8 @@ def stream_tts_to_speaker(
 
         # output_stream is closed in the finally block below
 
+    except GeminiOutboundDenied:
+        raise
     except Exception as exc:
         logger.warning("Streaming TTS pipeline error: %s", exc)
     finally:

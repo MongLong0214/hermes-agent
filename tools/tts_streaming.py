@@ -27,6 +27,7 @@ import time
 from abc import ABC, abstractmethod
 from typing import Callable, Dict, Iterator, List, Optional
 
+from agent.gemini_outbound_policy import GeminiOutboundDenied, deny_gemini_outbound
 from tools.tool_backend_helpers import resolve_openai_audio_api_key
 from tools.tts_tool import _get_provider, _load_tts_config, get_env_value
 
@@ -176,7 +177,26 @@ def _try_instantiate(name: str, tts_config: Dict) -> Optional[StreamingTTSProvid
 # latency/quality first. Deliberately hard-coded (a UX decision, not a
 # config knob); edge is absent because it has no chunked-PCM API — the
 # dispatcher's per-sentence sync path keeps it conversational instead.
-_PROVIDER_PRIORITY: List[str] = ["elevenlabs", "gemini", "openai", "xai"]
+_PROVIDER_PRIORITY: List[str] = ["elevenlabs", "openai", "xai"]
+
+
+def _openai_stream_route(section: Dict) -> tuple[str, Optional[str]]:
+    """Return only the non-secret model/base metadata for OpenAI streaming."""
+    model = section.get("model", "gpt-4o-mini-tts")
+    base_url = section.get("base_url") or get_env_value("OPENAI_BASE_URL") or None
+    return model, base_url
+
+
+def _preflight_streaming_provider(name: str, tts_config: Dict) -> None:
+    """Reject denied routes before availability probes can resolve secrets."""
+    if name == "gemini":
+        deny_gemini_outbound(canonical_provider="gemini")
+    if name == "openai":
+        section = tts_config.get("openai") or {}
+        if not isinstance(section, dict):
+            section = {}
+        model, base_url = _openai_stream_route(section)
+        deny_gemini_outbound(model=model, base_url=base_url)
 
 
 def resolve_streaming_provider(
@@ -189,9 +209,9 @@ def resolve_streaming_provider(
 
     1. ``tts.streaming.provider`` (config knob) when set:
        * a provider name pins that exact streamer (or ``None`` if unusable);
-       * ``auto`` walks the priority list (``elevenlabs → gemini → openai
-         → xai``) and returns the first usable streamer — an explicit
-         opt-in to "give me the best chunked voice available".
+       * ``auto`` walks the priority list (``elevenlabs → openai → xai``)
+         and returns the first usable streamer — an explicit opt-in to "give
+         me the best chunked voice available".
     2. Otherwise the *configured* TTS provider (or ``preferred`` override).
        ``None`` means "no chunked API for this provider" — the dispatcher
        then speaks per-sentence via the sync path, preserving the user's
@@ -202,14 +222,17 @@ def resolve_streaming_provider(
     pinned = str(streaming_cfg.get("provider") or "").lower().strip()
     if pinned == "auto":
         for name in _PROVIDER_PRIORITY:
+            _preflight_streaming_provider(name, tts_config)
             inst = _try_instantiate(name, tts_config)
             if inst is not None:
                 return inst
         return None
     if pinned:
+        _preflight_streaming_provider(pinned, tts_config)
         return _try_instantiate(pinned, tts_config)
 
     name = (preferred or _get_provider(tts_config)).lower().strip()
+    _preflight_streaming_provider(name, tts_config)
     return _try_instantiate(name, tts_config)
 
 
@@ -272,17 +295,15 @@ class OpenAIStreamer(StreamingTTSProvider):
         return bool(_openai_config_api_key() or resolve_openai_audio_api_key())
 
     def stream(self, text: str) -> Iterator[bytes]:
+        model, base_url = _openai_stream_route(self.section)
+        deny_gemini_outbound(model=model, base_url=base_url)
+
         from openai import OpenAI
 
         client = OpenAI(
             api_key=(self.section.get("api_key") or resolve_openai_audio_api_key()),
-            base_url=(
-                self.section.get("base_url")
-                or get_env_value("OPENAI_BASE_URL")
-                or None
-            ),
+            base_url=base_url,
         )
-        model = self.section.get("model", "gpt-4o-mini-tts")
         voice = self.section.get("voice", "alloy")
         with client.audio.speech.with_streaming_response.create(
             model=model,
@@ -323,12 +344,15 @@ class GeminiStreamer(StreamingTTSProvider):
 
     @staticmethod
     def available() -> bool:
+        deny_gemini_outbound(canonical_provider="gemini")
         return bool(
             _resolve_key("GEMINI_API_KEY", "gemini")
             or _resolve_key("GOOGLE_API_KEY", "gemini")
         )
 
     def stream(self, text: str) -> Iterator[bytes]:
+        deny_gemini_outbound(canonical_provider="gemini")
+
         import base64
         import json as _json
 
