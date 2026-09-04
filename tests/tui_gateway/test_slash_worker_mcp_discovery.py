@@ -51,6 +51,7 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
     (profile_home / "config.yaml").write_text(
         yaml.safe_dump(
             {
+                "mcp_discovery_timeout": 15.0,
                 "mcp_servers": {
                     "profileprobe": {
                         "enabled": True,
