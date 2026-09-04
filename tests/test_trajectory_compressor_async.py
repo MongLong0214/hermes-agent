@@ -11,7 +11,7 @@ each asyncio.run() gets a client bound to the current loop.
 """
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -154,6 +154,43 @@ class TestSourceLineVerification:
         """_get_async_client method should exist."""
         src = self._read_file()
         assert "def _get_async_client(self)" in src
+
+
+@pytest.mark.asyncio
+async def test_generate_summary_async_propagates_gemini_custom_route_denial_without_recovery():
+    """A custom Gemini route must escape the async caller unchanged."""
+    from trajectory_compressor import CompressionConfig, TrajectoryCompressor, TrajectoryMetrics
+
+    compressor = TrajectoryCompressor.__new__(TrajectoryCompressor)
+    compressor.config = CompressionConfig(
+        summarization_model="gemini-2.5-flash",
+        base_url="https://custom.example/v1",
+        summary_target_tokens=100,
+        max_retries=2,
+    )
+    compressor.logger = MagicMock()
+    compressor._use_call_llm = False
+    cached_client = MagicMock()
+    compressor.async_client = cached_client
+    compressor._async_client_api_key = "must-not-be-used"
+    client_constructor = MagicMock(side_effect=AssertionError("AsyncOpenAI construction reached"))
+    sleep = AsyncMock(side_effect=AssertionError("retry sleep reached"))
+    metrics = TrajectoryMetrics()
+
+    with (
+        patch("openai.AsyncOpenAI", client_constructor),
+        patch("trajectory_compressor.asyncio.sleep", sleep),
+        pytest.raises(GeminiOutboundDenied) as exc_info,
+    ):
+        await compressor._generate_summary_async("tool output", metrics)
+
+    _assert_stable_gemini_denial(exc_info)
+    client_constructor.assert_not_called()
+    cached_client.chat.completions.create.assert_not_called()
+    sleep.assert_not_awaited()
+    compressor.logger.warning.assert_not_called()
+    assert compressor.async_client is cached_client
+    assert metrics.summarization_errors == 0
 
 
 @pytest.mark.asyncio

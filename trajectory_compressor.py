@@ -46,6 +46,7 @@ import fire
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn
 from rich.console import Console
 from hermes_constants import OPENROUTER_BASE_URL, get_hermes_home
+from agent.gemini_outbound_policy import GeminiOutboundDenied
 from agent.retry_utils import jittered_backoff
 
 # Load .env from HERMES_HOME first, then project root as a dev fallback.
@@ -742,6 +743,8 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
                 summary = self._coerce_summary_content(response.choices[0].message.content)
                 return self._ensure_summary_prefix(summary)
                 
+            except GeminiOutboundDenied:
+                raise
             except Exception as e:
                 metrics.summarization_errors += 1
                 self.logger.warning("Summarization attempt %d failed: %s", attempt + 1, e)
