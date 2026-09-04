@@ -15,6 +15,16 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+
+def _assert_stable_gemini_denial(exc_info):
+    assert exc_info.type is GeminiOutboundDenied
+    assert type(exc_info.value) is GeminiOutboundDenied
+    assert exc_info.value.code == "gemini_outbound_denied"
+    assert str(exc_info.value) == "Gemini outbound requests are disabled."
+    assert vars(exc_info.value) == {}
+
 
 class TestAsyncClientLazyCreation:
     """trajectory_compressor.py — _get_async_client()"""
@@ -52,6 +62,37 @@ class TestAsyncClientLazyCreation:
             base_url="https://api.example.com/v1",
         )
         assert comp.async_client is not None
+
+    @pytest.mark.parametrize(
+        ("model", "base_url"),
+        [
+            ("gemini-2.5-flash", "https://custom.example/v1"),
+            ("gpt-4.1", "https://generativelanguage.googleapis.com/v1beta"),
+            ("gpt-4.1", "https://us-central1-aiplatform.googleapis.com/v1"),
+        ],
+    )
+    def test_get_async_client_denies_gemini_custom_routes_before_cache_and_client(
+        self, model, base_url
+    ):
+        from trajectory_compressor import TrajectoryCompressor
+
+        comp = TrajectoryCompressor.__new__(TrajectoryCompressor)
+        comp.config = SimpleNamespace(summarization_model=model, base_url=base_url)
+        cached_client = MagicMock()
+        comp.async_client = cached_client
+        comp._async_client_api_key = "must-not-be-used"
+        client_constructor = MagicMock(side_effect=AssertionError("AsyncOpenAI construction reached"))
+
+        with (
+            patch("openai.AsyncOpenAI", client_constructor),
+            pytest.raises(GeminiOutboundDenied) as exc_info,
+        ):
+            comp._get_async_client()
+
+        _assert_stable_gemini_denial(exc_info)
+        client_constructor.assert_not_called()
+        assert comp.async_client is cached_client
+        cached_client.chat.completions.create.assert_not_called()
 
     def test_get_async_client_creates_fresh_each_call(self):
         """Each call to _get_async_client() creates a NEW client instance,

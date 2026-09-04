@@ -391,6 +391,12 @@ class TrajectoryCompressor:
             self.async_client = None  # Not used directly
         else:
             # Custom endpoint — use config's raw base_url + api_key_env
+            from agent.gemini_outbound_policy import deny_gemini_outbound
+
+            deny_gemini_outbound(
+                model=self.config.summarization_model,
+                base_url=self.config.base_url,
+            )
             self._use_call_llm = False
             api_key = os.getenv(self.config.api_key_env)
             if not api_key:
@@ -418,6 +424,12 @@ class TrajectoryCompressor:
         ``process_directory()`` gets a client tied to its own loop,
         avoiding "Event loop is closed" errors on repeated calls.
         """
+        from agent.gemini_outbound_policy import deny_gemini_outbound
+
+        deny_gemini_outbound(
+            model=self.config.summarization_model,
+            base_url=self.config.base_url,
+        )
         from openai import AsyncOpenAI
         from agent.auxiliary_client import _to_openai_base_url
         # Always create a fresh client so it binds to the running loop.
