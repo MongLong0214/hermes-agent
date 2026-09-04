@@ -6,6 +6,7 @@ synth path are all mocked. Covers the registry/resolver, provider availability,
 the chunked-streamer playback path, and the universal per-sentence sync fallback.
 """
 
+import builtins
 import os
 import queue
 import sys
@@ -16,9 +17,15 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from agent.gemini_outbound_policy import GeminiOutboundDenied
 import tools.tts_streaming as ts
 
-pytest.importorskip("numpy")
+# The speaker-path tests below are already skipped on macOS because the
+# platform deliberately routes around sounddevice. Keep their historical
+# NumPy prerequisite on every other platform while allowing the resolver and
+# provider-policy tests to run with the repository's base Python on macOS.
+if sys.platform != "darwin":
+    pytest.importorskip("numpy")
 
 
 # ── SentenceChunker ──────────────────────────────────────────────────────
@@ -93,6 +100,63 @@ def test_never_swaps_provider_for_streaming(monkeypatch):
     assert ts.resolve_streaming_provider({"provider": "edge"}) is None
 
 
+def _assert_stable_denial(exc_info: pytest.ExceptionInfo[GeminiOutboundDenied]) -> None:
+    assert exc_info.type is GeminiOutboundDenied
+    assert type(exc_info.value) is GeminiOutboundDenied
+    assert exc_info.value.code == "gemini_outbound_denied"
+    assert str(exc_info.value) == "Gemini outbound requests are disabled."
+    assert vars(exc_info.value) == {}
+
+
+def test_resolve_streaming_gemini_denies_before_availability_key_lookup(monkeypatch):
+    def _explode(*_args, **_kwargs):
+        raise AssertionError("streamer availability or Gemini key lookup reached")
+
+    with monkeypatch.context() as context:
+        context.setattr(ts.GeminiStreamer, "available", staticmethod(_explode))
+        with pytest.raises(GeminiOutboundDenied) as exc_info:
+            ts.resolve_streaming_provider({"provider": "gemini"})
+    _assert_stable_denial(exc_info)
+
+    monkeypatch.setattr(ts, "_resolve_key", _explode)
+    with pytest.raises(GeminiOutboundDenied) as available_exc:
+        ts.GeminiStreamer.available()
+    _assert_stable_denial(available_exc)
+
+
+def test_resolve_streaming_openai_google_route_denies_before_availability(monkeypatch):
+    def _explode(*_args, **_kwargs):
+        raise AssertionError("OpenAI availability or credential lookup reached")
+
+    monkeypatch.setattr(ts.OpenAIStreamer, "available", staticmethod(_explode))
+    with pytest.raises(GeminiOutboundDenied) as exc_info:
+        ts.resolve_streaming_provider(
+            {
+                "streaming": {"provider": "openai"},
+                "openai": {"model": "gemini-2.5-flash-tts"},
+            }
+        )
+    _assert_stable_denial(exc_info)
+
+
+def test_auto_streaming_skips_gemini(monkeypatch):
+    calls = []
+    allowed = _register_fake(monkeypatch, "allowed-openai")
+
+    def _instantiate(name, config):
+        calls.append(name)
+        if name == "gemini":
+            raise AssertionError("Gemini must not be considered for auto streaming")
+        return allowed(config, {}) if name == "openai" else None
+
+    monkeypatch.setattr(ts, "_try_instantiate", _instantiate)
+    assert isinstance(
+        ts.resolve_streaming_provider({"streaming": {"provider": "auto"}}),
+        allowed,
+    )
+    assert calls == ["elevenlabs", "openai"]
+
+
 # ── Built-in provider availability ───────────────────────────────────────
 
 
@@ -153,6 +217,59 @@ def test_openai_streamer_prefers_configured_api_key(monkeypatch):
     assert streamer is not None
     assert list(streamer.stream("Streaming test.")) == [b"\x01\x00"]
     assert captured["client"]["api_key"] == "cfg-key"
+
+
+def test_gemini_streamer_denies_before_secret_or_http(monkeypatch):
+    def _explode(*_args, **_kwargs):
+        raise AssertionError("secret, env, or HTTP access reached")
+
+    real_import = builtins.__import__
+
+    def _guard_import(name, *args, **kwargs):
+        if name in {"base64", "json", "requests"}:
+            raise AssertionError(f"{name} import reached")
+        return real_import(name, *args, **kwargs)
+
+    with monkeypatch.context() as context:
+        context.setattr(ts, "_resolve_key", _explode)
+        context.setattr(ts, "get_env_value", _explode)
+        context.setattr(builtins, "__import__", _guard_import)
+        with pytest.raises(GeminiOutboundDenied) as exc_info:
+            list(ts.GeminiStreamer({}, {}).stream("Hello"))
+    _assert_stable_denial(exc_info)
+
+
+@pytest.mark.parametrize(
+    ("model", "base_url"),
+    [
+        ("gemini-2.5-flash-tts", "https://api.openai.com/v1"),
+        ("ordinary-tts-model", "https://vertexai.googleapis.com/v1"),
+    ],
+    ids=["google-model", "vertex-base-url"],
+)
+def test_openai_streamer_google_or_vertex_route_denies_before_secret_or_client(
+    monkeypatch, model, base_url
+):
+    def _explode(*_args, **_kwargs):
+        raise AssertionError("credential resolver or OpenAI client reached")
+
+    real_import = builtins.__import__
+
+    def _guard_import(name, *args, **kwargs):
+        if name == "openai":
+            raise AssertionError("OpenAI import reached")
+        return real_import(name, *args, **kwargs)
+
+    with monkeypatch.context() as context:
+        context.setattr(ts, "resolve_openai_audio_api_key", _explode)
+        context.setattr(ts, "get_env_value", _explode)
+        context.setattr(builtins, "__import__", _guard_import)
+        streamer = ts.OpenAIStreamer(
+            {"provider": "openai"}, {"model": model, "base_url": base_url}
+        )
+        with pytest.raises(GeminiOutboundDenied) as exc_info:
+            list(streamer.stream("Hello"))
+    _assert_stable_denial(exc_info)
 
 
 # ── Dispatch: chunked streamer path ──────────────────────────────────────
