@@ -12,8 +12,26 @@ Verifies that:
 import time
 from unittest.mock import MagicMock, patch
 
+import pytest
 
+from agent.gemini_outbound_policy import GeminiOutboundDenied
 from run_agent import AIAgent
+
+
+class _SideEffectReached(BaseException):
+    """Prohibited restore/recovery/refresh effect before default-deny."""
+
+
+def _explode(*_args, **_kwargs):
+    raise _SideEffectReached("prohibited Gemini/Vertex side effect reached")
+
+
+def _assert_stable_denial(exc_info):
+    assert exc_info.type is GeminiOutboundDenied
+    assert type(exc_info.value) is GeminiOutboundDenied
+    assert exc_info.value.code == "gemini_outbound_denied"
+    assert str(exc_info.value) == "Gemini outbound requests are disabled."
+    assert vars(exc_info.value) == {}
 
 
 def _make_tool_defs(*names: str) -> list:
@@ -598,3 +616,109 @@ class TestRateLimitCooldown:
 
         # second call should not have extended the cooldown
         assert second_cooldown == first_cooldown
+
+
+def test_restore_primary_runtime_denies_gemini_snapshot_before_mutation():
+    agent = _make_agent(provider="custom", base_url="https://my-llm.example.com/v1")
+    original_client = agent.client
+    original_provider = agent.provider
+    original_model = agent.model
+    original_url = agent.base_url
+    original_kwargs = dict(agent._client_kwargs)
+    original_key = agent.api_key
+    agent._fallback_activated = True
+    agent._fallback_index = 1
+    agent._primary_runtime["provider"] = "vertex"
+    agent._primary_runtime["requested_provider"] = "vertex"
+    agent._primary_runtime["base_url"] = "https://aiplatform.googleapis.com/v1"
+    agent._primary_runtime["model"] = "google/gemini-2.5-flash"
+    agent._primary_runtime["client_kwargs"] = {
+        "api_key": "placeholder-vertex-token",
+        "base_url": "https://aiplatform.googleapis.com/v1",
+    }
+
+    with (
+        patch("agent.credential_pool.load_pool", side_effect=_explode) as load_pool,
+        patch("run_agent.OpenAI", side_effect=_explode) as openai_cls,
+        patch.object(agent, "_create_openai_client", side_effect=_explode),
+        patch.object(agent, "_retire_shared_openai_client", side_effect=_explode),
+    ):
+        with pytest.raises(GeminiOutboundDenied) as exc_info:
+            agent._restore_primary_runtime()
+
+    _assert_stable_denial(exc_info)
+    load_pool.assert_not_called()
+    openai_cls.assert_not_called()
+    assert agent.client is original_client
+    assert agent.provider == original_provider
+    assert agent.model == original_model
+    assert agent.base_url == original_url
+    assert agent.api_key == original_key
+    assert agent._client_kwargs == original_kwargs
+    assert agent._fallback_activated is True
+    assert agent._fallback_index == 1
+
+
+def test_try_recover_primary_transport_denies_gemini_snapshot_before_sleep():
+    agent = _make_agent(provider="custom", base_url="https://my-llm.example.com/v1")
+    original_client = agent.client
+    original_provider = agent.provider
+    original_model = agent.model
+    original_url = agent.base_url
+    original_kwargs = dict(agent._client_kwargs)
+    agent._primary_runtime["provider"] = "gemini"
+    agent._primary_runtime["requested_provider"] = "gemini"
+    agent._primary_runtime["base_url"] = "https://generativelanguage.googleapis.com/v1beta"
+    agent._primary_runtime["model"] = "gemini-2.5-flash"
+    agent._primary_runtime["client_kwargs"] = {
+        "api_key": "placeholder-gemini-key",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta",
+    }
+    error = _make_transport_error("ReadTimeout")
+
+    with (
+        patch("time.sleep", side_effect=_explode) as slept,
+        patch("run_agent.OpenAI", side_effect=_explode) as openai_cls,
+        patch.object(agent, "_retire_shared_openai_client", side_effect=_explode),
+        patch.object(agent, "_create_openai_client", side_effect=_explode),
+    ):
+        with pytest.raises(GeminiOutboundDenied) as exc_info:
+            agent._try_recover_primary_transport(error, retry_count=3, max_retries=3)
+
+    _assert_stable_denial(exc_info)
+    slept.assert_not_called()
+    openai_cls.assert_not_called()
+    assert agent.client is original_client
+    assert agent.provider == original_provider
+    assert agent.model == original_model
+    assert agent.base_url == original_url
+    assert agent._client_kwargs == original_kwargs
+
+
+def test_try_refresh_vertex_client_credentials_denies_before_token_mint():
+    agent = _make_agent(provider="custom", base_url="https://my-llm.example.com/v1")
+    agent.provider = "vertex"
+    agent.api_mode = "chat_completions"
+    original_client = agent.client
+    original_key = agent.api_key
+    original_url = agent.base_url
+    original_kwargs = dict(agent._client_kwargs)
+
+    with (
+        patch(
+            "agent.vertex_adapter.get_vertex_config",
+            side_effect=_explode,
+        ) as get_config,
+        patch.object(agent, "_replace_primary_openai_client", side_effect=_explode),
+        patch("run_agent.logger") as mock_logger,
+    ):
+        with pytest.raises(GeminiOutboundDenied) as exc_info:
+            agent._try_refresh_vertex_client_credentials()
+
+    _assert_stable_denial(exc_info)
+    get_config.assert_not_called()
+    assert agent.client is original_client
+    assert agent.api_key == original_key
+    assert agent.base_url == original_url
+    assert agent._client_kwargs == original_kwargs
+    mock_logger.info.assert_not_called()

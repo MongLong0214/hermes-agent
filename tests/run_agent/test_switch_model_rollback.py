@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from agent.gemini_outbound_policy import GeminiOutboundDenied
 from run_agent import AIAgent
 
 
@@ -202,3 +203,120 @@ def test_successful_switch_still_works_after_rollback_refactor():
     assert agent.provider == "openrouter"
     assert agent.api_key == "or-key-new"
     assert agent.client is new_client
+
+
+def _assert_stable_denial(exc_info):
+    from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+    assert exc_info.type is GeminiOutboundDenied
+    assert type(exc_info.value) is GeminiOutboundDenied
+    assert exc_info.value.code == "gemini_outbound_denied"
+    assert str(exc_info.value) == "Gemini outbound requests are disabled."
+    assert vars(exc_info.value) == {}
+
+
+class _SideEffectReached(BaseException):
+    """Prohibited switch_model effect before default-deny."""
+
+
+def _explode(*_args, **_kwargs):
+    raise _SideEffectReached("prohibited Gemini/Vertex side effect reached")
+
+
+def _snapshot_switch_state(agent):
+    return {
+        "model": agent.model,
+        "provider": agent.provider,
+        "base_url": agent.base_url,
+        "api_mode": agent.api_mode,
+        "api_key": agent.api_key,
+        "client": agent.client,
+        "client_kwargs": dict(agent._client_kwargs),
+        "cached_system_prompt": agent._cached_system_prompt,
+        "primary_runtime": dict(agent._primary_runtime),
+        "fallback_activated": agent._fallback_activated,
+        "credential_pool": getattr(agent, "_credential_pool", None),
+    }
+
+
+def _assert_switch_state_unchanged(agent, before):
+    after = _snapshot_switch_state(agent)
+    assert after == before
+
+
+def test_switch_model_denies_explicit_vertex_provider_before_mutation():
+    agent = _make_agent_openrouter()
+    before = _snapshot_switch_state(agent)
+    agent._read_reasoning_echo_from_config = _explode
+    agent._create_openai_client = _explode
+
+    with (
+        patch("hermes_cli.providers.determine_api_mode", side_effect=_explode) as resolve_mode,
+        patch("agent.credential_pool.load_pool", side_effect=_explode) as load_pool,
+    ):
+        with pytest.raises(GeminiOutboundDenied) as exc_info:
+            agent.switch_model(
+                new_model="google/gemini-2.5-flash",
+                new_provider="vertex",
+                api_key="placeholder-vertex-token",
+                base_url="https://aiplatform.googleapis.com/v1",
+                api_mode="chat_completions",
+            )
+
+    _assert_stable_denial(exc_info)
+    resolve_mode.assert_not_called()
+    load_pool.assert_not_called()
+    _assert_switch_state_unchanged(agent, before)
+
+
+def test_switch_model_denies_google_host_before_mutation():
+    agent = _make_agent_openrouter()
+    before = _snapshot_switch_state(agent)
+    agent._read_reasoning_echo_from_config = _explode
+    agent._create_openai_client = _explode
+
+    with (
+        patch("hermes_cli.providers.determine_api_mode", side_effect=_explode) as resolve_mode,
+        patch("agent.credential_pool.load_pool", side_effect=_explode) as load_pool,
+    ):
+        with pytest.raises(GeminiOutboundDenied) as exc_info:
+            agent.switch_model(
+                new_model="ordinary-model",
+                new_provider="custom",
+                api_key="placeholder-key",
+                base_url="https://us-central1-aiplatform.googleapis.com/v1",
+                api_mode="chat_completions",
+            )
+
+    _assert_stable_denial(exc_info)
+    resolve_mode.assert_not_called()
+    load_pool.assert_not_called()
+    _assert_switch_state_unchanged(agent, before)
+
+
+def test_switch_model_second_guard_denies_resolved_gemini_api_mode():
+    agent = _make_agent_openrouter()
+    before = _snapshot_switch_state(agent)
+    agent._read_reasoning_echo_from_config = _explode
+    agent._create_openai_client = _explode
+
+    with (
+        patch(
+            "hermes_cli.providers.determine_api_mode",
+            return_value="gemini_native",
+        ) as resolve_mode,
+        patch("agent.credential_pool.load_pool", side_effect=_explode) as load_pool,
+    ):
+        with pytest.raises(GeminiOutboundDenied) as exc_info:
+            agent.switch_model(
+                new_model="x-ai/grok-4",
+                new_provider="openrouter",
+                api_key="or-key-original",
+                base_url="",
+                api_mode="",
+            )
+
+    _assert_stable_denial(exc_info)
+    resolve_mode.assert_called_once()
+    load_pool.assert_not_called()
+    _assert_switch_state_unchanged(agent, before)
