@@ -379,9 +379,41 @@ class TestFlushAfterCompression:
             # Failure cooldown/activity metadata may advance without ending
             # or rotating the parent session.
             after_session = db.get_session(parent_sid)
-            for key in ("id", "parent_session_id", "end_reason"):
-                assert after_session[key] == parent_session[key]
+            self._assert_parent_session_preserved(parent_session, after_session)
             db.close()
+
+    @staticmethod
+    def _assert_parent_session_preserved(before, after):
+        # SessionDB.record_compression_failure_cooldown and touch_session_activity
+        # write exactly these columns; all five changed in the failure fixture.
+        # Every other column (including ended_at) must remain identical.
+        bookkeeping = {
+            "compression_failure_cooldown_until",
+            "compression_failure_error",
+            "last_activity_at",
+            "last_activity_description",
+            "last_activity_provenance",
+        }
+        assert {key: value for key, value in after.items() if key not in bookkeeping} == {
+            key: value for key, value in before.items() if key not in bookkeeping
+        }
+
+    def test_parent_session_comparison_rejects_ended_at_change(self):
+        import pytest
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            try:
+                db.create_session("parent", "test")
+                before = db.get_session("parent")
+                assert before is not None
+                after = dict(before, ended_at=123.0)
+                assert before["ended_at"] is None
+                with pytest.raises(AssertionError):
+                    self._assert_parent_session_preserved(before, after)
+            finally:
+                db.close()
 
 
 
