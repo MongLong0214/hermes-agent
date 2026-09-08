@@ -17,7 +17,11 @@ each written so that removing the property turns the test red:
 
 from __future__ import annotations
 
+import json
 import os
+import re
+import runpy
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -316,3 +320,107 @@ class TestEnforcementSiteIsWired:
         assert len(gate) == 2, "all-checks-pass job not found in ci.yaml"
         needs_block = gate[1].split("if: always()", 1)[0]
         assert "- whitespace-check" in needs_block
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="CI step uses bash")
+class TestAggregateRequiredResults:
+    """Execute the real gate; derive valid skips from the actual job conditions."""
+
+    @staticmethod
+    def _case(path=".github/workflows/ci.yaml", event="pull_request", critical="false"):
+        import yaml
+
+        jobs = yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8"))["jobs"]
+        classify = runpy.run_path(str(REPO_ROOT / "scripts/ci/classify_changes.py"))["classify"]
+        outputs = {key: str(value).lower() for key, value in classify([path]).items()}
+        outputs["event_name"] = event
+        needs = {"detect": {"result": "success", "outputs": outputs}}
+        for name, job in jobs.items():
+            if "uses" not in job:
+                continue
+            condition = str(job.get("if", "True")).removeprefix("${{").removesuffix("}}")
+            condition = condition.replace("always()", "True").replace("false", "False")
+            condition = condition.replace("&&", " and ").replace("||", " or ")
+            condition = re.sub(
+                r"needs\.([\w-]+)\.outputs\.(\w+)",
+                lambda match: repr(
+                    outputs.get(match[2], "") if match[1] == "detect" else critical
+                ),
+                condition,
+            )
+            active = eval(condition.strip(), {"__builtins__": {}}, {})
+            needs[name] = {"result": "success" if active else "skipped", "outputs": {}}
+            if name == "supply-chain":
+                needs[name]["outputs"]["critical_findings"] = critical
+        return jobs["all-checks-pass"], needs
+
+    @staticmethod
+    def _run(tmp_path, gate, needs):
+        output = tmp_path / "github-output"
+        output.write_text("", encoding="utf-8")
+        step = next(step for step in gate["steps"] if step.get("id") == "evaluate")
+        result = subprocess.run(
+            ["bash", "-eo", "pipefail", "-c", step["run"]],
+            env={**os.environ, "NEEDS": json.dumps(needs), "GITHUB_OUTPUT": str(output)},
+            capture_output=True, text=True, timeout=10,
+        )
+        return result, output.read_text(encoding="utf-8")
+
+    @pytest.mark.parametrize("event", ["pull_request", "push"])
+    @pytest.mark.parametrize("critical", ["false", "true"])
+    @pytest.mark.parametrize("path", [
+        "README.md", "tests/test_example.py", "apps/desktop/src/app.ts",
+        "website/static/image.png", "scripts/install.ps1", "Cargo.toml",
+        "package-lock.json", "Dockerfile", "optional-mcps/catalog.json",
+        ".github/workflows/ci.yaml",
+    ])
+    def test_legitimate_skips_and_success_keep_output(self, tmp_path, path, event, critical):
+        gate, needs = self._case(path, event, critical)
+        assert needs["e2e-desktop"]["result"] == "skipped"
+        result, output = self._run(tmp_path, gate, needs)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert json.loads(output.removeprefix("needs-json=")) == {
+            name: info["result"] for name, info in needs.items()
+        }
+
+    @pytest.mark.parametrize("result", [
+        "failure", "cancelled", "timed_out", "unknown", "queued", "in_progress", "", "skipped",
+    ])
+    def test_every_active_job_must_succeed(self, tmp_path, result):
+        gate, baseline = self._case()
+        for name, info in baseline.items():
+            if info["result"] != "success":
+                continue
+            needs = {key: dict(value) for key, value in baseline.items()}
+            needs[name]["result"] = result
+            actual, _ = self._run(tmp_path, gate, needs)
+            assert actual.returncode != 0, f"{name}={result} incorrectly passed: {actual.stdout}"
+
+    def test_every_dependency_must_be_present(self, tmp_path):
+        gate, baseline = self._case()
+        for name in baseline:
+            needs = {key: value for key, value in baseline.items() if key != name}
+            actual, _ = self._run(tmp_path, gate, needs)
+            assert actual.returncode != 0, f"missing {name} incorrectly passed"
+
+    def test_gate_waits_for_every_check(self):
+        gate, needs = self._case()
+        assert set(gate["needs"]) == set(needs)
+        assert gate["if"] == "always()"
+
+    @pytest.mark.parametrize("value", [None, "", "unknown"])
+    def test_unproven_classifier_output_cannot_authorize_skip(self, tmp_path, value):
+        gate, needs = self._case("README.md")
+        if value is None:
+            del needs["detect"]["outputs"]["python"]
+        else:
+            needs["detect"]["outputs"]["python"] = value
+        actual, _ = self._run(tmp_path, gate, needs)
+        assert actual.returncode != 0, "unproven Python skip incorrectly passed"
+
+    @pytest.mark.parametrize("result", ["failure", "cancelled", "timed_out", "unknown"])
+    def test_inactive_lane_only_allows_success_or_skipped(self, tmp_path, result):
+        gate, needs = self._case("README.md")
+        needs["tests"]["result"] = result
+        actual, _ = self._run(tmp_path, gate, needs)
+        assert actual.returncode != 0, f"inactive tests={result} incorrectly passed"
