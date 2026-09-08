@@ -7157,6 +7157,13 @@ This compaction should PRIORITISE preserving all information related to the focu
             memory_context: Optional provider-supplied context to preserve in
                 the summary prompt. Whitespace-only values are ignored.
         """
+        from agent.conversation_compression import (
+            _restore_compressor_attempt_state,
+            _snapshot_compressor_attempt_state,
+        )
+
+        # Capture entry bookkeeping before per-call resets or self-healing.
+        attempt_state = _snapshot_compressor_attempt_state(self)
         # Reset per-call summary failure state — callers inspect these fields
         # after compress() returns to decide whether to surface a warning.
         self._last_summary_dropped_count = 0
@@ -7226,6 +7233,9 @@ This compaction should PRIORITISE preserving all information related to the focu
         else:
             self._lean_pristine_tools = {}
 
+        # Keep the pre-pass transcript as the rollback value. Pruning and echo
+        # filtering create candidate messages, not authority to publish on failure.
+        original_messages = messages
         # Phase 1: Prune old tool results (cheap, no LLM call)
         messages, pruned_count = self._prune_old_tool_results(
             messages, protect_tail_count=self.protect_last_n,
@@ -7524,39 +7534,20 @@ This compaction should PRIORITISE preserving all information related to the focu
                     focus_topic=summary_focus_topic,
                     memory_context=memory_context,
                 )
-            except AuxiliaryExplicitCancellation:
-                # Explicit cancellation is a true no-op. Restore state mutated by
-                # the resume/handoff self-heal scan before the exception escapes to
-                # the outer transaction, which restores the transcript and lease.
-                self._previous_summary = _previous_summary_before_scan
-                self._summary_has_user_turn = _summary_has_user_turn_before_scan
+            except BaseException:
+                # Every unwind preserves entry bookkeeping, including the
+                # self-heal scan's summary changes. Never swallow cancellation
+                # or unexpected errors; durable rollback belongs to the outer
+                # transaction holding the session lease.
+                _restore_compressor_attempt_state(
+                    self, attempt_state, durable_cooldown_authoritative=False,
+                )
                 raise
 
-        # If summary generation failed, behavior splits on
-        # ``abort_on_summary_failure`` (config: compression.abort_on_summary_failure):
-        #   True  → ABORT compression entirely. Return messages unchanged
-        #           and set _last_compress_aborted=True so callers can warn
-        #           the user and stop the auto-compress retry loop.
-        #   False → Fall through to the default fallback path below: insert
-        #           a deterministic "summary unavailable" handoff and drop
-        #           the middle window.  Records _last_summary_fallback_used /
-        #           _last_summary_dropped_count for gateway hygiene to
-        #           surface a warning.
-        # Default is False (historical behavior).
-        #
-        # EXCEPTION — terminal access/quota AND transient network failures
-        # always abort. Missing credentials, 401/402/403 access failures, and
-        # confirmed non-resetting quota exhaustion cannot be repaired by
-        # retrying the same summary request. A connection/stream-close error
-        # means the network blipped at the compaction moment (#29559). In all
-        # of these cases, rotating into a child session with a placeholder
-        # summary degrades the conversation for zero benefit. Preserve it
-        # unchanged until access is restored or connectivity recovers.
-        if not summary and not feasibility_skip and (
-            self.abort_on_summary_failure
-            or self._last_summary_auth_failure
-            or self._last_summary_network_failure
-        ):
+        # Failure is not authority to drop history, regardless of the legacy
+        # abort_on_summary_failure setting. Feasibility skips remain a distinct
+        # no-LLM policy decision; they must not be classified as summary failure.
+        if not summary and not feasibility_skip:
             n_skipped = compress_end - compress_start
             self._last_summary_dropped_count = 0  # nothing actually dropped
             self._last_summary_fallback_used = False
@@ -7572,6 +7563,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             # scan instead of narrow-rescanning against a half-populated state
             # and discarding a legitimately rehydrated fossil (#57835).
             self._previous_summary = _previous_summary_before_scan
+            self._summary_has_user_turn = _summary_has_user_turn_before_scan
             if not self.quiet_mode:
                 if self._last_summary_auth_failure:
                     logger.warning(
@@ -7600,7 +7592,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                         "frozen until the next /compress or /new.",
                         n_skipped,
                     )
-            return messages
+            return original_messages
 
         # Phase 4: Assemble compressed message list
         compressed = []
@@ -7627,9 +7619,8 @@ This compaction should PRIORITISE preserving all information related to the focu
             if stripped is not None:
                 compressed.append(stripped)
 
-        # If LLM summary failed, insert a deterministic fallback so the model
-        # gets at least locally recoverable continuity anchors instead of a
-        # content-free "N messages were removed" marker.
+        # A feasibility skip uses deterministic continuity anchors without an
+        # LLM call. Actual summary failures already returned the original history.
         if not summary:
             if not self.quiet_mode:
                 if feasibility_skip:

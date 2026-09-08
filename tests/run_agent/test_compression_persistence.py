@@ -18,7 +18,9 @@ Bug scenario (pre-fix):
 
 import os
 import tempfile
+from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -296,10 +298,9 @@ class TestFlushAfterCompression:
             # for a reason INDEPENDENT of _db_persisted (ephemeral scaffolding,
             # synthetic recovery turns). Keep this fixture free of such messages
             # or the row count would legitimately differ from len(compressed).
-            # The transcript must also be large enough that the provider-less
-            # static fallback net-shrinks it (middle drops must outweigh the
-            # fixed compaction marker overhead), or the no-growth commit guard
-            # correctly refuses the rotation this test exercises.
+            # The successful short summary must net-shrink the transcript,
+            # including the fixed compaction marker overhead, so the no-growth
+            # commit guard admits the rotation this test exercises.
             messages = [
                 {
                     "role": "user" if i % 2 == 0 else "assistant",
@@ -309,11 +310,20 @@ class TestFlushAfterCompression:
                 for i in range(40)
             ]
 
-            with patch("agent.context_compressor.call_llm", side_effect=RuntimeError("no provider")):
+            response = SimpleNamespace(choices=[
+                SimpleNamespace(message=SimpleNamespace(content="Earlier messages summarized."))
+            ])
+            with patch("agent.context_compressor.call_llm", return_value=response) as summarize:
                 compressed, _ = compress_context(
                     agent, messages, approx_tokens=100_000, system_message="sys"
                 )
 
+            summarize.assert_called_once()
+            assert not agent.context_compressor._last_compress_aborted
+            # Rotation refreshes compressor bookkeeping; prove success from
+            # the returned summary and the durable child transcript instead.
+            assert any("Earlier messages summarized." in message["content"] for message in compressed)
+            assert compressed != messages
             assert agent.session_id != parent_sid
             child_sid = agent.session_id
 
@@ -324,7 +334,86 @@ class TestFlushAfterCompression:
                 f"Expected {len(compressed)} rows in child session, got {len(child_rows)}. "
                 f"_db_persisted marker propagation bug (#57491)."
             )
+            assert [(row["role"], row["content"]) for row in child_rows] == [
+                (message["role"], message["content"]) for message in compressed
+            ]
             db.close()
+
+    def test_rotation_summary_failure_preserves_parent_and_transcript(self):
+        from agent.conversation_compression import compress_context
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            agent = self._make_agent(db)
+            agent.compression_in_place = False
+            parent_sid = agent.session_id
+            messages = [
+                {
+                    "role": "user" if i % 2 == 0 else "assistant",
+                    "content": f"message {i} " + "x" * 200,
+                }
+                for i in range(40)
+            ]
+            agent._flush_messages_to_session_db(messages, [])
+            for message in messages:
+                message["_db_persisted"] = True
+            before = deepcopy(messages)
+            parent_rows = db.get_messages(parent_sid)
+            parent_session = db.get_session(parent_sid)
+            flush_index = agent._last_flushed_db_idx
+
+            with patch("agent.context_compressor.call_llm", side_effect=RuntimeError("no provider")) as summarize:
+                returned, _ = compress_context(
+                    agent, messages, approx_tokens=100_000, system_message="sys"
+                )
+
+            assert summarize.called
+            assert agent.context_compressor._last_compress_aborted
+            assert agent.session_id == parent_sid
+            assert returned == before
+            assert messages == before
+            assert agent._last_flushed_db_idx == flush_index
+            agent._flush_messages_to_session_db(returned, before)
+            assert db.get_messages(parent_sid) == parent_rows
+            # Failure cooldown/activity metadata may advance without ending
+            # or rotating the parent session.
+            after_session = db.get_session(parent_sid)
+            self._assert_parent_session_preserved(parent_session, after_session)
+            db.close()
+
+    @staticmethod
+    def _assert_parent_session_preserved(before, after):
+        # SessionDB.record_compression_failure_cooldown and touch_session_activity
+        # write exactly these columns; all five changed in the failure fixture.
+        # Every other column (including ended_at) must remain identical.
+        bookkeeping = {
+            "compression_failure_cooldown_until",
+            "compression_failure_error",
+            "last_activity_at",
+            "last_activity_description",
+            "last_activity_provenance",
+        }
+        assert {key: value for key, value in after.items() if key not in bookkeeping} == {
+            key: value for key, value in before.items() if key not in bookkeeping
+        }
+
+    def test_parent_session_comparison_rejects_ended_at_change(self):
+        import pytest
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            try:
+                db.create_session("parent", "test")
+                before = db.get_session("parent")
+                assert before is not None
+                after = dict(before, ended_at=123.0)
+                assert before["ended_at"] is None
+                with pytest.raises(AssertionError):
+                    self._assert_parent_session_preserved(before, after)
+            finally:
+                db.close()
 
 
 

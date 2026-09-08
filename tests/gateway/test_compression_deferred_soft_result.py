@@ -1,88 +1,88 @@
-"""Gateway must treat ``compression_deferred`` as a soft result (#49874).
+"""Deferred and exhausted compression results retain actor and routing.
 
-A lock-contended compression defer means a CONCURRENT compressor is actively
-shrinking the session — the opposite of ``compression_exhausted`` (session
-permanently too large). The gateway's auto-reset (#9893/#35809) must never
-fire for a deferred turn: the session stays intact and the next message
-retries normally.
-
-AST invariants on ``gateway/run.py`` (mirrors
-``test_35809_auto_reset_clean_context.py``'s load-bearing pin style):
-
-* the ``compression_deferred`` branch guards the auto-reset block — a
-  deferred result can never reach ``reset_session``;
-* the deferred branch itself performs NO session mutation (no
-  ``reset_session``, no ``_evict_cached_agent``, no
-  ``_clear_conversation_scope``).
+A lock-contended defer is transient. Exhaustion explicitly blocks this request;
+neither result authorizes reset, cache eviction, or topic rebinding.
 """
+import ast
+from pathlib import Path
 
-from __future__ import annotations
+
+def test_deferred_and_exhausted_branches_never_mutate_actor():
+    path = Path(__file__).resolve().parents[2] / "gateway" / "run.py"
+    tree = ast.parse(path.read_text())
+    chains = [n for n in ast.walk(tree) if isinstance(n, ast.If)
+              and isinstance(n.test, ast.Call)
+              and isinstance(n.test.func, ast.Attribute)
+              and isinstance(n.test.func.value, ast.Name)
+              and n.test.func.value.id == "agent_result"
+              and n.test.args and isinstance(n.test.args[0], ast.Constant)
+              and n.test.args[0].value == "compression_deferred" and n.orelse]
+    assert len(chains) == 1
+    chain = chains[0]
+    assert any(isinstance(n, ast.Constant) and n.value == "compression_exhausted"
+               for n in ast.walk(chain.orelse[0].test))
+    calls = {n.func.attr for n in ast.walk(chain)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+    assert not calls & {"reset_session", "_evict_cached_agent",
+                        "_clear_conversation_scope", "_sync_telegram_topic_binding"}
+
 
 import ast
-import inspect
+import logging
+from pathlib import Path
+from types import SimpleNamespace
 
-from gateway import run as gateway_run
-
-
-def _calls(node: ast.AST) -> set[str]:
-    return {
-        n.func.attr
-        for n in ast.walk(node)
-        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-    }
+import pytest
 
 
-def _find_deferred_guarded_reset_chain() -> ast.If:
-    """Return the ``if agent_result.get('compression_deferred') ... elif
-    agent_result.get('compression_exhausted') ... reset_session`` chain."""
-    tree = ast.parse(inspect.getsource(gateway_run))
+def result_consumer():
+    # Compile the actual deferred/exhausted result-consumer, not a copy or a
+    # replacement helper. This seam is otherwise inside a large async handler.
+    path = Path(__file__).resolve().parents[2] / 'gateway' / 'run.py'
+    tree = ast.parse(path.read_text())
+    candidates = [n for n in ast.walk(tree) if isinstance(n, ast.If)
+                  and isinstance(n.test, ast.Call)
+                  and isinstance(n.test.func, ast.Attribute)
+                  and isinstance(n.test.func.value, ast.Name)
+                  and n.test.func.value.id == 'agent_result'
+                  and n.test.args and isinstance(n.test.args[0], ast.Constant)
+                  and n.test.args[0].value == 'compression_deferred'
+                  and n.orelse]
+    assert len(candidates) == 1
+    wrapper = ast.parse('async def consume(self, agent_result, session_entry, session_key, source, response):\n    return response, session_entry\n')
+    wrapper.body[0].body.insert(0, candidates[0])
+    ast.fix_missing_locations(wrapper)
+    namespace = {'logger': logging.getLogger(__name__)}
+    exec(compile(wrapper, str(path), 'exec'), namespace)
+    return namespace['consume']
 
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.If):
-            continue
-        test_consts = [
-            n.value
-            for n in ast.walk(node.test)
-            if isinstance(n, ast.Constant) and isinstance(n.value, str)
-        ]
-        if "compression_deferred" not in test_consts:
-            continue
-        # The reset must live in the orelse (elif compression_exhausted ...),
-        # never in the deferred body.
-        orelse_calls = set()
-        for sub in node.orelse:
-            orelse_calls |= _calls(sub)
-        if "reset_session" in orelse_calls:
-            return node
-    raise AssertionError(
-        "Could not locate the compression_deferred guard in front of the "
-        "compression-exhausted auto-reset block in gateway/run.py. The "
-        "soft-defer contract (#49874: lock-contended defer must never "
-        "auto-reset the session) is no longer structurally guaranteed."
+
+def forbidden(*args, **kwargs):
+    pytest.fail('compression failure attempted a session mutation')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('deferred', [False, True])
+async def test_exhaustion_preserves_actor_and_routing(deferred):
+    consume = result_consumer()
+    entry = SimpleNamespace(session_id='same-actor')
+    source = SimpleNamespace(chat_id='chat', thread_id='topic')
+    runner = SimpleNamespace(
+        async_session_store=SimpleNamespace(reset_session=forbidden),
+        _evict_cached_agent=forbidden, _clear_conversation_scope=forbidden,
+        _sync_telegram_topic_binding=forbidden,
     )
-
-
-class TestCompressionDeferredIsSoft:
-    def test_deferred_branch_guards_the_auto_reset(self):
-        """The auto-reset (``reset_session``) must be unreachable when
-        ``compression_deferred`` is set: the deferred check comes FIRST and
-        the reset lives only in its elif chain."""
-        node = _find_deferred_guarded_reset_chain()
-        # The exhaustion reset is in the orelse — verified by the finder.
-        # The deferred body must not mutate the session in any way.
-        body_calls = set()
-        for sub in node.body:
-            body_calls |= _calls(sub)
-        forbidden = {
-            "reset_session",
-            "_evict_cached_agent",
-            "_clear_conversation_scope",
-        }
-        assert not (body_calls & forbidden), (
-            f"The compression_deferred branch in gateway/run.py performs "
-            f"session mutation ({body_calls & forbidden}). A lock-contended "
-            f"defer is transient — the session must stay intact so the next "
-            f"message retries against the freshly compressed context "
-            f"(#49874, #69870)."
-        )
-
+    result = {'compression_exhausted': True, 'compression_deferred': deferred}
+    for _ in range(3):
+        response, returned_entry = await consume(runner, result, entry, 'same-key', source, 'original failure')
+        assert returned_entry is entry
+        assert entry.session_id == 'same-actor'
+        assert source.thread_id == 'topic'
+        assert 'original failure' in response
+        if not deferred:
+            assert 'blocked' in response.lower()
+            assert 'same session' in response.lower()
+            assert '/compress' in response
+            assert 'cooldown' in response.lower()
+        assert 'auto-reset' not in response.lower()
+        assert '/new' not in response

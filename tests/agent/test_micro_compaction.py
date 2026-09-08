@@ -18,6 +18,8 @@ The invariants that matter:
   times and then skipped, so a poison exchange can't stall every turn.
 """
 
+from copy import deepcopy
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -707,10 +709,40 @@ class TestMicroCompaction:
         assert cc._micro_compact_rolling_summary
         assert cc._micro_compact_cursor > 0
 
-        cc.compress(msgs, force=True)
+        response = SimpleNamespace(choices=[
+            SimpleNamespace(message=SimpleNamespace(content="Batch summary."))
+        ])
+        with patch("agent.context_compressor.call_llm", return_value=response) as summarize:
+            compressed = cc.compress(msgs, force=True)
+
+        summarize.assert_called_once()
+        assert not cc._last_compress_aborted
+        assert cc._last_compression_made_progress
+        assert compressed != msgs
+        assert _summary_markers(compressed)
 
         assert cc._micro_compact_rolling_summary == ""
         assert cc._micro_compact_cursor == 0
+
+    def test_batch_compress_failure_preserves_micro_state_and_transcript(self):
+        cc = _compressor()
+        msgs = cc._micro_compact(_conversation(exchanges=8))
+        before = deepcopy(msgs)
+        micro_state = {
+            name: deepcopy(value) for name, value in vars(cc).items()
+            if name.startswith("_micro_compact_")
+        }
+        assert cc._micro_compact_rolling_summary
+        assert cc._micro_compact_cursor > 0
+
+        with patch("agent.context_compressor.call_llm", side_effect=RuntimeError("no provider")) as summarize:
+            returned = cc.compress(msgs, force=True)
+
+        assert summarize.called
+        assert cc._last_compress_aborted
+        assert returned == before
+        assert msgs == before
+        assert {name: getattr(cc, name) for name in micro_state} == micro_state
 
     def test_persist_disabled_agent_never_micro_compacts(self):
         """finalize_turn must skip micro-compaction on isolated fork agents.

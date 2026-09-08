@@ -143,6 +143,78 @@ def test_current_user_turn_is_persisted_before_provider_call(agent):
     assert isinstance(persisted_messages[-1]["timestamp"], float)
 
 
+
+
+@pytest.mark.parametrize("overflow", ["payload", "context"])
+def test_repeated_oversized_entries_are_bounded_and_next_request_recovers(agent, monkeypatch, overflow):
+    """Real run loop + host compressor: one provider rejection per entry,
+    one failed summary across cooldown, and a fitting next request succeeds.
+    This permits a bounded blocked request, not a zero-provider-call latch.
+    """
+    import copy
+    import agent.context_compressor as module
+
+    clock = [1000.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    c = agent.context_compressor
+    c.context_length = 200_000
+    c.threshold_tokens = 100_000
+    c.protect_first_n = 1
+    c.protect_last_n = 1
+    c.abort_on_summary_failure = False
+    agent._disable_streaming = True
+    history = [{"role": "user" if i % 2 == 0 else "assistant",
+                "content": f"preserved fact {i}"} for i in range(40)]
+    before = copy.deepcopy(history)
+    actor = agent.session_id
+    summary = MagicMock(side_effect=RuntimeError("summary unavailable"))
+    monkeypatch.setattr(module, "call_llm", summary)
+    error = _make_413_error() if overflow == "payload" else Exception(
+        "Error code: 400 - prompt is too long: 233153 tokens > 200000 maximum")
+    if overflow == "context":
+        error.status_code = 400
+    provider = agent.client.chat.completions.create
+    provider.side_effect = error
+    with (
+        patch("agent.turn_context.estimate_request_tokens_rough", return_value=150_000),
+        patch("agent.conversation_loop.estimate_request_tokens_rough", return_value=150_000),
+        patch("agent.conversation_loop.estimate_messages_tokens_rough", return_value=150_000),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        for entry in range(3):
+            result = agent.run_conversation("oversized request", conversation_history=history)
+            assert result.get("compression_exhausted") is True
+            assert result.get("failed") is True
+            assert provider.call_count == entry + 1
+            assert summary.call_count == 1
+            assert c.get_active_compression_failure_cooldown()
+            assert agent.session_id == actor
+            assert history == before
+            retained = [(m["role"], m.get("content")) for m in result["messages"]]
+            assert all((m["role"], m["content"]) in retained for m in history)
+
+    # A summary cooldown must not latch the main provider off. The next
+    # fitting request succeeds without waiting or explicitly clearing state.
+    provider.side_effect = None
+    provider.return_value = _mock_response(content="normal recovery")
+    with (
+        patch("agent.turn_context.estimate_request_tokens_rough", return_value=100),
+        patch("agent.conversation_loop.estimate_request_tokens_rough", return_value=100),
+        patch("agent.conversation_loop.estimate_messages_tokens_rough", return_value=100),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("normal request", conversation_history=history)
+    assert result["completed"] is True
+    assert result["final_response"] == "normal recovery"
+    assert provider.call_count == 4
+    assert summary.call_count == 1
+    assert agent.session_id == actor
+
+
 class TestHTTP413Compression:
     """413 errors should trigger compression, not abort as generic 4xx."""
 
@@ -1193,3 +1265,83 @@ class TestOverflowWithCompactionDisabled:
         assert result.get("failed") is True
         assert result.get("compaction_disabled") is True
         assert "auto-compaction is disabled" in result["error"]
+
+
+import concurrent.futures
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+
+from agent import conversation_compression as cc
+from run_agent import AIAgent
+
+
+@pytest.mark.parametrize('progress,expected_elapsed,expected_idle,reason', [
+    (False, 120.0, 120.0, 'idle_timeout'),
+    (True, 600.0, 0.0, 'total_ceiling'),
+])
+def test_timeout_reports_actual_wait_and_preserves_actor(
+    monkeypatch, progress, expected_elapsed, expected_idle, reason
+):
+    clock = [1000.0]
+    monkeypatch.setattr(cc.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(cc, 'resolve_context_compression_timeouts', lambda: (120.0, 600.0))
+    monkeypatch.setattr(cc, '_try_admit_compression_job', lambda: True)
+    releases = []
+    monkeypatch.setattr(cc, '_release_compression_admission', lambda *a: releases.append(True))
+
+    class Pending:
+        def add_done_callback(self, callback):
+            self.callback = callback
+
+        def result(self, timeout):
+            clock[0] += timeout
+            if progress:
+                self.fence.touch_progress()
+            raise concurrent.futures.TimeoutError()
+
+        def cancel(self):
+            return False  # a running worker cannot be cancelled by Future.cancel
+
+    pending = Pending()
+
+    def submit(worker, fence):
+        pending.worker = worker
+        pending.fence = fence
+        return pending
+
+    monkeypatch.setattr(cc, '_get_compress_timeout_executor', lambda: SimpleNamespace(submit=submit))
+    agent = AIAgent.__new__(AIAgent)
+    agent._conversation_root_id = lambda: None
+    agent.session_id = 'same-actor'
+    agent._cached_system_prompt = 'system'
+    agent._touch_activity = MagicMock()
+    agent.context_compressor = SimpleNamespace(record_timeout_failure=MagicMock())
+    warnings = []
+    agent._emit_warning = warnings.append
+    original = [{'role': 'user', 'content': 'preserve this'}]
+
+    returned, prompt = agent._compress_context(original, 'system')
+
+    assert returned is original
+    assert prompt == 'system'
+    assert agent.session_id == 'same-actor'
+    assert pending.fence.is_cancelled
+    assert not pending.fence.begin_commit()
+    # Late queued execution is gated before entering the compressor.
+    assert pending.worker(pending.fence)[0] is original
+    pending.callback(pending)
+    assert releases == [True]
+    agent.context_compressor.record_timeout_failure.assert_called_once()
+    agent._touch_activity.assert_called_once()
+    assert len(warnings) == 1
+    warning = warnings[0]
+    assert reason in warning
+    assert f'elapsed={expected_elapsed:.1f}s' in warning
+    assert f'since_progress={expected_idle:.1f}s' in warning
+    assert 'idle_budget=120.0s' in warning
+    assert 'total_ceiling=600.0s' in warning
+    assert 'same session' in warning.lower()
+    assert 'no output' not in warning.lower()
+    assert '/new' not in warning

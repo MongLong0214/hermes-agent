@@ -8248,14 +8248,15 @@ class AIAgent:
                     return system_message or ""
 
             def _on_timeout(idle, waited, since_progress):
-                logger.warning(
-                    "Context compression made no progress for %.1fs "
-                    "(total wait %.1fs, ceiling %.1fs); continuing without "
-                    "compression",
-                    since_progress,
-                    waited,
-                    total_ceiling,
+                # Progress is an activity timestamp, not proof of summary output.
+                # Match the host wait's ceiling precedence when both expire.
+                reason = "total_ceiling" if waited >= total_ceiling else "idle_timeout"
+                detail = (
+                    f"{reason}: elapsed={waited:.1f}s, idle_budget={idle:.1f}s, "
+                    f"since_progress={since_progress:.1f}s, "
+                    f"total_ceiling={total_ceiling:.1f}s"
                 )
+                logger.warning("Context compression timed out (%s); messages preserved", detail)
                 touch = getattr(self, "_touch_activity", None)
                 if callable(touch):
                     try:
@@ -8275,10 +8276,7 @@ class AIAgent:
                     record = getattr(compressor, "record_timeout_failure", None)
                     if callable(record):
                         try:
-                            record(
-                                "host compress_context timeout "
-                                "(no summary progress)"
-                            )
+                            record(f"host compress_context timeout ({detail})")
                         except Exception:
                             logger.debug(
                                 "failed to record compress_context timeout "
@@ -8288,11 +8286,10 @@ class AIAgent:
                 emit = getattr(self, "_emit_warning", None)
                 if callable(emit):
                     emit(
-                        "⚠ Context compression timed out "
-                        f"after {idle:.1f}s with no output from the summary "
-                        "model. No messages were dropped — continuing without "
-                        "compression. Run /compress to retry, /new for a clean "
-                        "session, or check auxiliary.compression."
+                        f"⚠ Context compression timed out ({detail}). "
+                        "No messages were dropped; the same session is retained. "
+                        "Automatic compression retries respect the failure cooldown. "
+                        "Use /compress for an explicit retry or check auxiliary.compression."
                     )
 
             def _on_commit_overrun(waited, ceiling):
