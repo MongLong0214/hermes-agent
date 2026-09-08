@@ -2905,6 +2905,109 @@ class TestRunConversation:
         agent.compression_enabled = False
         agent.save_trajectories = False
 
+    def test_claimed_receipt_handoff_skips_second_claim_and_reaches_model_seam(self, agent):
+        """An ACP-owned claim crosses the run-conversation boundary unchanged."""
+        from tui_gateway.turn_receipts import ClaimedReceipt, ReceiptRequest
+
+        self._setup_agent(agent)
+        request = ReceiptRequest("session-1", "turn-1", "sha256:binding")
+        claimed = ClaimedReceipt(request, "claim-token")
+        completed = {"completed": True, "final_response": "done", "messages": []}
+        receipt_adapter = MagicMock()
+        receipt_adapter.claim_after_lease.side_effect = AssertionError("second claim")
+
+        with (
+            patch(
+                "tui_gateway.turn_receipts.TurnReceiptAdapter",
+                return_value=receipt_adapter,
+            ),
+            patch(
+                "agent.conversation_loop.run_conversation", return_value=completed
+            ) as model_seam,
+        ):
+            result = agent.run_conversation(
+                "prompt",
+                conversation_history=[],
+                task_id="task-1",
+                turn_receipt=claimed,
+            )
+
+        assert result is completed
+        assert result["completed"] is True
+        receipt_adapter.claim_after_lease.assert_not_called()
+        assert model_seam.call_args.kwargs["turn_receipt"] is claimed
+        assert model_seam.call_args.kwargs["turn_receipt"].request is request
+        assert model_seam.call_args.kwargs["turn_receipt"].claim_token == "claim-token"
+
+    def test_receipt_request_claims_then_reaches_model_seam(self, agent):
+        """Ordinary callers still claim a request before model execution."""
+        from tui_gateway.turn_receipts import ClaimedReceipt, ReceiptRequest
+
+        self._setup_agent(agent)
+        request = ReceiptRequest("session-1", "turn-1", "sha256:binding")
+        claimed = ClaimedReceipt(request, "claim-token")
+        completed = {"completed": True, "final_response": "done", "messages": []}
+        receipt_adapter = MagicMock()
+        receipt_adapter.claim_after_lease.return_value = claimed
+
+        with (
+            patch(
+                "tui_gateway.turn_receipts.TurnReceiptAdapter",
+                return_value=receipt_adapter,
+            ),
+            patch(
+                "agent.conversation_loop.run_conversation", return_value=completed
+            ) as model_seam,
+        ):
+            result = agent.run_conversation(
+                "prompt",
+                conversation_history=[],
+                task_id="task-1",
+                turn_receipt=request,
+            )
+
+        assert result is completed
+        receipt_adapter.claim_after_lease.assert_called_once_with(request)
+        assert model_seam.call_args.kwargs["turn_receipt"] is claimed
+
+    def test_receipt_request_replays_without_reaching_model_seam(self, agent):
+        """Ordinary completed requests retain their pre-model replay path."""
+        from tui_gateway.turn_receipts import ReceiptRequest
+
+        self._setup_agent(agent)
+        request = ReceiptRequest("session-1", "turn-1", "sha256:binding")
+        completed_receipt = {"status": "COMPLETED"}
+        replay = {"status": "COMPLETED", "assistantContent": "durable response"}
+        receipt_adapter = MagicMock()
+        receipt_adapter.claim_after_lease.return_value = completed_receipt
+        receipt_adapter.completed_replay.return_value = replay
+
+        with (
+            patch(
+                "tui_gateway.turn_receipts.TurnReceiptAdapter",
+                return_value=receipt_adapter,
+            ),
+            patch("agent.conversation_loop.run_conversation") as model_seam,
+        ):
+            result = agent.run_conversation(
+                "prompt",
+                conversation_history=[],
+                task_id="task-1",
+                turn_receipt=request,
+            )
+
+        assert result == {
+            "final_response": "durable response",
+            "messages": [],
+            "api_calls": 0,
+            "completed": True,
+            "turn_receipt": replay,
+            "replayed": True,
+        }
+        receipt_adapter.claim_after_lease.assert_called_once_with(request)
+        receipt_adapter.completed_replay.assert_called_once_with(request)
+        model_seam.assert_not_called()
+
     def test_task_start_failure_closes_relay_turn_and_lease(self, agent):
         relay_lease = SimpleNamespace(
             parent_session_id="",

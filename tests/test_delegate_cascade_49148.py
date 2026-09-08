@@ -23,7 +23,32 @@ def _make_conn():
         " parent_session_id TEXT,"
         " model_config TEXT)"
     )
-    conn.execute("CREATE TABLE messages (session_id TEXT)")
+    conn.execute(
+        "CREATE TABLE messages ("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " session_id TEXT NOT NULL)"
+    )
+    conn.execute(
+        "CREATE TABLE turn_receipts ("
+        " turn_request_id TEXT PRIMARY KEY,"
+        " session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,"
+        " binding_digest TEXT NOT NULL CHECK (binding_digest <> ''),"
+        " receipt_identity_json TEXT,"
+        " receipt_identity_digest TEXT,"
+        " target_bind_receipt_json TEXT,"
+        " target_bind_receipt_digest TEXT,"
+        " status TEXT NOT NULL,"
+        " claim_token TEXT,"
+        " terminal_message_id INTEGER REFERENCES messages(id) ON DELETE CASCADE,"
+        " response_digest TEXT,"
+        " abort_receipt_id TEXT,"
+        " abort_evidence_digest TEXT,"
+        " abort_reason_code TEXT,"
+        " created_at REAL NOT NULL,"
+        " claimed_at REAL,"
+        " completed_at REAL,"
+        " aborted_at REAL)"
+    )
     return conn
 
 

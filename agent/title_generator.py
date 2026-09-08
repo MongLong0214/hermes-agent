@@ -441,12 +441,25 @@ def generate_title(
         return None
 
 
-def _persist_session_title(session_db, session_id, title, *, source, dedupe=True):
+def _persist_session_title(
+    session_db,
+    session_id,
+    title,
+    *,
+    source,
+    dedupe=True,
+    attempt_bound=False,
+    expected_derived_title=None,
+    expected_derived_source=None,
+):
     """Persist a title at *source* authority, recovering from name collisions.
 
     The write goes through ``set_auto_title`` (precedence check + write in one
     transaction) so a manual ``/title`` set while generation was in flight is
-    never overwritten. ``ValueError`` means the name is taken by an unrelated
+    never overwritten. Background workers additionally use the store's
+    attempt-bound transaction when available, so a compression rotation can
+    move their expected derived title to its live continuation before the LLM
+    result arrives. ``ValueError`` means the name is taken by an unrelated
     session (the unique-title index); rather than leave the session untitled
     (#50537), append a ``#N`` suffix via ``get_next_title_in_lineage``.
 
@@ -462,8 +475,31 @@ def _persist_session_title(session_db, session_id, title, *, source, dedupe=True
     title already held the row (nothing was written).
     """
     auto_fn = getattr(session_db, "set_auto_title", None)
+    attempt_fn = getattr(type(session_db), "set_auto_title_for_attempt", None)
 
     def _set(candidate):
+        if attempt_bound:
+            if not callable(attempt_fn):
+                logger.debug(
+                    "Skipping %s title: attempt-bound persistence is unavailable",
+                    source,
+                )
+                return None
+            if not attempt_fn(
+                session_db,
+                session_id,
+                candidate,
+                source=source,
+                expected_title=expected_derived_title,
+                expected_source=expected_derived_source,
+            ):
+                logger.debug(
+                    "Skipping %s title: the originating attempt no longer "
+                    "owns a matching live session",
+                    source,
+                )
+                return None
+            return candidate
         if auto_fn is not None:
             if not auto_fn(session_id, candidate, source=source):
                 logger.debug(
@@ -536,6 +572,7 @@ def auto_title_session(
     main_runtime: dict = None,
     title_callback: Optional[TitleCallback] = None,
     runtime_validator: Optional[RuntimeValidator] = None,
+    expected_derived_title: Optional[str] = None,
 ) -> None:
     """Generate and store the model title for a session.
 
@@ -563,6 +600,7 @@ def auto_title_session(
             main_runtime=main_runtime,
             title_callback=title_callback,
             runtime_validator=runtime_validator,
+            expected_derived_title=expected_derived_title,
         )
     except Exception as e:
         # WARNING (not debug) so operators see it in agent.log; the message
@@ -588,6 +626,7 @@ def _auto_title_session(
     main_runtime: dict = None,
     title_callback: Optional[TitleCallback] = None,
     runtime_validator: Optional[RuntimeValidator] = None,
+    expected_derived_title: Optional[str] = None,
 ) -> None:
     """Body of :func:`auto_title_session` — see its docstring."""
     if not session_db or not session_id:
@@ -595,11 +634,28 @@ def _auto_title_session(
 
     # Skip when a title of at least LLM authority is already stored. A derived
     # title is expected here — upgrading it is the whole point of this call.
+    expected_derived_source = None
     try:
         source_fn = getattr(session_db, "get_session_title_source", None)
         if source_fn is not None:
             existing_source = source_fn(session_id)
             if existing_source is not None and existing_source != "derived":
+                return
+            if existing_source == "derived":
+                title_fn = getattr(session_db, "get_session_title", None)
+                if not callable(title_fn):
+                    return
+                current_title = title_fn(session_id)
+                if not current_title:
+                    return
+                if (
+                    expected_derived_title is not None
+                    and current_title != expected_derived_title
+                ):
+                    return
+                expected_derived_title = current_title
+                expected_derived_source = "derived"
+            elif expected_derived_title is not None:
                 return
         elif session_db.get_session_title(session_id):
             return
@@ -643,7 +699,15 @@ def _auto_title_session(
             return
 
     try:
-        persisted = _persist_session_title(session_db, session_id, title, source=source)
+        persisted = _persist_session_title(
+            session_db,
+            session_id,
+            title,
+            source=source,
+            attempt_bound=True,
+            expected_derived_title=expected_derived_title,
+            expected_derived_source=expected_derived_source,
+        )
         if persisted is None:
             return
         logger.debug("Auto-generated session title: %s", persisted)
@@ -722,6 +786,15 @@ def maybe_auto_title(
     if not session_db or not session_id or not user_message:
         return
 
+    title_getter = getattr(session_db, "get_session_title", None)
+    if callable(title_getter):
+        try:
+            if str(title_getter(session_id) or "").strip():
+                return
+        except Exception:
+            logger.debug("Title check failed for %s", session_id, exc_info=True)
+            return
+
     # Count the real questions behind us to detect the opening turn.
     # ``conversation_history`` is the state BEFORE this turn's message is
     # appended when called from the turn prologue, and after it when called
@@ -745,7 +818,9 @@ def maybe_auto_title(
         logger.debug("Auto-title skipped: auxiliary.title_generation.enabled=false")
         return
 
-    apply_instant_title(session_db, session_id, user_message, title_callback)
+    expected_derived_title = apply_instant_title(
+        session_db, session_id, user_message, title_callback
+    )
 
     thread = threading.Thread(
         target=auto_title_session,
@@ -755,6 +830,7 @@ def maybe_auto_title(
             "main_runtime": main_runtime,
             "title_callback": title_callback,
             "runtime_validator": runtime_validator,
+            "expected_derived_title": expected_derived_title,
         },
         daemon=True,
         name="auto-title",

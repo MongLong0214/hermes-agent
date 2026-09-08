@@ -55,9 +55,6 @@ from toolset_distributions import (
 from model_tools import TOOL_TO_TOOLSET_MAP
 
 
-# Global configuration for worker processes
-_WORKER_CONFIG = {}
-
 # All possible tools - auto-derived from the master mapping in model_tools.py.
 # This stays in sync automatically when new tools are added to TOOL_TO_TOOLSET_MAP.
 # Used for consistent schema in Arrow/Parquet (HuggingFace datasets) and for

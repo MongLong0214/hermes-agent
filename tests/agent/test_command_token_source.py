@@ -310,10 +310,21 @@ class TestAuxiliaryResolverHonoursKeyCmd:
         import agent.auxiliary_client as ac
         from hermes_cli import runtime_provider as rp
 
-        monkeypatch.setattr(
-            rp, "_get_named_custom_provider",
-            lambda name: dict(entry, name="dbx") if name == "dbx" else None,
-        )
+        from types import MappingProxyType
+
+        def selected_snapshot(name):
+            if name != "dbx":
+                return None
+            return MappingProxyType({
+                "kind": "providers", "name": "dbx", "routing_hint": "dbx",
+                "base_url": entry.get("base_url", ""), "api_key": entry.get("api_key", ""),
+                "key_env": "", "key_cmd": entry.get("key_cmd", ""),
+                "model": entry.get("model", ""), "api_mode": "",
+                "extra_body": MappingProxyType({}), "extra_headers": MappingProxyType({}),
+                "max_output_tokens": None,
+            })
+
+        monkeypatch.setattr(rp, "_get_named_custom_provider_snapshot", selected_snapshot)
         seen = {}
 
         def _spy(*, api_key, base_url, **kw):

@@ -103,6 +103,17 @@ def _session_source_for_agent(platform: Optional[str]) -> str:
     return platform or "cli"
 
 
+def is_turn_receipt_runtime_supported(
+    api_mode: object, provider: object, moa_config: object = None
+) -> bool:
+    """Whether a runtime can atomically finalize a durable turn receipt."""
+    return (
+        api_mode == "chat_completions"
+        and str(provider or "").strip().lower() != "moa"
+        and moa_config is None
+    )
+
+
 # OpenAI lazy proxy + safe stdio + proxy URL helpers — see agent/process_bootstrap.py.
 # `OpenAI` is re-exported here so `patch("run_agent.OpenAI", ...)` in tests works.
 # The other `# noqa: F401` re-exports below cover names accessed via
@@ -2001,7 +2012,10 @@ class AIAgent:
                 if timestamp is not None:
                     msg["timestamp"] = timestamp
 
-    def _persist_session(self, messages: List[Dict], conversation_history: List[Dict] = None):
+    def _persist_session(
+        self, messages: List[Dict], conversation_history: List[Dict] = None, *,
+        terminal_receipt_hold=None,
+    ):
         """Save session state to both JSON log and SQLite on any exit path.
 
         Ensures conversations are never lost, even on errors or early returns.
@@ -2022,24 +2036,27 @@ class AIAgent:
 
         persist_lock = getattr(self, "_session_persist_lock", None)
 
-        def _persist_and_drain() -> None:
+        def _persist_and_drain():
             self._drop_trailing_empty_response_scaffolding(messages)
             self._session_messages = messages
             self._save_session_log(messages)
-            self._flush_messages_to_session_db(messages, conversation_history)
+            flushed = self._flush_messages_to_session_db(
+                messages, conversation_history,
+                terminal_receipt_hold=terminal_receipt_hold,
+            )
             # Drain async token-accounting deltas at every persist point (turn
             # finalize + error exits) so a crash after this line loses at most
             # the in-flight API call's delta. Cheap no-op when nothing queued.
             if self._session_db is not None:
                 self._session_db.flush_token_counts()
             note_turn_persisted(self)
+            return flushed
 
         if persist_lock is None:
-            _persist_and_drain()
-            return
+            return _persist_and_drain()
 
         with persist_lock:
-            _persist_and_drain()
+            return _persist_and_drain()
 
     def _drop_trailing_empty_response_scaffolding(self, messages: List[Dict]) -> None:
         """Remove private empty-response retry/failure scaffolding from transcript tails.
@@ -2103,19 +2120,26 @@ class AIAgent:
         self,
         messages: List[Dict],
         conversation_history: Optional[List[Dict]] = None,
+        *,
+        terminal_receipt_hold=None,
     ):
         """Serialize direct and turn-boundary session flushes per agent."""
         persist_lock = getattr(self, "_session_persist_lock", None)
         if persist_lock is None:
-            return self._flush_messages_to_session_db_unlocked(messages, conversation_history)
+            return self._flush_messages_to_session_db_unlocked(
+                messages, conversation_history, terminal_receipt_hold=terminal_receipt_hold
+            )
         with persist_lock:
-            return self._flush_messages_to_session_db_unlocked(messages, conversation_history)
+            return self._flush_messages_to_session_db_unlocked(
+                messages, conversation_history, terminal_receipt_hold=terminal_receipt_hold
+            )
 
     def _flush_messages_to_session_db_unlocked(
         self,
         messages: List[Dict],
         conversation_history: Optional[List[Dict]] = None,
         _adoption_budget: int = 1,
+        terminal_receipt_hold=None,
     ):
         """Persist any un-flushed messages to the SQLite session store.
 
@@ -2144,6 +2168,24 @@ class AIAgent:
             return None
         if not self._session_db:
             return None
+        if terminal_receipt_hold is not None:
+            hold_message = terminal_receipt_hold.terminal_message
+            hold_index = terminal_receipt_hold.terminal_message_index
+            if (
+                not isinstance(hold_index, int)
+                or isinstance(hold_index, bool)
+                or hold_index < 0
+                or hold_index >= len(messages)
+                or not isinstance(hold_message, dict)
+                or messages[hold_index] is not hold_message
+                or sum(message is hold_message for message in messages) != 1
+                or hold_message.get("role") != "assistant"
+                or hold_message.get("display_kind") == "hidden"
+                or hold_message.get("tool_calls")
+                or not isinstance(hold_message.get("content"), str)
+                or hold_message.get(_DB_PERSISTED_MARKER)
+            ):
+                raise RuntimeError("terminal turn receipt hold is not persistable")
         # Persist user-message override (#48677 chokepoint): historically this
         # mutated the live `messages` list in place, which — on the early
         # crash-resilience persist that runs BEFORE the API call is built —
@@ -2387,6 +2429,36 @@ class AIAgent:
             # re-writes the whole tail (same recovery contract as before,
             # minus the partial-prefix case that could double-pay counters).
             if _batch_rows:
+                terminal_turn_receipt = None
+                if terminal_receipt_hold is not None:
+                    from hermes_state import TerminalTurnReceipt
+
+                    hold_message = terminal_receipt_hold.terminal_message
+                    terminal_indices = [
+                        index
+                        for index, message in enumerate(_batch_msgs)
+                        if message is hold_message
+                    ]
+                    if len(terminal_indices) != 1:
+                        raise RuntimeError("terminal receipt hold was not selected for batch")
+                    terminal_message_index = terminal_indices[0]
+                    terminal_row = _batch_rows[terminal_message_index]
+                    if (
+                        terminal_row.get("role") != "assistant"
+                        or terminal_row.get("display_kind") == "hidden"
+                        or terminal_row.get("tool_calls")
+                        or not isinstance(terminal_row.get("content"), str)
+                    ):
+                        raise RuntimeError("terminal receipt hold was not selected for batch")
+                    claimed = terminal_receipt_hold.claimed
+                    terminal_turn_receipt = TerminalTurnReceipt(
+                        session_id=claimed.request.session_id,
+                        turn_request_id=claimed.request.turn_request_id,
+                        binding_digest=claimed.request.binding_digest,
+                        claim_token=claimed.claim_token,
+                        response_digest=terminal_receipt_hold.response_digest,
+                        terminal_message_index=terminal_message_index,
+                    )
                 self._session_db.append_messages_batch(
                     session_id=self.session_id,
                     messages=_batch_rows,
@@ -2400,6 +2472,7 @@ class AIAgent:
                         self, "_active_session_turn_lease_ttl_seconds", 300.0
                     )
                     or 300.0,
+                    terminal_turn_receipt=terminal_turn_receipt,
                 )
                 for _written in _batch_msgs:
                     _written[_DB_PERSISTED_MARKER] = True
@@ -2470,6 +2543,7 @@ class AIAgent:
                                 messages,
                                 conversation_history,
                                 _adoption_budget=0,
+                                terminal_receipt_hold=terminal_receipt_hold,
                             )
                 # No live tip (or budget exhausted): fail closed — never guess
                 # a target session. The per-turn diagnostic flag lets the
@@ -5277,12 +5351,16 @@ class AIAgent:
         )
 
     def _replace_primary_openai_client(self, *, reason: str) -> bool:
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+
         with self._openai_client_lock():
             old_client = getattr(self, "client", None)
             try:
                 new_client = self._build_primary_client_for_active_provider(
                     reason=reason,
                 )
+            except GeminiOutboundDenied:
+                raise
             except Exception as exc:
                 logger.warning(
                     "Failed to rebuild shared primary client (%s) %s error=%s",
@@ -5302,6 +5380,17 @@ class AIAgent:
         return True
 
     def _ensure_primary_openai_client(self, *, reason: str) -> Any:
+        from agent.agent_runtime_helpers import deny_gemini_outbound_route
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+        _kwargs = getattr(self, "_client_kwargs", None) or {}
+        deny_gemini_outbound_route(
+            canonical_provider=getattr(self, "provider", ""),
+            model=getattr(self, "model", ""),
+            base_url=_kwargs.get("base_url") or getattr(self, "base_url", ""),
+            api_mode=getattr(self, "api_mode", ""),
+            routing_hint=getattr(self, "requested_provider", "") or getattr(self, "provider", ""),
+        )
         with self._openai_client_lock():
             client = getattr(self, "client", None)
             if client is not None and not self._is_openai_client_closed(client):
@@ -5311,6 +5400,8 @@ class AIAgent:
                 new_client = self._create_openai_client(
                     self._client_kwargs, reason=reason, shared=True
                 )
+            except GeminiOutboundDenied:
+                raise
             except Exception as exc:
                 logger.warning(
                     "Failed to recreate closed OpenAI client (%s) %s error=%s",
@@ -5388,8 +5479,17 @@ class AIAgent:
         return cache
 
     def _create_request_openai_client(self, *, reason: str, api_kwargs: Optional[dict] = None) -> Any:
+        from agent.agent_runtime_helpers import deny_gemini_outbound_route
         from unittest.mock import Mock
 
+        _kwargs = getattr(self, "_client_kwargs", None) or {}
+        deny_gemini_outbound_route(
+            canonical_provider=getattr(self, "provider", ""),
+            model=getattr(self, "model", ""),
+            base_url=_kwargs.get("base_url") or getattr(self, "base_url", ""),
+            api_mode=getattr(self, "api_mode", ""),
+            routing_hint=getattr(self, "requested_provider", "") or getattr(self, "provider", ""),
+        )
         primary_client = self._ensure_primary_openai_client(reason=reason)
         if self.provider == "moa":
             return primary_client
@@ -6118,6 +6218,19 @@ class AIAgent:
         new token into the client kwargs, and rebuilds the primary OpenAI
         client. Returns True when a usable token+base_url were obtained.
         """
+        from agent.agent_runtime_helpers import deny_gemini_outbound_route
+
+        # Provider identity, not a leftover non-Google URL, owns this refresh.
+        deny_gemini_outbound_route(
+            canonical_provider=getattr(self, "provider", ""),
+            model=getattr(self, "model", ""),
+            api_mode=getattr(self, "api_mode", ""),
+            routing_hint=getattr(self, "requested_provider", "") or getattr(self, "provider", ""),
+        )
+        deny_gemini_outbound_route(
+            base_url=(getattr(self, "_client_kwargs", None) or {}).get("base_url")
+            or getattr(self, "base_url", ""),
+        )
         if self.api_mode != "chat_completions" or self.provider != "vertex":
             return False
 
@@ -8501,6 +8614,7 @@ class AIAgent:
         persist_user_display_kind: Optional[str] = None,
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         moa_config: Optional[dict[str, Any]] = None,
+        turn_receipt=None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         # A review deliberately shares this agent's session_id for prompt-cache
@@ -8556,6 +8670,7 @@ class AIAgent:
         task_started = False
         task_finished = False
         relay_outcome = "failed"
+        claimed_turn_receipt = None
 
         def _stop_durable_turn_lease_refresher() -> None:
             nonlocal durable_turn_lease_turn_active
@@ -8816,6 +8931,59 @@ class AIAgent:
                     daemon=True,
                 )
 
+            # Receipt v1 is a closed execution profile: only the direct,
+            # standard chat-completions transport can claim it.  Keep this
+            # ahead of relay/task/model setup and, critically, ahead of the
+            # claim so an unsupported runtime cannot leave a durable receipt
+            # in CLAIMED without a compatible atomic finalizer.
+            if turn_receipt is not None and not is_turn_receipt_runtime_supported(
+                getattr(self, "api_mode", None),
+                getattr(self, "provider", None),
+                moa_config,
+            ):
+                return {
+                    "final_response": "",
+                    "messages": list(conversation_history or []),
+                    "api_calls": 0,
+                    "completed": False,
+                    "failed": True,
+                    "error": "turn_receipt_runtime_unsupported",
+                    "failure_reason": "turn_receipt_runtime_unsupported",
+                }
+
+            # Receipt claiming is deliberately after the durable session lease
+            # and before any relay/task/model/tool setup.  The immutable value
+            # remains local to this invocation; cached agents never retain it.
+            if turn_receipt is not None:
+                from tui_gateway.turn_receipts import ClaimedReceipt, TurnReceiptAdapter
+
+                if isinstance(turn_receipt, ClaimedReceipt):
+                    claimed_turn_receipt = turn_receipt
+                else:
+                    adapter = TurnReceiptAdapter(getattr(self, "_session_db", None))
+                    claimed_or_status = adapter.claim_after_lease(turn_receipt)
+                    if isinstance(claimed_or_status, ClaimedReceipt):
+                        claimed_turn_receipt = claimed_or_status
+                    else:
+                        replay = adapter.completed_replay(turn_receipt)
+                        if replay is not None:
+                            return {
+                                "final_response": replay["assistantContent"],
+                                "messages": list(conversation_history or []),
+                                "api_calls": 0,
+                                "completed": True,
+                                "turn_receipt": replay,
+                                "replayed": True,
+                            }
+                        return {
+                            "final_response": "",
+                            "messages": list(conversation_history or []),
+                            "api_calls": 0,
+                            "completed": False,
+                            "in_progress": True,
+                            "turn_receipt": claimed_or_status,
+                        }
+
 
             relay_lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(
                 profile_key=relay_runtime.current_profile_key(),
@@ -8875,6 +9043,7 @@ class AIAgent:
                         persist_user_display_kind=persist_user_display_kind,
                         persist_user_display_metadata=persist_user_display_metadata,
                         moa_config=moa_config,
+                        turn_receipt=claimed_turn_receipt,
                     )
                 finally:
                     # The lease remains held through relay/task finalization, but

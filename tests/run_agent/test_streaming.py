@@ -232,33 +232,26 @@ class TestStreamingAccumulator:
     @patch("run_agent.AIAgent._create_request_openai_client")
     @patch("run_agent.AIAgent._close_request_openai_client")
     def test_native_gemini_endpoint_omits_stream_options(self, mock_close, mock_create):
-        """Google's native Gemini REST endpoint rejects OpenAI-only stream_options."""
+        """Native Gemini is denied before a client or stream can be created."""
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
         from run_agent import AIAgent
 
-        mock_client = MagicMock()
-        mock_client.chat.completions.create.return_value = iter([
-            _make_stream_chunk(content="Paris", finish_reason="stop", model="gemini"),
-        ])
-        mock_create.return_value = mock_client
+        with pytest.raises(GeminiOutboundDenied) as exc_info:
+            AIAgent(
+                api_key="test-key",
+                base_url="https://generativelanguage.googleapis.com/v1beta",
+                model="gemini-3-flash-preview",
+                provider="gemini",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
 
-        agent = AIAgent(
-            api_key="test-key",
-            base_url="https://generativelanguage.googleapis.com/v1beta",
-            model="gemini-3-flash-preview",
-            provider="gemini",
-            quiet_mode=True,
-            skip_context_files=True,
-            skip_memory=True,
-        )
-        agent.api_mode = "chat_completions"
-        agent._interrupt_requested = False
-
-        response = agent._interruptible_streaming_api_call({})
-
-        assert response.choices[0].message.content == "Paris"
-        call_kwargs = mock_client.chat.completions.create.call_args.kwargs
-        assert call_kwargs["stream"] is True
-        assert "stream_options" not in call_kwargs
+        assert str(exc_info.value) == "Gemini outbound requests are disabled."
+        assert exc_info.value.code == "gemini_outbound_denied"
+        assert vars(exc_info.value) == {}
+        mock_create.assert_not_called()
+        mock_close.assert_not_called()
 
 
 

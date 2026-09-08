@@ -6604,6 +6604,9 @@ class BasePlatformAdapter(ABC):
                                     chat_id=event.source.chat_id,
                                     thread_id=getattr(event.source, "thread_id", None),
                                     content=text_content,
+                                    adapter_profile=getattr(
+                                        delivery_adapter, "_owner_profile", None
+                                    ),
                                 )
                                 await asyncio.to_thread(mark_attempting, _obligation_id)
                         except Exception:
@@ -6626,11 +6629,41 @@ class BasePlatformAdapter(ABC):
                             if getattr(result, "success", False):
                                 await asyncio.to_thread(mark_delivered, _obligation_id)
                             else:
-                                await asyncio.to_thread(
-                                    mark_failed,
-                                    _obligation_id,
-                                    str(getattr(result, "error", "") or ""),
+                                _delivery_error = str(
+                                    getattr(result, "error", "") or ""
                                 )
+                                await asyncio.to_thread(
+                                    mark_failed, _obligation_id, _delivery_error
+                                )
+                                # A replacement can finish reconnecting while
+                                # this in-flight send is failing.  The reconnect
+                                # hook may have swept too early; signal another
+                                # scoped transactional sweep once the failed row
+                                # is durable.  Atomic claiming deduplicates
+                                # concurrent reconnect and late-failure signals.
+                                if _delivery_error == "send_path_degraded":
+                                    _live_adapter = self._final_delivery_adapter(
+                                        event.source
+                                    )
+                                    _runtime_redeliver = getattr(
+                                        getattr(self, "gateway_runner", None),
+                                        "_redeliver_failed_obligations_for_platform",
+                                        None,
+                                    )
+                                    if (
+                                        _live_adapter is not delivery_adapter
+                                        and callable(_runtime_redeliver)
+                                    ):
+                                        _runtime_result = _runtime_redeliver(
+                                            event.source.platform,
+                                            profile=getattr(
+                                                delivery_adapter,
+                                                "_owner_profile",
+                                                None,
+                                            ),
+                                        )
+                                        if inspect.isawaitable(_runtime_result):
+                                            await _runtime_result
                         except Exception:
                             logger.debug(
                                 "delivery ledger update failed", exc_info=True

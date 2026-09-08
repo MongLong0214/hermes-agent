@@ -6,6 +6,7 @@ import asyncio
 from datetime import datetime, timezone
 import base64
 import contextvars
+import hashlib
 import json
 import logging
 import os
@@ -79,6 +80,7 @@ from agent.context_compressor import (
     ContextCompressor,
 )
 from agent.interrupt_compat import request_hard_interrupt
+from tui_gateway.turn_receipts import ClaimedReceipt, ReceiptRequest, TurnReceiptAdapter
 from tools.approval import (
     reset_hermes_interactive_context,
     set_hermes_interactive_context,
@@ -1779,6 +1781,69 @@ class HermesACPAgent(acp.Agent):
         next_cursor = sessions[-1].session_id if has_more and sessions else None
         return ListSessionsResponse(sessions=sessions, next_cursor=next_cursor)
 
+    @staticmethod
+    def _terminal_receipt_refusal() -> PromptResponse:
+        return PromptResponse(
+            stop_reason="refusal",
+            field_meta={"hermes": {"acpTerminalReceipt": {"status": "REFUSED"}}},
+        )
+
+    @staticmethod
+    def _target_bind_receipt_from_wire(
+        receipt: Any, session_id: str
+    ) -> dict[str, Any] | None:
+        """Adapt one closed ACP target-bind wire receipt to Hermes' internal form."""
+        wire_keys = {
+            "domain", "version", "actor_id", "binding_generation",
+            "executor_runtime_identity", "requested_session_id", "lineage_root_digest",
+            "receipt_digest",
+        }
+        if (
+            not isinstance(receipt, dict)
+            or set(receipt) != wire_keys
+            or receipt.get("domain") != "hermes.target-bind"
+            or type(receipt.get("version")) is not int
+            or receipt["version"] != 1
+            or receipt.get("requested_session_id") != session_id
+        ):
+            return None
+        return {"schema": "hermes.target-bind-receipt", **receipt}
+
+    @staticmethod
+    def _terminal_receipt_request(
+        session_id: str, receipt_identity: dict[str, Any], receipt: Any
+    ) -> ReceiptRequest | None:
+        if not isinstance(receipt, dict):
+            return None
+        turn_request_id = receipt_identity.get("turnRequestId")
+        receipt_identity_digest = receipt.get("receiptIdentityDigest")
+        if (
+            not isinstance(turn_request_id, str)
+            or not turn_request_id
+            or not isinstance(receipt_identity_digest, str)
+            or not receipt_identity_digest
+        ):
+            return None
+        return ReceiptRequest(session_id, turn_request_id, receipt_identity_digest)
+
+    async def _terminal_receipt_response(
+        self, session_id: str, receipt: dict[str, Any], *, refusal: bool = False
+    ) -> PromptResponse:
+        assistant_content = receipt.get("assistantContent")
+        if isinstance(assistant_content, str) and self._conn:
+            try:
+                await self._conn.session_update(
+                    session_id, acp.update_agent_message_text(assistant_content)
+                )
+            except Exception:
+                logger.debug(
+                    "Could not replay ACP terminal receipt for %s", session_id, exc_info=True
+                )
+        return PromptResponse(
+            stop_reason="refusal" if refusal else "end_turn",
+            field_meta={"hermes": {"acpTerminalReceipt": receipt}},
+        )
+
     # ---- Prompt (core) ------------------------------------------------------
 
     async def prompt(
@@ -1794,10 +1859,272 @@ class HermesACPAgent(acp.Agent):
         **kwargs: Any,
     ) -> PromptResponse:
         """Run Hermes on the user's prompt and stream events back to the editor."""
-        state = self.session_manager.get_session(session_id)
+        hermes_metadata = kwargs.get("hermes")
+        terminal_receipt_present = (
+            isinstance(hermes_metadata, dict)
+            and "acpTerminalReceipt" in hermes_metadata
+        )
+        # Terminal-receipt prompts inspect only an already-cached state first.
+        # A cache miss must validate the durable receipt before any source-based
+        # restore can call _make_agent.
+        state = (
+            self.session_manager._get_cached_session(session_id)
+            if terminal_receipt_present
+            else self.session_manager.get_session(session_id)
+        )
+        terminal_receipt_db_hint = None
+        if state is None and terminal_receipt_present:
+            # A non-ACP session can be materialized only after the durable
+            # receipt evidence has authenticated this exact target. Ordinary
+            # ACP paths retain SessionManager's source fence above.
+            if set(hermes_metadata) != {"acpTerminalReceipt"}:
+                return self._terminal_receipt_refusal()
+            metadata = hermes_metadata["acpTerminalReceipt"]
+            if not isinstance(metadata, dict) or set(metadata) != {
+                "operation", "receiptIdentity", "targetBindReceipt"
+            }:
+                return self._terminal_receipt_refusal()
+            operation = metadata["operation"]
+            receipt_identity = metadata["receiptIdentity"]
+            target_bind_receipt = self._target_bind_receipt_from_wire(
+                metadata["targetBindReceipt"], session_id
+            )
+            if (
+                not isinstance(operation, str)
+                or operation not in {"execute", "status"}
+                or not isinstance(receipt_identity, dict)
+                or target_bind_receipt is None
+            ):
+                return self._terminal_receipt_refusal()
+            terminal_receipt_db_hint = self.session_manager._get_db()
+            if terminal_receipt_db_hint is None:
+                return self._terminal_receipt_refusal()
+            try:
+                admission = terminal_receipt_db_hint.validate_acp_turn_receipt_request(
+                    session_id, receipt_identity, target_bind_receipt
+                )
+                receipt_identity = admission["receiptIdentity"]
+                target_bind_receipt = admission["targetBindReceipt"]
+            except Exception:
+                logger.debug("ACP terminal receipt target refused", exc_info=True)
+                return self._terminal_receipt_refusal()
+
+            # A cache-miss status request is strictly a durable read: never
+            # build an AIAgent or materialize its transcript merely to report
+            # receipt state.
+            if operation == "status":
+                adapter = TurnReceiptAdapter(terminal_receipt_db_hint)
+                try:
+                    receipt = terminal_receipt_db_hint.get_acp_turn_receipt(
+                        session_id, receipt_identity, target_bind_receipt
+                    )
+                except Exception:
+                    logger.debug("ACP terminal receipt status refused", exc_info=True)
+                    return self._terminal_receipt_refusal()
+                if receipt is None:
+                    return await self._terminal_receipt_response(
+                        session_id,
+                        {
+                            "status": "NEVER_FOUND",
+                            "turnRequestId": receipt_identity["turnRequestId"],
+                        },
+                    )
+                if receipt.get("status") == "COMPLETED":
+                    request = self._terminal_receipt_request(
+                        session_id, receipt_identity, receipt
+                    )
+                    if request is None:
+                        return self._terminal_receipt_refusal()
+                    try:
+                        replay = adapter.completed_replay(request)
+                    except Exception:
+                        logger.debug("ACP terminal receipt replay refused", exc_info=True)
+                        return self._terminal_receipt_refusal()
+                    if replay is None:
+                        return self._terminal_receipt_refusal()
+                    return await self._terminal_receipt_response(session_id, replay)
+                return await self._terminal_receipt_response(session_id, receipt)
+
+            # The exact terminal user bytes are closed over before an
+            # exceptional non-ACP restore can build an agent or load history.
+            if len(prompt) != 1 or not isinstance(prompt[0], TextContentBlock):
+                return self._terminal_receipt_refusal()
+            raw_user_content = prompt[0].text
+            if not isinstance(raw_user_content, str):
+                return self._terminal_receipt_refusal()
+            expected_prompt_digest = "sha256:" + hashlib.sha256(
+                json.dumps(raw_user_content, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            if receipt_identity.get("promptDigest") != expected_prompt_digest:
+                return self._terminal_receipt_refusal()
+
+            state = self.session_manager._restore_authorized_terminal_receipt_target(
+                session_id, db=terminal_receipt_db_hint
+            )
+            if state is None:
+                # A valid receipt for an ACP-owned row retains the established
+                # ordinary restore path, but only after the receipt preflight.
+                state = self.session_manager.get_session(session_id)
+
         if state is None:
             logger.error("prompt: session %s not found", session_id)
-            return PromptResponse(stop_reason="refusal")
+            return (
+                self._terminal_receipt_refusal()
+                if terminal_receipt_present
+                else PromptResponse(stop_reason="refusal")
+            )
+
+        terminal_receipt: ClaimedReceipt | None = None
+        terminal_receipt_db = None
+        terminal_receipt_identity: dict[str, Any] | None = None
+        terminal_receipt_target: dict[str, Any] | None = None
+        if terminal_receipt_present:
+            hermes_metadata = kwargs["hermes"]
+            if set(hermes_metadata) != {"acpTerminalReceipt"}:
+                return self._terminal_receipt_refusal()
+            metadata = hermes_metadata["acpTerminalReceipt"]
+            if not isinstance(metadata, dict) or set(metadata) != {
+                "operation", "receiptIdentity", "targetBindReceipt"
+            }:
+                return self._terminal_receipt_refusal()
+            operation = metadata["operation"]
+            receipt_identity = metadata["receiptIdentity"]
+            target_bind_receipt = self._target_bind_receipt_from_wire(
+                metadata["targetBindReceipt"], session_id
+            )
+            if (
+                not isinstance(operation, str)
+                or operation not in {"execute", "status"}
+                or not isinstance(receipt_identity, dict)
+                or target_bind_receipt is None
+            ):
+                return self._terminal_receipt_refusal()
+            db = (
+                terminal_receipt_db_hint
+                if terminal_receipt_db_hint is not None
+                else getattr(state.agent, "_session_db", None)
+            )
+            if db is None:
+                return self._terminal_receipt_refusal()
+            current_agent_session_id = getattr(state.agent, "session_id", None) or state.session_id
+            try:
+                admission = db.validate_acp_turn_receipt_request(
+                    session_id, receipt_identity, target_bind_receipt
+                )
+                receipt_identity = admission["receiptIdentity"]
+                target_bind_receipt = admission["targetBindReceipt"]
+                target_session_id = target_bind_receipt["requested_session_id"]
+                if (
+                    db.get_conversation_root(current_agent_session_id)
+                    != db.get_conversation_root(target_session_id)
+                ):
+                    return self._terminal_receipt_refusal()
+            except Exception:
+                logger.debug("ACP terminal receipt target refused", exc_info=True)
+                return self._terminal_receipt_refusal()
+            adapter = TurnReceiptAdapter(db)
+            if operation == "status":
+                try:
+                    receipt = db.get_acp_turn_receipt(
+                        session_id, receipt_identity, target_bind_receipt
+                    )
+                except Exception:
+                    logger.debug("ACP terminal receipt status refused", exc_info=True)
+                    return self._terminal_receipt_refusal()
+                if receipt is None:
+                    return await self._terminal_receipt_response(
+                        session_id,
+                        {
+                            "status": "NEVER_FOUND",
+                            "turnRequestId": receipt_identity["turnRequestId"],
+                        },
+                    )
+                if receipt.get("status") == "COMPLETED":
+                    request = self._terminal_receipt_request(
+                        session_id, receipt_identity, receipt
+                    )
+                    if request is None:
+                        return self._terminal_receipt_refusal()
+                    try:
+                        replay = adapter.completed_replay(request)
+                    except Exception:
+                        logger.debug("ACP terminal receipt replay refused", exc_info=True)
+                        return self._terminal_receipt_refusal()
+                    if replay is None:
+                        return self._terminal_receipt_refusal()
+                    return await self._terminal_receipt_response(session_id, replay)
+                return await self._terminal_receipt_response(session_id, receipt)
+
+            if len(prompt) != 1 or not isinstance(prompt[0], TextContentBlock):
+                return self._terminal_receipt_refusal()
+            user_content = prompt[0].text
+            if not isinstance(user_content, str):
+                return self._terminal_receipt_refusal()
+            expected_prompt_digest = "sha256:" + hashlib.sha256(
+                json.dumps(user_content, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            if receipt_identity.get("promptDigest") != expected_prompt_digest:
+                return self._terminal_receipt_refusal()
+            try:
+                receipt = db.prepare_acp_turn_receipt(
+                    session_id, receipt_identity, target_bind_receipt
+                )
+            except Exception:
+                logger.debug("ACP terminal receipt admission refused", exc_info=True)
+                return self._terminal_receipt_refusal()
+            request = self._terminal_receipt_request(session_id, receipt_identity, receipt)
+            if request is None:
+                return self._terminal_receipt_refusal()
+            if receipt.get("status") == "COMPLETED":
+                try:
+                    replay = adapter.completed_replay(request)
+                except Exception:
+                    logger.debug("ACP terminal receipt replay refused", exc_info=True)
+                    return self._terminal_receipt_refusal()
+                if replay is None:
+                    return self._terminal_receipt_refusal()
+                return await self._terminal_receipt_response(session_id, replay)
+            if receipt.get("status") != "PREPARED":
+                return await self._terminal_receipt_response(session_id, receipt)
+            from run_agent import is_turn_receipt_runtime_supported
+
+            if not is_turn_receipt_runtime_supported(
+                getattr(state.agent, "api_mode", None),
+                getattr(state.agent, "provider", None),
+            ):
+                return await self._terminal_receipt_response(session_id, receipt)
+            with state.runtime_lock:
+                if state.is_running:
+                    busy = True
+                    claimed_or_status = None
+                else:
+                    busy = False
+                    try:
+                        claimed_or_status = adapter.claim_after_lease(request)
+                    except Exception:
+                        logger.debug("ACP terminal receipt claim refused", exc_info=True)
+                        claimed_or_status = None
+                    if isinstance(claimed_or_status, ClaimedReceipt):
+                        state.is_running = True
+                        state.current_prompt_text = user_content
+            if busy:
+                return await self._terminal_receipt_response(session_id, receipt)
+            if not isinstance(claimed_or_status, ClaimedReceipt):
+                if isinstance(claimed_or_status, dict):
+                    if claimed_or_status.get("status") == "COMPLETED":
+                        try:
+                            replay = adapter.completed_replay(request)
+                        except Exception:
+                            logger.debug("ACP terminal receipt replay refused", exc_info=True)
+                            return self._terminal_receipt_refusal()
+                        if replay is not None:
+                            return await self._terminal_receipt_response(session_id, replay)
+                    return await self._terminal_receipt_response(session_id, claimed_or_status)
+                return self._terminal_receipt_refusal()
+            terminal_receipt = claimed_or_status
+            terminal_receipt_db = db
+            terminal_receipt_identity = receipt_identity
+            terminal_receipt_target = target_bind_receipt
 
         user_text = _extract_text(prompt).strip()
         user_content = _content_blocks_to_openai_user_content(prompt)
@@ -1805,7 +2132,7 @@ class HermesACPAgent(acp.Agent):
         has_content = bool(user_text) or (
             isinstance(user_content, list) and bool(user_content)
         )
-        if not has_content:
+        if terminal_receipt is None and not has_content:
             return PromptResponse(stop_reason="end_turn")
 
         # /steer on an idle session has no in-flight tool call to inject into.
@@ -1820,7 +2147,12 @@ class HermesACPAgent(acp.Agent):
         #      silently append to state.queued_prompts and respond with
         #      "No active turn — queued for the next turn", which looks like
         #      /queue even though the user never typed /queue.
-        if text_only_prompt and isinstance(user_content, str) and user_text.startswith("/steer"):
+        if (
+            terminal_receipt is None
+            and text_only_prompt
+            and isinstance(user_content, str)
+            and user_text.startswith("/steer")
+        ):
             steer_text = user_text.split(maxsplit=1)[1].strip() if len(user_text.split(maxsplit=1)) > 1 else ""
             interrupted_prompt = ""
             rewrite_idle = False
@@ -1841,7 +2173,8 @@ class HermesACPAgent(acp.Agent):
                 user_text = steer_text
                 user_content = steer_text
         elif (
-            text_only_prompt
+            terminal_receipt is None
+            and text_only_prompt
             and isinstance(user_content, str)
             and not user_text.startswith("/")
         ):
@@ -1865,7 +2198,12 @@ class HermesACPAgent(acp.Agent):
         # Slash commands are text-only; if the client included images/resources,
         # send the whole multimodal prompt to the agent instead of treating it as
         # an ACP command.
-        if text_only_prompt and isinstance(user_content, str) and user_text.startswith("/"):
+        if (
+            terminal_receipt is None
+            and text_only_prompt
+            and isinstance(user_content, str)
+            and user_text.startswith("/")
+        ):
             response_text = self._handle_slash_command(user_text, state)
             if response_text is not None:
                 if self._conn:
@@ -1880,7 +2218,9 @@ class HermesACPAgent(acp.Agent):
         redirected = False
         queued_depth: int | None = None
         with state.runtime_lock:
-            if state.is_running:
+            if terminal_receipt is not None:
+                pass
+            elif state.is_running:
                 if (
                     text_only_prompt
                     and isinstance(user_content, str)
@@ -2072,15 +2412,46 @@ class HermesACPAgent(acp.Agent):
 
             agent._on_session_title = _notify_title_update
             try:
-                result = agent.run_conversation(
-                    user_message=user_content,
-                    conversation_history=state.history,
-                    task_id=session_id,
-                    persist_user_message=user_text or "[Image attachment]",
-                )
+                if terminal_receipt is not None:
+                    result = agent.run_conversation(
+                        user_message=user_content,
+                        conversation_history=state.history,
+                        task_id=session_id,
+                        persist_user_message=user_content,
+                        turn_receipt=terminal_receipt,
+                    )
+                else:
+                    result = agent.run_conversation(
+                        user_message=user_content,
+                        conversation_history=state.history,
+                        task_id=session_id,
+                        persist_user_message=user_text or "[Image attachment]",
+                    )
                 return result
             except Exception as e:
                 logger.exception("Agent error in session %s", session_id)
+                if terminal_receipt is not None:
+                    if (
+                        terminal_receipt_db is not None
+                        and isinstance(terminal_receipt_identity, dict)
+                        and isinstance(terminal_receipt_target, dict)
+                    ):
+                        try:
+                            terminal_receipt_db.abort_acp_turn_receipt(
+                                session_id,
+                                terminal_receipt_identity,
+                                terminal_receipt_target,
+                                terminal_receipt.claim_token,
+                                "HERMES_AGENT_RUN_EXCEPTION",
+                            )
+                        except Exception:
+                            logger.debug(
+                                "ACP terminal receipt abort persistence refused",
+                                exc_info=True,
+                            )
+                    # Terminal callers receive only the outcome subsequently
+                    # reread from durable receipt state, never exception text.
+                    return {"final_response": "", "messages": state.history}
                 return {"final_response": f"Error: {e}", "messages": state.history}
             finally:
                 # Restore the interactive contextvar for this context.
@@ -2172,6 +2543,7 @@ class HermesACPAgent(acp.Agent):
             final_response
             and conn
             and not suppress_interrupt_response
+            and terminal_receipt is None
             and (not streamed_message or result.get("response_transformed"))
         ):
             # Deliver the final response when streaming did not already send it,
@@ -2214,6 +2586,29 @@ class HermesACPAgent(acp.Agent):
             )
 
         await self._send_usage_update(state)
+
+        if terminal_receipt is not None:
+            try:
+                durable_receipt = terminal_receipt_db.get_acp_turn_receipt(
+                    session_id, terminal_receipt_identity, terminal_receipt_target
+                )
+            except Exception:
+                logger.debug("ACP terminal receipt completion read refused", exc_info=True)
+                return self._terminal_receipt_refusal()
+            if not isinstance(durable_receipt, dict):
+                return self._terminal_receipt_refusal()
+            if durable_receipt.get("status") == "COMPLETED":
+                try:
+                    replay = TurnReceiptAdapter(terminal_receipt_db).completed_replay(
+                        terminal_receipt.request
+                    )
+                except Exception:
+                    logger.debug("ACP terminal receipt completion replay refused", exc_info=True)
+                    return self._terminal_receipt_refusal()
+                if replay is None:
+                    return self._terminal_receipt_refusal()
+                return await self._terminal_receipt_response(session_id, replay)
+            return await self._terminal_receipt_response(session_id, durable_receipt)
 
         stop_reason = "cancelled" if cancelled else "end_turn"
         return PromptResponse(stop_reason=stop_reason, usage=usage)

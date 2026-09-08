@@ -1,6 +1,7 @@
 """Tests for gateway/mirror.py — session mirroring."""
 
 import json
+import sqlite3
 from unittest.mock import patch, MagicMock
 
 import gateway.mirror as mirror_mod
@@ -95,7 +96,7 @@ class TestMirrorToSession:
 
         with patch.object(mirror_mod, "_SESSIONS_DIR", sessions_dir), \
              patch.object(mirror_mod, "_SESSIONS_INDEX", index_file), \
-             patch("gateway.mirror._append_to_sqlite") as mock_sqlite:
+             patch("gateway.mirror._append_to_sqlite", return_value=True) as mock_sqlite:
             result = mirror_to_session(
                 "telegram",
                 "-1001",
@@ -129,4 +130,223 @@ class TestAppendToSqlite:
 
         mock_db.append_message.assert_called_once()
         mock_db.close.assert_called_once()
+
+
+class TestMirrorRefusedWrite:
+    """R-6: a refused mirror write must not be reported as mirrored."""
+
+    def test_refused_write_does_not_report_mirrored_true(self, tmp_path, monkeypatch):
+        """A refused/failed SQLite append must not come back as ``True``.
+
+        ``_append_to_sqlite`` (gateway/mirror.py) wraps its
+        ``SessionDB.append_message`` call in a bare ``except Exception``
+        that only logs at DEBUG and never signals failure to its caller.
+        ``mirror_to_session`` therefore falls through to its unconditional
+        ``return True`` (line 96) even when the write was refused and the
+        message was never persisted anywhere — the caller
+        (``tools/send_message_tool.py:521`` sets ``result["mirrored"] =
+        True`` straight from this return value, which is what the model
+        sees) is told the mirror succeeded when it did not.
+
+        This drives the REAL public entry point ``mirror_to_session`` (not
+        ``_append_to_sqlite`` directly) against a REAL ``SessionDB``
+        backed by a tmp_path SQLite file. Only the deepest dependency,
+        ``SessionDB.append_message`` itself, is patched to raise —
+        standing in for a real refusal the SQLite layer can produce on
+        this path. ``CompressionSessionClosedError`` is used because it
+        is a real exception class ``hermes_state`` raises for a session
+        that can no longer accept writes (e.g. closed by compression).
+        ``SessionTurnLeaseLostError`` is NOT a live case here and is
+        deliberately not used: ``_append_to_sqlite`` never passes a
+        ``turn_lease_holder`` to ``append_message``, so the turn-lease
+        fence is not engaged on this path at all -- there is no lock or
+        lease for this call to hold or lose. Any other exception the
+        SQLite layer can raise would exercise the same code path just as
+        well; this one was picked because it is a real, named refusal
+        rather than a synthetic one.
+        """
+        import hermes_state
+
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+
+        def _refuse(self, *args, **kwargs):
+            raise hermes_state.CompressionSessionClosedError("sess_refused")
+
+        monkeypatch.setattr(hermes_state.SessionDB, "append_message", _refuse)
+
+        result = mirror_to_session(
+            "telegram",
+            "12345",
+            "This must not silently vanish",
+            source_label="cli",
+            session_id="sess_refused",
+        )
+
+        assert result is False, (
+            "mirror_to_session reported the mirror as successful (or "
+            "returned a non-boolean truthy/falsy stand-in) for a write "
+            "that was refused and never persisted — the message was "
+            "silently dropped instead of the caller being told the exact "
+            f"refusal. got: {result!r}"
+        )
+
+
+class TestMirrorRealCommit:
+    """End-to-end: mirror_to_session against a REAL SessionDB/tempfile.
+
+    The mocked unit tests above (``TestMirrorToSession``,
+    ``TestAppendToSqlite``) isolate session-resolution and connection-
+    lifecycle behaviour by mocking ``_append_to_sqlite``/``SessionDB``
+    entirely — useful for what they check, but none of them prove a row
+    actually lands on disk; they only prove a mock was called. These two
+    exercise the real write path and confirm the returned value against
+    an INDEPENDENT ``sqlite3`` connection reading the same file, never
+    against a mock's call history.
+    """
+
+    def test_successful_mirror_lands_a_real_row(self, tmp_path, monkeypatch):
+        """A normal append must both return True AND actually persist."""
+        import hermes_state
+
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+        db = hermes_state.SessionDB()
+        db.create_session("sess_real", "test")
+        db.close()
+
+        result = mirror_to_session(
+            "telegram",
+            "12345",
+            "This row must actually land",
+            source_label="cli",
+            session_id="sess_real",
+        )
+
+        assert result is True
+
+        conn = sqlite3.connect(str(tmp_path / "state.db"))
+        try:
+            rows = conn.execute(
+                "SELECT content FROM messages WHERE session_id = ?",
+                ("sess_real",),
+            ).fetchall()
+        finally:
+            conn.close()
+        assert any(r[0] == "This row must actually land" for r in rows), (
+            "mirror_to_session returned True but an independent connection "
+            "found no matching row on disk"
+        )
+
+    def test_close_failure_after_committed_append_still_reports_true(self, tmp_path, monkeypatch):
+        """A close() failure AFTER a real, persisted append must not flip True to False.
+
+        ``SessionDB.close()`` already guards its own internal teardown
+        steps against raising -- the WAL checkpoint pragma is wrapped in
+        its own try/except (hermes_state.py ~5077-5083), and
+        ``_close_connection_quietly`` wraps the connection's own
+        ``close()`` the same way -- so mocking the whole ``SessionDB`` to
+        make ``close()`` raise (as an earlier version of this test did)
+        fabricates a failure the real class cannot produce.
+
+        The one step ``close()`` invokes UNGUARDED is
+        ``_stop_token_writer()`` (its own docstring claims "never raises",
+        but the only try/finally inside it wraps ``_apply_token_batch``
+        without an ``except``, so an exception there propagates straight
+        out of ``close()``). That is the real, reachable seam: this test
+        raises there, on the real class, then verifies via an independent
+        connection that the row committed before the raise actually
+        persisted, and that the reported result is still True.
+        """
+        import hermes_state
+
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+        db = hermes_state.SessionDB()
+        db.create_session("sess_committed", "test")
+        db.close()
+
+        def _raise(self, *args, **kwargs):
+            raise RuntimeError("token writer teardown boom")
+
+        monkeypatch.setattr(hermes_state.SessionDB, "_stop_token_writer", _raise)
+
+        result = mirror_to_session(
+            "telegram",
+            "55555",
+            "Row commits even though close() blows up",
+            source_label="cli",
+            session_id="sess_committed",
+        )
+
+        assert result is True, (
+            "a close() failure after a successful, persisted append "
+            "flipped a committed write into a reported failure — the "
+            f"row IS on disk, so the truthful answer is True. got: {result!r}"
+        )
+
+        # Independent verification -- bypasses hermes_state (and the
+        # _stop_token_writer patch above) entirely, so this cannot be
+        # fooled by the same fault the patch injects.
+        conn = sqlite3.connect(str(tmp_path / "state.db"))
+        try:
+            rows = conn.execute(
+                "SELECT content FROM messages WHERE session_id = ?",
+                ("sess_committed",),
+            ).fetchall()
+        finally:
+            conn.close()
+        assert any(r[0] == "Row commits even though close() blows up" for r in rows), (
+            "mirror_to_session returned True but an independent connection "
+            "found no matching row on disk"
+        )
+
+
+class TestMirrorLoggingCannotFlipResult:
+    """Once a write has committed, a misbehaving log handler must not be
+    able to turn that True into a False.
+
+    Logging filters/handlers installed by users or plugins can themselves
+    raise. ``mirror_to_session`` / ``_append_to_sqlite`` sit right next to
+    such calls after deciding their return value; an exception escaping
+    one of those calls was previously caught by an outer/enclosing
+    ``except Exception`` and reported as a refusal -- the same class of
+    lie as the original defect, with the sign flipped by an entirely
+    incidental log line rather than by real commit status.
+    """
+
+    def test_post_commit_debug_log_failure_does_not_flip_true_to_false(self, monkeypatch):
+        """gateway/mirror.py's post-append ``logger.debug(...)`` must be inert."""
+        monkeypatch.setattr(mirror_mod, "_append_to_sqlite", lambda *a, **k: True)
+        monkeypatch.setattr(
+            mirror_mod.logger,
+            "debug",
+            MagicMock(side_effect=RuntimeError("handler boom")),
+        )
+
+        result = mirror_to_session(
+            "telegram",
+            "12345",
+            "hello",
+            source_label="cli",
+            session_id="sess_x",
+        )
+
+        assert result is True, (
+            "a logging handler failure right after a committed append "
+            f"flipped the result away from True. got: {result!r}"
+        )
+
+    def test_close_failure_log_failure_does_not_flip_true_to_false(self):
+        """``_append_to_sqlite``'s own close-failure debug log must be inert too."""
+        from gateway.mirror import _append_to_sqlite
+
+        mock_db = MagicMock()
+        mock_db.close.side_effect = RuntimeError("close boom")
+
+        with patch("hermes_state.SessionDB", return_value=mock_db), \
+             patch.object(mirror_mod.logger, "debug", side_effect=RuntimeError("handler boom")):
+            result = _append_to_sqlite("sess_x", {"role": "assistant", "content": "hi"})
+
+        assert result is True, (
+            "a close() failure whose own debug log ALSO raised flipped a "
+            f"committed append away from True. got: {result!r}"
+        )
 

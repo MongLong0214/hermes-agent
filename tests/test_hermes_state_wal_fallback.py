@@ -498,6 +498,8 @@ class TestSessionDbUsesWalFallback:
             # connect_tracked passes a tracking-augmented factory; drop it and
             # substitute the double, which connect_tracked re-applies to the
             # returned instance.
+            if args and args[0] == ":memory:":
+                return real_connect(*args, **kwargs)
             kwargs.pop("factory", None)
             return real_connect(str(target), factory=factory, **kwargs)
 
@@ -530,6 +532,8 @@ class TestSessionDbUsesWalFallback:
             # connect_tracked passes a tracking-augmented factory; drop it and
             # substitute the double, which connect_tracked re-applies to the
             # returned instance.
+            if args and args[0] == ":memory:":
+                return real_connect(*args, **kwargs)
             kwargs.pop("factory", None)
             return real_connect(str(target), factory=factory, **kwargs)
 

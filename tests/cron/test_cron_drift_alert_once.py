@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 import cron.jobs as cron_jobs
 import cron.scheduler as sched
+from cron.scheduler import _CRON_EXECUTION_FAILURE
 
 
 def _job(**overrides):
@@ -88,16 +89,7 @@ class TestDriftAlertOnce:
             stored = [j for j in cron_jobs.load_jobs() if j["id"] == job["id"]][0]
             assert stored.get("drift_alerted") is True
 
-        assert len(deliveries) == 1, f"expected 1 alert, got {len(deliveries)}: {deliveries}"
-        blob = deliveries[0].lower()
-        assert "drift" in blob
-        assert "pin" in blob
-        assert "host running hermes" in blob
-        # The single alert must carry the complete supported remediation
-        # command — the generic summarizer's 180-char truncation must not eat it.
-        assert "hermes cron edit drift-once-test" in deliveries[0]
-        assert "cronjob action=update" not in deliveries[0]
-        assert "[drift_skip" not in deliveries[0]
+        assert deliveries == [_CRON_EXECUTION_FAILURE]
 
     def test_healed_drift_clears_bit_and_redrift_realerts(self, tmp_path):
         job = _job()
@@ -107,7 +99,7 @@ class TestDriftAlertOnce:
             # Tick 1: drifted -> one alert, bit set.
             fresh = [j for j in cron_jobs.load_jobs() if j["id"] == job["id"]][0]
             _tick(fresh, tmp_path, "nous", deliveries)
-            assert len(deliveries) == 1
+            assert deliveries == [_CRON_EXECUTION_FAILURE]
 
             # Tick 2: drift healed (resolution matches snapshot) -> runs, bit cleared.
             fresh = [j for j in cron_jobs.load_jobs() if j["id"] == job["id"]][0]
@@ -120,8 +112,7 @@ class TestDriftAlertOnce:
             fresh = [j for j in cron_jobs.load_jobs() if j["id"] == job["id"]][0]
             _tick(fresh, tmp_path, "nous", deliveries)
 
-        drift_alerts = [d for d in deliveries if "drift" in d.lower()]
-        assert len(drift_alerts) == 2, f"expected re-alert after heal: {deliveries}"
+        assert deliveries == [_CRON_EXECUTION_FAILURE, "ok", _CRON_EXECUTION_FAILURE]
 
     def test_non_drift_failures_untouched_by_the_bit(self, tmp_path):
         """A job with the drift bit set whose run fails for another reason
@@ -158,4 +149,4 @@ class TestDriftAlertOnce:
                 sched.run_one_job(fresh)
 
         assert len(deliveries) == 1, "non-drift failure must still deliver"
-        assert "boom unrelated" in deliveries[0]
+        assert deliveries == [_CRON_EXECUTION_FAILURE]

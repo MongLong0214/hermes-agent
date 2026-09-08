@@ -21,7 +21,6 @@ from agent.redact import redact_sensitive_text
 from agent.tool_result_classification import file_mutation_result_landed
 
 # ANSI escape codes for coloring tool failure indicators
-_RED = "\033[31m"
 _RESET = "\033[0m"
 
 logger = logging.getLogger(__name__)

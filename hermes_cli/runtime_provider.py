@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from types import MappingProxyType
 from urllib.parse import urlparse
 from typing import Any, Dict, Optional
 
@@ -51,6 +52,13 @@ from hermes_cli.providers import is_official_openai_host
 from utils import base_url_host_matches, base_url_hostname, env_int
 
 
+# Metadata-only named-provider lookup must not perform resolver/plugin discovery.
+# Freeze the built-in canonical names available at module import; raw aliases are
+# intentionally not included because credential resolution lets a custom entry
+# own an alias while canonical built-ins retain their shadow behavior.
+_STATIC_BUILTIN_PROVIDER_KEYS = frozenset(PROVIDER_REGISTRY)
+
+
 def _getenv(name: str, default: str = "") -> str:
     """Profile-scoped replacement for ``os.getenv`` on credential/provider reads.
 
@@ -62,6 +70,79 @@ def _getenv(name: str, default: str = "") -> str:
     """
     val = _get_secret(name, default)
     return val if val is not None else default
+
+
+# Static source census: these runtime URL overrides are consumed by auth
+# helpers but are not declared on the matching auth-provider registry entry.
+# Keep the mapping immutable and read each name only through profile-scoped
+# ``_getenv``; values are route facts and must never be logged.
+_NON_REGISTRY_PRE_CREDENTIAL_BASE_URL_ENVS = MappingProxyType(
+    {
+        "nous": ("NOUS_INFERENCE_BASE_URL",),
+        "openai-codex": ("HERMES_CODEX_BASE_URL",),
+        "qwen-oauth": ("HERMES_QWEN_BASE_URL",),
+        "xai-oauth": ("HERMES_XAI_BASE_URL", "XAI_BASE_URL"),
+        "openrouter": ("CUSTOM_BASE_URL",),
+        "custom": ("CUSTOM_BASE_URL",),
+    }
+)
+
+
+def _freeze_pre_credential_generic_route_facts(
+    *,
+    provider: object,
+    provider_config: object,
+    model_cfg: Dict[str, Any],
+    target_model: Optional[str],
+    explicit_base_url: Optional[str],
+    requested_provider: object,
+) -> MappingProxyType:
+    """Freeze generic nonsecret route facts before credential-bearing effects.
+
+    Generic API-key providers receive their endpoint from an immutable registry
+    record as well as optional URL overrides.  A friendly request label is not
+    allow authority: evaluate every already-selected URL/API-mode fact from one
+    snapshot before pool, secret, command, client, or network work begins.
+    """
+    def known_text(value: object) -> str:
+        return value.strip() if isinstance(value, str) else ""
+
+    canonical_provider = known_text(provider)
+    routing_hint = known_text(requested_provider)
+    model = known_text(target_model) or known_text(
+        model_cfg.get("default") or model_cfg.get("model")
+    )
+    configured_base_url = known_text(explicit_base_url) or known_text(
+        model_cfg.get("base_url")
+    )
+    registry_base_url = known_text(
+        getattr(provider_config, "inference_base_url", "")
+    )
+    configured_api_mode = known_text(model_cfg.get("api_mode"))
+    registry_api_mode = known_text(getattr(provider_config, "api_mode", ""))
+
+    base_url_env_names = []
+    declared = getattr(provider_config, "base_url_env_var", "")
+    if isinstance(declared, str) and declared:
+        base_url_env_names.append(declared)
+    base_url_env_names.extend(
+        _NON_REGISTRY_PRE_CREDENTIAL_BASE_URL_ENVS.get(canonical_provider, ())
+    )
+
+    return MappingProxyType(
+        {
+            "canonical_provider": canonical_provider,
+            "model": model,
+            "base_urls": tuple(
+                value
+                for value in (configured_base_url, registry_base_url)
+                if value
+            ),
+            "api_mode": configured_api_mode or registry_api_mode,
+            "routing_hint": routing_hint,
+            "base_url_env_names": tuple(dict.fromkeys(base_url_env_names)),
+        }
+    )
 
 
 def _normalize_custom_provider_name(value: str) -> str:
@@ -466,6 +547,39 @@ def _maybe_apply_codex_app_server_runtime(
     return api_mode
 
 
+def _freeze_selected_pool_route_facts(
+    *,
+    entry: PooledCredential,
+    provider: str,
+    requested_provider: str,
+    model: object,
+) -> MappingProxyType:
+    """Snapshot a selected pool's nonsecret route before any key is read."""
+    from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+    try:
+        runtime_base_url = getattr(entry, "runtime_base_url", None)
+        entry_base_url = getattr(entry, "base_url", None)
+        entry_api_mode = getattr(entry, "api_mode", None)
+    except Exception as exc:
+        raise GeminiOutboundDenied() from exc
+    if runtime_base_url is not None and not isinstance(runtime_base_url, str):
+        raise GeminiOutboundDenied()
+    if entry_base_url is not None and not isinstance(entry_base_url, str):
+        raise GeminiOutboundDenied()
+    if entry_api_mode is not None and not isinstance(entry_api_mode, str):
+        raise GeminiOutboundDenied()
+    return MappingProxyType(
+        {
+            "canonical_provider": str(provider or ""),
+            "model": str(model or ""),
+            "base_url": str(runtime_base_url or entry_base_url or "").strip(),
+            "api_mode": str(entry_api_mode or "").strip(),
+            "routing_hint": str(requested_provider or provider or ""),
+        }
+    )
+
+
 def _resolve_runtime_from_pool_entry(
     *,
     provider: str,
@@ -474,6 +588,7 @@ def _resolve_runtime_from_pool_entry(
     model_cfg: Optional[Dict[str, Any]] = None,
     pool: Optional[CredentialPool] = None,
     target_model: Optional[str] = None,
+    route_facts: Optional[MappingProxyType] = None,
 ) -> Dict[str, Any]:
     model_cfg = model_cfg or _get_model_config()
     # When the caller is resolving for a specific target model (e.g. a /model
@@ -483,7 +598,14 @@ def _resolve_runtime_from_pool_entry(
     # opencode-zen /v1 to be stripped for chat_completions requests when
     # config.default was still a Claude model.
     effective_model = (target_model or model_cfg.get("default") or "")
-    base_url = (getattr(entry, "runtime_base_url", None) or getattr(entry, "base_url", None) or "").rstrip("/")
+    if route_facts is None:
+        route_facts = _freeze_selected_pool_route_facts(
+            entry=entry,
+            provider=provider,
+            requested_provider=requested_provider,
+            model=effective_model,
+        )
+    base_url = str(route_facts["base_url"] or "").rstrip("/")
     api_key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
     api_mode = "chat_completions"
     if provider == "openai-codex":
@@ -524,7 +646,7 @@ def _resolve_runtime_from_pool_entry(
     elif provider == "copilot":
         api_mode = _copilot_runtime_api_mode(
             model_cfg,
-            getattr(entry, "runtime_api_key", ""),
+            api_key,
             target_model=effective_model,
         )
         base_url = base_url or PROVIDER_REGISTRY["copilot"].inference_base_url
@@ -604,7 +726,7 @@ def _resolve_runtime_from_pool_entry(
     if provider == "lmstudio":
         base_url = auth_mod._normalize_lmstudio_runtime_base_url(base_url)
 
-    return {
+    result = {
         "provider": provider,
         "api_mode": api_mode,
         "base_url": base_url,
@@ -613,6 +735,7 @@ def _resolve_runtime_from_pool_entry(
         "credential_pool": pool,
         "requested_provider": requested_provider,
     }
+    return _guard_resolved_runtime(result)
 
 
 def resolve_requested_provider(requested: Optional[str] = None) -> str:
@@ -632,6 +755,38 @@ def resolve_requested_provider(requested: Optional[str] = None) -> str:
         return env_provider
 
     return "auto"
+
+
+def _deny_gemini_runtime_route(
+    *,
+    canonical_provider: object = "",
+    model: object = "",
+    base_url: object = "",
+    api_mode: object = "",
+    routing_hint: object = "",
+) -> None:
+    """Deny a known Gemini-family route before resolution reads credentials."""
+    from agent.gemini_outbound_policy import deny_gemini_outbound
+
+    deny_gemini_outbound(
+        canonical_provider=canonical_provider,
+        model=model,
+        base_url=base_url,
+        api_mode=api_mode,
+        routing_hint=routing_hint,
+    )
+
+
+def _guard_resolved_runtime(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Deny a final Gemini/Vertex route while preserving safe result identity."""
+    _deny_gemini_runtime_route(
+        canonical_provider=result.get("provider", ""),
+        model=result.get("model", ""),
+        base_url=result.get("base_url", ""),
+        api_mode=result.get("api_mode", ""),
+        routing_hint=result.get("requested_provider", ""),
+    )
+    return result
 
 
 def _try_resolve_from_custom_pool(
@@ -704,7 +859,198 @@ def _lift_extra_headers(entry: Dict[str, Any], result: Dict[str, Any]) -> None:
         result["extra_headers"] = extra_headers
 
 
-def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, Any]]:
+def _freeze_named_provider_value(value: Any) -> Any:
+    """Freeze config-derived named-provider facts for a single handoff."""
+    if isinstance(value, dict):
+        return MappingProxyType(
+            {str(key): _freeze_named_provider_value(item) for key, item in value.items()}
+        )
+    if isinstance(value, list):
+        return tuple(_freeze_named_provider_value(item) for item in value)
+    return value
+
+
+def _thaw_named_provider_value(value: Any) -> Any:
+    """Copy a frozen snapshot value into the legacy mutable result shape."""
+    if isinstance(value, MappingProxyType):
+        return {key: _thaw_named_provider_value(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_named_provider_value(item) for item in value]
+    return value
+
+
+def _named_provider_max_output_tokens(entry: Dict[str, Any]) -> Optional[int]:
+    for key in ("max_output_tokens", "max_tokens"):
+        value = entry.get(key)
+        if isinstance(value, int) and value > 0:
+            return value
+    return None
+
+
+def _get_named_custom_provider_snapshot(requested_provider: str) -> Optional[MappingProxyType]:
+    """Select one immutable named-provider config snapshot without effects.
+
+    This selector performs exactly one config parse and never resolves keys,
+    commands, plugins, proxies, or clients.  Consumers must carry this exact
+    object from route policy to credential/client construction.
+    """
+    requested_norm = _normalize_custom_provider_name(requested_provider or "")
+    if not requested_norm:
+        return None
+    if requested_norm in {"auto", "openrouter"}:
+        return None
+    if (
+        requested_norm != "custom"
+        and not requested_norm.startswith("custom:")
+        and requested_norm in _STATIC_BUILTIN_PROVIDER_KEYS
+    ):
+        return None
+
+    config = load_config()
+    providers = config.get("providers")
+    if isinstance(providers, dict):
+        for ep_name, entry in providers.items():
+            if not isinstance(entry, dict) or entry.get("enabled") is False:
+                continue
+            display_name = entry.get("name", "")
+            if requested_norm not in custom_provider_aliases(
+                str(display_name or ep_name), str(ep_name)
+            ):
+                continue
+            base_url = entry.get("api") or entry.get("url") or entry.get("base_url") or ""
+            if not isinstance(base_url, str) or not base_url.strip():
+                continue
+            raw_api_mode = entry.get("api_mode") or entry.get("transport")
+            return MappingProxyType(
+                {
+                    "kind": "providers",
+                    "name": str(entry.get("name", ep_name) or ep_name),
+                    "routing_hint": requested_norm,
+                    "base_url": base_url.strip(),
+                    "api_key": str(entry.get("api_key", "") or "").strip(),
+                    "key_env": str(
+                        entry.get("key_env") or entry.get("api_key_env") or ""
+                    ).strip(),
+                    "key_cmd": str(entry.get("key_cmd", "") or "").strip(),
+                    "model": str(entry.get("default_model", "") or "").strip(),
+                    "api_mode": _parse_api_mode(raw_api_mode)
+                    or str(raw_api_mode or "").strip(),
+                    "extra_body": _freeze_named_provider_value(
+                        dict(entry.get("extra_body", {}))
+                        if isinstance(entry.get("extra_body"), dict)
+                        else {}
+                    ),
+                    "extra_headers": _freeze_named_provider_value(
+                        normalize_extra_headers(entry.get("extra_headers")) or {}
+                    ),
+                    "max_output_tokens": _named_provider_max_output_tokens(entry),
+                }
+            )
+
+    custom_providers = config.get("custom_providers")
+    if isinstance(custom_providers, dict):
+        return None
+    for entry in get_compatible_custom_providers(config):
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        base_url = entry.get("base_url")
+        if not isinstance(name, str) or not isinstance(base_url, str) or not base_url.strip():
+            continue
+        provider_key = str(entry.get("provider_key", "") or "").strip()
+        if requested_norm not in custom_provider_aliases(name, provider_key):
+            continue
+        raw_api_mode = entry.get("api_mode")
+        return MappingProxyType(
+            {
+                "kind": "custom_providers",
+                "name": name.strip(),
+                "routing_hint": requested_norm,
+                "base_url": base_url.strip(),
+                "api_key": str(entry.get("api_key", "") or "").strip(),
+                "key_env": str(entry.get("key_env", "") or "").strip(),
+                "provider_key": provider_key,
+                "model": str(entry.get("model", "") or "").strip(),
+                "api_mode": _parse_api_mode(raw_api_mode)
+                or str(raw_api_mode or "").strip(),
+                "extra_body": _freeze_named_provider_value(
+                    dict(entry.get("extra_body", {}))
+                    if isinstance(entry.get("extra_body"), dict)
+                    else {}
+                ),
+                "extra_headers": _freeze_named_provider_value(
+                    normalize_extra_headers(entry.get("extra_headers")) or {}
+                ),
+                "max_output_tokens": _named_provider_max_output_tokens(entry),
+            }
+        )
+    return None
+
+
+def _get_named_custom_provider_metadata(requested_provider: str) -> Optional[Dict[str, str]]:
+    """Return non-secret routing facts for a saved custom provider.
+
+    This is intentionally narrower than :func:`_get_named_custom_provider`.
+    Callers that need to decide whether a route is permitted must be able to do
+    so before reading ``key_env``, inline keys, command-token configuration,
+    headers, adapters, or credential pools.  Keep this helper cycle-safe: it
+    may inspect provider identity, model, endpoint, and transport only.
+    """
+    snapshot = _get_named_custom_provider_snapshot(requested_provider)
+    if snapshot is None:
+        return None
+    return {
+        "provider": "custom",
+        "routing_hint": str(snapshot["routing_hint"]),
+        "model": str(snapshot["model"]),
+        "base_url": str(snapshot["base_url"]),
+        "api_mode": str(snapshot["api_mode"]),
+    }
+
+
+def _materialize_named_custom_provider_snapshot(
+    snapshot: MappingProxyType,
+) -> Dict[str, Any]:
+    """Resolve credentials from an already selected immutable snapshot only."""
+    kind = snapshot.get("kind")
+    result: Dict[str, Any] = {
+        "name": str(snapshot.get("name", "")),
+        "base_url": str(snapshot.get("base_url", "")),
+        "api_key": str(snapshot.get("api_key", "")),
+    }
+    key_env = str(snapshot.get("key_env", "") or "").strip()
+    if kind == "providers":
+        resolved_api_key = _getenv(key_env, "").strip() if key_env else ""
+        result["api_key"] = resolved_api_key or result["api_key"]
+        key_cmd = str(snapshot.get("key_cmd", "") or "").strip()
+        if key_cmd:
+            result["key_cmd"] = key_cmd
+    elif key_env:
+        result["key_env"] = key_env
+        provider_key = str(snapshot.get("provider_key", "") or "").strip()
+        if provider_key:
+            result["provider_key"] = provider_key
+    extra_body = _thaw_named_provider_value(snapshot.get("extra_body", {}))
+    if extra_body:
+        result["extra_body"] = extra_body
+    extra_headers = _thaw_named_provider_value(snapshot.get("extra_headers", {}))
+    if extra_headers:
+        result["extra_headers"] = extra_headers
+    api_mode = str(snapshot.get("api_mode", "") or "").strip()
+    if api_mode:
+        result["api_mode"] = api_mode
+    model = str(snapshot.get("model", "") or "").strip()
+    if model:
+        result["model"] = model
+    max_output_tokens = snapshot.get("max_output_tokens")
+    if isinstance(max_output_tokens, int) and max_output_tokens > 0:
+        result["max_output_tokens"] = max_output_tokens
+    return result
+
+
+def _get_named_custom_provider(requested_provider: str, *, snapshot: Optional[MappingProxyType] = None) -> Optional[Dict[str, Any]]:
+    if snapshot is not None:
+        return _materialize_named_custom_provider_snapshot(snapshot)
     requested_norm = _normalize_custom_provider_name(requested_provider or "")
     if not requested_norm:
         return None
@@ -1119,6 +1465,12 @@ def _resolve_named_custom_runtime(
             pass
     if requested_norm == "custom" and explicit_base_url:
         base_url = explicit_base_url.strip().rstrip("/")
+        _deny_gemini_runtime_route(
+            canonical_provider="custom",
+            model=target_model or _get_model_config().get("default"),
+            base_url=base_url,
+            routing_hint=requested_provider,
+        )
         # Check credential pool first — mirrors the named-custom-provider path
         # so bare `provider: custom` with a configured custom_providers entry
         # also gets its api_key from the pool instead of env var fallbacks.
@@ -1151,7 +1503,23 @@ def _resolve_named_custom_runtime(
             "requested_provider": requested_provider,
         }
 
-    custom_provider = _get_named_custom_provider(requested_provider)
+    named_snapshot = _get_named_custom_provider_snapshot(requested_provider)
+    if named_snapshot is not None:
+        # The snapshot contains every nonsecret route fact needed to decide
+        # policy.  Do not materialize it (which can read key_env/key_cmd) until
+        # this single selected route has been allowed.
+        _deny_gemini_runtime_route(
+            canonical_provider="custom",
+            model=target_model or named_snapshot.get("model", ""),
+            base_url=named_snapshot.get("base_url", ""),
+            api_mode=named_snapshot.get("api_mode", ""),
+            routing_hint=named_snapshot.get("routing_hint", requested_provider),
+        )
+        custom_provider = _get_named_custom_provider(
+            requested_provider, snapshot=named_snapshot
+        )
+    else:
+        custom_provider = _get_named_custom_provider(requested_provider)
     if not custom_provider:
         return None
 
@@ -1161,6 +1529,18 @@ def _resolve_named_custom_runtime(
     ).rstrip("/")
     if not base_url:
         return None
+
+    _deny_gemini_runtime_route(
+        canonical_provider="custom",
+        model=(
+            target_model
+            or custom_provider.get("model")
+            or _get_model_config().get("default")
+        ),
+        base_url=base_url,
+        api_mode=custom_provider.get("api_mode"),
+        routing_hint=requested_provider,
+    )
 
     # Check if a credential pool exists for this custom endpoint
     pool_result = _try_resolve_from_custom_pool(base_url, "custom", custom_provider.get("api_mode"), provider_name=custom_provider.get("name"))
@@ -1334,6 +1714,14 @@ def _resolve_openrouter_runtime(
         or OPENROUTER_BASE_URL
     ).rstrip("/")
 
+    _deny_gemini_runtime_route(
+        canonical_provider="custom" if requested_norm == "custom" else "openrouter",
+        model=model_cfg.get("default") or model_cfg.get("model"),
+        base_url=base_url,
+        api_mode=model_cfg.get("api_mode"),
+        routing_hint=requested_provider,
+    )
+
     # Choose API key based on whether the resolved base_url targets OpenRouter.
     # When hitting OpenRouter, prefer OPENROUTER_API_KEY (issue #289).
     # When hitting a custom endpoint (e.g. Z.ai, local LLM), prefer
@@ -1486,6 +1874,14 @@ def _resolve_azure_foundry_runtime(
             "Azure Foundry requires a base URL. Set it via 'hermes model' or "
             "the AZURE_FOUNDRY_BASE_URL environment variable."
         )
+
+    _deny_gemini_runtime_route(
+        canonical_provider=requested_provider,
+        model=effective_model,
+        base_url=base_url,
+        api_mode=cfg_api_mode,
+        routing_hint=requested_provider,
+    )
 
     # Anthropic SDK appends /v1/messages itself, so strip any trailing /v1
     # we inherited from the configured base_url to avoid double-/v1 paths.
@@ -1780,7 +2176,34 @@ def resolve_runtime_provider(
     persisted default. Other callers can leave it None to preserve existing
     behavior (api_mode derived from config).
     """
+    return _guard_resolved_runtime(
+        _resolve_runtime_provider_impl(
+            requested=requested,
+            explicit_api_key=explicit_api_key,
+            explicit_base_url=explicit_base_url,
+            target_model=target_model,
+        )
+    )
+
+
+def _resolve_runtime_provider_impl(
+    *,
+    requested: Optional[str] = None,
+    explicit_api_key: Optional[str] = None,
+    explicit_base_url: Optional[str] = None,
+    target_model: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Internal implementation guarded by :func:`resolve_runtime_provider`."""
     requested_provider = resolve_requested_provider(requested)
+    model_cfg = _get_model_config()
+
+    _deny_gemini_runtime_route(
+        canonical_provider=requested_provider,
+        model=target_model or model_cfg.get("default") or model_cfg.get("model"),
+        base_url=explicit_base_url or model_cfg.get("base_url"),
+        api_mode=model_cfg.get("api_mode"),
+        routing_hint=requested or requested_provider,
+    )
 
     # Honour ``providers.<name>.enabled: false`` for BOTH user-defined
     # custom providers and the built-in ones (openai / anthropic /
@@ -1934,6 +2357,33 @@ def resolve_runtime_provider(
         explicit_base_url=explicit_base_url,
     )
     model_cfg = _get_model_config()
+    provider_config = PROVIDER_REGISTRY.get(provider)
+
+    generic_route_facts = _freeze_pre_credential_generic_route_facts(
+        provider=provider,
+        provider_config=provider_config,
+        model_cfg=model_cfg,
+        target_model=target_model,
+        explicit_base_url=explicit_base_url,
+        requested_provider=requested_provider,
+    )
+    for pre_credential_base_url in generic_route_facts["base_urls"] or ("",):
+        _deny_gemini_runtime_route(
+            canonical_provider=generic_route_facts["canonical_provider"],
+            model=generic_route_facts["model"],
+            base_url=pre_credential_base_url,
+            api_mode=generic_route_facts["api_mode"],
+            routing_hint=generic_route_facts["routing_hint"],
+        )
+    for base_url_env_name in generic_route_facts["base_url_env_names"]:
+        provider_env_base_url = _getenv(base_url_env_name, "")
+        _deny_gemini_runtime_route(
+            canonical_provider=generic_route_facts["canonical_provider"],
+            model=generic_route_facts["model"],
+            base_url=provider_env_base_url,
+            api_mode=generic_route_facts["api_mode"],
+            routing_hint=generic_route_facts["routing_hint"],
+        )
 
     # OpenCode Zen free tier (*-free slugs, e.g. x-preview-f-free /
     # "Ox Alpha"): served ANONYMOUSLY on the Zen relay ONLY. Any bearer the
@@ -1993,7 +2443,15 @@ def resolve_runtime_provider(
     if pool and pool.has_credentials():
         entry = pool.select()
         pool_api_key = ""
+        pool_route_facts: Optional[MappingProxyType] = None
         if entry is not None:
+            pool_route_facts = _freeze_selected_pool_route_facts(
+                entry=entry,
+                provider=provider,
+                requested_provider=requested_provider,
+                model=target_model or model_cfg.get("default") or model_cfg.get("model") or "",
+            )
+            _deny_gemini_runtime_route(**pool_route_facts)
             pool_api_key = (
                 getattr(entry, "runtime_api_key", None)
                 or getattr(entry, "access_token", "")
@@ -2020,6 +2478,13 @@ def resolve_runtime_provider(
                     refreshed = None
                 if refreshed is not None:
                     entry = refreshed
+                    pool_route_facts = _freeze_selected_pool_route_facts(
+                        entry=entry,
+                        provider=provider,
+                        requested_provider=requested_provider,
+                        model=target_model or model_cfg.get("default") or model_cfg.get("model") or "",
+                    )
+                    _deny_gemini_runtime_route(**pool_route_facts)
                     pool_api_key = (
                         getattr(entry, "runtime_api_key", None)
                         or getattr(entry, "access_token", "")
@@ -2038,11 +2503,7 @@ def resolve_runtime_provider(
             and credential_pool_matches_provider(
                 pool,
                 provider,
-                base_url=(
-                    getattr(entry, "runtime_base_url", None)
-                    or getattr(entry, "base_url", None)
-                    or ""
-                ),
+                base_url=pool_route_facts["base_url"] if pool_route_facts is not None else "",
             )
         ):
             return _resolve_runtime_from_pool_entry(
@@ -2052,6 +2513,7 @@ def resolve_runtime_provider(
                 model_cfg=model_cfg,
                 pool=pool,
                 target_model=target_model,
+                route_facts=pool_route_facts,
             )
 
     if provider == "nous":

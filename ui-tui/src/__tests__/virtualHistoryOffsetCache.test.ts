@@ -1,7 +1,7 @@
 import { PassThrough } from 'stream'
 
 import { Box, renderSync, ScrollBox, type ScrollBoxHandle, Text } from '@hermes/ink'
-import React, { useLayoutEffect, useRef } from 'react'
+import React, { act, useLayoutEffect, useRef } from 'react'
 import { describe, expect, it, vi } from 'vitest'
 
 import { MAX_HISTORY } from '../config/limits.js'
@@ -514,13 +514,15 @@ describe('useVirtualHistory offset cache reuse', () => {
     }
   })
 
-  it('corrects and compensates a same-layout row measured at unmount', async () => {
+  it('corrects and compensates a same-layout row measured at unmount', () => {
     const items = Array.from({ length: 20 }, (_, index) => ({ height: 2, key: `item-${index}` }))
     const expose = { current: null as Exposed | null }
     const streams = makeStreams()
     const initialHeights = new Map(items.map(item => [item.key, item.height]))
+    const view = (heights: ReadonlyMap<string, number>) =>
+      React.createElement(Harness, { expose, initialHeights: heights, items })
 
-    const instance = renderSync(React.createElement(Harness, { expose, initialHeights, items }), {
+    const instance = renderSync(view(initialHeights), {
       patchConsole: false,
       stderr: streams.stderr as NodeJS.WriteStream,
       stdin: streams.stdin as NodeJS.ReadStream,
@@ -528,18 +530,39 @@ describe('useVirtualHistory offset cache reuse', () => {
     })
 
     try {
-      await delay(20)
-      const scroll = expose.current!.scroll!
+      act(() => {
+        instance.rerender(view(initialHeights))
+      })
 
-      scroll.scrollTo(0)
-      await delay(20)
-      scroll.scrollTo(5)
+      const scroll = expose.current!.scroll!
+      expect(scroll).toBeTruthy()
+
+      act(() => {
+        scroll.scrollTo(0)
+      })
+
+      expect(scroll.isSticky()).toBe(false)
+      expect(scroll.getScrollTop()).toBe(0)
+      expect(expose.current!.virtualHistory.start).toBe(0)
+      expect(expose.current!.virtualHistory.offsets[1]).toBe(2)
+
       const adjustScrollTop = vi.spyOn(scroll, 'adjustScrollTop')
       const staleHeights = new Map(initialHeights)
-
       staleHeights.set(items[0]!.key, 1)
-      instance.rerender(React.createElement(Harness, { expose, initialHeights: staleHeights, items }))
-      await delay(40)
+
+      // QUANTUM=10: bins 0 and 5 are identical, so this is not a range commit.
+      // item-0 stays mounted until the stale cache rerender unmounts it.
+      act(() => {
+        scroll.scrollTo(5)
+      })
+      expect(scroll.getScrollTop()).toBe(5)
+      expect(scroll.isSticky()).toBe(false)
+      expect(expose.current!.virtualHistory.start).toBe(0)
+      expect(adjustScrollTop).not.toHaveBeenCalled()
+
+      act(() => {
+        instance.rerender(view(staleHeights))
+      })
 
       expect(adjustScrollTop).toHaveBeenCalledOnce()
       expect(adjustScrollTop).toHaveBeenCalledWith(1)

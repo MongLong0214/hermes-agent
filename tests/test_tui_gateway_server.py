@@ -19907,3 +19907,239 @@ def test_workspace_move_rehomes_running_session(monkeypatch, tmp_path):
     assert captured["row_update"] == (target, str(new_cwd))
     assert live["cwd"] == str(new_cwd)
     assert live.get("explicit_cwd") is True
+
+
+def test_prompt_submit_retries_branch_seed_in_timestamp_order(monkeypatch, tmp_path):
+    """A branch-seed retry driven by a real ``prompt.submit`` must persist
+    the seed in TIMESTAMP order, not in whatever order it happens to sit in
+    ``session["history"]`` (R-4).
+
+    ``_persist_branch_seed`` retries on every submit until it succeeds (see
+    the unset ``_branch_seed_persisted`` check). By the time of a later
+    retry, ``session["history"]`` can already hold this branch's OWN newer
+    turn ahead of the parent's (chronologically earlier) seed messages in
+    LIST order -- exactly the shape a reconcile/append artifact produces
+    once a deferred seed keeps failing past the branch's first turn.
+    ``append_messages_batch`` inserts strictly in list order, and
+    ``hermes_state.get_messages`` reads back strictly by AUTOINCREMENT id
+    (insertion order, not chronology) -- so an unsorted retry commits the
+    parent's earlier-in-time history AFTER the branch's own already-newer
+    turn, permanently corrupting the transcript's replayed/displayed order.
+    """
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    # The branch row's parent_session_id is a real FK -- the parent row
+    # must exist before _ensure_session_db_row can create the branch's own
+    # row inside prompt.submit's normal (unrelated) first step.
+    db.create_session("parent-key", source="tui")
+
+    class _NoThread:
+        """The async agent-run continuation is irrelevant here: the seed
+        retry runs synchronously, before prompt.submit even schedules it."""
+
+        def __init__(self, target=None, daemon=None, name=None):
+            self._target = target
+
+        def start(self):
+            pass
+
+    # session["history"] at retry time: this branch's OWN turn-1 exchange
+    # (newer timestamps) sits BEFORE the parent's seed (older timestamps)
+    # in LIST order -- the shape a reconcile/append artifact produces once
+    # a deferred seed retry runs after the branch's own first turn.
+    history = [
+        {"role": "user", "content": "branch turn 1", "timestamp": 2000.0},
+        {"role": "assistant", "content": "branch turn 1 reply", "timestamp": 2001.0},
+        {"role": "user", "content": "parent question", "timestamp": 1000.0},
+        {"role": "assistant", "content": "parent answer", "timestamp": 1001.0},
+    ]
+    session = _session(
+        session_key="branch-key",
+        parent_session_id="parent-key",
+        history=history,
+    )
+    server._sessions["retry-sid"] = session
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    monkeypatch.setattr(server, "_claim_active_session_slot", lambda *a, **k: (None, None))
+    monkeypatch.setattr(server, "_start_agent_build", lambda sid, session: None)
+    monkeypatch.setattr(server.threading, "Thread", _NoThread)
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {"session_id": "retry-sid", "text": "branch turn 2"},
+            }
+        )
+        assert (resp.get("result") or {}).get("status") == "streaming", resp
+
+        rows = db.get_messages("branch-key")
+        contents = [r["content"] for r in rows]
+        assert contents.index("parent question") < contents.index("branch turn 1"), (
+            "the retried branch seed landed AFTER this branch's own turn 1 "
+            f"instead of before it (row order: {contents})"
+        )
+        assert contents.index("parent answer") < contents.index("branch turn 1")
+    finally:
+        server._sessions.pop("retry-sid", None)
+        db.close()
+
+
+def test_profile_scoped_agent_build_fails_loudly_when_profile_db_unopenable(
+    monkeypatch, tmp_path
+):
+    """A profile-scoped rebuild that can't open ITS OWN profile's state.db
+    must fail the build (surfacing agent_error), not silently fall through
+    with ``session_db=None`` (R-3).
+
+    ``_make_agent``'s own default (``session_db if session_db is not None
+    else _get_db()``) exists so a NON-profile session can use the shared
+    launch db. But the build here is scoped to a profile — falling through
+    to that same default reuses the LAUNCH profile's (a different profile's)
+    db handle as if it were this profile's, and every turn from here on
+    mis-persists into the wrong profile's state.db instead of the build
+    failing where the real error is.
+    """
+    import threading
+    import uuid
+
+    profile_home = tmp_path / "profiles" / "wrongprofile"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "default"))
+
+    class _UnopenableSessionDB:
+        def __init__(self, *a, **k):
+            raise RuntimeError("simulated: profile state.db unopenable")
+
+    monkeypatch.setattr("hermes_state.SessionDB", _UnopenableSessionDB)
+
+    make_agent_calls = []
+    monkeypatch.setattr(
+        server,
+        "_make_agent",
+        lambda *a, **k: make_agent_calls.append(k) or pytest.fail(
+            "_make_agent must not be called once the profile's own db "
+            "failed to open — that's exactly when its session_db=None "
+            "default falls back to the launch (wrong) profile's db"
+        ),
+    )
+    monkeypatch.setattr("tui_gateway.entry.ensure_mcp_discovery_started", lambda: None)
+    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
+    monkeypatch.setattr(server, "_SlashWorker", lambda *args: None)
+    monkeypatch.setattr(server, "_attach_worker", lambda *args: None)
+    monkeypatch.setattr(server, "_config_model_target", lambda: ("", ""))
+    monkeypatch.setattr(server, "_start_notification_poller", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_schedule_mcp_late_refresh", lambda *a, **k: None)
+    events = []
+    monkeypatch.setattr(server, "_emit", lambda *a, **k: events.append((a, k)))
+
+    ready = threading.Event()
+    sid = f"test-wrongdb-sid-{uuid.uuid4().hex[:8]}"
+    session = {
+        "agent_ready": ready,
+        "session_key": f"test-wrongdb-key-{uuid.uuid4().hex[:8]}",
+        "profile_home": str(profile_home),
+    }
+
+    server._sessions[sid] = session
+    try:
+        server._start_agent_build(sid, session)
+        assert ready.wait(timeout=15), "agent_ready never set after failed build"
+        assert not make_agent_calls
+        assert session.get("agent_error"), (
+            "a profile db open failure must surface as agent_error, not "
+            "silently proceed to build an agent against the wrong profile's db"
+        )
+    finally:
+        server._sessions.pop(sid, None)
+
+
+def test_sess_nowait_rejects_a_session_flagged_closing(monkeypatch):
+    """``_sess_nowait`` (and therefore ``_sess``/``_sess_building``, which
+    both resolve through it) must not hand back a session that a concurrent
+    close has already flagged ``_closing`` (R-3).
+
+    ``_pop_session_by_id`` sets ``_closing`` and pops the session from
+    ``_sessions`` under ``_sessions_lock`` in the same critical section, but
+    ``_sess_nowait`` reads ``_sessions`` WITHOUT taking that lock — so a
+    caller mid-way through an ordinary handler (``image.attach``,
+    ``session.info``, ``session.branch``, ...) can resolve the very session
+    object a concurrent ``session.close`` is mid-teardown on, and keep
+    operating on it (e.g. a since-``.close()``'d agent) instead of getting a
+    clean "session not found". This reproduces under ordinary UI usage: a
+    user closes a session tab while another operation on it is in flight, not
+    just adversarially. Only 3 call sites in this file already re-check
+    ``_closing`` (the prompt-drain, prompt-submit and thread-start
+    checkpoints) — the common resolver every OTHER handler funnels through
+    never did.
+    """
+    server._sessions["closing-sid"] = {
+        "session_key": "closing-key",
+        "_closing": True,
+        "history_lock": threading.Lock(),
+    }
+    try:
+        s, err = server._sess_nowait({"session_id": "closing-sid"}, "rid-1")
+        assert s is None, (
+            "_sess_nowait handed back a session already flagged _closing by "
+            "a concurrent teardown instead of treating it as gone"
+        )
+        assert err is not None
+    finally:
+        server._sessions.pop("closing-sid", None)
+
+
+def test_coerce_seed_history_preserves_timestamp_for_ordering(monkeypatch, tmp_path):
+    """R-4 must fix the REAL path: session.create's ``messages`` param goes
+    through ``_coerce_seed_history`` before it ever reaches
+    ``_persist_branch_seed``. The client echoes back the same
+    ``{"text": ..., "timestamp": ...}`` shape ``_history_to_messages`` sent it
+    (the display projection), out of chronological order relative to list
+    position (e.g. a "fork from message N" client feature). If
+    ``_coerce_seed_history`` drops ``timestamp``, every seed message lands in
+    ``session["history"]`` with no ordering signal, and the sort added to
+    ``_persist_branch_seed`` for R-4 becomes a no-op on this path (a stable
+    sort over an all-zero key changes nothing) even though a unit test that
+    hand-builds ``session["history"]`` with timestamps already in place
+    would pass.
+    """
+    from hermes_state import SessionDB
+
+    # The raw wire payload for session.create's "messages" param: shaped like
+    # _history_to_messages' output (role/text/timestamp), and NOT in
+    # chronological order by list position -- the parent's earlier message
+    # sits after the later one in the list, exactly the shape a "fork from
+    # message N" / reorder-on-the-client artifact produces.
+    raw_messages = [
+        {"role": "assistant", "text": "parent answer", "timestamp": 1001.0},
+        {"role": "user", "text": "parent question", "timestamp": 1000.0},
+    ]
+
+    history = server._coerce_seed_history(raw_messages)
+    assert history[0].get("timestamp") == 1000.0 or history[1].get("timestamp") == 1000.0, (
+        "the coerced seed history must retain each message's timestamp so "
+        "_persist_branch_seed's sort has an ordering signal to sort by "
+        f"(coerced: {history})"
+    )
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("parent-key", source="tui")
+    db.create_session("branch-key", source="tui")
+    session = _session(
+        session_key="branch-key",
+        parent_session_id="parent-key",
+        history=history,
+    )
+    try:
+        monkeypatch.setattr(server, "_get_db", lambda: db)
+        server._persist_branch_seed(session)
+
+        rows = db.get_messages("branch-key")
+        contents = [r["content"] for r in rows]
+        assert contents.index("parent question") < contents.index("parent answer"), (
+            "the branch seed built from session.create's real messages param "
+            f"landed out of chronological order (row order: {contents})"
+        )
+    finally:
+        db.close()

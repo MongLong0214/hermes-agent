@@ -149,25 +149,129 @@ def test_legacy_v22_optimize_lands_on_cjk(cjk_so, tmp_path, monkeypatch):
     cjk index in the same run."""
     import time as _time
 
-    from hermes_state import SCHEMA_SQL
-
     monkeypatch.setenv("HERMES_FTS5_CJK_SO", str(cjk_so))
     db_path = tmp_path / "state.db"
 
-    # Hand-build a genuine legacy inline DB (single-column messages_fts).
+    # Hand-build the pre-v28 v22 persisted surfaces: no authority objects,
+    # inline FTS tables, and the v22 schema marker. SessionDB then performs
+    # the current migration against this actual legacy input.
     conn = sqlite3.connect(str(db_path))
-    conn.executescript(SCHEMA_SQL)
     conn.executescript("""
-        DROP TABLE IF EXISTS messages_fts;
-        DROP TABLE IF EXISTS messages_fts_trigram;
-        DROP VIEW IF EXISTS messages_fts_trigram_src;
+        CREATE TABLE schema_version (
+            version INTEGER NOT NULL
+        );
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY,
+            source TEXT NOT NULL,
+            user_id TEXT,
+            session_key TEXT,
+            chat_id TEXT,
+            chat_type TEXT,
+            thread_id TEXT,
+            display_name TEXT,
+            origin_json TEXT,
+            expiry_finalized INTEGER DEFAULT 0,
+            model TEXT,
+            model_config TEXT,
+            system_prompt TEXT,
+            parent_session_id TEXT,
+            started_at REAL NOT NULL,
+            ended_at REAL,
+            end_reason TEXT,
+            message_count INTEGER DEFAULT 0,
+            tool_call_count INTEGER DEFAULT 0,
+            input_tokens INTEGER DEFAULT 0,
+            output_tokens INTEGER DEFAULT 0,
+            cache_read_tokens INTEGER DEFAULT 0,
+            cache_write_tokens INTEGER DEFAULT 0,
+            reasoning_tokens INTEGER DEFAULT 0,
+            cwd TEXT,
+            git_branch TEXT,
+            git_repo_root TEXT,
+            billing_provider TEXT,
+            billing_base_url TEXT,
+            billing_mode TEXT,
+            estimated_cost_usd REAL,
+            actual_cost_usd REAL,
+            cost_status TEXT,
+            cost_source TEXT,
+            pricing_version TEXT,
+            title TEXT,
+            api_call_count INTEGER DEFAULT 0,
+            handoff_state TEXT,
+            handoff_platform TEXT,
+            handoff_error TEXT,
+            compression_failure_cooldown_until REAL,
+            compression_failure_error TEXT,
+            compression_fallback_streak INTEGER NOT NULL DEFAULT 0,
+            profile_name TEXT,
+            rewind_count INTEGER NOT NULL DEFAULT 0,
+            archived INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
+        );
+        CREATE TABLE messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL REFERENCES sessions(id),
+            role TEXT NOT NULL,
+            content TEXT,
+            tool_call_id TEXT,
+            tool_calls TEXT,
+            tool_name TEXT,
+            effect_disposition TEXT,
+            timestamp REAL NOT NULL,
+            token_count INTEGER,
+            finish_reason TEXT,
+            reasoning TEXT,
+            reasoning_content TEXT,
+            reasoning_details TEXT,
+            codex_reasoning_items TEXT,
+            codex_message_items TEXT,
+            platform_message_id TEXT,
+            observed INTEGER DEFAULT 0,
+            active INTEGER NOT NULL DEFAULT 1,
+            compacted INTEGER NOT NULL DEFAULT 0,
+            api_content TEXT
+        );
+        CREATE TABLE state_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        );
         CREATE VIRTUAL TABLE messages_fts USING fts5(content);
         CREATE TRIGGER messages_fts_insert AFTER INSERT ON messages BEGIN
-            INSERT INTO messages_fts(rowid, content) VALUES (new.id, COALESCE(new.content,''));
+            INSERT INTO messages_fts(rowid, content) VALUES (
+                new.id,
+                COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
+            );
+        END;
+        CREATE TRIGGER messages_fts_delete AFTER DELETE ON messages BEGIN
+            DELETE FROM messages_fts WHERE rowid = old.id;
+        END;
+        CREATE TRIGGER messages_fts_update AFTER UPDATE ON messages BEGIN
+            DELETE FROM messages_fts WHERE rowid = old.id;
+            INSERT INTO messages_fts(rowid, content) VALUES (
+                new.id,
+                COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
+            );
+        END;
+        CREATE VIRTUAL TABLE messages_fts_trigram USING fts5(content, tokenize='trigram');
+        CREATE TRIGGER messages_fts_trigram_insert AFTER INSERT ON messages BEGIN
+            INSERT INTO messages_fts_trigram(rowid, content) VALUES (
+                new.id,
+                COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
+            );
+        END;
+        CREATE TRIGGER messages_fts_trigram_delete AFTER DELETE ON messages BEGIN
+            DELETE FROM messages_fts_trigram WHERE rowid = old.id;
+        END;
+        CREATE TRIGGER messages_fts_trigram_update AFTER UPDATE ON messages BEGIN
+            DELETE FROM messages_fts_trigram WHERE rowid = old.id;
+            INSERT INTO messages_fts_trigram(rowid, content) VALUES (
+                new.id,
+                COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
+            );
         END;
     """)
-    conn.execute("DELETE FROM schema_version")
-    conn.execute("INSERT INTO schema_version (version) VALUES (10)")
+    conn.execute("INSERT INTO schema_version (version) VALUES (22)")
     conn.execute(
         "INSERT INTO sessions (id, source, started_at) VALUES ('s1', 'cli', ?)",
         (_time.time(),),
@@ -183,6 +287,23 @@ def test_legacy_v22_optimize_lands_on_cjk(cjk_so, tmp_path, monkeypatch):
             (_time.time(), role, content),
         )
     conn.commit()
+    trigger_names = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'messages'"
+        )
+    }
+    expected_trigger_names = {
+        "messages_fts_insert",
+        "messages_fts_delete",
+        "messages_fts_update",
+        "messages_fts_trigram_insert",
+        "messages_fts_trigram_delete",
+        "messages_fts_trigram_update",
+    }
+    assert trigger_names == expected_trigger_names, (
+        f"pre-startup raw v22 trigger names: {sorted(trigger_names)!r}"
+    )
     conn.close()
 
     d = SessionDB(db_path=db_path)

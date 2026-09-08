@@ -1,3 +1,4 @@
+import copy
 import sys
 import types
 from types import SimpleNamespace
@@ -1711,6 +1712,1350 @@ def test_run_conversation_compresses_mid_turn_before_output_budget_exhaustion(mo
     assert len(compress_calls) == 1
     assert compress_calls[0] >= 15_000
     assert len(requests) == 2
+
+
+def test_native_compaction_gets_turn_start_and_tool_followup_before_local_summary(monkeypatch):
+    """A direct native route gets one checkpoint-and-replay opportunity first.
+
+    The rough request estimate crosses the local threshold even though the
+    previous provider count fit below it.  The server then returns a native
+    checkpoint with a tool call; the tool-result follow-up must replay that
+    checkpoint without starting a local summary.  This is the live failure
+    shape where the local pre-API path used to block the first native request.
+    """
+    agent = _build_agent(monkeypatch)
+    agent.model = "gpt-5.6"
+    agent.codex_responses_native_compaction = True
+    agent.codex_responses_compact_threshold = 200_000
+    agent.context_compressor.context_length = 1_000_000
+    agent.context_compressor.threshold_tokens = 200_000
+    agent.context_compressor.last_prompt_tokens = 199_387
+    agent.context_compressor.last_real_prompt_tokens = 199_387
+    agent.context_compressor.last_rough_tokens_when_real_prompt_fit = 0
+
+    first_response = SimpleNamespace(
+        output=[
+            SimpleNamespace(type="compaction", encrypted_content="sealed_checkpoint"),
+            SimpleNamespace(
+                type="function_call",
+                id="fc_1",
+                call_id="call_1",
+                name="terminal",
+                arguments="{}",
+            ),
+        ],
+        usage=SimpleNamespace(
+            input_tokens=200_865,
+            output_tokens=4,
+            total_tokens=200_869,
+        ),
+        status="completed",
+        model="gpt-5.6",
+    )
+    final_response = SimpleNamespace(
+        output=[
+            SimpleNamespace(
+                type="message",
+                content=[SimpleNamespace(type="output_text", text="done")],
+            )
+        ],
+        usage=SimpleNamespace(
+            input_tokens=48_029,
+            output_tokens=3,
+            total_tokens=48_032,
+        ),
+        status="completed",
+        model="gpt-5.6",
+    )
+    responses = [first_response, final_response]
+    requests = []
+    monkeypatch.setattr(
+        agent,
+        "_interruptible_api_call",
+        lambda api_kwargs: requests.append(api_kwargs) or responses.pop(0),
+    )
+    monkeypatch.setattr(
+        "agent.turn_context.estimate_request_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.estimate_messages_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.estimate_request_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop._estimate_tools_tokens_rough", lambda *_a, **_k: 0
+    )
+
+    def _append_tool_result(assistant_message, messages, effective_task_id, api_call_count=0):
+        for call in assistant_message.tool_calls:
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": "tool result",
+                }
+            )
+
+    compression_calls = []
+
+    def _record_local_compression(messages, system_message, **kwargs):
+        compression_calls.append(kwargs.get("approx_tokens"))
+        return messages, system_message
+
+    monkeypatch.setattr(agent, "_execute_tool_calls", _append_tool_result)
+    monkeypatch.setattr(agent, "_compress_context", _record_local_compression)
+
+    history = [
+        {"role": "user", "content": f"prior user {i}"}
+        for i in range(30)
+    ]
+    result = agent.run_conversation("continue", conversation_history=history)
+
+    assert result["completed"] is True
+    assert compression_calls == []
+    assert len(requests) == 2
+    assert requests[0]["context_management"]
+    assert requests[1]["context_management"]
+    assert any(item.get("type") == "compaction" for item in requests[1]["input"])
+    assert agent.context_compressor.last_real_prompt_tokens == 48_029
+
+
+def test_native_compaction_rejection_rebuilds_through_local_preflight(monkeypatch):
+    """A rejected native first chance must not retry an over-threshold bare wire."""
+    agent = _build_agent(monkeypatch)
+    agent.model = "gpt-5.6"
+    agent.codex_responses_native_compaction = True
+    agent.codex_responses_compact_threshold = 200_000
+    agent.context_compressor.context_length = 1_000_000
+    agent.context_compressor.threshold_tokens = 200_000
+    agent.context_compressor.last_prompt_tokens = 199_387
+    agent.context_compressor.last_real_prompt_tokens = 199_387
+    agent.context_compressor.last_rough_tokens_when_real_prompt_fit = 0
+
+    class _NativeRejection(Exception):
+        status_code = 400
+
+    outcomes = [
+        _NativeRejection("Unknown parameter: context_management"),
+        _codex_message_response("recovered"),
+    ]
+    requests = []
+
+    def _call(api_kwargs):
+        requests.append(api_kwargs)
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    compression_calls = []
+    monkeypatch.setattr(agent, "_interruptible_api_call", _call)
+    monkeypatch.setattr(
+        "agent.turn_context.estimate_request_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.estimate_messages_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.estimate_request_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop._estimate_tools_tokens_rough", lambda *_a, **_k: 0
+    )
+    monkeypatch.setattr(
+        agent,
+        "_compress_context",
+        lambda messages, system_message, **kwargs: (
+            compression_calls.append(kwargs["approx_tokens"]) or messages,
+            system_message,
+        ),
+    )
+
+    result = agent.run_conversation(
+        "continue",
+        conversation_history=[{"role": "user", "content": f"prior user {i}"} for i in range(30)],
+    )
+
+    assert result["completed"] is True
+    assert len(requests) == 2
+    assert requests[0]["context_management"]
+    assert "context_management" not in requests[1]
+    assert compression_calls == [231_730]
+
+
+def test_native_compaction_usage_less_provider_retry_rebuilds_before_bare_wire(monkeypatch):
+    """A native-bearing request that raises without usage loses native ownership.
+
+    The retry may only reach the Responses wire after the normal local
+    preflight, and it must not carry the native field that owned the failed
+    request.  The compression observation and the payload inspection are
+    deliberately independent of the fake provider's successful output.
+    """
+    agent = _build_agent(monkeypatch)
+    agent.model = "gpt-5.6"
+    agent.codex_responses_native_compaction = True
+    agent.codex_responses_compact_threshold = 200_000
+    agent.context_compressor.context_length = 1_000_000
+    agent.context_compressor.threshold_tokens = 200_000
+    agent.context_compressor.last_prompt_tokens = 199_387
+    agent.context_compressor.last_real_prompt_tokens = 199_387
+    agent.context_compressor.last_rough_tokens_when_real_prompt_fit = 0
+
+    outcomes = [RuntimeError("provider connection dropped"), _codex_message_response("recovered")]
+    requests = []
+
+    def _call(api_kwargs):
+        requests.append(api_kwargs)
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    compression_calls = []
+    monkeypatch.setattr(agent, "_interruptible_api_call", _call)
+    monkeypatch.setattr(
+        "agent.turn_context.estimate_request_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.estimate_messages_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.estimate_request_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop._estimate_tools_tokens_rough", lambda *_a, **_k: 0
+    )
+    monkeypatch.setattr(
+        agent,
+        "_compress_context",
+        lambda messages, system_message, **kwargs: (
+            compression_calls.append(kwargs["approx_tokens"]) or messages,
+            system_message,
+        ),
+    )
+
+    result = agent.run_conversation(
+        "continue",
+        conversation_history=[{"role": "user", "content": f"prior user {i}"} for i in range(30)],
+    )
+
+    assert result["completed"] is True
+    assert compression_calls == [231_730]
+    assert len(requests) == 2
+    assert requests[0]["context_management"]
+    assert "context_management" not in requests[1]
+
+
+def test_native_preflight_stream_failure_rebuilds_before_bare_retry_and_keeps_normal_retry(monkeypatch):
+    """An in-flight native stream cannot spend its retry on another native wire."""
+    import httpx
+
+    def _completed_stream():
+        item = SimpleNamespace(
+            type="message",
+            status="completed",
+            content=[SimpleNamespace(type="output_text", text="recovered")],
+        )
+        return _FakeCreateStream([SimpleNamespace(type="response.output_item.done", item=item)])
+
+    def _run_case(*, native):
+        agent = _build_agent(monkeypatch)
+        agent.model = "gpt-5.6"
+        agent.codex_responses_native_compaction = native
+        agent.context_compressor.context_length = 1_000_000
+        agent.context_compressor.threshold_tokens = 200_000 if native else 800_000
+        agent.context_compressor.last_prompt_tokens = 199_387
+        agent.context_compressor.last_real_prompt_tokens = 199_387
+        agent.context_compressor.last_rough_tokens_when_real_prompt_fit = 0
+        wire_calls, ordering, compression_calls = [], [], []
+
+        def _create(**api_kwargs):
+            payload = {
+                "context_management": tuple(
+                    item.get("type") for item in api_kwargs.get("context_management", [])
+                ),
+                "checkpoint": tuple(
+                    item.get("type")
+                    for item in api_kwargs.get("input", [])
+                    if isinstance(item, dict) and item.get("type") == "compaction"
+                ),
+                "stream": api_kwargs.get("stream"),
+            }
+            wire_calls.append(payload)
+            ordering.append("native_wire" if payload["context_management"] else "bare_wire")
+            if len(wire_calls) == 1:
+                raise httpx.ConnectError(
+                    "usage-less stream connection dropped",
+                    request=httpx.Request("POST", "https://example.test/responses"),
+                )
+            return _completed_stream()
+
+        client = SimpleNamespace(responses=SimpleNamespace(create=_create))
+        monkeypatch.setattr(agent, "_create_request_openai_client", lambda **_k: client)
+        monkeypatch.setattr(
+            "agent.turn_context.estimate_request_tokens_rough",
+            lambda *_a, **_k: 231_730 if native else 10_000,
+        )
+        monkeypatch.setattr(
+            "agent.conversation_loop.estimate_messages_tokens_rough",
+            lambda *_a, **_k: 231_730 if native else 10_000,
+        )
+        monkeypatch.setattr(
+            "agent.conversation_loop.estimate_request_tokens_rough",
+            lambda *_a, **_k: 231_730 if native else 10_000,
+        )
+        monkeypatch.setattr(agent, "_compress_context", lambda messages, system_message, **kwargs: (
+            ordering.append("compress") or compression_calls.append(kwargs["approx_tokens"]) or messages,
+            system_message,
+        ))
+
+        result = agent.run_conversation(
+            "continue",
+            conversation_history=[{"role": "user", "content": f"prior user {i}"} for i in range(30)],
+        )
+        assert result["completed"] is True
+        return wire_calls, ordering, compression_calls
+
+    native_wires, native_order, native_compression = _run_case(native=True)
+    assert native_wires == [
+        {"context_management": ("compaction",), "checkpoint": (), "stream": True},
+        {"context_management": (), "checkpoint": (), "stream": True},
+    ]
+    assert native_order == ["native_wire", "compress", "bare_wire"]
+    assert len(native_compression) == 1
+    assert native_compression[0] >= 231_730
+
+    ordinary_wires, ordinary_order, ordinary_compression = _run_case(native=False)
+    assert ordinary_wires == [
+        {"context_management": (), "checkpoint": (), "stream": True},
+        {"context_management": (), "checkpoint": (), "stream": True},
+    ]
+    assert ordinary_order == ["bare_wire", "bare_wire"]
+    assert ordinary_compression == []
+
+
+def test_native_preflight_iterator_transport_failure_rebuilds_before_bare_retry(monkeypatch):
+    """A pre-output iterator failure must reach the native fallback owner."""
+    import httpx
+
+    class _FirstIterationFailure:
+        def __init__(self, error):
+            self.error = error
+
+        def __iter__(self):
+            def _events():
+                raise self.error
+                yield None  # pragma: no cover - makes this a lazy iterator
+
+            return _events()
+
+    class _PartialOutputThenFailure:
+        def __init__(self, error):
+            self.error = error
+
+        def __iter__(self):
+            yield SimpleNamespace(type="response.output_text.delta", delta="partial")
+            raise self.error
+
+    def _completed_stream():
+        item = SimpleNamespace(
+            type="message",
+            status="completed",
+            content=[SimpleNamespace(type="output_text", text="recovered")],
+        )
+        return _FakeCreateStream([SimpleNamespace(type="response.output_item.done", item=item)])
+
+    request = httpx.Request("POST", "https://example.test/responses")
+
+    def _transport_error(error_type):
+        if error_type is ConnectionError:
+            return error_type("usage-less stream connection dropped")
+        return error_type("usage-less stream connection dropped", request=request)
+
+    def _run_case(*, native, first_stream):
+        agent = _build_agent(monkeypatch)
+        agent.model = "gpt-5.6"
+        agent.codex_responses_native_compaction = native
+        agent.context_compressor.context_length = 1_000_000
+        agent.context_compressor.threshold_tokens = 200_000 if native else 800_000
+        agent.context_compressor.last_prompt_tokens = 199_387
+        agent.context_compressor.last_real_prompt_tokens = 199_387
+        agent.context_compressor.last_rough_tokens_when_real_prompt_fit = 0
+        wire_calls, ordering, compression_calls, streamed = [], [], [], []
+
+        def _create(**api_kwargs):
+            payload = {
+                "context_management": tuple(
+                    item.get("type") for item in api_kwargs.get("context_management", [])
+                ),
+                "checkpoint": tuple(
+                    item.get("type")
+                    for item in api_kwargs.get("input", [])
+                    if isinstance(item, dict) and item.get("type") == "compaction"
+                ),
+                "stream": api_kwargs.get("stream"),
+            }
+            wire_calls.append(payload)
+            ordering.append("native_wire" if payload["context_management"] else "bare_wire")
+            if len(wire_calls) == 1:
+                return first_stream()
+            return _completed_stream()
+
+        client = SimpleNamespace(responses=SimpleNamespace(create=_create))
+        monkeypatch.setattr(agent, "_create_request_openai_client", lambda **_k: client)
+        agent.stream_delta_callback = streamed.append
+        monkeypatch.setattr(
+            "agent.turn_context.estimate_request_tokens_rough",
+            lambda *_a, **_k: 231_730 if native else 10_000,
+        )
+        monkeypatch.setattr(
+            "agent.conversation_loop.estimate_messages_tokens_rough",
+            lambda *_a, **_k: 231_730 if native else 10_000,
+        )
+        monkeypatch.setattr(
+            "agent.conversation_loop.estimate_request_tokens_rough",
+            lambda *_a, **_k: 231_730 if native else 10_000,
+        )
+        monkeypatch.setattr(agent, "_compress_context", lambda messages, system_message, **kwargs: (
+            ordering.append("compress") or compression_calls.append(kwargs["approx_tokens"]) or messages,
+            system_message,
+        ))
+
+        result = agent.run_conversation(
+            "continue",
+            conversation_history=[{"role": "user", "content": f"prior user {i}"} for i in range(30)],
+        )
+        return result, wire_calls, ordering, compression_calls, streamed
+
+    retryable_transport_errors = (
+        httpx.ConnectError,
+        httpx.ReadTimeout,
+        httpx.RemoteProtocolError,
+        ConnectionError,
+    )
+    expected_native_wires = [
+        {"context_management": ("compaction",), "checkpoint": (), "stream": True},
+        {"context_management": (), "checkpoint": (), "stream": True},
+    ]
+    for error_type in retryable_transport_errors:
+        native_result, native_wires, native_order, native_compression, native_streamed = _run_case(
+            native=True,
+            first_stream=lambda error_type=error_type: _FirstIterationFailure(
+                _transport_error(error_type)
+            ),
+        )
+        assert native_result["completed"] is True
+        assert native_wires == expected_native_wires
+        assert native_order == ["native_wire", "compress", "bare_wire"]
+        assert len(native_compression) == 1
+        assert native_compression[0] >= 231_730
+        assert native_streamed == []
+
+    ordinary_result, ordinary_wires, ordinary_order, ordinary_compression, ordinary_streamed = _run_case(
+        native=False,
+        first_stream=lambda: _FirstIterationFailure(_transport_error(httpx.ConnectError)),
+    )
+    assert ordinary_result["completed"] is True
+    assert ordinary_wires == [
+        {"context_management": (), "checkpoint": (), "stream": True},
+        {"context_management": (), "checkpoint": (), "stream": True},
+    ]
+    assert ordinary_order == ["bare_wire", "bare_wire"]
+    assert ordinary_compression == []
+    assert ordinary_streamed == []
+
+    for error_type in retryable_transport_errors:
+        partial_result, partial_wires, partial_order, partial_compression, partial_streamed = _run_case(
+            native=True,
+            first_stream=lambda error_type=error_type: _PartialOutputThenFailure(
+                _transport_error(error_type)
+            ),
+        )
+        assert partial_result["completed"] is False
+        assert partial_result["failed"] is True
+        assert partial_result["messages"][-1]["content"] == "partial"
+        assert partial_result["final_response"].startswith("⚠️ No reply:")
+        assert not partial_result["final_response"].startswith("partial\n")
+        assert partial_result["response_previewed"] is True
+        assert partial_wires == [
+            {"context_management": ("compaction",), "checkpoint": (), "stream": True},
+        ]
+        assert partial_order == ["native_wire"]
+        assert partial_compression == []
+        assert partial_streamed == ["partial"]
+
+
+def test_native_preflight_raw_partial_transport_failure_preserves_once_without_replay(monkeypatch):
+    """A raw ManagedLlmStream partial must end the physical request safely."""
+    import httpx
+
+    class _PartialOutputThenFailure:
+        def __init__(self, error):
+            self.error = error
+            self.iterations = 0
+            self.closed = False
+
+        def __iter__(self):
+            self.iterations += 1
+            yield SimpleNamespace(type="response.output_text.delta", delta="partial")
+            raise self.error
+
+        def close(self):
+            self.closed = True
+
+    agent = _build_agent(monkeypatch)
+    agent.model = "gpt-5.6"
+    agent.codex_responses_native_compaction = True
+    agent.context_compressor.context_length = 1_000_000
+    agent.context_compressor.threshold_tokens = 200_000
+    agent.context_compressor.last_prompt_tokens = 199_387
+    agent.context_compressor.last_real_prompt_tokens = 199_387
+    agent.context_compressor.last_rough_tokens_when_real_prompt_fit = 0
+    wire_calls, ordering, compression_calls, streamed = [], [], [], []
+    partial_stream = _PartialOutputThenFailure(
+        httpx.ConnectError(
+            "stream dropped after output",
+            request=httpx.Request("POST", "https://example.test/responses"),
+        )
+    )
+
+    def _create(**api_kwargs):
+        payload = {
+            "context_management": tuple(
+                item.get("type") for item in api_kwargs.get("context_management", [])
+            ),
+            "checkpoint": tuple(
+                item.get("type")
+                for item in api_kwargs.get("input", [])
+                if isinstance(item, dict) and item.get("type") == "compaction"
+            ),
+            "stream": api_kwargs.get("stream"),
+        }
+        wire_calls.append(payload)
+        ordering.append("native_wire" if payload["context_management"] else "bare_wire")
+        return partial_stream
+
+    client = SimpleNamespace(responses=SimpleNamespace(create=_create))
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **_k: client)
+    agent.stream_delta_callback = streamed.append
+    monkeypatch.setattr(
+        "agent.turn_context.estimate_request_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.estimate_messages_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.estimate_request_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(agent, "_compress_context", lambda messages, system_message, **kwargs: (
+        ordering.append("compress") or compression_calls.append(kwargs["approx_tokens"]) or messages,
+        system_message,
+    ))
+
+    result = agent.run_conversation(
+        "continue",
+        conversation_history=[{"role": "user", "content": f"prior user {i}"} for i in range(30)],
+    )
+
+    assert result["completed"] is False
+    assert result["failed"] is True
+    assert result["messages"][-1]["content"] == "partial"
+    assert result["final_response"].startswith("⚠️ No reply:")
+    assert not result["final_response"].startswith("partial\n")
+    assert result["response_previewed"] is True
+    assert wire_calls == [
+        {"context_management": ("compaction",), "checkpoint": (), "stream": True},
+    ]
+    assert ordering == ["native_wire"]
+    assert compression_calls == []
+    assert streamed == ["partial"]
+    assert partial_stream.iterations == 1
+    assert partial_stream.closed is True
+
+
+@pytest.mark.parametrize(
+    "event_factory",
+    [
+        pytest.param(
+            lambda: SimpleNamespace(type="response.output_text.delta", delta="partial"),
+            id="text",
+        ),
+        pytest.param(lambda: SimpleNamespace(type="response.created"), id="lifecycle"),
+        pytest.param(
+            lambda: SimpleNamespace(
+                type="response.output_item.added",
+                item=SimpleNamespace(type="function_call"),
+            ),
+            id="tool",
+        ),
+        pytest.param(
+            lambda: SimpleNamespace(type="response.reasoning_text.delta", delta="thinking"),
+            id="reasoning",
+        ),
+        pytest.param(
+            lambda: SimpleNamespace(type="response.usage.delta", usage={"output_tokens": 1}),
+            id="usage",
+        ),
+        pytest.param(
+            lambda: SimpleNamespace(
+                type="response.compaction_checkpoint", encrypted_content="sealed_checkpoint"
+            ),
+            id="checkpoint",
+        ),
+    ],
+)
+def test_native_preflight_accepted_semantic_event_prevents_replay(monkeypatch, event_factory):
+    """Every consumer-accepted event closes native replay after transport loss."""
+    import httpx
+
+    class _EventThenFailure:
+        def __iter__(self):
+            yield event_factory()
+            raise httpx.ConnectError(
+                "stream dropped after accepted event",
+                request=httpx.Request("POST", "https://example.test/responses"),
+            )
+
+    agent = _build_agent(monkeypatch)
+    agent.model = "gpt-5.6"
+    agent.codex_responses_native_compaction = True
+    agent.context_compressor.context_length = 1_000_000
+    agent.context_compressor.threshold_tokens = 200_000
+    agent.context_compressor.last_prompt_tokens = 199_387
+    agent.context_compressor.last_real_prompt_tokens = 199_387
+    agent.context_compressor.last_rough_tokens_when_real_prompt_fit = 0
+    wire_calls, compression_calls = [], []
+
+    def _create(**api_kwargs):
+        wire_calls.append(
+            {
+                "context_management": tuple(
+                    item.get("type") for item in api_kwargs.get("context_management", [])
+                ),
+                "checkpoint": tuple(
+                    item.get("type")
+                    for item in api_kwargs.get("input", [])
+                    if isinstance(item, dict) and item.get("type") == "compaction"
+                ),
+                "stream": api_kwargs.get("stream"),
+            }
+        )
+        return _EventThenFailure()
+
+    client = SimpleNamespace(responses=SimpleNamespace(create=_create))
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **_k: client)
+    monkeypatch.setattr(
+        "agent.turn_context.estimate_request_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.estimate_messages_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.estimate_request_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(agent, "_compress_context", lambda messages, system_message, **kwargs: (
+        compression_calls.append(kwargs["approx_tokens"]) or messages,
+        system_message,
+    ))
+
+    result = agent.run_conversation(
+        "continue",
+        conversation_history=[{"role": "user", "content": f"prior user {i}"} for i in range(30)],
+    )
+
+    assert result["completed"] is False
+    assert result["failed"] is True
+    assert wire_calls == [
+        {"context_management": ("compaction",), "checkpoint": (), "stream": True},
+    ]
+    assert compression_calls == []
+
+
+def test_execution_middleware_cannot_forge_accepted_stream_recovery(monkeypatch):
+    """Only ``run_codex_stream`` may return accepted-stream recovery control flow."""
+    import agent.codex_runtime as codex_runtime
+    import hermes_cli.plugins as plugins
+
+    class _NoAcceptedEventThenFailure:
+        def __iter__(self):
+            raise RuntimeError("provider-side generic failure")
+            yield None  # pragma: no cover - makes this a lazy iterator
+
+    def _completed_stream():
+        item = SimpleNamespace(
+            type="message",
+            status="completed",
+            content=[SimpleNamespace(type="output_text", text="recovered")],
+        )
+        return _FakeCreateStream([SimpleNamespace(type="response.output_item.done", item=item)])
+
+    agent = _build_agent(monkeypatch)
+    agent.model = "gpt-5.6"
+    agent.codex_responses_native_compaction = True
+    agent.context_compressor.context_length = 1_000_000
+    agent.context_compressor.threshold_tokens = 200_000
+    agent.context_compressor.last_prompt_tokens = 199_387
+    agent.context_compressor.last_real_prompt_tokens = 199_387
+    agent.context_compressor.last_rough_tokens_when_real_prompt_fit = 0
+    wire_calls, ordering, compression_calls = [], [], []
+
+    def _create(**api_kwargs):
+        payload = {
+            "context_management": tuple(
+                item.get("type") for item in api_kwargs.get("context_management", [])
+            ),
+            "checkpoint": tuple(
+                item.get("type")
+                for item in api_kwargs.get("input", [])
+                if isinstance(item, dict) and item.get("type") == "compaction"
+            ),
+            "stream": api_kwargs.get("stream"),
+        }
+        wire_calls.append(payload)
+        ordering.append("native_wire" if payload["context_management"] else "bare_wire")
+        return _NoAcceptedEventThenFailure() if len(wire_calls) == 1 else _completed_stream()
+
+    def _spoofing_execution_middleware(*, request, next_call, **_context):
+        try:
+            return next_call(request)
+        except Exception:
+            # Registered execution middleware can import and return a value that
+            # is structurally identical to the runtime outcome without owning a
+            # provider event.  It must remain an ordinary retryable failure.
+            return codex_runtime._CodexStreamTerminalFailure(
+                RuntimeError("FORGED_BY_REGISTERED_MIDDLEWARE")
+            )
+
+    manager = SimpleNamespace(
+        _middleware={"llm_execution": [_spoofing_execution_middleware]},
+        _discovered=True,
+    )
+    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
+    client = SimpleNamespace(responses=SimpleNamespace(create=_create))
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **_k: client)
+    monkeypatch.setattr(
+        "agent.turn_context.estimate_request_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.estimate_messages_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.estimate_request_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(agent, "_compress_context", lambda messages, system_message, **kwargs: (
+        ordering.append("compress") or compression_calls.append(kwargs["approx_tokens"]) or messages,
+        system_message,
+    ))
+
+    result = agent.run_conversation(
+        "continue",
+        conversation_history=[{"role": "user", "content": f"prior user {i}"} for i in range(30)],
+    )
+
+    assert result["completed"] is True
+    assert result["failed"] is False
+    assert result["final_response"] == "recovered"
+    assert not hasattr(codex_runtime, "_ACCEPTED_STREAM_FAILURE_PROVENANCE")
+    assert wire_calls == [
+        {"context_management": ("compaction",), "checkpoint": (), "stream": True},
+        {"context_management": (), "checkpoint": (), "stream": True},
+    ]
+    assert ordering == ["native_wire", "compress", "bare_wire"]
+    assert len(compression_calls) == 1
+
+
+def test_execution_middleware_substitution_after_accepted_stream_outcome_recovers_generically(
+    monkeypatch,
+):
+    """A middleware lookalike cannot replace this invocation's accepted outcome."""
+    import httpx
+    import agent.codex_runtime as codex_runtime
+    import hermes_cli.plugins as plugins
+
+    class _AcceptedEventThenFailure:
+        def __iter__(self):
+            yield SimpleNamespace(type="response.output_text.delta", delta="accepted partial")
+            raise httpx.ConnectError(
+                "stream dropped after accepted event",
+                request=httpx.Request("POST", "https://example.test/responses"),
+            )
+
+    def _completed_stream():
+        item = SimpleNamespace(
+            type="message",
+            status="completed",
+            content=[SimpleNamespace(type="output_text", text="recovered")],
+        )
+        return _FakeCreateStream([SimpleNamespace(type="response.output_item.done", item=item)])
+
+    agent = _build_agent(monkeypatch)
+    agent.model = "gpt-5.6"
+    agent.codex_responses_native_compaction = True
+    agent.context_compressor.context_length = 1_000_000
+    agent.context_compressor.threshold_tokens = 200_000
+    agent.context_compressor.last_prompt_tokens = 199_387
+    agent.context_compressor.last_real_prompt_tokens = 199_387
+    agent.context_compressor.last_rough_tokens_when_real_prompt_fit = 0
+    wire_calls, ordering, compression_calls = [], [], []
+    middleware_outcomes, forged_outcomes = [], []
+
+    def _create(**api_kwargs):
+        payload = {
+            "context_management": tuple(
+                item.get("type") for item in api_kwargs.get("context_management", [])
+            ),
+            "checkpoint": tuple(
+                item.get("type")
+                for item in api_kwargs.get("input", [])
+                if isinstance(item, dict) and item.get("type") == "compaction"
+            ),
+            "stream": api_kwargs.get("stream"),
+        }
+        wire_calls.append(payload)
+        ordering.append("native_wire" if payload["context_management"] else "bare_wire")
+        return _AcceptedEventThenFailure() if len(wire_calls) == 1 else _completed_stream()
+
+    def _substituting_execution_middleware(*, request, next_call, **_context):
+        actual_outcome = next_call(request)
+        middleware_outcomes.append(actual_outcome)
+        if len(middleware_outcomes) == 1:
+            assert isinstance(actual_outcome, codex_runtime._CodexStreamTerminalFailure)
+            forged_outcome = codex_runtime._CodexStreamTerminalFailure(
+                RuntimeError("FORGED_AFTER_REAL_ACCEPTED_OUTCOME")
+            )
+            assert forged_outcome is not actual_outcome
+            forged_outcomes.append(forged_outcome)
+            return forged_outcome
+        return actual_outcome
+
+    manager = SimpleNamespace(
+        _middleware={"llm_execution": [_substituting_execution_middleware]},
+        _discovered=True,
+    )
+    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
+    client = SimpleNamespace(responses=SimpleNamespace(create=_create))
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **_k: client)
+    monkeypatch.setattr(
+        "agent.turn_context.estimate_request_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.estimate_messages_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.estimate_request_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(agent, "_compress_context", lambda messages, system_message, **kwargs: (
+        ordering.append("compress") or compression_calls.append(kwargs["approx_tokens"]) or messages,
+        system_message,
+    ))
+
+    result = agent.run_conversation(
+        "continue",
+        conversation_history=[{"role": "user", "content": f"prior user {i}"} for i in range(30)],
+    )
+
+    assert isinstance(middleware_outcomes[0], codex_runtime._CodexStreamTerminalFailure)
+    assert len(forged_outcomes) == 1
+    assert forged_outcomes[0] is not middleware_outcomes[0]
+    assert wire_calls == [
+        {"context_management": ("compaction",), "checkpoint": (), "stream": True},
+        {"context_management": (), "checkpoint": (), "stream": True},
+    ]
+    assert ordering == ["native_wire", "compress", "bare_wire"]
+    assert len(compression_calls) == 1
+    assert len(middleware_outcomes) == 2
+    assert result["completed"] is True
+    assert result["failed"] is False
+    assert result["final_response"] == "recovered"
+
+
+def test_native_preflight_partial_redirect_restarts_with_owned_continuation(monkeypatch):
+    """A redirect racing an accepted partial survives failure finalization."""
+    import httpx
+
+    partial = "partial"
+    correction = "focus on the corrected task"
+
+    class _PartialRedirectThenFailure:
+        def __iter__(self):
+            yield SimpleNamespace(type="response.output_text.delta", delta=partial)
+            assert agent.redirect(correction) is True
+            # Exercise the wire-loss race after the redirect is durably queued
+            # but before its cancellation signal wins the stream poll.
+            agent._interrupt_requested = False
+            raise httpx.ConnectError(
+                "stream dropped after redirect",
+                request=httpx.Request("POST", "https://example.test/responses"),
+            )
+
+    def _completed_stream():
+        item = SimpleNamespace(
+            type="message",
+            status="completed",
+            content=[SimpleNamespace(type="output_text", text="redirected completion")],
+        )
+        return _FakeCreateStream([SimpleNamespace(type="response.output_item.done", item=item)])
+
+    agent = _build_agent(monkeypatch)
+    agent.model = "gpt-5.6"
+    agent.codex_responses_native_compaction = True
+    agent.context_compressor.context_length = 1_000_000
+    agent.context_compressor.threshold_tokens = 200_000
+    agent.context_compressor.last_prompt_tokens = 199_387
+    agent.context_compressor.last_real_prompt_tokens = 199_387
+    agent.context_compressor.last_rough_tokens_when_real_prompt_fit = 0
+    wire_calls, ordering, compression_calls, streamed = [], [], [], []
+
+    def _create(**api_kwargs):
+        payload = {
+            "context_management": tuple(
+                item.get("type") for item in api_kwargs.get("context_management", [])
+            ),
+            "has_context_management": "context_management" in api_kwargs,
+            # Capture the actual Responses input, not a repr, so the bare
+            # redirected continuation is mutation-sensitive to a stale native
+            # checkpoint being reintroduced.
+            "input": copy.deepcopy(api_kwargs.get("input", [])),
+            "stream": api_kwargs.get("stream"),
+        }
+        wire_calls.append(payload)
+        ordering.append("native_wire" if payload["context_management"] else "bare_wire")
+        return _PartialRedirectThenFailure() if len(wire_calls) == 1 else _completed_stream()
+
+    client = SimpleNamespace(responses=SimpleNamespace(create=_create))
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **_k: client)
+    agent.stream_delta_callback = streamed.append
+    monkeypatch.setattr(
+        "agent.turn_context.estimate_request_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.estimate_messages_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.estimate_request_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(agent, "_compress_context", lambda messages, system_message, **kwargs: (
+        ordering.append("compress") or compression_calls.append(kwargs["approx_tokens"]) or messages,
+        system_message,
+    ))
+
+    result = agent.run_conversation(
+        "continue",
+        conversation_history=[{"role": "user", "content": f"prior user {i}"} for i in range(30)],
+    )
+
+    assert result["completed"] is True
+    assert result["failed"] is False
+    assert result["final_response"] == "redirected completion"
+    assert [message["content"] for message in result["messages"]].count(partial) == 1
+    assert any(correction in str(message.get("api_content", message["content"])) for message in result["messages"])
+    assert wire_calls[0]["context_management"] == ("compaction",)
+    assert wire_calls[1]["context_management"] == ()
+    assert wire_calls[1]["has_context_management"] is False
+    assert not any(
+        isinstance(item, dict) and item.get("type") == "compaction"
+        for item in wire_calls[1]["input"]
+    )
+    assert partial in str(wire_calls[1]["input"])
+    assert correction in str(wire_calls[1]["input"])
+    assert wire_calls[1]["input"] != wire_calls[0]["input"]
+    assert ordering == ["native_wire", "compress", "bare_wire"]
+    assert len(compression_calls) == 1
+    assert streamed == [partial]
+    assert agent._has_pending_redirect() is False
+
+
+def test_native_preflight_interrupt_before_wire_expires_state_before_next_turn(monkeypatch):
+    """An armed native request interrupted before create cannot own the next turn."""
+    agent = _build_agent(monkeypatch)
+    agent.model = "gpt-5.6"
+    agent.codex_responses_native_compaction = True
+    agent.codex_responses_compact_threshold = 200_000
+    agent.context_compressor.context_length = 1_000_000
+    agent.context_compressor.threshold_tokens = 200_000
+    agent.context_compressor.last_prompt_tokens = 199_387
+    agent.context_compressor.last_real_prompt_tokens = 199_387
+    agent.context_compressor.last_rough_tokens_when_real_prompt_fit = 0
+
+    identity = (agent.session_id, agent.model, agent.provider, agent.base_url)
+    wire_calls, ordering, compression_calls = [], [], []
+
+    def _completed_stream():
+        item = SimpleNamespace(
+            type="message",
+            status="completed",
+            content=[SimpleNamespace(type="output_text", text="recovered")],
+        )
+        return _FakeCreateStream([SimpleNamespace(type="response.output_item.done", item=item)])
+
+    def _create(**api_kwargs):
+        payload = {
+            "context_management": tuple(
+                item.get("type") for item in api_kwargs.get("context_management", [])
+            ),
+            "checkpoint": tuple(
+                item.get("type")
+                for item in api_kwargs.get("input", [])
+                if isinstance(item, dict) and item.get("type") == "compaction"
+            ),
+            "stream": api_kwargs.get("stream"),
+        }
+        wire_calls.append(payload)
+        ordering.append("native_wire" if payload["context_management"] else "bare_wire")
+        return _completed_stream()
+
+    client = SimpleNamespace(responses=SimpleNamespace(create=_create))
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **_k: client)
+    monkeypatch.setattr(
+        "agent.turn_context.estimate_request_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.estimate_messages_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.estimate_request_tokens_rough", lambda *_a, **_k: 231_730
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop._estimate_tools_tokens_rough", lambda *_a, **_k: 0
+    )
+    monkeypatch.setattr(
+        agent,
+        "_compress_context",
+        lambda messages, system_message, **kwargs: (
+            ordering.append("compress") or compression_calls.append(kwargs["approx_tokens"]) or messages,
+            system_message,
+        ),
+    )
+
+    original_streaming_call = agent._interruptible_streaming_api_call
+
+    def _interrupt_before_wire(api_kwargs, **_kwargs):
+        assert api_kwargs["context_management"]
+        ordering.append("interrupted_before_wire")
+        agent.interrupt("/stop")
+        raise InterruptedError()
+
+    monkeypatch.setattr(agent, "_interruptible_streaming_api_call", _interrupt_before_wire)
+    history = [{"role": "user", "content": f"prior user {i}"} for i in range(30)]
+    agent.run_conversation("first turn", conversation_history=history)
+
+    assert wire_calls == []
+    assert ordering == ["interrupted_before_wire"]
+    assert identity == (agent.session_id, agent.model, agent.provider, agent.base_url)
+
+    agent.clear_interrupt()
+    monkeypatch.setattr(agent, "_interruptible_streaming_api_call", original_streaming_call)
+    result = agent.run_conversation("next turn", conversation_history=history)
+
+    assert result["completed"] is True
+    assert ordering == ["interrupted_before_wire", "compress", "bare_wire"]
+    assert compression_calls == [231_730]
+    assert wire_calls == [
+        {"context_management": (), "checkpoint": (), "stream": True},
+    ]
+
+
+def test_native_compaction_replay_payload_loss_reenters_local_preflight(monkeypatch):
+    """A checkpoint replay is rejected before—not after—a malformed wire.
+
+    Both the native field and the opaque checkpoint are required at the final
+    Responses payload boundary.  Strip each once after capture to prove the
+    invalid replay never reaches the provider and the existing local fallback
+    owns the next dispatched request.
+    """
+    for missing in ("context_management", "checkpoint"):
+        agent = _build_agent(monkeypatch)
+        agent.model = "gpt-5.6"
+        agent.codex_responses_native_compaction = True
+        agent.codex_responses_compact_threshold = 200_000
+        agent.context_compressor.context_length = 1_000_000
+        agent.context_compressor.threshold_tokens = 200_000
+        agent.context_compressor.last_prompt_tokens = 199_387
+        agent.context_compressor.last_real_prompt_tokens = 199_387
+        agent.context_compressor.last_rough_tokens_when_real_prompt_fit = 0
+
+        capture = SimpleNamespace(
+            output=[
+                SimpleNamespace(type="compaction", encrypted_content="sealed_checkpoint"),
+                SimpleNamespace(
+                    type="function_call",
+                    id="fc_1",
+                    call_id="call_1",
+                    name="terminal",
+                    arguments="{}",
+                ),
+            ],
+            usage=SimpleNamespace(input_tokens=200_865, output_tokens=4, total_tokens=200_869),
+            status="completed",
+            model="gpt-5.6",
+        )
+        outcomes = [capture, _codex_message_response("recovered")]
+        requests = []
+        compression_calls = []
+        monkeypatch.setattr(
+            agent,
+            "_interruptible_api_call",
+            lambda api_kwargs: requests.append(api_kwargs) or outcomes.pop(0),
+        )
+        monkeypatch.setattr(
+            "agent.turn_context.estimate_request_tokens_rough", lambda *_a, **_k: 231_730
+        )
+        monkeypatch.setattr(
+            "agent.conversation_loop.estimate_messages_tokens_rough", lambda *_a, **_k: 231_730
+        )
+        monkeypatch.setattr(
+            "agent.conversation_loop.estimate_request_tokens_rough", lambda *_a, **_k: 231_730
+        )
+        monkeypatch.setattr(
+            "agent.conversation_loop._estimate_tools_tokens_rough", lambda *_a, **_k: 0
+        )
+        monkeypatch.setattr(
+            agent,
+            "_execute_tool_calls",
+            lambda assistant_message, messages, *_a: messages.append(
+                {"role": "tool", "tool_call_id": "call_1", "content": "tool result"}
+            ),
+        )
+        monkeypatch.setattr(
+            agent,
+            "_compress_context",
+            lambda messages, system_message, **kwargs: (
+                compression_calls.append(kwargs["approx_tokens"]) or messages,
+                system_message,
+            ),
+        )
+
+        transport = agent._get_transport()
+        original_preflight = transport.preflight_kwargs
+        stripped = False
+
+        def _strip_one_replay(api_kwargs, **kwargs):
+            nonlocal stripped
+            prepared = original_preflight(api_kwargs, **kwargs)
+            has_checkpoint = any(
+                item.get("type") == "compaction"
+                for item in prepared.get("input", [])
+                if isinstance(item, dict)
+            )
+            if stripped or not has_checkpoint:
+                return prepared
+            stripped = True
+            prepared = dict(prepared)
+            if missing == "context_management":
+                prepared.pop("context_management", None)
+            else:
+                prepared["input"] = [
+                    item for item in prepared["input"]
+                    if not (isinstance(item, dict) and item.get("type") == "compaction")
+                ]
+            return prepared
+
+        monkeypatch.setattr(transport, "preflight_kwargs", _strip_one_replay)
+        result = agent.run_conversation(
+            "continue",
+            conversation_history=[{"role": "user", "content": f"prior user {i}"} for i in range(30)],
+        )
+
+        assert result["completed"] is True
+        assert stripped is True
+        assert compression_calls == [231_730]
+        assert len(requests) == 2
+        assert all(request["context_management"] for request in requests)
+        assert any(item.get("type") == "compaction" for item in requests[1]["input"])
+
+
+def test_native_compaction_replay_without_proven_reduction_opens_local_fallback(monkeypatch):
+    """A replay checkpoint alone is not success without independent usage proof."""
+    for replay_usage in (None, 200_865):
+        agent = _build_agent(monkeypatch)
+        agent.model = "gpt-5.6"
+        agent.codex_responses_native_compaction = True
+        agent.codex_responses_compact_threshold = 200_000
+        agent.context_compressor.context_length = 1_000_000
+        agent.context_compressor.threshold_tokens = 200_000
+        agent.context_compressor.last_prompt_tokens = 199_387
+        agent.context_compressor.last_real_prompt_tokens = 199_387
+        agent.context_compressor.last_rough_tokens_when_real_prompt_fit = 0
+
+        def _checkpoint_tool_response(call_id, usage):
+            return SimpleNamespace(
+                output=[
+                    SimpleNamespace(type="compaction", encrypted_content=f"sealed_{call_id}"),
+                    SimpleNamespace(
+                        type="function_call",
+                        id=f"fc_{call_id}",
+                        call_id=call_id,
+                        name="terminal",
+                        arguments="{}",
+                    ),
+                ],
+                usage=(
+                    None
+                    if usage is None
+                    else SimpleNamespace(input_tokens=usage, output_tokens=4, total_tokens=usage + 4)
+                ),
+                status="completed",
+                model="gpt-5.6",
+            )
+
+        outcomes = [
+            _checkpoint_tool_response("call_1", 200_865),
+            _checkpoint_tool_response("call_2", replay_usage),
+            _codex_message_response("recovered"),
+        ]
+        requests = []
+        events = []
+        compression_calls = []
+
+        def _rough(messages, *_a, **_k):
+            return 10_000 if any(
+                isinstance(message, dict) and message.get("content") == "[local fallback]"
+                for message in messages
+            ) else 231_730
+
+        def _call(api_kwargs):
+            events.append("wire")
+            requests.append(api_kwargs)
+            return outcomes.pop(0)
+
+        def _compress(messages, system_message, **kwargs):
+            events.append("compress")
+            compression_calls.append(kwargs["approx_tokens"])
+            return [{"role": "user", "content": "[local fallback]"}], system_message
+
+        monkeypatch.setattr(agent, "_interruptible_api_call", _call)
+        monkeypatch.setattr("agent.turn_context.estimate_request_tokens_rough", _rough)
+        monkeypatch.setattr("agent.conversation_loop.estimate_messages_tokens_rough", _rough)
+        monkeypatch.setattr("agent.conversation_loop.estimate_request_tokens_rough", _rough)
+        monkeypatch.setattr("agent.conversation_loop._estimate_tools_tokens_rough", lambda *_a, **_k: 0)
+        monkeypatch.setattr(
+            agent,
+            "_execute_tool_calls",
+            lambda assistant_message, messages, *_a: messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": assistant_message.tool_calls[0].id,
+                    "content": "tool result",
+                }
+            ),
+        )
+        monkeypatch.setattr(agent, "_compress_context", _compress)
+
+        result = agent.run_conversation(
+            "continue",
+            conversation_history=[{"role": "user", "content": f"prior user {i}"} for i in range(30)],
+        )
+
+        assert result["completed"] is True
+        assert events == ["wire", "wire", "compress", "wire"]
+        assert compression_calls == [200_865]
+        assert len(requests) == 3
+        assert all(request["context_management"] for request in requests)
+        assert any(item.get("type") == "compaction" for item in requests[1]["input"])
+        assert not any(item.get("type") == "compaction" for item in requests[2]["input"])
+
+
+def test_native_preflight_grace_uses_provider_headroom_once_and_preserves_local_controls(monkeypatch):
+    """Provider input headroom, not the local 200k trigger, owns native grace."""
+    results = {}
+    for name, native_enabled, context_length, rough_tokens in (
+        ("safe_900k", True, 1_000_000, 900_000),
+        ("hard_headroom", True, 800_000, 900_000),
+        ("disabled", False, 1_000_000, 231_730),
+    ):
+        agent = _build_agent(monkeypatch)
+        agent.model = "gpt-5.6"
+        agent.codex_responses_native_compaction = native_enabled
+        agent.codex_responses_compact_threshold = 200_000
+        agent.context_compressor.context_length = context_length
+        agent.context_compressor.max_tokens = 50_000
+        agent.context_compressor.threshold_tokens = 200_000
+        agent.context_compressor.last_prompt_tokens = 199_387
+        agent.context_compressor.last_real_prompt_tokens = 199_387
+        agent.context_compressor.last_rough_tokens_when_real_prompt_fit = 0
+
+        events = []
+        requests = []
+        compression_calls = []
+
+        def _rough(messages, *_a, **_k):
+            return 10_000 if any(
+                isinstance(message, dict) and message.get("content") == "[local fallback]"
+                for message in messages
+            ) else rough_tokens
+
+        def _call(api_kwargs):
+            events.append("wire")
+            requests.append(api_kwargs)
+            return _codex_message_response("done")
+
+        def _compress(messages, system_message, **kwargs):
+            events.append("compress")
+            compression_calls.append(kwargs["approx_tokens"])
+            return [{"role": "user", "content": "[local fallback]"}], system_message
+
+        monkeypatch.setattr(agent, "_interruptible_api_call", _call)
+        monkeypatch.setattr("agent.turn_context.estimate_request_tokens_rough", _rough)
+        monkeypatch.setattr("agent.conversation_loop.estimate_messages_tokens_rough", _rough)
+        monkeypatch.setattr("agent.conversation_loop.estimate_request_tokens_rough", _rough)
+        monkeypatch.setattr("agent.conversation_loop._estimate_tools_tokens_rough", lambda *_a, **_k: 0)
+        monkeypatch.setattr(agent, "_compress_context", _compress)
+
+        if name == "safe_900k":
+            import agent.conversation_loop as conversation_loop
+            import agent.native_compaction as native_compaction
+
+            defer_calls = []
+            start_calls = []
+            original_defer = native_compaction.defer_local_preflight_for_native_compaction
+            original_start = conversation_loop.start_native_compaction_preflight_request
+
+            def _turn_defer(target, *args, **kwargs):
+                if target is agent:
+                    defer_calls.append("turn_start")
+                return original_defer(target, *args, **kwargs)
+
+            def _loop_defer(target, *args, **kwargs):
+                if target is agent:
+                    defer_calls.append("pre_api")
+                return original_defer(target, *args, **kwargs)
+
+            def _start(target, *args, **kwargs):
+                if target is agent:
+                    start_calls.append("wire")
+                return original_start(target, *args, **kwargs)
+
+            # turn_context imports the predicate inside build_turn_context;
+            # conversation_loop holds its own imported binding.
+            monkeypatch.setattr(native_compaction, "defer_local_preflight_for_native_compaction", _turn_defer)
+            monkeypatch.setattr(conversation_loop, "defer_local_preflight_for_native_compaction", _loop_defer)
+            monkeypatch.setattr(conversation_loop, "start_native_compaction_preflight_request", _start)
+
+        result = agent.run_conversation(
+            "continue",
+            conversation_history=[{"role": "user", "content": f"prior user {i}"} for i in range(30)],
+        )
+        assert result["completed"] is True
+        results[name] = (events, compression_calls, requests)
+        if name == "safe_900k":
+            assert defer_calls[:2] == ["turn_start", "pre_api"]
+            assert start_calls == ["wire"]
+
+    safe_events, safe_compression, safe_requests = results["safe_900k"]
+    assert safe_events == ["wire"]
+    assert safe_compression == []
+    assert safe_requests[0]["context_management"]
+
+    hard_events, hard_compression, hard_requests = results["hard_headroom"]
+    assert hard_events == ["compress", "wire"]
+    assert hard_compression == [900_000]
+    assert hard_requests[0]["context_management"]
+
+    disabled_events, disabled_compression, disabled_requests = results["disabled"]
+    assert disabled_events == ["compress", "wire"]
+    assert disabled_compression == [231_730]
+    assert "context_management" not in disabled_requests[0]
 
 
 def test_mid_turn_compaction_does_not_double_persist_in_place_rows(monkeypatch, tmp_path):

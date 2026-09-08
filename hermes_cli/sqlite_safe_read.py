@@ -73,9 +73,6 @@ logger = logging.getLogger(__name__)
 
 SQLITE_HEADER_MAGIC = b"SQLite format 3\x00"
 
-# Offset of the 4-byte big-endian page-count field in the SQLite header.
-_HEADER_PAGE_COUNT_OFFSET = 28
-
 # Guards BOTH the registry and the lifecycle syscalls it describes. Reentrant
 # because connect_tracked -> _canonical_db_path -> ... stays on one thread.
 _live_lock = threading.RLock()
@@ -150,18 +147,30 @@ class _TrackingMixin:
     """Untrack-on-close behaviour, mixable into any Connection subclass."""
 
     _hermes_tracked_path: str | None = None
+    _hermes_native_close_complete = False
 
     def close(self) -> None:  # type: ignore[misc]
+        if getattr(self, "_hermes_native_close_complete", False):
+            return
         with _live_lock:
             path = getattr(self, "_hermes_tracked_path", None)
-            # Close first; untrack only once the descriptor is actually gone.
-            # Untracking before a failing close (e.g. cross-thread
-            # ProgrammingError) leaves the FD open while the byte-probe
-            # guard thinks nothing is live — see #75629.
-            super().close()  # type: ignore[misc]
+            primary = None
+            try:
+                super().close()  # type: ignore[misc]
+            except BaseException as exc:
+                primary = exc
+            try:
+                sqlite3.Connection.close(self)
+            except BaseException:
+                if primary is not None:
+                    raise primary
+                raise
+            self._hermes_native_close_complete = True
             if path is not None:
                 self._hermes_tracked_path = None
                 untrack_connection(path)
+            if primary is not None:
+                raise primary
 
 
 class TrackedConnection(_TrackingMixin, sqlite3.Connection):

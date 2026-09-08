@@ -78,6 +78,9 @@ gateway:
     switch_failed:         "Гілку створено, але не вдалося переключитися на неї."
     branched_one:          "⑂ Створено гілку **{title}** (скопійовано {count} повідомлення)\nОригінал: `{parent}`\nГілка: `{new}`\nВикористайте `/resume`, щоб повернутися до оригіналу."
     branched_many:         "⑂ Створено гілку **{title}** (скопійовано {count} повідомлень)\nОригінал: `{parent}`\nГілка: `{new}`\nВикористайте `/resume`, щоб повернутися до оригіналу."
+    branched_one_untitled: "⑂ Branched ({count} message copied)\nOriginal: `{parent}`\nBranch: `{new}`\nUse `/resume` to switch back to the original."
+    branched_many_untitled: "⑂ Branched ({count} messages copied)\nOriginal: `{parent}`\nBranch: `{new}`\nUse `/resume` to switch back to the original."
+    title_not_set_note: "\n⚠️ Title \"{title}\" was not set: {error}"
 
   commands:
     usage:                 "Використання: `/commands [page]`"

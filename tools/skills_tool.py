@@ -163,13 +163,6 @@ def _skills_dir() -> Path:
 MAX_NAME_LENGTH = 64
 MAX_DESCRIPTION_LENGTH = 1024
 
-# Platform identifiers for the 'platforms' frontmatter field.
-# Maps user-friendly names to sys.platform prefixes.
-_PLATFORM_MAP = {
-    "macos": "darwin",
-    "linux": "linux",
-    "windows": "win32",
-}
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _REMOTE_ENV_BACKENDS = frozenset(
     {"docker", "singularity", "modal", "ssh", "daytona", "vercel_sandbox"}

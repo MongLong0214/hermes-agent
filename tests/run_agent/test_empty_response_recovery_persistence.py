@@ -38,9 +38,18 @@ def _agent_with_stubbed_persistence():
     agent._session_db = None
     agent._session_messages = []
     agent.flushed_session_db_messages = []
-    agent._flush_messages_to_session_db = lambda messages, conversation_history=None: (
+    agent.__dict__["flushed_terminal_receipt_holds"] = []
+
+    def _flush_messages_to_session_db(
+        messages,
+        conversation_history=None,
+        *,
+        terminal_receipt_hold=None,
+    ):
         agent.flushed_session_db_messages.append([m.copy() for m in messages])
-    )
+        agent.__dict__["flushed_terminal_receipt_holds"].append(terminal_receipt_hold)
+
+    agent._flush_messages_to_session_db = _flush_messages_to_session_db
     return agent
 
 
@@ -85,6 +94,7 @@ def test_persist_session_strips_trailing_empty_recovery_scaffolding():
         {"role": "user", "content": "run the task"},
     ]
     assert agent.flushed_session_db_messages[-1] == messages
+    assert agent.__dict__["flushed_terminal_receipt_holds"][-1] is None
     assert all(not msg.get("_empty_recovery_synthetic") for msg in messages)
 
 
@@ -102,6 +112,7 @@ def test_persist_session_keeps_unmarked_terminal_empty_response():
         {"role": "assistant", "content": "(empty)"},
     ]
     assert agent.flushed_session_db_messages[-1] == messages
+    assert agent.__dict__["flushed_terminal_receipt_holds"][-1] is None
 
 
 

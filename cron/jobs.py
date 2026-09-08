@@ -38,6 +38,13 @@ from typing import Optional, Dict, List, Any, Set, Tuple, Union, Collection
 
 logger = logging.getLogger(__name__)
 
+# One execution-local capability bridges only legacy scheduler seam callables
+# that still accept ``claim_dispatch(job_id)``. It is never populated from the
+# durable store, so an id-only caller cannot adopt another worker's authority.
+_claimed_dispatch_snapshot: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
+    "cron_claimed_dispatch_snapshot", default=None
+)
+
 from hermes_time import now as _hermes_now
 from utils import atomic_replace, atomic_write_text
 
@@ -458,6 +465,21 @@ def fire_claim_fence(job_id: str, *, expected_owner: str):
 # updated lets an unsafe value (``../escape``, absolute path, nested) leak
 # into output writes/deletes.
 _IMMUTABLE_JOB_FIELDS = frozenset({"id"})
+_RESTART_POLICIES = frozenset({"terminal", "resume"})
+_RESUME_RETRY_INITIAL_SECONDS = 5
+_RESUME_RETRY_MAX_SECONDS = 300
+
+
+def _validate_restart_policy(value: Any) -> str:
+    """Validate the explicit one-shot restart contract at every write door."""
+    if not isinstance(value, str) or value not in _RESTART_POLICIES:
+        raise ValueError("restart_policy must be one of: terminal, resume")
+    return value
+
+
+def _stored_restart_policy(value: Any) -> str:
+    """Read legacy/corrupt policy values fail-closed as terminal."""
+    return value if isinstance(value, str) and value == "resume" else "terminal"
 
 
 def _job_output_dir(job_id: str) -> Path:
@@ -552,6 +574,9 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
         name = label_source[:50].strip() or "cron job"
     normalized["name"] = name
     normalized["schedule_display"] = _schedule_display_for_job(normalized)
+    normalized["restart_policy"] = _stored_restart_policy(
+        normalized.get("restart_policy")
+    )
 
     # Display state is derived from the scheduler-honoured ``enabled`` flag so a
     # half-paused record (enabled=true + state/paused_at) cannot render as
@@ -1817,6 +1842,7 @@ def create_job(
     schedule: str,
     name: Optional[str] = None,
     repeat: Optional[int] = None,
+    restart_policy: str = "terminal",
     deliver: Optional[str] = None,
     origin: Optional[Dict[str, Any]] = None,
     skill: Optional[str] = None,
@@ -1905,6 +1931,7 @@ def create_job(
         The created job dict
     """
     parsed_schedule = parse_schedule(schedule)
+    restart_policy = _validate_restart_policy(restart_policy)
 
     # Normalize repeat: treat 0 or negative values as None (infinite)
     if repeat is not None and repeat <= 0:
@@ -2020,6 +2047,7 @@ def create_job(
             "times": repeat,  # None = forever
             "completed": 0
         },
+        "restart_policy": restart_policy,
         "enabled": True,
         "state": "scheduled",
         "paused_at": None,
@@ -2137,6 +2165,11 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
             # Validate / normalize workdir if present in updates.  Empty string
             # or None both mean "clear the field" (restore old behaviour).
+            if "restart_policy" in updates:
+                updates["restart_policy"] = _validate_restart_policy(
+                    updates["restart_policy"]
+                )
+
             if "workdir" in updates:
                 _wd = updates["workdir"]
                 if _wd in {None, "", False}:
@@ -2358,6 +2391,7 @@ def mark_job_run(
     status: Optional[str] = None,
     *,
     expected_fire_owner: Optional[str] = None,
+    expected_resume_owner: Optional[str] = None,
 ) -> bool:
     with _fire_job_lock(job_id) as acquired:
         if not acquired:
@@ -2369,6 +2403,7 @@ def mark_job_run(
             delivery_error,
             status=status,
             expected_fire_owner=expected_fire_owner,
+            expected_resume_owner=expected_resume_owner,
         )
 
 
@@ -2463,6 +2498,7 @@ def _mark_job_run_locked(
     *,
     status: Optional[str] = None,
     expected_fire_owner: Optional[str] = None,
+    expected_resume_owner: Optional[str] = None,
 ) -> bool:
     """
     Mark a job as having been run.
@@ -2492,6 +2528,64 @@ def _mark_job_run_locked(
                             job_id,
                         )
                         return False
+                reservation = job.get("resume_reservation")
+                if (
+                    _stored_restart_policy(job.get("restart_policy")) == "resume"
+                    and isinstance(reservation, dict)
+                    and reservation.get("state") == "running"
+                    and expected_resume_owner is None
+                ):
+                    # The running reservation is the durable authority for an
+                    # opted-in occurrence. A shutdown snapshot can observe the
+                    # two-field in-memory registration between claim_dispatch()
+                    # and its later owner update; fail closed rather than
+                    # consuming the run while leaving that reservation behind.
+                    logger.warning(
+                        "mark_job_run: job_id %s has a running resume reservation "
+                        "without its owner; discarding unowned settlement",
+                        job_id,
+                    )
+                    return False
+                if expected_resume_owner is not None:
+                    if (
+                        not isinstance(reservation, dict)
+                        or reservation.get("state") != "running"
+                        or reservation.get("owner") != expected_resume_owner
+                    ):
+                        logger.warning(
+                            "mark_job_run: job_id %s resume reservation owner changed; "
+                            "discarding stale completion",
+                            job_id,
+                        )
+                        return False
+                if status == "interrupted" and expected_resume_owner is not None:
+                    assert isinstance(reservation, dict)
+                    # A forced gateway drain is not a terminal completion for
+                    # an explicitly resumable occurrence. Keep its durable ID,
+                    # release the owner, and defer a re-claim with a bounded
+                    # exponential backoff so a shutdown loop cannot hot-fire.
+                    attempt = max(1, int(reservation.get("attempt") or 1))
+                    retry_seconds = min(
+                        _RESUME_RETRY_INITIAL_SECONDS * (2 ** (attempt - 1)),
+                        _RESUME_RETRY_MAX_SECONDS,
+                    )
+                    now = _hermes_now()
+                    reservation["owner"] = None
+                    reservation["state"] = "retry_pending"
+                    reservation["retry_not_before"] = (
+                        now + timedelta(seconds=retry_seconds)
+                    ).isoformat()
+                    job["last_run_at"] = now.isoformat()
+                    job["last_status"] = "interrupted"
+                    job["last_error"] = error or "Cron run interrupted"
+                    job["last_delivery_error"] = delivery_error
+                    job["fire_claim"] = None
+                    job["run_claim"] = None
+                    job["enabled"] = True
+                    job["state"] = "retry_pending"
+                    job["next_run_at"] = reservation["retry_not_before"]
+                    save_jobs(jobs)
+                    return True
                 now = _hermes_now().isoformat()
                 job["last_run_at"] = now
                 job["last_status"] = status or ("ok" if success else "error")
@@ -2527,6 +2621,8 @@ def _mark_job_run_locked(
                 # is claimable again. No-op if the job never carried a claim.
                 if job.get("run_claim") is not None:
                     job["run_claim"] = None
+                if expected_resume_owner is not None:
+                    job.pop("resume_reservation", None)
                 
                 # Increment completed count.  Finite one-shot jobs are
                 # pre-claimed by claim_dispatch() BEFORE the side effect runs
@@ -2649,7 +2745,51 @@ def _write_wedged_oneshot_diagnostic(job: Dict[str, Any]) -> None:
         )
 
 
-def claim_dispatch(job_id: str) -> bool:
+def _resume_run_claim_matches_running_reservation(
+    job: Dict[str, Any], run_claim: Any
+) -> bool:
+    """Return whether a stale claim proves the exact resumable run died.
+
+    A stale timestamp only establishes that *some* claimant stopped
+    heartbeating. It may never authorize mutation of a different live resume
+    reservation. The durable proof binds the due-scan run owner to the distinct
+    fire/dispatch owner: the run claim must carry the reservation's owner and
+    occurrence, and a persisted fire claim must point back to that exact run
+    owner. Missing or malformed linkage fails closed.
+    """
+    reservation = job.get("resume_reservation")
+    if not isinstance(reservation, dict) or reservation.get("state") != "running":
+        return False
+    fire_owner = reservation.get("owner")
+    occurrence_id = reservation.get("occurrence_id")
+    if not isinstance(fire_owner, str) or not fire_owner:
+        return False
+    if not isinstance(occurrence_id, str) or not occurrence_id:
+        return False
+    if not isinstance(run_claim, dict):
+        return False
+    run_owner = run_claim.get("by")
+    if (
+        not isinstance(run_owner, str)
+        or not run_owner
+        or run_claim.get("fire_owner") != fire_owner
+        or run_claim.get("occurrence_id") != occurrence_id
+    ):
+        return False
+    fire_claim = job.get("fire_claim")
+    if fire_claim is not None and (
+        not isinstance(fire_claim, dict)
+        or fire_claim.get("by") != fire_owner
+        or fire_claim.get("source_run_owner") != run_owner
+        or fire_claim.get("occurrence_id") != occurrence_id
+    ):
+        return False
+    return True
+
+
+def claim_dispatch(
+    job_id: str, *, claimed_job: Optional[Dict[str, Any]] = None
+) -> bool:
     """Atomically claim a finite one-shot job dispatch BEFORE execution.
 
     Increments ``repeat.completed`` under the cross-process jobs lock and
@@ -2666,11 +2806,63 @@ def claim_dispatch(job_id: str) -> bool:
     Recurring jobs (they use ``advance_next_run``) and infinite-repeat / no-repeat
     jobs are left unchanged and always allowed to proceed.
     """
+    # ``claimed_job`` is an execution capability, never reconstructed from a
+    # public job id. A scheduler may scope it across a legacy one-argument seam,
+    # but callers without that exact capability cannot adopt stored authority.
+    if claimed_job is None:
+        claimed_job = _claimed_dispatch_snapshot.get()
     with _jobs_lock():
         jobs = load_jobs()
         for i, job in enumerate(jobs):
             if job["id"] != job_id:
                 continue
+            current_is_resume = _stored_restart_policy(job.get("restart_policy")) == "resume"
+            snapshot_is_resume = (
+                isinstance(claimed_job, dict)
+                and _stored_restart_policy(claimed_job.get("restart_policy")) == "resume"
+            )
+            if current_is_resume or snapshot_is_resume:
+                # Resume capabilities are fenced before any schedule/repeat
+                # branch that could otherwise consume, complete, or remove a
+                # row whose policy changed after acquisition.
+                if (
+                    not current_is_resume
+                    or job.get("schedule", {}).get("kind") != "once"
+                    or not isinstance(claimed_job, dict)
+                ):
+                    return False
+                repeat = job.get("repeat")
+                if not isinstance(repeat, dict):
+                    return False
+                times = repeat.get("times")
+                completed = repeat.get("completed", 0)
+                if not isinstance(times, int) or times <= 0 or completed >= times:
+                    return False
+                reservation = job.get("resume_reservation")
+                fire_claim = job.get("fire_claim")
+                run_claim = job.get("run_claim")
+                if (
+                    not isinstance(run_claim, dict)
+                    or not isinstance(fire_claim, dict)
+                    or not isinstance(reservation, dict)
+                    or not isinstance(run_claim.get("by"), str)
+                    or not run_claim["by"]
+                    or not isinstance(fire_claim.get("by"), str)
+                    or not fire_claim["by"]
+                    or not isinstance(run_claim.get("occurrence_id"), str)
+                    or not run_claim["occurrence_id"]
+                    or run_claim.get("fire_owner") != fire_claim["by"]
+                    or fire_claim.get("source_run_owner") != run_claim["by"]
+                    or fire_claim.get("occurrence_id") != run_claim["occurrence_id"]
+                    or reservation.get("state") != "running"
+                    or reservation.get("owner") != fire_claim["by"]
+                    or reservation.get("occurrence_id") != run_claim["occurrence_id"]
+                    or claimed_job.get("run_claim") != run_claim
+                    or claimed_job.get("fire_claim") != fire_claim
+                    or claimed_job.get("resume_reservation") != reservation
+                ):
+                    return False
+                return True
             if job.get("schedule", {}).get("kind") != "once":
                 return True  # recurring jobs use advance_next_run(), not dispatch claims
             repeat = job.get("repeat")
@@ -2712,7 +2904,7 @@ def claim_dispatch(job_id: str) -> bool:
                     times,
                 )
                 return False
-            # Claim this dispatch before the side effect runs.
+            # Claim this terminal dispatch before the side effect runs.
             repeat["completed"] = completed + 1
             save_jobs(jobs)
             logger.debug(
@@ -2868,7 +3060,9 @@ def claim_job_for_fire(
     claim_ttl_seconds: int = 300,
     force: bool = False,
     return_job: bool = False,
+    expected_run_owner: Optional[str] = None,
 ) -> Union[bool, Dict[str, Any]]:
+    """Claim one fire, optionally upgrading the exact due-scan run owner."""
     with _fire_job_lock(job_id) as acquired:
         if not acquired:
             return False
@@ -2877,6 +3071,7 @@ def claim_job_for_fire(
             claim_ttl_seconds=claim_ttl_seconds,
             force=force,
             return_job=return_job,
+            expected_run_owner=expected_run_owner,
         )
 
 
@@ -2886,6 +3081,7 @@ def _claim_job_for_fire_locked(
     claim_ttl_seconds: int = 300,
     force: bool = False,
     return_job: bool = False,
+    expected_run_owner: Optional[str] = None,
 ) -> Union[bool, Dict[str, Any]]:
     """Atomically claim a job for a single external 'fire' (multi-machine
     at-most-once). Returns True iff THIS caller won the claim.
@@ -2922,6 +3118,102 @@ def _claim_job_for_fire_locked(
             if not force and not is_job_runnable(job):
                 return False
             now = _hermes_now()
+            is_resume_oneshot = (
+                job.get("schedule", {}).get("kind") == "once"
+                and _stored_restart_policy(job.get("restart_policy")) == "resume"
+            )
+            if is_resume_oneshot:
+                # A resumable body gets authority only from this transaction.
+                # A due worker must prove the exact run token it observed; a
+                # manual/external worker can mint only from a completely empty
+                # authority slot.  Neither path adopts, repairs, or replaces a
+                # pre-existing lease/reservation.
+                run_claim = job.get("run_claim")
+                fire_claim = job.get("fire_claim")
+                reservation = job.get("resume_reservation")
+                occurrence_id: Optional[str] = None
+                reservation_attempt = 1
+                if expected_run_owner is None:
+                    if run_claim is not None or fire_claim is not None:
+                        return False
+                else:
+                    if (
+                        not isinstance(run_claim, dict)
+                        or run_claim.get("by") != expected_run_owner
+                        or run_claim.get("fire_owner") not in (None, "")
+                        or run_claim.get("occurrence_id") not in (None, "")
+                        or fire_claim is not None
+                    ):
+                        return False
+                    try:
+                        claimed_at = _ensure_aware(
+                            datetime.fromisoformat(run_claim["at"])
+                        )
+                        age = (now - claimed_at).total_seconds()
+                    except (KeyError, TypeError, ValueError):
+                        return False
+                    if not 0 <= age < _oneshot_run_claim_ttl_seconds():
+                        return False
+
+                if reservation is not None:
+                    if (
+                        not isinstance(reservation, dict)
+                        or reservation.get("state") != "retry_pending"
+                        or reservation.get("owner") is not None
+                        or not isinstance(reservation.get("occurrence_id"), str)
+                        or not reservation["occurrence_id"]
+                    ):
+                        return False
+                    retry_not_before = reservation.get("retry_not_before")
+                    if not isinstance(retry_not_before, str):
+                        return False
+                    try:
+                        eligible_at = _ensure_aware(
+                            datetime.fromisoformat(retry_not_before)
+                        )
+                        reservation_attempt = max(
+                            1, int(reservation.get("attempt") or 1)
+                        ) + 1
+                    except (TypeError, ValueError):
+                        return False
+                    if eligible_at > now:
+                        return False
+                    occurrence_id = reservation["occurrence_id"]
+
+                if force:
+                    job["enabled"] = True
+                    job["state"] = "scheduled"
+                    job["paused_at"] = None
+                    job["paused_reason"] = None
+                run_owner = (
+                    expected_run_owner
+                    if expected_run_owner is not None
+                    else f"{_machine_id()}:{uuid.uuid4().hex}"
+                )
+                fire_owner = f"{_machine_id()}:{uuid.uuid4().hex}"
+                occurrence_id = occurrence_id or uuid.uuid4().hex
+                job["run_claim"] = {
+                    "at": now.isoformat(),
+                    "by": run_owner,
+                    "fire_owner": fire_owner,
+                    "occurrence_id": occurrence_id,
+                }
+                job["fire_claim"] = {
+                    "at": now.isoformat(),
+                    "by": fire_owner,
+                    "source_run_owner": run_owner,
+                    "occurrence_id": occurrence_id,
+                }
+                job["resume_reservation"] = {
+                    "occurrence_id": occurrence_id,
+                    "owner": fire_owner,
+                    "state": "running",
+                    "attempt": reservation_attempt,
+                    "reserved_at": now.isoformat(),
+                }
+                save_jobs(jobs)
+                return copy.deepcopy(job) if return_job else True
+
             existing = job.get("fire_claim")
             if existing:
                 try:
@@ -2946,7 +3238,32 @@ def _claim_job_for_fire_locked(
             # stale lease, and the previous runner must not heartbeat the new
             # claim merely because hostname + PID are unchanged.
             owner = f"{_machine_id()}:{uuid.uuid4().hex}"
-            job["fire_claim"] = {"at": now.isoformat(), "by": owner}
+            fire_claim = {"at": now.isoformat(), "by": owner}
+            run_claim = job.get("run_claim")
+            if (
+                job.get("schedule", {}).get("kind") == "once"
+                and _stored_restart_policy(job.get("restart_policy")) == "resume"
+            ):
+                if not (
+                    isinstance(run_claim, dict)
+                    and isinstance(run_claim.get("by"), str)
+                    and run_claim["by"]
+                ):
+                    # Manual/external fires can start without a preceding due
+                    # scan. Mint their distinct run token in this same durable
+                    # transaction so they satisfy the identical A→B handoff.
+                    run_claim = {
+                        "at": now.isoformat(),
+                        "by": f"{_machine_id()}:{uuid.uuid4().hex}",
+                    }
+                    job["run_claim"] = run_claim
+                # Keep this distinct run token for heartbeat/release fencing
+                # while binding this fire token to the exact token it upgrades;
+                # claim_dispatch() verifies the pair before a resumable body may
+                # start.
+                fire_claim["source_run_owner"] = run_claim["by"]
+                run_claim["fire_owner"] = owner
+            job["fire_claim"] = fire_claim
             kind = job.get("schedule", {}).get("kind")
             if kind in {"cron", "interval"}:
                 nxt = compute_next_run(job["schedule"], now.isoformat())
@@ -3266,6 +3583,69 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                 except (KeyError, ValueError, TypeError):
                     pass  # malformed claim → fall through and (re)claim
 
+                # A resumable occurrence records its owner separately from the
+                # run claim. If the process dies after claim_dispatch() but
+                # before settlement, the stale run claim otherwise admits this
+                # job again while the durable reservation stays "running" and
+                # rejects every retry forever. Reuse the existing TTL/malformed
+                # semantics as the sole liveness proof; never infer death from
+                # the PID or reservation timestamp.
+                if _stored_restart_policy(job.get("restart_policy")) == "resume":
+                    reservation = job.get("resume_reservation")
+                    if isinstance(reservation, dict) and reservation.get("state") == "running":
+                        if not _resume_run_claim_matches_running_reservation(
+                            job, existing_claim
+                        ):
+                            # A stale/malformed lease only proves that a claimant
+                            # stopped heartbeating. Without an exact durable
+                            # owner+occurrence chain it cannot fence a potentially
+                            # live reservation or authorize a replay.
+                            continue
+                        attempt = max(1, int(reservation.get("attempt") or 1))
+                        retry_seconds = min(
+                            _RESUME_RETRY_INITIAL_SECONDS * (2 ** (attempt - 1)),
+                            _RESUME_RETRY_MAX_SECONDS,
+                        )
+                        retry_not_before = (
+                            now + timedelta(seconds=retry_seconds)
+                        ).isoformat()
+                        reservation["owner"] = None
+                        reservation["state"] = "retry_pending"
+                        reservation["retry_not_before"] = retry_not_before
+                        job["resume_reservation"] = reservation
+                        job["run_claim"] = None
+                        job["fire_claim"] = None
+                        job["enabled"] = True
+                        job["state"] = "retry_pending"
+                        job["next_run_at"] = retry_not_before
+                        for rj in raw_jobs:
+                            if rj.get("id") == job.get("id"):
+                                rj["resume_reservation"] = copy.deepcopy(reservation)
+                                rj["run_claim"] = None
+                                rj["fire_claim"] = None
+                                rj["enabled"] = True
+                                rj["state"] = "retry_pending"
+                                rj["next_run_at"] = retry_not_before
+                                needs_save = True
+                                break
+                        logger.warning(
+                            "Job '%s': rearmed abandoned resumable occurrence after stale run claim",
+                            job.get("name", job.get("id", "?")),
+                        )
+                        continue
+
+            reservation = job.get("resume_reservation")
+            if (
+                _stored_restart_policy(job.get("restart_policy")) == "resume"
+                and isinstance(reservation, dict)
+                and reservation.get("state") == "running"
+                and not existing_claim
+            ):
+                # A running resume reservation without a durable run claim has
+                # no liveness proof. Fail closed rather than minting a new claim
+                # beneath a possibly live execution.
+                continue
+
             next_run = job.get("next_run_at")
             if not next_run:
                 schedule = job.get("schedule", {})
@@ -3508,7 +3888,10 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                 # (_oneshot_run_claim_ttl_seconds, derived from HERMES_CRON_TIMEOUT),
                 # so the job is re-dispatched rather than wedged forever.
                 if kind == "once":
-                    claim = {"at": now.isoformat(), "by": _machine_id()}
+                    # Every acquisition gets a fresh token. A retry on the
+                    # same host must still fence a late prior runner from
+                    # settling or heartbeating the replacement occurrence.
+                    claim = {"at": now.isoformat(), "by": f"{_machine_id()}:{uuid.uuid4().hex}"}
                     job["run_claim"] = claim
                     for rj in raw_jobs:
                         if rj["id"] == job["id"]:

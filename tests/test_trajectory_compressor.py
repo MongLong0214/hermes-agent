@@ -6,8 +6,10 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch, MagicMock
 
+import openai
 import pytest
 
+from agent.gemini_outbound_policy import GeminiOutboundDenied
 from trajectory_compressor import (
     CompressionConfig,
     TrajectoryMetrics,
@@ -52,6 +54,67 @@ def test_generate_summary_kimi_omits_temperature():
 
     assert result.startswith("[CONTEXT SUMMARY]:")
     assert "temperature" not in compressor.client.chat.completions.create.call_args.kwargs
+
+
+def _assert_stable_gemini_denial(exc_info):
+    assert exc_info.type is GeminiOutboundDenied
+    assert type(exc_info.value) is GeminiOutboundDenied
+    assert exc_info.value.code == "gemini_outbound_denied"
+    assert str(exc_info.value) == "Gemini outbound requests are disabled."
+    assert vars(exc_info.value) == {}
+
+
+@pytest.mark.parametrize(
+    ("model", "base_url"),
+    [
+        ("gemini-2.5-flash", "https://custom.example/v1"),
+        ("gpt-4.1", "https://generativelanguage.googleapis.com/v1beta"),
+        ("gpt-4.1", "https://us-central1-aiplatform.googleapis.com/v1"),
+    ],
+)
+def test_init_summarizer_denies_gemini_custom_routes_before_credentials_and_client(
+    model, base_url
+):
+    compressor = TrajectoryCompressor.__new__(TrajectoryCompressor)
+    compressor.config = SimpleNamespace(
+        summarization_model=model,
+        base_url=base_url,
+        api_key_env="MUST_NOT_BE_READ",
+        max_concurrent_requests=1,
+    )
+    credential_lookup = MagicMock(side_effect=AssertionError("credential lookup reached"))
+    client_constructor = MagicMock(side_effect=AssertionError("OpenAI construction reached"))
+
+    with (
+        patch("trajectory_compressor.os.getenv", credential_lookup),
+        patch.object(openai, "OpenAI", client_constructor),
+        pytest.raises(GeminiOutboundDenied) as exc_info,
+    ):
+        compressor._init_summarizer()
+
+    _assert_stable_gemini_denial(exc_info)
+    credential_lookup.assert_not_called()
+    client_constructor.assert_not_called()
+
+
+def test_init_summarizer_allows_ordinary_custom_openai_compatible_route():
+    compressor = TrajectoryCompressor.__new__(TrajectoryCompressor)
+    compressor.config = SimpleNamespace(
+        summarization_model="gpt-4.1",
+        base_url="https://custom.example/v1",
+        api_key_env="CUSTOM_API_KEY",
+        max_concurrent_requests=1,
+    )
+    client_constructor = MagicMock(return_value=MagicMock())
+
+    with (
+        patch("trajectory_compressor.os.getenv", return_value="test-key"),
+        patch.object(openai, "OpenAI", client_constructor),
+    ):
+        compressor._init_summarizer()
+
+    assert compressor._use_call_llm is False
+    client_constructor.assert_called_once()
 
 
 

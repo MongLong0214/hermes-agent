@@ -3276,7 +3276,6 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
                 text=True, encoding="utf-8", errors="replace",
             )
         if fetch_result is not None and fetch_result.returncode == 0:
-            upstream_exists = True
             compare_branch = f"upstream/{branch}"
         else:
             # No upstream remote, or the upstream fetch failed — use origin.
@@ -3287,7 +3286,6 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
                 capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
             )
-            upstream_exists = False
             compare_branch = f"origin/{branch}"
     else:
         # Non-default branch: compare against origin/<branch> directly.
@@ -3298,7 +3296,6 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
         )
-        upstream_exists = False
         compare_branch = f"origin/{branch}"
 
     if fetch_result.returncode != 0:

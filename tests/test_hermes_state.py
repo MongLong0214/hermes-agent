@@ -1,9 +1,14 @@
 """Tests for hermes_state.py — SessionDB SQLite CRUD, FTS5 search, export."""
 
-import sqlite3
-import time
+import hashlib
 import json
+import os
+import sqlite3
+import subprocess
+import sys
+import time
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
@@ -12,6 +17,7 @@ import pytest
 import hermes_state
 from agent.session_activity import ActivityProvenance
 from hermes_state import SCHEMA_SQL, SCHEMA_VERSION, SessionDB
+from hermes_state_common import TURN_FENCE_GOVERNED_TABLES, register_turn_fence_generation
 
 
 class _NoFtsCursor(sqlite3.Cursor):
@@ -60,6 +66,11 @@ class _NoFtsExistingTableConnection(sqlite3.Connection):
 class _NoTrigramCursor(sqlite3.Cursor):
     """Simulate a SQLite build with FTS5 but without the trigram tokenizer."""
 
+    def execute(self, sql, parameters=()):
+        if "tokenize='trigram'" in sql:
+            raise sqlite3.OperationalError("no such tokenizer: trigram")
+        return super().execute(sql, parameters)
+
     def executescript(self, sql_script):
         if "tokenize='trigram'" in sql_script:
             raise sqlite3.OperationalError("no such tokenizer: trigram")
@@ -98,12 +109,371 @@ def _no_fts_rebuild_throttle(monkeypatch):
     monkeypatch.setattr(SessionDB, "_FTS_REBUILD_DUTY_FACTOR", 0.0)
 
 
+def _state_store_snapshot(db_path: Path):
+    """Capture bytes plus the public schema graph without opening a writer."""
+    def digest(path: Path):
+        return hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
+
+    conn = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        version = tuple(conn.execute("SELECT version FROM schema_version"))
+        graph = tuple(
+            conn.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                "WHERE type IN ('table', 'index', 'trigger', 'view') "
+                "ORDER BY type, name"
+            )
+        )
+    finally:
+        conn.close()
+    return {
+        "files": {
+            suffix: digest(db_path.with_name(db_path.name + suffix))
+            for suffix in ("", "-wal", "-shm")
+        },
+        "schema_version": version,
+        "graph": graph,
+    }
+
+
+def _seed_v27_state_store(db_path: Path) -> None:
+    """Build a complete pre-v28 store, rather than a scalar-only downgrade."""
+    current = SessionDB(db_path)
+    current.close()
+
+    legacy = sqlite3.connect(str(db_path))
+    try:
+        for (name,) in legacy.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+            "AND (name LIKE 'turn_fence_%' OR name LIKE 'session_process_%')"
+        ):
+            legacy.execute(f'DROP TRIGGER "{name}"')
+        legacy.execute("PRAGMA foreign_keys = OFF")
+        legacy.execute("DROP TABLE session_process_reservations")
+        legacy.execute("DROP TABLE session_process_authority_events")
+        legacy.execute("DROP TABLE session_process_authorities")
+        legacy.execute("ALTER TABLE sessions DROP COLUMN session_generation")
+        legacy.execute(
+            "DELETE FROM state_meta WHERE key IN "
+            "('session_process_state_db_id', 'session_process_state_family')"
+        )
+        legacy.execute("DELETE FROM schema_version")
+        legacy.execute(
+            "INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION - 1,)
+        )
+        legacy.create_function(
+            "hermes_turn_fence_generation", 0, lambda: SCHEMA_VERSION - 1
+        )
+        for table in TURN_FENCE_GOVERNED_TABLES:
+            if table in {"session_process_authorities", "session_process_reservations"}:
+                continue
+            for operation in ("INSERT", "UPDATE", "DELETE"):
+                legacy.execute(
+                    f"CREATE TRIGGER turn_fence_{table}_{operation.lower()} "
+                    f"BEFORE {operation} ON {table} BEGIN "
+                    "SELECT CASE "
+                    "WHEN typeof(hermes_turn_fence_generation()) != 'integer' "
+                    f"OR hermes_turn_fence_generation() != {SCHEMA_VERSION - 1} "
+                    "THEN RAISE(ABORT, 'state DB generation incompatible') "
+                    "END; END"
+                )
+        legacy.commit()
+    finally:
+        legacy.close()
+
+
+_LEGACY_CANONICAL_WRITER_PATH = (
+    Path(__file__).resolve().parent / "fixtures" / "legacy_v27_canonical_writer.py"
+)
+
+
+def _start_legacy_canonical_writer_attempt(home: Path, db_path: Path):
+    """Start the tracked v27-compatible writer outside the project import path."""
+    assert _LEGACY_CANONICAL_WRITER_PATH.is_file()
+    writer_cwd = home / "legacy-writer-cwd"
+    writer_cwd.mkdir()
+    env = {
+        "HERMES_HOME": str(home),
+        "LEGACY_SCHEMA_GENERATION": str(SCHEMA_VERSION - 1),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONPATH": "",
+        "PYTHONSAFEPATH": "1",
+        "STATE_DB_PATH": str(db_path),
+    }
+    for name in ("PATH", "SYSTEMROOT", "WINDIR"):
+        value = os.environ.get(name)
+        if value:
+            env[name] = value
+    process = subprocess.Popen(
+        [sys.executable, "-B", str(_LEGACY_CANONICAL_WRITER_PATH)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        cwd=writer_cwd,
+    )
+    assert process.stdout is not None
+    assert process.stderr is not None
+    return process, process.stdout.readline().strip()
+
+
+def _start_legacy_canonical_writer(home: Path, db_path: Path):
+    process, outcome = _start_legacy_canonical_writer_attempt(home, db_path)
+    assert outcome == "READY:READBACK", process.stderr.read()
+    return process
+
+
+def _stop_legacy_canonical_writer(process):
+    try:
+        if process.stdin is not None and not process.stdin.closed:
+            process.stdin.close()
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.terminate()
+        process.wait(timeout=5)
+    finally:
+        if process.stderr is not None:
+            stderr = process.stderr.read()
+            assert process.returncode == 0, stderr
+
+
 # =========================================================================
 # Connection lifecycle
 # =========================================================================
 
 
 class TestConnectionLifecycle:
+    def test_schema_version_existing_future_fails_before_package_mutation(self, tmp_path):
+        """An existing future store is rejected before SessionDB can write it."""
+        db_path = tmp_path / "future-state.db"
+        seed = SessionDB(db_path)
+        seed.close()
+        seed = sqlite3.connect(str(db_path), isolation_level=None)
+        seed.execute("PRAGMA journal_mode=WAL")
+        seed.execute(
+            "UPDATE schema_version SET version = ?", (SCHEMA_VERSION + 1,)
+        )
+        before = _state_store_snapshot(db_path)
+
+        with pytest.raises(RuntimeError) as raised:
+            SessionDB(db_path=db_path)
+
+        error = raised.value
+        assert isinstance(error, hermes_state.IncompatibleSchemaError)
+        assert error.code == "STATE_DB_SCHEMA_INCOMPATIBLE"
+        assert error.expected_generation == SCHEMA_VERSION
+        assert error.actual_generation == SCHEMA_VERSION + 1
+        assert error.build_identity["version"]
+        assert "expected generation" in str(error)
+        assert "actual generation" in str(error)
+        assert "build identity" in str(error)
+        assert str(db_path) not in str(error)
+        assert str(tmp_path) not in (hermes_state.get_last_init_error() or "")
+        assert _state_store_snapshot(db_path) == before
+        seed.close()
+
+    def test_forward_schema_migration_refuses_active_legacy_canonical_writer(
+        self, tmp_path, monkeypatch
+    ):
+        """Only the live canonical store refuses a forward-fence publication."""
+        home = tmp_path / "profile-home"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        canonical = home / "state.db"
+        temporary = tmp_path / "temporary-v27.db"
+        _seed_v27_state_store(canonical)
+        _seed_v27_state_store(temporary)
+        writer = _start_legacy_canonical_writer(home, canonical)
+        try:
+            # The tracked legacy fixture both wrote and read its v27 row before
+            # the new migrator was admitted.
+            check = sqlite3.connect(str(canonical))
+            try:
+                assert check.execute(
+                    "SELECT entry_json FROM gateway_routing WHERE session_key = 'legacy-writer'"
+                ).fetchall() == [('{}',)]
+            finally:
+                check.close()
+            # A test/private DB stays migratable while the live profile is owned.
+            temp_db = SessionDB(temporary)
+            temp_db.close()
+            assert _state_store_snapshot(temporary)["schema_version"] == (
+                (SCHEMA_VERSION,),
+            )
+
+            before = _state_store_snapshot(canonical)
+            with pytest.raises(hermes_state.ForwardSchemaMigrationAdmissionError) as raised:
+                SessionDB(canonical)
+            error = raised.value
+            assert error.expected_generation == SCHEMA_VERSION
+            assert error.actual_generation == SCHEMA_VERSION - 1
+            assert str(canonical) not in str(error)
+            assert _state_store_snapshot(canonical) == before
+        finally:
+            _stop_legacy_canonical_writer(writer)
+
+        # Once that precise live owner is gone, normal forward migration and
+        # equal-version reopen remain available.
+        upgraded = SessionDB(canonical)
+        upgraded.close()
+        equal_version = SessionDB(canonical)
+        equal_version.close()
+        assert _state_store_snapshot(canonical)["schema_version"] == ((SCHEMA_VERSION,),)
+
+        new_home = tmp_path / "empty-profile-home"
+        new_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(new_home))
+        fresh = SessionDB(new_home / "state.db")
+        fresh.close()
+        assert _state_store_snapshot(new_home / "state.db")["schema_version"] == (
+            (SCHEMA_VERSION,),
+        )
+
+    def test_forward_migration_keeps_canonical_lock_target_when_home_changes_before_lease(
+        self, tmp_path, monkeypatch
+    ):
+        """A frozen canonical home must keep admission on that home's runtime lock."""
+        from gateway import status
+
+        home_a = tmp_path / "home-a"
+        home_b = tmp_path / "home-b"
+        home_a.mkdir()
+        home_b.mkdir()
+        canonical = home_b / "state.db"
+        canonical_lock_path = home_b / "gateway.lock"
+        monkeypatch.setenv("HERMES_HOME", str(home_b))
+        _seed_v27_state_store(canonical)
+        writer = _start_legacy_canonical_writer(home_b, canonical)
+        before = _state_store_snapshot(canonical)
+        observed_lock_targets = []
+        original_acquire = status.acquire_gateway_runtime_migration_lease
+        original_init_schema = SessionDB._init_schema
+        reached_v28_publication = []
+
+        def switch_home_after_target_snapshot(target_lock_path=None):
+            observed_lock_targets.append(target_lock_path)
+            monkeypatch.setenv("HERMES_HOME", str(home_a))
+            if target_lock_path is None:
+                return original_acquire()
+            return original_acquire(target_lock_path)
+
+        def record_v28_publication(db):
+            reached_v28_publication.append(True)
+            return original_init_schema(db)
+
+        monkeypatch.setattr(
+            status,
+            "acquire_gateway_runtime_migration_lease",
+            switch_home_after_target_snapshot,
+        )
+        monkeypatch.setattr(SessionDB, "_init_schema", record_v28_publication)
+        db = None
+        error = None
+        try:
+            try:
+                db = SessionDB(canonical)
+            except BaseException as exc:
+                error = exc
+            finally:
+                if db is not None:
+                    db.close()
+
+            # The predecessor takes a private home-a lease and reaches DDL;
+            # refusal must happen before the first writable publication step.
+            assert reached_v28_publication == []
+            assert isinstance(error, hermes_state.ForwardSchemaMigrationAdmissionError)
+            assert observed_lock_targets == [canonical_lock_path]
+            assert os.environ["HERMES_HOME"] == str(home_a)
+            assert _state_store_snapshot(canonical) == before
+        finally:
+            _stop_legacy_canonical_writer(writer)
+
+    def test_forward_schema_migration_holds_gateway_lock_until_v28_publication(
+        self, tmp_path, monkeypatch
+    ):
+        """A migration lease excludes a late old-runtime lock claimant until v28 commits."""
+        home = tmp_path / "profile-home"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        canonical = home / "state.db"
+        _seed_v27_state_store(canonical)
+        before_v28_publication = threading.Event()
+        allow_v28_publication = threading.Event()
+        migration_result = []
+        original_init_schema = SessionDB._init_schema
+
+        def pause_before_v28_publication(db):
+            before_v28_publication.set()
+            assert allow_v28_publication.wait(timeout=5), "test did not release v28 publication"
+            return original_init_schema(db)
+
+        monkeypatch.setattr(SessionDB, "_init_schema", pause_before_v28_publication)
+
+        def migrate():
+            try:
+                migration_result.append(("db", SessionDB(canonical)))
+            except BaseException as exc:
+                migration_result.append(("error", exc))
+
+        migration = threading.Thread(target=migrate)
+        migration.start()
+        assert before_v28_publication.wait(timeout=5), "migration never reached publication barrier"
+        claimant, outcome = _start_legacy_canonical_writer_attempt(home, canonical)
+        try:
+            # On the predecessor, the admission probe completed before this
+            # exact old runtime could claim, start, and write to the canonical
+            # store, exposing the check→DDL gap.
+            assert outcome == "REFUSED"
+        finally:
+            allow_v28_publication.set()
+            migration.join(timeout=10)
+            _stop_legacy_canonical_writer(claimant)
+
+        assert not migration.is_alive(), "migration did not complete after publication release"
+        kind, result = migration_result.pop()
+        assert kind == "db", result
+        result.close()
+        assert _state_store_snapshot(canonical)["schema_version"] == ((SCHEMA_VERSION,),)
+        check = sqlite3.connect(str(canonical))
+        try:
+            assert check.execute(
+                "SELECT COUNT(*) FROM gateway_routing WHERE session_key = 'legacy-writer'"
+            ).fetchone() == (0,)
+        finally:
+            check.close()
+
+    @pytest.mark.parametrize(
+        "values",
+        (
+            (),
+            (0, 1),
+            ("text",),
+            (3.5,),
+            (sqlite3.Binary(b"blob"),),
+            (None,),
+            (-1,),
+            (float(2**63),),
+        ),
+    )
+    def test_schema_version_existing_malformed_scalar_is_rejected_read_only(
+        self, tmp_path, values
+    ):
+        """Malformed scalar rows fail closed on a read-only open without repair."""
+        db_path = tmp_path / "invalid-state.db"
+        seed = sqlite3.connect(str(db_path))
+        if values:
+            seed.execute("CREATE TABLE schema_version (version)")
+            seed.executemany(
+                "INSERT INTO schema_version (version) VALUES (?)",
+                [(value,) for value in values],
+            )
+        seed.commit()
+        seed.close()
+
+        with pytest.raises(hermes_state.IncompatibleSchemaError):
+            SessionDB(db_path=db_path, read_only=True)
+
     def test_failed_writable_open_does_not_leak_tracked_connection(
         self, tmp_path, monkeypatch
     ):
@@ -1535,6 +1905,7 @@ class TestSessionTitleIndexRepair:
         session_db.close()
 
         with sqlite3.connect(db_path) as conn:
+            register_turn_fence_generation(conn)
             conn.execute("DROP INDEX idx_sessions_title_unique")
             if duplicate_titles:
                 conn.execute(
@@ -2600,6 +2971,121 @@ class TestVacuum:
         # Should not raise, even though there's nothing significant to reclaim.
         db.vacuum()
 
+    def test_vacuum_allows_ordinary_no_owner_raw_maintenance(self, db):
+        """No durable rebuild owner permits the real maintenance sequence."""
+        marker_key = hermes_state._OFFLINE_REBUILD_EPOCH_KEY
+        statements = []
+        try:
+            assert db._offline_rebuild_marker is None
+            assert db._conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?", (marker_key,)
+            ).fetchone() is None
+            db._conn.set_trace_callback(statements.append)
+
+            result = db.vacuum()
+
+            assert isinstance(result, int)
+            assert any(
+                " ".join(sql.upper().split()).startswith("VACUUM")
+                for sql in statements
+            )
+            assert db._conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?", (marker_key,)
+            ).fetchone() is None
+        finally:
+            db._conn.set_trace_callback(None)
+
+    def test_vacuum_refuses_null_marker_before_raw_maintenance(self, db, monkeypatch):
+        """A present NULL marker cannot authorize checkpoint or VACUUM."""
+        marker_key = hermes_state._OFFLINE_REBUILD_EPOCH_KEY
+        statements = []
+        try:
+            # Keep this focused on SessionDB.vacuum's real raw-maintenance
+            # boundary rather than optimize_fts' separately guarded claim.
+            monkeypatch.setattr(db, "optimize_fts", lambda: 0)
+            db._conn.execute(
+                "INSERT INTO state_meta(key, value) VALUES (?, NULL)",
+                (marker_key,),
+            )
+            db._conn.commit()
+            db._conn.set_trace_callback(statements.append)
+
+            with pytest.raises(hermes_state.SessionTurnLeaseLostError):
+                db.vacuum()
+
+            assert _raw_maintenance_statements(statements) == []
+            assert db._conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?", (marker_key,)
+            ).fetchone()[0] is None
+        finally:
+            db._conn.set_trace_callback(None)
+
+    @pytest.mark.parametrize("marker_state", ("foreign", "deleted", "malformed"))
+    def test_vacuum_blocks_post_proof_marker_transition(
+        self, tmp_path, monkeypatch, marker_state
+    ):
+        """A foreign marker transition cannot commit before raw VACUUM."""
+        db = SessionDB(db_path=tmp_path / "state.db")
+        marker_key = hermes_state._OFFLINE_REBUILD_EPOCH_KEY
+        marker = (
+            "foreign-vacuum-owner"
+            if marker_state == "foreign"
+            else sqlite3.Binary(b"\x00\xffmalformed-vacuum-owner")
+        )
+        statements = []
+        state = {"attempted": False, "committed": False, "error": None}
+        original_authority = db._assert_offline_rebuild_maintenance_authority
+
+        def assert_then_attempt_transition(conn):
+            original_authority(conn)
+            state["attempted"] = True
+            writer = sqlite3.connect(
+                str(db.db_path), isolation_level=None, timeout=0.0
+            )
+            try:
+                writer.execute("BEGIN IMMEDIATE")
+                writer.execute(
+                    "INSERT INTO state_meta(key, value) VALUES (?, ?)",
+                    (marker_key, marker),
+                )
+                if marker_state == "deleted":
+                    writer.execute(
+                        "DELETE FROM state_meta WHERE key = ?", (marker_key,)
+                    )
+                writer.execute("COMMIT")
+                state["committed"] = True
+            except sqlite3.OperationalError as exc:
+                state["error"] = exc
+                if writer.in_transaction:
+                    writer.execute("ROLLBACK")
+            finally:
+                writer.close()
+
+        try:
+            monkeypatch.setattr(db, "optimize_fts", lambda: 0)
+            monkeypatch.setattr(
+                db,
+                "_assert_offline_rebuild_maintenance_authority",
+                assert_then_attempt_transition,
+            )
+            db._conn.set_trace_callback(statements.append)
+            db.vacuum()
+
+            assert state["attempted"] is True
+            assert state["committed"] is False
+            assert isinstance(state["error"], sqlite3.OperationalError)
+            assert db._conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?", (marker_key,)
+            ).fetchone() is None
+            raw_maintenance = _raw_maintenance_statements(statements)
+            assert any(
+                " ".join(sql.upper().split()).startswith("VACUUM")
+                for sql in raw_maintenance
+            )
+        finally:
+            db._conn.set_trace_callback(None)
+            db.close()
+
     def test_auto_maintenance_records_successful_vacuum(self, db, monkeypatch):
         monkeypatch.setattr(db, "prune_sessions", lambda **_kwargs: 3)
         vacuum_calls = []
@@ -2660,6 +3146,43 @@ class TestVacuum:
         assert second["vacuumed"] is True
         assert vacuum_calls == [True, True]
         assert db.get_meta("last_vacuum") is not None
+
+    @pytest.mark.parametrize("marker", ("foreign-auto-vacuum-owner", None))
+    def test_auto_maintenance_propagates_vacuum_authority_refusal(
+        self, db, monkeypatch, marker
+    ):
+        """A real raw-maintenance refusal cannot become a success/meta report."""
+        statements: list[str] = []
+        db._conn.set_trace_callback(statements.append)
+
+        def prune_then_take_over(**_kwargs):
+            with sqlite3.connect(str(db.db_path), isolation_level=None) as writer:
+                writer.execute(
+                    "INSERT INTO state_meta(key, value) VALUES (?, ?)",
+                    (hermes_state._OFFLINE_REBUILD_EPOCH_KEY, marker),
+                )
+            return 1
+
+        monkeypatch.setattr(db, "prune_sessions", prune_then_take_over)
+
+        with pytest.raises(hermes_state.SessionTurnLeaseLostError):
+            db.maybe_auto_prune_and_vacuum(
+                min_interval_hours=0,
+                min_vacuum_interval_days=0,
+            )
+
+        normalized = [" ".join(sql.upper().split()) for sql in statements]
+        assert not any(
+            sql.startswith("VACUUM") or "WAL_CHECKPOINT" in sql
+            for sql in normalized
+        )
+        assert db.get_meta("last_vacuum") is None
+        assert db.get_meta("last_auto_prune") is None
+        with sqlite3.connect(str(db.db_path)) as writer:
+            assert writer.execute(
+                "SELECT value FROM state_meta WHERE key = ?",
+                (hermes_state._OFFLINE_REBUILD_EPOCH_KEY,),
+            ).fetchone() == (marker,)
 
     def test_wal_size_limit_is_bounded(self, db):
         """journal_size_limit must be a finite bound, not SQLite's -1 default.
@@ -3016,32 +3539,213 @@ class TestFTSExternalContentMigration:
 
     @staticmethod
     def _build_v22_db(db_path):
-        """Build a v22-shaped DB by hand: inline FTS tables + concat triggers."""
-        conn = sqlite3.connect(str(db_path))
-        conn.executescript(SCHEMA_SQL)
-        # Replace the current (v23) FTS objects with the v22 inline shape.
-        conn.executescript("""
-            DROP TABLE IF EXISTS messages_fts;
-            DROP TABLE IF EXISTS messages_fts_trigram;
-            DROP VIEW IF EXISTS messages_fts_trigram_src;
+        """Build the immutable historical v22 persisted surface by hand.
 
-            CREATE VIRTUAL TABLE messages_fts USING fts5(content);
-            CREATE TRIGGER messages_fts_insert AFTER INSERT ON messages BEGIN
+        Source: 505fb587512301346c7408ba840c3d269bb94519:hermes_state.py.
+        It deliberately contains no post-v22 authority/process objects; callers
+        open it through SessionDB so supported initialization owns those upgrades.
+        """
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS schema_version (
+                version INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS sessions (
+                id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                user_id TEXT,
+                session_key TEXT,
+                chat_id TEXT,
+                chat_type TEXT,
+                thread_id TEXT,
+                display_name TEXT,
+                origin_json TEXT,
+                expiry_finalized INTEGER DEFAULT 0,
+                model TEXT,
+                model_config TEXT,
+                system_prompt TEXT,
+                parent_session_id TEXT,
+                started_at REAL NOT NULL,
+                ended_at REAL,
+                end_reason TEXT,
+                message_count INTEGER DEFAULT 0,
+                tool_call_count INTEGER DEFAULT 0,
+                input_tokens INTEGER DEFAULT 0,
+                output_tokens INTEGER DEFAULT 0,
+                cache_read_tokens INTEGER DEFAULT 0,
+                cache_write_tokens INTEGER DEFAULT 0,
+                reasoning_tokens INTEGER DEFAULT 0,
+                cwd TEXT,
+                git_branch TEXT,
+                git_repo_root TEXT,
+                billing_provider TEXT,
+                billing_base_url TEXT,
+                billing_mode TEXT,
+                estimated_cost_usd REAL,
+                actual_cost_usd REAL,
+                cost_status TEXT,
+                cost_source TEXT,
+                pricing_version TEXT,
+                title TEXT,
+                api_call_count INTEGER DEFAULT 0,
+                handoff_state TEXT,
+                handoff_platform TEXT,
+                handoff_error TEXT,
+                compression_failure_cooldown_until REAL,
+                compression_failure_error TEXT,
+                compression_fallback_streak INTEGER NOT NULL DEFAULT 0,
+                profile_name TEXT,
+                rewind_count INTEGER NOT NULL DEFAULT 0,
+                archived INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL REFERENCES sessions(id),
+                role TEXT NOT NULL,
+                content TEXT,
+                tool_call_id TEXT,
+                tool_calls TEXT,
+                tool_name TEXT,
+                effect_disposition TEXT,
+                timestamp REAL NOT NULL,
+                token_count INTEGER,
+                finish_reason TEXT,
+                reasoning TEXT,
+                reasoning_content TEXT,
+                reasoning_details TEXT,
+                codex_reasoning_items TEXT,
+                codex_message_items TEXT,
+                platform_message_id TEXT,
+                observed INTEGER DEFAULT 0,
+                active INTEGER NOT NULL DEFAULT 1,
+                compacted INTEGER NOT NULL DEFAULT 0,
+                api_content TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS session_model_usage (
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                model TEXT NOT NULL,
+                billing_provider TEXT NOT NULL DEFAULT '',
+                billing_base_url TEXT NOT NULL DEFAULT '',
+                billing_mode TEXT NOT NULL DEFAULT '',
+                task TEXT NOT NULL DEFAULT '',
+                api_call_count INTEGER NOT NULL DEFAULT 0,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+                reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+                estimated_cost_usd REAL NOT NULL DEFAULT 0,
+                actual_cost_usd REAL NOT NULL DEFAULT 0,
+                cost_status TEXT,
+                cost_source TEXT,
+                first_seen REAL,
+                last_seen REAL,
+                PRIMARY KEY (session_id, model, billing_provider, billing_base_url, billing_mode, task)
+            );
+
+            CREATE TABLE IF NOT EXISTS state_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS gateway_routing (
+                scope TEXT NOT NULL DEFAULT '',
+                session_key TEXT NOT NULL,
+                entry_json TEXT NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY (scope, session_key)
+            );
+
+            CREATE TABLE IF NOT EXISTS compression_locks (
+                session_id TEXT PRIMARY KEY,
+                holder TEXT NOT NULL,
+                acquired_at REAL NOT NULL,
+                expires_at REAL NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS async_delegations (
+                delegation_id TEXT PRIMARY KEY,
+                origin_session TEXT NOT NULL,
+                origin_ui_session_id TEXT NOT NULL DEFAULT '',
+                parent_session_id TEXT,
+                state TEXT NOT NULL,
+                dispatched_at REAL NOT NULL,
+                completed_at REAL,
+                updated_at REAL NOT NULL,
+                event_json TEXT,
+                result_json TEXT,
+                delivery_state TEXT NOT NULL DEFAULT 'pending',
+                delivery_attempts INTEGER NOT NULL DEFAULT 0,
+                delivered_at REAL,
+                owner_pid INTEGER,
+                owner_started_at INTEGER,
+                task_json TEXT,
+                delivery_claim TEXT,
+                delivery_claimed_at REAL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
+            CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
+            CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
+            CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
+            CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
+            CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usage(session_id);
+            CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
+            CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
+                ON async_delegations(delivery_state, completed_at);
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+                content
+            );
+
+            CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
                 INSERT INTO messages_fts(rowid, content) VALUES (
                     new.id,
                     COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
                 );
             END;
 
-            CREATE VIRTUAL TABLE messages_fts_trigram USING fts5(content, tokenize='trigram');
-            CREATE TRIGGER messages_fts_trigram_insert AFTER INSERT ON messages BEGIN
+            CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
+                DELETE FROM messages_fts WHERE rowid = old.id;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE ON messages BEGIN
+                DELETE FROM messages_fts WHERE rowid = old.id;
+                INSERT INTO messages_fts(rowid, content) VALUES (
+                    new.id,
+                    COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
+                );
+            END;
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts_trigram USING fts5(
+                content,
+                tokenize='trigram'
+            );
+
+            CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_insert AFTER INSERT ON messages BEGIN
+                INSERT INTO messages_fts_trigram(rowid, content) VALUES (
+                    new.id,
+                    COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
+                );
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_delete AFTER DELETE ON messages BEGIN
+                DELETE FROM messages_fts_trigram WHERE rowid = old.id;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_update AFTER UPDATE ON messages BEGIN
+                DELETE FROM messages_fts_trigram WHERE rowid = old.id;
                 INSERT INTO messages_fts_trigram(rowid, content) VALUES (
                     new.id,
                     COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
                 );
             END;
         """)
-        conn.execute("DELETE FROM schema_version")
         conn.execute("INSERT INTO schema_version (version) VALUES (22)")
         conn.execute(
             "INSERT INTO sessions (id, source, started_at) VALUES ('s1', 'cli', ?)",
@@ -3077,6 +3781,18 @@ class TestFTSExternalContentMigration:
 
         db = SessionDB(db_path=db_path)
         try:
+            # The real opener, not the historical fixture, initializes durable
+            # current-generation authority identity and backfills this session.
+            state_db_id = db.get_meta("session_process_state_db_id")
+            assert state_db_id is not None and len(state_db_id) == 64
+            assert db._conn is not None
+            authority = db._conn.execute(
+                "SELECT state_db_id, state_family FROM session_process_authorities "
+                "WHERE session_id = 's1'"
+            ).fetchone()
+            assert authority is not None
+            assert authority[0] == state_db_id
+            assert authority[1] == hermes_state.SESSION_PROCESS_AUTHORITY_STATE_FAMILY
             # DECOUPLED: the main schema_version advances to current even though
             # the FTS layout stays legacy — future migrations must not be gated
             # behind the FTS opt-in.
@@ -5040,3 +5756,1717 @@ class TestFts5SanitizerCharacterClass:
         # text; keep % intact there (pre-existing contract).
         sanitized = self._sanitize("完成50%")
         assert "%" in sanitized
+
+
+@pytest.mark.parametrize("method_name", ("rebuild_fts", "optimize_fts"))
+def test_foreign_offline_rebuild_marker_refuses_direct_fts_mutation(
+    tmp_path, method_name
+):
+    """A foreign durable rebuild claim fences every direct FTS mutation."""
+    db_path = tmp_path / "state.db"
+    owner = SessionDB(db_path=db_path)
+    foreign = SessionDB(db_path=db_path)
+    marker_key = "_hermes_offline_rebuild_epoch_v1"
+    marker_value = '{"owner_pid":1,"owner_pid_start":1.0,"nonce":"foreign"}'
+    try:
+        owner._conn.execute(
+            "INSERT INTO state_meta(key, value) VALUES (?, ?)",
+            (marker_key, marker_value),
+        )
+        owner._conn.commit()
+
+        with pytest.raises(hermes_state.SessionTurnLeaseLostError):
+            getattr(foreign, method_name)()
+
+        assert owner._conn.execute(
+            "SELECT value FROM state_meta WHERE key = ?", (marker_key,)
+        ).fetchone()[0] == marker_value
+    finally:
+        foreign.close()
+        owner.close()
+
+
+@pytest.mark.parametrize(
+    ("method_name", "command"),
+    (("optimize_fts", "optimize"), ("rebuild_fts", "rebuild")),
+)
+def test_direct_fts_commands_stop_after_marker_takeover(
+    tmp_path, monkeypatch, method_name, command
+):
+    """A later direct FTS command cannot use the first command's claim."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    marker_key = hermes_state._OFFLINE_REBUILD_EPOCH_KEY
+    foreign_marker = f"foreign-{command}-owner"
+    adversarial_key = f"adversarial-{command}-marker"
+    adversarial_value = f"foreign-{command}-bytes"
+    first_command_seen = False
+    takeover_complete = False
+    commands_after_takeover: list[str] = []
+    try:
+        db.create_session(session_id="s1", source="cli")
+        db.append_message(session_id="s1", role="user", content="fts authority")
+        assert db._fts_table_exists("messages_fts")
+        assert db._fts_table_exists("messages_fts_trigram")
+        original_table_exists = db._fts_table_exists
+
+        def record_fts_command(sql: str) -> None:
+            nonlocal first_command_seen
+            if f"VALUES('{command}')" not in sql:
+                return
+            if takeover_complete:
+                commands_after_takeover.append(sql)
+            else:
+                first_command_seen = True
+
+        def replace_marker_after_first_command(table: str) -> bool:
+            nonlocal takeover_complete
+            if table == "messages_fts_trigram" and not takeover_complete:
+                assert first_command_seen is True
+                with sqlite3.connect(str(db.db_path), isolation_level=None) as writer:
+                    cursor = writer.execute(
+                        "UPDATE state_meta SET value = ? WHERE key = ?",
+                        (foreign_marker, marker_key),
+                    )
+                    assert cursor.rowcount == 1
+                    writer.execute(
+                        "INSERT OR REPLACE INTO state_meta(key, value) VALUES (?, ?)",
+                        (adversarial_key, adversarial_value),
+                    )
+                takeover_complete = True
+            return original_table_exists(table)
+
+        db._conn.set_trace_callback(record_fts_command)
+        monkeypatch.setattr(db, "_fts_table_exists", replace_marker_after_first_command)
+
+        with pytest.raises(hermes_state.SessionTurnLeaseLostError):
+            getattr(db, method_name)()
+
+        assert takeover_complete is True
+        assert commands_after_takeover == []
+        assert db._conn.execute(
+            "SELECT value FROM state_meta WHERE key = ?", (marker_key,)
+        ).fetchone()[0] == foreign_marker
+        assert db._conn.execute(
+            "SELECT value FROM state_meta WHERE key = ?", (adversarial_key,)
+        ).fetchone()[0] == adversarial_value
+    finally:
+        db._conn.set_trace_callback(None)
+        db.close()
+
+
+def test_incremental_fts_merge_stops_after_marker_takeover(tmp_path, monkeypatch):
+    """Every independently committed FTS merge rechecks the rebuild claim."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    marker_key = hermes_state._OFFLINE_REBUILD_EPOCH_KEY
+    foreign_marker = "foreign-incremental-merge-owner"
+    adversarial_key = "adversarial-incremental-merge-marker"
+    adversarial_value = "foreign-incremental-merge-bytes"
+    first_command_seen = False
+    takeover_complete = False
+    commands_after_takeover: list[str] = []
+    try:
+        db.create_session(session_id="s1", source="cli")
+        db.append_message(session_id="s1", role="user", content="fts merge authority")
+        assert db._fts_table_exists("messages_fts")
+        assert db._fts_table_exists("messages_fts_trigram")
+        db._fts_usermerge_floor_applied = True
+        original_table_exists = db._fts_table_exists
+
+        def record_merge_command(sql: str) -> None:
+            nonlocal first_command_seen
+            if "VALUES('merge', 37)" not in sql:
+                return
+            if takeover_complete:
+                commands_after_takeover.append(sql)
+            else:
+                first_command_seen = True
+
+        def replace_marker_after_first_command(table: str) -> bool:
+            nonlocal takeover_complete
+            if table == "messages_fts_trigram" and not takeover_complete:
+                assert first_command_seen is True
+                with sqlite3.connect(str(db.db_path), isolation_level=None) as writer:
+                    cursor = writer.execute(
+                        "UPDATE state_meta SET value = ? WHERE key = ?",
+                        (foreign_marker, marker_key),
+                    )
+                    assert cursor.rowcount == 1
+                    writer.execute(
+                        "INSERT OR REPLACE INTO state_meta(key, value) VALUES (?, ?)",
+                        (adversarial_key, adversarial_value),
+                    )
+                takeover_complete = True
+            return original_table_exists(table)
+
+        db._conn.set_trace_callback(record_merge_command)
+        monkeypatch.setattr(db, "_fts_table_exists", replace_marker_after_first_command)
+
+        with pytest.raises(hermes_state.SessionTurnLeaseLostError):
+            db._merge_fts_incrementally(max_pages=37, max_commands=1)
+
+        assert takeover_complete is True
+        assert commands_after_takeover == []
+        assert db._conn.execute(
+            "SELECT value FROM state_meta WHERE key = ?", (marker_key,)
+        ).fetchone()[0] == foreign_marker
+        assert db._conn.execute(
+            "SELECT value FROM state_meta WHERE key = ?", (adversarial_key,)
+        ).fetchone()[0] == adversarial_value
+    finally:
+        db._conn.set_trace_callback(None)
+        db.close()
+
+
+@pytest.mark.parametrize(
+    ("method_name", "command"),
+    (("optimize_fts", "optimize"), ("rebuild_fts", "rebuild")),
+    ids=("optimize", "rebuild"),
+)
+def test_direct_fts_commands_stop_after_marker_deletion(
+    tmp_path, monkeypatch, method_name, command
+):
+    """A missing active claim fences each later direct FTS command."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    marker_key = hermes_state._OFFLINE_REBUILD_EPOCH_KEY
+    first_command_seen = False
+    marker_deleted = False
+    commands_after_deletion: list[str] = []
+    try:
+        db.create_session(session_id="s1", source="cli")
+        db.append_message(session_id="s1", role="user", content="fts authority")
+        assert db._fts_table_exists("messages_fts")
+        assert db._fts_table_exists("messages_fts_trigram")
+        original_table_exists = db._fts_table_exists
+
+        def record_fts_command(sql: str) -> None:
+            nonlocal first_command_seen
+            if f"VALUES('{command}')" not in sql:
+                return
+            if marker_deleted:
+                commands_after_deletion.append(sql)
+            else:
+                first_command_seen = True
+
+        def delete_marker_after_first_command(table: str) -> bool:
+            nonlocal marker_deleted
+            if table == "messages_fts_trigram" and not marker_deleted:
+                assert first_command_seen is True
+                with sqlite3.connect(str(db.db_path), isolation_level=None) as writer:
+                    cursor = writer.execute(
+                        "DELETE FROM state_meta WHERE key = ?", (marker_key,)
+                    )
+                    assert cursor.rowcount == 1
+                marker_deleted = True
+            return original_table_exists(table)
+
+        db._conn.set_trace_callback(record_fts_command)
+        monkeypatch.setattr(db, "_fts_table_exists", delete_marker_after_first_command)
+
+        with pytest.raises(hermes_state.SessionTurnLeaseLostError):
+            getattr(db, method_name)()
+
+        assert marker_deleted is True
+        assert commands_after_deletion == []
+        assert db._conn.execute(
+            "SELECT value FROM state_meta WHERE key = ?", (marker_key,)
+        ).fetchone() is None
+    finally:
+        db._conn.set_trace_callback(None)
+        db.close()
+
+
+def test_incremental_fts_usermerge_and_merge_stop_after_marker_deletion(
+    tmp_path, monkeypatch
+):
+    """A missing active claim fences the merge command after usermerge."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    marker_key = hermes_state._OFFLINE_REBUILD_EPOCH_KEY
+    first_command_seen = False
+    marker_deleted = False
+    commands_after_deletion: list[str] = []
+    try:
+        db.create_session(session_id="s1", source="cli")
+        db.append_message(session_id="s1", role="user", content="fts authority")
+        assert db._fts_table_exists("messages_fts")
+        assert db._fts_table_exists("messages_fts_trigram")
+        original_execute_command = db._execute_fts_command_owned
+
+        def record_fts_command(sql: str) -> None:
+            nonlocal first_command_seen
+            if (
+                "VALUES('usermerge', 2)" not in sql
+                and "VALUES('merge', 37)" not in sql
+            ):
+                return
+            if marker_deleted:
+                commands_after_deletion.append(sql)
+            else:
+                first_command_seen = True
+
+        def delete_marker_after_usermerge(sql: str, parameters=()):
+            nonlocal marker_deleted
+            result = original_execute_command(sql, parameters)
+            if not marker_deleted:
+                assert "VALUES('usermerge', 2)" in sql
+                assert first_command_seen is True
+                with sqlite3.connect(str(db.db_path), isolation_level=None) as writer:
+                    cursor = writer.execute(
+                        "DELETE FROM state_meta WHERE key = ?", (marker_key,)
+                    )
+                    assert cursor.rowcount == 1
+                marker_deleted = True
+            return result
+
+        db._conn.set_trace_callback(record_fts_command)
+        monkeypatch.setattr(
+            db, "_execute_fts_command_owned", delete_marker_after_usermerge
+        )
+
+        with pytest.raises(hermes_state.SessionTurnLeaseLostError):
+            db._merge_fts_incrementally(max_pages=37, max_commands=1)
+
+        assert marker_deleted is True
+        assert commands_after_deletion == []
+        assert db._conn.execute(
+            "SELECT value FROM state_meta WHERE key = ?", (marker_key,)
+        ).fetchone() is None
+    finally:
+        db._conn.set_trace_callback(None)
+        db.close()
+
+
+def test_ordinary_write_allows_no_rebuild_marker_without_local_owner(tmp_path):
+    """An absent marker remains normal when this SessionDB owns none."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    marker_key = hermes_state._OFFLINE_REBUILD_EPOCH_KEY
+    try:
+        assert db._offline_rebuild_marker is None
+        db.create_session(session_id="s1", source="cli")
+
+        assert db.get_session("s1")["id"] == "s1"
+        assert db._conn.execute(
+            "SELECT value FROM state_meta WHERE key = ?", (marker_key,)
+        ).fetchone() is None
+    finally:
+        db.close()
+
+
+def _capture_fts_schema_takeover(db, *, delete_marker: bool):
+    """Replace or delete the active marker before the next schema mutation."""
+    marker_key = hermes_state._OFFLINE_REBUILD_EPOCH_KEY
+    foreign_marker = "foreign-fts-schema-owner"
+    state = {"complete": False, "error": None, "mutations": []}
+
+    def trace(sql: str) -> None:
+        if not state["complete"]:
+            return
+        if sql.lstrip().upper().startswith(
+            ("CREATE", "DROP", "INSERT", "UPDATE", "DELETE", "REPLACE")
+        ):
+            state["mutations"].append(sql)
+
+    def takeover() -> None:
+        if state["complete"]:
+            return
+        try:
+            with sqlite3.connect(str(db.db_path), isolation_level=None) as writer:
+                if delete_marker:
+                    cursor = writer.execute(
+                        "DELETE FROM state_meta WHERE key = ?", (marker_key,)
+                    )
+                else:
+                    cursor = writer.execute(
+                        "UPDATE state_meta SET value = ? WHERE key = ?",
+                        (foreign_marker, marker_key),
+                    )
+                if cursor.rowcount != 1:
+                    raise AssertionError("active marker was not changed exactly once")
+            state["complete"] = True
+        except BaseException as exc:
+            state["error"] = exc
+
+    db._conn.set_trace_callback(trace)
+    return marker_key, foreign_marker, state, takeover
+
+
+def _assert_fts_schema_takeover_refused(
+    db, marker_key: str, foreign_marker: str, state: dict, *, delete_marker: bool
+) -> None:
+    assert state["error"] is None
+    assert state["complete"] is True
+    assert state["mutations"] == []
+    marker = db._conn.execute(
+        "SELECT value FROM state_meta WHERE key = ?", (marker_key,)
+    ).fetchone()
+    if delete_marker:
+        assert marker is None
+    else:
+        assert marker[0] == foreign_marker
+
+
+@pytest.mark.parametrize("delete_marker", (False, True), ids=("replace", "delete"))
+def test_stale_fts_recovery_refuses_marker_change_before_recovery_script(
+    tmp_path, monkeypatch, delete_marker
+):
+    """Recovery cannot execute its script after its durable claim is lost."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        marker_key, foreign_marker, state, takeover = _capture_fts_schema_takeover(
+            db, delete_marker=delete_marker
+        )
+        monkeypatch.setattr(
+            db,
+            "_foreign_state_db_holders",
+            lambda: (takeover(), [])[1],
+        )
+
+        with pytest.raises(hermes_state.SessionTurnLeaseLostError):
+            db._recover_stale_fts(db._conn, legacy=False)
+
+        _assert_fts_schema_takeover_refused(
+            db,
+            marker_key,
+            foreign_marker,
+            state,
+            delete_marker=delete_marker,
+        )
+    finally:
+        db._conn.set_trace_callback(None)
+        db.close()
+
+
+@pytest.mark.parametrize(
+    ("table_name", "ddl"),
+    (
+        ("messages_fts", hermes_state.FTS_SQL),
+        ("messages_fts_trigram", hermes_state.FTS_TRIGRAM_SQL),
+    ),
+    ids=("base", "trigram"),
+)
+@pytest.mark.parametrize("delete_marker", (False, True), ids=("replace", "delete"))
+def test_fts_schema_setup_refuses_marker_change_before_ddl(
+    tmp_path, table_name, ddl, delete_marker
+):
+    """Base and trigram setup cannot use the outer claim for later DDL."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        for trigger in hermes_state._FTS_TRIGGERS:
+            if trigger.startswith(table_name):
+                db._conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        db._conn.execute(f"DROP TABLE IF EXISTS {table_name}")
+        if table_name == "messages_fts_trigram":
+            db._conn.execute("DROP VIEW IF EXISTS messages_fts_trigram_src")
+        db._conn.commit()
+        marker_key, foreign_marker, state, takeover = _capture_fts_schema_takeover(
+            db, delete_marker=delete_marker
+        )
+        db._conn.create_function("fts_schema_takeover", 0, lambda: (takeover(), 1)[1])
+
+        with pytest.raises(hermes_state.SessionTurnLeaseLostError):
+            db._ensure_fts_schema(
+                db._conn,
+                table_name,
+                "SELECT fts_schema_takeover();\n" + ddl,
+            )
+
+        _assert_fts_schema_takeover_refused(
+            db,
+            marker_key,
+            foreign_marker,
+            state,
+            delete_marker=delete_marker,
+        )
+    finally:
+        db._conn.set_trace_callback(None)
+        db.close()
+
+
+@pytest.mark.parametrize("delete_marker", (False, True), ids=("replace", "delete"))
+def test_cjk_fts_schema_setup_refuses_marker_change_before_direct_writes(
+    tmp_path, delete_marker
+):
+    """CJK setup rechecks its claim before its stale marker and trigger DDL."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db._conn.execute("CREATE TABLE messages_fts_cjk (value TEXT)")
+        for trigger in hermes_state._FTS_CJK_TRIGGERS:
+            db._conn.execute(
+                f"CREATE TRIGGER {trigger} AFTER INSERT ON messages BEGIN SELECT 1; END"
+            )
+        db._conn.commit()
+        db._fts_cjk_loaded = False
+        marker_key, foreign_marker, state, takeover = _capture_fts_schema_takeover(
+            db, delete_marker=delete_marker
+        )
+
+        class _TakeoverCursor(sqlite3.Cursor):
+            def execute(self, sql, parameters=()):
+                if (
+                    not state["complete"]
+                    and "SELECT 1 FROM SQLITE_MASTER WHERE TYPE = 'TABLE'" in " ".join(
+                        sql.upper().split()
+                    )
+                ):
+                    takeover()
+                return super().execute(sql, parameters)
+
+        cursor = db._conn.cursor(factory=_TakeoverCursor)
+
+        with pytest.raises(hermes_state.SessionTurnLeaseLostError):
+            db._ensure_fts_cjk_schema(cursor)
+
+        _assert_fts_schema_takeover_refused(
+            db,
+            marker_key,
+            foreign_marker,
+            state,
+            delete_marker=delete_marker,
+        )
+    finally:
+        db._conn.set_trace_callback(None)
+        db.close()
+
+
+def _capture_init_schema_fts_authority_loss(db, *, delete_marker: bool):
+    """Record FTS writes after replacing or deleting the active init claim."""
+    marker_key = hermes_state._OFFLINE_REBUILD_EPOCH_KEY
+    foreign_marker = "foreign-init-schema-fts-owner"
+    state = {
+        "active_before_takeover": False,
+        "complete": False,
+        "error": None,
+        "mutations": [],
+    }
+
+    def is_fts_mutation(sql: str) -> bool:
+        statement = " ".join(sql.upper().split())
+        if not statement.startswith(("CREATE", "DROP", "INSERT", "UPDATE", "DELETE")):
+            return False
+        return "MESSAGES_FTS" in statement or (
+            "STATE_META" in statement
+            and "FTS_" in statement
+            and "_HERMES_OFFLINE_REBUILD" not in statement
+        )
+
+    def trace(sql: str) -> None:
+        if state["complete"] and is_fts_mutation(sql):
+            state["mutations"].append(sql)
+
+    def take_over() -> None:
+        if state["complete"]:
+            return
+        try:
+            def replace_or_delete(writer) -> None:
+                active = writer.execute(
+                    "SELECT value FROM state_meta WHERE key = ?", (marker_key,)
+                ).fetchone()
+                state["active_before_takeover"] = active is not None
+                if active is None:
+                    if not delete_marker:
+                        writer.execute(
+                            "INSERT INTO state_meta(key, value) VALUES (?, ?)",
+                            (marker_key, foreign_marker),
+                        )
+                elif delete_marker:
+                    cursor = writer.execute(
+                        "DELETE FROM state_meta WHERE key = ?", (marker_key,)
+                    )
+                    assert cursor.rowcount == 1
+                else:
+                    cursor = writer.execute(
+                        "UPDATE state_meta SET value = ? WHERE key = ?",
+                        (foreign_marker, marker_key),
+                    )
+                    assert cursor.rowcount == 1
+
+            # Full initialization now holds its BEGIN IMMEDIATE through the
+            # FTS tail, so a second connection cannot race the owner. Drive
+            # the same row change on the guarded physical connection instead.
+            if db._conn.in_transaction:
+                replace_or_delete(db._conn)
+            else:
+                with sqlite3.connect(str(db.db_path), isolation_level=None) as writer:
+                    replace_or_delete(writer)
+            state["complete"] = True
+        except BaseException as exc:
+            state["error"] = exc
+
+    db._conn.set_trace_callback(trace)
+    return marker_key, foreign_marker, state, take_over
+
+
+def _assert_init_schema_fts_authority_refused(
+    db, marker_key: str, foreign_marker: str, state: dict, *, delete_marker: bool
+) -> None:
+    assert state["error"] is None
+    assert state["complete"] is True
+    assert state["active_before_takeover"] is True
+    assert state["mutations"] == []
+    marker = db._conn.execute(
+        "SELECT value FROM state_meta WHERE key = ?", (marker_key,)
+    ).fetchone()
+    # The lost-ownership signal and all initialization work rolled back
+    # together; the temporary init claim was never made durable.
+    assert marker is None
+
+
+def _replace_fts_with_legacy_inline_layout(db) -> None:
+    """Install a legacy inline FTS shape with no sync triggers."""
+    db._drop_fts_triggers(db._conn)
+    db._conn.execute("DROP VIEW IF EXISTS messages_fts_trigram_src")
+    db._conn.execute("DROP TABLE IF EXISTS messages_fts_trigram")
+    db._conn.execute("DROP TABLE IF EXISTS messages_fts")
+    db._conn.execute("CREATE VIRTUAL TABLE messages_fts USING fts5(content)")
+    db._conn.execute(
+        "CREATE VIRTUAL TABLE messages_fts_trigram "
+        "USING fts5(content, tokenize='trigram')"
+    )
+    db._conn.commit()
+
+
+@pytest.mark.parametrize("delete_marker", (False, True), ids=("replace", "delete"))
+def test_init_schema_base_trigram_rebuild_refuses_lost_active_marker(
+    tmp_path, monkeypatch, delete_marker
+):
+    """The real init rebuild cannot outlive the FTS claim that enabled it."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db._conn.execute("DROP TRIGGER IF EXISTS messages_fts_insert")
+        db._conn.commit()
+        marker_key, foreign_marker, state, take_over = (
+            _capture_init_schema_fts_authority_loss(
+                db, delete_marker=delete_marker
+            )
+        )
+        original_ensure = db._ensure_fts_schema
+
+        def take_over_after_trigram_ensure(cursor, table_name, ddl):
+            result = original_ensure(cursor, table_name, ddl)
+            if table_name == "messages_fts_trigram":
+                take_over()
+            return result
+
+        monkeypatch.setattr(db, "_ensure_fts_schema", take_over_after_trigram_ensure)
+
+        with pytest.raises(hermes_state.SessionTurnLeaseLostError):
+            db._init_schema()
+
+        _assert_init_schema_fts_authority_refused(
+            db,
+            marker_key,
+            foreign_marker,
+            state,
+            delete_marker=delete_marker,
+        )
+    finally:
+        db._conn.set_trace_callback(None)
+        db.close()
+
+
+@pytest.mark.parametrize("delete_marker", (False, True), ids=("replace", "delete"))
+def test_init_schema_legacy_rebuild_refuses_lost_active_marker(
+    tmp_path, monkeypatch, delete_marker
+):
+    """The legacy init rebuild is fenced by the same durable active claim."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        _replace_fts_with_legacy_inline_layout(db)
+        marker_key, foreign_marker, state, take_over = (
+            _capture_init_schema_fts_authority_loss(
+                db, delete_marker=delete_marker
+            )
+        )
+        original_ensure = db._ensure_fts_schema
+
+        def take_over_after_trigram_ensure(cursor, table_name, ddl):
+            result = original_ensure(cursor, table_name, ddl)
+            if table_name == "messages_fts_trigram":
+                take_over()
+            return result
+
+        monkeypatch.setattr(db, "_ensure_fts_schema", take_over_after_trigram_ensure)
+
+        with pytest.raises(hermes_state.SessionTurnLeaseLostError):
+            db._init_schema()
+
+        _assert_init_schema_fts_authority_refused(
+            db,
+            marker_key,
+            foreign_marker,
+            state,
+            delete_marker=delete_marker,
+        )
+    finally:
+        db._conn.set_trace_callback(None)
+        db.close()
+
+
+@pytest.mark.parametrize("delete_marker", (False, True), ids=("replace", "delete"))
+def test_init_schema_stale_trigger_detachment_refuses_lost_active_marker(
+    tmp_path, monkeypatch, delete_marker
+):
+    """Stale-index trigger detachment is fenced before its first DROP DDL."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db._conn.execute(
+            "INSERT INTO state_meta(key, value) VALUES (?, '1')",
+            (hermes_state.FTS_STALE_KEY,),
+        )
+        db._conn.commit()
+        marker_key, foreign_marker, state, take_over = (
+            _capture_init_schema_fts_authority_loss(
+                db, delete_marker=delete_marker
+            )
+        )
+        original_offline_rebuild = db.offline_rebuild
+
+        @contextmanager
+        def take_over_after_detachment_claim(*, reason):
+            with original_offline_rebuild(reason=reason):
+                if reason == "detach stale FTS triggers":
+                    take_over()
+                yield db
+
+        monkeypatch.setattr(db, "offline_rebuild", take_over_after_detachment_claim)
+
+        with pytest.raises(hermes_state.SessionTurnLeaseLostError):
+            db._init_schema()
+
+        _assert_init_schema_fts_authority_refused(
+            db,
+            marker_key,
+            foreign_marker,
+            state,
+            delete_marker=delete_marker,
+        )
+    finally:
+        db._conn.set_trace_callback(None)
+        db.close()
+
+
+@pytest.mark.parametrize("delete_marker", (False, True), ids=("replace", "delete"))
+def test_init_schema_broad_trigger_migration_refuses_lost_active_marker(
+    tmp_path, monkeypatch, delete_marker
+):
+    """Broad-trigger migration cannot DROP after the active claim changes."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db._conn.execute("DROP TRIGGER IF EXISTS messages_fts_update")
+        db._conn.execute(
+            "CREATE TRIGGER messages_fts_update AFTER UPDATE ON messages "
+            "BEGIN SELECT 1; END"
+        )
+        db._conn.commit()
+        marker_key, foreign_marker, state, take_over = (
+            _capture_init_schema_fts_authority_loss(
+                db, delete_marker=delete_marker
+            )
+        )
+        original_migrate = db._migrate_broad_fts_update_triggers
+
+        def take_over_before_migration(cursor):
+            take_over()
+            return original_migrate(cursor)
+
+        monkeypatch.setattr(
+            db, "_migrate_broad_fts_update_triggers", take_over_before_migration
+        )
+
+        with pytest.raises(hermes_state.SessionTurnLeaseLostError):
+            db._init_schema()
+
+        _assert_init_schema_fts_authority_refused(
+            db,
+            marker_key,
+            foreign_marker,
+            state,
+            delete_marker=delete_marker,
+        )
+    finally:
+        db._conn.set_trace_callback(None)
+        db.close()
+
+
+def test_init_schema_fts_repair_succeeds_without_an_owner(tmp_path):
+    """Ordinary startup repairs FTS and leaves no offline claim behind."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    marker_key = hermes_state._OFFLINE_REBUILD_EPOCH_KEY
+    try:
+        db.create_session(session_id="s1", source="cli")
+        db.append_message(session_id="s1", role="user", content="startup repair")
+        db._conn.execute("DROP TRIGGER IF EXISTS messages_fts_insert")
+        db._conn.commit()
+
+        db._init_schema()
+
+        assert db._fts_trigger_count(db._conn) == len(hermes_state._FTS_TRIGGERS)
+        assert len(db.search_messages("startup repair")) == 1
+        assert db._conn.execute(
+            "SELECT value FROM state_meta WHERE key = ?", (marker_key,)
+        ).fetchone() is None
+    finally:
+        db.close()
+
+
+def test_init_schema_fts_repair_keeps_a_valid_existing_owner(tmp_path):
+    """A valid unchanged outer owner permits the repair and stays exact."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    marker_key = hermes_state._OFFLINE_REBUILD_EPOCH_KEY
+    try:
+        db.create_session(session_id="s1", source="cli")
+        db.append_message(session_id="s1", role="user", content="owned repair")
+        db._conn.execute("DROP TRIGGER IF EXISTS messages_fts_insert")
+        db._conn.commit()
+
+        with db.offline_rebuild(reason="test init-schema existing owner"):
+            marker = db._offline_rebuild_marker
+            assert db._conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?", (marker_key,)
+            ).fetchone()[0] == marker
+
+            db._init_schema()
+
+            assert db._conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?", (marker_key,)
+            ).fetchone()[0] == marker
+            assert len(db.search_messages("owned repair")) == 1
+
+        assert db._conn.execute(
+            "SELECT value FROM state_meta WHERE key = ?", (marker_key,)
+        ).fetchone() is None
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("delete_marker", (False, True), ids=("replace", "delete"))
+def test_init_schema_preliminary_writes_refuse_lost_active_marker(
+    tmp_path, delete_marker
+):
+    """The pre-FTS schema path stays inside the owner's transaction boundary."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    marker_key = hermes_state._OFFLINE_REBUILD_EPOCH_KEY
+    foreign_marker = b"\x00foreign-init-owner\xff"
+    state = {"complete": False, "mutations": []}
+    try:
+        # Exercise all preliminary mutation families if the authority check is
+        # bypassed: the declarative script, reconciliation, deferred indexes,
+        # startup data repair, versioned migrations, and turn-fence migration.
+        db._conn.execute('ALTER TABLE sessions DROP COLUMN "last_read_at"')
+        db._conn.execute("DROP INDEX IF EXISTS idx_messages_session_active")
+        db._conn.execute("UPDATE messages SET active = NULL")
+        db._conn.execute("UPDATE schema_version SET version = 0")
+        db._conn.commit()
+
+        def trace(sql: str) -> None:
+            if not state["complete"]:
+                return
+            normalized = " ".join(sql.upper().split())
+            if normalized.startswith(("CREATE", "ALTER", "DROP", "INSERT", "UPDATE", "DELETE")):
+                state["mutations"].append(normalized)
+
+        def lose_owner() -> None:
+            with sqlite3.connect(str(db.db_path), isolation_level=None) as writer:
+                if delete_marker:
+                    cursor = writer.execute(
+                        "DELETE FROM state_meta WHERE key = ?", (marker_key,)
+                    )
+                else:
+                    cursor = writer.execute(
+                        "UPDATE state_meta SET value = ? WHERE key = ?",
+                        (sqlite3.Binary(foreign_marker), marker_key),
+                    )
+                assert cursor.rowcount == 1
+            state["complete"] = True
+
+        db._conn.set_trace_callback(trace)
+        with pytest.raises(hermes_state.SessionTurnLeaseLostError):
+            with db.offline_rebuild(reason="test preliminary init authority"):
+                # ``offline_rebuild`` has completed its pre-init comparison;
+                # this is the gap before the first SCHEMA_SQL mutation.
+                lose_owner()
+                db._init_schema()
+
+        assert state["complete"] is True
+        assert state["mutations"] == []
+        marker = db._conn.execute(
+            "SELECT value FROM state_meta WHERE key = ?", (marker_key,)
+        ).fetchone()
+        if delete_marker:
+            assert marker is None
+        else:
+            assert marker is not None
+            assert marker[0] == foreign_marker
+            assert isinstance(marker[0], bytes)
+    finally:
+        db._conn.set_trace_callback(None)
+        db.close()
+
+
+def _raw_maintenance_statements(statements: list[str]) -> list[str]:
+    """Return VACUUM/checkpoint statements from a real connection trace."""
+    return [
+        sql
+        for sql in statements
+        if " ".join(sql.upper().split()).startswith(
+            ("VACUUM", "PRAGMA WAL_CHECKPOINT")
+        )
+    ]
+
+
+def _vacuum_into_statements(statements: list[str]) -> list[str]:
+    """Return real snapshot statements from a connection trace."""
+    return [
+        sql
+        for sql in statements
+        if " ".join(sql.upper().split()).startswith("VACUUM INTO")
+    ]
+
+
+def _arm_raw_maintenance_takeover(
+    monkeypatch: pytest.MonkeyPatch,
+    db: SessionDB,
+    *,
+    marker: str | None,
+) -> tuple[dict[str, object], list[str]]:
+    """Attempt a real foreign marker commit at the authority/raw boundary."""
+    state: dict[str, object] = {
+        "attempted": False,
+        "committed": False,
+        "error": None,
+        "proofs": 0,
+    }
+    statements: list[str] = []
+    real_assert = db._assert_offline_rebuild_maintenance_authority
+    db._conn.set_trace_callback(statements.append)
+
+    def prove_then_take_over(conn: sqlite3.Connection) -> None:
+        real_assert(conn)
+        state["proofs"] = int(state["proofs"]) + 1
+        if state["proofs"] != 1:
+            return
+        state["attempted"] = True
+        writer = sqlite3.connect(
+            str(db.db_path), isolation_level=None, timeout=0.0
+        )
+        try:
+            writer.execute("BEGIN IMMEDIATE")
+            writer.execute(
+                "INSERT INTO state_meta(key, value) VALUES (?, ?)",
+                (hermes_state._OFFLINE_REBUILD_EPOCH_KEY, marker),
+            )
+            writer.execute("COMMIT")
+            state["committed"] = True
+        except sqlite3.OperationalError as exc:
+            state["error"] = exc
+            if writer.in_transaction:
+                writer.execute("ROLLBACK")
+        finally:
+            writer.close()
+
+    monkeypatch.setattr(
+        db,
+        "_assert_offline_rebuild_maintenance_authority",
+        prove_then_take_over,
+    )
+    return state, statements
+
+
+@pytest.mark.parametrize("marker", ("foreign-raw-maintenance-owner", None))
+@pytest.mark.parametrize("operation", ("checkpoint", "vacuum", "snapshot"))
+def test_raw_maintenance_holds_sqlite_exclusion_through_authority_and_operation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    marker: str | None,
+    operation: str,
+) -> None:
+    """A long-lived SessionDB leaves no commit window after its authority read."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        if operation == "snapshot":
+            _seed_stale_tool_call_marker_for_purge(db)
+        state, statements = _arm_raw_maintenance_takeover(
+            monkeypatch,
+            db,
+            marker=marker,
+        )
+
+        if operation == "checkpoint":
+            db._try_wal_checkpoint()
+        elif operation == "vacuum":
+            db.vacuum()
+        else:
+            db.purge_stale_tool_call_markers()
+
+        normalized = [" ".join(sql.upper().split()) for sql in statements]
+        assert state["attempted"] is True
+        if operation == "snapshot":
+            assert any(sql.startswith("VACUUM INTO") for sql in normalized)
+        else:
+            assert any(sql.startswith("PRAGMA WAL_CHECKPOINT") for sql in normalized)
+        assert state["committed"] is False
+        assert isinstance(state["error"], sqlite3.OperationalError)
+
+        with sqlite3.connect(str(db.db_path), isolation_level=None, timeout=0.0) as writer:
+            writer.execute("BEGIN IMMEDIATE")
+            writer.execute("INSERT INTO state_meta(key, value) VALUES (?, ?)", ("after-fence", operation))
+            writer.execute("COMMIT")
+    finally:
+        db._conn.set_trace_callback(None)
+        db.close()
+
+
+@pytest.mark.parametrize("marker", (b"foreign-optimize-owner", None), ids=("foreign", "null"))
+@pytest.mark.parametrize("seam", ("vacuum", "checkpoint"))
+def test_optimize_fts_storage_fences_post_proof_raw_maintenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    marker: bytes | None,
+    seam: str,
+) -> None:
+    """A foreign or NULL marker cannot commit between optimize proof and raw I/O."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    state: dict[str, object] = {
+        "attempted": False,
+        "committed": False,
+        "error": None,
+        "proofs": 0,
+    }
+    statements: list[str] = []
+    real_assert = db._assert_offline_rebuild_maintenance_authority
+    try:
+        def prove_then_take_over(conn: sqlite3.Connection) -> None:
+            real_assert(conn)
+            state["proofs"] = int(state["proofs"]) + 1
+            proof_for_seam = 1 if seam == "vacuum" else 2
+            if state["proofs"] != proof_for_seam:
+                return
+            state["attempted"] = True
+            writer = sqlite3.connect(
+                str(db.db_path), isolation_level=None, timeout=0.0
+            )
+            try:
+                writer.execute("BEGIN IMMEDIATE")
+                writer.execute(
+                    "INSERT INTO state_meta(key, value) VALUES (?, ?)",
+                    (hermes_state._OFFLINE_REBUILD_EPOCH_KEY, marker),
+                )
+                writer.execute("COMMIT")
+                state["committed"] = True
+            except sqlite3.OperationalError as exc:
+                state["error"] = exc
+                if writer.in_transaction:
+                    writer.execute("ROLLBACK")
+            finally:
+                writer.close()
+
+        db._conn.set_trace_callback(statements.append)
+        monkeypatch.setattr(
+            db,
+            "_assert_offline_rebuild_maintenance_authority",
+            prove_then_take_over,
+        )
+
+        db.optimize_fts_storage(vacuum=True)
+
+        normalized = [" ".join(sql.upper().split()) for sql in statements]
+        raw_statement = (
+            "VACUUM" if seam == "vacuum" else "PRAGMA WAL_CHECKPOINT(PASSIVE)"
+        )
+        assert state["attempted"] is True
+        assert state["committed"] is False
+        assert isinstance(state["error"], sqlite3.OperationalError)
+        assert any(sql.startswith(raw_statement) for sql in normalized)
+
+        with sqlite3.connect(str(db.db_path), isolation_level=None, timeout=0.0) as writer:
+            writer.execute("BEGIN IMMEDIATE")
+            writer.execute(
+                "INSERT INTO state_meta(key, value) VALUES (?, ?)",
+                (f"after-optimize-{seam}", "released"),
+            )
+            writer.execute("COMMIT")
+    finally:
+        db._conn.set_trace_callback(None)
+        db.close()
+
+
+def _seed_stale_tool_call_marker_for_purge(db: SessionDB) -> int:
+    """Seed one durable stale marker before exercising purge authority."""
+    session_id = "purge-authority-session"
+    db.create_session(session_id, "cli")
+    cursor = db._conn.execute(
+        "INSERT INTO messages(session_id, role, content, timestamp, tool_calls) "
+        "VALUES (?, 'assistant', '[memory]', ?, '[]')",
+        (session_id, time.time()),
+    )
+    db._conn.commit()
+    assert cursor.lastrowid is not None
+    return int(cursor.lastrowid)
+
+
+@pytest.mark.parametrize(
+    "claim_state",
+    ("local", "foreign", "null", "deleted"),
+)
+def test_purge_stale_markers_refuses_every_active_or_lost_rebuild_claim(
+    tmp_path, claim_state
+):
+    """The real snapshot boundary requires existing maintenance authority."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    marker_key = hermes_state._OFFLINE_REBUILD_EPOCH_KEY
+    local_marker = "local-purge-owner"
+    foreign_marker = "foreign-purge-owner"
+    statements: list[str] = []
+    try:
+        stale_id = _seed_stale_tool_call_marker_for_purge(db)
+        db._conn.set_trace_callback(statements.append)
+
+        def assert_refused(expected_marker_row, expected_local_marker) -> None:
+            with pytest.raises(hermes_state.SessionTurnLeaseLostError) as raised:
+                db.purge_stale_tool_call_markers()
+
+            assert type(raised.value) is hermes_state.SessionTurnLeaseLostError
+            assert _vacuum_into_statements(statements) == []
+            assert list(
+                db.db_path.parent.glob(
+                    f"{db.db_path.name}.pre-clean-markers-backup-*"
+                )
+            ) == []
+            marker_row = db._conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?", (marker_key,)
+            ).fetchone()
+            assert (
+                None if marker_row is None else tuple(marker_row)
+            ) == expected_marker_row
+            assert db._offline_rebuild_marker == expected_local_marker
+            assert db._conn.execute(
+                "SELECT content FROM messages WHERE id = ?", (stale_id,)
+            ).fetchone()[0] == "[memory]"
+
+        if claim_state == "local":
+            with db.offline_rebuild(reason="test purge exact local owner"):
+                local_marker = db._offline_rebuild_marker
+                assert isinstance(local_marker, str)
+                assert_refused((local_marker,), local_marker)
+        elif claim_state == "foreign":
+            db._conn.execute(
+                "INSERT INTO state_meta(key, value) VALUES (?, ?)",
+                (marker_key, foreign_marker),
+            )
+            db._conn.commit()
+            assert_refused((foreign_marker,), None)
+        elif claim_state == "null":
+            db._conn.execute(
+                "INSERT INTO state_meta(key, value) VALUES (?, NULL)",
+                (marker_key,),
+            )
+            db._conn.commit()
+            assert_refused((None,), None)
+        else:
+            db._conn.execute(
+                "INSERT INTO state_meta(key, value) VALUES (?, ?)",
+                (marker_key, local_marker),
+            )
+            db._conn.commit()
+            db._offline_rebuild_marker = local_marker
+            cursor = db._conn.execute(
+                "DELETE FROM state_meta WHERE key = ?", (marker_key,)
+            )
+            db._conn.commit()
+            assert cursor.rowcount == 1
+            assert_refused(None, local_marker)
+    finally:
+        db._offline_rebuild_marker = None
+        db._conn.set_trace_callback(None)
+        db.close()
+
+
+def test_purge_stale_markers_allows_ordinary_no_owner_snapshot(tmp_path):
+    """The no-owner path keeps its snapshot-then-purge contract."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    marker_key = hermes_state._OFFLINE_REBUILD_EPOCH_KEY
+    statements: list[str] = []
+    try:
+        stale_id = _seed_stale_tool_call_marker_for_purge(db)
+        db._conn.set_trace_callback(statements.append)
+
+        report = db.purge_stale_tool_call_markers()
+
+        assert report["rows_affected"] == 1
+        backup_path = report["backup_path"]
+        assert isinstance(backup_path, str)
+        backup = Path(backup_path)
+        assert backup.exists()
+        assert _vacuum_into_statements(statements)
+        with sqlite3.connect(str(backup)) as snapshot:
+            assert snapshot.execute(
+                "SELECT content FROM messages WHERE id = ?", (stale_id,)
+            ).fetchone() == ("[memory]",)
+        assert db._conn.execute(
+            "SELECT content FROM messages WHERE id = ?", (stale_id,)
+        ).fetchone()[0] == ""
+        assert db._conn.execute(
+            "SELECT value FROM state_meta WHERE key = ?", (marker_key,)
+        ).fetchone() is None
+    finally:
+        db._conn.set_trace_callback(None)
+        db.close()
+
+
+@pytest.mark.parametrize("delete_marker", (False, True), ids=("replace", "delete"))
+def test_optimize_storage_stops_before_raw_maintenance_after_claim_loss(
+    tmp_path, delete_marker
+):
+    """A lost optimize claim blocks its later VACUUM/checkpoint seam."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    marker_key = hermes_state._OFFLINE_REBUILD_EPOCH_KEY
+    foreign_marker = b"\x00foreign-optimize-maintenance\xff"
+    state = {"changed": False, "maintenance": []}
+    try:
+        def lose_claim_before_vacuum(status):
+            if status["phase"] != "vacuum" or state["changed"]:
+                return
+            with sqlite3.connect(str(db.db_path), isolation_level=None) as writer:
+                if delete_marker:
+                    cursor = writer.execute(
+                        "DELETE FROM state_meta WHERE key = ?", (marker_key,)
+                    )
+                else:
+                    cursor = writer.execute(
+                        "UPDATE state_meta SET value = ? WHERE key = ?",
+                        (sqlite3.Binary(foreign_marker), marker_key),
+                    )
+                assert cursor.rowcount == 1
+            state["changed"] = True
+
+        db._conn.set_trace_callback(state["maintenance"].append)
+        caught = None
+        try:
+            db.optimize_fts_storage(
+                progress_cb=lose_claim_before_vacuum, vacuum=True
+            )
+        except BaseException as exc:
+            caught = exc
+
+        assert state["changed"] is True
+        assert _raw_maintenance_statements(state["maintenance"]) == []
+        assert isinstance(caught, hermes_state.SessionTurnLeaseLostError)
+        with sqlite3.connect(str(db.db_path)) as inspector:
+            marker = inspector.execute(
+                "SELECT value FROM state_meta WHERE key = ?", (marker_key,)
+            ).fetchone()
+        if delete_marker:
+            assert marker is None
+        else:
+            assert marker is not None
+            assert marker[0] == foreign_marker
+            assert isinstance(marker[0], bytes)
+    finally:
+        db._conn.set_trace_callback(None)
+        db.close()
+
+
+@pytest.mark.parametrize("delete_marker", (False, True), ids=("replace", "delete"))
+@pytest.mark.parametrize("checkpoint_path", ("periodic", "close"))
+def test_checkpoint_skips_raw_maintenance_after_local_claim_loss(
+    tmp_path, delete_marker, checkpoint_path
+):
+    """Periodic and close checkpoints preserve a changed local claim."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    marker_key = hermes_state._OFFLINE_REBUILD_EPOCH_KEY
+    local_marker = "local-checkpoint-owner"
+    foreign_marker = b"\x00foreign-checkpoint-owner\xff"
+    statements = []
+    try:
+        db._conn.execute(
+            "INSERT INTO state_meta(key, value) VALUES (?, ?)",
+            (marker_key, local_marker),
+        )
+        db._conn.commit()
+        db._offline_rebuild_marker = local_marker
+        with sqlite3.connect(str(db.db_path), isolation_level=None) as writer:
+            if delete_marker:
+                cursor = writer.execute(
+                    "DELETE FROM state_meta WHERE key = ?", (marker_key,)
+                )
+            else:
+                cursor = writer.execute(
+                    "UPDATE state_meta SET value = ? WHERE key = ?",
+                    (sqlite3.Binary(foreign_marker), marker_key),
+                )
+            assert cursor.rowcount == 1
+
+        db._conn.set_trace_callback(statements.append)
+        if checkpoint_path == "periodic":
+            db._try_wal_checkpoint()
+        else:
+            db.close()
+
+        assert _raw_maintenance_statements(statements) == []
+        with sqlite3.connect(str(db.db_path)) as inspector:
+            marker = inspector.execute(
+                "SELECT value FROM state_meta WHERE key = ?", (marker_key,)
+            ).fetchone()
+        if delete_marker:
+            assert marker is None
+        else:
+            assert marker is not None
+            assert marker[0] == foreign_marker
+            assert isinstance(marker[0], bytes)
+    finally:
+        db._offline_rebuild_marker = None
+        if db._conn is not None:
+            db._conn.set_trace_callback(None)
+        db.close()
+
+
+def test_vacuum_refuses_foreign_claim_without_raw_maintenance(tmp_path):
+    """A foreign optimize refusal cannot fall through to checkpoint/VACUUM."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    marker_key = hermes_state._OFFLINE_REBUILD_EPOCH_KEY
+    foreign_marker = b"\x00foreign-vacuum-owner\xff"
+    statements = []
+    try:
+        db._conn.execute(
+            "INSERT INTO state_meta(key, value) VALUES (?, ?)",
+            (marker_key, sqlite3.Binary(foreign_marker)),
+        )
+        db._conn.commit()
+        db._conn.set_trace_callback(statements.append)
+        caught = None
+        try:
+            db.vacuum()
+        except BaseException as exc:
+            caught = exc
+
+        assert _raw_maintenance_statements(statements) == []
+        assert isinstance(caught, hermes_state.SessionTurnLeaseLostError)
+        marker = db._conn.execute(
+            "SELECT value FROM state_meta WHERE key = ?", (marker_key,)
+        ).fetchone()
+        assert marker[0] == foreign_marker
+        assert isinstance(marker[0], bytes)
+    finally:
+        db._conn.set_trace_callback(None)
+        db.close()
+
+
+def test_nested_write_transaction_refuses_replaced_offline_rebuild_owner(tmp_path):
+    """A nested write cannot proceed after its outer transaction loses ownership."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    marker_key = hermes_state._OFFLINE_REBUILD_EPOCH_KEY
+    foreign_marker = "foreign-nested-write-owner"
+    sentinel_key = "nested-write-should-not-exist"
+    try:
+        with db.offline_rebuild(reason="test nested write authority"):
+            local_marker = db._offline_rebuild_marker
+            assert isinstance(local_marker, str)
+
+            with db.write_transaction() as conn:
+                cursor = conn.execute(
+                    "UPDATE state_meta SET value = ? WHERE key = ?",
+                    (foreign_marker, marker_key),
+                )
+                assert cursor.rowcount == 1
+
+                with pytest.raises(hermes_state.SessionTurnLeaseLostError) as raised:
+                    with db.write_transaction() as nested_conn:
+                        nested_conn.execute(
+                            "INSERT INTO state_meta(key, value) VALUES (?, ?)",
+                            (sentinel_key, "nested-write"),
+                        )
+
+                assert type(raised.value) is hermes_state.SessionTurnLeaseLostError
+                assert conn.execute(
+                    "SELECT value FROM state_meta WHERE key = ?", (sentinel_key,)
+                ).fetchone() is None
+                conn.execute(
+                    "UPDATE state_meta SET value = ? WHERE key = ?",
+                    (local_marker, marker_key),
+                )
+    finally:
+        db.close()
+
+
+def test_turn_receipt_persists_acp_identity_separate_from_target_bind_evidence(tmp_path):
+    """A receipt is bound to the closed ACP identity, not only caller digest bytes."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "hermes-session"
+    request_id = "acp-turn-1"
+    binding_digest = "sha256:" + "a" * 64
+    identity = {
+        "schema": "hermes.acp-terminal-receipt-identity",
+        "version": 1,
+        "turnRequestId": request_id,
+        "targetActorId": "actor-1",
+        "promptDigest": "sha256:" + "b" * 64,
+        "bindingGeneration": 7,
+        "targetBindingId": "target-binding-1",
+        "targetAttestationId": "target-attestation-1",
+        "executorSessionId": "executor-session-1",
+        "executorSessionIncarnation": "executor-incarnation-1",
+    }
+    try:
+        db.create_session(session_id, source="test")
+        target_bind_record = db.prepare_target_bind_receipt(
+            session_id,
+            "actor-1",
+            7,
+            "executor-runtime-1",
+        )
+        target_bind = {
+            key: target_bind_record[key]
+            for key in (
+                "schema",
+                "domain",
+                "version",
+                "actor_id",
+                "binding_generation",
+                "executor_runtime_identity",
+                "requested_session_id",
+                "lineage_root_digest",
+                "receipt_digest",
+            )
+        }
+
+        admission = db.validate_acp_turn_receipt_request(session_id, identity, target_bind)
+        assert admission["receiptIdentity"] == identity
+        assert admission["targetBindReceipt"] == target_bind
+        prepared = db.prepare_acp_turn_receipt(
+            session_id,
+            identity,
+            target_bind,
+        )
+
+        assert prepared["receiptIdentity"] == identity
+        assert prepared["receiptIdentityDigest"] != binding_digest
+        assert prepared["targetBindReceiptDigest"] == target_bind["receipt_digest"]
+        assert db.prepare_acp_turn_receipt(session_id, identity, target_bind) == prepared
+
+        conflicting = {**identity, "targetAttestationId": "target-attestation-2"}
+        conflicting_admission = db.validate_acp_turn_receipt_request(
+            session_id, conflicting, target_bind
+        )
+        assert conflicting_admission["receiptIdentityDigest"] != admission["receiptIdentityDigest"]
+        with pytest.raises(hermes_state.TurnReceiptConflictError):
+            db.prepare_acp_turn_receipt(session_id, conflicting, target_bind)
+
+        assert db.get_acp_turn_receipt(session_id, identity, target_bind) == prepared
+        assert db.get_acp_turn_receipt(session_id, conflicting, target_bind) is None
+    finally:
+        db.close()
+
+
+def _acp_abort_inputs(db, session_id: str, turn_request_id: str) -> tuple[dict, dict]:
+    """Build one closed ACP identity and its matching durable target proof."""
+    identity = {
+        "schema": "hermes.acp-terminal-receipt-identity",
+        "version": 1,
+        "turnRequestId": turn_request_id,
+        "targetActorId": "abort-actor",
+        "promptDigest": "sha256:" + "b" * 64,
+        "bindingGeneration": 3,
+        "targetBindingId": "abort-target-binding",
+        "targetAttestationId": "abort-target-attestation",
+        "executorSessionId": "abort-executor-session",
+        "executorSessionIncarnation": "abort-executor-incarnation",
+    }
+    target_record = db.prepare_target_bind_receipt(
+        session_id, "abort-actor", 3, "abort-executor-runtime"
+    )
+    target_bind = {
+        key: target_record[key]
+        for key in (
+            "schema",
+            "domain",
+            "version",
+            "actor_id",
+            "binding_generation",
+            "executor_runtime_identity",
+            "requested_session_id",
+            "lineage_root_digest",
+            "receipt_digest",
+        )
+    }
+    return identity, target_bind
+
+
+def _abort_canonical_digest(payload: dict) -> str:
+    return "sha256:" + hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+
+def test_abort_acp_turn_receipt_commits_closed_terminal_evidence_and_fences_late_finish(tmp_path):
+    """Only the matching claim may atomically make a closed ACP receipt ABORTED."""
+    db_path = tmp_path / "abort-receipt.db"
+    db = SessionDB(db_path=db_path)
+    session_id = "abort-session"
+    turn_request_id = "abort-turn"
+    claim_token = "secret-claim-token"
+    reason_code = "HERMES_AGENT_RUN_EXCEPTION"
+    try:
+        db.create_session(session_id, source="test")
+        identity, target_bind = _acp_abort_inputs(db, session_id, turn_request_id)
+        prepared = db.prepare_acp_turn_receipt(session_id, identity, target_bind)
+        assert db.get_acp_turn_receipt(session_id, identity, target_bind)["status"] == "PREPARED"
+        assert db.claim_turn_receipt(
+            session_id,
+            turn_request_id,
+            prepared["receiptIdentityDigest"],
+            claim_token,
+        )
+
+        aborted = db.abort_acp_turn_receipt(
+            session_id, identity, target_bind, claim_token, reason_code
+        )
+
+        with pytest.raises(hermes_state.TurnReceiptFenceError):
+            db.abort_acp_turn_receipt(
+                session_id, identity, target_bind, "wrong-claim-token", reason_code
+            )
+        with pytest.raises(hermes_state.TargetBindReceiptFenceError):
+            db.abort_acp_turn_receipt(
+                session_id,
+                identity,
+                {**target_bind, "receipt_digest": "sha256:" + "f" * 64},
+                claim_token,
+                reason_code,
+            )
+        with pytest.raises(hermes_state.TurnReceiptConflictError):
+            db.abort_acp_turn_receipt(
+                session_id,
+                {**identity, "targetAttestationId": "wrong-binding"},
+                target_bind,
+                claim_token,
+                reason_code,
+            )
+        with pytest.raises(ValueError):
+            db.abort_acp_turn_receipt(
+                session_id, identity, target_bind, claim_token, "CHANGED_REASON"
+            )
+
+        prepared_identity, prepared_target = _acp_abort_inputs(
+            db, session_id, "still-prepared-turn"
+        )
+        db.prepare_acp_turn_receipt(session_id, prepared_identity, prepared_target)
+        with pytest.raises(hermes_state.TurnReceiptFenceError):
+            db.abort_acp_turn_receipt(
+                session_id,
+                prepared_identity,
+                prepared_target,
+                claim_token,
+                reason_code,
+            )
+        assert (
+            db.get_acp_turn_receipt(session_id, prepared_identity, prepared_target)["status"]
+            == "PREPARED"
+        )
+
+        expected_receipt_id = _abort_canonical_digest(
+            {
+                "domain": "hermes.acp-terminal-abort-receipt-id",
+                "version": 1,
+                "receiptIdentityDigest": prepared["receiptIdentityDigest"],
+                "targetBindReceiptDigest": prepared["targetBindReceiptDigest"],
+                "claimToken": claim_token,
+            }
+        )
+        expected_evidence_digest = _abort_canonical_digest(
+            {
+                "domain": "hermes.acp-terminal-abort-evidence",
+                "version": 1,
+                "receiptId": expected_receipt_id,
+                "receiptIdentityDigest": prepared["receiptIdentityDigest"],
+                "targetBindReceiptDigest": prepared["targetBindReceiptDigest"],
+                "reasonCode": reason_code,
+                "claimToken": claim_token,
+            }
+        )
+        assert set(aborted) == {
+            "status",
+            "turnRequestId",
+            "sessionId",
+            "receiptIdentity",
+            "receiptIdentityDigest",
+            "targetBindReceipt",
+            "targetBindReceiptDigest",
+            "receiptId",
+            "evidenceDigest",
+            "reasonCode",
+        }
+        assert aborted == {
+            "status": "ABORTED",
+            "turnRequestId": turn_request_id,
+            "sessionId": target_bind["requested_session_id"],
+            "receiptIdentity": identity,
+            "receiptIdentityDigest": prepared["receiptIdentityDigest"],
+            "targetBindReceipt": target_bind,
+            "targetBindReceiptDigest": prepared["targetBindReceiptDigest"],
+            "receiptId": expected_receipt_id,
+            "evidenceDigest": expected_evidence_digest,
+            "reasonCode": reason_code,
+        }
+        assert claim_token not in json.dumps(aborted, sort_keys=True)
+        assert db.abort_acp_turn_receipt(
+            session_id, identity, target_bind, claim_token, reason_code
+        ) == aborted
+        with pytest.raises(ValueError):
+            db.abort_acp_turn_receipt(
+                session_id, identity, target_bind, claim_token, "CHANGED_REASON"
+            )
+        with pytest.raises(hermes_state.TurnReceiptFenceError):
+            db.finish_turn_receipt(
+                session_id,
+                turn_request_id,
+                prepared["receiptIdentityDigest"],
+                claim_token,
+                assistant_content="must not persist",
+                response_digest="sha256:" + "a" * 64,
+            )
+        assert db.get_messages(session_id) == []
+    finally:
+        db.close()
+
+    reopened = SessionDB(db_path=db_path)
+    try:
+        assert reopened.get_acp_turn_receipt(session_id, identity, target_bind) == aborted
+    finally:
+        reopened.close()
+
+
+def test_abort_acp_turn_receipt_leaves_completed_race_unchanged(tmp_path):
+    """An ABORTED writer must not overwrite a terminal assistant committed first."""
+    db = SessionDB(db_path=tmp_path / "completed-race.db")
+    session_id = "completed-race-session"
+    claim_token = "completed-race-claim"
+    try:
+        db.create_session(session_id, source="test")
+        identity, target_bind = _acp_abort_inputs(db, session_id, "completed-race-turn")
+        prepared = db.prepare_acp_turn_receipt(session_id, identity, target_bind)
+        assert db.claim_turn_receipt(
+            session_id,
+            identity["turnRequestId"],
+            prepared["receiptIdentityDigest"],
+            claim_token,
+        )
+        completed = db.finish_turn_receipt(
+            session_id,
+            identity["turnRequestId"],
+            prepared["receiptIdentityDigest"],
+            claim_token,
+            assistant_content="completed first",
+            response_digest="sha256:" + "c" * 64,
+        )
+        with pytest.raises(hermes_state.TurnReceiptFenceError):
+            db.abort_acp_turn_receipt(
+                session_id,
+                identity,
+                target_bind,
+                "wrong-completed-claim",
+                "HERMES_AGENT_RUN_EXCEPTION",
+            )
+        assert db.abort_acp_turn_receipt(
+            session_id,
+            identity,
+            target_bind,
+            claim_token,
+            "HERMES_AGENT_RUN_EXCEPTION",
+        ) == completed
+        assert [message["content"] for message in db.get_messages(session_id)] == [
+            "completed first"
+        ]
+    finally:
+        db.close()
+
+
+def test_migrate_turn_receipts_adds_nullable_abort_evidence_columns(tmp_path):
+    """Existing receipt tables gain all abort evidence fields without rebuilding rows."""
+    db = SessionDB(db_path=tmp_path / "legacy-turn-receipts.db")
+    try:
+        assert db._conn is not None
+        db._conn.execute("DROP TABLE turn_receipts")
+        db._conn.execute(
+            """CREATE TABLE turn_receipts (
+                turn_request_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                binding_digest TEXT NOT NULL,
+                receipt_identity_json TEXT,
+                receipt_identity_digest TEXT,
+                target_bind_receipt_json TEXT,
+                target_bind_receipt_digest TEXT,
+                status TEXT NOT NULL,
+                claim_token TEXT,
+                terminal_message_id INTEGER,
+                response_digest TEXT,
+                created_at REAL NOT NULL,
+                claimed_at REAL,
+                completed_at REAL
+            )"""
+        )
+        db._conn.commit()
+        assert db.migrate_turn_receipts() == 0
+        columns = {
+            row["name"] for row in db._conn.execute("PRAGMA table_info(turn_receipts)")
+        }
+        assert {
+            "abort_receipt_id",
+            "abort_evidence_digest",
+            "abort_reason_code",
+            "aborted_at",
+        } <= columns
+    finally:
+        db.close()
+
+
+def test_acp_receipt_identity_validation_is_closed_and_side_effect_free(tmp_path):
+    """Invalid ACP admission cannot insert a receipt or mutate bind evidence."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "hermes-session"
+    identity = {
+        "schema": "hermes.acp-terminal-receipt-identity",
+        "version": 1,
+        "turnRequestId": "turn-identity-validation",
+        "targetActorId": "actor-1",
+        "promptDigest": "sha256:" + "b" * 64,
+        "bindingGeneration": 7,
+        "targetBindingId": "opaque-target-binding",
+        "targetAttestationId": "opaque-target-attestation",
+        "executorSessionId": "opaque-executor-session",
+        "executorSessionIncarnation": "opaque-incarnation",
+    }
+    try:
+        db.create_session(session_id, source="test")
+        target_record = db.prepare_target_bind_receipt(
+            session_id, "actor-1", 7, "executor-runtime-1"
+        )
+        target_bind = {
+            key: target_record[key]
+            for key in (
+                "schema", "domain", "version", "actor_id", "binding_generation",
+                "executor_runtime_identity", "requested_session_id", "lineage_root_digest",
+                "receipt_digest",
+            )
+        }
+        for malformed_identity in (
+            {key: value for key, value in identity.items() if key != "executorSessionId"},
+            {**identity, "unexpected": True},
+        ):
+            with pytest.raises(ValueError):
+                db.validate_acp_turn_receipt_request(
+                    session_id, malformed_identity, target_bind
+                )
+        with pytest.raises(hermes_state.TargetBindReceiptFenceError):
+            db.validate_acp_turn_receipt_request(
+                session_id,
+                identity,
+                {key: value for key, value in target_bind.items() if key != "receipt_digest"},
+            )
+
+        assert db.get_turn_receipt(
+            session_id, identity["turnRequestId"], "sha256:" + "b" * 64
+        ) is None
+        assert db.validate_target_bind_receipt(session_id, target_bind) == target_bind
+    finally:
+        db.close()

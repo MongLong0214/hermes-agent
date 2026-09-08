@@ -1,0 +1,5 @@
+{
+  "artifact": "gateway-freeze-watchdog",
+  "authority": "observer_only",
+  "operational_liveness": "UNVERIFIED"
+}

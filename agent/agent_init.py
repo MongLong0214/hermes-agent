@@ -31,6 +31,25 @@ from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse, urlunparse
 
 from agent.context_compressor import ContextCompressor
+from agent.gemini_outbound_policy import GeminiOutboundDenied, deny_gemini_outbound as _policy_deny_gemini_outbound
+
+
+def deny_gemini_outbound(**route: object) -> None:
+    """Treat the concrete selected endpoint as outbound-route authority."""
+    base_url = route.get("base_url")
+    if isinstance(base_url, str) and base_url.strip():
+        _policy_deny_gemini_outbound(base_url=base_url)
+        return
+    provider = route.get("canonical_provider", "")
+    hint = route.get("routing_hint", "")
+    if str(provider or "").strip() or str(hint or "").strip():
+        _policy_deny_gemini_outbound(
+            canonical_provider=provider,
+            routing_hint=hint,
+            api_mode=route.get("api_mode", ""),
+        )
+        return
+    _policy_deny_gemini_outbound(**route)
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import StreamingContextScrubber
 from agent.session_activity import ActivityProvenance
@@ -687,6 +706,13 @@ def init_agent(
         requested_provider.strip().lower()
         if isinstance(requested_provider, str) and requested_provider.strip()
         else agent.provider
+    )
+    deny_gemini_outbound(
+        canonical_provider=agent.provider,
+        model=agent.model,
+        base_url=agent.base_url,
+        api_mode=api_mode,
+        routing_hint=agent.requested_provider,
     )
     agent._credential_pool = credential_pool
     agent.acp_command = acp_command or command
@@ -1386,6 +1412,17 @@ def init_agent(
                     _fb_resolved = False
                     for _fb in _fb_entries:
                         try:
+                            # Fallback keys are secret-bearing.  Classify the
+                            # complete nonsecret route before resolving one so
+                            # a prohibited Gemini route cannot even read its
+                            # key_env through the scoped secret store.
+                            deny_gemini_outbound(
+                                canonical_provider=_fb.get("provider", ""),
+                                model=_fb.get("model", ""),
+                                base_url=_fb.get("base_url", ""),
+                                api_mode=_fb.get("api_mode", ""),
+                                routing_hint=_fb.get("provider", ""),
+                            )
                             from hermes_cli.fallback_config import resolve_entry_api_key
                             _fb_explicit_key = resolve_entry_api_key(_fb)
                             _fb_client, _fb_model = resolve_provider_client(
@@ -1393,6 +1430,8 @@ def init_agent(
                                 explicit_base_url=_fb.get("base_url"),
                                 explicit_api_key=_fb_explicit_key,
                             )
+                        except GeminiOutboundDenied:
+                            raise
                         except Exception as _fb_exc:
                             logger.debug(
                                 "Init-time fallback entry %s failed: %s",

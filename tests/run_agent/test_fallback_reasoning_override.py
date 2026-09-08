@@ -57,7 +57,7 @@ class TestFallbackReasoningOverride:
 
         This tests the integration of Task 6 (_primary_runtime snapshot) with
         Task 6b (fallback re-resolution). The full cycle:
-        1. Primary model = gemini-flash, reasoning = medium
+        1. Primary model = gpt-4o, reasoning = medium
         2. /model switch → _primary_runtime captures reasoning_config
         3. Fallback activates → reasoning re-resolved for fallback model
         4. restore_primary_runtime → reasoning_config restored from snapshot
@@ -67,8 +67,8 @@ class TestFallbackReasoningOverride:
         agent = MagicMock()
         # Simulate: _primary_runtime was captured during /model switch
         agent._primary_runtime = {
-            "model": "gemini-flash",
-            "provider": "google",
+            "model": "gpt-4o",
+            "provider": "openai",
             "base_url": "",
             "api_mode": "openai",
             "api_key": "key",
@@ -76,7 +76,7 @@ class TestFallbackReasoningOverride:
             "use_prompt_caching": False,
             "use_native_cache_layout": False,
             "reasoning_config": {"enabled": True, "effort": "medium"},
-            "compressor_model": "gemini-flash",
+            "compressor_model": "gpt-4o",
             "compressor_base_url": "",
             "compressor_api_key": "",
             "compressor_provider": "",

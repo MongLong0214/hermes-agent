@@ -21,6 +21,7 @@ import os
 import time
 from typing import Optional, Tuple
 
+from agent.gemini_outbound_policy import deny_gemini_outbound
 from agent.secret_scope import get_secret as _get_secret, is_multiplex_active
 
 # Ensure google-auth is installed before importing. The [vertex] extra is no
@@ -114,6 +115,7 @@ def get_vertex_credentials(credentials_path: Optional[str] = None) -> Tuple[Opti
     Caches the underlying Credentials object and refreshes it when within
     5 minutes of expiry, so repeated calls don't thrash the token endpoint.
     """
+    deny_gemini_outbound(canonical_provider="vertex")
     if google is None:
         logger.warning("google-auth package not installed. Cannot use Vertex AI.")
         return None, None

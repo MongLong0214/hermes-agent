@@ -1381,7 +1381,6 @@ _READ_TOOL_SHORT_OPTIONS_WITH_ARG = {
     "man": frozenset("CRLmMSserEPp"),
     "ag": frozenset("gGmpW"),
 }
-_SHELL_PUNCTUATION = {";", "&", "&&", "|", "||", "(", ")", "{", "}"}
 _MAX_DETECTION_COMMAND_CHARS = 128_000
 _MAX_SEPARATOR_FREE_COMMAND_CHARS = 4_096
 _MAX_DETECTION_SEGMENTS = 25_000
@@ -1907,12 +1906,6 @@ def _read_shell_word(command: str, pos: int) -> tuple[int, int, str]:
             break
         i += 1
     return (start, i, command[start:i])
-
-
-def _strip_optional_shell_quotes(word: str) -> str:
-    if len(word) >= 2 and word[0] == word[-1] and word[0] in ("'", '"'):
-        return word[1:-1]
-    return word
 
 
 def _is_simple_shell_literal(value: str) -> bool:

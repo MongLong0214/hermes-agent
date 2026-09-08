@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+import stat
 import threading
 import time
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from gateway.shutdown_watchdog import (
     _arm_loop_floor_timer,
+    _write_loop_liveness_watchdog_dump,
     start_loop_liveness_watchdog,
 )
 
@@ -21,11 +26,415 @@ def _immediate_loop() -> MagicMock:
     return loop
 
 
-def test_loop_liveness_watchdog_stop_during_dump_disarms_hard_exit():
+def test_loop_liveness_final_strike_persists_private_all_thread_dump_before_exit(
+    tmp_path, monkeypatch
+):
+    """The final strike must leave durable evidence even when stderr is discarded."""
+    loop = MagicMock(spec=asyncio.AbstractEventLoop)
+    events = []
+    dump_calls = []
+    exit_code = 71
+    target = tmp_path / "logs" / "gateway-loop-liveness-watchdog.log"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    def fake_dump_traceback(*, file=None, all_threads):
+        dump_calls.append({"file_supplied": file is not None, "all_threads": all_threads})
+        events.append("dump")
+        if file is not None:
+            file.write("synthetic all-thread stack\\n")
+
+    def fake_mark_exited(code, *, reason):
+        events.append("mark_exited")
+        assert (code, reason) == (exit_code, "loop_liveness_watchdog")
+
+    def fake_exit(code):
+        events.append("hard_exit")
+        assert code == exit_code
+
+    with (
+        patch(
+            "gateway.shutdown_watchdog.faulthandler.dump_traceback",
+            side_effect=fake_dump_traceback,
+        ),
+        patch(
+            "gateway.lifecycle_ledger.mark_exited", side_effect=fake_mark_exited
+        ),
+        patch("gateway.shutdown_watchdog.os._exit", side_effect=fake_exit),
+    ):
+        handle = start_loop_liveness_watchdog(
+            loop,
+            probe_interval=0.01,
+            probe_timeout=0.01,
+            max_strikes=1,
+            exit_code=exit_code,
+        )
+        assert handle is not None
+        handle.join(timeout=2.0)
+
+    assert not handle.is_alive()
+    assert dump_calls == [{"file_supplied": True, "all_threads": True}]
+    assert events == ["dump", "mark_exited", "hard_exit"]
+    assert target.is_file()
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+    header = json.loads(target.read_text(encoding="utf-8").splitlines()[0])
+    assert set(header) == {
+        "event_kind",
+        "pid",
+        "strike_count",
+        "probe_interval_s",
+        "probe_timeout_s",
+        "utc_timestamp",
+        "runtime_state",
+    }
+    assert header["event_kind"] == "loop_liveness_watchdog_final_strike"
+    assert header["pid"] == os.getpid()
+    assert header["strike_count"] == 1
+    assert header["probe_interval_s"] == 0.01
+    assert header["probe_timeout_s"] == 0.01
+    assert header["utc_timestamp"].endswith("+00:00")
+    assert header["runtime_state"] == {"loop_liveness": "unresponsive"}
+    assert "synthetic all-thread stack" in target.read_text(encoding="utf-8")
+
+
+def test_loop_liveness_final_strike_fsyncs_replaced_dump_directory_before_exit(
+    tmp_path, monkeypatch
+):
+    """A replaced final-strike dump must have its directory entry persisted."""
+    loop = MagicMock(spec=asyncio.AbstractEventLoop)
+    events = []
+    directory_fds = set()
+    exit_code = 71
+    target = tmp_path / "logs" / "gateway-loop-liveness-watchdog.log"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    real_open = os.open
+    real_fsync = os.fsync
+    real_replace = os.replace
+    real_close = os.close
+
+    def spy_open(path, flags, mode=0o777, *, dir_fd=None):
+        kwargs = {} if dir_fd is None else {"dir_fd": dir_fd}
+        fd = real_open(path, flags, mode, **kwargs)
+        if Path(path) == target.parent:
+            directory_fds.add(fd)
+            events.append("open_directory")
+        return fd
+
+    def spy_fsync(fd):
+        events.append("directory_fsync" if fd in directory_fds else "file_fsync")
+        return real_fsync(fd)
+
+    def spy_replace(source, destination):
+        events.append("replace")
+        return real_replace(source, destination)
+
+    def spy_close(fd):
+        try:
+            return real_close(fd)
+        finally:
+            if fd in directory_fds:
+                events.append("close_directory")
+
+    def fake_dump_traceback(*, file=None, all_threads):
+        assert file is not None
+        assert all_threads is True
+        events.append("temp_content_write")
+        file.write("synthetic all-thread stack\\n")
+
+    def fake_mark_exited(code, *, reason):
+        assert (code, reason) == (exit_code, "loop_liveness_watchdog")
+        events.append("mark_exited")
+
+    def fake_exit(code):
+        assert code == exit_code
+        events.append("hard_exit")
+
+    with (
+        patch(
+            "gateway.shutdown_watchdog.faulthandler.dump_traceback",
+            side_effect=fake_dump_traceback,
+        ),
+        patch("gateway.shutdown_watchdog.os.open", side_effect=spy_open),
+        patch("gateway.shutdown_watchdog.os.fsync", side_effect=spy_fsync),
+        patch("gateway.shutdown_watchdog.os.replace", side_effect=spy_replace),
+        patch("gateway.shutdown_watchdog.os.close", side_effect=spy_close),
+        patch(
+            "gateway.lifecycle_ledger.mark_exited", side_effect=fake_mark_exited
+        ),
+        patch("gateway.shutdown_watchdog.os._exit", side_effect=fake_exit),
+    ):
+        handle = start_loop_liveness_watchdog(
+            loop,
+            probe_interval=0.01,
+            probe_timeout=0.01,
+            max_strikes=1,
+            exit_code=exit_code,
+        )
+        assert handle is not None
+        handle.join(timeout=2.0)
+
+    assert not handle.is_alive()
+    assert events == [
+        "temp_content_write",
+        "file_fsync",
+        "replace",
+        "open_directory",
+        "directory_fsync",
+        "close_directory",
+        "mark_exited",
+        "hard_exit",
+    ]
+
+
+def test_loop_liveness_dump_tightens_stale_temp_mode_before_dump_bytes(
+    tmp_path, monkeypatch
+):
+    """A stale fixed temp file is private before any dump bytes are written."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    target = tmp_path / "logs" / "gateway-loop-liveness-watchdog.log"
+    temporary = target.with_name(f".{target.name}.tmp")
+    temporary.parent.mkdir()
+    temporary.touch()
+    temporary.chmod(0o666)
+    write_modes = []
+    stack_modes = []
+    real_fdopen = os.fdopen
+
+    class ModeCheckingFile:
+        def __init__(self, fh):
+            self._fh = fh
+
+        def write(self, content):
+            mode = stat.S_IMODE(os.fstat(self._fh.fileno()).st_mode)
+            write_modes.append(mode)
+            return self._fh.write(content)
+
+        def flush(self):
+            return self._fh.flush()
+
+        def fileno(self):
+            return self._fh.fileno()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            self._fh.close()
+            return False
+
+    def fake_fdopen(fd, *args, **kwargs):
+        return ModeCheckingFile(real_fdopen(fd, *args, **kwargs))
+
+    def fake_dump_traceback(*, file=None, all_threads):
+        assert file is not None
+        assert all_threads is True
+        mode = stat.S_IMODE(os.fstat(file.fileno()).st_mode)
+        stack_modes.append(mode)
+        file.write("synthetic all-thread stack\\n")
+
+    with (
+        patch("gateway.shutdown_watchdog.os.fdopen", side_effect=fake_fdopen),
+        patch(
+            "gateway.shutdown_watchdog.faulthandler.dump_traceback",
+            side_effect=fake_dump_traceback,
+        ),
+    ):
+        assert _write_loop_liveness_watchdog_dump(
+            target,
+            strikes=1,
+            probe_interval=0.01,
+            probe_timeout=0.01,
+        )
+
+    assert write_modes
+    assert set(write_modes) == {0o600}
+    assert stack_modes == [0o600]
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+
+def test_loop_liveness_dump_atomically_replaces_latest_private_file(tmp_path, monkeypatch):
+    """Repeated final strikes retain one private latest dump, not an unbounded log."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    target = tmp_path / "logs" / "gateway-loop-liveness-watchdog.log"
+    dump_count = 0
+    real_replace = os.replace
+
+    def fake_dump_traceback(*, file=None, all_threads):
+        nonlocal dump_count
+        assert file is not None
+        assert all_threads is True
+        dump_count += 1
+        file.write(f"synthetic all-thread stack {dump_count}\\n")
+
+    with (
+        patch(
+            "gateway.shutdown_watchdog.faulthandler.dump_traceback",
+            side_effect=fake_dump_traceback,
+        ),
+        patch("gateway.lifecycle_ledger.mark_exited"),
+        patch("gateway.shutdown_watchdog.os._exit"),
+        patch(
+            "gateway.shutdown_watchdog.os.replace", side_effect=real_replace
+        ) as replace,
+    ):
+        for _ in range(2):
+            loop = MagicMock(spec=asyncio.AbstractEventLoop)
+            handle = start_loop_liveness_watchdog(
+                loop, probe_interval=0.01, probe_timeout=0.01, max_strikes=1
+            )
+            assert handle is not None
+            handle.join(timeout=2.0)
+            assert not handle.is_alive()
+
+    assert replace.call_count == 2
+    temporary = target.with_name(f".{target.name}.tmp")
+    assert [Path(call.args[0]) for call in replace.call_args_list] == [
+        temporary,
+        temporary,
+    ]
+    assert list((tmp_path / "logs").iterdir()) == [target]
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+    contents = target.read_text(encoding="utf-8")
+    assert "synthetic all-thread stack 1" not in contents
+    assert "synthetic all-thread stack 2" in contents
+
+
+def test_loop_liveness_dump_failure_warns_safely_and_still_hard_exits(
+    tmp_path, monkeypatch
+):
+    """A private-sink failure never prevents recovery or leaks its details."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    loop = MagicMock(spec=asyncio.AbstractEventLoop)
+    events = []
+
+    def fake_mark_exited(*_args, **_kwargs):
+        events.append("mark_exited")
+
+    def fake_exit(*_args, **_kwargs):
+        events.append("hard_exit")
+
+    with (
+        patch(
+            "gateway.shutdown_watchdog.os.open",
+            side_effect=OSError("write failed at /private/path/with-token"),
+        ),
+        patch(
+            "gateway.lifecycle_ledger.mark_exited", side_effect=fake_mark_exited
+        ),
+        patch("gateway.shutdown_watchdog.os._exit", side_effect=fake_exit),
+        patch("gateway.shutdown_watchdog.logger.warning") as warning,
+    ):
+        handle = start_loop_liveness_watchdog(
+            loop, probe_interval=0.01, probe_timeout=0.01, max_strikes=1
+        )
+        assert handle is not None
+        handle.join(timeout=2.0)
+
+    assert not handle.is_alive()
+    assert events == ["mark_exited", "hard_exit"]
+    warning.assert_called_once_with(
+        "Gateway loop liveness watchdog durable dump failed; "
+        "continuing forced recovery."
+    )
+
+
+@pytest.mark.parametrize(
+    "failure_stage", ["directory_open", "directory_fsync", "directory_close"]
+)
+def test_loop_liveness_directory_sync_failure_preserves_replaced_dump_and_exits(
+    tmp_path, monkeypatch, failure_stage
+):
+    """Directory durability failures remain fail-open after replacing the dump."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    loop = MagicMock(spec=asyncio.AbstractEventLoop)
+    target = tmp_path / "logs" / "gateway-loop-liveness-watchdog.log"
+    events = []
+    directory_fds = set()
+    raw_failure = "directory sync failed at /private/path/with-token"
+    real_open = os.open
+    real_fsync = os.fsync
+    real_replace = os.replace
+    real_close = os.close
+
+    def fail_directory_open(path, flags, mode=0o777, *, dir_fd=None):
+        kwargs = {} if dir_fd is None else {"dir_fd": dir_fd}
+        if Path(path) == target.parent:
+            if failure_stage == "directory_open":
+                raise OSError(raw_failure)
+            fd = real_open(path, flags, mode, **kwargs)
+            directory_fds.add(fd)
+            return fd
+        return real_open(path, flags, mode, **kwargs)
+
+    def fail_directory_fsync(fd):
+        if failure_stage == "directory_fsync" and fd in directory_fds:
+            raise OSError(raw_failure)
+        return real_fsync(fd)
+
+    def fail_directory_close(fd):
+        if failure_stage == "directory_close" and fd in directory_fds:
+            real_close(fd)
+            raise OSError(raw_failure)
+        return real_close(fd)
+
+    def record_replace(source, destination):
+        events.append("replace")
+        return real_replace(source, destination)
+
+    def fake_dump_traceback(*, file=None, all_threads):
+        assert file is not None
+        assert all_threads is True
+        events.append("dump")
+        file.write("synthetic all-thread stack\\n")
+
+    def fake_mark_exited(*_args, **_kwargs):
+        events.append("mark_exited")
+
+    def fake_exit(*_args, **_kwargs):
+        events.append("hard_exit")
+
+    with (
+        patch("gateway.shutdown_watchdog.os.open", side_effect=fail_directory_open),
+        patch("gateway.shutdown_watchdog.os.fsync", side_effect=fail_directory_fsync),
+        patch("gateway.shutdown_watchdog.os.close", side_effect=fail_directory_close),
+        patch("gateway.shutdown_watchdog.os.replace", side_effect=record_replace),
+        patch(
+            "gateway.shutdown_watchdog.faulthandler.dump_traceback",
+            side_effect=fake_dump_traceback,
+        ),
+        patch(
+            "gateway.lifecycle_ledger.mark_exited", side_effect=fake_mark_exited
+        ),
+        patch("gateway.shutdown_watchdog.os._exit", side_effect=fake_exit),
+        patch("gateway.shutdown_watchdog.logger.warning") as warning,
+    ):
+        handle = start_loop_liveness_watchdog(
+            loop, probe_interval=0.01, probe_timeout=0.01, max_strikes=1
+        )
+        assert handle is not None
+        handle.join(timeout=2.0)
+
+    assert not handle.is_alive()
+    assert events == ["dump", "replace", "mark_exited", "hard_exit"]
+    assert target.is_file()
+    assert "synthetic all-thread stack" in target.read_text(encoding="utf-8")
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+    warning.assert_called_once_with(
+        "Gateway loop liveness watchdog durable dump failed; "
+        "continuing forced recovery."
+    )
+    assert raw_failure not in str(warning.call_args)
+    assert str(target) not in str(warning.call_args)
+
+
+def test_loop_liveness_watchdog_stop_during_dump_disarms_hard_exit(
+    tmp_path, monkeypatch
+):
     loop = MagicMock(spec=asyncio.AbstractEventLoop)
     handle_ready = threading.Event()
     handle_ref = {}
     exit_codes = []
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
     def stop_during_dump(*_args, **_kwargs) -> None:
         assert handle_ready.wait(timeout=2.0)
@@ -49,8 +458,43 @@ def test_loop_liveness_watchdog_stop_during_dump_disarms_hard_exit():
 
     assert not handle.is_alive()
     critical.assert_called_once()
-    dump.assert_called_once_with(all_threads=True)
+    dump.assert_called_once()
+    assert dump.call_args.kwargs["all_threads"] is True
+    assert dump.call_args.kwargs["file"] is not None
+    assert (tmp_path / "logs" / "gateway-loop-liveness-watchdog.log").is_file()
     assert exit_codes == []
+
+
+def test_loop_liveness_watchdog_stop_before_dump_disarms_dump_and_hard_exit(
+    tmp_path, monkeypatch
+):
+    """A disarm in the final-strike window must not create evidence or exit."""
+    loop = MagicMock(spec=asyncio.AbstractEventLoop)
+    handle_ready = threading.Event()
+    handle_ref = {}
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    def stop_before_dump(*_args, **_kwargs) -> None:
+        assert handle_ready.wait(timeout=2.0)
+        handle_ref["handle"].stop()
+
+    with (
+        patch("gateway.shutdown_watchdog.logger.critical", side_effect=stop_before_dump),
+        patch("gateway.shutdown_watchdog.faulthandler.dump_traceback") as dump,
+        patch("gateway.shutdown_watchdog.os._exit") as hard_exit,
+    ):
+        handle = start_loop_liveness_watchdog(
+            loop, probe_interval=0.01, probe_timeout=0.01, max_strikes=1
+        )
+        assert handle is not None
+        handle_ref["handle"] = handle
+        handle_ready.set()
+        handle.join(timeout=2.0)
+
+    assert not handle.is_alive()
+    dump.assert_not_called()
+    hard_exit.assert_not_called()
+    assert not (tmp_path / "logs" / "gateway-loop-liveness-watchdog.log").exists()
 
 
 def test_loop_liveness_watchdog_stop_during_final_miss_disarms_hard_exit():

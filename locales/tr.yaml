@@ -78,6 +78,9 @@ gateway:
     switch_failed:         "Dal oluşturuldu ancak ona geçilemedi."
     branched_one:          "⑂ **{title}** dalına geçildi ({count} mesaj kopyalandı)\nOrijinal: `{parent}`\nDal: `{new}`\nOrijinale geri dönmek için `/resume` kullanın."
     branched_many:         "⑂ **{title}** dalına geçildi ({count} mesaj kopyalandı)\nOrijinal: `{parent}`\nDal: `{new}`\nOrijinale geri dönmek için `/resume` kullanın."
+    branched_one_untitled: "⑂ Branched ({count} message copied)\nOriginal: `{parent}`\nBranch: `{new}`\nUse `/resume` to switch back to the original."
+    branched_many_untitled: "⑂ Branched ({count} messages copied)\nOriginal: `{parent}`\nBranch: `{new}`\nUse `/resume` to switch back to the original."
+    title_not_set_note: "\n⚠️ Title \"{title}\" was not set: {error}"
 
   commands:
     usage:                 "Kullanım: `/commands [page]`"

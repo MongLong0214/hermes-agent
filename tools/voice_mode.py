@@ -1444,16 +1444,6 @@ def transcribe_recording(wav_path: str, model: Optional[str] = None) -> Dict[str
     return result
 
 
-def _should_chunk_for_transcription(file_path: str, max_file_size: int) -> bool:
-    """Return whether a CLI WAV recording needs to be split before STT."""
-    if not file_path.lower().endswith(".wav"):
-        return False
-    try:
-        return os.path.getsize(file_path) > max_file_size
-    except OSError:
-        return False
-
-
 def _transcribe_wav_in_chunks(
     wav_path: str,
     *,

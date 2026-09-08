@@ -15,49 +15,27 @@ import pytest
 from tools import async_delegation as ad
 
 
-class _TrackingConnection:
-    """Delegates to a real sqlite3.Connection while recording close() calls.
-
-    sqlite3.Connection is a static C type: it has no per-instance __dict__ and
-    its methods can't be monkeypatched, so open/close tracking is done via a
-    delegating wrapper returned in place of the real connection.
-    """
-
-    def __init__(self, real, closed_ids):
-        object.__setattr__(self, "_real", real)
-        object.__setattr__(self, "_closed_ids", closed_ids)
-
-    def close(self):
-        self._closed_ids.append(id(self._real))
-        self._real.close()
-
-    def __enter__(self):
-        self._real.__enter__()
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        return self._real.__exit__(exc_type, exc, tb)
-
-    def __getattr__(self, name):
-        return getattr(self._real, name)
-
-    def __setattr__(self, name, value):
-        setattr(self._real, name, value)
-
-
 def _point_ledger(monkeypatch, tmp_path):
     monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
     return ad
 
 
 def _track_connections(monkeypatch):
+    """Observe closes without discarding connect_tracked's admitted factory."""
     opened, closed = [], []
     real_connect = sqlite3.connect
 
     def tracking_connect(*args, **kwargs):
-        conn = real_connect(*args, **kwargs)
+        factory = kwargs.pop("factory", sqlite3.Connection)
+
+        class TrackingConnection(factory):
+            def close(self):
+                closed.append(id(self))
+                return super().close()
+
+        conn = real_connect(*args, factory=TrackingConnection, **kwargs)
         opened.append(id(conn))
-        return _TrackingConnection(conn, closed)
+        return conn
 
     monkeypatch.setattr(ad.sqlite3, "connect", tracking_connect)
     return opened, closed
@@ -82,25 +60,16 @@ def test_ledger_operations_close_every_connection(monkeypatch, tmp_path):
 def test_schema_init_failure_still_closes_connection(monkeypatch, tmp_path):
     """A PRAGMA/DDL failure after connect() must still close the connection."""
     _point_ledger(monkeypatch, tmp_path)
-    opened, closed = [], []
-    real_connect = sqlite3.connect
+    opened, closed = _track_connections(monkeypatch)
 
-    class _FailingSchemaConnection(_TrackingConnection):
-        def execute(self, sql, *args, **kwargs):
-            if "CREATE TABLE" in sql:
-                raise sqlite3.OperationalError("simulated schema init failure")
-            return self._real.execute(sql, *args, **kwargs)
+    def fail_schema_init(_conn):
+        raise sqlite3.OperationalError("simulated schema init failure")
 
-    def tracking_connect(*args, **kwargs):
-        conn = real_connect(*args, **kwargs)
-        opened.append(id(conn))
-        return _FailingSchemaConnection(conn, closed)
-
-    monkeypatch.setattr(ad.sqlite3, "connect", tracking_connect)
+    monkeypatch.setattr(ad, "_initialize_schema", fail_schema_init)
 
     with pytest.raises(sqlite3.OperationalError):
-        with ad._transaction():
-            pass
+        ad._connect()
 
-    assert len(opened) == 1
-    assert len(closed) == 1
+    assert opened, "expected bootstrap and ledger connections"
+    assert len(opened) == len(closed)
+    assert set(opened) == set(closed)

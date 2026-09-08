@@ -30,7 +30,6 @@ logger = logging.getLogger(__name__)
 # ANSI building blocks for conversation display
 # =========================================================================
 
-_GOLD = "\033[1;38;2;255;215;0m"  # True-color #FFD700 bold
 _BOLD = "\033[1m"
 _DIM = "\033[2m"
 _RST = "\033[0m"

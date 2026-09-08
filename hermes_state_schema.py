@@ -10,6 +10,8 @@ module-level constants live in hermes_state_common.
 
 import logging
 import json
+import re
+import secrets
 import sqlite3
 from typing import Dict, Optional
 
@@ -25,9 +27,15 @@ from hermes_state_common import (
     LEGACY_FTS_TRIGRAM_SQL,
     SCHEMA_SQL,
     SCHEMA_VERSION,
+    SESSION_PROCESS_AUTHORITY_STATE_DB_ID_BYTES,
+    SESSION_PROCESS_AUTHORITY_STATE_FAMILY,
+    TURN_FENCE_GENERATION,
+    TURN_FENCE_GOVERNED_TABLES,
+    TURN_FENCE_OPERATIONS,
     _FTS_CJK_TRIGGERS,
     _FTS_TRIGGERS,
     _ephemeral_child_sql,
+    turn_fence_trigger_definitions,
 )
 
 # Moved methods logged under the "hermes_state" logger before the split;
@@ -40,7 +48,7 @@ _READ_PROBE_STATEMENTS: Optional[tuple] = None
 
 
 def schema_read_probe_statements() -> tuple:
-    """SELECT statements that fail iff a live store is behind SCHEMA_SQL.
+    """SELECT statements that fail iff a database is behind SCHEMA_SQL.
 
     Read-only opens skip ``_reconcile_columns()`` by design (no DDL against
     another profile's live DB), so a store created before a schema addition
@@ -84,6 +92,110 @@ def schema_read_probe_statements() -> tuple:
 
 class SessionSchemaMixin:
     """See module docstring — mixin for SessionDB (Schema cluster)."""
+
+    @staticmethod
+    def _initialize_session_process_authority_state(cursor: sqlite3.Cursor) -> None:
+        """Provision and verify the durable SessionDB authority identity.
+
+        A database instance is identified by random persistent bytes instead of
+        its path so copied or moved stores cannot silently share capability
+        authority.  Existing session rows are backfilled exactly once; their
+        historical lifecycle is represented by append-only events before any
+        caller can issue a reservation from the reopened database.
+        """
+        identity_key = "session_process_state_db_id"
+        family_key = "session_process_state_family"
+        identity_row = cursor.execute(
+            "SELECT value FROM state_meta WHERE key = ?", (identity_key,)
+        ).fetchone()
+        if identity_row is None:
+            state_db_id = secrets.token_hex(SESSION_PROCESS_AUTHORITY_STATE_DB_ID_BYTES)
+            cursor.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, ?)",
+                (identity_key, state_db_id),
+            )
+        else:
+            state_db_id = identity_row[0]
+        if (
+            not isinstance(state_db_id, str)
+            or len(state_db_id) != SESSION_PROCESS_AUTHORITY_STATE_DB_ID_BYTES * 2
+            or state_db_id.lower() != state_db_id
+            or any(char not in "0123456789abcdef" for char in state_db_id)
+        ):
+            raise sqlite3.DatabaseError(
+                "STATE_DB_AUTHORITY_IDENTITY_INCOMPATIBLE: malformed state_db_id"
+            )
+
+        family_row = cursor.execute(
+            "SELECT value FROM state_meta WHERE key = ?", (family_key,)
+        ).fetchone()
+        if family_row is None:
+            cursor.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, ?)",
+                (family_key, SESSION_PROCESS_AUTHORITY_STATE_FAMILY),
+            )
+        elif family_row[0] != SESSION_PROCESS_AUTHORITY_STATE_FAMILY:
+            raise sqlite3.DatabaseError(
+                "STATE_DB_AUTHORITY_IDENTITY_INCOMPATIBLE: unknown state family"
+            )
+
+        # Rows predating the authority schema did not have a generation.  They
+        # receive their first authority epoch atomically with the schema open;
+        # a genuine reopen advances from there through the sessions trigger.
+        cursor.execute(
+            "UPDATE sessions SET session_generation = 1 "
+            "WHERE session_generation IS NULL OR session_generation < 1"
+        )
+        cursor.execute(
+            """INSERT OR IGNORE INTO session_process_authorities (
+                   session_id, session_generation, state_db_id, state_family,
+                   authority_token, status, issued_at, terminal_at
+               )
+               SELECT s.id, s.session_generation, ?, ?, lower(hex(randomblob(32))),
+                      CASE WHEN s.ended_at IS NULL THEN 'ISSUED'
+                           WHEN s.end_reason = 'authority_revoked' THEN 'REVOKED'
+                           ELSE 'CLOSED' END,
+                      s.started_at, s.ended_at
+               FROM sessions AS s""",
+            (state_db_id, SESSION_PROCESS_AUTHORITY_STATE_FAMILY),
+        )
+        cursor.execute(
+            """INSERT INTO session_process_authority_events (
+                   session_id, session_generation, state_db_id, state_family,
+                   event_type, occurred_at
+               )
+               SELECT a.session_id, a.session_generation, a.state_db_id,
+                      a.state_family, 'SESSION_ISSUED', a.issued_at
+               FROM session_process_authorities AS a
+               WHERE NOT EXISTS (
+                   SELECT 1 FROM session_process_authority_events AS e
+                   WHERE e.session_id = a.session_id
+                     AND e.session_generation = a.session_generation
+                     AND e.event_type = 'SESSION_ISSUED'
+               )"""
+        )
+        cursor.execute(
+            """INSERT INTO session_process_authority_events (
+                   session_id, session_generation, state_db_id, state_family,
+                   event_type, occurred_at
+               )
+               SELECT a.session_id, a.session_generation, a.state_db_id,
+                      a.state_family,
+                      CASE a.status WHEN 'REVOKED' THEN 'SESSION_REVOKED'
+                                    ELSE 'SESSION_CLOSED' END,
+                      a.terminal_at
+               FROM session_process_authorities AS a
+               WHERE a.status IN ('CLOSED', 'REVOKED')
+                 AND a.terminal_at IS NOT NULL
+                 AND NOT EXISTS (
+                     SELECT 1 FROM session_process_authority_events AS e
+                     WHERE e.session_id = a.session_id
+                       AND e.session_generation = a.session_generation
+                       AND e.event_type = CASE a.status
+                           WHEN 'REVOKED' THEN 'SESSION_REVOKED'
+                           ELSE 'SESSION_CLOSED' END
+                 )"""
+        )
 
     def _dedupe_legacy_system_prompts(self, cursor: sqlite3.Cursor) -> None:
         """Move inline prompt snapshots into the shared content-addressed table.
@@ -208,10 +320,15 @@ class SessionSchemaMixin:
         if not to_drop:
             return 0
 
-        for name in to_drop:
-            # Names are drawn from the update_names literal allowlist above —
-            # never user input — so the identifier is interpolation-safe.
-            cursor.execute(f"DROP TRIGGER IF EXISTS {name}")
+        # The active rebuild owner (when any) must be checked after BEGIN and
+        # before the first trigger DROP.  `_init_schema()` holds that owner
+        # across its whole FTS repair sequence; this transaction closes the
+        # gap between inspecting sqlite_master and mutating it.
+        with self.write_transaction() as repair_conn:
+            for name in to_drop:
+                # Names are drawn from the update_names literal allowlist above
+                # — never user input — so the identifier is interpolation-safe.
+                repair_conn.execute(f"DROP TRIGGER IF EXISTS {name}")
 
         # Re-apply current DDL so CREATE TRIGGER installs the OF variants.
         # Choose legacy vs v23 the same way _init_schema does.
@@ -277,14 +394,16 @@ class SessionSchemaMixin:
         """
         self._fts_cjk_available = False
         try:
-            self.set_meta(FTS_CJK_STALE_KEY, "1", cursor=cursor)
+            with self.write_transaction() as repair_conn:
+                self.set_meta(FTS_CJK_STALE_KEY, "1", cursor=repair_conn)
         except Exception:
             logger.debug(
                 "Could not persist CJK FTS stale breadcrumb",
                 exc_info=True,
             )
         try:
-            cursor.execute("DROP TRIGGER IF EXISTS messages_fts_cjk_update")
+            with self.write_transaction() as repair_conn:
+                repair_conn.execute("DROP TRIGGER IF EXISTS messages_fts_cjk_update")
         except Exception:
             logger.debug(
                 "Could not drop residual CJK UPDATE trigger after quarantine",
@@ -367,6 +486,12 @@ class SessionSchemaMixin:
             raise
 
     def _recover_stale_fts(self, cursor: sqlite3.Cursor, *, legacy: bool) -> bool:
+        with self.offline_rebuild(reason="recover stale FTS"):
+            return self._recover_stale_fts_owned(cursor, legacy=legacy)
+
+    def _recover_stale_fts_owned(
+        self, cursor: sqlite3.Cursor, *, legacy: bool
+    ) -> bool:
         """Atomically rebuild stale base/trigram indexes and resume syncing."""
         foreign_holders = self._foreign_state_db_holders()
         if foreign_holders:
@@ -435,23 +560,19 @@ class SessionSchemaMixin:
         # One write transaction closes the dangerous gap: no canonical writer
         # can slip between the full rebuild and trigger restoration.
         recovery_sql = (
-            "BEGIN IMMEDIATE;"
-            + drop_sql
+            drop_sql
             + rebuild_sql
             + f"DELETE FROM state_meta WHERE key = '{FTS_STALE_KEY}';"
-            + "COMMIT;"
         )
         try:
-            cursor.executescript(recovery_sql)
+            self._execute_fts_schema_script(cursor, recovery_sql)
         except sqlite3.DatabaseError as exc:
-            try:
-                self._conn.rollback()
-            except sqlite3.Error:
-                pass
             # Stale indexes must remain detached even on SQLite builds whose
             # DDL transaction behavior differs.
-            self._drop_all_fts_triggers(cursor)
-            self._conn.commit()
+            self._execute_write(
+                lambda conn: self._drop_all_fts_triggers(conn),
+                _count_write=False,
+            )
             logger.error(
                 "Automatic rebuild of stale FTS indexes failed (%s); "
                 "canonical writes remain enabled with FTS detached.",
@@ -819,7 +940,468 @@ class SessionSchemaMixin:
         finally:
             cursor.execute("PRAGMA foreign_keys=ON")
 
+    def _session_turn_lease_epoch_rebuild_checkpoint(self, stage: str) -> None:
+        """Test seam for deterministic rollback probes of the legacy rebuild."""
+        del stage
+
+    def _heal_session_turn_leases_legacy_epoch(self, cursor: sqlite3.Cursor) -> None:
+        """Remove the legacy ``epoch`` column from ``session_turn_leases``.
+
+        Legacy ``session_turn_leases`` tables can carry ``epoch INTEGER NOT
+        NULL`` with no ``DEFAULT`` alongside nullable ``owner_pid`` and
+        ``owner_pid_start`` fields.  The acquisition ``INSERT OR IGNORE``
+        does not populate ``epoch``, so SQLite rejects the row and ``OR
+        IGNORE`` suppresses the NOT NULL violation.  No lease row is created,
+        the following owner lookup finds no row, and acquisition returns
+        False.
+
+        No version-gated migration covers this table, so a database can report
+        ``schema_version == SCHEMA_VERSION`` while retaining the legacy table
+        shape.  The heal therefore runs unconditionally on every open, like
+        :meth:`_heal_gateway_routing_pk` and
+        :meth:`_heal_session_model_usage_pk` above.
+
+        ``owner_pid`` and ``owner_pid_start`` are deliberately preserved.
+        They are nullable and do not cause the rejected insert; removing them
+        would add DDL surface without repairing the legacy failure shape.
+        """
+        try:
+            rows = cursor.execute(
+                'PRAGMA table_info("session_turn_leases")'
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return
+        if not rows:
+            # Table doesn't exist yet -- SCHEMA_SQL above just created it
+            # correctly (4 columns, no epoch).
+            return
+
+        def _col(row, idx, name):
+            return row[idx] if isinstance(row, (tuple, list)) else row[name]
+
+        live_cols = {_col(r, 1, "name") for r in rows}
+        if "epoch" not in live_cols:
+            return  # Already the shape hermes_state_common.py declares.
+
+        # DDL is authorized only for the complete legacy failure shape.  A
+        # same-named epoch column can be a later extension with a valid
+        # default, different primary key, or otherwise unknown ownership; do
+        # not destructively reinterpret it as the one historical defect.
+        proven_legacy_descriptor = (
+            ("conversation_id", "TEXT", 0, None, 1),
+            ("holder", "TEXT", 1, None, 0),
+            ("acquired_at", "REAL", 1, None, 0),
+            ("expires_at", "REAL", 1, None, 0),
+            ("epoch", "INTEGER", 1, None, 0),
+            ("owner_pid", "INTEGER", 0, None, 0),
+            ("owner_pid_start", "REAL", 0, None, 0),
+        )
+        live_descriptor = tuple(
+            (
+                _col(row, 1, "name"),
+                _col(row, 2, "type"),
+                _col(row, 3, "notnull"),
+                _col(row, 4, "dflt_value"),
+                _col(row, 5, "pk"),
+            )
+            for row in rows
+        )
+        proven_legacy_table_sql = (
+            "CREATE TABLE session_turn_leases ( "
+            "conversation_id TEXT PRIMARY KEY, holder TEXT NOT NULL, "
+            "acquired_at REAL NOT NULL, expires_at REAL NOT NULL, "
+            "epoch INTEGER NOT NULL, owner_pid INTEGER, owner_pid_start REAL )"
+        )
+        table_row = cursor.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            ("session_turn_leases",),
+        ).fetchone()
+        table_sql = _col(table_row, 0, "sql") if table_row is not None else None
+        if (
+            live_descriptor != proven_legacy_descriptor
+            or not isinstance(table_sql, str)
+            or " ".join(table_sql.split()) != proven_legacy_table_sql
+        ):
+            raise sqlite3.DatabaseError(
+                "SESSION_TURN_LEASE_EPOCH_HEAL_REFUSED: "
+                "session_turn_leases does not match the proven legacy descriptor"
+            )
+
+        logger.info(
+            "session_turn_leases has legacy NOT NULL 'epoch' column with no "
+            "DEFAULT; every acquire has been silently failing on this "
+            "store (INSERT OR IGNORE swallows the NOT NULL violation). "
+            "Dropping the column."
+        )
+
+        if sqlite3.sqlite_version_info >= (3, 35, 0):
+            # DROP COLUMN (SQLite >= 3.35, released 2021-03-12; the
+            # interpreter this repo runs under is 3.50.4) is an in-place
+            # schema edit: unlike a rename+rebuild it does not touch the
+            # table's identity, so the three turn-fence triggers already
+            # attached to session_turn_leases (it is in
+            # TURN_FENCE_GOVERNED_TABLES) are untouched -- nothing to
+            # reinstall, nothing to verify, no schema_version bookkeeping
+            # to disturb. None of those triggers' bodies reference `epoch`
+            # (turn_fence_trigger_sql() only ever calls
+            # hermes_turn_fence_generation(), see hermes_state_common.py),
+            # so SQLite's "column used by a trigger/view" restriction on
+            # DROP COLUMN does not apply here -- verified empirically
+            # (governed table with all three triggers attached, DROP
+            # COLUMN succeeds and the triggers keep firing) before this
+            # was written; see tests/state/test_session_turn_lease_epoch_heal.py.
+            def _epoch_is_still_present() -> bool:
+                return any(
+                    _col(row, 1, "name") == "epoch"
+                    for row in cursor.execute(
+                        'PRAGMA table_info("session_turn_leases")'
+                    ).fetchall()
+                )
+
+            try:
+                cursor.execute(
+                    'ALTER TABLE "session_turn_leases" DROP COLUMN "epoch"'
+                )
+            except sqlite3.OperationalError as exc:
+                # Lock/busy failures must reach the outer open-time patience
+                # loop unchanged.  A real DDL blocker is a durable unsafe
+                # state: refuse the open rather than logging and continuing.
+                if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+                    raise
+                if _epoch_is_still_present():
+                    raise sqlite3.DatabaseError(
+                        "SESSION_TURN_LEASE_EPOCH_HEAL_DROP_FAILED: "
+                        "SQLite could not remove legacy session_turn_leases.epoch"
+                    ) from exc
+                raise
+            if _epoch_is_still_present():
+                raise sqlite3.DatabaseError(
+                    "SESSION_TURN_LEASE_EPOCH_HEAL_INCOMPLETE: "
+                    "session_turn_leases.epoch remains after DROP COLUMN"
+                )
+            return
+
+        # SQLite < 3.35 lacks DROP COLUMN.  The preflight snapshot itself is
+        # destructive authority: a connection that adds an object after an
+        # unlocked census but before RENAME would have that object carried to
+        # the legacy table then deleted without replay.  Take the write lock
+        # first, then authoritatively revalidate the descriptor, table DDL,
+        # and every replayable/dependent schema object before any mutation.
+        projection = (
+            "conversation_id, holder, acquired_at, expires_at, "
+            "owner_pid, owner_pid_start"
+        )
+        owns_transaction = not self._conn.in_transaction
+        if owns_transaction:
+            cursor.execute("BEGIN IMMEDIATE")
+        try:
+            rows = cursor.execute(
+                'PRAGMA table_info("session_turn_leases")'
+            ).fetchall()
+            live_cols = {_col(r, 1, "name") for r in rows}
+            if "epoch" not in live_cols:
+                # Another writer completed the repair before this transaction
+                # acquired its lock.  We made no mutation, so commit the
+                # empty transaction and leave the converged table alone.
+                if owns_transaction:
+                    self._conn.commit()
+                return
+            live_descriptor = tuple(
+                (
+                    _col(row, 1, "name"),
+                    _col(row, 2, "type"),
+                    _col(row, 3, "notnull"),
+                    _col(row, 4, "dflt_value"),
+                    _col(row, 5, "pk"),
+                )
+                for row in rows
+            )
+            table_row = cursor.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                ("session_turn_leases",),
+            ).fetchone()
+            table_sql = _col(table_row, 0, "sql") if table_row is not None else None
+            if (
+                live_descriptor != proven_legacy_descriptor
+                or not isinstance(table_sql, str)
+                or " ".join(table_sql.split()) != proven_legacy_table_sql
+            ):
+                raise sqlite3.DatabaseError(
+                    "SESSION_TURN_LEASE_EPOCH_HEAL_REFUSED: "
+                    "session_turn_leases does not match the proven legacy descriptor"
+                )
+
+            fence_definitions = tuple(
+                (name, sql)
+                for name, sql in turn_fence_trigger_definitions()
+                if name.startswith("turn_fence_session_turn_leases_")
+            )
+            expected_fences = dict(fence_definitions)
+            object_rows = cursor.execute(
+                "SELECT type, name, sql FROM sqlite_master "
+                "WHERE tbl_name = ? AND type IN ('index', 'trigger') "
+                "AND sql IS NOT NULL ORDER BY type, name",
+                ("session_turn_leases",),
+            ).fetchall()
+            preserved_indexes = []
+            preserved_triggers = []
+            for row in object_rows:
+                object_type = _col(row, 0, "type")
+                name = _col(row, 1, "name")
+                sql = _col(row, 2, "sql")
+                if not isinstance(name, str) or not isinstance(sql, str):
+                    raise sqlite3.DatabaseError(
+                        "SESSION_TURN_LEASE_EPOCH_REBUILD_REFUSED: "
+                        "session_turn_leases has an unprovable schema object"
+                    )
+                if name in expected_fences:
+                    if object_type != "trigger" or sql != expected_fences[name]:
+                        raise sqlite3.DatabaseError(
+                            "SESSION_TURN_LEASE_EPOCH_REBUILD_REFUSED: "
+                            "turn-fence object is not the canonical declaration"
+                        )
+                    continue
+                if "epoch" in sql.lower():
+                    raise sqlite3.DatabaseError(
+                        "SESSION_TURN_LEASE_EPOCH_REBUILD_REFUSED: "
+                        "session_turn_leases schema object depends on epoch"
+                    )
+                if object_type == "index":
+                    preserved_indexes.append((name, sql))
+                elif object_type == "trigger":
+                    preserved_triggers.append((name, sql))
+                else:
+                    raise sqlite3.DatabaseError(
+                        "SESSION_TURN_LEASE_EPOCH_REBUILD_REFUSED: "
+                        "session_turn_leases has an unsupported schema object"
+                    )
+
+            mentions_lease_table = re.compile(
+                r"(?<![0-9A-Za-z_$])session_turn_leases(?![0-9A-Za-z_$])",
+                re.IGNORECASE,
+            )
+            dependent_rows = cursor.execute(
+                "SELECT type, name, sql FROM sqlite_master "
+                "WHERE type IN ('view', 'trigger') AND tbl_name != ? "
+                "ORDER BY type, name",
+                ("session_turn_leases",),
+            ).fetchall()
+            for row in dependent_rows:
+                object_type = _col(row, 0, "type")
+                name = _col(row, 1, "name")
+                sql = _col(row, 2, "sql")
+                if not isinstance(name, str) or not isinstance(sql, str):
+                    raise sqlite3.DatabaseError(
+                        "SESSION_TURN_LEASE_EPOCH_REBUILD_REFUSED: "
+                        "session_turn_leases has an unprovable dependent object"
+                    )
+                if mentions_lease_table.search(sql):
+                    raise sqlite3.DatabaseError(
+                        "SESSION_TURN_LEASE_EPOCH_REBUILD_REFUSED: "
+                        "session_turn_leases has an unprovable dependent object"
+                    )
+
+            table_names = cursor.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name != ?",
+                ("session_turn_leases",),
+            ).fetchall()
+            for table_name_row in table_names:
+                table_name = _col(table_name_row, 0, "name")
+                if not isinstance(table_name, str):
+                    raise sqlite3.DatabaseError(
+                        "SESSION_TURN_LEASE_EPOCH_REBUILD_REFUSED: "
+                        "session_turn_leases has an unprovable dependent object"
+                    )
+                escaped_table_name = table_name.replace('"', '""')
+                foreign_keys = cursor.execute(
+                    f'PRAGMA foreign_key_list("{escaped_table_name}")'
+                ).fetchall()
+                if any(
+                    isinstance(_col(foreign_key, 2, "table"), str)
+                    and _col(foreign_key, 2, "table").casefold()
+                    == "session_turn_leases"
+                    for foreign_key in foreign_keys
+                ):
+                    raise sqlite3.DatabaseError(
+                        "SESSION_TURN_LEASE_EPOCH_REBUILD_REFUSED: "
+                        "session_turn_leases has an unprovable dependent object"
+                    )
+
+            cursor.execute(
+                'ALTER TABLE "session_turn_leases" '
+                'RENAME TO "session_turn_leases_legacy_epoch"'
+            )
+            self._session_turn_lease_epoch_rebuild_checkpoint("rename")
+            cursor.execute(
+                """CREATE TABLE session_turn_leases (
+    conversation_id TEXT PRIMARY KEY,
+    holder TEXT NOT NULL,
+    acquired_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    owner_pid INTEGER,
+    owner_pid_start REAL
+)"""
+            )
+            self._session_turn_lease_epoch_rebuild_checkpoint("create")
+            source_rows = [
+                tuple(row)
+                for row in cursor.execute(
+                    f"SELECT {projection} FROM session_turn_leases_legacy_epoch "
+                    "ORDER BY rowid"
+                ).fetchall()
+            ]
+            source_count = cursor.execute(
+                "SELECT COUNT(*) FROM session_turn_leases_legacy_epoch"
+            ).fetchone()[0]
+            cursor.execute(
+                "INSERT INTO session_turn_leases "
+                f"({projection}) SELECT {projection} "
+                "FROM session_turn_leases_legacy_epoch ORDER BY rowid"
+            )
+            self._session_turn_lease_epoch_rebuild_checkpoint("copy")
+            target_rows = [
+                tuple(row)
+                for row in cursor.execute(
+                    f"SELECT {projection} FROM session_turn_leases ORDER BY rowid"
+                ).fetchall()
+            ]
+            target_count = cursor.execute(
+                "SELECT COUNT(*) FROM session_turn_leases"
+            ).fetchone()[0]
+            if (
+                source_count != target_count
+                or len(source_rows) != source_count
+                or target_rows != source_rows
+            ):
+                raise sqlite3.DatabaseError(
+                    "SESSION_TURN_LEASE_EPOCH_REBUILD_VERIFY_FAILED: "
+                    "session_turn_leases copy did not preserve every row"
+                )
+            self._session_turn_lease_epoch_rebuild_checkpoint("verify")
+            cursor.execute("DROP TABLE session_turn_leases_legacy_epoch")
+            self._session_turn_lease_epoch_rebuild_checkpoint("drop")
+            for _name, sql in preserved_indexes:
+                cursor.execute(sql)
+            self._session_turn_lease_epoch_rebuild_checkpoint("index")
+            for _name, sql in preserved_triggers:
+                cursor.execute(sql)
+            for _name, sql in fence_definitions:
+                cursor.execute(sql)
+            actual_fences = {
+                _col(row, 0, "name"): _col(row, 1, "sql")
+                for row in cursor.execute(
+                    "SELECT name, sql FROM sqlite_master "
+                    "WHERE type = 'trigger' AND name IN (?, ?, ?)",
+                    tuple(expected_fences),
+                ).fetchall()
+            }
+            if actual_fences != expected_fences:
+                raise sqlite3.DatabaseError(
+                    "SESSION_TURN_LEASE_EPOCH_REBUILD_VERIFY_FAILED: "
+                    "session_turn_leases turn-fence triggers were not restored"
+                )
+            self._session_turn_lease_epoch_rebuild_checkpoint("trigger")
+            if owns_transaction:
+                self._conn.commit()
+        except BaseException:
+            if owns_transaction:
+                self._conn.rollback()
+            raise
+
+    def _apply_turn_fence_generation_delta(self, cursor: sqlite3.Cursor) -> None:
+        """Atomically install and verify the complete v27 trigger barrier."""
+        definitions = turn_fence_trigger_definitions()
+        if len(definitions) != (
+            len(TURN_FENCE_GOVERNED_TABLES) * len(TURN_FENCE_OPERATIONS)
+        ):
+            raise RuntimeError("turn-fence trigger declaration is incomplete")
+        expected = dict(definitions)
+        with self.write_transaction():
+            for name, _sql in definitions:
+                cursor.execute(f"DROP TRIGGER IF EXISTS {name}")
+            for _name, sql in definitions:
+                cursor.execute(sql)
+            placeholders = ", ".join("?" for _name in expected)
+            rows = cursor.execute(
+                "SELECT name, sql FROM sqlite_master "
+                f"WHERE type = 'trigger' AND name IN ({placeholders})",
+                tuple(expected),
+            ).fetchall()
+            if {row[0]: row[1] for row in rows} != expected:
+                raise RuntimeError("turn-fence trigger verification failed")
+            cursor.execute("DELETE FROM schema_version")
+            cursor.execute(
+                "INSERT INTO schema_version (version) VALUES (?)",
+                (SCHEMA_VERSION,),
+            )
+
     def _init_schema(self):
+        """Run writable startup schema work under guarded transactions."""
+        conn = self._conn
+        foreign_keys_enabled = bool(
+            conn.execute("PRAGMA foreign_keys").fetchone()[0]
+        )
+        if foreign_keys_enabled:
+            # The legacy session_model_usage shape may contain orphaned rows;
+            # its established healer needs this disabled for the in-transaction
+            # copy.  Restore the connection policy after the schema boundary.
+            conn.execute("PRAGMA foreign_keys=OFF")
+        primary_exc = None
+        try:
+            # The modern DROP COLUMN path has a deliberately short deferred
+            # boundary: a competing writer can still prove a real lock race
+            # at the DDL itself, while the marker is compared after BEGIN.
+            # The full initialization transaction below then covers every
+            # remaining schema, reconciliation, migration, and FTS mutation.
+            with self.write_transaction(immediate=False):
+                self._assert_forward_schema_migration_admission()
+                self._heal_session_turn_leases_legacy_epoch(conn.cursor())
+            with self.write_transaction():
+                self._assert_forward_schema_migration_admission()
+                self._init_schema_mutations()
+        except BaseException as exc:
+            primary_exc = exc
+            raise
+        finally:
+            # A failed guarded transaction can retire its physical connection
+            # after rollback.  Do not mask that body error by restoring a
+            # pragma on the closed handle.  If a live handle cannot prove the
+            # old policy was restored, retire it rather than leave a reusable
+            # connection with foreign keys disabled.
+            if foreign_keys_enabled and self._conn is conn:
+                try:
+                    conn.execute("PRAGMA foreign_keys=ON")
+                except BaseException as restore_exc:
+                    self._conn = None
+                    close_exc = None
+                    try:
+                        conn.close()
+                    except BaseException as exc:
+                        close_exc = exc
+                    if primary_exc is None:
+                        if close_exc is not None:
+                            try:
+                                restore_exc.add_note(
+                                    f"connection retirement failed: {close_exc}"
+                                )
+                            except Exception:
+                                pass
+                        raise
+                    try:
+                        primary_exc.add_note(
+                            f"foreign-key policy restoration failed: {restore_exc}"
+                        )
+                        if close_exc is not None:
+                            primary_exc.add_note(
+                                f"connection retirement failed: {close_exc}"
+                            )
+                    except Exception:
+                        pass
+                    if primary_exc.__cause__ is None:
+                        raise primary_exc from restore_exc
+
+    def _init_schema_mutations(self):
         """Create tables and FTS if they don't exist, reconcile columns.
 
         Schema management follows the declarative reconciliation pattern
@@ -834,7 +1416,8 @@ class SessionSchemaMixin:
         """
         cursor = self._conn.cursor()
 
-        cursor.executescript(SCHEMA_SQL)
+        for statement in self._split_fts_schema_script(SCHEMA_SQL):
+            cursor.execute(statement)
 
         # ── Declarative column reconciliation ──────────────────────────
         # Diff live tables against SCHEMA_SQL and ADD any missing columns.
@@ -842,6 +1425,28 @@ class SessionSchemaMixin:
         # migration was skipped (e.g. due to version renumbering), the
         # column gets created here.
         self._reconcile_columns(cursor)
+
+        # The v28 trigger barrier must replace a retained older-generation
+        # barrier before any data migration or initialization writes a governed
+        # table.  Keep the entry version for the legacy data-migration gates
+        # below: _apply_turn_fence_generation_delta() publishes v28 eagerly.
+        initial_version_row = cursor.execute(
+            "SELECT version FROM schema_version LIMIT 1"
+        ).fetchone()
+        if initial_version_row is None:
+            current_version = 0
+        else:
+            current_version = (
+                initial_version_row["version"]
+                if isinstance(initial_version_row, sqlite3.Row)
+                else initial_version_row[0]
+            )
+        if current_version < SCHEMA_VERSION:
+            self._apply_turn_fence_generation_delta(cursor)
+
+        # The identity must exist before a raw SQL writer can insert a session
+        # and fire the authority issuance trigger declared in SCHEMA_SQL.
+        self._initialize_session_process_authority_state(cursor)
 
         # Rebuild gateway_routing if it still carries the pre-scope PRIMARY
         # KEY (session_key alone). ADD COLUMN cannot fix a PK, so this is
@@ -853,6 +1458,11 @@ class SessionSchemaMixin:
         # landed — the version-gated rebuild is unreachable there, #73823).
         # Same PK-rebuild constraint as gateway_routing above.
         self._heal_session_model_usage_pk(cursor)
+
+        # Remove the legacy NOT NULL/no-DEFAULT `epoch` column from
+        # session_turn_leases if present. No version-gated migration covers
+        # this table, so the heal runs unconditionally like the two above.
+        self._heal_session_turn_leases_legacy_epoch(cursor)
 
         # Indexes that reference reconciler-added columns must be created
         # AFTER _reconcile_columns runs — declaring them in SCHEMA_SQL
@@ -869,7 +1479,8 @@ class SessionSchemaMixin:
 
         # Deferred indexes that reference the reconciler-added ``active``
         # column (idx_messages_session_active) — same ordering constraint.
-        cursor.executescript(DEFERRED_INDEX_SQL)
+        for statement in self._split_fts_schema_script(DEFERRED_INDEX_SQL):
+            cursor.execute(statement)
 
         # Heal NULL ``active`` rows unconditionally on every startup.
         # On real-world DBs the reconciler-added ``active`` column can lack
@@ -897,27 +1508,23 @@ class SessionSchemaMixin:
         if self._fts_stale:
             # A prior process deliberately detached FTS after corruption.
             # Keep every FTS writer detached until a full rebuild succeeds.
-            self._drop_all_fts_triggers(cursor)
+            with self.offline_rebuild(reason="detach stale FTS triggers"):
+                with self.write_transaction() as repair_conn:
+                    self._drop_all_fts_triggers(repair_conn)
         if not fts5_available:
             # Existing FTS triggers can still fire on messages INSERT/UPDATE
             # even though the current sqlite runtime cannot read the virtual
             # tables they target. Drop only the triggers so core persistence
             # continues; if a future runtime has FTS5, _ensure_fts_schema()
             # recreates them.
-            self._drop_fts_triggers(cursor)
+            with self.offline_rebuild(reason="detach unavailable FTS triggers"):
+                with self.write_transaction() as repair_conn:
+                    self._drop_fts_triggers(repair_conn)
 
         # ── Schema version bookkeeping ─────────────────────────────────
-        # Bump to current so future data migrations (if any) can gate on
-        # version.  No version-gated column additions remain.
-        cursor.execute("SELECT version FROM schema_version LIMIT 1")
-        row = cursor.fetchone()
-        if row is None:
-            cursor.execute(
-                "INSERT INTO schema_version (version) VALUES (?)",
-                (SCHEMA_VERSION,),
-            )
-        else:
-            current_version = row["version"] if isinstance(row, sqlite3.Row) else row[0]
+        # The entry version was captured before the v28 fence publication so
+        # legacy data migrations keep their established gates.
+        if initial_version_row is not None:
             # Data migrations that can't be expressed declaratively (row
             # backfills, index changes tied to a specific version step) stay
             # in a version-gated chain. Column additions are handled by
@@ -1182,13 +1789,14 @@ class SessionSchemaMixin:
             # is the one case we skip (we can't have created the current FTS
             # objects, so claiming the current schema would be a lie).
             if (
-                current_version < SCHEMA_VERSION
+                current_version < TURN_FENCE_GENERATION - 1
                 and fts_migrations_complete
                 and fts5_available
             ):
                 cursor.execute(
-                    "UPDATE schema_version SET version = ?",
-                    (SCHEMA_VERSION,),
+                    "UPDATE schema_version SET version = "
+                    "CASE WHEN version < ? THEN ? ELSE version END",
+                    (TURN_FENCE_GENERATION - 1, TURN_FENCE_GENERATION - 1),
                 )
 
         # Unique title index — always ensure it exists. Older databases may
@@ -1228,76 +1836,82 @@ class SessionSchemaMixin:
             pass  # Index already exists
 
         if fts5_available:
-            # FTS5 setup. Run the DDL even when the virtual table exists so
-            # CREATE TRIGGER IF NOT EXISTS repairs trigger-only degradation from
-            # an earlier no-FTS5 runtime.
-            #
-            # OPT-IN v23 boundary: a legacy v22 install (inline-content FTS,
-            # not yet opted into `hermes db optimize`) must keep its EXISTING
-            # inline schema + triggers. Running the v23 external-content DDL
-            # here would create the trigram source VIEW and leave the DB in a
-            # mixed inline/external state. So for a legacy DB we only ensure
-            # its inline triggers exist (via the legacy DDL), and skip the
-            # v23 view/external tables entirely. Fresh installs and opted-in
-            # DBs have no legacy inline FTS, so they get the v23 DDL.
-            legacy_fts = self._db_has_legacy_inline_fts(cursor)
-            if self._fts_stale:
-                if self._recover_stale_fts(cursor, legacy=legacy_fts):
-                    # CJK was detached alongside the corrupt base indexes and
-                    # has its own stale marker. Its existing ensure path keeps
-                    # it offline until its dedicated rebuild.
-                    self._ensure_fts_cjk_schema(cursor)
+            # Keep one durable owner across setup and any later raw repair.
+            # The nested ensure helpers deliberately retain their standalone
+            # ownership contract, but their temporary claims must not leave a
+            # gap before `_init_schema()` rebuilds indexes or replaces broad
+            # triggers below.
+            with self.offline_rebuild(reason="initialize FTS schema"):
+                # FTS5 setup. Run the DDL even when the virtual table exists so
+                # CREATE TRIGGER IF NOT EXISTS repairs trigger-only degradation from
+                # an earlier no-FTS5 runtime.
+                #
+                # OPT-IN v23 boundary: a legacy v22 install (inline-content FTS,
+                # not yet opted into `hermes db optimize`) must keep its EXISTING
+                # inline schema + triggers. Running the v23 external-content DDL
+                # here would create the trigram source VIEW and leave the DB in a
+                # mixed inline/external state. So for a legacy DB we only ensure
+                # its inline triggers exist (via the legacy DDL), and skip the
+                # v23 view/external tables entirely. Fresh installs and opted-in
+                # DBs have no legacy inline FTS, so they get the v23 DDL.
+                legacy_fts = self._db_has_legacy_inline_fts(cursor)
+                if self._fts_stale:
+                    if self._recover_stale_fts(cursor, legacy=legacy_fts):
+                        # CJK was detached alongside the corrupt base indexes and
+                        # has its own stale marker. Its existing ensure path keeps
+                        # it offline until its dedicated rebuild.
+                        self._ensure_fts_cjk_schema(cursor)
+                    else:
+                        self._fts_enabled = False
+                        self._trigram_available = False
+                        self._fts_cjk_available = False
+                elif legacy_fts:
+                    triggers_need_repair = (
+                        self._fts_trigger_count(cursor) < len(_FTS_TRIGGERS)
+                    )
+                    self._fts_enabled = self._ensure_fts_schema(
+                        cursor, "messages_fts", LEGACY_FTS_SQL
+                    )
+                    if self._fts_enabled:
+                        trigram_enabled = self._ensure_fts_schema(
+                            cursor, "messages_fts_trigram", LEGACY_FTS_TRIGRAM_SQL
+                        )
+                        self._trigram_available = trigram_enabled
+                        if triggers_need_repair:
+                            with self.write_transaction() as repair_conn:
+                                self._rebuild_legacy_fts_indexes(
+                                    repair_conn, include_trigram=trigram_enabled
+                                )
                 else:
-                    self._fts_enabled = False
-                    self._trigram_available = False
-                    self._fts_cjk_available = False
-            elif legacy_fts:
-                triggers_need_repair = (
-                    self._fts_trigger_count(cursor) < len(_FTS_TRIGGERS)
-                )
-                self._fts_enabled = self._ensure_fts_schema(
-                    cursor, "messages_fts", LEGACY_FTS_SQL
-                )
-                if self._fts_enabled:
-                    trigram_enabled = self._ensure_fts_schema(
-                        cursor, "messages_fts_trigram", LEGACY_FTS_TRIGRAM_SQL
+                    triggers_need_repair = (
+                        self._fts_trigger_count(cursor) < len(_FTS_TRIGGERS)
                     )
-                    self._trigram_available = trigram_enabled
-                    if triggers_need_repair:
-                        self._rebuild_legacy_fts_indexes(
-                            cursor, include_trigram=trigram_enabled
-                        )
-            else:
-                triggers_need_repair = (
-                    self._fts_trigger_count(cursor) < len(_FTS_TRIGGERS)
-                )
-                self._fts_enabled = self._ensure_fts_schema(
-                    cursor, "messages_fts", FTS_SQL
-                )
-
-                # Trigram FTS5 for CJK/substring search. This is optional
-                # relative to the main FTS table; if it cannot be created,
-                # CJK search falls back to LIKE.
-                if self._fts_enabled:
-                    trigram_enabled = self._ensure_fts_schema(
-                        cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
+                    self._fts_enabled = self._ensure_fts_schema(
+                        cursor, "messages_fts", FTS_SQL
                     )
-                    self._trigram_available = trigram_enabled
-                    if triggers_need_repair:
-                        self._rebuild_fts_indexes(
-                            cursor,
-                            include_trigram=trigram_enabled,
+
+                    # Trigram FTS5 for CJK/substring search. This is optional
+                    # relative to the main FTS table; if it cannot be created,
+                    # CJK search falls back to LIKE.
+                    if self._fts_enabled:
+                        trigram_enabled = self._ensure_fts_schema(
+                            cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
                         )
-                    # CJK-bigram index (cjk_unicode61). Strictly additive to
-                    # the surfaces above and gated on the loadable tokenizer:
-                    self._ensure_fts_cjk_schema(cursor)
+                        self._trigram_available = trigram_enabled
+                        if triggers_need_repair:
+                            with self.write_transaction() as repair_conn:
+                                self._rebuild_fts_indexes(
+                                    repair_conn,
+                                    include_trigram=trigram_enabled,
+                                )
+                        # CJK-bigram index (cjk_unicode61). Strictly additive to
+                        # the surfaces above and gated on the loadable tokenizer:
+                        self._ensure_fts_cjk_schema(cursor)
 
-            # Replace any pre-existing broad AFTER UPDATE triggers with
-            # AFTER UPDATE OF variants. IF NOT EXISTS cannot rewrite them.
-            if getattr(self, "_fts_enabled", False):
-                self._migrate_broad_fts_update_triggers(cursor)
-
-        self._conn.commit()
+                # Replace any pre-existing broad AFTER UPDATE triggers with
+                # AFTER UPDATE OF variants. IF NOT EXISTS cannot rewrite them.
+                if getattr(self, "_fts_enabled", False):
+                    self._migrate_broad_fts_update_triggers(cursor)
 
     def _backfill_gateway_metadata_from_sessions_json(
         self, cursor: sqlite3.Cursor

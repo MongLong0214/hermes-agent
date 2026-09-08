@@ -22,6 +22,7 @@ import pytest
 
 from cron import scheduler as sched
 from cron.scheduler import (
+    _CRON_DELIVERY_FAILURE,
     _deliver_result,
     _get_home_target_chat_id,
     _get_home_target_thread_id,
@@ -173,4 +174,4 @@ class TestRelayDeliveryGate:
         config.get_home_channel = lambda p: None
         result = self._run({}, config)
         assert result is not None
-        assert "not configured/enabled" in result
+        assert result == _CRON_DELIVERY_FAILURE

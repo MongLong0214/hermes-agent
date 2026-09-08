@@ -21,10 +21,12 @@ import errno
 import hashlib
 import json
 import logging
+import math
 import os
 import queue
 import random
 import re
+import secrets
 import sqlite3
 import sys
 import threading
@@ -32,6 +34,7 @@ import time
 import weakref
 from collections import deque
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 from agent.memory_manager import sanitize_context
@@ -84,11 +87,16 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     MAX_FTS5_QUERY_CHARS,
     SCHEMA_SQL,
     SCHEMA_VERSION,
+    SESSION_PROCESS_AUTHORITY_MAX_RESERVATION_TTL_SECONDS,
+    SESSION_PROCESS_AUTHORITY_RESERVATION_TTL_SECONDS,
+    SESSION_PROCESS_AUTHORITY_STATE_FAMILY,
+    TURN_FENCE_GENERATION,
     _PREVIEW_CONTENT_SQL,
     _PREVIEW_HEAD_CHARS,
     _PREVIEW_MAX_CHARS,
     _PREVIEW_SCAFFOLD_WINDOW,
     _PREVIEW_SCAFFOLDED_SQL,
+    register_turn_fence_generation,
 )
 from hermes_state_portability import SessionPortabilityMixin
 from hermes_state_schema import SessionSchemaMixin
@@ -172,6 +180,83 @@ class SessionExportTooLargeError(ValueError):
             f"session '{session_id}' has at least {message_count} active messages; "
             f"safe in-memory export limit is {limit}"
         )
+
+
+class IncompatibleSchemaError(RuntimeError):
+    """The on-disk session state cannot be safely opened by this version."""
+
+    __slots__ = (
+        "actual_generation",
+        "build_identity",
+        "code",
+        "expected_generation",
+    )
+
+    def __init__(
+        self,
+        *,
+        expected_generation: Optional[int] = None,
+        actual_generation: Optional[int] = None,
+    ):
+        self.expected_generation = expected_generation
+        self.actual_generation = actual_generation
+        self.build_identity = _state_schema_build_identity()
+        if expected_generation is None or actual_generation is None:
+            message = "Session state is incompatible with this Hermes version."
+        else:
+            message = (
+                "Session state schema is newer than this Hermes build "
+                f"(expected generation {expected_generation}, "
+                f"actual generation {actual_generation}, "
+                f"build identity {_format_state_schema_build_identity(self.build_identity)})."
+            )
+        super().__init__(message)
+        self.code = "STATE_DB_SCHEMA_INCOMPATIBLE"
+
+
+class ForwardSchemaMigrationAdmissionError(RuntimeError):
+    """A live canonical runtime owns a DB that needs a forward migration."""
+
+    __slots__ = (
+        "actual_generation",
+        "build_identity",
+        "code",
+        "expected_generation",
+    )
+
+    def __init__(self, *, expected_generation: int, actual_generation: int):
+        self.expected_generation = expected_generation
+        self.actual_generation = actual_generation
+        self.build_identity = _state_schema_build_identity()
+        super().__init__(
+            "Refusing forward state-schema migration while the canonical Hermes "
+            "runtime lock is active "
+            f"(expected generation {expected_generation}, "
+            f"actual generation {actual_generation}, "
+            f"build identity {_format_state_schema_build_identity(self.build_identity)})."
+        )
+        self.code = "STATE_DB_FORWARD_MIGRATION_ADMISSION_BLOCKED"
+
+
+def _state_schema_build_identity() -> dict[str, str]:
+    """Return support-safe build identity without exposing checkout locations."""
+    try:
+        from hermes_cli.build_info import get_code_identity
+
+        identity = get_code_identity()
+        version = identity.get("version")
+        short_sha = identity.get("short_sha")
+    except Exception:
+        version = None
+        short_sha = None
+    return {
+        "version": str(version) if version else "unknown",
+        "short_sha": str(short_sha) if short_sha else "unknown",
+    }
+
+
+def _format_state_schema_build_identity(identity: dict[str, str]) -> str:
+    return f"version={identity['version']}, sha={identity['short_sha']}"
 
 
 _COMPRESSION_LOCK_HOLDER_PID_RE = re.compile(r"(?:^|:)pid=(\d+)(?::|$)")
@@ -344,6 +429,7 @@ def _delete_delegate_children(conn, parent_ids: List[str]) -> List[str]:
     ids = _collect_delegate_child_ids(conn, parent_ids)
     if ids:
         ph = ",".join("?" * len(ids))
+        _retire_terminal_turn_receipts(conn, ids)
         conn.execute(f"DELETE FROM messages WHERE session_id IN ({ph})", ids)
         # FK safety: orphan any untagged stragglers pointing at a doomed row.
         conn.execute(
@@ -353,6 +439,29 @@ def _delete_delegate_children(conn, parent_ids: List[str]) -> List[str]:
         )
         conn.execute(f"DELETE FROM sessions WHERE id IN ({ph})", ids)
     return ids
+
+
+def _retire_terminal_turn_receipts(
+    conn, session_ids: List[str], *, active_only: bool = False
+) -> None:
+    """Retire receipts whose terminal rows are about to be deleted.
+
+    Older state databases retain the original ``RESTRICT`` terminal-message
+    foreign key, so this explicit lifecycle step is needed alongside the
+    current-schema cascade.  The caller already owns the transcript write
+    transaction, making receipt retirement and message deletion atomic.
+    """
+    ids = [session_id for session_id in session_ids if session_id]
+    if not ids:
+        return
+    placeholders = ",".join("?" * len(ids))
+    active_clause = " AND active = 1" if active_only else ""
+    conn.execute(
+        "DELETE FROM turn_receipts WHERE terminal_message_id IN ("
+        f"SELECT id FROM messages WHERE session_id IN ({placeholders})"
+        f"{active_clause})",
+        ids,
+    )
 
 T = TypeVar("T")
 
@@ -1071,11 +1180,121 @@ class WalUnsupportedError(sqlite3.OperationalError):
     """
 
 
+@contextmanager
+def _same_connection_raw_maintenance_fence(
+    conn: sqlite3.Connection,
+    *,
+    assert_authority: Callable[[], None],
+):
+    """Keep real SQLite exclusion from authority proof through raw maintenance.
+
+    ``BEGIN IMMEDIATE`` is a sufficient write fence for ordinary DML, but
+    SQLite forbids a transaction around ``VACUUM`` and may reject checkpoint
+    or journal-mode pragmas in one.  On SQLite 3.50.4, exclusive locking mode
+    plus a completed ``BEGIN EXCLUSIVE`` keeps the same connection's writer
+    exclusion after that transaction ends, including in WAL mode.  The
+    authority read therefore cannot be followed by another connection's
+    ``BEGIN IMMEDIATE``/marker commit before the raw operation.
+
+    The normal-mode transaction in ``finally`` releases that exclusion after
+    the raw operation in both WAL and DELETE mode.  A journal-mode switch is
+    the exception: SQLite retains its lock after a successful switch to WAL,
+    so SessionDB replaces its disposable initialization connection afterward.
+    """
+    if conn.in_transaction:
+        raise sqlite3.ProgrammingError(
+            "raw SQLite maintenance fence requires an autocommit connection"
+        )
+
+    try:
+        mode = conn.execute("PRAGMA locking_mode=EXCLUSIVE").fetchone()
+        if mode is None or str(mode[0]).strip().lower() != "exclusive":
+            raise sqlite3.OperationalError(
+                "could not request exclusive SQLite maintenance locking mode"
+            )
+        conn.execute("BEGIN EXCLUSIVE")
+        conn.execute("COMMIT")
+    except BaseException as acquire_exc:
+        if conn.in_transaction:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+        try:
+            conn.execute("PRAGMA locking_mode=NORMAL")
+        except BaseException as reset_exc:
+            try:
+                acquire_exc.add_note(
+                    f"raw SQLite maintenance lock reset failed: {reset_exc}"
+                )
+            except Exception:
+                pass
+        raise
+
+    primary_exc: Optional[BaseException] = None
+    try:
+        assert_authority()
+        yield
+    except BaseException as exc:
+        primary_exc = exc
+        raise
+    finally:
+        if conn.in_transaction:
+            try:
+                conn.execute("ROLLBACK")
+            except BaseException as rollback_exc:
+                if primary_exc is not None:
+                    try:
+                        primary_exc.add_note(
+                            f"raw SQLite maintenance rollback failed: {rollback_exc}"
+                        )
+                    except Exception:
+                        pass
+                else:
+                    raise
+        try:
+            conn.execute("PRAGMA locking_mode=NORMAL")
+            # SQLite 3.50.4 does not relinquish the exclusive lock merely
+            # because the PRAGMA reports NORMAL. A completed normal-mode
+            # transaction is the bounded release point in both DELETE and
+            # WAL; it is deliberately AFTER the raw operation, not wrapped
+            # around it.
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("COMMIT")
+        except BaseException as release_exc:
+            if primary_exc is not None:
+                try:
+                    primary_exc.add_note(
+                        f"raw SQLite maintenance lock release failed: {release_exc}"
+                    )
+                except Exception:
+                    pass
+            else:
+                raise
+
+
+def _run_journal_mode_change(
+    conn: sqlite3.Connection,
+    sql: str,
+    *,
+    before_journal_mode_change: Optional[Callable[[], None]],
+) -> Any:
+    """Run one setting journal-mode pragma under the shared authority fence."""
+    if before_journal_mode_change is None:
+        return conn.execute(sql).fetchone()
+    with _same_connection_raw_maintenance_fence(
+        conn,
+        assert_authority=before_journal_mode_change,
+    ):
+        return conn.execute(sql).fetchone()
+
+
 def apply_wal_with_fallback(
     conn: sqlite3.Connection,
     *,
     db_label: str = "state.db",
     require_wal: bool = False,
+    before_journal_mode_change: Optional[Callable[[], None]] = None,
 ) -> str:
     """Set ``journal_mode=WAL`` on ``conn``, falling back to DELETE on failure.
 
@@ -1119,7 +1338,11 @@ def apply_wal_with_fallback(
     on the same NFS mount.
 
     Shared by :class:`SessionDB` and ``hermes_cli.kanban_db.connect`` so
-    both databases get identical fallback behavior.
+    both databases get identical fallback behavior. A public ``state.db``
+    caller passes ``before_journal_mode_change`` to prove durable
+    offline-rebuild authority on this exact connection immediately before
+    SQLite is allowed to switch modes. Other databases deliberately leave it
+    unset: their journal policy does not share state.db's marker.
 
     Never downgrades to DELETE if the on-disk DB header reports WAL — see
     _on_disk_journal_mode.  That holds for both the NFS path and the
@@ -1136,6 +1359,7 @@ def apply_wal_with_fallback(
             conn,
             db_label=db_label,
             require_delete=configured == "delete",
+            before_journal_mode_change=before_journal_mode_change,
         )
 
     # Read-only probe — no flock, no checkpoint, no WAL/SHM unlink.
@@ -1163,7 +1387,11 @@ def apply_wal_with_fallback(
                 "concurrent openers); refusing to downgrade a database "
                 "this process does not exclusively own"
             )
-        actual = _set_journal_mode_no_wait(conn, "DELETE")
+        actual = _set_journal_mode_no_wait(
+            conn,
+            "DELETE",
+            before_journal_mode_change=before_journal_mode_change,
+        )
         if actual != "delete":
             raise sqlite3.OperationalError(
                 f"could not set configured journal_mode=delete (got {actual or 'no result'})"
@@ -1180,7 +1408,11 @@ def apply_wal_with_fallback(
         # returned row, not the mere absence of an exception; otherwise we
         # report a false ``"wal"`` AND skip the fallback WARNING, leaving the
         # DB silently in DELETE (reader-blocks-writer) with no signal.
-        row = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+        row = _run_journal_mode_change(
+            conn,
+            "PRAGMA journal_mode=WAL",
+            before_journal_mode_change=before_journal_mode_change,
+        )
         mode = str(row[0]).strip().lower() if row and row[0] is not None else ""
         if mode == "wal":
             _apply_wal_size_limit(conn)
@@ -1220,7 +1452,11 @@ def apply_wal_with_fallback(
             for _ in range(2):
                 time.sleep(0.05)
                 try:
-                    row = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+                    row = _run_journal_mode_change(
+                        conn,
+                        "PRAGMA journal_mode=WAL",
+                        before_journal_mode_change=before_journal_mode_change,
+                    )
                 except sqlite3.OperationalError as retry_exc:
                     if "disk i/o error" not in str(retry_exc).lower():
                         raise
@@ -1247,11 +1483,20 @@ def apply_wal_with_fallback(
             # Caller mandates WAL — fail loudly instead of degrading to DELETE.
             raise WalUnsupportedError(str(exc)) from exc
         _log_wal_fallback_once(db_label, exc)
-        _set_journal_mode_no_wait(conn, "DELETE")
+        _set_journal_mode_no_wait(
+            conn,
+            "DELETE",
+            before_journal_mode_change=before_journal_mode_change,
+        )
         return "delete"
 
 
-def _set_journal_mode_no_wait(conn: sqlite3.Connection, mode: str) -> str:
+def _set_journal_mode_no_wait(
+    conn: sqlite3.Connection,
+    mode: str,
+    *,
+    before_journal_mode_change: Optional[Callable[[], None]] = None,
+) -> str:
     """Execute ``PRAGMA journal_mode=<mode>`` without waiting on other openers.
 
     This is the ONLY place a journal-mode switch pragma may be issued for a
@@ -1278,7 +1523,11 @@ def _set_journal_mode_no_wait(conn: sqlite3.Connection, mode: str) -> str:
         previous_timeout = 0
     conn.execute("PRAGMA busy_timeout=0")
     try:
-        row = conn.execute(f"PRAGMA journal_mode={mode}").fetchone()
+        row = _run_journal_mode_change(
+            conn,
+            f"PRAGMA journal_mode={mode}",
+            before_journal_mode_change=before_journal_mode_change,
+        )
         return str(row[0]).strip().lower() if row and row[0] is not None else ""
     finally:
         try:
@@ -1292,6 +1541,7 @@ def _apply_delete_for_wal_reset_bug(
     *,
     db_label: str,
     require_delete: bool = False,
+    before_journal_mode_change: Optional[Callable[[], None]] = None,
 ) -> str:
     """Avoid enabling WAL when the linked SQLite has the WAL-reset bug.
 
@@ -1333,7 +1583,11 @@ def _apply_delete_for_wal_reset_bug(
 
     actual = ""
     try:
-        actual = _set_journal_mode_no_wait(conn, "DELETE")
+        actual = _set_journal_mode_no_wait(
+            conn,
+            "DELETE",
+            before_journal_mode_change=before_journal_mode_change,
+        )
     except sqlite3.OperationalError as exc:
         if require_delete:
             raise
@@ -1573,6 +1827,151 @@ def is_malformed_schema_error(exc: BaseException) -> bool:
     if not isinstance(exc, sqlite3.DatabaseError):
         return False
     return any(marker in str(exc).lower() for marker in _MALFORMED_SCHEMA_MARKERS)
+
+
+def _validate_schema_version_scalar(conn: sqlite3.Connection) -> int:
+    """Validate the one canonical, SQLite-typed schema-version scalar."""
+    rows = conn.execute(
+        "SELECT version, typeof(version) FROM schema_version"
+    ).fetchall()
+    if len(rows) != 1:
+        raise IncompatibleSchemaError()
+    version, value_type = rows[0]
+    if (
+        value_type == "integer"
+        and type(version) is int
+        and version > SCHEMA_VERSION
+    ):
+        raise IncompatibleSchemaError(
+            expected_generation=SCHEMA_VERSION,
+            actual_generation=version,
+        )
+    if (
+        value_type != "integer"
+        or type(version) is not int
+        or version < 0
+        or version > (2**63 - 1)
+    ):
+        raise IncompatibleSchemaError()
+    return version
+
+
+def _validate_connection_schema(
+    conn: sqlite3.Connection, *, allow_uninitialized_schema: bool = False
+) -> Optional[int]:
+    """SELECT-only compatibility check for a package-owned connection."""
+    try:
+        has_schema_version = conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'schema_version'"
+        ).fetchone() is not None
+        if not has_schema_version:
+            if not allow_uninitialized_schema:
+                raise IncompatibleSchemaError()
+            version = None
+        else:
+            version = _validate_schema_version_scalar(conn)
+        generation, generation_type = conn.execute(
+            "SELECT hermes_turn_fence_generation(), "
+            "typeof(hermes_turn_fence_generation())"
+        ).fetchone()
+    except IncompatibleSchemaError:
+        raise
+    except sqlite3.DatabaseError:
+        raise IncompatibleSchemaError() from None
+    if (
+        generation_type != "integer"
+        or type(generation) is not int
+        or generation != TURN_FENCE_GENERATION
+    ):
+        raise IncompatibleSchemaError()
+    return version
+
+
+def _probe_existing_state_db_schema(
+    db_path: Path, *, allow_malformed_repair: bool
+) -> Optional[int]:
+    """Read and validate an existing DB before any package write path opens it."""
+    def probe() -> int:
+        conn = sqlite3.connect(
+            f"file:{db_path}?mode=ro",
+            uri=True,
+            isolation_level=None,
+        )
+        try:
+            return _validate_schema_version_scalar(conn)
+        finally:
+            conn.close()
+
+    try:
+        return probe()
+    except IncompatibleSchemaError:
+        raise
+    except sqlite3.DatabaseError as exc:
+        if is_malformed_schema_error(exc):
+            # A read-only open must preserve the underlying malformed-store
+            # failure.  It never repairs the database, and its caller relies
+            # on the DatabaseError path to prove the tracked handle closed.
+            if not allow_malformed_repair:
+                raise
+        elif (
+            allow_malformed_repair
+            and isinstance(exc, sqlite3.OperationalError)
+            and "no such table: schema_version" in str(exc).lower()
+        ):
+            # A pre-versioned state store is initialized and healed below.
+            # Its tables can still carry a durable rebuild marker, which the
+            # post-open authority check fences before schema DDL runs.
+            return None
+        else:
+            raise IncompatibleSchemaError() from None
+        if not _claim_repair_attempt(db_path):
+            raise
+        report = repair_state_db_schema(db_path)
+        if not report.get("repaired"):
+            raise
+
+    try:
+        return probe()
+    except IncompatibleSchemaError:
+        raise
+    except sqlite3.DatabaseError:
+        raise IncompatibleSchemaError() from None
+
+
+def _canonical_state_db_home(db_path: Path) -> Optional[Path]:
+    """Return the immutable canonical-home snapshot for *db_path*, if any."""
+    try:
+        home = Path(get_hermes_home()).expanduser().resolve(strict=False)
+        canonical_db = (home / "state.db").resolve(strict=False)
+        candidate = Path(db_path).expanduser().resolve(strict=False)
+    except OSError:
+        return None
+    if os.path.normcase(str(candidate)) != os.path.normcase(str(canonical_db)):
+        return None
+    return home
+
+
+def _is_canonical_state_db(db_path: Path) -> bool:
+    """Whether *db_path* is the active profile's canonical ``state.db``."""
+    return _canonical_state_db_home(db_path) is not None
+
+
+def _canonical_live_state_db_has_active_gateway_runtime(db_path: Path) -> bool:
+    """Whether this exact profile's canonical state DB has a live gateway lock.
+
+    The runtime lock is OS-owned by the gateway process and is released by the
+    kernel on death. It is deliberately checked only for the profile-safe
+    ``get_hermes_home() / 'state.db'`` target: private/temp databases retain
+    their independent migration path.
+    """
+    if not _is_canonical_state_db(db_path):
+        return False
+    try:
+        from gateway.status import is_gateway_runtime_lock_active
+    except Exception as exc:
+        raise RuntimeError("canonical gateway runtime lock inspection is unavailable") from exc
+    return is_gateway_runtime_lock_active()
 
 
 # Markers that mean the host filesystem cannot accept another write. Kept as
@@ -2103,9 +2502,13 @@ def _persistent_repair_attempts_exhausted(db_path: Path) -> bool:
 
 
 def _record_repair_outcome(
-    db_path: Path, *, repaired: bool, fingerprint: "Optional[str]" = None
+    db_path: Path,
+    *,
+    repaired: bool,
+    fingerprint: "Optional[str]" = None,
+    _local_rebuild_marker: Optional[str] = None,
 ) -> None:
-    """Update the persistent attempt ledger after a repair pass. Never raises.
+    """Update the persistent attempt ledger after a repair pass.
 
     Defaults to the post-attempt fingerprint — the file state the NEXT
     attempt's exhaustion probe will observe.
@@ -2118,9 +2521,19 @@ def _record_repair_outcome(
     passes never matches.
     """
     ledger_path = _repair_ledger_path(db_path)
+    conn: Optional[sqlite3.Connection] = None
     try:
+        # The ledger is a separate file, so its publication must borrow a
+        # SQLite write lock. BEGIN IMMEDIATE prevents a marker takeover after
+        # this exact proof and before unlinking or rewriting the ledger.
+        conn = _connect_repair_durable(db_path)
+        conn.execute("BEGIN IMMEDIATE")
+        _assert_repair_state_db_write_authority(
+            conn, local_marker=_local_rebuild_marker
+        )
         if repaired:
             ledger_path.unlink(missing_ok=True)
+            conn.execute("COMMIT")
             return
         ledger = _read_repair_ledger(db_path)
         recorded = ledger.get("fingerprint")
@@ -2148,8 +2561,19 @@ def _record_repair_outcome(
             ),
             encoding="utf-8",
         )
+        conn.execute("COMMIT")
+    except SessionTurnLeaseLostError:
+        raise
     except Exception as exc:  # pragma: no cover - best effort
         logger.warning("Could not update state.db repair ledger: %s", exc)
+    finally:
+        if conn is not None:
+            if conn.in_transaction:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+            conn.close()
 
 
 def _existing_malformed_backups(db_path: Path) -> "List[Path]":
@@ -2505,8 +2929,46 @@ def _connect_repair_durable(db_path: Path) -> sqlite3.Connection:
     schema parses again, which is the point at which the pragmas can stick.
     """
     conn = sqlite3.connect(str(db_path), isolation_level=None)
+    register_turn_fence_generation(conn)
     _reapply_durability_barriers(conn)
     return conn
+
+
+def _backup_db_file_under_repair_authority(
+    db_path: Path,
+    *,
+    local_marker: Optional[str],
+) -> "Tuple[Optional[Path], Optional[str]]":
+    """Hold repair authority on the copying connection until backup completes."""
+    conn = _connect_repair_durable(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            _assert_repair_state_db_write_authority(
+                conn, local_marker=local_marker
+            )
+            result = _backup_db_file(db_path)
+        except BaseException as exc:
+            if conn.in_transaction:
+                try:
+                    conn.execute("ROLLBACK")
+                except BaseException as rollback_exc:
+                    try:
+                        exc.add_note(
+                            f"repair backup rollback failed: {rollback_exc}"
+                        )
+                    except Exception:
+                        pass
+            raise
+        conn.execute("ROLLBACK")
+        return result
+    finally:
+        if conn.in_transaction:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+        conn.close()
 
 
 def _reapply_durability_barriers(conn: sqlite3.Connection) -> bool:
@@ -2528,7 +2990,15 @@ def _reapply_durability_barriers(conn: sqlite3.Connection) -> bool:
         return False
 
 
-def _db_opens_cleanly(db_path: Path) -> Optional[str]:
+_REPAIR_AUTHORITY_UNSET = object()
+
+
+def _db_opens_cleanly(
+    db_path: Path,
+    *,
+    write_connection: Optional[Any] = None,
+    _repair_local_marker: Any = _REPAIR_AUTHORITY_UNSET,
+) -> Optional[str]:
     """Probe a DB on a fresh connection. Returns None if healthy, else a reason.
 
     Runs the same first-statement (``PRAGMA journal_mode``) that trips the
@@ -2540,6 +3010,9 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
     past as a false "ok" (#50502).
     """
     conn = _connect_repair_durable(db_path)
+    probe_write_connection = (
+        conn if write_connection is None else write_connection
+    )
     try:
         # Best-effort tokenizer load: a DB carrying the messages_fts_cjk
         # index needs the cjk_unicode61 extension before any statement can
@@ -2620,21 +3093,26 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
         # populated DB", not corruption.
         probe_session_id = f"_hermes_fts_health_probe_{time.time_ns()}"
         try:
-            conn.execute("BEGIN IMMEDIATE")
-            conn.execute(
+            probe_write_connection.execute("BEGIN IMMEDIATE")
+            if _repair_local_marker is not _REPAIR_AUTHORITY_UNSET:
+                _assert_repair_state_db_write_authority(
+                    probe_write_connection,
+                    local_marker=_repair_local_marker,
+                )
+            probe_write_connection.execute(
                 "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
                 (probe_session_id, "_health_probe", time.time()),
             )
-            conn.execute(
+            probe_write_connection.execute(
                 "INSERT INTO messages (session_id, role, content, timestamp) "
                 "VALUES (?, ?, ?, ?)",
                 (probe_session_id, "user", "_fts_health_probe", time.time()),
             )
-            conn.execute("ROLLBACK")
+            probe_write_connection.execute("ROLLBACK")
         except sqlite3.OperationalError as exc:
             # Missing tables / FTS disabled — not the corruption class we probe.
             try:
-                conn.execute("ROLLBACK")
+                probe_write_connection.execute("ROLLBACK")
             except sqlite3.Error:
                 pass
             msg = str(exc).lower()
@@ -2647,6 +3125,12 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
                 # a tokenizer-less one self-heals by dropping the triggers.
                 return None
             return str(exc)
+        except BaseException:
+            try:
+                probe_write_connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
         return None
     except sqlite3.DatabaseError as exc:
         return str(exc)
@@ -2708,7 +3192,12 @@ def _live_writer_holds_db(db_path: Path) -> bool:
                 pass
 
 
-def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, Any]:
+def repair_state_db_schema(
+    db_path: Path,
+    *,
+    backup: bool = True,
+    _local_rebuild_marker: Optional[str] = None,
+) -> Dict[str, Any]:
     """Repair a state.db whose ``sqlite_master`` schema is malformed or whose
     FTS indexes reject writes.
 
@@ -2753,31 +3242,14 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
         report["error"] = f"{db_path} does not exist"
         return report
 
-    # Cross-restart attempt cap (#86747): the in-memory claim bounds one
-    # process, but a corruption class the strategies below cannot heal
-    # (b-tree page damage) previously re-ran the whole surgery — and took a
-    # fresh multi-hundred-MB forensic backup — on EVERY restart, forever.
-    # After _MAX_PERSISTENT_REPAIR_ATTEMPTS failures against the same
-    # damaged file, stop retrying and surface a terminal, actionable error.
-    if _persistent_repair_attempts_exhausted(db_path):
-        report["error"] = (
-            f"automatic repair has already failed "
-            f"{_MAX_PERSISTENT_REPAIR_ATTEMPTS} times on this exact file — "
-            "the corruption is beyond the schema/FTS repair strategies "
-            "(likely b-tree page damage). Manual recovery required: restore "
-            f"a backup, or salvage with `sqlite3 {db_path} \".recover\"`. "
-            f"Delete {_repair_ledger_path(db_path).name} to force another "
-            "automatic attempt."
-        )
-        logger.error("state.db repair skipped: %s", report["error"])
-        return report
-
     with _cross_process_repair_lock(db_path) as holding_lock:
         if not holding_lock:
             # Another process is still inside its critical section. It may
             # nonetheless have healed the file already (long VACUUM after a
             # successful strategy), so re-probe before reporting failure.
-            if _db_opens_cleanly(db_path) is None:
+            if _db_opens_cleanly(
+                db_path, _repair_local_marker=_local_rebuild_marker
+            ) is None:
                 report["repaired"] = True
                 report["strategy"] = "repaired_by_other_process"
                 return report
@@ -2803,7 +3275,43 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
             logger.error("state.db repair skipped: %s", report["error"])
             return report
 
-        result = _repair_state_db_schema_locked(db_path, backup=backup, report=report)
+        # A forensic backup is publication too: prove repair authority before
+        # it, and again on every later replacement connection.  In particular
+        # a malformed state_meta table is not evidence of the ordinary
+        # bootstrap/no-owner state.
+        conn = _connect_repair_durable(db_path)
+        try:
+            _assert_repair_state_db_write_authority(
+                conn, local_marker=_local_rebuild_marker
+            )
+        finally:
+            conn.close()
+
+        # Cross-restart attempt cap: the in-memory claim bounds one
+        # process, but a corruption class the strategies below cannot heal
+        # (b-tree page damage) previously re-ran the whole surgery — and took a
+        # fresh multi-hundred-MB forensic backup — on EVERY restart, forever.
+        # The authority check above must precede this accounting: a refusal is
+        # neither a repair attempt nor evidence that can spend its budget.
+        if _persistent_repair_attempts_exhausted(db_path):
+            report["error"] = (
+                f"automatic repair has already failed "
+                f"{_MAX_PERSISTENT_REPAIR_ATTEMPTS} times on this exact file — "
+                "the corruption is beyond the schema/FTS repair strategies "
+                "(likely b-tree page damage). Manual recovery required: restore "
+                f"a backup, or salvage with `sqlite3 {db_path} \".recover\"`. "
+                f"Delete {_repair_ledger_path(db_path).name} to force another "
+                "automatic attempt."
+            )
+            logger.error("state.db repair skipped: %s", report["error"])
+            return report
+
+        result = _repair_state_db_schema_locked(
+            db_path,
+            backup=backup,
+            report=report,
+            _local_rebuild_marker=_local_rebuild_marker,
+        )
         # Persist the outcome AFTER surgery, keyed on the post-attempt
         # fingerprint — that is the file state the NEXT attempt's exhaustion
         # probe will observe. Failures count toward the cross-restart cap;
@@ -2811,12 +3319,20 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
         # file re-keys the ledger and restarts the count: that keeps a
         # genuinely NEW corruption event from inheriting a stale budget,
         # while the backup dedupe/cap above bounds the disk cost either way.)
-        _record_repair_outcome(db_path, repaired=bool(result.get("repaired")))
+        _record_repair_outcome(
+            db_path,
+            repaired=bool(result.get("repaired")),
+            _local_rebuild_marker=_local_rebuild_marker,
+        )
         return result
 
 
 def _repair_state_db_schema_locked(
-    db_path: Path, *, backup: bool, report: Dict[str, Any]
+    db_path: Path,
+    *,
+    backup: bool,
+    report: Dict[str, Any],
+    _local_rebuild_marker: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Repair strategies for :func:`repair_state_db_schema`.
 
@@ -2826,13 +3342,18 @@ def _repair_state_db_schema_locked(
     # repaired the file, in which case redoing the surgery would undo its
     # work on a now-healthy DB (the repair/re-corrupt cascade this lock
     # exists to break).
-    if _db_opens_cleanly(db_path) is None:
+    if _db_opens_cleanly(
+        db_path, _repair_local_marker=_local_rebuild_marker
+    ) is None:
         report["repaired"] = True
         report["strategy"] = "already_healthy"
         return report
 
     if backup:
-        bpath, backup_error = _backup_db_file(db_path)
+        bpath, backup_error = _backup_db_file_under_repair_authority(
+            db_path,
+            local_marker=_local_rebuild_marker,
+        )
         report["backup_path"] = str(bpath) if bpath else None
         if bpath is None:
             # HARD STOP (#69603): every strategy below mutates the damaged
@@ -2858,20 +3379,35 @@ def _repair_state_db_schema_locked(
             # The cjk index can only be rebuilt with its tokenizer loaded;
             # best-effort (a tokenizer-less host skips it at the probe below).
             load_fts5_cjk_extension(conn)
-            for table_name in (
-                "messages_fts", "messages_fts_trigram", "messages_fts_cjk"
-            ):
-                try:
-                    conn.execute(
-                        f"INSERT INTO {table_name}({table_name}) VALUES('rebuild')"
-                    )
-                except sqlite3.OperationalError:
-                    # Table absent (FTS disabled / trigram off / cjk not
-                    # present or tokenizer unavailable) — skip it.
-                    continue
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                _assert_repair_state_db_write_authority(
+                    conn, local_marker=_local_rebuild_marker
+                )
+                for table_name in (
+                    "messages_fts", "messages_fts_trigram", "messages_fts_cjk"
+                ):
+                    try:
+                        _assert_repair_state_db_write_authority(
+                            conn, local_marker=_local_rebuild_marker
+                        )
+                        conn.execute(
+                            f"INSERT INTO {table_name}({table_name}) VALUES('rebuild')"
+                        )
+                    except sqlite3.OperationalError:
+                        # Table absent (FTS disabled / trigram off / cjk not
+                        # present or tokenizer unavailable) — skip it.
+                        continue
+                conn.commit()
+            except BaseException:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
         finally:
             conn.close()
-        if _db_opens_cleanly(db_path) is None:
+        if _db_opens_cleanly(
+            db_path, _repair_local_marker=_local_rebuild_marker
+        ) is None:
             report["repaired"] = True
             report["strategy"] = "rebuild_fts"
             logger.warning(
@@ -2894,11 +3430,22 @@ def _repair_state_db_schema_locked(
             # REINDEX rewrites every index b-tree; take the barriers now that
             # the schema parses, in case the open-time attempt was refused.
             _reapply_durability_barriers(conn)
-            conn.execute("REINDEX")
-            conn.commit()
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                _assert_repair_state_db_write_authority(
+                    conn, local_marker=_local_rebuild_marker
+                )
+                conn.execute("REINDEX")
+                conn.commit()
+            except BaseException:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
         finally:
             conn.close()
-        if _db_opens_cleanly(db_path) is None:
+        if _db_opens_cleanly(
+            db_path, _repair_local_marker=_local_rebuild_marker
+        ) is None:
             report["repaired"] = True
             report["strategy"] = "reindex_btree"
             logger.warning(
@@ -2912,24 +3459,44 @@ def _repair_state_db_schema_locked(
     try:
         conn = _connect_repair_durable(db_path)
         try:
-            conn.execute("PRAGMA writable_schema=ON")
-            dupes = conn.execute(
-                "SELECT type, name, COUNT(*) AS c, MIN(rowid) AS keep "
-                "FROM sqlite_master GROUP BY type, name HAVING c > 1"
-            ).fetchall()
-            for type_, name, _count, keep in dupes:
-                conn.execute(
-                    "DELETE FROM sqlite_master "
-                    "WHERE type IS ? AND name IS ? AND rowid <> ?",
-                    (type_, name, keep),
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                _assert_repair_state_db_write_authority(
+                    conn, local_marker=_local_rebuild_marker
                 )
-            if dupes:
-                _bump_schema_cookie(conn)
-            conn.execute("PRAGMA writable_schema=OFF")
-            conn.commit()
+                conn.execute("PRAGMA writable_schema=ON")
+                dupes = conn.execute(
+                    "SELECT type, name, COUNT(*) AS c, MIN(rowid) AS keep "
+                    "FROM sqlite_master GROUP BY type, name HAVING c > 1"
+                ).fetchall()
+                for type_, name, _count, keep in dupes:
+                    _assert_repair_state_db_write_authority(
+                        conn, local_marker=_local_rebuild_marker
+                    )
+                    conn.execute(
+                        "DELETE FROM sqlite_master "
+                        "WHERE type IS ? AND name IS ? AND rowid <> ?",
+                        (type_, name, keep),
+                    )
+                if dupes:
+                    _assert_repair_state_db_write_authority(
+                        conn, local_marker=_local_rebuild_marker
+                    )
+                    _bump_schema_cookie(conn)
+                conn.execute("PRAGMA writable_schema=OFF")
+                conn.commit()
+            except BaseException:
+                try:
+                    conn.execute("PRAGMA writable_schema=OFF")
+                finally:
+                    if conn.in_transaction:
+                        conn.rollback()
+                raise
         finally:
             conn.close()
-        if _db_opens_cleanly(db_path) is None:
+        if _db_opens_cleanly(
+            db_path, _repair_local_marker=_local_rebuild_marker
+        ) is None:
             report["repaired"] = True
             report["strategy"] = "dedup_schema"
             logger.warning(
@@ -2944,19 +3511,47 @@ def _repair_state_db_schema_locked(
     try:
         conn = _connect_repair_durable(db_path)
         try:
-            conn.execute("PRAGMA writable_schema=ON")
-            conn.execute("DELETE FROM sqlite_master WHERE name LIKE 'messages_fts%'")
-            _bump_schema_cookie(conn)
-            conn.execute("PRAGMA writable_schema=OFF")
-            conn.commit()
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                _assert_repair_state_db_write_authority(
+                    conn, local_marker=_local_rebuild_marker
+                )
+                conn.execute("PRAGMA writable_schema=ON")
+                _assert_repair_state_db_write_authority(
+                    conn, local_marker=_local_rebuild_marker
+                )
+                conn.execute(
+                    "DELETE FROM sqlite_master WHERE name LIKE 'messages_fts%'"
+                )
+                _assert_repair_state_db_write_authority(
+                    conn, local_marker=_local_rebuild_marker
+                )
+                _bump_schema_cookie(conn)
+                conn.execute("PRAGMA writable_schema=OFF")
+                conn.commit()
+            except BaseException:
+                try:
+                    conn.execute("PRAGMA writable_schema=OFF")
+                finally:
+                    if conn.in_transaction:
+                        conn.rollback()
+                raise
             # The schema is repaired and parseable now, so the barriers can
             # finally stick — and VACUUM, which rewrites the entire file, is
             # the single most damaging operation to lose halfway.
             _reapply_durability_barriers(conn)
-            conn.execute("VACUUM")
+            with _same_connection_raw_maintenance_fence(
+                conn,
+                assert_authority=lambda: _assert_offline_rebuild_maintenance_authority(
+                    conn, local_marker=_local_rebuild_marker
+                ),
+            ):
+                conn.execute("VACUUM")
         finally:
             conn.close()
-        reason = _db_opens_cleanly(db_path)
+        reason = _db_opens_cleanly(
+            db_path, _repair_local_marker=_local_rebuild_marker
+        )
         if reason is None:
             report["repaired"] = True
             report["strategy"] = "drop_fts_rebuild"
@@ -3152,6 +3747,385 @@ class SessionTurnLeaseLostError(RuntimeError):
     """
 
 
+class TurnReceiptFenceError(RuntimeError):
+    """A terminal receipt cannot be completed by the presented claim token."""
+
+
+class TurnReceiptConflictError(RuntimeError):
+    """An existing receipt conflicts with the requested immutable binding."""
+
+
+class TargetBindReceiptFenceError(RuntimeError):
+    """A target bind receipt cannot be safely resolved from durable state."""
+
+
+class TargetBindReceiptConflictError(RuntimeError):
+    """An existing target bind identity conflicts with immutable evidence."""
+
+
+_TARGET_BIND_RECEIPT_META_PREFIX = "target_bind_receipt:"
+_TARGET_BIND_RECEIPT_SCHEMA = "hermes.target-bind-receipt"
+_TARGET_BIND_RECEIPT_DOMAIN = "hermes.target-bind"
+_TARGET_BIND_RECEIPT_VERSION = 1
+_TARGET_BIND_LINEAGE_ROOT_DIGEST_DOMAIN = b"hermes.target-bind:lineage-root\0"
+_ACP_TURN_RECEIPT_IDENTITY_SCHEMA = "hermes.acp-terminal-receipt-identity"
+_ACP_TURN_RECEIPT_IDENTITY_VERSION = 1
+_ACP_TURN_RECEIPT_ABORT_REASON = "HERMES_AGENT_RUN_EXCEPTION"
+_ACP_TURN_RECEIPT_ABORT_RECEIPT_ID_DOMAIN = "hermes.acp-terminal-abort-receipt-id"
+_ACP_TURN_RECEIPT_ABORT_EVIDENCE_DOMAIN = "hermes.acp-terminal-abort-evidence"
+_ACP_TURN_RECEIPT_IDENTITY_FIELDS = frozenset(
+    {
+        "schema",
+        "version",
+        "turnRequestId",
+        "targetActorId",
+        "promptDigest",
+        "bindingGeneration",
+        "targetBindingId",
+        "targetAttestationId",
+        "executorSessionId",
+        "executorSessionIncarnation",
+    }
+)
+
+
+@dataclass(frozen=True)
+class TerminalTurnReceipt:
+    """The immutable outcome that must commit with one explicit batch row."""
+
+    session_id: str
+    turn_request_id: str
+    binding_digest: str
+    claim_token: str
+    response_digest: str
+    terminal_message_index: int
+
+    def __post_init__(self) -> None:
+        if not all(
+            isinstance(value, str) and value
+            for value in (
+                self.session_id,
+                self.turn_request_id,
+                self.binding_digest,
+                self.claim_token,
+                self.response_digest,
+            )
+        ):
+            raise ValueError(
+                "terminal turn receipt requires session, request, binding digest, "
+                "claim token, and response digest"
+            )
+        if (
+            not isinstance(self.terminal_message_index, int)
+            or isinstance(self.terminal_message_index, bool)
+            or self.terminal_message_index < 0
+        ):
+            raise ValueError("terminal turn receipt requires a nonnegative row index")
+
+
+_OFFLINE_REBUILD_EPOCH_KEY = "_hermes_offline_rebuild_epoch_v1"
+
+
+def _assert_offline_rebuild_write_authority(
+    conn: sqlite3.Connection,
+    local_marker: Optional[str],
+    *,
+    require_metadata_table: bool = False,
+) -> None:
+    """Refuse writes unless the durable rebuild claim matches this owner."""
+    try:
+        state_meta_object = conn.execute(
+            "SELECT type FROM sqlite_master WHERE name = 'state_meta'"
+        ).fetchone()
+        if state_meta_object is not None and state_meta_object[0] != "table":
+            raise SessionTurnLeaseLostError(
+                "refusing write without provable offline rebuild authority"
+            )
+        rows = conn.execute(
+            "SELECT value FROM state_meta WHERE key = ?",
+            (_OFFLINE_REBUILD_EPOCH_KEY,),
+        ).fetchall()
+    except sqlite3.OperationalError as exc:
+        # Bootstrap and pre-versioned stores have no metadata table yet.
+        # Every other failure, including a malformed readable table, must
+        # stop the pending write rather than being mistaken for absence.
+        if "no such table: state_meta" in str(exc).lower():
+            if local_marker is None and not require_metadata_table:
+                return
+            if require_metadata_table:
+                raise SessionTurnLeaseLostError(
+                    "refusing write without provable offline rebuild authority"
+                ) from exc
+            raise SessionTurnLeaseLostError(
+                "refusing write while an offline rebuild owns this database"
+            ) from exc
+        raise SessionTurnLeaseLostError(
+            "refusing write without provable offline rebuild authority"
+        ) from exc
+    except sqlite3.Error as exc:
+        raise SessionTurnLeaseLostError(
+            "refusing write without provable offline rebuild authority"
+        ) from exc
+    if not rows:
+        if local_marker is None:
+            return
+        raise SessionTurnLeaseLostError(
+            "refusing write while an offline rebuild owns this database"
+        )
+    if len(rows) != 1:
+        raise SessionTurnLeaseLostError(
+            "refusing write without provable offline rebuild authority"
+        )
+    row = rows[0]
+    value = row["value"] if isinstance(row, sqlite3.Row) else row[0]
+    if local_marker is not None and local_marker == value:
+        return
+    raise SessionTurnLeaseLostError(
+        "refusing write while an offline rebuild owns this database"
+    )
+
+
+def _is_minimal_legacy_state_db_without_metadata(conn: sqlite3.Connection) -> bool:
+    """Whether ``conn`` has only the pre-``state_meta`` repair tables."""
+    try:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+            if not str(row[0]).startswith("sqlite_")
+        }
+    except sqlite3.Error:
+        return False
+    return tables == {"sessions", "messages"}
+
+
+def _assert_repair_state_db_write_authority(
+    conn: sqlite3.Connection, *, local_marker: Optional[str]
+) -> None:
+    """Prove repair authority even when another schema row is malformed.
+
+    A duplicate FTS definition prevents SQLite from parsing *any* ordinary
+    statement, including the metadata SELECT.  ``writable_schema`` lets this
+    one connection read state_meta without repairing it; the fallback is
+    deliberately read-only apart from that connection-local pragma.  A
+    damaged state_meta shape/value still cannot establish no-owner authority
+    and is fenced.
+    """
+    require_metadata_table = not _is_minimal_legacy_state_db_without_metadata(conn)
+    try:
+        _assert_offline_rebuild_write_authority(
+            conn,
+            local_marker,
+            require_metadata_table=require_metadata_table,
+        )
+        return
+    except SessionTurnLeaseLostError as exc:
+        cause = exc.__cause__
+        if not (
+            isinstance(cause, sqlite3.DatabaseError)
+            and is_malformed_schema_error(cause)
+        ):
+            raise
+    except Exception as exc:
+        raise SessionTurnLeaseLostError(
+            "refusing schema repair without provable offline rebuild authority"
+        ) from exc
+
+    try:
+        conn.execute("PRAGMA writable_schema=ON")
+        _assert_offline_rebuild_write_authority(
+            conn,
+            local_marker,
+            require_metadata_table=True,
+        )
+    except SessionTurnLeaseLostError:
+        raise
+    except Exception as exc:
+        raise SessionTurnLeaseLostError(
+            "refusing schema repair without provable offline rebuild authority"
+        ) from exc
+    finally:
+        try:
+            conn.execute("PRAGMA writable_schema=OFF")
+        except sqlite3.Error:
+            pass
+
+
+def _assert_offline_rebuild_maintenance_authority(
+    conn: sqlite3.Connection, *, local_marker: Optional[str]
+) -> None:
+    """Refuse raw maintenance while a durable rebuild claim governs this DB."""
+    _assert_offline_rebuild_write_authority(conn, local_marker)
+    if local_marker is not None:
+        raise SessionTurnLeaseLostError(
+            "refusing raw SQLite maintenance while an offline rebuild owns this database"
+        )
+
+
+class _SerializedCursor(sqlite3.Cursor):
+    """Cursor whose every SQLite entry runs under the connection's RLock.
+
+    See :class:`_SerializedConnectionMixin` for why this exists. Fetches are
+    wrapped too, not just execute: ``fetchone``/``fetchall`` step the VM and
+    build row objects while HOLDING the GIL, which takes the connection mutex
+    — exactly the GIL-held-mutex-wait leg of the deadlock.
+    """
+
+    def _serial(self):
+        return self.connection._hermes_serial_lock
+
+    def execute(self, *args, **kwargs):
+        with self._serial():
+            return super().execute(*args, **kwargs)
+
+    def executemany(self, *args, **kwargs):
+        with self._serial():
+            return super().executemany(*args, **kwargs)
+
+    def executescript(self, *args, **kwargs):
+        with self._serial():
+            return super().executescript(*args, **kwargs)
+
+    def fetchone(self):
+        with self._serial():
+            return super().fetchone()
+
+    def fetchmany(self, *args, **kwargs):
+        with self._serial():
+            return super().fetchmany(*args, **kwargs)
+
+    def fetchall(self):
+        with self._serial():
+            return super().fetchall()
+
+    def __next__(self):
+        with self._serial():
+            return super().__next__()
+
+    def close(self):
+        with self._serial():
+            return super().close()
+
+
+class _SerializedConnectionMixin:
+    """Serialize every SQLite entry on one connection behind an RLock.
+
+    2026-08-25: the gateway froze solid for 80+ minutes in a textbook ABBA
+    deadlock (thread sample in the incident record). The two legs:
+
+    - thread A inside ``sqlite3_step`` (connection mutex HELD, GIL released)
+      hit a turn-fence trigger, whose ``hermes_turn_fence_generation()`` UDF
+      re-enters Python and must WAIT for the GIL;
+    - thread B HOLDING the GIL called into the same shared connection
+      (``check_same_thread=False``) — cursor-description/bind/fetch paths keep
+      the GIL while taking the connection mutex — and blocked on the mutex A
+      holds.
+
+    Neither can proceed; the whole process (event loop included) stops. The
+    same unsynchronized sharing also segfaults outright under load (repro in
+    the incident record exits SIGSEGV without this lock).
+
+    The fix: at most one thread inside SQLite per connection, enforced here at
+    the connection-factory choke point rather than at call sites — 70+ call
+    sites touch ``self._conn`` and at least one (``clear_session_activity_
+    labels``) provably bypassed the writer lock. Waiting on THIS RLock releases
+    the GIL, so the UDF thread can always finish its callback and release the
+    connection mutex: the cycle cannot form, per-connection locks are
+    sufficient, and the turn-fence semantics stay exactly as shipped.
+
+    ``interrupt()`` is deliberately NOT wrapped: it exists to cancel another
+    thread's in-flight statement, so serializing it behind the very statement
+    it should cancel would defeat it (sqlite3_interrupt is safe without the
+    mutex by design).
+    """
+
+    def __init__(self, *args, **kwargs):
+        self._hermes_serial_lock = threading.RLock()
+        super().__init__(*args, **kwargs)
+
+    def cursor(self, factory=None):
+        with self._hermes_serial_lock:
+            return super().cursor(factory or _SerializedCursor)
+
+    # execute/executemany/executescript are implemented HERE in Python, routed
+    # through self.cursor(), instead of delegating to the C shortcuts: on
+    # Python 3.11 the C implementations build a PLAIN Cursor directly (they do
+    # not call the overridden cursor()), so ``conn.execute(...).fetchall()``
+    # would fetch on an unserialized cursor — the exact GIL-held mutex wait
+    # this mixin exists to prevent. Verified empirically: 3.9 routes through
+    # cursor(), 3.11 does not.
+
+    def execute(self, *args, **kwargs):
+        with self._hermes_serial_lock:
+            return self.cursor().execute(*args, **kwargs)
+
+    def executemany(self, *args, **kwargs):
+        with self._hermes_serial_lock:
+            return self.cursor().executemany(*args, **kwargs)
+
+    def executescript(self, *args, **kwargs):
+        with self._hermes_serial_lock:
+            return self.cursor().executescript(*args, **kwargs)
+
+    def commit(self):
+        with self._hermes_serial_lock:
+            return super().commit()
+
+    def rollback(self):
+        with self._hermes_serial_lock:
+            return super().rollback()
+
+    def close(self):
+        with self._hermes_serial_lock:
+            return super().close()
+
+    def __exit__(self, *exc_info):
+        # ``with conn:`` commits/rolls back on exit — an SQLite entry.
+        with self._hermes_serial_lock:
+            return super().__exit__(*exc_info)
+
+    def create_function(self, *args, **kwargs):
+        with self._hermes_serial_lock:
+            return super().create_function(*args, **kwargs)
+
+    def create_collation(self, *args, **kwargs):
+        with self._hermes_serial_lock:
+            return super().create_collation(*args, **kwargs)
+
+    def create_aggregate(self, *args, **kwargs):
+        with self._hermes_serial_lock:
+            return super().create_aggregate(*args, **kwargs)
+
+    def backup(self, *args, **kwargs):
+        with self._hermes_serial_lock:
+            return super().backup(*args, **kwargs)
+
+
+class _SerializedConnection(_SerializedConnectionMixin, sqlite3.Connection):
+    pass
+
+
+_serialized_factory_cache: dict = {}
+
+
+def _serialized_connection_factory(factory: type) -> type:
+    """Mix serialization into *factory* (mirrors ``_tracking_factory``)."""
+    if factory is sqlite3.Connection:
+        return _SerializedConnection
+    if issubclass(factory, _SerializedConnectionMixin):
+        return factory
+    cached = _serialized_factory_cache.get(factory)
+    if cached is None:
+        cached = type(
+            f"Serialized{factory.__name__}",
+            (_SerializedConnectionMixin, factory),
+            {},
+        )
+        _serialized_factory_cache[factory] = cached
+    return cached
+
+
 def _connect_tracked_db(path, tracking_path=None, **kwargs):
     """``sqlite3.connect`` that registers the open fd for lock-safety.
 
@@ -3166,6 +4140,13 @@ def _connect_tracked_db(path, tracking_path=None, **kwargs):
     connect would disable the guard for the lifetime of that connection,
     which is precisely the failure mode this module exists to prevent.
     """
+    # Serialize every connection this package opens (see
+    # _SerializedConnectionMixin): the turn-fence UDF re-enters Python from
+    # inside sqlite3_step, and an unsynchronized shared connection turns that
+    # into a GIL/connection-mutex ABBA deadlock or a segfault.
+    kwargs["factory"] = _serialized_connection_factory(
+        kwargs.get("factory", sqlite3.Connection)
+    )
     try:
         from hermes_cli.sqlite_safe_read import connect_tracked
     except ImportError:
@@ -3646,6 +4627,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     _COMPRESSION_BUSY_WAIT_S = 5.0
     _WRITE_RETRY_MIN_S = 0.020   # 20ms
     _WRITE_RETRY_MAX_S = 0.150   # 150ms
+    _offline_rebuild_ownership_error = SessionTurnLeaseLostError
     _WRITE_RETRY_SLOW_AFTER_S = 2.0
     _WRITE_RETRY_SLOW_MIN_S = 0.250  # 250ms
     _WRITE_RETRY_SLOW_MAX_S = 1.000  # 1s
@@ -3722,13 +4704,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     def __init__(self, db_path: Path = None, read_only: bool = False):
         self.db_path = db_path or _default_db_path()
+        path_existed_before_connect = self.db_path.exists()
+        existing_schema_version: Optional[int] = None
         # Fail hard (before any connection/pragma/mkdir) if a pytest-context
         # process resolved the developer's production state.db — see the
         # live-DB test-isolation guard block near _default_db_path().
         _ensure_test_isolation(self.db_path)
         self.read_only = read_only
 
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         # Read-path split (WAL only): recall/browse queries borrow a
         # read-only connection from a bounded pool so they never queue
         # behind writer flushes on self._lock. See _read_ctx().
@@ -3802,6 +4786,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._fts_cjk_available = False
         self._fts_unavailable_warned = False
         self._conn = None
+        self._existing_schema_version: Optional[int] = None
+        self._forward_schema_migration_lease = None
+        self._offline_rebuild_marker: Optional[str] = None
+        self._offline_rebuild_depth = 0
+        self._offline_rebuild_transition = False
         # Async token accounting (see queue_token_counts). The condition
         # guards queue + writer state; it is distinct from self._lock so
         # enqueue/flush bookkeeping never contends with SQLite writes.
@@ -3822,6 +4811,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # must already exist + be initialised (callers guard on
                 # db_path.exists()); a SELECT against an empty file raises and
                 # the caller degrades per-profile.
+                if path_existed_before_connect:
+                    _probe_existing_state_db_schema(
+                        self.db_path, allow_malformed_repair=False
+                    )
                 self._conn = _connect_tracked_db(
                     f"file:{self.db_path}?mode=ro",
                     tracking_path=self.db_path,
@@ -3831,6 +4824,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     isolation_level=None,
                 )
                 self._conn.row_factory = sqlite3.Row
+                register_turn_fence_generation(self._conn)
+                _validate_connection_schema(self._conn)
                 # FTS capability flags normally come from writable schema
                 # initialisation. Probe existing virtual tables with SELECTs
                 # only so read-only search keeps its FTS and trigram paths.
@@ -3902,6 +4897,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # opaquely or risk further damage). Raise with the clear message.
                 if qpath is None and self.db_path.exists() and is_zeroed_state_db(self.db_path):
                     raise sqlite3.DatabaseError(msg)
+                if qpath is not None:
+                    path_existed_before_connect = False
+
+            if path_existed_before_connect:
+                existing_schema_version = _probe_existing_state_db_schema(
+                    self.db_path, allow_malformed_repair=True
+                )
+            self._existing_schema_version = existing_schema_version
+            # Reject a live old runtime before its successor can change journal
+            # mode, run reconciliation, or publish any migration/fence DDL.
+            self._assert_forward_schema_migration_admission()
 
             def _connect_and_init():
                 self._conn = _connect_tracked_db(
@@ -3917,12 +4923,56 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     isolation_level=None,
                 )
                 self._conn.row_factory = sqlite3.Row
-                self._wal_active = (
-                    apply_wal_with_fallback(self._conn, db_label="state.db") == "wal"
+                register_turn_fence_generation(self._conn)
+                _validate_connection_schema(
+                    self._conn,
+                    allow_uninitialized_schema=(
+                        not path_existed_before_connect
+                        or existing_schema_version is None
+                    ),
                 )
+                self._assert_offline_rebuild_write_authority(self._conn)
+                self._wal_active = (
+                    apply_wal_with_fallback(
+                        self._conn,
+                        db_label="state.db",
+                        before_journal_mode_change=lambda: self._assert_offline_rebuild_maintenance_authority(
+                            self._conn
+                        ),
+                    )
+                    == "wal"
+                )
+                if self._wal_active:
+                    # SQLite 3.50.4 retains an EXCLUSIVE lock from a
+                    # successful WAL mode change until the setting connection
+                    # closes, even after a normal-mode transaction. This
+                    # startup connection is disposable, so replace it before
+                    # it becomes SessionDB's long-lived writer.
+                    old_conn, self._conn = self._conn, None
+                    old_conn.close()
+                    self._conn = _connect_tracked_db(
+                        str(self.db_path),
+                        check_same_thread=False,
+                        timeout=1.0,
+                        isolation_level=None,
+                    )
+                    self._conn.row_factory = sqlite3.Row
+                    register_turn_fence_generation(self._conn)
+                    _validate_connection_schema(
+                        self._conn,
+                        allow_uninitialized_schema=(
+                            not path_existed_before_connect
+                            or existing_schema_version is None
+                        ),
+                    )
+                    self._assert_offline_rebuild_write_authority(self._conn)
+                    _apply_wal_size_limit(self._conn)
+                    _apply_macos_checkpoint_barrier(self._conn)
+                    _enforce_macos_synchronous_full(self._conn)
                 apply_database_pragmas(self._conn, db_label="state.db")
                 self._conn.execute("PRAGMA foreign_keys=ON")
                 self._fts_cjk_loaded = load_fts5_cjk_extension(self._conn)
+                self.migrate_turn_receipts()
                 self._init_schema()
 
             def _connect_and_init_with_lock_patience():
@@ -3963,31 +5013,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                             )
                         )
 
-            try:
-                _connect_and_init_with_lock_patience()
-            except sqlite3.DatabaseError as exc:
-                # The malformed-schema class (e.g. a duplicate sqlite_master
-                # row for messages_fts) fails on the very first statement —
-                # before _init_schema can run — so it can't be caught at the
-                # FTS-rebuild layer. Recover by repairing sqlite_master in
-                # place (backup first; canonical sessions/messages preserved),
-                # then reopen once. This is what lets Desktop/Dashboard
-                # self-heal instead of silently showing "no sessions".
-                if not is_malformed_schema_error(exc) or not _claim_repair_attempt(self.db_path):
-                    raise
-                logger.error(
-                    "state.db schema is malformed (%s) — attempting automatic "
-                    "repair (a backup copy is made first).", exc,
-                )
-                try:
-                    if self._conn is not None:
-                        self._conn.close()
-                except Exception:
-                    pass
-                report = repair_state_db_schema(self.db_path)
-                if not report.get("repaired"):
-                    raise
-                _connect_and_init_with_lock_patience()
+            _connect_and_init_with_lock_patience()
 
             # NOTE: the v23 FTS optimization is OPT-IN (`hermes db optimize`),
             # never auto-started on open. Legacy installs keep their working
@@ -3997,6 +5023,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # an unattended open. (An interrupted optimize resumes when the
             # user re-runs the command.)
             initialization_complete = True
+        except IncompatibleSchemaError as exc:
+            _set_last_init_error(f"{exc.code}: {exc}")
+            raise
         except Exception as exc:
             # Capture the cause so /resume and friends can surface WHY the
             # session DB is unavailable instead of a bare "Session database
@@ -4016,6 +5045,70 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if not initialization_complete:
                 conn, self._conn = self._conn, None
                 self._close_connection_quietly(conn)
+            self._release_forward_schema_migration_lease()
+
+    def _assert_forward_schema_migration_admission(self) -> None:
+        """Reserve the canonical runtime lock through a lower-schema migration."""
+        if getattr(self, "_forward_schema_migration_lease", None) is not None:
+            return
+        actual_generation = self._existing_schema_version
+        if (
+            self.read_only
+            or actual_generation is None
+            or actual_generation >= SCHEMA_VERSION
+        ):
+            return
+        canonical_home = _canonical_state_db_home(self.db_path)
+        if canonical_home is None:
+            return
+        try:
+            from gateway.status import (
+                _gateway_runtime_lock_path_for_home,
+                acquire_gateway_runtime_migration_lease,
+            )
+            target_lock_path = _gateway_runtime_lock_path_for_home(canonical_home)
+        except Exception as exc:
+            raise RuntimeError("canonical gateway runtime migration lease is unavailable") from exc
+
+        lease = acquire_gateway_runtime_migration_lease(target_lock_path)
+        if lease is None:
+            raise ForwardSchemaMigrationAdmissionError(
+                expected_generation=SCHEMA_VERSION,
+                actual_generation=actual_generation,
+            )
+        self._forward_schema_migration_lease = lease
+        try:
+            # The first SELECT-only observation only selects the admission
+            # branch. Re-probe while the flock is held so a lock claimant or
+            # concurrent migrator cannot make its generation stale before any
+            # writable SQLite connection, WAL transition, or DDL publication.
+            actual_generation = _probe_existing_state_db_schema(
+                self.db_path, allow_malformed_repair=True
+            )
+            self._existing_schema_version = actual_generation
+            if actual_generation is None or actual_generation >= SCHEMA_VERSION:
+                self._release_forward_schema_migration_lease()
+        except BaseException:
+            self._release_forward_schema_migration_lease()
+            raise
+
+    def _release_forward_schema_migration_lease(self) -> None:
+        lease = getattr(self, "_forward_schema_migration_lease", None)
+        self._forward_schema_migration_lease = None
+        if lease is None:
+            return
+        try:
+            from gateway.status import release_gateway_runtime_migration_lease
+
+            release_gateway_runtime_migration_lease(lease)
+        except Exception:
+            logger.exception("Could not release the canonical migration lease")
+
+    def ensure_compatible_schema(self) -> None:
+        """Recheck this open connection without repairing or mutating state."""
+        if self._conn is None:
+            raise IncompatibleSchemaError()
+        _validate_connection_schema(self._conn)
 
     # ── Read-path split ──
 
@@ -4306,6 +5399,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         )
 
     def _ensure_fts_cjk_schema(self, cursor) -> None:
+        with self.offline_rebuild(reason="ensure CJK FTS schema"):
+            self._ensure_fts_cjk_schema_owned(cursor)
+
+    def _ensure_fts_cjk_schema_owned(self, cursor) -> None:
         """Create / repair / self-heal the CJK-bigram index surface.
 
         ``cursor`` may be a Cursor or a Connection (both expose execute /
@@ -4356,18 +5453,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         "with the extension to rebuild.",
                         fts5_cjk_so_path(),
                     )
-                    cursor.execute(
-                        "INSERT INTO state_meta (key, value) VALUES (?, '1') "
-                        "ON CONFLICT(key) DO UPDATE SET value = '1'",
-                        (FTS_CJK_STALE_KEY,),
-                    )
-                    for trig in live:
-                        cursor.execute(f"DROP TRIGGER IF EXISTS {trig}")
+
+                    def detach_cjk_triggers(conn: sqlite3.Connection) -> None:
+                        conn.execute(
+                            "INSERT INTO state_meta (key, value) VALUES (?, '1') "
+                            "ON CONFLICT(key) DO UPDATE SET value = '1'",
+                            (FTS_CJK_STALE_KEY,),
+                        )
+                        for trig in live:
+                            conn.execute(f"DROP TRIGGER IF EXISTS {trig}")
+
+                    self._execute_write(detach_cjk_triggers, _count_write=False)
             self._fts_cjk_available = False
             return
 
         try:
-            cursor.executescript(FTS_CJK_TABLE_SQL)
+            self._execute_fts_schema_script(cursor, FTS_CJK_TABLE_SQL)
             if not cjk_present:
                 # Freshly created. An empty DB's index is complete by
                 # construction (triggers will cover every future row); a
@@ -4376,26 +5477,29 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # keep NEW rows indexed while old rows await the
                 # `optimize-storage` backfill. Either way any old stale
                 # breadcrumb refers to a table that no longer exists.
-                cursor.execute(
-                    "DELETE FROM state_meta WHERE key = ?",
-                    (FTS_CJK_STALE_KEY,),
-                )
-                n_msgs = cursor.execute(
-                    "SELECT COUNT(*) FROM messages WHERE role <> 'tool'"
-                ).fetchone()[0]
-                if n_msgs > 0:
-                    hw = cursor.execute(
-                        "SELECT COALESCE(MAX(id), 0) FROM messages"
+                def seed_cjk_backfill(conn: sqlite3.Connection) -> None:
+                    conn.execute(
+                        "DELETE FROM state_meta WHERE key = ?",
+                        (FTS_CJK_STALE_KEY,),
+                    )
+                    n_msgs = conn.execute(
+                        "SELECT COUNT(*) FROM messages WHERE role <> 'tool'"
                     ).fetchone()[0]
-                    for k, v in (
-                        ("fts_cjk_rebuild_high_water", str(hw)),
-                        ("fts_cjk_rebuild_progress", "0"),
-                    ):
-                        cursor.execute(
-                            "INSERT INTO state_meta (key, value) VALUES (?, ?) "
-                            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                            (k, v),
-                        )
+                    if n_msgs > 0:
+                        hw = conn.execute(
+                            "SELECT COALESCE(MAX(id), 0) FROM messages"
+                        ).fetchone()[0]
+                        for k, v in (
+                            ("fts_cjk_rebuild_high_water", str(hw)),
+                            ("fts_cjk_rebuild_progress", "0"),
+                        ):
+                            conn.execute(
+                                "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                                (k, v),
+                            )
+
+                self._execute_write(seed_cjk_backfill, _count_write=False)
             stale = cursor.execute(
                 "SELECT 1 FROM state_meta WHERE key = ?",
                 (FTS_CJK_STALE_KEY,),
@@ -4408,7 +5512,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # `optimize-storage` run rebuilds from scratch.
                 self._fts_cjk_available = False
                 return
-            cursor.executescript(FTS_CJK_TRIGGER_SQL)
+            self._execute_fts_schema_script(cursor, FTS_CJK_TRIGGER_SQL)
             backfill_pending = cursor.execute(
                 "SELECT 1 FROM state_meta "
                 "WHERE key = 'fts_cjk_rebuild_high_water' LIMIT 1"
@@ -4437,6 +5541,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         table_name: str,
         ddl: str,
     ) -> bool:
+        with self.offline_rebuild(reason=f"ensure {table_name} FTS schema"):
+            return self._ensure_fts_schema_owned(cursor, table_name, ddl)
+
+    def _ensure_fts_schema_owned(
+        self,
+        cursor: sqlite3.Cursor,
+        table_name: str,
+        ddl: str,
+    ) -> bool:
         status = self._fts_table_probe(cursor, table_name)
         if status is None:
             return False
@@ -4444,7 +5557,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # Run even when the virtual table exists so any dropped or missing
             # triggers are recreated after a previous no-FTS5 runtime disabled
             # them to keep message writes working.
-            cursor.executescript(ddl)
+            self._execute_fts_schema_script(cursor, ddl)
             return True
         except sqlite3.OperationalError as exc:
             if not self._is_fts5_unavailable_error(exc):
@@ -4458,10 +5571,319 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 self._warn_fts5_unavailable(exc)
             return False
 
+    @staticmethod
+    def _split_fts_schema_script(script: str) -> list[str]:
+        """Split FTS DDL without breaking trigger bodies on their semicolons."""
+        statements = []
+        pending = ""
+        for character in script:
+            pending += character
+            if character == ";" and sqlite3.complete_statement(pending):
+                if pending.strip():
+                    statements.append(pending)
+                pending = ""
+        if pending.strip():
+            statements.append(pending)
+        return statements
+
+    def _execute_fts_schema_script(self, cursor, script: str) -> None:
+        """Run FTS schema writes under one post-BEGIN ownership comparison."""
+        statements = self._split_fts_schema_script(script)
+        while statements and statements[0].lstrip().upper().startswith("SELECT"):
+            cursor.execute(statements.pop(0))
+        if not statements:
+            return
+        with self.write_transaction():
+            for statement in statements:
+                cursor.execute(statement)
+
+    @contextmanager
+    def _same_connection_transaction_boundary(self):
+        """Hold this instance and its exact physical connection together."""
+        with self._lock:
+            conn = self._conn
+            if conn is None:
+                raise sqlite3.ProgrammingError(
+                    "SessionDB has no connection for a transaction boundary"
+                )
+            serial_lock = getattr(conn, "_hermes_serial_lock", None)
+            if serial_lock is None:
+                serial_lock = threading.RLock()
+                conn._hermes_serial_lock = serial_lock
+            with serial_lock:
+                if self._conn is not conn:
+                    raise sqlite3.ProgrammingError(
+                        "SessionDB connection changed while entering a transaction boundary"
+                    )
+                yield conn
+
+    @staticmethod
+    def _begin_immediate_before_deadline(
+        conn: sqlite3.Connection, deadline: float, *, immediate: bool = True
+    ) -> None:
+        """Begin within the retry budget and restore the prior busy timeout."""
+        row = conn.execute("PRAGMA busy_timeout").fetchone()
+        previous_timeout_ms = int(row[0]) if row and row[0] is not None else 0
+        bounded_timeout_ms = min(
+            previous_timeout_ms, max(0, int((deadline - time.monotonic()) * 1000))
+        )
+        changed = bounded_timeout_ms != previous_timeout_ms
+        if changed:
+            conn.execute(f"PRAGMA busy_timeout={bounded_timeout_ms}")
+        try:
+            conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+        except BaseException:
+            if changed:
+                try:
+                    conn.execute(f"PRAGMA busy_timeout={previous_timeout_ms}")
+                except Exception:
+                    pass
+            raise
+        if changed:
+            try:
+                conn.execute(f"PRAGMA busy_timeout={previous_timeout_ms}")
+            except BaseException as exc:
+                # The caller must distinguish this from a failed BEGIN: work
+                # started and cannot be replayed even after rollback succeeds.
+                try:
+                    setattr(exc, "_hermes_transaction_started", True)
+                except Exception:
+                    pass
+                raise
+
+    def _rollback_or_retire_failed_transaction(
+        self, conn: sqlite3.Connection, primary_exc: BaseException
+    ) -> None:
+        """Rollback once, or permanently retire an indeterminate connection."""
+        rollback_exc = None
+        try:
+            conn.rollback()
+        except BaseException as exc:
+            rollback_exc = exc
+        if rollback_exc is None and not conn.in_transaction:
+            return
+        if rollback_exc is None:
+            rollback_exc = sqlite3.OperationalError(
+                "SQLite rollback left a transaction active"
+            )
+        if self._conn is conn:
+            self._conn = None
+        try:
+            conn.close()
+        except BaseException as close_exc:
+            try:
+                primary_exc.add_note("SQLite transaction cleanup failed")
+            except Exception:
+                pass
+            try:
+                rollback_exc.add_note(str(close_exc))
+            except Exception:
+                pass
+        raise primary_exc from rollback_exc
+
+    def _assert_offline_rebuild_write_authority(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        """Refuse writes while a different durable rebuild claim is active."""
+        _assert_offline_rebuild_write_authority(
+            conn, self._offline_rebuild_marker
+        )
+
+    def _assert_offline_rebuild_maintenance_authority(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        """Refuse raw maintenance while any rebuild claim governs this DB.
+
+        SQLite cannot compare the durable marker and run VACUUM or a WAL
+        checkpoint in one transaction.  A local claim therefore makes those
+        no-transaction statements inadmissible; they must wait until its
+        compare-delete release completes.  A foreign claim is refused by the
+        exact durable comparison immediately before the statement as well.
+        """
+        self._assert_offline_rebuild_write_authority(conn)
+        if self._offline_rebuild_marker is not None:
+            raise SessionTurnLeaseLostError(
+                "refusing raw SQLite maintenance while an offline rebuild owns this database"
+            )
+
+    @contextmanager
+    def _raw_maintenance_fence(self):
+        """Fence one no-transaction raw operation on this exact connection."""
+        conn = self._conn
+        if conn is None:
+            raise sqlite3.ProgrammingError(
+                "SessionDB has no connection for raw SQLite maintenance"
+            )
+        with _same_connection_raw_maintenance_fence(
+            conn,
+            assert_authority=lambda: self._assert_offline_rebuild_maintenance_authority(
+                conn
+            ),
+        ):
+            yield conn
+
+    @contextmanager
+    def offline_rebuild(self, *, reason: str):
+        """Hold this database's durable exclusion claim for FTS maintenance."""
+        if self.read_only:
+            yield self
+            return
+        if self._offline_rebuild_marker is not None:
+            self._assert_offline_rebuild_write_authority(self._conn)
+            self._offline_rebuild_depth += 1
+            try:
+                yield self
+            finally:
+                self._offline_rebuild_depth -= 1
+            return
+
+        owner_pid = os.getpid()
+        owner_pid_start = time.time()
+        if owner_pid <= 0 or not math.isfinite(owner_pid_start):
+            raise SessionTurnLeaseLostError(
+                "offline rebuild cannot establish a valid process identity"
+            )
+        marker_value = json.dumps(
+            {
+                "generation": 1,
+                "nonce": os.urandom(16).hex(),
+                "owner_pid": owner_pid,
+                "owner_pid_start": owner_pid_start,
+                "reason": reason,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+        def claim(conn: sqlite3.Connection) -> None:
+            row = conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?",
+                (_OFFLINE_REBUILD_EPOCH_KEY,),
+            ).fetchone()
+            if row is not None:
+                raise SessionTurnLeaseLostError(
+                    "offline rebuild exclusion is already held"
+                )
+            conn.execute(
+                "INSERT INTO state_meta(key, value) VALUES (?, ?)",
+                (_OFFLINE_REBUILD_EPOCH_KEY, marker_value),
+            )
+
+        self._offline_rebuild_transition = True
+        try:
+            self._execute_write(claim, _count_write=False)
+        except BaseException:
+            self._offline_rebuild_marker = None
+            raise
+        finally:
+            self._offline_rebuild_transition = False
+        self._offline_rebuild_marker = marker_value
+        self._offline_rebuild_depth = 1
+        primary_exc: Optional[BaseException] = None
+        try:
+            with self._same_connection_transaction_boundary() as conn:
+                self._assert_offline_rebuild_write_authority(conn)
+                yield self
+        except BaseException as exc:
+            primary_exc = exc
+            raise
+        finally:
+            def release(conn: sqlite3.Connection) -> None:
+                cursor = conn.execute(
+                    "DELETE FROM state_meta WHERE key = ? AND value = ?",
+                    (_OFFLINE_REBUILD_EPOCH_KEY, marker_value),
+                )
+                if cursor.rowcount != 1:
+                    raise SessionTurnLeaseLostError(
+                        "offline rebuild exclusion changed before release"
+                    )
+
+            try:
+                self._offline_rebuild_transition = True
+                self._execute_write(release, _count_write=False)
+            except BaseException:
+                if primary_exc is None:
+                    raise
+                try:
+                    primary_exc.add_note(
+                        "offline rebuild exclusion changed before release"
+                    )
+                except Exception:
+                    pass
+            finally:
+                self._offline_rebuild_transition = False
+                self._offline_rebuild_depth = 0
+                self._offline_rebuild_marker = None
+
+    @contextmanager
+    def write_transaction(
+        self, patience_s: Optional[float] = None, *, immediate: bool = True
+    ):
+        """Yield one caller-owned transaction without replaying post-BEGIN work."""
+        if patience_s is None:
+            patience_s = self._WRITE_PATIENCE_S
+
+        # Schema initialization composes several helpers that each retain a
+        # standalone transaction contract.  When its outer transaction is
+        # already active, they must stay on that exact connection and leave
+        # commit/rollback to the owner rather than creating an implicit gap.
+        with self._same_connection_transaction_boundary() as conn:
+            if conn.in_transaction:
+                self._assert_offline_rebuild_write_authority(conn)
+                yield conn
+                return
+
+        deadline = time.monotonic() + patience_s
+        while True:
+            ownership = contextlib.ExitStack()
+            transaction_started = False
+            try:
+                conn = ownership.enter_context(self._same_connection_transaction_boundary())
+                try:
+                    self._begin_immediate_before_deadline(
+                        conn, deadline, immediate=immediate
+                    )
+                    transaction_started = True
+                except BaseException as exc:
+                    if getattr(exc, "_hermes_transaction_started", False):
+                        self._rollback_or_retire_failed_transaction(conn, exc)
+                    raise
+            except sqlite3.OperationalError as exc:
+                ownership.close()
+                if (
+                    not transaction_started
+                    and not getattr(exc, "_hermes_transaction_started", False)
+                    and ("locked" in str(exc).lower() or "busy" in str(exc).lower())
+                    and self._sleep_before_write_retry(deadline, patience_s)
+                ):
+                    continue
+                raise
+            except BaseException:
+                ownership.close()
+                raise
+            break
+
+        try:
+            try:
+                self._assert_offline_rebuild_write_authority(conn)
+                yield conn
+            except BaseException as exc:
+                self._rollback_or_retire_failed_transaction(conn, exc)
+                raise
+            try:
+                conn.commit()
+            except BaseException as exc:
+                self._rollback_or_retire_failed_transaction(conn, exc)
+                raise
+        finally:
+            ownership.close()
+
     def _execute_write(
         self,
         fn: Callable[[sqlite3.Connection], T],
         patience_s: Optional[float] = None,
+        *,
+        _count_write: bool = True,
     ) -> T:
         """Execute a write transaction with BEGIN IMMEDIATE and jitter retry.
 
@@ -4489,6 +5911,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         if patience_s is None:
             patience_s = self._WRITE_PATIENCE_S
+
+        # See write_transaction(): nested schema/FTS recovery helpers inherit
+        # the initialization transaction's exact authority comparison and must
+        # neither commit nor replay its caller's work.
+        with self._same_connection_transaction_boundary() as conn:
+            if conn.in_transaction:
+                self._assert_offline_rebuild_write_authority(conn)
+                return fn(conn)
+
         deadline = time.monotonic() + patience_s
         # Set on the first compression-busy collision so the short wait is
         # measured from then, not from the start of the write.
@@ -4504,27 +5935,98 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         def _is_no_more_rows(exc: sqlite3.Error) -> bool:
             return "no more rows available" in str(exc).lower()
 
+        def _is_explicit_fts_commit_error(exc: BaseException) -> bool:
+            """A commit replay needs one direct, exact supported FTS5 signature."""
+            return (
+                type(exc) is sqlite3.DatabaseError
+                and str(exc)
+                in {
+                    'fts5: corrupt structure record for table "messages_fts"',
+                    'fts5: corrupt structure record for table "messages_fts_trigram"',
+                    'fts5: corrupt structure record for table "messages_fts_cjk"',
+                }
+            )
+
+        def _recovery_is_replay_safe(exc: BaseException) -> bool:
+            """Allow recovery only after rollback proves replay safety."""
+            return (
+                transaction_rolled_back
+                and not getattr(exc, "_hermes_transaction_started", False)
+                and (
+                    (
+                        not commit_attempted
+                        and (
+                            not callback_mutated
+                            or (
+                                isinstance(exc, sqlite3.DatabaseError)
+                                and self._is_fts_write_corruption_error(exc)
+                            )
+                        )
+                    )
+                    or (
+                        commit_failure_definitely_rolled_back
+                        and _is_explicit_fts_commit_error(exc)
+                    )
+                )
+            )
+
         while True:
+            transaction_started = False
+            transaction_rolled_back = False
+            callback_mutated = False
+            commit_attempted = False
+            commit_failure_definitely_rolled_back = False
             try:
-                with self._lock:
-                    self._conn.execute("BEGIN IMMEDIATE")
+                with self._same_connection_transaction_boundary() as conn:
                     try:
-                        result = fn(self._conn)
-                        self._conn.commit()
-                    except BaseException:
-                        try:
-                            self._conn.rollback()
-                        except Exception:
-                            pass
+                        self._begin_immediate_before_deadline(conn, deadline)
+                        transaction_started = True
+                    except BaseException as exc:
+                        if getattr(exc, "_hermes_transaction_started", False):
+                            self._rollback_or_retire_failed_transaction(conn, exc)
+                        raise
+                    callback_total_changes: Optional[int] = None
+                    try:
+                        self._assert_offline_rebuild_write_authority(conn)
+                        callback_total_changes = conn.total_changes
+                        result = fn(conn)
+                        commit_attempted = True
+                        conn.commit()
+                    except BaseException as exc:
+                        if callback_total_changes is not None:
+                            callback_mutated = conn.total_changes != callback_total_changes
+                        # A raised commit is normally ambiguous: it may have
+                        # durably committed before SQLite reported the error.
+                        # The sole exception is an FTS-corruption DatabaseError
+                        # observed while the same transaction remains active;
+                        # only a successful rollback to autocommit proves this
+                        # callback can safely be replayed.
+                        commit_failure_had_active_transaction = (
+                            commit_attempted
+                            and _is_explicit_fts_commit_error(exc)
+                            and conn.in_transaction
+                        )
+                        self._rollback_or_retire_failed_transaction(conn, exc)
+                        transaction_rolled_back = True
+                        commit_failure_definitely_rolled_back = (
+                            commit_failure_had_active_transaction
+                            and not conn.in_transaction
+                        )
                         raise
                 # Success — periodic best-effort checkpoint + FTS merge.
-                self._write_count += 1
-                if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
-                    self._try_wal_checkpoint()
-                if self._write_count % self._FTS_MERGE_EVERY_N_WRITES == 0:
-                    self._try_incremental_merge_fts()
+                if _count_write:
+                    self._write_count += 1
+                    if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
+                        self._try_wal_checkpoint()
+                    if (
+                        not self._offline_rebuild_transition
+                        and self._write_count % self._FTS_MERGE_EVERY_N_WRITES == 0
+                    ):
+                        self._try_incremental_merge_fts()
                 return result
             except SessionCompressionInProgressError:
+                if transaction_started or commit_attempted:
+                    raise
                 # A live foreign compression lock is transient: the compressor
                 # publishes in a couple of seconds. Without any wait, a steer
                 # that lands mid-compression aborts the user's turn as
@@ -4546,8 +6048,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     continue
                 raise
             except sqlite3.OperationalError as exc:
+                if commit_attempted or getattr(exc, "_hermes_transaction_started", False):
+                    raise
                 err_msg = str(exc).lower()
                 if "locked" in err_msg or "busy" in err_msg:
+                    if transaction_started:
+                        raise
                     if self._sleep_before_write_retry(deadline, patience_s):
                         continue
                     # Patience exhausted — say what actually happened so the
@@ -4559,11 +6065,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         "a large WAL checkpoint, or an older pre-update "
                         "process; the database itself is healthy)"
                     ) from exc
+                if transaction_started and not _recovery_is_replay_safe(exc):
+                    raise
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
                     continue
                 # Non-lock error or patience exhausted — propagate.
                 raise
             except sqlite3.DatabaseError as exc:
+                if (
+                    commit_attempted
+                    and not _recovery_is_replay_safe(exc)
+                ) or getattr(exc, "_hermes_transaction_started", False):
+                    raise
+                if transaction_started and not _recovery_is_replay_safe(exc):
+                    raise
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
                     continue
                 # Corrupt FTS shadow tables make every write raise the
@@ -4584,6 +6099,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # subclass) or another sqlite3.Error class outside the two
                 # handlers above. Message-scoped: anything else propagates
                 # untouched.
+                if commit_attempted or getattr(exc, "_hermes_transaction_started", False):
+                    raise
+                if transaction_started and not _recovery_is_replay_safe(exc):
+                    raise
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
                     continue
                 raise
@@ -4815,31 +6334,25 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return False
 
         try:
-            with self._lock:
-                self._conn.execute("BEGIN IMMEDIATE")
-                try:
-                    self._conn.execute(
+            with self.write_transaction() as conn:
+                conn.execute(
+                    "INSERT INTO state_meta (key, value) VALUES (?, '1') "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (FTS_STALE_KEY,),
+                )
+                cjk_triggers_present = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'trigger' "
+                    f"AND name IN ({','.join('?' for _ in _FTS_CJK_TRIGGERS)}) "
+                    "LIMIT 1",
+                    _FTS_CJK_TRIGGERS,
+                ).fetchone()
+                if cjk_triggers_present:
+                    conn.execute(
                         "INSERT INTO state_meta (key, value) VALUES (?, '1') "
                         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                        (FTS_STALE_KEY,),
+                        (FTS_CJK_STALE_KEY,),
                     )
-                    cjk_triggers_present = self._conn.execute(
-                        "SELECT 1 FROM sqlite_master WHERE type = 'trigger' "
-                        f"AND name IN ({','.join('?' for _ in _FTS_CJK_TRIGGERS)}) "
-                        "LIMIT 1",
-                        _FTS_CJK_TRIGGERS,
-                    ).fetchone()
-                    if cjk_triggers_present:
-                        self._conn.execute(
-                            "INSERT INTO state_meta (key, value) VALUES (?, '1') "
-                            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                            (FTS_CJK_STALE_KEY,),
-                        )
-                    self._drop_all_fts_triggers(self._conn.cursor())
-                    self._conn.commit()
-                except BaseException:
-                    self._conn.rollback()
-                    raise
+                self._drop_all_fts_triggers(conn.cursor())
         except sqlite3.Error as detach_exc:
             logger.error(
                 "Could not detach corrupt FTS indexes; canonical write still "
@@ -4880,9 +6393,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         try:
             with self._lock:
-                result = self._conn.execute(
-                    "PRAGMA wal_checkpoint(PASSIVE)"
-                ).fetchone()
+                if self._conn is None:
+                    return
+                try:
+                    with self._raw_maintenance_fence() as conn:
+                        result = conn.execute(
+                            "PRAGMA wal_checkpoint(PASSIVE)"
+                        ).fetchone()
+                except SessionTurnLeaseLostError as exc:
+                    if isinstance(exc.__cause__, sqlite3.Error):
+                        logger.warning("WAL checkpoint (PASSIVE) failed: %s", exc)
+                    else:
+                        logger.debug("WAL checkpoint (PASSIVE) skipped: %s", exc)
+                    return
                 if result and result[1] > 0:
                     logger.debug(
                         "WAL checkpoint: %d/%d pages checkpointed",
@@ -4965,7 +6488,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     # checkpoint was already made PASSIVE to avoid. TRUNCATE
                     # belongs only on a sole-opener/quiescent connection.
                     try:
-                        self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                        with self._raw_maintenance_fence() as conn:
+                            conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                    except SessionTurnLeaseLostError as exc:
+                        if isinstance(exc.__cause__, sqlite3.Error):
+                            logger.debug(
+                                "WAL checkpoint (PASSIVE) at close failed: %s", exc
+                            )
+                        else:
+                            logger.debug(
+                                "WAL checkpoint (PASSIVE) at close skipped: %s", exc
+                            )
                     except Exception as exc:
                         logger.debug(
                             "WAL checkpoint (PASSIVE) at close failed: %s",
@@ -5259,6 +6792,483 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """Create a new session record. Returns the session_id."""
         self._insert_session_row(session_id, source, **kwargs)
         return session_id
+
+    def issue_session_process_authority(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Return the current issued authority for one live session.
+
+        Issuance itself is a sessions-table SQLite trigger, so every writer —
+        including a legacy raw SQL call that bypasses this Python method —
+        receives the same single generation and durable ``SESSION_ISSUED``
+        evidence in the transaction that created the session.  This method is
+        deliberately a fail-closed read of that durable record, not a second
+        mutable issuance path.
+        """
+        if not isinstance(session_id, str) or not session_id.strip():
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT a.state_db_id, a.state_family, a.session_id,
+                          a.session_generation, a.authority_token, a.status,
+                          a.issued_at
+                   FROM session_process_authorities AS a
+                   JOIN sessions AS s ON s.id = a.session_id
+                   WHERE a.session_id = ?
+                     AND a.session_generation = s.session_generation
+                     AND s.ended_at IS NULL
+                     AND a.status = 'ISSUED'""",
+                (session_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    @staticmethod
+    def _session_process_authority_payload(
+        authority: Any,
+    ) -> Optional[Tuple[str, str, str, int, str, float]]:
+        """Validate the complete authority envelope before touching SQLite."""
+        if not isinstance(authority, dict):
+            return None
+        state_db_id = authority.get("state_db_id")
+        state_family = authority.get("state_family")
+        session_id = authority.get("session_id")
+        generation = authority.get("session_generation")
+        token = authority.get("authority_token")
+        issued_at = authority.get("issued_at")
+        if (
+            not isinstance(state_db_id, str)
+            or len(state_db_id) != 64
+            or state_db_id.lower() != state_db_id
+            or any(char not in "0123456789abcdef" for char in state_db_id)
+            or state_family != SESSION_PROCESS_AUTHORITY_STATE_FAMILY
+            or not isinstance(session_id, str)
+            or not session_id.strip()
+            or isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation < 1
+            or not isinstance(token, str)
+            or len(token) != 64
+            or token.lower() != token
+            or any(char not in "0123456789abcdef" for char in token)
+            or isinstance(issued_at, bool)
+            or not isinstance(issued_at, (int, float))
+            or not math.isfinite(float(issued_at))
+            or authority.get("status") != "ISSUED"
+        ):
+            return None
+        return (
+            state_db_id,
+            state_family,
+            session_id,
+            generation,
+            token,
+            float(issued_at),
+        )
+
+    def reserve_session_process_authority(
+        self, authority: Any, *, ttl_seconds: float = SESSION_PROCESS_AUTHORITY_RESERVATION_TTL_SECONDS
+    ) -> Optional[Dict[str, Any]]:
+        """Create one short-lived reservation for the current authority.
+
+        This is an issuance prerequisite only: it does not launch or attach a
+        real process.  The one-time reservation is persisted with only a token
+        digest; Producer-B can later consume it to bind a spawned process.
+        """
+        parsed = self._session_process_authority_payload(authority)
+        if (
+            parsed is None
+            or isinstance(ttl_seconds, bool)
+            or not isinstance(ttl_seconds, (int, float))
+            or not math.isfinite(float(ttl_seconds))
+        ):
+            return None
+        ttl = float(ttl_seconds)
+        if ttl <= 0 or ttl > SESSION_PROCESS_AUTHORITY_MAX_RESERVATION_TTL_SECONDS:
+            return None
+        state_db_id, state_family, session_id, generation, token, issued_at = parsed
+        now = time.time()
+        expires_at = now + ttl
+        reservation_id = secrets.token_urlsafe(24)
+        reservation_token = secrets.token_urlsafe(32)
+        reservation_token_sha256 = hashlib.sha256(
+            reservation_token.encode("ascii")
+        ).hexdigest()
+
+        def _do(conn):
+            current = conn.execute(
+                """SELECT 1
+                   FROM session_process_authorities AS a
+                   JOIN sessions AS s ON s.id = a.session_id
+                   WHERE a.session_id = ?
+                     AND a.session_generation = ?
+                     AND a.state_db_id = ?
+                     AND a.state_family = ?
+                     AND a.authority_token = ?
+                     AND a.issued_at = ?
+                     AND a.status = 'ISSUED'
+                     AND s.session_generation = a.session_generation
+                     AND s.ended_at IS NULL""",
+                (session_id, generation, state_db_id, state_family, token, issued_at),
+            ).fetchone()
+            if current is None:
+                return None
+            conn.execute(
+                """INSERT INTO session_process_reservations (
+                       reservation_id, reservation_token_sha256, session_id,
+                       session_generation, state_db_id, state_family, status,
+                       reserved_at, expires_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, 'RESERVED', ?, ?)""",
+                (
+                    reservation_id,
+                    reservation_token_sha256,
+                    session_id,
+                    generation,
+                    state_db_id,
+                    state_family,
+                    now,
+                    expires_at,
+                ),
+            )
+            return {
+                "reservation_id": reservation_id,
+                "reservation_token": reservation_token,
+                "state_db_id": state_db_id,
+                "state_family": state_family,
+                "session_id": session_id,
+                "session_generation": generation,
+                "status": "RESERVED",
+                "reserved_at": now,
+                "expires_at": expires_at,
+            }
+
+        return self._execute_write(_do)
+
+    @staticmethod
+    def _session_process_reservation_payload(
+        reservation: Any,
+    ) -> Optional[Tuple[str, str, str, str, int, float, float]]:
+        """Validate a presented reservation before its one-time consume."""
+        if not isinstance(reservation, dict):
+            return None
+        reservation_id = reservation.get("reservation_id")
+        reservation_token = reservation.get("reservation_token")
+        state_db_id = reservation.get("state_db_id")
+        state_family = reservation.get("state_family")
+        session_id = reservation.get("session_id")
+        generation = reservation.get("session_generation")
+        reserved_at = reservation.get("reserved_at")
+        expires_at = reservation.get("expires_at")
+        if (
+            not isinstance(reservation_id, str)
+            or len(reservation_id) < 32
+            or not isinstance(reservation_token, str)
+            or len(reservation_token) < 32
+            or not isinstance(state_db_id, str)
+            or len(state_db_id) != 64
+            or state_db_id.lower() != state_db_id
+            or any(char not in "0123456789abcdef" for char in state_db_id)
+            or state_family != SESSION_PROCESS_AUTHORITY_STATE_FAMILY
+            or not isinstance(session_id, str)
+            or not session_id.strip()
+            or isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation < 1
+            or isinstance(reserved_at, bool)
+            or not isinstance(reserved_at, (int, float))
+            or isinstance(expires_at, bool)
+            or not isinstance(expires_at, (int, float))
+            or not math.isfinite(float(reserved_at))
+            or not math.isfinite(float(expires_at))
+            or float(expires_at) <= float(reserved_at)
+            or reservation.get("status") != "RESERVED"
+        ):
+            return None
+        return (
+            reservation_id,
+            reservation_token,
+            state_db_id,
+            session_id,
+            generation,
+            float(reserved_at),
+            float(expires_at),
+        )
+
+    def consume_session_process_reservation(self, reservation: Any) -> bool:
+        """Atomically consume an unexpired reservation without binding a PID."""
+        parsed = self._session_process_reservation_payload(reservation)
+        if parsed is None:
+            return False
+        (
+            reservation_id,
+            reservation_token,
+            state_db_id,
+            session_id,
+            generation,
+            reserved_at,
+            expires_at,
+        ) = parsed
+        now = time.time()
+        if expires_at <= now:
+            return False
+        token_sha256 = hashlib.sha256(reservation_token.encode("ascii")).hexdigest()
+
+        def _do(conn):
+            row = conn.execute(
+                """SELECT r.reservation_token_sha256
+                   FROM session_process_reservations AS r
+                   JOIN session_process_authorities AS a
+                     ON a.session_id = r.session_id
+                    AND a.session_generation = r.session_generation
+                   JOIN sessions AS s ON s.id = r.session_id
+                   WHERE r.reservation_id = ?
+                     AND r.session_id = ?
+                     AND r.session_generation = ?
+                     AND r.state_db_id = ?
+                     AND r.state_family = ?
+                     AND r.reserved_at = ?
+                     AND r.expires_at = ?
+                     AND r.status = 'RESERVED'
+                     AND r.expires_at > ?
+                     AND a.status = 'ISSUED'
+                     AND s.session_generation = r.session_generation
+                     AND s.ended_at IS NULL""",
+                (
+                    reservation_id,
+                    session_id,
+                    generation,
+                    state_db_id,
+                    SESSION_PROCESS_AUTHORITY_STATE_FAMILY,
+                    reserved_at,
+                    expires_at,
+                    now,
+                ),
+            ).fetchone()
+            if row is None or not secrets.compare_digest(row[0], token_sha256):
+                return False
+            cursor = conn.execute(
+                """UPDATE session_process_reservations
+                   SET status = 'BOUND', consumed_at = ?
+                   WHERE reservation_id = ? AND status = 'RESERVED'""",
+                (now, reservation_id),
+            )
+            return bool(cursor.rowcount)
+
+        return bool(self._execute_write(_do))
+
+    def revoke_session_process_authority(self, session_id: str) -> bool:
+        """Revoke the live authority once by closing its owning session.
+
+        The normal session-close trigger changes the authority state and emits
+        ``SESSION_REVOKED`` in the exact ``BEGIN IMMEDIATE`` transaction.  A
+        duplicate, unknown, or already-closed request makes no write and is
+        rejected by returning ``False``.
+        """
+        if not isinstance(session_id, str) or not session_id.strip():
+            return False
+
+        now = time.time()
+
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE sessions SET ended_at = ?, end_reason = 'authority_revoked' "
+                "WHERE id = ? AND ended_at IS NULL",
+                (now, session_id),
+            )
+            return bool(cursor.rowcount)
+
+        return bool(self._execute_write(_do))
+
+    def create_session_strict(
+        self,
+        session_id: str,
+        source: str,
+        model: str = None,
+        model_config: Dict[str, Any] = None,
+        system_prompt: str = None,
+        user_id: str = None,
+        session_key: Optional[str] = None,
+        chat_id: str = None,
+        chat_type: str = None,
+        thread_id: str = None,
+        parent_session_id: str = None,
+        cwd: str = None,
+        profile_name: str = None,
+        git_repo_root: str = None,
+        origin_json: str = None,
+        display_name: str = None,
+    ) -> bool:
+        """Create a session row iff ``session_id`` is not already taken.
+
+        Same column set as :meth:`create_session`, but a PK collision is
+        refused rather than an opportunity to enrich the existing row — NOT
+        A SINGLE COLUMN on a pre-existing row (foreign or otherwise) is ever
+        written, not even a NULL-only backfill. :meth:`create_session`'s
+        ``ON CONFLICT ... DO UPDATE`` fills NULL routing/origin columns
+        (``session_key``/``chat_id``/``chat_type``/...) on ANY row already
+        occupying the id — including one this caller has no relationship to
+        — before any provenance check downstream ever runs. Callers whose
+        id is only *probabilistically* unique (gateway ``/branch``'s
+        timestamp+random id) must use this instead, so a collision is
+        refused untouched rather than silently repointed.
+
+        Returns ``True`` when the row is freshly created, ``False`` when
+        ``session_id`` is already taken. Everything else raises.
+
+        The precondition rule: whether the id is taken is decided by a
+        ``SELECT`` that runs BEFORE any write this method makes — before
+        ``_store_system_prompt`` and before the ``INSERT`` — inside the same
+        ``BEGIN IMMEDIATE`` transaction ``_execute_write`` holds under
+        ``self._lock``. That exclusive write lock is held for the entire
+        call, so no other writer can claim the id between the SELECT and
+        the INSERT. So ``False`` means nothing of ours was written, and any
+        ``sqlite3.IntegrityError`` the INSERT itself raises afterward — a
+        foreign-key violation, a turn-fence trigger's ``RAISE(ABORT)``, a
+        UNIQUE violation on some other column — is a genuine failure, not a
+        collision on this id, and propagates untouched.
+        """
+        def _do(conn):
+            # Must be the first statement in _do, before every other write
+            # (including _store_system_prompt): see precondition rule above.
+            row = conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if row is not None:
+                return False
+            system_prompt_hash = self._store_system_prompt(conn, system_prompt)
+            conn.execute(
+                """INSERT INTO sessions (
+                   id, source, user_id, session_key, chat_id, chat_type, thread_id,
+                   model, model_config, system_prompt, system_prompt_hash,
+                   parent_session_id, cwd, profile_name, git_repo_root,
+                   origin_json, display_name, started_at
+                )
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    session_id,
+                    source,
+                    user_id,
+                    session_key,
+                    chat_id,
+                    chat_type,
+                    thread_id,
+                    model,
+                    json.dumps(model_config) if model_config else None,
+                    system_prompt_hash,
+                    parent_session_id,
+                    cwd,
+                    profile_name,
+                    git_repo_root,
+                    origin_json,
+                    display_name,
+                    time.time(),
+                ),
+            )
+            if system_prompt_hash is not None:
+                self._delete_unreferenced_system_prompts(conn)
+            if parent_session_id:
+                # Backfill from the parent — same shape as
+                # _insert_session_row, but this UPDATE only ever touches the
+                # row we just INSERTed (WHERE id = ? on our own fresh id), so
+                # it can never reach across into an existing/foreign row.
+                conn.execute(
+                    """UPDATE sessions
+                       SET cwd = COALESCE(sessions.cwd,
+                                 (SELECT p.cwd FROM sessions p
+                                   WHERE p.id = sessions.parent_session_id)),
+                           git_repo_root = COALESCE(sessions.git_repo_root,
+                                           (SELECT p.git_repo_root FROM sessions p
+                                             WHERE p.id = sessions.parent_session_id)),
+                           git_branch = COALESCE(sessions.git_branch,
+                                        (SELECT p.git_branch FROM sessions p
+                                          WHERE p.id = sessions.parent_session_id)),
+                           profile_name = COALESCE(sessions.profile_name,
+                                          (SELECT p.profile_name FROM sessions p
+                                            WHERE p.id = sessions.parent_session_id))
+                     WHERE id = ? AND parent_session_id IS NOT NULL""",
+                    (session_id,),
+                )
+                conn.execute(
+                    """UPDATE sessions
+                       SET user_id = COALESCE(sessions.user_id,
+                                     (SELECT p.user_id FROM sessions p
+                                       WHERE p.id = sessions.parent_session_id)),
+                           session_key = COALESCE(sessions.session_key,
+                                         (SELECT p.session_key FROM sessions p
+                                           WHERE p.id = sessions.parent_session_id)),
+                           chat_id = COALESCE(sessions.chat_id,
+                                     (SELECT p.chat_id FROM sessions p
+                                       WHERE p.id = sessions.parent_session_id)),
+                           chat_type = COALESCE(sessions.chat_type,
+                                       (SELECT p.chat_type FROM sessions p
+                                         WHERE p.id = sessions.parent_session_id)),
+                           thread_id = COALESCE(sessions.thread_id,
+                                       (SELECT p.thread_id FROM sessions p
+                                         WHERE p.id = sessions.parent_session_id)),
+                           display_name = COALESCE(sessions.display_name,
+                                          (SELECT p.display_name FROM sessions p
+                                            WHERE p.id = sessions.parent_session_id)),
+                           origin_json = COALESCE(sessions.origin_json,
+                                         (SELECT p.origin_json FROM sessions p
+                                           WHERE p.id = sessions.parent_session_id))
+                     WHERE id = ? AND parent_session_id IS NOT NULL
+                       AND EXISTS (
+                           SELECT 1 FROM sessions p
+                           WHERE p.id = sessions.parent_session_id
+                             AND p.end_reason = 'compression'
+                       )""",
+                    (session_id,),
+                )
+            return True
+
+        return bool(
+            self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+        )
+
+    def create_imported_session(
+        self,
+        session_id: str,
+        source: str,
+        messages: List[Dict[str, Any]],
+        *,
+        cwd: str = None,
+        origin_json: str = None,
+        turn_lease_holder=None,
+        turn_lease_ttl_seconds: float = 300.0,
+    ) -> str:
+        """Create a new imported session and its transcript atomically.
+
+        Foreign imports must not expose a prefix transcript: the session row,
+        every parsed message, and their counters either commit together or are
+        all rolled back.  Unlike :meth:`create_session`, an occupied id is an
+        error rather than an opportunity to enrich an existing session.
+        """
+        def _do(conn):
+            # Imports acquire against an absent id before creating its session
+            # row, so the admission check has to precede the strict insert.
+            self._check_transcript_write_guards(
+                conn,
+                session_id,
+                None,
+                turn_lease_holder=turn_lease_holder,
+                turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+            )
+            conn.execute(
+                """INSERT INTO sessions (id, source, cwd, origin_json, started_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (session_id, source, cwd, origin_json, time.time()),
+            )
+            inserted, tool_calls_total = self._insert_message_rows(
+                conn, session_id, messages
+            )
+            conn.execute(
+                """UPDATE sessions
+                   SET message_count = ?, tool_call_count = ?
+                   WHERE id = ?""",
+                (inserted, tool_calls_total, session_id),
+            )
+            return session_id
+
+        return self._execute_write(
+            _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
+        )
 
     def record_gateway_session_peer(
         self,
@@ -6198,9 +8208,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     ) -> None:
         """Atomically close a parent and publish its durable compression child.
 
-        The parent closure, child row, and compacted handoff become visible in
-        one transaction. Readers can therefore observe either the live parent or
-        a complete child, never an ended parent with a missing/empty child.
+        The parent closure, child row, compacted handoff, and any carried title
+        with its provenance become visible in one transaction. Readers can
+        therefore observe either the live parent or a complete child, never an
+        ended parent with a missing/empty child or split title identity.
 
         Concurrent-append safety (#75316): when *watermark* is provided (the
         parent's :meth:`get_active_message_watermark` captured at compression
@@ -6233,7 +8244,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     f"Compression lease lost before publication: {parent_session_id}"
                 )
             parent = conn.execute(
-                """SELECT ended_at, cwd, git_branch, git_repo_root,
+                """SELECT ended_at, title, title_source, cwd, git_branch, git_repo_root,
                           user_id, session_key, chat_id, chat_type,
                           thread_id, display_name, origin_json, profile_name
                    FROM sessions WHERE id = ?""",
@@ -6327,6 +8338,35 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
                 (total_messages, total_tool_calls, child_session_id),
             )
+            if parent["title"] is not None:
+                cleared = conn.execute(
+                    "UPDATE sessions SET title = NULL, title_source = NULL "
+                    "WHERE id = ? AND title IS ? AND title_source IS ?",
+                    (
+                        parent_session_id,
+                        parent["title"],
+                        parent["title_source"],
+                    ),
+                )
+                if cleared.rowcount != 1:
+                    raise RuntimeError(
+                        f"Compression parent title changed during publication: "
+                        f"{parent_session_id}"
+                    )
+                assigned = conn.execute(
+                    "UPDATE sessions SET title = ?, title_source = ? "
+                    "WHERE id = ? AND title IS NULL AND title_source IS NULL",
+                    (
+                        parent["title"],
+                        parent["title_source"],
+                        child_session_id,
+                    ),
+                )
+                if assigned.rowcount != 1:
+                    raise RuntimeError(
+                        f"Compression child title changed during publication: "
+                        f"{child_session_id}"
+                    )
             updated = conn.execute(
                 "UPDATE sessions SET ended_at = ?, end_reason = 'compression' "
                 "WHERE id = ? AND ended_at IS NULL",
@@ -7134,16 +9174,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         (conversation_id, current_holder),
                     )
             conn.execute(
-                "INSERT OR IGNORE INTO session_turn_leases "
+                "INSERT INTO session_turn_leases "
                 "(conversation_id, holder, acquired_at, expires_at) "
-                "VALUES (?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(conversation_id) DO NOTHING",
                 (conversation_id, holder, now, expires_at),
             )
             owner = conn.execute(
                 "SELECT holder FROM session_turn_leases WHERE conversation_id = ?",
                 (conversation_id,),
             ).fetchone()
-            return owner is not None and owner["holder"] == holder
+            if owner is None:
+                raise sqlite3.DatabaseError(
+                    "SESSION_TURN_LEASE_ACQUIRE_INSERT_MISSING"
+                )
+            return owner["holder"] == holder
 
         return bool(self._execute_write(_do, patience_s=patience_s))
 
@@ -7257,6 +9302,967 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
 
         self._execute_write(_do)
+
+    # ------------------------------------------------------------------
+    # Dormant terminal turn receipts
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _turn_receipt_public(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
+        """Project a receipt into its stable adapter-facing representation."""
+        if row is None:
+            return None
+        if row["status"] == "ABORTED":
+            identity_json = row["receipt_identity_json"]
+            target_bind_json = row["target_bind_receipt_json"]
+            if not isinstance(identity_json, str) or not isinstance(target_bind_json, str):
+                raise TurnReceiptFenceError("aborted turn receipt evidence is malformed")
+            try:
+                identity = json.loads(identity_json)
+                target_bind = json.loads(target_bind_json)
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise TurnReceiptFenceError(
+                    "aborted turn receipt evidence is malformed"
+                ) from exc
+            if not isinstance(identity, dict) or not isinstance(target_bind, dict):
+                raise TurnReceiptFenceError("aborted turn receipt evidence is malformed")
+            receipt_id = row["abort_receipt_id"]
+            evidence_digest = row["abort_evidence_digest"]
+            reason_code = row["abort_reason_code"]
+            if not all(
+                isinstance(value, str) and value
+                for value in (
+                    row["receipt_identity_digest"],
+                    row["target_bind_receipt_digest"],
+                    receipt_id,
+                    evidence_digest,
+                    reason_code,
+                )
+            ):
+                raise TurnReceiptFenceError("aborted turn receipt evidence is malformed")
+            return {
+                "status": "ABORTED",
+                "turnRequestId": str(row["turn_request_id"]),
+                "sessionId": str(target_bind["requested_session_id"]),
+                "receiptIdentity": identity,
+                "receiptIdentityDigest": row["receipt_identity_digest"],
+                "targetBindReceipt": target_bind,
+                "targetBindReceiptDigest": row["target_bind_receipt_digest"],
+                "receiptId": receipt_id,
+                "evidenceDigest": evidence_digest,
+                "reasonCode": reason_code,
+            }
+        result = {
+            "turnRequestId": str(row["turn_request_id"]),
+            "sessionId": str(row["session_id"]),
+            "status": str(row["status"]),
+            "terminalMessageId": row["terminal_message_id"],
+            "responseDigest": row["response_digest"],
+            "createdAt": float(row["created_at"]),
+            "claimedAt": (
+                float(row["claimed_at"])
+                if row["claimed_at"] is not None
+                else None
+            ),
+            "completedAt": (
+                float(row["completed_at"])
+                if row["completed_at"] is not None
+                else None
+            ),
+        }
+        identity_json = row["receipt_identity_json"]
+        target_bind_json = row["target_bind_receipt_json"]
+        if identity_json is not None or target_bind_json is not None:
+            if not isinstance(identity_json, str) or not isinstance(target_bind_json, str):
+                raise TurnReceiptFenceError("turn receipt admission evidence is malformed")
+            try:
+                identity = json.loads(identity_json)
+                target_bind = json.loads(target_bind_json)
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise TurnReceiptFenceError(
+                    "turn receipt admission evidence is malformed"
+                ) from exc
+            if not isinstance(identity, dict) or not isinstance(target_bind, dict):
+                raise TurnReceiptFenceError("turn receipt admission evidence is malformed")
+            result.update(
+                {
+                    "receiptIdentity": identity,
+                    "receiptIdentityDigest": row["receipt_identity_digest"],
+                    "targetBindReceipt": target_bind,
+                    "targetBindReceiptDigest": row["target_bind_receipt_digest"],
+                }
+            )
+        if "terminal_response" in row.keys() and row["terminal_response"] is not None:
+            result["responseText"] = row["terminal_response"]
+        return result
+
+    def migrate_turn_receipts(self) -> int:
+        """Migrate receipt schema without adopting legacy unbound rows.
+
+        ``SCHEMA_SQL`` creates the table for databases that predate this
+        dormant feature.  A C3-A table has no ``binding_digest`` column, so
+        SQLite can only add it nullable while preserving its existing rows.
+        Those rows remain explicitly unbound and every bound operation fences
+        them; a supplied digest is never used to backfill historic evidence.
+        This normalizer remains behind the adapter's ``migration`` surface;
+        it neither imports an external store nor owns a transaction.
+        """
+
+        def _do(conn):
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'turn_receipts'"
+            ).fetchone()
+            if exists is None:
+                return 0
+            columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(turn_receipts)").fetchall()
+            }
+            if "binding_digest" not in columns:
+                conn.execute(
+                    "ALTER TABLE turn_receipts ADD COLUMN binding_digest TEXT"
+                )
+            for column in (
+                "receipt_identity_json",
+                "receipt_identity_digest",
+                "target_bind_receipt_json",
+                "target_bind_receipt_digest",
+                "abort_receipt_id",
+                "abort_evidence_digest",
+                "abort_reason_code",
+            ):
+                if column not in columns:
+                    conn.execute(f"ALTER TABLE turn_receipts ADD COLUMN {column} TEXT")
+            if "aborted_at" not in columns:
+                conn.execute("ALTER TABLE turn_receipts ADD COLUMN aborted_at REAL")
+            return conn.execute(
+                "UPDATE turn_receipts SET status = 'PREPARED' "
+                "WHERE status IS NULL OR TRIM(status) = ''"
+            ).rowcount
+
+        return int(self._execute_write(_do, _count_write=False) or 0)
+
+    @staticmethod
+    def _require_target_bind_identifier(value: Any, name: str) -> str:
+        """Accept only a canonical opaque identifier for a bind receipt."""
+        if (
+            not isinstance(value, str)
+            or not value
+            or value != value.strip()
+            or len(value) > 512
+            or any(ord(char) < 32 or ord(char) == 127 for char in value)
+        ):
+            raise ValueError(f"{name} must be a non-empty opaque identifier")
+        return value
+
+    @staticmethod
+    def _target_bind_receipt_root(conn, session_id: str) -> str:
+        """Resolve one exact durable lineage root or fence malformed ancestry."""
+        current = session_id
+        seen = set()
+        for _ in range(100):
+            if current in seen:
+                raise TargetBindReceiptFenceError("target bind lineage is cyclic")
+            seen.add(current)
+            row = conn.execute(
+                "SELECT id, parent_session_id FROM sessions WHERE id = ?", (current,)
+            ).fetchone()
+            if row is None:
+                raise TargetBindReceiptFenceError("target bind session is unavailable")
+            parent_id = row["parent_session_id"]
+            if parent_id is None:
+                return str(row["id"])
+            if not isinstance(parent_id, str) or not parent_id:
+                raise TargetBindReceiptFenceError("target bind lineage is invalid")
+            current = parent_id
+        raise TargetBindReceiptFenceError("target bind lineage is ambiguous")
+
+    @staticmethod
+    def _target_bind_canonical_digest(payload: Dict[str, Any]) -> str:
+        """Return the canonical SHA-256 commitment for a public receipt payload."""
+        payload_bytes = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return "sha256:" + hashlib.sha256(payload_bytes).hexdigest()
+
+    @staticmethod
+    def _target_bind_lineage_root_digest(lineage_root_id: str) -> str:
+        """Commit to resolved root bytes without disclosing the private root."""
+        root_bytes = lineage_root_id.encode("utf-8")
+        return "sha256:" + hashlib.sha256(
+            _TARGET_BIND_LINEAGE_ROOT_DIGEST_DOMAIN + root_bytes
+        ).hexdigest()
+
+    @staticmethod
+    def _target_bind_receipt_record(
+        *,
+        session_id: str,
+        lineage_root_id: str,
+        actor_id: str,
+        binding_generation: int,
+        executor_runtime_identity: str,
+    ) -> tuple[str, Dict[str, Any]]:
+        """Build the stable identity key and immutable receipt evidence."""
+        binding_identity = {
+            "domain": _TARGET_BIND_RECEIPT_DOMAIN,
+            "version": _TARGET_BIND_RECEIPT_VERSION,
+            "actor_id": actor_id,
+            "binding_generation": binding_generation,
+            "executor_runtime_identity": executor_runtime_identity,
+        }
+        identity_bytes = json.dumps(
+            binding_identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        identity_digest = "sha256:" + hashlib.sha256(identity_bytes).hexdigest()
+        public_receipt = {
+            "domain": _TARGET_BIND_RECEIPT_DOMAIN,
+            "version": _TARGET_BIND_RECEIPT_VERSION,
+            "actor_id": actor_id,
+            "binding_generation": binding_generation,
+            "executor_runtime_identity": executor_runtime_identity,
+            "requested_session_id": session_id,
+            "lineage_root_digest": SessionDB._target_bind_lineage_root_digest(
+                lineage_root_id
+            ),
+        }
+        record = {
+            "schema": _TARGET_BIND_RECEIPT_SCHEMA,
+            **public_receipt,
+            "lineage_root_id": lineage_root_id,
+            "binding_identity": identity_digest,
+        }
+        record["receipt_digest"] = SessionDB._target_bind_canonical_digest(public_receipt)
+        return _TARGET_BIND_RECEIPT_META_PREFIX + identity_digest.removeprefix("sha256:"), record
+
+    def prepare_target_bind_receipt(
+        self,
+        session_id: str,
+        actor_id: str,
+        binding_generation: int,
+        executor_runtime_identity: str,
+        *,
+        expected_lineage_root_digest: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Persist or replay one immutable target-authenticated bind receipt.
+
+        ``expected_lineage_root_digest`` is an optional preflight fence for
+        local callers.  Existing trusted callers omit it and retain their
+        server-resolved lineage behavior.
+        """
+        session_id = self._require_target_bind_identifier(session_id, "session_id")
+        actor_id = self._require_target_bind_identifier(actor_id, "actor_id")
+        executor_runtime_identity = self._require_target_bind_identifier(
+            executor_runtime_identity, "executor_runtime_identity"
+        )
+        if (
+            not isinstance(binding_generation, int)
+            or isinstance(binding_generation, bool)
+            or binding_generation < 0
+        ):
+            raise ValueError("binding_generation must be a nonnegative integer")
+        if expected_lineage_root_digest is not None and (
+            not isinstance(expected_lineage_root_digest, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", expected_lineage_root_digest)
+            is None
+        ):
+            raise ValueError("expected_lineage_root_digest must be canonical")
+
+        def _do(conn):
+            lineage_root_id = self._target_bind_receipt_root(conn, session_id)
+            lineage_root_digest = self._target_bind_lineage_root_digest(
+                lineage_root_id
+            )
+            if (
+                expected_lineage_root_digest is not None
+                and expected_lineage_root_digest != lineage_root_digest
+            ):
+                raise TargetBindReceiptFenceError(
+                    "expected target bind lineage root does not match"
+                )
+            key, expected = self._target_bind_receipt_record(
+                session_id=session_id,
+                lineage_root_id=lineage_root_id,
+                actor_id=actor_id,
+                binding_generation=binding_generation,
+                executor_runtime_identity=executor_runtime_identity,
+            )
+            row = conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?", (key,)
+            ).fetchone()
+            if row is not None:
+                try:
+                    stored = json.loads(row["value"])
+                except (TypeError, json.JSONDecodeError) as exc:
+                    raise TargetBindReceiptFenceError(
+                        "target bind receipt is malformed"
+                    ) from exc
+                if not isinstance(stored, dict):
+                    raise TargetBindReceiptFenceError("target bind receipt is malformed")
+                if stored != expected:
+                    raise TargetBindReceiptConflictError(
+                        "target bind identity is already bound to different evidence"
+                    )
+                return stored
+            conn.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, ?)",
+                (
+                    key,
+                    json.dumps(
+                        expected,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                ),
+            )
+            return expected
+
+        return self._execute_write(_do)
+
+    @staticmethod
+    def _canonical_acp_turn_receipt_identity(
+        value: Any, *, turn_request_id: str
+    ) -> tuple[Dict[str, Any], str]:
+        """Validate the complete, closed ACP v1 identity denominator."""
+        if not isinstance(value, dict) or set(value) != _ACP_TURN_RECEIPT_IDENTITY_FIELDS:
+            raise ValueError("receipt_identity must be the closed ACP v1 identity")
+        if (
+            value.get("schema") != _ACP_TURN_RECEIPT_IDENTITY_SCHEMA
+            or value.get("version") != _ACP_TURN_RECEIPT_IDENTITY_VERSION
+            or value.get("turnRequestId") != turn_request_id
+        ):
+            raise ValueError("receipt_identity is not the current ACP v1 identity")
+        normalized = {
+            "schema": _ACP_TURN_RECEIPT_IDENTITY_SCHEMA,
+            "version": _ACP_TURN_RECEIPT_IDENTITY_VERSION,
+            "turnRequestId": SessionDB._require_target_bind_identifier(
+                value["turnRequestId"], "turnRequestId"
+            ),
+            "targetActorId": SessionDB._require_target_bind_identifier(
+                value["targetActorId"], "targetActorId"
+            ),
+            "promptDigest": value["promptDigest"],
+            "bindingGeneration": value["bindingGeneration"],
+            "targetBindingId": SessionDB._require_target_bind_identifier(
+                value["targetBindingId"], "targetBindingId"
+            ),
+            "targetAttestationId": SessionDB._require_target_bind_identifier(
+                value["targetAttestationId"], "targetAttestationId"
+            ),
+            "executorSessionId": SessionDB._require_target_bind_identifier(
+                value["executorSessionId"], "executorSessionId"
+            ),
+            "executorSessionIncarnation": SessionDB._require_target_bind_identifier(
+                value["executorSessionIncarnation"], "executorSessionIncarnation"
+            ),
+        }
+        if re.fullmatch(r"sha256:[0-9a-f]{64}", normalized["promptDigest"]) is None:
+            raise ValueError("receipt_identity promptDigest must be canonical")
+        generation = normalized["bindingGeneration"]
+        if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
+            raise ValueError("receipt_identity bindingGeneration must be nonnegative")
+        payload = json.dumps(
+            normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return normalized, "sha256:" + hashlib.sha256(payload).hexdigest()
+
+    @staticmethod
+    def _target_bind_public_receipt(record: Dict[str, Any]) -> Dict[str, Any]:
+        """Return only caller-safe, durable target-bind authorization evidence."""
+        fields = (
+            "schema",
+            "domain",
+            "version",
+            "actor_id",
+            "binding_generation",
+            "executor_runtime_identity",
+            "requested_session_id",
+            "lineage_root_digest",
+            "receipt_digest",
+        )
+        return {field: record[field] for field in fields}
+
+    def _validate_target_bind_receipt_on_conn(
+        self, conn, session_id: str, value: Any
+    ) -> Dict[str, Any]:
+        """Resolve caller evidence against exact current local durable state."""
+        expected_fields = {
+            "schema", "domain", "version", "actor_id", "binding_generation",
+            "executor_runtime_identity", "requested_session_id", "lineage_root_digest",
+            "receipt_digest",
+        }
+        if not isinstance(value, dict) or set(value) != expected_fields:
+            raise TargetBindReceiptFenceError("target bind receipt is not closed")
+        if (
+            value.get("schema") != _TARGET_BIND_RECEIPT_SCHEMA
+            or value.get("domain") != _TARGET_BIND_RECEIPT_DOMAIN
+            or value.get("version") != _TARGET_BIND_RECEIPT_VERSION
+            or value.get("requested_session_id") != session_id
+        ):
+            raise TargetBindReceiptFenceError("target bind receipt is not current")
+        actor_id = self._require_target_bind_identifier(value.get("actor_id"), "actor_id")
+        runtime_identity = self._require_target_bind_identifier(
+            value.get("executor_runtime_identity"), "executor_runtime_identity"
+        )
+        generation = value.get("binding_generation")
+        if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
+            raise TargetBindReceiptFenceError("target bind receipt generation is invalid")
+        lineage_root = self._target_bind_receipt_root(conn, session_id)
+        key, expected = self._target_bind_receipt_record(
+            session_id=session_id,
+            lineage_root_id=lineage_root,
+            actor_id=actor_id,
+            binding_generation=generation,
+            executor_runtime_identity=runtime_identity,
+        )
+        row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
+        if row is None:
+            raise TargetBindReceiptFenceError("target bind receipt is unavailable")
+        try:
+            stored = json.loads(row["value"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise TargetBindReceiptFenceError("target bind receipt is malformed") from exc
+        if stored != expected:
+            raise TargetBindReceiptFenceError("target bind receipt is stale")
+        public = self._target_bind_public_receipt(expected)
+        if value != public:
+            raise TargetBindReceiptFenceError("target bind receipt does not match durable state")
+        return public
+
+    def validate_target_bind_receipt(
+        self, session_id: str, target_bind_receipt: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Return exact current target-bind evidence or fail closed."""
+        session_id = self._require_target_bind_identifier(session_id, "session_id")
+        with self._read_ctx() as conn:
+            return self._validate_target_bind_receipt_on_conn(
+                conn, session_id, target_bind_receipt
+            )
+
+    def validate_acp_turn_receipt_request(
+        self,
+        session_id: str,
+        receipt_identity: Dict[str, Any],
+        target_bind_receipt: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Return closed ACP admission evidence without inserting or updating.
+
+        ACP-local identifiers remain opaque to Hermes: their normalized bytes
+        are committed in the identity digest, while Hermes resolves only its
+        target-bind actor, generation, runtime, and lineage-root evidence.
+        """
+        session_id = self._require_target_bind_identifier(session_id, "session_id")
+        turn_request_id = (
+            receipt_identity.get("turnRequestId")
+            if isinstance(receipt_identity, dict)
+            and isinstance(receipt_identity.get("turnRequestId"), str)
+            else ""
+        )
+        normalized_identity, identity_digest = self._canonical_acp_turn_receipt_identity(
+            receipt_identity, turn_request_id=turn_request_id
+        )
+        with self._read_ctx() as conn:
+            normalized_target_bind = self._validate_target_bind_receipt_on_conn(
+                conn, session_id, target_bind_receipt
+            )
+        if (
+            normalized_identity["targetActorId"]
+            != normalized_target_bind["actor_id"]
+            or normalized_identity["bindingGeneration"]
+            != normalized_target_bind["binding_generation"]
+        ):
+            raise TargetBindReceiptFenceError(
+                "receipt identity is not authorized by target bind receipt"
+            )
+        return {
+            "receiptIdentity": normalized_identity,
+            "receiptIdentityDigest": identity_digest,
+            "targetBindReceipt": normalized_target_bind,
+            "targetBindReceiptDigest": normalized_target_bind["receipt_digest"],
+        }
+
+    @staticmethod
+    def _require_turn_receipt_binding_digest(binding_digest: str) -> None:
+        """Reject absent bindings without imposing a digest canonicalization policy."""
+        if not isinstance(binding_digest, str) or not binding_digest:
+            raise ValueError("binding_digest is required")
+
+    @staticmethod
+    def _bound_turn_receipt_row(
+        row: Optional[sqlite3.Row], session_id: str, binding_digest: str
+    ) -> Optional[sqlite3.Row]:
+        """Return *row* only when its immutable request binding matches."""
+        if row is None:
+            return None
+        if row["session_id"] != session_id:
+            raise TurnReceiptConflictError(
+                "turn request id is already bound to another session"
+            )
+        stored_digest = row["binding_digest"]
+        if not isinstance(stored_digest, str) or not stored_digest:
+            raise TurnReceiptFenceError("turn receipt has no binding digest")
+        if stored_digest != binding_digest:
+            raise TurnReceiptConflictError(
+                "turn request id is already bound to another digest"
+            )
+        return row
+
+    def prepare_acp_turn_receipt(
+        self,
+        session_id: str,
+        receipt_identity: Dict[str, Any],
+        target_bind_receipt: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Prepare one receipt using its closed ACP identity as the binding."""
+        admission = self.validate_acp_turn_receipt_request(
+            session_id, receipt_identity, target_bind_receipt
+        )
+        return self.prepare_turn_receipt(
+            session_id,
+            admission["receiptIdentity"]["turnRequestId"],
+            admission["receiptIdentityDigest"],
+            receipt_identity=admission["receiptIdentity"],
+            target_bind_receipt=admission["targetBindReceipt"],
+        )
+
+    def prepare_turn_receipt(
+        self,
+        session_id: str,
+        turn_request_id: str,
+        binding_digest: str,
+        *,
+        receipt_identity: Optional[Dict[str, Any]] = None,
+        target_bind_receipt: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Create or replay one receipt with optional closed ACP admission evidence."""
+        if not session_id or not turn_request_id:
+            raise ValueError("session_id and turn_request_id are required")
+        self._require_turn_receipt_binding_digest(binding_digest)
+        if (receipt_identity is None) != (target_bind_receipt is None):
+            raise ValueError("receipt identity and target bind receipt are coupled")
+        now = time.time()
+
+        def _do(conn):
+            normalized_identity = None
+            identity_digest = None
+            normalized_target_bind = None
+            target_bind_digest = None
+            if receipt_identity is not None:
+                normalized_identity, identity_digest = self._canonical_acp_turn_receipt_identity(
+                    receipt_identity, turn_request_id=turn_request_id
+                )
+                normalized_target_bind = self._validate_target_bind_receipt_on_conn(
+                    conn, session_id, target_bind_receipt
+                )
+                if (
+                    normalized_identity["targetActorId"]
+                    != normalized_target_bind["actor_id"]
+                    or normalized_identity["bindingGeneration"]
+                    != normalized_target_bind["binding_generation"]
+                ):
+                    raise TargetBindReceiptFenceError(
+                        "receipt identity is not authorized by target bind receipt"
+                    )
+                if binding_digest != identity_digest:
+                    raise TurnReceiptFenceError(
+                        "ACP receipt identity digest does not match binding digest"
+                    )
+                target_bind_digest = normalized_target_bind["receipt_digest"]
+            row = conn.execute(
+                "SELECT * FROM turn_receipts WHERE turn_request_id = ?",
+                (turn_request_id,),
+            ).fetchone()
+            if row is not None:
+                row = self._bound_turn_receipt_row(row, session_id, binding_digest)
+                if row is None:  # pragma: no cover - guarded by the selected row
+                    raise TurnReceiptFenceError("turn receipt disappeared during prepare")
+                if normalized_identity is not None:
+                    if (
+                        row["receipt_identity_digest"] != identity_digest
+                        or row["target_bind_receipt_digest"] != target_bind_digest
+                    ):
+                        raise TurnReceiptConflictError(
+                            "turn request id is already bound to another ACP identity"
+                        )
+                return self._turn_receipt_public(row)
+            if normalized_identity is None:
+                conn.execute(
+                    "INSERT INTO turn_receipts "
+                    "(turn_request_id, session_id, binding_digest, status, created_at) "
+                    "VALUES (?, ?, ?, 'PREPARED', ?)",
+                    (turn_request_id, session_id, binding_digest, now),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO turn_receipts "
+                    "(turn_request_id, session_id, binding_digest, receipt_identity_json, "
+                    "receipt_identity_digest, target_bind_receipt_json, "
+                    "target_bind_receipt_digest, status, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'PREPARED', ?)",
+                    (
+                        turn_request_id,
+                        session_id,
+                        binding_digest,
+                        json.dumps(
+                            normalized_identity,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        identity_digest,
+                        json.dumps(
+                            normalized_target_bind,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        target_bind_digest,
+                        now,
+                    ),
+                )
+            row = conn.execute(
+                "SELECT * FROM turn_receipts WHERE turn_request_id = ?",
+                (turn_request_id,),
+            ).fetchone()
+            return self._turn_receipt_public(row)
+
+        result = self._execute_write(_do)
+        if result is None:  # pragma: no cover - table primary key guarantees a row
+            raise sqlite3.DatabaseError("TURN_RECEIPT_PREPARE_MISSING")
+        return result
+
+    def get_turn_receipt(
+        self, session_id: str, turn_request_id: str, binding_digest: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return a receipt only when its request binding matches exactly."""
+        if not session_id or not turn_request_id:
+            return None
+        self._require_turn_receipt_binding_digest(binding_digest)
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT * FROM turn_receipts WHERE turn_request_id = ?",
+                (turn_request_id,),
+            ).fetchone()
+        return self._turn_receipt_public(
+            self._bound_turn_receipt_row(row, session_id, binding_digest)
+        )
+
+    def get_acp_turn_receipt(
+        self,
+        session_id: str,
+        receipt_identity: Dict[str, Any],
+        target_bind_receipt: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Read one ACP receipt after revalidating its durable admission proof."""
+        admission = self.validate_acp_turn_receipt_request(
+            session_id, receipt_identity, target_bind_receipt
+        )
+        normalized_identity = admission["receiptIdentity"]
+        identity_digest = admission["receiptIdentityDigest"]
+        normalized_target_bind = admission["targetBindReceipt"]
+        try:
+            receipt = self.get_turn_receipt(
+                session_id, normalized_identity["turnRequestId"], identity_digest
+            )
+        except TurnReceiptConflictError:
+            return None
+        if receipt is None:
+            return None
+        if (
+            receipt.get("receiptIdentityDigest") != identity_digest
+            or receipt.get("targetBindReceiptDigest")
+            != normalized_target_bind["receipt_digest"]
+        ):
+            raise TurnReceiptConflictError(
+                "turn request id is already bound to another ACP identity"
+            )
+        return receipt
+
+    def claim_turn_receipt(
+        self,
+        session_id: str,
+        turn_request_id: str,
+        binding_digest: str,
+        claim_token: str,
+    ) -> bool:
+        """Claim PREPARED once, or idempotently retry its stored token."""
+        if not session_id or not turn_request_id or not claim_token:
+            return False
+        self._require_turn_receipt_binding_digest(binding_digest)
+        claimed_at = time.time()
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT * FROM turn_receipts WHERE turn_request_id = ?",
+                (turn_request_id,),
+            ).fetchone()
+            row = self._bound_turn_receipt_row(row, session_id, binding_digest)
+            if row is None:
+                return False
+            if row["status"] == "CLAIMED":
+                return row["claim_token"] == claim_token
+            if row["status"] != "PREPARED":
+                return False
+            changed = conn.execute(
+                "UPDATE turn_receipts SET status = 'CLAIMED', claim_token = ?, "
+                "claimed_at = ? WHERE session_id = ? AND turn_request_id = ? "
+                "AND binding_digest = ? AND status = 'PREPARED'",
+                (
+                    claim_token,
+                    claimed_at,
+                    session_id,
+                    turn_request_id,
+                    binding_digest,
+                ),
+            ).rowcount
+            return changed == 1
+
+        return bool(self._execute_write(_do))
+
+    @staticmethod
+    def _canonical_acp_abort_digest(payload: Dict[str, Any]) -> str:
+        """Hash one canonical UTF-8 abort evidence payload."""
+        encoded = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+    @classmethod
+    def _acp_abort_evidence_digests(
+        cls,
+        *,
+        receipt_identity_digest: str,
+        target_bind_receipt_digest: str,
+        claim_token: str,
+        reason_code: str,
+    ) -> tuple[str, str]:
+        """Derive the closed ABORTED receipt and evidence commitments."""
+        receipt_id = cls._canonical_acp_abort_digest(
+            {
+                "domain": _ACP_TURN_RECEIPT_ABORT_RECEIPT_ID_DOMAIN,
+                "version": 1,
+                "receiptIdentityDigest": receipt_identity_digest,
+                "targetBindReceiptDigest": target_bind_receipt_digest,
+                "claimToken": claim_token,
+            }
+        )
+        evidence_digest = cls._canonical_acp_abort_digest(
+            {
+                "domain": _ACP_TURN_RECEIPT_ABORT_EVIDENCE_DOMAIN,
+                "version": 1,
+                "receiptId": receipt_id,
+                "receiptIdentityDigest": receipt_identity_digest,
+                "targetBindReceiptDigest": target_bind_receipt_digest,
+                "reasonCode": reason_code,
+                "claimToken": claim_token,
+            }
+        )
+        return receipt_id, evidence_digest
+
+    def abort_acp_turn_receipt(
+        self,
+        session_id: str,
+        receipt_identity: Dict[str, Any],
+        target_bind_receipt: Dict[str, Any],
+        claim_token: str,
+        reason_code: str,
+    ) -> Dict[str, Any]:
+        """Atomically terminalize one matching claimed ACP receipt as ABORTED."""
+        session_id = self._require_target_bind_identifier(session_id, "session_id")
+        if not isinstance(claim_token, str) or not claim_token:
+            raise ValueError("claim_token is required")
+        if reason_code != _ACP_TURN_RECEIPT_ABORT_REASON:
+            raise ValueError("abort reason code is not allowed")
+        turn_request_id = ""
+        if isinstance(receipt_identity, dict):
+            candidate_turn_request_id = receipt_identity.get("turnRequestId")
+            if isinstance(candidate_turn_request_id, str):
+                turn_request_id = candidate_turn_request_id
+
+        def _do(conn):
+            identity, identity_digest = self._canonical_acp_turn_receipt_identity(
+                receipt_identity, turn_request_id=turn_request_id
+            )
+            target_bind = self._validate_target_bind_receipt_on_conn(
+                conn, session_id, target_bind_receipt
+            )
+            if (
+                identity["targetActorId"] != target_bind["actor_id"]
+                or identity["bindingGeneration"] != target_bind["binding_generation"]
+            ):
+                raise TargetBindReceiptFenceError(
+                    "receipt identity is not authorized by target bind receipt"
+                )
+            target_bind_digest = target_bind["receipt_digest"]
+            row = conn.execute(
+                "SELECT * FROM turn_receipts WHERE turn_request_id = ?",
+                (identity["turnRequestId"],),
+            ).fetchone()
+            row = self._bound_turn_receipt_row(row, session_id, identity_digest)
+            if row is None:
+                raise TurnReceiptFenceError("ACP terminal receipt was not prepared")
+            if (
+                row["receipt_identity_digest"] != identity_digest
+                or row["target_bind_receipt_digest"] != target_bind_digest
+            ):
+                raise TurnReceiptConflictError(
+                    "turn request id is already bound to another ACP identity"
+                )
+            if row["claim_token"] != claim_token:
+                raise TurnReceiptFenceError("ACP terminal receipt claim token was refused")
+            if row["status"] == "COMPLETED":
+                return self._turn_receipt_public(row)
+            receipt_id, evidence_digest = self._acp_abort_evidence_digests(
+                receipt_identity_digest=identity_digest,
+                target_bind_receipt_digest=target_bind_digest,
+                claim_token=claim_token,
+                reason_code=reason_code,
+            )
+            if row["status"] == "ABORTED":
+                if (
+                    row["abort_receipt_id"] != receipt_id
+                    or row["abort_evidence_digest"] != evidence_digest
+                    or row["abort_reason_code"] != reason_code
+                    or row["aborted_at"] is None
+                ):
+                    raise TurnReceiptConflictError(
+                        "aborted turn receipt has different terminal evidence"
+                    )
+                return self._turn_receipt_public(row)
+            if row["status"] != "CLAIMED":
+                raise TurnReceiptFenceError("ACP terminal receipt was not claimed")
+            changed = conn.execute(
+                "UPDATE turn_receipts SET status = 'ABORTED', abort_receipt_id = ?, "
+                "abort_evidence_digest = ?, abort_reason_code = ?, aborted_at = ? "
+                "WHERE session_id = ? AND turn_request_id = ? AND status = 'CLAIMED' "
+                "AND binding_digest = ? AND receipt_identity_digest = ? "
+                "AND target_bind_receipt_digest = ? AND claim_token = ?",
+                (
+                    receipt_id,
+                    evidence_digest,
+                    reason_code,
+                    time.time(),
+                    session_id,
+                    identity["turnRequestId"],
+                    identity_digest,
+                    identity_digest,
+                    target_bind_digest,
+                    claim_token,
+                ),
+            ).rowcount
+            if changed != 1:
+                raise TurnReceiptFenceError("ACP terminal receipt abort was refused")
+            row = conn.execute(
+                "SELECT * FROM turn_receipts WHERE turn_request_id = ?",
+                (identity["turnRequestId"],),
+            ).fetchone()
+            aborted = self._turn_receipt_public(row)
+            if aborted is None:  # pragma: no cover - primary-key update preserves the row
+                raise sqlite3.DatabaseError("ACP_TURN_RECEIPT_ABORT_MISSING")
+            return aborted
+
+        result = self._execute_write(_do)
+        if not isinstance(result, dict):  # pragma: no cover - durable receipt always projects
+            raise sqlite3.DatabaseError("ACP_TURN_RECEIPT_ABORT_MISSING")
+        return result
+
+    @staticmethod
+    def _preflight_terminal_turn_receipt(
+        conn, receipt: TerminalTurnReceipt
+    ) -> Optional[int]:
+        """Refuse a stale completion before its assistant row is inserted."""
+        row = conn.execute(
+            "SELECT * FROM turn_receipts WHERE turn_request_id = ?",
+            (receipt.turn_request_id,),
+        ).fetchone()
+        row = SessionDB._bound_turn_receipt_row(
+            row, receipt.session_id, receipt.binding_digest
+        )
+        if row is None:
+            raise TurnReceiptFenceError("terminal receipt was not prepared")
+        if row["status"] == "COMPLETED":
+            if row["claim_token"] != receipt.claim_token:
+                raise TurnReceiptFenceError("terminal receipt claim token was refused")
+            if (
+                row["terminal_message_id"] is not None
+                and row["response_digest"] == receipt.response_digest
+            ):
+                return int(row["terminal_message_id"])
+            raise TurnReceiptConflictError(
+                "completed turn receipt has a different terminal binding"
+            )
+        if row["status"] != "CLAIMED" or row["claim_token"] != receipt.claim_token:
+            raise TurnReceiptFenceError("terminal receipt claim token was refused")
+        return None
+
+    @staticmethod
+    def _complete_terminal_turn_receipt(
+        conn, receipt: TerminalTurnReceipt, terminal_message_id: int
+    ) -> None:
+        """Complete one claimed receipt on the existing transcript transaction."""
+        completed_at = time.time()
+        changed = conn.execute(
+            "UPDATE turn_receipts SET status = 'COMPLETED', "
+            "terminal_message_id = ?, response_digest = ?, completed_at = ? "
+            "WHERE session_id = ? AND turn_request_id = ? AND status = 'CLAIMED' "
+            "AND binding_digest = ? AND claim_token = ?",
+            (
+                terminal_message_id,
+                receipt.response_digest,
+                completed_at,
+                receipt.session_id,
+                receipt.turn_request_id,
+                receipt.binding_digest,
+                receipt.claim_token,
+            ),
+        ).rowcount
+        if changed != 1:
+            raise TurnReceiptFenceError("terminal receipt completion was refused")
+
+    def finish_turn_receipt(
+        self,
+        session_id: str,
+        turn_request_id: str,
+        binding_digest: str,
+        claim_token: str,
+        *,
+        assistant_content: str,
+        response_digest: str,
+    ) -> Dict[str, Any]:
+        """Append an assistant terminal row and complete its receipt together."""
+        self._require_turn_receipt_binding_digest(binding_digest)
+        self.append_message(
+            session_id,
+            "assistant",
+            content=assistant_content,
+            terminal_turn_receipt=TerminalTurnReceipt(
+                session_id=session_id,
+                turn_request_id=turn_request_id,
+                binding_digest=binding_digest,
+                claim_token=claim_token,
+                response_digest=response_digest,
+                terminal_message_index=0,
+            ),
+        )
+        receipt = self.get_turn_receipt(session_id, turn_request_id, binding_digest)
+        if receipt is None:  # pragma: no cover - guarded by the same transaction
+            raise sqlite3.DatabaseError("TURN_RECEIPT_FINISH_MISSING")
+        return receipt
+
+    def prune_turn_receipts(self, session_id: str, completed_before: float) -> int:
+        """Prune only old COMPLETED receipts; pending evidence is retained."""
+        if not session_id:
+            return 0
+
+        def _do(conn):
+            return conn.execute(
+                "DELETE FROM turn_receipts WHERE session_id = ? "
+                "AND status = 'COMPLETED' AND completed_at < ?",
+                (session_id, float(completed_before)),
+            ).rowcount
+
+        return int(self._execute_write(_do) or 0)
 
     def get_compression_lock_holder(self, session_id: str) -> Optional[str]:
         """Return the current (non-expired) holder for ``session_id``, or None.
@@ -8727,6 +11733,143 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             raise ValueError(f"invalid automatic title source: {source!r}")
         return self._set_session_title(session_id, title, source=source)
 
+    def set_auto_title_for_attempt(
+        self,
+        originating_session_id: str,
+        title: str,
+        *,
+        source: str,
+        expected_title: Optional[str],
+        expected_source: Optional[str],
+    ) -> bool:
+        """Conditionally persist a background title on its live attempt target.
+
+        An automatic title worker can outlive compression of the segment that
+        started it.  Resolve that segment's live compression continuation and
+        require the derived title captured by the originating attempt in the
+        SAME transaction as the LLM upgrade.  This leaves a worker that races a
+        manual title, another LLM result, or a non-compression close with no
+        target it may safely mutate.
+        """
+        if source not in (self.TITLE_SOURCE_DERIVED, self.TITLE_SOURCE_LLM):
+            raise ValueError(f"invalid automatic title source: {source!r}")
+        title = self.sanitize_title(title)
+        if not title:
+            return False
+        if expected_title is None:
+            if expected_source is not None:
+                return False
+        elif expected_source != self.TITLE_SOURCE_DERIVED:
+            return False
+
+        def _resolve_live_target(conn) -> Optional[str]:
+            current = originating_session_id
+            seen = {current} if current else set()
+            for _ in range(100):
+                row = conn.execute(
+                    "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
+                    (current,),
+                ).fetchone()
+                if row is None:
+                    return None
+                if row["ended_at"] is None:
+                    return current
+                if row["end_reason"] != "compression":
+                    return None
+                children = conn.execute(
+                    """
+                    SELECT child.id
+                    FROM sessions AS parent
+                    JOIN sessions AS child ON child.parent_session_id = parent.id
+                    WHERE parent.id = ?
+                      AND parent.end_reason = 'compression'
+                      AND COALESCE(json_extract(COALESCE(child.model_config, '{}'),
+                                                '$._branched_from'), '') != ?
+                      AND COALESCE(json_extract(COALESCE(child.model_config, '{}'),
+                                                '$._delegate_from'), '') != ?
+                      AND COALESCE(child.source, '') != 'tool'
+                    ORDER BY child.started_at ASC, child.id ASC
+                    LIMIT 2
+                    """,
+                    (current, current, current),
+                ).fetchall()
+                if len(children) != 1:
+                    return None
+                child_id = children[0]["id"]
+                if not child_id or child_id in seen:
+                    return None
+                seen.add(child_id)
+                current = child_id
+            return None
+
+        def _do(conn):
+            target_id = _resolve_live_target(conn)
+            if target_id is None:
+                return 0
+            current = conn.execute(
+                "SELECT title, title_source, ended_at FROM sessions WHERE id = ?",
+                (target_id,),
+            ).fetchone()
+            if current is None or current["ended_at"] is not None:
+                return 0
+            if expected_title is None:
+                # A collision-declined instant title can still title an active
+                # origin later, but it has no derived identity to carry across
+                # a compression boundary.
+                if (
+                    target_id != originating_session_id
+                    or current["title"] is not None
+                    or current["title_source"] is not None
+                ):
+                    return 0
+            elif (
+                current["title"] != expected_title
+                or current["title_source"] != expected_source
+            ):
+                return 0
+
+            if (
+                current["title"] is not None
+                and self._title_rank(current["title_source"])
+                >= self._title_rank(source)
+            ):
+                return 0
+
+            conflict = conn.execute(
+                "SELECT id FROM sessions WHERE title = ? AND id != ?",
+                (title, target_id),
+            ).fetchone()
+            if conflict:
+                conflict_id = conflict["id"]
+                if self._is_compression_ancestor(
+                    conn, ancestor_id=conflict_id, descendant_id=target_id
+                ):
+                    conn.execute(
+                        "UPDATE sessions SET title = NULL, title_source = NULL "
+                        "WHERE id = ?",
+                        (conflict_id,),
+                    )
+                else:
+                    raise ValueError(
+                        f"Title '{title}' is already in use by session {conflict_id}"
+                    )
+
+            cursor = conn.execute(
+                "UPDATE sessions SET title = ?, title_source = ? "
+                "WHERE id = ? AND ended_at IS NULL AND title IS ? "
+                "AND title_source IS ?",
+                (
+                    title,
+                    source,
+                    target_id,
+                    current["title"],
+                    current["title_source"],
+                ),
+            )
+            return cursor.rowcount
+
+        return bool(self._execute_write(_do))
+
     def set_auto_title_if_empty(self, session_id: str, title: str) -> bool:
         """Back-compat shim: set an LLM title only if nothing better exists.
 
@@ -9836,6 +12979,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         compression_lock_holder: Optional[str] = None,
         turn_lease_holder: Optional[str] = None,
         turn_lease_ttl_seconds: float = 300.0,
+        terminal_turn_receipt: Optional[TerminalTurnReceipt] = None,
     ) -> int:
         """
         Append a message to a session. Returns the message row ID.
@@ -9856,7 +13000,25 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         (which sqlite3 cannot bind and which the conversation loop scrubs
         from every outgoing payload anyway, so the scrubbed form IS the
         wire bytes).
+
+        ``terminal_turn_receipt`` is completed in this very transaction.  A
+        fenced or failed receipt update therefore rolls back the assistant row
+        it describes rather than leaving a durable, ambiguous reply.
         """
+        if terminal_turn_receipt is not None:
+            if terminal_turn_receipt.session_id != session_id:
+                raise ValueError("terminal_turn_receipt session does not match append")
+            self._validate_terminal_turn_receipt_batch(
+                [
+                    {
+                        "role": role,
+                        "content": content,
+                        "tool_calls": tool_calls,
+                        "display_kind": display_kind,
+                    }
+                ],
+                terminal_turn_receipt,
+            )
         # Display metadata is presentation-only and never changes the model
         # context role/content replayed to providers.
         display_metadata_json = self._encode_display_metadata(display_metadata)
@@ -9900,6 +13062,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 turn_lease_holder=turn_lease_holder,
                 turn_lease_ttl_seconds=turn_lease_ttl_seconds,
             )
+            if terminal_turn_receipt is not None:
+                existing_terminal_id = self._preflight_terminal_turn_receipt(
+                    conn, terminal_turn_receipt
+                )
+                if existing_terminal_id is not None:
+                    return existing_terminal_id
             cursor = conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
@@ -9944,6 +13112,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?",
                     (session_id,),
                 )
+            if terminal_turn_receipt is not None:
+                self._complete_terminal_turn_receipt(
+                    conn, terminal_turn_receipt, int(msg_id)
+                )
             return msg_id
 
         # Transcript append is THE critical write: its failure aborts the
@@ -9955,6 +13127,30 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
         )
 
+    @staticmethod
+    def _validate_terminal_turn_receipt_batch(
+        messages: List[Dict[str, Any]], receipt: TerminalTurnReceipt
+    ) -> None:
+        """Fence a receipt to one visible, newly inserted assistant row."""
+        index = receipt.terminal_message_index
+        if index < 0 or index >= len(messages):
+            raise ValueError("terminal_turn_receipt index is outside the batch")
+        terminal_message = messages[index]
+        if not isinstance(terminal_message, dict):
+            raise ValueError("terminal_turn_receipt index does not select a message")
+        if sum(message is terminal_message for message in messages) != 1:
+            raise ValueError("terminal_turn_receipt message is not unique in the batch")
+        if (
+            terminal_message.get("role") != "assistant"
+            or terminal_message.get("display_kind") == "hidden"
+            or terminal_message.get("tool_calls")
+            or not isinstance(terminal_message.get("content"), str)
+            or terminal_message.get(_DB_PERSISTED_MARKER_KEY)
+        ):
+            raise ValueError("terminal_turn_receipt row is not a visible terminal assistant")
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", receipt.response_digest):
+            raise ValueError("terminal_turn_receipt response digest is invalid")
+
     def append_messages_batch(
         self,
         session_id: str,
@@ -9963,6 +13159,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         turn_lease_holder: Optional[str] = None,
         chunk_rows: Optional[int] = None,
         turn_lease_ttl_seconds: float = 300.0,
+        terminal_turn_receipt: Optional[TerminalTurnReceipt] = None,
     ) -> int:
         """Append multiple messages atomically in ONE write transaction.
 
@@ -9991,6 +13188,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         leaves a partial seed), just with bounded lock holds. A turn flush
         never needs it. Returns the inserted row count.
         """
+        if terminal_turn_receipt is not None:
+            if terminal_turn_receipt.session_id != session_id:
+                raise ValueError("terminal_turn_receipt session does not match append")
+            self._validate_terminal_turn_receipt_batch(
+                messages, terminal_turn_receipt
+            )
+
+        if terminal_turn_receipt is not None and chunk_rows is not None:
+            raise ValueError(
+                "terminal_turn_receipt cannot be combined with chunk_rows"
+            )
+
         if not messages:
             return 0
 
@@ -10014,6 +13223,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 turn_lease_holder=turn_lease_holder,
                 turn_lease_ttl_seconds=turn_lease_ttl_seconds,
             )
+            if terminal_turn_receipt is not None:
+                existing_terminal_id = self._preflight_terminal_turn_receipt(
+                    conn, terminal_turn_receipt
+                )
+                if existing_terminal_id is not None:
+                    raise TurnReceiptConflictError(
+                        "a completed terminal receipt cannot be replayed as a batch"
+                    )
             inserted, tool_calls_total = self._insert_message_rows(
                 conn, session_id, messages
             )
@@ -10028,6 +13245,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 conn.execute(
                     "UPDATE sessions SET message_count = message_count + ? WHERE id = ?",
                     (inserted, session_id),
+                )
+            if terminal_turn_receipt is not None:
+                terminal_message_id = messages[
+                    terminal_turn_receipt.terminal_message_index
+                ].get("_row_id")
+                if not isinstance(terminal_message_id, int):
+                    raise sqlite3.DatabaseError(
+                        "terminal_turn_receipt selected row was not inserted"
+                    )
+                self._complete_terminal_turn_receipt(
+                    conn, terminal_turn_receipt, int(terminal_message_id)
                 )
             return inserted
 
@@ -10438,6 +13666,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     (session_id,),
                 )
             else:
+                _retire_terminal_turn_receipts(
+                    conn, [session_id], active_only=active_only
+                )
                 conn.execute(
                     f"DELETE FROM messages WHERE session_id = ?{active_clause}",
                     (session_id,),
@@ -11892,6 +15123,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     def clear_messages(self, session_id: str) -> None:
         """Delete all messages for a session and reset its counters."""
         def _do(conn):
+            _retire_terminal_turn_receipts(conn, [session_id])
             conn.execute(
                 "DELETE FROM messages WHERE session_id = ?", (session_id,)
             )
@@ -11992,6 +15224,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "WHERE parent_session_id = ?",
                 (session_id,),
             )
+            _retire_terminal_turn_receipts(conn, [session_id])
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
             self._delete_unreferenced_system_prompts(conn)
@@ -12662,8 +15895,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     affected.append(row["id"])
             return affected
 
-        with self._read_ctx() as conn:
-            affected_ids = _find_affected(conn)
+        # A backup is about to acquire the raw-maintenance fence.  Use the
+        # writer for its preflight read so this operation does not leave one
+        # of SessionDB's pooled WAL readers in the way of that fence.
+        if backup:
+            with self._lock:
+                affected_ids = _find_affected(self._conn)
+        else:
+            with self._read_ctx() as conn:
+                affected_ids = _find_affected(conn)
 
         if dry_run:
             return {
@@ -12690,7 +15930,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 f"{self.db_path.name}.pre-clean-markers-backup-{stamp}"
             )
             with self._lock:
-                self._conn.execute("VACUUM INTO ?", (str(dest),))
+                with self._raw_maintenance_fence() as conn:
+                    conn.execute("VACUUM INTO ?", (str(dest),))
             backup_path = str(dest)
             logger.info("Backed up state.db to %s before clean-markers write", backup_path)
 
@@ -12829,7 +16070,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                automatically clears bindings.
         """
         def _do(conn):
-            conn.executescript(
+            for statement in self._split_fts_schema_script(
                 """
                 CREATE TABLE IF NOT EXISTS telegram_dm_topic_mode (
                     chat_id TEXT PRIMARY KEY,
@@ -12862,7 +16103,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 CREATE INDEX IF NOT EXISTS idx_telegram_dm_topic_bindings_user
                 ON telegram_dm_topic_bindings(user_id, chat_id);
                 """
-            )
+            ):
+                conn.execute(statement)
 
             # v1 → v2: rebuild telegram_dm_topic_bindings if its session_id FK
             # lacks ON DELETE CASCADE. SQLite can't ALTER a foreign key, so we
@@ -12881,7 +16123,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     for row in fk_rows
                 )
                 if needs_rebuild:
-                    conn.executescript(
+                    for statement in self._split_fts_schema_script(
                         """
                         CREATE TABLE telegram_dm_topic_bindings_new (
                             chat_id TEXT NOT NULL,
@@ -12906,7 +16148,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         CREATE INDEX idx_telegram_dm_topic_bindings_user
                             ON telegram_dm_topic_bindings(user_id, chat_id);
                         """
-                    )
+                    ):
+                        conn.execute(statement)
 
             conn.execute(
                 "INSERT INTO state_meta (key, value) VALUES (?, ?) "
@@ -13384,31 +16627,34 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         optimized = 0
         try:
             optimized = self.optimize_fts()
+        except SessionTurnLeaseLostError:
+            raise
         except Exception as exc:
             logger.warning("FTS optimize before VACUUM failed: %s", exc)
         # VACUUM cannot be executed inside a transaction.
         with self._lock:
-            # Best-effort WAL checkpoint first, then VACUUM. PASSIVE, not
-            # TRUNCATE: a manual `hermes sessions vacuum` runs in a transient
-            # CLI process, and a TRUNCATE reset here would race a live gateway
-            # writer and tear B-tree pages (#45383). VACUUM folds the WAL back
-            # itself; journal_size_limit bounds the file.
-            try:
-                self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except Exception as exc:
-                logger.debug("WAL checkpoint (PASSIVE) before VACUUM failed: %s", exc)
-            self._conn.execute("VACUUM")
-            # ...and again afterwards. VACUUM rewrites every page THROUGH the
-            # WAL, so the pre-VACUUM checkpoint above does nothing for the
-            # slack VACUUM itself creates: on a 3.0 GB database it left a
-            # 3.07 GB state.db-wal behind, so `sessions optimize` reported
-            # "reclaimed -11.2 MB" while actually consuming 3 GB of disk and
-            # filling the host to 100%. Truncating here is what makes the
-            # command a net win instead of a net loss on large databases.
-            try:
-                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            except Exception as exc:
-                logger.debug("WAL checkpoint (TRUNCATE) after VACUUM failed: %s", exc)
+            with self._raw_maintenance_fence() as conn:
+                # Best-effort WAL checkpoint first, then VACUUM. PASSIVE, not
+                # TRUNCATE: a manual `hermes sessions vacuum` runs in a transient
+                # CLI process, and a TRUNCATE reset here would race a live gateway
+                # writer and tear B-tree pages (#45383). VACUUM folds the WAL back
+                # itself; journal_size_limit bounds the file.
+                try:
+                    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                except Exception as exc:
+                    logger.debug("WAL checkpoint (PASSIVE) before VACUUM failed: %s", exc)
+                conn.execute("VACUUM")
+                # ...and again afterwards. VACUUM rewrites every page THROUGH the
+                # WAL, so the pre-VACUUM checkpoint above does nothing for the
+                # slack VACUUM itself creates: on a 3.0 GB database it left a
+                # 3.07 GB state.db-wal behind, so `sessions optimize` reported
+                # "reclaimed -11.2 MB" while actually consuming 3 GB of disk and
+                # filling the host to 100%. Truncating here is what makes the
+                # command a net win instead of a net loss on large databases.
+                try:
+                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                except Exception as exc:
+                    logger.debug("WAL checkpoint (TRUNCATE) after VACUUM failed: %s", exc)
         return optimized
 
     def maybe_auto_prune_and_vacuum(
@@ -13480,6 +16726,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     self.vacuum()
                     result["vacuumed"] = True
                     self.set_meta("last_vacuum", str(now))
+                except SessionTurnLeaseLostError:
+                    # A raw-maintenance fence refusal says another owner may
+                    # now govern state.db. It is not a best-effort vacuum
+                    # failure and must not fall through to success metadata.
+                    raise
                 except Exception as exc:
                     logger.warning("state.db VACUUM failed: %s", exc)
 
@@ -13494,6 +16745,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     retention_days,
                     " + VACUUM" if result["vacuumed"] else "",
                 )
+        except SessionTurnLeaseLostError:
+            raise
         except Exception as exc:
             # Maintenance must never block startup. Log and return error marker.
             logger.warning("state.db auto-maintenance failed: %s", exc)

@@ -163,74 +163,44 @@ def test_translate_native_response_surfaces_reasoning_and_tool_calls():
     assert json.loads(choice.message.tool_calls[0].function.arguments) == {"q": "hermes"}
 
 
-def test_native_client_uses_x_goog_api_key_and_native_models_endpoint(monkeypatch):
-    from agent.gemini_native_adapter import GeminiNativeClient
+def test_native_client_denies_before_key_or_http_client_setup(monkeypatch):
+    import agent.gemini_native_adapter as adapter
+    from agent.gemini_outbound_policy import GeminiOutboundDenied
 
-    recorded = {}
+    class ExplodingClient:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("httpx.Client must not be created")
 
-    class DummyHTTP:
-        def post(self, url, json=None, headers=None, timeout=None):
-            recorded["url"] = url
-            recorded["json"] = json
-            recorded["headers"] = headers
-            return DummyResponse(
-                payload={
-                    "candidates": [
-                        {
-                            "content": {"parts": [{"text": "hello"}]},
-                            "finishReason": "STOP",
-                        }
-                    ],
-                    "usageMetadata": {
-                        "promptTokenCount": 1,
-                        "candidatesTokenCount": 1,
-                        "totalTokenCount": 2,
-                    },
-                }
-            )
+    class ExplodingTimeout:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("httpx.Timeout must not be created")
 
-        def close(self):
-            return None
+    monkeypatch.setattr(adapter.httpx, "Client", ExplodingClient)
+    monkeypatch.setattr(adapter.httpx, "Timeout", ExplodingTimeout)
 
-    monkeypatch.setattr("agent.gemini_native_adapter.httpx.Client", lambda *a, **k: DummyHTTP())
+    denials = []
+    unexpected = []
+    for api_key in ("AIza-test", ""):
+        try:
+            adapter.GeminiNativeClient(api_key=api_key)
+        except GeminiOutboundDenied as exc:
+            denials.append(exc)
+        except Exception as exc:
+            unexpected.append(exc)
 
-    client = GeminiNativeClient(api_key="AIza-test", base_url="https://generativelanguage.googleapis.com/v1beta")
-    response = client.chat.completions.create(
-        model="gemini-2.5-flash",
-        messages=[{"role": "user", "content": "Hello"}],
-    )
-
-    assert recorded["url"] == "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
-    assert recorded["headers"]["x-goog-api-key"] == "AIza-test"
-    assert "Authorization" not in recorded["headers"]
-    assert response.choices[0].message.content == "hello"
+    assert unexpected == []
+    assert len(denials) == 2
+    for exc in denials:
+        assert type(exc) is GeminiOutboundDenied
+        assert str(exc) == "Gemini outbound requests are disabled."
+        assert exc.code == "gemini_outbound_denied"
+        assert vars(exc) == {}
 
 
 
 
 
 
-
-
-def test_native_client_accepts_injected_http_client():
-    from agent.gemini_native_adapter import GeminiNativeClient
-
-    injected = SimpleNamespace(close=lambda: None)
-    client = GeminiNativeClient(api_key="AIza-test", http_client=injected)
-    assert client._http is injected
-
-
-def test_native_client_rejects_empty_api_key_with_actionable_message():
-    """Empty/whitespace api_key must raise at construction, not produce a cryptic
-    Google GFE 'Error 400 (Bad Request)!!1' HTML page on the first request."""
-    from agent.gemini_native_adapter import GeminiNativeClient
-
-    for bad in ("", "   ", None):
-        with pytest.raises(RuntimeError) as excinfo:
-            GeminiNativeClient(api_key=bad)  # type: ignore[arg-type]
-        msg = str(excinfo.value)
-        assert "GOOGLE_API_KEY" in msg and "GEMINI_API_KEY" in msg
-        assert "aistudio.google.com" in msg
 
 
 @pytest.mark.asyncio

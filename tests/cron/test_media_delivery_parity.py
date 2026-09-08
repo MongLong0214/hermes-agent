@@ -30,7 +30,11 @@ from pathlib import Path
 
 import pytest
 
-from cron.scheduler import _deliver_result, _send_media_via_adapter
+from cron.scheduler import (
+    _CRON_DELIVERY_FAILURE,
+    _deliver_result,
+    _send_media_via_adapter,
+)
 
 
 @pytest.fixture()
@@ -128,7 +132,7 @@ class TestStandaloneWarningsSurfaced:
             "an attachment-upload failure reported via warnings must surface "
             "as a delivery error, not vanish"
         )
-        assert "missing_scope" in err or "Failed to send media" in err
+        assert err == _CRON_DELIVERY_FAILURE
 
     def test_clean_delivery_still_returns_none(
         self, monkeypatch, slack_platform_config, slack_job, media_file
@@ -187,7 +191,7 @@ class TestLiveAdapterMediaFailuresSurfaced:
             assert errors, (
                 "a failed media send must be returned to the caller, not only logged"
             )
-            assert any("upload rejected" in e for e in errors)
+            assert errors == [_CRON_DELIVERY_FAILURE]
         finally:
             loop.call_soon_threadsafe(loop.stop)
             t.join(timeout=5)

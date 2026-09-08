@@ -3571,6 +3571,15 @@ class SessionStore:
             self._ensure_loaded_locked()
             return self._entries.get(session_key)
 
+    def lookup_by_session_key_existing(self, session_key: str) -> Optional[SessionEntry]:
+        """Return an already-loaded entry without creating, healing, or recovering it."""
+        if not isinstance(session_key, str) or not session_key:
+            return None
+        with self._lock:
+            if not self._loaded:
+                return None
+            return self._entries.get(session_key)
+
     def peek_session_id(self, session_key: str) -> Optional[str]:
         """Return the persisted session_id currently bound to a session key.
 

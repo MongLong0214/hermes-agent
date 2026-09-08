@@ -28,25 +28,26 @@ def _run_probe(resp: MagicMock) -> str:
 
 
 class TestProbeGeminiTier:
-    """Verify the tier probe classifies keys correctly."""
+    def test_probe_denies_before_http_client_and_propagates_canonical_error(self, monkeypatch):
+        import pytest
 
+        import agent.gemini_native_adapter as adapter
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
 
+        class ExplodingClient:
+            def __init__(self, *args, **kwargs):
+                raise AssertionError("httpx.Client must not be created")
 
+        monkeypatch.setattr(adapter.httpx, "Client", ExplodingClient)
 
+        with pytest.raises(GeminiOutboundDenied) as excinfo:
+            adapter.probe_gemini_tier("fake-key")
 
-    def test_free_tier_via_429_body(self):
-        body = (
-            '{"error":{"code":429,"message":"Quota exceeded for metric: '
-            'generativelanguage.googleapis.com/generate_content_free_tier_requests, '
-            'limit: 20"}}'
-        )
-        resp = _mock_response(429, {}, body)
-        assert _run_probe(resp) == "free"
-
-
-    def test_successful_200_without_rpd_header_is_paid(self):
-        resp = _mock_response(200, {}, '{"candidates":[]}')
-        assert _run_probe(resp) == "paid"
+        exc = excinfo.value
+        assert type(exc) is GeminiOutboundDenied
+        assert str(exc) == "Gemini outbound requests are disabled."
+        assert exc.code == "gemini_outbound_denied"
+        assert vars(exc) == {}
 
 
 

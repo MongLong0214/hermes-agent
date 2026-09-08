@@ -31,7 +31,7 @@ import pytest
 
 from agent.memory_manager import build_memory_context_block
 from agent.turn_context import build_turn_context, compose_user_api_content
-from hermes_state import SessionDB
+from hermes_state import SCHEMA_VERSION, SessionDB
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +117,9 @@ class TestAutoMigration:
                 reasoning TEXT
             );
         """)
+        conn.execute(
+            "INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,)
+        )
         conn.execute(
             "INSERT INTO messages (session_id, role, content, timestamp) "
             "VALUES (?, ?, ?, ?)",

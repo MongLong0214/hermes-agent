@@ -11,6 +11,7 @@ Covers:
 """
 
 import logging
+from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -19,7 +20,11 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import PlatformConfig
-from gateway.platforms.api_server import APIServerAdapter, cors_middleware
+from gateway.platforms.api_server import (
+    APIServerAdapter,
+    _project_public_cron_job,
+    cors_middleware,
+)
 
 _MOD = "gateway.platforms.api_server"
 
@@ -64,6 +69,59 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/api/jobs/{job_id}/resume", adapter._handle_resume_job)
     app.router.add_post("/api/jobs/{job_id}/run", adapter._handle_run_job)
     return app
+
+
+_PUBLIC_CRON_JOB_FIELDS = frozenset({
+    "id",
+    "name",
+    "prompt",
+    "skill",
+    "skills",
+    "schedule",
+    "schedule_display",
+    "repeat",
+    "restart_policy",
+    "deliver",
+    "enabled",
+    "state",
+    "paused_at",
+    "paused_reason",
+    "next_run_at",
+    "last_run_at",
+    "last_status",
+    "last_delivery_error",
+    "last_fire_error",
+})
+
+
+def _public_job_fields(job):
+    return {key: job[key] for key in _PUBLIC_CRON_JOB_FIELDS if key in job}
+
+
+def _all_mapping_keys(value):
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            yield key
+            yield from _all_mapping_keys(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            yield from _all_mapping_keys(nested)
+
+
+def _assert_public_job_response(response_job, stored_job):
+    assert response_job == _public_job_fields(stored_job)
+    assert set(response_job) <= _PUBLIC_CRON_JOB_FIELDS
+    assert not {
+        "run_claim",
+        "fire_claim",
+        "resume_reservation",
+        "future_internal_key",
+        "latest_execution",
+        "owner",
+        "occurrence_id",
+        "process_token",
+        "session_id",
+    }.intersection(_all_mapping_keys(response_job))
 
 
 @pytest.fixture
@@ -335,8 +393,377 @@ class TestRunJob:
                 resp = await cli.post(f"/api/jobs/{VALID_JOB_ID}/run")
                 assert resp.status == 200
                 data = await resp.json()
-                assert data["job"] == triggered_job
+                assert data["job"] == SAMPLE_JOB
+                assert "last_run" not in data["job"]
                 mock_trigger.assert_called_once_with(VALID_JOB_ID)
+
+
+class TestPublicJobProjection:
+    def test_projection_detaches_mutable_values_and_closes_status_shapes(self):
+        """Projection owns its graph and exposes only the nested status schema."""
+        source = {
+            "schedule": {"parts": ["weekday"], "window": {"hour": 9}},
+            "skills": [{"name": "public-skill", "labels": ["daily"]}],
+            "repeat": {"remaining": [3]},
+            "last_delivery_error": None,
+            "last_fire_error": {
+                "at": {"attempts": ["first"]},
+                "detail": "safe fire detail",
+                "future_private_status": {"marker": "nested-private-canary"},
+            },
+            "future_internal_key": {"marker": "top-level-private-canary"},
+        }
+        original = deepcopy(source)
+
+        projected = _project_public_cron_job(source)
+
+        for field in ("schedule", "skills", "repeat"):
+            assert projected[field] == source[field]
+            assert type(projected[field]) is type(source[field])
+        assert projected["last_delivery_error"] is None
+        assert projected["last_fire_error"] == {
+            "at": source["last_fire_error"]["at"],
+            "detail": source["last_fire_error"]["detail"],
+        }
+        assert set(projected["last_fire_error"]) == {"at", "detail"}
+        assert "future_internal_key" not in projected
+
+        projected["schedule"]["parts"].append("weekend")
+        projected["schedule"]["window"]["hour"] = 17
+        projected["skills"][0]["labels"].append("weekly")
+        projected["repeat"]["remaining"].append(2)
+        projected["last_fire_error"]["at"]["attempts"].append("second")
+        projected["last_fire_error"]["future"] = "public-only"
+
+        assert source == original
+
+        malformed = _project_public_cron_job({
+            "last_delivery_error": {"marker": "malformed-delivery-canary"},
+            "last_fire_error": ["malformed-fire-canary"],
+        })
+        assert malformed["last_delivery_error"] == "Delivery status unavailable"
+        assert malformed["last_fire_error"] == {
+            "at": None,
+            "detail": "Status detail unavailable",
+        }
+
+    @pytest.mark.asyncio
+    async def test_authenticated_job_responses_are_allowlisted(self, auth_adapter, monkeypatch, tmp_path):
+        """Every bearer-authenticated job response projects persisted records."""
+        from cron.jobs import create_job, get_job, load_jobs, save_jobs
+
+        hermes_home = tmp_path / "hermes-home"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        private_state = {
+            "run_claim": {
+                "owner": "run-owner-canary",
+                "occurrence_id": "run-occurrence-canary",
+                "process_token": "run-process-token-canary",
+            },
+            "fire_claim": {
+                "owner": "fire-owner-canary",
+                "source_run_owner": "source-run-owner-canary",
+            },
+            "resume_reservation": {
+                "owner": "resume-owner-canary",
+                "occurrence_id": "resume-occurrence-canary",
+            },
+            "origin": {
+                "session_id": "private-session-canary",
+                "routing_token": "private-routing-token-canary",
+            },
+            "latest_execution": {
+                "pid": 9876,
+                "process_token": "execution-process-token-canary",
+            },
+            "future_internal_key": {
+                "owner": "future-owner-canary",
+                "linkage": {"token": "future-linkage-token-canary"},
+            },
+        }
+        private_tokens = {
+            "run-owner-canary",
+            "fire-owner-canary",
+            "resume-owner-canary",
+            "private-session-canary",
+            "execution-process-token-canary",
+            "future-linkage-token-canary",
+        }
+        seed_job = {
+            "id": VALID_JOB_ID,
+            "name": "literal-public-job",
+            "prompt": "literal public prompt",
+            "skill": "literal-skill",
+            "skills": ["literal-skill", "literal-second-skill"],
+            "schedule": {"kind": "cron", "expr": "*/5 * * * *", "display": "every 5m"},
+            "schedule_display": "every 5m",
+            "repeat": {"times": 3, "completed": 1},
+            "restart_policy": "resume",
+            "deliver": "local",
+            "enabled": True,
+            "state": "scheduled",
+            "paused_at": None,
+            "paused_reason": None,
+            "next_run_at": "2030-01-01T00:05:00+00:00",
+            "last_run_at": "2030-01-01T00:00:00+00:00",
+            "last_status": "ok",
+            "last_delivery_error": None,
+            "last_fire_error": {"at": "2030-01-01T00:01:00+00:00", "detail": "retryable"},
+            **deepcopy(private_state),
+        }
+        save_jobs([deepcopy(seed_job)])
+
+        expected_routes = {
+            ("GET", "/api/jobs", "_handle_list_jobs"),
+            ("POST", "/api/jobs", "_handle_create_job"),
+            ("GET", "/api/jobs/{job_id}", "_handle_get_job"),
+            ("PATCH", "/api/jobs/{job_id}", "_handle_update_job"),
+            ("DELETE", "/api/jobs/{job_id}", "_handle_delete_job"),
+            ("POST", "/api/jobs/{job_id}/pause", "_handle_pause_job"),
+            ("POST", "/api/jobs/{job_id}/resume", "_handle_resume_job"),
+            ("POST", "/api/jobs/{job_id}/run", "_handle_run_job"),
+        }
+        actual_routes = {
+            (method, path, handler.__name__)
+            for method, path, handler in auth_adapter._http_route_table()
+            if path == "/api/jobs" or path.startswith("/api/jobs/")
+        }
+        assert actual_routes == expected_routes
+
+        created_job_id = None
+
+        def add_private_state(job_id):
+            jobs = load_jobs()
+            for job in jobs:
+                if job["id"] == job_id:
+                    job.update(deepcopy(private_state))
+                    save_jobs(jobs)
+                    return deepcopy(job)
+            raise AssertionError(f"missing stored test job: {job_id}")
+
+        def create_without_scheduler_registration(**kwargs):
+            nonlocal created_job_id
+            created = create_job(**kwargs)
+            created_job_id = created["id"]
+            return add_private_state(created_job_id)
+
+        def trigger_without_execution(job_id):
+            return get_job(job_id)
+
+        def stored_job(job_id):
+            return next(job for job in load_jobs() if job["id"] == job_id)
+
+        def assert_projected_job(response_job, source_job):
+            _assert_public_job_response(response_job, source_job)
+            response_text = str(response_job)
+            assert all(token not in response_text for token in private_tokens)
+
+        headers = {"Authorization": "Bearer sk-secret"}
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            # Scheduler registration and execution are the only external seams;
+            # persistence plus each aiohttp handler remain real.
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_create", create_without_scheduler_registration
+            ), patch(f"{_MOD}._cron_trigger", trigger_without_execution), patch(
+                f"{_MOD}._notify_cron_provider_jobs_changed"
+            ):
+                resp = await cli.post(
+                    "/api/jobs",
+                    json={
+                        "name": "created-public-job",
+                        "prompt": "created public prompt",
+                        "schedule": "*/10 * * * *",
+                        "skills": ["created-skill"],
+                        "repeat": 2,
+                    },
+                    headers=headers,
+                )
+                assert resp.status == 200
+                created_payload = await resp.json()
+                assert created_job_id is not None
+                assert_projected_job(created_payload["job"], stored_job(created_job_id))
+
+                resp = await cli.get("/api/jobs", headers=headers)
+                assert resp.status == 200
+                listed_payload = await resp.json()
+                response_by_id = {job["id"]: job for job in listed_payload["jobs"]}
+                stored_by_id = {job["id"]: job for job in load_jobs()}
+                assert set(response_by_id) == set(stored_by_id)
+                for job_id, response_job in response_by_id.items():
+                    assert_projected_job(response_job, stored_by_id[job_id])
+
+                raw_after_list = deepcopy(load_jobs())
+                assert raw_after_list[0]["run_claim"] == private_state["run_claim"]
+                assert raw_after_list[0]["resume_reservation"] == private_state["resume_reservation"]
+                assert raw_after_list[0]["future_internal_key"] == private_state["future_internal_key"]
+
+                resp = await cli.get(f"/api/jobs/{VALID_JOB_ID}", headers=headers)
+                assert resp.status == 200
+                get_payload = await resp.json()
+                assert_projected_job(get_payload["job"], stored_job(VALID_JOB_ID))
+                assert load_jobs() == raw_after_list
+
+                resp = await cli.patch(
+                    f"/api/jobs/{VALID_JOB_ID}",
+                    json={"name": "updated-public-job"},
+                    headers=headers,
+                )
+                assert resp.status == 200
+                update_payload = await resp.json()
+                assert_projected_job(update_payload["job"], stored_job(VALID_JOB_ID))
+
+                resp = await cli.post(f"/api/jobs/{VALID_JOB_ID}/pause", headers=headers)
+                assert resp.status == 200
+                pause_payload = await resp.json()
+                assert_projected_job(pause_payload["job"], stored_job(VALID_JOB_ID))
+
+                resp = await cli.post(f"/api/jobs/{VALID_JOB_ID}/resume", headers=headers)
+                assert resp.status == 200
+                resume_payload = await resp.json()
+                assert_projected_job(resume_payload["job"], stored_job(VALID_JOB_ID))
+
+                resp = await cli.post(f"/api/jobs/{VALID_JOB_ID}/run", headers=headers)
+                assert resp.status == 200
+                run_payload = await resp.json()
+                assert_projected_job(run_payload["job"], stored_job(VALID_JOB_ID))
+
+        for job_id in (VALID_JOB_ID, created_job_id):
+            raw_job = stored_job(job_id)
+            for key, value in private_state.items():
+                assert raw_job[key] == value
+
+    @pytest.mark.asyncio
+    async def test_bearer_job_responses_sanitize_persisted_status_errors(
+        self, auth_adapter, caplog, monkeypatch, tmp_path,
+    ):
+        """All seven bearer record responses sanitize persisted status errors."""
+        from cron.jobs import create_job, get_job, load_jobs, save_jobs
+
+        hermes_home = tmp_path / "hermes-home"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        raw_error = (
+            "synthetic-private-adapter-exception "
+            "/synthetic/private-status/attachment.txt "
+            "token=sk-synthetic-delivery-token"
+        )
+        raw_fire_error = {
+            "at": "2030-01-01T00:01:00+00:00",
+            "detail": raw_error,
+            "future_private_status": {"marker": "future-fire-private-canary"},
+        }
+        seed_job = {
+            "id": VALID_JOB_ID,
+            "name": "status-error-job",
+            "prompt": "status error regression fixture",
+            "schedule": {"kind": "cron", "expr": "*/5 * * * *", "display": "every 5m"},
+            "schedule_display": "every 5m",
+            "restart_policy": "terminal",
+            "deliver": "local",
+            "enabled": True,
+            "state": "scheduled",
+            "last_delivery_error": raw_error,
+            "last_fire_error": deepcopy(raw_fire_error),
+        }
+        save_jobs([deepcopy(seed_job)])
+
+        created_job_id = None
+
+        def inject_raw_status(job_id):
+            jobs = load_jobs()
+            for job in jobs:
+                if job["id"] == job_id:
+                    job["last_delivery_error"] = raw_error
+                    job["last_fire_error"] = deepcopy(raw_fire_error)
+                    save_jobs(jobs)
+                    return deepcopy(job)
+            raise AssertionError(f"missing stored test job: {job_id}")
+
+        def create_with_raw_status(**kwargs):
+            nonlocal created_job_id
+            created = create_job(**kwargs)
+            created_job_id = created["id"]
+            return inject_raw_status(created_job_id)
+
+        def trigger_without_execution(job_id):
+            return get_job(job_id)
+
+        def assert_sanitized(job):
+            rendered = str(job)
+            assert job["last_delivery_error"] == "Delivery failed"
+            assert len(job["last_delivery_error"]) <= 500
+            assert job["last_fire_error"] == {
+                "at": raw_fire_error["at"],
+                "detail": "Status detail unavailable",
+            }
+            assert set(job["last_fire_error"]) == {"at", "detail"}
+            for private_value in (
+                "/synthetic/private-status/attachment.txt",
+                "sk-synthetic-delivery-token",
+                "synthetic-private-adapter-exception",
+                "future-fire-private-canary",
+            ):
+                assert private_value not in rendered
+
+        headers = {"Authorization": "Bearer sk-secret"}
+        app = _create_app(auth_adapter)
+        caplog.set_level(logging.DEBUG)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_create", create_with_raw_status
+            ), patch(f"{_MOD}._cron_trigger", trigger_without_execution), patch(
+                f"{_MOD}._notify_cron_provider_jobs_changed"
+            ):
+                resp = await cli.post(
+                    "/api/jobs",
+                    json={
+                        "name": "created-status-error-job",
+                        "prompt": "created status error regression fixture",
+                        "schedule": "*/10 * * * *",
+                    },
+                    headers=headers,
+                )
+                assert resp.status == 200
+                assert created_job_id is not None
+                assert_sanitized((await resp.json())["job"])
+
+                resp = await cli.get("/api/jobs", headers=headers)
+                assert resp.status == 200
+                for job in (await resp.json())["jobs"]:
+                    assert_sanitized(job)
+
+                resp = await cli.get(f"/api/jobs/{VALID_JOB_ID}", headers=headers)
+                assert resp.status == 200
+                assert_sanitized((await resp.json())["job"])
+
+                resp = await cli.patch(
+                    f"/api/jobs/{VALID_JOB_ID}",
+                    json={"name": "updated-status-error-job"},
+                    headers=headers,
+                )
+                assert resp.status == 200
+                assert_sanitized((await resp.json())["job"])
+
+                resp = await cli.post(f"/api/jobs/{VALID_JOB_ID}/pause", headers=headers)
+                assert resp.status == 200
+                assert_sanitized((await resp.json())["job"])
+
+                resp = await cli.post(f"/api/jobs/{VALID_JOB_ID}/resume", headers=headers)
+                assert resp.status == 200
+                assert_sanitized((await resp.json())["job"])
+
+                resp = await cli.post(f"/api/jobs/{VALID_JOB_ID}/run", headers=headers)
+                assert resp.status == 200
+                assert_sanitized((await resp.json())["job"])
+
+        assert created_job_id is not None
+        for job_id in (VALID_JOB_ID, created_job_id):
+            raw_job = get_job(job_id)
+            assert raw_job is not None
+            assert raw_job["last_delivery_error"] == raw_error
+            assert raw_job["last_fire_error"] == raw_fire_error
+        assert raw_error not in caplog.text
 
 
 # ---------------------------------------------------------------------------

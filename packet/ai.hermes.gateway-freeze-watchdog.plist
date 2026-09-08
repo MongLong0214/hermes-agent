@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.hermes.gateway-freeze-watchdog</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__WATCHDOG_SCRIPT__</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>300</integer>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__WATCHDOG_PATH__</string>
+    <key>WATCHDOG_ROOT</key>
+    <string>__WATCHDOG_ROOT__</string>
+    <key>WATCHDOG_INSPECT_CMD</key>
+    <string>__WATCHDOG_INSPECT_CMD__</string>
+    <key>WATCHDOG_TIME_CMD</key>
+    <string>__WATCHDOG_TIME_CMD__</string>
+    <key>WATCHDOG_SCRIPT_PATH</key>
+    <string>__WATCHDOG_SCRIPT_PATH__</string>
+    <key>WATCHDOG_EXPECTED_SHA256</key>
+    <string>__WATCHDOG_EXPECTED_SHA256__</string>
+    <key>WATCHDOG_HASH_CMD</key>
+    <string>__WATCHDOG_HASH_CMD__</string>
+  </dict>
+</dict>
+</plist>

@@ -2665,6 +2665,7 @@ from gateway.turn_lease import (
     DEFAULT_LEASE_WAIT,
     SessionTurnLeaseRegistry,
     TurnLeaseTimeoutError,
+    TurnLeaseToken,
 )
 from gateway.session_state import (
     SERVICE_TIER_UNSET as _SERVICE_TIER_UNSET,
@@ -6755,6 +6756,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _profile_failed_platforms: Optional[Dict[str, Dict[Platform, asyncio.Task]]] = None
     _systemd_watchdog: Optional[Any] = None
     _startup_restore_in_progress: bool = False
+    # A bounded pending exact-token authority set must never outgrow the
+    # durable delivery ledger's retention denominator.
+    _RUNTIME_CLAIM_COMPENSATION_CAP = 500
+    _runtime_claim_pending_compensations: set[tuple[str, str, tuple[str, str]]]
+    _runtime_claim_compensation_reservations: set[tuple[str, tuple[str, str]]]
+    _runtime_claim_compensation_retrying: set[tuple[str, str, tuple[str, str]]]
+    _runtime_claim_compensation_lock: asyncio.Lock
 
     # ------------------------------------------------------------------
     # Legacy per-session dict adapters.  All per-session state lives in
@@ -12087,13 +12095,53 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 RECOVERED_MARKER,
                 mark_delivered,
                 mark_failed,
+                release_runtime_claim,
+                settle_runtime_claim,
+                settle_runtime_claim_after_send_started,
             )
         except Exception:
             logger.debug("delivery ledger import failed", exc_info=True)
             return 0
 
+        async def release_unsent_runtime_claim(row: dict, claim_token: str) -> None:
+            if not row.get("runtime_recovery"):
+                return
+            try:
+                await asyncio.to_thread(
+                    release_runtime_claim,
+                    row["obligation_id"],
+                    claim_token=claim_token,
+                )
+            except Exception:
+                logger.debug("runtime delivery claim release failed", exc_info=True)
+
+        async def settle_started_runtime_claim(row: dict, claim_token: str) -> bool:
+            if not row.get("runtime_recovery"):
+                return False
+            return await asyncio.to_thread(
+                settle_runtime_claim_after_send_started,
+                row["obligation_id"],
+                claim_token=claim_token,
+            )
+
         redelivered = 0
         for row in claimed:
+            runtime_claim_token = ""
+            if row.get("runtime_recovery"):
+                candidate_token = row.get("runtime_claim_token")
+                if not (
+                    isinstance(candidate_token, str)
+                    and len(candidate_token) >= 32
+                    and candidate_token.isascii()
+                    and candidate_token.strip() == candidate_token
+                ):
+                    logger.warning("Runtime delivery claim lacks authority")
+                    return redelivered
+                runtime_claim_token = candidate_token
+            if not getattr(self, "_running", True):
+                if runtime_claim_token:
+                    await release_unsent_runtime_claim(row, runtime_claim_token)
+                continue
             try:
                 platform = Platform(row["platform"])
             except Exception:
@@ -12102,48 +12150,102 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     row["obligation_id"], row.get("platform"),
                 )
                 continue
-            adapter = self.adapters.get(platform)
+            profile = row.get("profile")
+            if profile and profile != "default":
+                profile_adapters = getattr(self, "_profile_adapters", {})
+                profile_map = (
+                    profile_adapters.get(profile, {})
+                    if isinstance(profile_adapters, dict)
+                    else {}
+                )
+                adapter = profile_map.get(platform)
+            else:
+                adapter = self.adapters.get(platform)
             if adapter is None:
-                # Platform not connected this boot — leave the row claimed;
-                # attempts cap + stale cutoff bound the retries on later boots.
+                if runtime_claim_token:
+                    await release_unsent_runtime_claim(row, runtime_claim_token)
                 continue
             content = row["content"]
             if row.get("needs_marker"):
-                content = RECOVERED_MARKER + content
+                content = row.get("marker", RECOVERED_MARKER) + content
             metadata = (
                 {"thread_id": row["thread_id"]} if row.get("thread_id") else None
             )
 
+            runtime_claim_settled = False
+            runtime_claim_fallback_attempted = False
             try:
-                result = await adapter.send(
-                    chat_id=row["chat_id"],
-                    content=content,
-                    metadata=metadata,
+                try:
+                    result = await adapter.send(
+                        chat_id=row["chat_id"],
+                        content=content,
+                        metadata=metadata,
+                    )
+                except Exception:
+                    logger.warning("Recovered delivery send failed")
+                    result = None
+                delivered = result is not None and getattr(result, "success", False)
+                error = (
+                    ""
+                    if delivered
+                    else str(getattr(result, "error", "") or "send failed")
                 )
-            except Exception as send_err:
-                logger.warning(
-                    "obligation %s: redelivery send raised: %s",
-                    row["obligation_id"], send_err,
-                )
-                result = None
-            try:
-                if result is not None and getattr(result, "success", False):
-                    await asyncio.to_thread(mark_delivered, row["obligation_id"])
+                if row.get("runtime_recovery"):
+                    try:
+                        runtime_claim_settled = await asyncio.to_thread(
+                            settle_runtime_claim,
+                            row["obligation_id"],
+                            claim_token=runtime_claim_token,
+                            delivered=delivered,
+                            error=error,
+                        )
+                    except Exception:
+                        runtime_claim_fallback_attempted = True
+                        try:
+                            await settle_started_runtime_claim(
+                                row, runtime_claim_token
+                            )
+                        except BaseException:
+                            logger.warning("Runtime delivery settlement recovery failed")
+                            raise
+                        logger.warning(
+                            "Runtime delivery settlement failed; no delivery count recorded"
+                        )
+                        return redelivered
+                    if not runtime_claim_settled:
+                        logger.debug("Runtime delivery settlement lost ownership")
+                        return redelivered
+                else:
+                    try:
+                        if delivered:
+                            await asyncio.to_thread(mark_delivered, row["obligation_id"])
+                        else:
+                            await asyncio.to_thread(mark_failed, row["obligation_id"], error)
+                    except Exception:
+                        logger.debug("delivery ledger update failed")
+                        continue
+                if delivered:
                     redelivered += 1
                     logger.info(
-                        "Redelivered recovered final response to %s:%s "
-                        "(obligation %s, attempt %d)",
-                        row["platform"], row["chat_id"],
-                        row["obligation_id"], row["attempts"],
+                        "Recovered delivery succeeded (attempt %d)", row["attempts"]
                     )
-                else:
-                    await asyncio.to_thread(
-                        mark_failed,
-                        row["obligation_id"],
-                        str(getattr(result, "error", "") or "send failed"),
-                    )
-            except Exception:
-                logger.debug("delivery ledger update failed", exc_info=True)
+                elif row.get("runtime_recovery"):
+                    # The just-failed row is eligible only at a later reconnect;
+                    # this signal never reclaims it or advances to another row.
+                    return redelivered
+            except BaseException:
+                if (
+                    not runtime_claim_settled
+                    and not runtime_claim_fallback_attempted
+                ):
+                    runtime_claim_fallback_attempted = True
+                    try:
+                        await settle_started_runtime_claim(
+                            row, runtime_claim_token
+                        )
+                    except BaseException:
+                        logger.warning("Runtime delivery cancellation settlement failed")
+                raise
         return redelivered
 
     async def _redeliver_pending_obligations(self) -> int:
@@ -12158,6 +12260,221 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return await self._redeliver_claimed_obligations(
             await self._claim_pending_obligations()
         )
+
+    async def _redeliver_failed_obligations_for_platform(
+        self, platform: Platform, *, profile: Optional[str] = None
+    ) -> int:
+        """Replay this adapter identity's transient rows after a reconnect."""
+        try:
+            from gateway.delivery_ledger import (
+                claim_failed_for_runtime,
+                ledger_enabled,
+                peek_failed_for_runtime,
+                release_runtime_claim,
+            )
+        except Exception:
+            logger.debug("runtime delivery ledger import failed")
+            return 0
+
+        scope_profile = str(profile or "").strip() or "default"
+        scope = (platform.value, scope_profile)
+        pending_compensations = getattr(
+            self, "_runtime_claim_pending_compensations", None
+        )
+        if pending_compensations is None:
+            pending_compensations = set()
+            self._runtime_claim_pending_compensations = pending_compensations
+        reservations = getattr(self, "_runtime_claim_compensation_reservations", None)
+        if reservations is None:
+            reservations = set()
+            self._runtime_claim_compensation_reservations = reservations
+        retrying_compensations = getattr(
+            self, "_runtime_claim_compensation_retrying", None
+        )
+        if retrying_compensations is None:
+            retrying_compensations = set()
+            self._runtime_claim_compensation_retrying = retrying_compensations
+        compensation_lock = getattr(self, "_runtime_claim_compensation_lock", None)
+        if compensation_lock is None:
+            compensation_lock = asyncio.Lock()
+            self._runtime_claim_compensation_lock = compensation_lock
+
+        async def release_reservation(reservation: tuple[str, tuple[str, str]]) -> None:
+            async with compensation_lock:
+                reservations.discard(reservation)
+
+        async def retain_compensation(
+            reservation: tuple[str, tuple[str, str]],
+            compensation: tuple[str, str, tuple[str, str]],
+        ) -> None:
+            # Transfer exactly one occupied slot, atomically: a cancellation
+            # must not briefly free capacity before its exact token is pending.
+            async with compensation_lock:
+                reservations.discard(reservation)
+                pending_compensations.add(compensation)
+
+        blocked_obligations = set()
+        # Retry each exact pending authority once before peeking new work. A
+        # False result proves this token no longer owns a row, while any other
+        # unknown result must remain pending and cannot be sent this signal.
+        retry_compensations = []
+        async with compensation_lock:
+            for compensation in tuple(pending_compensations):
+                obligation_id, _claim_token, pending_scope = compensation
+                if pending_scope != scope:
+                    continue
+                if compensation in retrying_compensations:
+                    blocked_obligations.add(obligation_id)
+                    continue
+                retrying_compensations.add(compensation)
+                retry_compensations.append(compensation)
+        for compensation in retry_compensations:
+            obligation_id, claim_token, _pending_scope = compensation
+            released = None
+            try:
+                released = await asyncio.to_thread(
+                    release_runtime_claim,
+                    obligation_id,
+                    claim_token=claim_token,
+                )
+            except Exception:
+                blocked_obligations.add(obligation_id)
+                logger.debug("runtime delivery cancellation release retry failed")
+            else:
+                if released is not True and released is not False:
+                    blocked_obligations.add(obligation_id)
+                    logger.debug("runtime delivery cancellation release retry uncertain")
+            finally:
+                async with compensation_lock:
+                    retrying_compensations.discard(compensation)
+                    if released is True or released is False:
+                        pending_compensations.discard(compensation)
+
+        try:
+            if not await asyncio.to_thread(ledger_enabled):
+                return 0
+            candidates = await asyncio.to_thread(
+                peek_failed_for_runtime, platform.value, profile=profile
+            )
+        except Exception:
+            logger.debug("runtime delivery ledger sweep failed")
+            return 0
+        if not candidates:
+            return 0
+        candidates = [
+            candidate
+            for candidate in candidates
+            if candidate.get("obligation_id") not in blocked_obligations
+        ]
+        if not candidates:
+            return 0
+
+        cleared = []
+        for candidate in candidates:
+            session_key = candidate.get("session_key") or ""
+            if not session_key:
+                cleared.append(candidate)
+                continue
+            try:
+                await self.async_session_store.clear_resume_pending(session_key)
+            except Exception:
+                logger.debug("runtime resume clearance failed")
+            else:
+                cleared.append(candidate)
+
+        redelivered = 0
+        for candidate in cleared:
+            obligation_id = candidate["obligation_id"]
+            reservation = (obligation_id, scope)
+            async with compensation_lock:
+                if (
+                    reservation in reservations
+                    or any(
+                        pending_obligation_id == obligation_id
+                        and pending_scope == scope
+                        for pending_obligation_id, _pending_token, pending_scope
+                        in pending_compensations
+                    )
+                    or len(pending_compensations) + len(reservations)
+                    >= self._RUNTIME_CLAIM_COMPENSATION_CAP
+                ):
+                    continue
+                reservations.add(reservation)
+            claim_task = asyncio.create_task(
+                asyncio.to_thread(
+                    claim_failed_for_runtime,
+                    obligation_id,
+                    platform.value,
+                    profile=profile,
+                )
+            )
+            try:
+                row = await asyncio.shield(claim_task)
+            except asyncio.CancelledError:
+                # A cancelled await does not stop the SQLite worker. Keep its
+                # task alive until the committed row returns, then refund only
+                # that row's token before honoring the original cancellation.
+                while not claim_task.done():
+                    try:
+                        await asyncio.shield(claim_task)
+                    except asyncio.CancelledError:
+                        pass
+                try:
+                    row = claim_task.result()
+                except BaseException:
+                    row = None
+                if isinstance(row, dict):
+                    claim_token = row.get("runtime_claim_token")
+                    obligation_id = row.get("obligation_id")
+                    if (
+                        isinstance(obligation_id, str)
+                        and isinstance(claim_token, str)
+                        and len(claim_token) >= 32
+                        and claim_token.isascii()
+                        and claim_token.strip() == claim_token
+                    ):
+                        compensation = (obligation_id, claim_token, scope)
+                        release_task = asyncio.create_task(
+                            asyncio.to_thread(
+                                release_runtime_claim,
+                                obligation_id,
+                                claim_token=claim_token,
+                            )
+                        )
+                        while not release_task.done():
+                            try:
+                                await asyncio.shield(release_task)
+                            except asyncio.CancelledError:
+                                pass
+                            except BaseException:
+                                break
+                        try:
+                            released = release_task.result()
+                        except BaseException:
+                            await retain_compensation(reservation, compensation)
+                            logger.debug("runtime delivery claim cancellation release failed")
+                        else:
+                            if released is not True:
+                                await retain_compensation(reservation, compensation)
+                            else:
+                                await release_reservation(reservation)
+                    else:
+                        await release_reservation(reservation)
+                else:
+                    await release_reservation(reservation)
+                raise
+            except Exception:
+                await release_reservation(reservation)
+                logger.debug("runtime delivery claim failed")
+                continue
+            if row is None:
+                await release_reservation(reservation)
+                continue
+            # The normal send/settlement path now owns this durable claim; the
+            # finite admission slot was only needed through acquisition.
+            await release_reservation(reservation)
+            redelivered += await self._redeliver_claimed_obligations([row])
+        return redelivered
 
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
         """Auto-continue fresh restart-interrupted sessions after startup.
@@ -14566,6 +14883,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             needs_attention=False,
                             retrying_since=None,
                         )
+                        if self._running and self.adapters.get(platform) is adapter:
+                            await self._redeliver_failed_obligations_for_platform(platform)
                         logger.info("✓ %s reconnected successfully", platform.value)
 
                         # Rebuild channel directory with the new adapter
@@ -15678,6 +15997,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "✓ %s reconnected (profile: %s)",
                                 platform.value,
                                 profile_name,
+                            )
+                            await self._redeliver_failed_obligations_for_platform(
+                                platform, profile=profile_name
                             )
                             return
                         # A newer reconnect already won the slot while this
@@ -18198,6 +18520,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
 
+        event._gateway_turn_lease_token = None
         try:
             try:
                 _agent_result = await self._handle_message_with_agent(
@@ -18230,32 +18553,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("post-turn hook failed: %s", _goal_exc)
             return _agent_result
         finally:
-            # MoA one-shot restore must run on EVERY exit path, not just
-            # success. The restore data lives on the per-turn event object
-            # (_moa_restore_override), which is discarded once the event goes
-            # out of scope — so if _handle_message_with_agent raises, a restore
-            # in the try block would be skipped and the MoA override would leak
-            # permanently (every later message silently fans out through MoA).
-            # Putting it in finally guarantees the revert on success, exception,
-            # and interrupt alike.
-            self._restore_moa_one_shot(event, _quick_key)
-            self._restore_pending_one_turn_model_override(_quick_key)
-            # Normal completion/exception/interrupt owns and clears this exact
-            # durable marker.  SIGKILL/OOM skips finally, leaving the marker for
-            # the next unclean startup's recovery pass.
-            await self._clear_durable_active_turn(event)
-            # Unconditional release covers every exit path. _release_running_agent_state
-            # is idempotent (pop-on-absent is harmless) and, called without a
-            # run_generation guard, always clears the slot regardless of which
-            # generation it holds. This evicts the zombie left when session_reset
-            # bumps the generation (N -> N+1) mid-flight: gen-N's guarded release
-            # inside _run_agent returns False, and the old sentinel-only check here
-            # missed the leftover real agent — locking the session out forever (#28686).
-            self._release_running_agent_state(_quick_key)
-            # Turn lease (#64934): release THIS turn's lease token — keyed by
-            # (routing key, run generation) so this unwind can only ever free
-            # the lease its own turn acquired, never a newer turn's.
-            self._release_turn_lease(_quick_key, _run_generation)
+            try:
+                # MoA one-shot restore must run on EVERY exit path, not just
+                # success. The restore data lives on the per-turn event object
+                # (_moa_restore_override), which is discarded once the event goes
+                # out of scope — so if _handle_message_with_agent raises, a restore
+                # in the try block would be skipped and the MoA override would leak
+                # permanently (every later message silently fans out through MoA).
+                # Putting it in finally guarantees the revert on success, exception,
+                # and interrupt alike.
+                self._restore_moa_one_shot(event, _quick_key)
+                self._restore_pending_one_turn_model_override(_quick_key)
+                try:
+                    # Normal completion/exception/interrupt owns and clears this exact
+                    # durable marker. SIGKILL/OOM skips finally, leaving the marker for
+                    # the next unclean startup's recovery pass.
+                    await self._clear_durable_active_turn(event)
+                finally:
+                    # _release_running_agent_state is synchronous and idempotent.
+                    self._release_running_agent_state(_quick_key)
+            finally:
+                # This synchronous, event-owned release has no await boundary, so a
+                # repeated cancellation during durable cleanup cannot skip it.
+                self._release_turn_lease(
+                    _quick_key,
+                    _run_generation,
+                    token=getattr(event, "_gateway_turn_lease_token", None),
+                )
 
     def _restore_moa_one_shot(self, event: "MessageEvent", quick_key: str) -> None:
         """Revert a ``/moa <prompt>`` one-shot model override after its turn.
@@ -19004,6 +19328,163 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
+    @staticmethod
+    def _is_canonical_outward_callback_attribute(name: str) -> bool:
+        """Return whether a cached agent attribute can emit beyond this request."""
+        return (
+            name == "callback"
+            or name.endswith("_callback")
+            or name == "_on_session_title"
+        )
+
+    @staticmethod
+    def _select_canonical_turn_result(
+        result: Any,
+        *,
+        binding_name: str,
+        history_boundary: int,
+        expected_session_id: str,
+    ) -> Any:
+        """Select exactly one physical current-turn assistant terminal."""
+        from gateway.canonical_surface import CanonicalTurnResult
+
+        if (
+            not isinstance(result, dict)
+            or result.get("completed") is not True
+            or result.get("session_id", expected_session_id) != expected_session_id
+            or not isinstance(result.get("final_response"), str)
+            or not result["final_response"].strip()
+            or not isinstance(result.get("messages"), list)
+            or isinstance(history_boundary, bool)
+            or not isinstance(history_boundary, int)
+        ):
+            raise ValueError("canonical_turn_refused")
+        messages = result["messages"]
+        if history_boundary < 0 or history_boundary >= len(messages):
+            raise ValueError("canonical_turn_refused")
+        suffix = messages[history_boundary:]
+        if len(suffix) < 2:
+            raise ValueError("canonical_turn_refused")
+        user = suffix[0]
+        if (
+            not isinstance(user, dict)
+            or user.get("role") != "user"
+            or not isinstance(user.get("content"), str)
+            or not user["content"].strip()
+        ):
+            raise ValueError("canonical_turn_refused")
+
+        expect_tool = False
+        expected_tool_call_id: Optional[str] = None
+        terminal: Optional[str] = None
+        for index, row in enumerate(suffix[1:], start=1):
+            if not isinstance(row, dict) or not isinstance(row.get("role"), str):
+                raise ValueError("canonical_turn_refused")
+            role = row["role"]
+            if expect_tool:
+                if (
+                    role != "tool"
+                    or row.get("tool_call_id") != expected_tool_call_id
+                    or not isinstance(row.get("content"), str)
+                    or not row["content"].strip()
+                ):
+                    raise ValueError("canonical_turn_refused")
+                expect_tool = False
+                expected_tool_call_id = None
+                continue
+
+            if role != "assistant":
+                raise ValueError("canonical_turn_refused")
+            if "tool_calls" in row:
+                tool_calls = row["tool_calls"]
+                if (
+                    not isinstance(tool_calls, list)
+                    or len(tool_calls) != 1
+                    or not isinstance(tool_calls[0], dict)
+                    or not isinstance(tool_calls[0].get("id"), str)
+                    or not tool_calls[0]["id"].strip()
+                ):
+                    raise ValueError("canonical_turn_refused")
+                expected_tool_call_id = tool_calls[0]["id"]
+                expect_tool = True
+                continue
+
+            content = row.get("content")
+            if (
+                not isinstance(content, str)
+                or not content.strip()
+                or content != result["final_response"]
+                or index != len(suffix) - 1
+            ):
+                raise ValueError("canonical_turn_refused")
+            terminal = content
+
+        if expect_tool or terminal is None:
+            raise ValueError("canonical_turn_refused")
+        return CanonicalTurnResult(binding_name=binding_name, terminal_text=terminal)
+
+    async def run_bound_existing_turn(
+        self, binding: Any, event: Any, entry: Any, *, reply_sink: Any = None
+    ) -> Any:
+        """Run only an exact pre-existing cached session for canonical ingress."""
+        from gateway.canonical_surface import require_request_local_reply_sink
+
+        require_request_local_reply_sink(reply_sink)
+        if entry.session_key != binding.session_key or entry.session_id != binding.session_id:
+            raise ValueError("canonical_binding_stale")
+        with self._agent_cache_lock:
+            cached = self._agent_cache.get(entry.session_key)
+            if not cached:
+                raise ValueError("canonical_agent_missing")
+            agent = cached[0] if isinstance(cached, tuple) else cached
+            cached_session_id = cached[3] if isinstance(cached, tuple) and len(cached) > 3 else getattr(agent, "session_id", None)
+            if cached_session_id != entry.session_id or getattr(agent, "session_id", None) != entry.session_id:
+                raise ValueError("canonical_agent_missing")
+
+        generation = self._begin_session_run_generation(entry.session_key)
+        try:
+            lease = await self._turn_leases.acquire(
+                entry.session_id,
+                owner_key=f"canonical:{id(event)}",
+                generation=generation,
+            )
+        except Exception:
+            raise ValueError("canonical_turn_busy") from None
+        try:
+            if not bool(getattr(agent, "compression_in_place", True)):
+                raise ValueError("canonical_turn_refused")
+            outward_callbacks = {
+                name: value
+                for name, value in vars(agent).items()
+                if self._is_canonical_outward_callback_attribute(name)
+            }
+            for name in outward_callbacks:
+                setattr(agent, name, None)
+            try:
+                history = await self.async_session_store.load_transcript(entry.session_id)
+                agent_history, _ = _build_gateway_agent_history(history)
+                self._init_cached_agent_for_turn(agent, 0)
+                result = await asyncio.to_thread(
+                    agent.run_conversation,
+                    event.text,
+                    conversation_history=agent_history,
+                    task_id=entry.session_id,
+                )
+                boundary = getattr(agent, "_persist_user_message_idx", None)
+                if isinstance(boundary, bool) or not isinstance(boundary, int):
+                    raise ValueError("canonical_turn_refused")
+                return self._select_canonical_turn_result(
+                    result,
+                    binding_name=binding.name,
+                    history_boundary=boundary,
+                    expected_session_id=entry.session_id,
+                )
+            finally:
+                for name, value in outward_callbacks.items():
+                    setattr(agent, name, value)
+        finally:
+            self._turn_leases.release(lease)
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -19378,6 +19859,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._clear_session_env(_session_env_tokens)
                 raise
             if _lease_token is not None:
+                # The event is the per-turn authority. Capture its exact token
+                # before publishing the mutable shared compatibility slot.
+                event._gateway_turn_lease_token = _lease_token
                 _lease_state = self._session_state(_quick_key).turn
                 _lease_state.lease_token = _lease_token
                 _lease_state.lease_generation = run_generation
@@ -19986,7 +20470,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             # the fresh child still serializes
                                             # against this turn (#64934).
                                             self._rebind_turn_lease(
-                                                _quick_key, run_generation, _hyg_new_sid
+                                                _quick_key,
+                                                run_generation,
+                                                _hyg_new_sid,
+                                                token=getattr(
+                                                    event,
+                                                    "_gateway_turn_lease_token",
+                                                    None,
+                                                ),
                                             )
                                             await self.async_session_store._save()
                                             await asyncio.to_thread(
@@ -20504,7 +20995,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # serialization boundary must move with it or an alias
                     # key resolving the fresh child could interleave (#64934).
                     self._rebind_turn_lease(
-                        _quick_key, run_generation, session_entry.session_id
+                        _quick_key,
+                        run_generation,
+                        session_entry.session_id,
+                        token=getattr(event, "_gateway_turn_lease_token", None),
                     )
                     await self.async_session_store._save()
                     await self.async_session_store._record_gateway_session_peer(
@@ -26635,60 +27129,122 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._persist_active_agents()
         return True
 
-    def _release_turn_lease(self, session_key: str, run_generation: int) -> bool:
+    def _release_turn_lease(
+        self,
+        session_key: str,
+        run_generation: int,
+        *,
+        token: Optional[TurnLeaseToken] = None,
+    ) -> bool:
         """Release the turn lease acquired by (``session_key``, ``run_generation``).
 
         Companion to the acquisition in ``_handle_message_with_agent``
-        (#64934). The token map is keyed by (routing key, run generation), so
-        this can only ever free the lease its own turn acquired — a stale
-        unwind whose generation was bumped by /stop or /new pops ITS token,
-        and the registry's identity check refuses it if a newer turn already
-        holds the lease. Idempotent and safe for bare test runners built via
+        (#64934). ``state.turn.lease_token``/``lease_generation`` is a SINGLE
+        shared slot per routing key — a second concurrent turn on the same
+        key (a stale unwind, or a fresh turn after /new landing on the same
+        key before the first turn unwound) overwrites it unconditionally.
+        When that happens the first turn's own token is gone from the slot,
+        and looking it up there would either release the WRONG (newer)
+        lease or, with the old generation guard, silently orphan the first
+        turn's own lease forever (no TTL ever reclaims it).
+
+        ``token``, when given, is this call's own lease token — stashed on
+        the per-turn event at acquire time, so it is never shared and can
+        never be clobbered by another turn. It is released directly via
+        ``registry.release()``, which is itself identity-checked (only frees
+        the lease if this token is still its current holder). The shared
+        slot is cleared too, but ONLY if it still points at this same token —
+        never a newer turn's.
+
+        With no ``token``, falls back to the previous generation-checked
+        shared-slot lookup unchanged, for any caller that has no event to
+        stash a token on.
+
+        Idempotent and safe for bare test runners built via
         ``object.__new__`` (getattr defaults).
         """
         if not session_key:
             return False
         registry = getattr(self, "_turn_leases", None)
+        if registry is None:
+            return False
+        if token is not None:
+            if token.owner_key != session_key or token.generation != run_generation:
+                return False
+            state = self._peek_session_state(session_key)
+            try:
+                released = registry.release(token)
+            except Exception:
+                logger.debug("Failed to release turn lease", exc_info=True)
+                return False
+            if not released:
+                return False
+            if state is not None:
+                turn = state.turn
+                if turn.lease_token is token:
+                    turn.lease_token = None
+                    turn.lease_generation = None
+            return True
+
         state = self._peek_session_state(session_key)
-        if state is None or registry is None:
+        if state is not None:
+            turn = state.turn
+            if turn.lease_token is None or turn.lease_generation != run_generation:
+                return False
+            resolved_token = turn.lease_token
+            try:
+                released = registry.release(resolved_token)
+            except Exception:
+                logger.debug("Failed to release turn lease", exc_info=True)
+                return False
+            if not released:
+                return False
+            if turn.lease_token is resolved_token:
+                turn.lease_token = None
+                turn.lease_generation = None
+            return True
+
+        legacy_tokens = getattr(self, "_turn_lease_tokens", None)
+        if not isinstance(legacy_tokens, dict):
             return False
-        turn = state.turn
-        if turn.lease_token is None or turn.lease_generation != run_generation:
+        legacy_key = (session_key, run_generation)
+        resolved_token = legacy_tokens.get(legacy_key)
+        if resolved_token is None:
             return False
-        token = turn.lease_token
-        turn.lease_token = None
-        turn.lease_generation = None
         try:
-            return registry.release(token)
+            released = registry.release(resolved_token)
         except Exception:
             logger.debug("Failed to release turn lease", exc_info=True)
             return False
+        if not released:
+            return False
+        if legacy_tokens.get(legacy_key) is resolved_token:
+            legacy_tokens.pop(legacy_key, None)
+        return True
 
     def _rebind_turn_lease(
-        self, session_key: str, run_generation: int, new_session_id: str
+        self,
+        session_key: str,
+        run_generation: int,
+        new_session_id: str,
+        *,
+        token: Optional[TurnLeaseToken],
     ) -> bool:
-        """Follow a mid-turn session_id rotation with the held turn lease.
-
-        Compression (session-hygiene pre-compression or the agent's own
-        compressor) can rotate ``session_entry.session_id`` while this turn
-        is in flight. The turn's flush targets the NEW id, so the
-        serialization boundary must follow it — otherwise an alias routing
-        key resolving the new id (topic tip-walk onto the fresh child) could
-        start a concurrent turn the lease never sees (#64934 rotation-alias
-        window). Call at every site that reassigns session_entry.session_id
-        mid-turn. Fail-open no-op when there is no held token.
-        """
-        if not session_key or not new_session_id:
+        """Follow a mid-turn session_id rotation with this event's held lease."""
+        if (
+            not session_key
+            or not new_session_id
+            or token is None
+            or token.released
+            or token.owner_key != session_key
+            or token.generation != run_generation
+        ):
             return False
         registry = getattr(self, "_turn_leases", None)
-        state = self._peek_session_state(session_key)
-        if state is None or registry is None:
-            return False
-        turn = state.turn
-        if turn.lease_token is None or turn.lease_generation != run_generation:
+        if registry is None:
             return False
         try:
-            return registry.rebind(turn.lease_token, new_session_id)
+            return registry.rebind(token, new_session_id)
         except Exception:
             logger.debug("Failed to rebind turn lease", exc_info=True)
             return False

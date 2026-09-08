@@ -35,6 +35,7 @@ role-alternation invariant Hermes enforces everywhere else:
 from __future__ import annotations
 
 import json
+import os
 import re
 import uuid
 from dataclasses import dataclass
@@ -366,18 +367,64 @@ def import_foreign_session(source: str, path, db=None) -> str:
                 "foreign_session_id": parsed.get("session_id"),
             }
         }
-        db.create_session(
-            session_id,
-            source=_SOURCE_DB_NAMES[source],
-            cwd=parsed.get("cwd"),
-            origin_json=json.dumps(origin),
+        from hermes_state import SessionTurnLeaseLostError
+
+        # Present grant IS the holder string on this fence design (no separate
+        # token) — acquire/release/guard all key off the same value.
+        turn_lease_holder = (
+            f"pid={os.getpid()}:turn=foreign-session-import:session={session_id}"
         )
-        for turn in turns:
-            db.append_message(session_id, turn["role"], turn["content"])
+        lease_acquired = False
+        committed = False
         try:
-            db.set_session_title(session_id, title)
-        except Exception:
-            pass  # title is cosmetic; the import itself succeeded
+            try:
+                # The importer is an alternate writer.  Acquire against the absent
+                # id before creating its row, then present that grant to the one
+                # transaction that publishes the complete imported transcript.
+                lease_acquired = db.acquire_session_turn_lease(
+                    session_id,
+                    turn_lease_holder,
+                    ttl_seconds=30.0,
+                    wait_seconds=30.0,
+                )
+                if not lease_acquired:
+                    raise SessionTurnLeaseLostError(
+                        f"Could not acquire the session turn lease for {session_id!r}"
+                    )
+                db.create_imported_session(
+                    session_id,
+                    source=_SOURCE_DB_NAMES[source],
+                    messages=turns,
+                    cwd=parsed.get("cwd"),
+                    origin_json=json.dumps(origin),
+                    turn_lease_holder=turn_lease_holder,
+                    turn_lease_ttl_seconds=30.0,
+                )
+                committed = True
+            except Exception as exc:
+                if committed:
+                    raise
+                # ValueError is this function's documented failure channel, and
+                # both callers print it and exit non-zero.
+                raise ValueError(
+                    "Another process is running a turn on this conversation; "
+                    "nothing was imported"
+                ) from exc
+            try:
+                # Title writes are not transcript appends and are not fenced
+                # by the turn lease on this design (compare-and-swap on the
+                # sessions row is race-safe on its own).
+                db.set_session_title(session_id, title)
+            except Exception:
+                pass  # title is cosmetic; the import itself succeeded
+        finally:
+            if lease_acquired:
+                try:
+                    db.release_session_turn_lease(session_id, turn_lease_holder)
+                except Exception:
+                    # Cleanup cannot reverse a committed import, and before a
+                    # commit the public failure channel is already active.
+                    pass
         return session_id
     finally:
         if owns_db:

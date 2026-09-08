@@ -6,6 +6,7 @@ Diagnoses issues with Hermes Agent setup.
 
 import os
 import sys
+import sqlite3
 import subprocess
 import shutil
 import importlib.util
@@ -174,6 +175,47 @@ def _read_journal_mode(db_path: Path) -> tuple[str | None, str | None]:
     if header[18] == 1:
         return "rollback", None
     return None, f"unrecognized file-format version {header[18]}"
+
+
+def _checkpoint_large_state_wal(db_path: Path) -> tuple[bool, str | None]:
+    """Run doctor's state.db checkpoint only after same-connection authority.
+
+    ``PRAGMA wal_checkpoint`` mutates a public state.db even in PASSIVE mode.
+    The marker proof must therefore run on this connection immediately before
+    it. A refusal is an unsuccessful fix, never a best-effort success.
+    """
+    from hermes_state import (
+        SessionTurnLeaseLostError,
+        _assert_offline_rebuild_maintenance_authority,
+        _same_connection_raw_maintenance_fence,
+    )
+
+    conn = None
+    succeeded = False
+    error: str | None = None
+    try:
+        conn = sqlite3.connect(str(db_path))
+        with _same_connection_raw_maintenance_fence(
+            conn,
+            assert_authority=lambda: _assert_offline_rebuild_maintenance_authority(
+                conn, local_marker=None
+            ),
+        ):
+            conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        succeeded = True
+    except SessionTurnLeaseLostError as exc:
+        error = str(exc)
+    except sqlite3.Error as exc:
+        error = str(exc)
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.Error as close_exc:
+                if error is None:
+                    succeeded = False
+                    error = f"could not close state.db checkpoint connection: {close_exc}"
+    return succeeded, error
 
 
 def _format_db_size(db_path: Path) -> str:
@@ -1965,19 +2007,27 @@ def run_doctor(args):
                     "(may indicate missed checkpoints)"
                 )
                 if should_fix:
-                    import sqlite3
-                    conn = sqlite3.connect(str(state_db_path))
-                    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-                    conn.close()
-                    new_size = wal_path.stat().st_size if wal_path.exists() else 0
-                    check_ok(f"WAL checkpoint performed ({wal_size // 1024}K → {new_size // 1024}K)")
-                    fixed_count += 1
+                    checkpointed, checkpoint_error = _checkpoint_large_state_wal(
+                        state_db_path
+                    )
+                    if checkpointed:
+                        new_size = wal_path.stat().st_size if wal_path.exists() else 0
+                        check_ok(
+                            f"WAL checkpoint performed ({wal_size // 1024}K → {new_size // 1024}K)"
+                        )
+                        fixed_count += 1
+                    else:
+                        detail = checkpoint_error or "unknown checkpoint failure"
+                        check_warn("WAL checkpoint refused", f"({detail})")
+                        issues.append(
+                            "Large WAL checkpoint was not performed: " + detail
+                        )
                 else:
                     issues.append("Large WAL file — run 'hermes doctor --fix' to checkpoint")
             elif wal_size > 10 * 1024 * 1024:  # 10 MB
                 check_info(f"WAL file is {wal_size // (1024*1024)} MB (normal for active sessions)")
-        except Exception:
-            pass
+        except OSError as exc:
+            check_info(f"WAL file size unavailable ({exc})")
 
     _check_gateway_service_linger(issues)
     _check_s6_supervision(issues)

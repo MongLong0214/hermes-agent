@@ -11619,7 +11619,15 @@ def count_notify_subs(
     path = db_path if db_path is not None else kanban_db_path(board=board)
     if not path.exists():
         return 0
-    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+    resolved_path = path.resolve()
+    from hermes_cli.sqlite_safe_read import connect_tracked
+
+    conn = connect_tracked(
+        resolved_path.as_uri() + "?mode=ro",
+        uri=True,
+        tracking_path=resolved_path,
+        connect_fn=sqlite3.connect,
+    )
     try:
         try:
             owner_where, owner_params = _notify_profile_filter(

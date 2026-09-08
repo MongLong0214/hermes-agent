@@ -5016,6 +5016,7 @@ class GatewaySlashCommandsMixin:
         Inspired by Claude Code's /branch command.
         """
         import uuid as _uuid
+        from hermes_state import SessionTurnLeaseLostError
 
         if not self._session_db:
             from hermes_state import format_session_db_unavailable
@@ -5024,9 +5025,51 @@ class GatewaySlashCommandsMixin:
         source = event.source
         session_key = self._session_key_for_source(source)
 
-        # Load the current session and its transcript
+        # Load the current session and its transcript. The read is fenced by
+        # the PARENT's own turn lease — not the child's, and not skipped —
+        # so a legitimate in-flight parent turn can't commit a message
+        # between this read and the copy below that the branch then silently
+        # never sees. Off the event loop: acquisition can wait on the
+        # parent's own running turn.
         current_entry = await self.async_session_store.get_or_create_session(source)
-        history = await self.async_session_store.load_transcript(current_entry.session_id)
+        sync_db = getattr(self._session_db, "_db", self._session_db)
+        # A per-call nonce, not just pid+parent id: two concurrent /branch
+        # calls on the SAME parent (same pid, same session id) would
+        # otherwise mint the IDENTICAL holder string. try_acquire_session_
+        # turn_lease treats a second acquire by an already-held holder as a
+        # legitimate re-entrant success (hermes_state.py), so an aliased
+        # holder lets a second call's release delete the FIRST call's lease
+        # out from under its still-in-progress read — the same convention
+        # run_agent.py's relay_turn_id already uses for its own holder.
+        parent_lease_holder = (
+            f"pid={os.getpid()}:turn=branch-read-{_uuid.uuid4().hex}"
+            f":session={current_entry.session_id}"
+        )
+
+        def _read_parent_transcript_fenced():
+            if not sync_db.acquire_session_turn_lease(
+                current_entry.session_id, parent_lease_holder,
+                ttl_seconds=30.0, wait_seconds=30.0,
+            ):
+                raise SessionTurnLeaseLostError(
+                    f"Could not acquire the parent turn lease for "
+                    f"{current_entry.session_id!r} to branch"
+                )
+            try:
+                return self.session_store.load_transcript(current_entry.session_id)
+            finally:
+                sync_db.release_session_turn_lease(
+                    current_entry.session_id, parent_lease_holder
+                )
+
+        try:
+            history = await asyncio.to_thread(_read_parent_transcript_fenced)
+        except SessionTurnLeaseLostError as e:
+            logger.error("Branch history read refused by the parent's turn lease: %s", e)
+            return t(
+                "gateway.branch.create_failed",
+                error="parent session is busy with another turn — try again in a moment",
+            )
         if not history:
             return t("gateway.branch.no_conversation")
 
@@ -5068,8 +5111,16 @@ class GatewaySlashCommandsMixin:
         # list_sessions_rich() keeps the branch visible in /resume and
         # /sessions even after the parent is reopened and re-ended with a
         # different end_reason (e.g. tui_shutdown overwriting 'branched').
+        #
+        # STRICT insert, not create_session's enrich-on-conflict upsert: a
+        # collision on this generated id must be refused untouched — the old
+        # ON CONFLICT DO UPDATE filled a colliding foreign row's NULL
+        # session_key/chat_id/chat_type with THIS operation's routing
+        # identity before the provenance check below ever ran.
+        creation_error = None
+        created = False
         try:
-            await self._session_db.create_session(
+            created = await self._session_db.create_session_strict(
                 session_id=new_session_id,
                 source=source.platform.value if source.platform else "gateway",
                 model=(self.config.get("model", {}) or {}).get("default") if isinstance(self.config, dict) else None,
@@ -5102,48 +5153,115 @@ class GatewaySlashCommandsMixin:
                 display_name=current_entry.display_name,
             )
         except Exception as e:
+            creation_error = e
             logger.error("Failed to create branch session: %s", e)
-            return t("gateway.branch.create_failed", error=e)
+
+        # create_session_strict guarantees created=False means NOTHING of
+        # ours landed — a PK collision on the generated id is refused before
+        # a single column is written, so there is no row here to verify
+        # provenance on: the id belongs entirely to whatever already
+        # occupied it, untouched by this operation.
+        if not created:
+            if creation_error is None:
+                logger.error(
+                    "Generated branch session id already exists (collision), "
+                    "refused without writing to it: %s",
+                    new_session_id,
+                )
+            return t(
+                "gateway.branch.create_failed",
+                error=creation_error or "generated session ID collision",
+            )
 
         # Copy conversation history to the new session in bounded-chunk
         # transactions (see #23254): one txn per row was the removed
         # write-amplification pattern, and a history can be hundreds of rows.
         # Best-effort like the old loop — a failed copy still yields a
         # usable (partial) branch.
-        try:
-            await self._session_db.append_messages_batch(
-                new_session_id,
-                [
-                    {
-                        "role": msg.get("role", "user"),
-                        "content": msg.get("content"),
-                        "tool_name": msg.get("tool_name") or msg.get("name"),
-                        "tool_calls": msg.get("tool_calls"),
-                        "tool_call_id": msg.get("tool_call_id"),
-                        "finish_reason": msg.get("finish_reason"),
-                        "reasoning": msg.get("reasoning"),
-                        "reasoning_content": msg.get("reasoning_content"),
-                        "reasoning_details": msg.get("reasoning_details"),
-                        "codex_reasoning_items": msg.get("codex_reasoning_items"),
-                        "codex_message_items": msg.get("codex_message_items"),
-                        # Keep the api_content sidecar so the branch's first turn
-                        # replays the parent's exact wire bytes (warm provider
-                        # prompt cache) instead of a full cold prefill.
-                        "api_content": extract_api_content_sidecar(msg),
-                        "timestamp": msg.get("timestamp"),
-                    }
-                    for msg in history
-                ],
-                chunk_rows=500,
-            )
-        except Exception:
-            pass  # Best-effort copy
+        branch_rows = [
+            {
+                "role": msg.get("role", "user"),
+                "content": msg.get("content"),
+                "tool_name": msg.get("tool_name") or msg.get("name"),
+                "tool_calls": msg.get("tool_calls"),
+                "tool_call_id": msg.get("tool_call_id"),
+                "finish_reason": msg.get("finish_reason"),
+                "reasoning": msg.get("reasoning"),
+                "reasoning_content": msg.get("reasoning_content"),
+                "reasoning_details": msg.get("reasoning_details"),
+                "codex_reasoning_items": msg.get("codex_reasoning_items"),
+                "codex_message_items": msg.get("codex_message_items"),
+                # Keep the api_content sidecar so the branch's first turn
+                # replays the parent's exact wire bytes (warm provider
+                # prompt cache) instead of a full cold prefill.
+                "api_content": extract_api_content_sidecar(msg),
+                "timestamp": msg.get("timestamp"),
+            }
+            for msg in history
+        ]
 
-        # Set title
+        # The new child is its own lease root — an explicit fork breaks the
+        # compression-parent walk in _session_turn_lease_key_on_conn, so its
+        # own id IS the conversation_id. Holding the lease here (and passing
+        # it through to append_messages_batch) fences the seed against any
+        # other writer that might learn this id before switch_session() below
+        # publishes it as the canonical route. ``sync_db`` was already
+        # resolved above for the parent-side fenced read.
+        branch_lease_holder = f"pid={os.getpid()}:turn=branch-seed:session={new_session_id}"
+
+        def _seed_branch_history() -> None:
+            if not sync_db.try_acquire_session_turn_lease(
+                new_session_id, branch_lease_holder, ttl_seconds=30.0,
+            ):
+                raise SessionTurnLeaseLostError(
+                    f"Could not acquire the branch-seed turn lease for {new_session_id!r}"
+                )
+            try:
+                sync_db.append_messages_batch(
+                    new_session_id,
+                    branch_rows,
+                    turn_lease_holder=branch_lease_holder,
+                    chunk_rows=500,
+                )
+            finally:
+                sync_db.release_session_turn_lease(new_session_id, branch_lease_holder)
+
         try:
-            await self._session_db.set_session_title(new_session_id, branch_title)
-        except Exception:
-            pass
+            # Off the event loop, matching the AsyncSessionDB contract this
+            # call used to go through — acquisition can wait on another writer.
+            await asyncio.to_thread(_seed_branch_history)
+        except SessionTurnLeaseLostError as e:
+            logger.error("Branch history copy refused by the turn lease: %s", e)
+        except Exception as e:
+            logger.error("Branch history copy failed after session creation: %s", e)
+
+        # Copy chunks commit independently, so the durable child is the only
+        # truthful source for the outward count after either success or a
+        # later-chunk exception.
+        try:
+            durable_branch_rows = await self._session_db.get_messages(new_session_id)
+        except Exception as e:
+            logger.error("Failed to recount committed branch history: %s", e)
+            return t("gateway.branch.switch_failed")
+        msg_count = sum(row.get("role") == "user" for row in durable_branch_rows)
+
+        # Set title. Two ways this can fail to land — a raised exception (e.g.
+        # a title collision) and a `False` return (e.g. a lost compare-and-swap
+        # race) — and both must be treated as "did not land": the outward
+        # message must not assert a title that isn't actually on the row.
+        title_failure_reason: str | None = None
+        try:
+            title_applied = await self._session_db.set_session_title(new_session_id, branch_title)
+        except Exception as e:
+            title_applied = False
+            title_failure_reason = str(e)
+        if not title_applied and title_failure_reason is None:
+            title_failure_reason = "title update did not apply"
+        if title_failure_reason is not None:
+            logger.error(
+                "Branch title %r failed to publish for %s (parent %s): %s",
+                branch_title, new_session_id, parent_session_id, title_failure_reason,
+            )
 
         # Switch the session store entry to the new session
         new_entry = await self.async_session_store.switch_session(session_key, new_session_id)
@@ -5154,7 +5272,20 @@ class GatewaySlashCommandsMixin:
         # Evict any cached agent for this session
         self._evict_cached_agent(session_key)
 
-        msg_count = len([m for m in history if m.get("role") == "user"])
+        if title_failure_reason is not None:
+            untitled_key = (
+                "gateway.branch.branched_one_untitled"
+                if msg_count == 1
+                else "gateway.branch.branched_many_untitled"
+            )
+            return t(
+                untitled_key, count=msg_count, parent=parent_session_id, new=new_session_id
+            ) + t(
+                "gateway.branch.title_not_set_note",
+                title=branch_title,
+                error=title_failure_reason,
+            )
+
         key = "gateway.branch.branched_one" if msg_count == 1 else "gateway.branch.branched_many"
         return t(key, title=branch_title, count=msg_count, parent=parent_session_id, new=new_session_id)
 

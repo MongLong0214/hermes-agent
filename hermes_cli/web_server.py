@@ -340,9 +340,9 @@ def _eager_reconcile_own_session_db() -> None:
     :func:`_open_session_db_at_path`, which retries on every poll.
     """
     try:
-        from hermes_state import SessionDB, _default_db_path
+        from hermes_state import _default_db_path
 
-        SessionDB(db_path=Path(_default_db_path()), read_only=False).close()
+        _open_session_db_at_path(Path(_default_db_path()), read_only=False).close()
     except Exception as exc:
         _log.warning(
             "startup schema reconcile of state.db failed (%s); session "
@@ -12162,11 +12162,64 @@ from hermes_cli.web_routers.sessions import (  # noqa: E402,F401 — legacy re-e
 
 
 
-# Serialises the one-time writable schema bootstrap for read-only opens.
-# Concurrent first-load polls otherwise race sqlite file creation: the losers
-# open mode=ro against a store whose schema is still being written and every
-# query raises "no such table: sessions".
-_session_db_bootstrap_lock = threading.Lock()
+# A first writable SQLite open creates a non-empty file before running its
+# schema DDL.  Readers must therefore join the writer by database path, not by
+# observing file size alone.  The dictionary lock protects the map lookup and
+# file-state decision only; it never covers SessionDB work or endpoint reads.
+# A failed generation stays as a process-lifetime tombstone, so a partial file
+# cannot later be mistaken for a ready store without an explicit process reset.
+_SESSION_DB_FRESH_STORE_READY_TIMEOUT_S = 30.0
+
+
+class _SessionDBFreshStoreReadiness:
+    def __init__(self):
+        self.done = threading.Event()
+        self.error = None
+
+
+_session_db_fresh_store_readiness: Dict[str, _SessionDBFreshStoreReadiness] = {}
+_session_db_fresh_store_readiness_lock = threading.Lock()
+
+
+def _wait_for_fresh_session_db_readiness(canonical_path, readiness) -> None:
+    """Wait outside the state lock and propagate a completed generation result."""
+    if not readiness.done.wait(_SESSION_DB_FRESH_STORE_READY_TIMEOUT_S):
+        raise TimeoutError(f"timed out waiting for fresh session DB: {canonical_path}")
+    if readiness.error is not None:
+        raise readiness.error
+
+
+def _claim_fresh_session_db_readiness(db_path: Path):
+    """Claim a fresh-store generation or wait for the exact one in progress."""
+    canonical_path = str(Path(db_path).resolve())
+    with _session_db_fresh_store_readiness_lock:
+        readiness = _session_db_fresh_store_readiness.get(canonical_path)
+        if readiness is None:
+            try:
+                needs_bootstrap = Path(canonical_path).stat().st_size == 0
+            except FileNotFoundError:
+                needs_bootstrap = True
+            except OSError:
+                needs_bootstrap = False
+            if needs_bootstrap:
+                readiness = _SessionDBFreshStoreReadiness()
+                _session_db_fresh_store_readiness[canonical_path] = readiness
+                return canonical_path, readiness
+
+    if readiness is not None:
+        _wait_for_fresh_session_db_readiness(canonical_path, readiness)
+    return None
+
+
+def _finish_fresh_session_db_readiness(canonical_path, readiness, error=None):
+    """Publish a generation; only completed successes leave the map."""
+    with _session_db_fresh_store_readiness_lock:
+        # Set error before the event while holding the same lock that published
+        # this generation. Registered followers observe both after wait().
+        readiness.error = error
+        readiness.done.set()
+        if error is None and _session_db_fresh_store_readiness.get(canonical_path) is readiness:
+            del _session_db_fresh_store_readiness[canonical_path]
 
 
 def _session_db_read_probe_statements() -> tuple:
@@ -12218,21 +12271,26 @@ def _open_session_db_at_path(db_path: Path, *, read_only: bool):
 
     from hermes_state import SessionDB, is_malformed_schema_error
 
+    readiness = _claim_fresh_session_db_readiness(db_path)
+
     if not read_only:
-        return SessionDB(db_path=db_path, read_only=False)
-
-    def _needs_bootstrap() -> bool:
+        if readiness is None:
+            return SessionDB(db_path=db_path, read_only=False)
         try:
-            return db_path.stat().st_size == 0
-        except FileNotFoundError:
-            return True
-        except OSError:
-            return False
+            db = SessionDB(db_path=db_path, read_only=False)
+        except BaseException as exc:
+            _finish_fresh_session_db_readiness(*readiness, error=exc)
+            raise
+        _finish_fresh_session_db_readiness(*readiness)
+        return db
 
-    if _needs_bootstrap():
-        with _session_db_bootstrap_lock:
-            if _needs_bootstrap():
-                SessionDB(db_path=db_path, read_only=False).close()
+    if readiness is not None:
+        try:
+            SessionDB(db_path=db_path, read_only=False).close()
+        except BaseException as exc:
+            _finish_fresh_session_db_readiness(*readiness, error=exc)
+            raise
+        _finish_fresh_session_db_readiness(*readiness)
 
     def _open_probed():
         db = SessionDB(db_path=db_path, read_only=True)

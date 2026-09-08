@@ -159,7 +159,9 @@ class TestMissingProviderKeyBlocks:
             f"expected exactly one alert across two ticks, got {len(deliveries)}: "
             f"{deliveries!r}"
         )
-        assert "blocked" in deliveries[0].lower()
+        assert deliveries == ["Cron delivery failed"]
+        assert "blocked_config" not in deliveries[0]
+        assert "openrouter" not in deliveries[0]
 
     def test_fallback_chain_rescues_missing_primary_key(self, tmp_path):
         """A configured fallback chain means a missing primary key does NOT

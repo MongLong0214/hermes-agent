@@ -135,26 +135,42 @@ def test_multiplex_unscoped_read_fails_closed(vertex_adapter, monkeypatch):
         secret_scope.set_multiplex_active(False)
 
 
-def test_adc_refuses_foreign_profile_google_application_credentials(
-    vertex_adapter, monkeypatch, tmp_path
-):
-    """When this profile's scope defines no Vertex credentials, but os.environ
-    still carries a *different* profile's GOOGLE_APPLICATION_CREDENTIALS (left
-    there by python-dotenv at gateway boot), ADC must not silently mint a
-    token under that foreign service account."""
-    from agent import secret_scope
+def test_get_vertex_credentials_denies_before_path_cache_adc_refresh_or_config(vertex_adapter, monkeypatch):
+    from agent.gemini_outbound_policy import GeminiOutboundDenied
 
-    sa_file = tmp_path / "other_profile_sa.json"
-    sa_file.write_text('{"project_id": "other-profile"}')
-    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", str(sa_file))
+    def explode(*args, **kwargs):
+        raise AssertionError("credential resolution must not be contacted")
 
-    secret_scope.set_multiplex_active(True)
-    token = secret_scope.set_secret_scope({})  # this profile defines nothing
-    try:
-        assert vertex_adapter.get_vertex_credentials() == (None, None)
-    finally:
-        secret_scope.reset_secret_scope(token)
-        secret_scope.set_multiplex_active(False)
+    class ExplodingCache:
+        def get(self, *args, **kwargs):
+            raise AssertionError("credential cache get must not be contacted")
+
+        def pop(self, *args, **kwargs):
+            raise AssertionError("credential cache pop must not be contacted")
+
+        def __setitem__(self, *args, **kwargs):
+            raise AssertionError("credential cache must not be contacted")
+
+    class ExplodingRequest:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("credential refresh request must not be created")
+
+    monkeypatch.setattr(vertex_adapter, "_resolve_credentials_path", explode)
+    monkeypatch.setattr(vertex_adapter, "_creds_cache", ExplodingCache())
+    monkeypatch.setattr(vertex_adapter.service_account.Credentials, "from_service_account_file", explode)
+    monkeypatch.setattr(vertex_adapter.google.auth, "default", explode)
+    monkeypatch.setattr(vertex_adapter, "_refresh_credentials", explode)
+    monkeypatch.setattr(vertex_adapter.google.auth.transport.requests, "Request", ExplodingRequest)
+    monkeypatch.setattr(vertex_adapter, "_vertex_config", explode)
+
+    with pytest.raises(GeminiOutboundDenied) as excinfo:
+        vertex_adapter.get_vertex_credentials("must-not-be-resolved")
+
+    exc = excinfo.value
+    assert type(exc) is GeminiOutboundDenied
+    assert str(exc) == "Gemini outbound requests are disabled."
+    assert exc.code == "gemini_outbound_denied"
+    assert vars(exc) == {}
 
 
 

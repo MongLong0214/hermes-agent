@@ -83,7 +83,7 @@ class TestStandaloneDeliverySkipsDuringShutdown:
 
         send_mock.assert_not_called()
         assert result is not None
-        assert "shutting down" in result
+        assert result == "Cron delivery failed"
 
     def test_normal_delivery_still_works_when_not_finalizing(self):
         """Guard must not regress the happy path: a normal (non-finalizing)

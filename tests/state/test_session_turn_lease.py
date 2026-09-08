@@ -2,16 +2,228 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import threading
 import time
+import uuid
 from types import SimpleNamespace
 
 import pytest
 
 import hermes_state
-from hermes_state import SessionDB, SessionTurnLeaseLostError
+from hermes_state import (
+    SessionDB,
+    SessionTurnLeaseLostError,
+    TurnReceiptFenceError,
+)
+
+
+def _complete_turn_receipt(
+    db, session_id: str, turn_request_id: str
+) -> tuple[str, dict]:
+    """Create one completed receipt whose terminal row destructive flows remove."""
+    claim_token = f"claim-{turn_request_id}"
+    binding_digest = f"binding:{turn_request_id}"
+    db.prepare_turn_receipt(session_id, turn_request_id, binding_digest)
+    assert db.claim_turn_receipt(
+        session_id, turn_request_id, binding_digest, claim_token
+    )
+    receipt = db.finish_turn_receipt(
+        session_id,
+        turn_request_id,
+        binding_digest,
+        claim_token,
+        assistant_content="terminal reply",
+        response_digest="sha256:" + "e" * 64,
+    )
+    return claim_token, receipt
+
+
+def _open_with_legacy_restrict_receipts(path):
+    """Open a database whose pre-C3 receipt FK still uses RESTRICT."""
+    fresh = SessionDB(path)
+    try:
+        foreign_keys = fresh._conn.execute(
+            "PRAGMA foreign_key_list('turn_receipts')"
+        ).fetchall()
+        assert any(
+            row["from"] == "terminal_message_id"
+            and row["on_delete"] == "CASCADE"
+            for row in foreign_keys
+        )
+    finally:
+        fresh.close()
+
+    with sqlite3.connect(path) as conn:
+        conn.execute("DROP TABLE turn_receipts")
+        conn.execute(
+            """CREATE TABLE turn_receipts (
+                turn_request_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                status TEXT NOT NULL,
+                claim_token TEXT,
+                terminal_message_id INTEGER REFERENCES messages(id),
+                response_digest TEXT,
+                created_at REAL NOT NULL,
+                claimed_at REAL,
+                completed_at REAL
+            )"""
+        )
+    return SessionDB(path)
+
+
+def test_turn_receipt_claim_token_fences_retries_across_restart(tmp_path):
+    """The stored token alone may retry a claim and its finished receipt."""
+    from tui_gateway.turn_receipts import TurnReceiptAdapter
+
+    path = tmp_path / "state.db"
+    db = SessionDB(path)
+    db.create_session("session", source="test")
+    receipts = TurnReceiptAdapter(db)
+    binding_digest = "binding:claim-retry"
+    receipts.prepare("session", "request", binding_digest)
+    token, claimed = receipts.claim(
+        "session", "request", binding_digest, claim_token="claim-a"
+    )
+    assert token == "claim-a"
+    assert claimed is not None
+    claimed_at = claimed["claimedAt"]
+    db.close()
+
+    reopened = SessionDB(path)
+    receipts = TurnReceiptAdapter(reopened)
+    try:
+        retry_token, retried_claim = receipts.claim(
+            "session", "request", binding_digest, claim_token="claim-a"
+        )
+        assert retry_token == "claim-a"
+        assert retried_claim is not None
+        assert retried_claim["claimedAt"] == claimed_at
+
+        rejected_token, rejected_claim = receipts.claim(
+            "session", "request", binding_digest, claim_token="claim-b"
+        )
+        assert rejected_token is None
+        assert rejected_claim == retried_claim
+
+        completed = receipts.finish(
+            "session",
+            "request",
+            binding_digest,
+            "claim-a",
+            assistant_content="terminal reply",
+            response_digest="sha256:" + "e" * 64,
+        )
+        with pytest.raises(TurnReceiptFenceError):
+            receipts.finish(
+                "session",
+                "request",
+                binding_digest,
+                "claim-b",
+                assistant_content="terminal reply",
+                response_digest="sha256:" + "e" * 64,
+            )
+        completed_bytes = json.dumps(completed, separators=(",", ":"))
+        retried_completed = receipts.finish(
+            "session",
+            "request",
+            binding_digest,
+            "claim-a",
+            assistant_content="terminal reply",
+            response_digest="sha256:" + "e" * 64,
+        )
+        assert (
+            json.dumps(retried_completed, separators=(",", ":")) == completed_bytes
+        )
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize("operation", ("replace", "clear", "delete"))
+def test_destructive_message_operations_retire_terminal_receipts(tmp_path, operation):
+    """Terminal-message deletion also works for existing RESTRICT schemas."""
+    db = _open_with_legacy_restrict_receipts(tmp_path / f"{operation}.db")
+    db.create_session("session", source="test")
+    _, completed = _complete_turn_receipt(db, "session", f"request-{operation}")
+    assert completed["terminalMessageId"] is not None
+
+    if operation == "replace":
+        db.replace_messages(
+            "session", [{"role": "user", "content": "replacement"}]
+        )
+        assert [row["content"] for row in db.get_messages("session")] == [
+            "replacement"
+        ]
+    elif operation == "clear":
+        db.clear_messages("session")
+        assert db.get_messages("session") == []
+    else:
+        assert db.delete_session("session") is True
+
+    assert db.get_turn_receipt(
+        "session", f"request-{operation}", f"binding:request-{operation}"
+    ) is None
+    assert db._conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    db.close()
+
+
+def test_terminal_assistant_row_and_completed_receipt_commit_atomically(tmp_path):
+    """Each injected failure leaves neither the terminal row nor COMPLETED receipt."""
+    from hermes_state import TerminalTurnReceipt
+
+    for stage, trigger_sql in (
+        (
+            "before row insert",
+            """CREATE TRIGGER terminal_receipt_before_row_insert
+            BEFORE INSERT ON messages WHEN NEW.role = 'assistant'
+            BEGIN SELECT RAISE(ABORT, 'before row insert'); END""",
+        ),
+        (
+            "after row insert",
+            """CREATE TRIGGER terminal_receipt_after_row_insert
+            AFTER INSERT ON messages WHEN NEW.role = 'assistant'
+            BEGIN SELECT RAISE(ABORT, 'after row insert'); END""",
+        ),
+        (
+            "before receipt update",
+            """CREATE TRIGGER terminal_receipt_before_receipt_update
+            BEFORE UPDATE OF status ON turn_receipts
+            WHEN NEW.status = 'COMPLETED'
+            BEGIN SELECT RAISE(ABORT, 'before receipt update'); END""",
+        ),
+    ):
+        db = SessionDB(tmp_path / f"{stage.replace(' ', '-')}.db")
+        db.create_session("session", source="test")
+        turn_request_id = uuid.uuid4().hex
+        claim_token = uuid.uuid4().hex
+        binding_digest = f"binding:{turn_request_id}"
+        db.prepare_turn_receipt("session", turn_request_id, binding_digest)
+        assert db.claim_turn_receipt(
+            "session", turn_request_id, binding_digest, claim_token
+        )
+        db._conn.execute(trigger_sql)
+
+        with pytest.raises(sqlite3.DatabaseError, match=stage):
+            db.append_message(
+                "session",
+                "assistant",
+                content="terminal reply",
+                terminal_turn_receipt=TerminalTurnReceipt(
+                    session_id="session",
+                    turn_request_id=turn_request_id,
+                    binding_digest=binding_digest,
+                    claim_token=claim_token,
+                    response_digest="sha256:" + "a" * 64,
+                    terminal_message_index=0,
+                ),
+            )
+
+        assert db.get_messages("session") == []
+        receipt = db.get_turn_receipt("session", turn_request_id, binding_digest)
+        assert receipt["status"] != "COMPLETED", stage
+        db.close()
 
 
 def test_turn_lease_serializes_separate_session_db_instances(tmp_path):
@@ -69,6 +281,58 @@ def test_turn_lease_is_scoped_to_conversation_root(tmp_path):
         "child", child_holder, ttl_seconds=5
     )
     db.release_session_turn_lease("child", root_holder)
+
+
+def test_turn_lease_only_ignores_conversation_id_conflict(tmp_path):
+    """A different UNIQUE constraint must not become ordinary contention."""
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("conversation-a", source="test")
+    db.create_session("conversation-b", source="test")
+    db._conn.execute(
+        "CREATE UNIQUE INDEX session_turn_leases_holder_unique_for_test "
+        "ON session_turn_leases(holder)"
+    )
+
+    holder = f"pid={os.getpid()}:turn=shared"
+    assert db.try_acquire_session_turn_lease(
+        "conversation-a", holder, ttl_seconds=5
+    )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        db.try_acquire_session_turn_lease(
+            "conversation-b", holder, ttl_seconds=5
+        )
+
+    rows = db._conn.execute(
+        "SELECT conversation_id, holder FROM session_turn_leases "
+        "ORDER BY conversation_id"
+    ).fetchall()
+    assert [tuple(row) for row in rows] == [("conversation-a", holder)]
+
+
+def test_turn_lease_raises_when_insert_is_ignored_without_owner(tmp_path):
+    """A silent insert refusal must not be reported as contention."""
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("conversation", source="test")
+    db._conn.execute(
+        """CREATE TRIGGER session_turn_leases_ignore_insert_for_test
+        BEFORE INSERT ON session_turn_leases
+        BEGIN
+            SELECT RAISE(IGNORE);
+        END"""
+    )
+
+    holder = f"pid={os.getpid()}:turn=ignored"
+    with pytest.raises(sqlite3.DatabaseError) as exc_info:
+        db.try_acquire_session_turn_lease(
+            "conversation", holder, ttl_seconds=5
+        )
+
+    assert str(exc_info.value) == "SESSION_TURN_LEASE_ACQUIRE_INSERT_MISSING"
+    assert db._conn.execute(
+        "SELECT 1 FROM session_turn_leases WHERE conversation_id = ?",
+        ("conversation",),
+    ).fetchone() is None
 
 
 def test_turn_lease_does_not_serialize_delegate_child_with_parent(tmp_path):
@@ -214,7 +478,7 @@ def test_turn_lease_write_txn_does_not_trust_fail_open_key_helper(
 def test_turn_lease_retries_locked_in_txn_key_walk(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ):
-    """A locked lineage walk must retry, not INSERT under the child id."""
+    """A post-BEGIN locked lineage walk rolls back without replaying work."""
     db = SessionDB(tmp_path / "state.db")
     db.create_session(
         "delegate",
@@ -240,16 +504,16 @@ def test_turn_lease_retries_locked_in_txn_key_walk(
 
     monkeypatch.setattr(db, "_session_turn_lease_key_on_conn", flaky_walk)
     holder = f"pid={os.getpid()}:turn=delegate"
-    assert db.try_acquire_session_turn_lease(
-        "delegate-continuation", holder, ttl_seconds=5
-    )
-    assert attempts["n"] >= 2
-    monkeypatch.setattr(db, "_session_turn_lease_key_on_conn", original)
-    assert not db.try_acquire_session_turn_lease(
-        "delegate", f"pid={os.getpid()}:turn=other", ttl_seconds=5
-    )
-    assert db.refresh_session_turn_lease("delegate", holder, ttl_seconds=5)
-    db.release_session_turn_lease("delegate-continuation", holder)
+    with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+        db.try_acquire_session_turn_lease(
+            "delegate-continuation", holder, ttl_seconds=5
+        )
+
+    assert attempts["n"] == 1
+    assert db._conn.execute(
+        "SELECT conversation_id FROM session_turn_leases WHERE conversation_id = ?",
+        ("delegate",),
+    ).fetchone() is None
 
 
 def test_turn_lease_refresh_and_release_are_owner_fenced(tmp_path):

@@ -59,29 +59,22 @@ def _seed_session(home, session_id, *, source, cwd=None, tokens=None, cost=None)
     ``tokens`` is an (input, output) pair; both it and ``cost`` are written
     straight to the row, the shape a finished turn leaves behind.
     """
-    import sqlite3
-
     from hermes_state import SessionDB
 
     db = SessionDB(db_path=home / "state.db")
     try:
         db.create_session(session_id, source=source, cwd=str(cwd) if cwd else None)
         db.append_message(session_id=session_id, role="user", content="hi")
+        if tokens is not None or cost is not None:
+            db._execute_write(
+                lambda conn: conn.execute(
+                    "UPDATE sessions SET input_tokens = ?, output_tokens = ?, "
+                    "estimated_cost_usd = ? WHERE id = ?",
+                    (*(tokens or (0, 0)), cost or 0.0, session_id),
+                )
+            )
     finally:
         db.close()
-
-    if tokens is None and cost is None:
-        return
-
-    conn = sqlite3.connect(home / "state.db")
-    try:
-        conn.execute(
-            "UPDATE sessions SET input_tokens = ?, output_tokens = ?, estimated_cost_usd = ? WHERE id = ?",
-            (*(tokens or (0, 0)), cost or 0.0, session_id),
-        )
-        conn.commit()
-    finally:
-        conn.close()
 
 
 def _seed_project(home, name, folder):

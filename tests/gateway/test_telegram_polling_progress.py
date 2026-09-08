@@ -6,7 +6,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from gateway.config import PlatformConfig
+from gateway.config import Platform, PlatformConfig
+from gateway.run import GatewayRunner
 from plugins.platforms.telegram import adapter as tg_adapter
 from plugins.platforms.telegram.adapter import TelegramAdapter
 
@@ -42,6 +43,26 @@ class _ControlledRequest:
 
 def _make_adapter() -> TelegramAdapter:
     return TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
+
+
+class _RedeliveryRunner:
+    """Narrow runtime-redelivery seam double; no ledger or adapter registry."""
+
+    def __init__(self, failure=None):
+        self._running = True
+        self.calls = []
+        self.failure = failure
+
+    async def _redeliver_failed_obligations_for_platform(self, platform, *, profile):
+        self.calls.append((platform, profile))
+        if self.failure is not None:
+            raise self.failure
+
+
+async def _await_runtime_redelivery(adapter: TelegramAdapter) -> None:
+    task = getattr(adapter, "_polling_runtime_redelivery_task", None)
+    assert task is not None
+    await task
 
 
 def _mock_polling_app(*, get_me=None):
@@ -359,6 +380,246 @@ async def test_current_polling_generation_success_records_progress():
     assert adapter._polling_network_error_count == 0
     assert adapter._send_path_degraded is False
     assert generation > 0
+
+
+@pytest.mark.asyncio
+async def test_first_polling_progress_signals_owner_redelivery_once_per_degraded_generation():
+    """The first real progress edge hands the normalized owner to the runner once."""
+    adapter = _make_adapter()
+    adapter.set_owner_profile("recovery-owner")
+    runner = _RedeliveryRunner()
+    setattr(adapter, "gateway_runner", runner)
+
+    generation_one, progress_one = adapter._begin_polling_generation()
+    request_one = adapter._instrument_polling_request(
+        _ControlledRequest(result=(200, b'{"ok":true,"result":[]}'))
+    )
+    await _request_for_generation(generation_one, request_one, "getUpdates")
+    assert progress_one.is_set()
+    await _await_runtime_redelivery(adapter)
+    assert runner.calls == [(Platform.TELEGRAM, adapter._owner_profile)]
+
+    await _request_for_generation(generation_one, request_one, "getUpdates")
+    assert runner.calls == [(Platform.TELEGRAM, adapter._owner_profile)]
+
+    generation_two, progress_two = adapter._begin_polling_generation()
+    request_two = adapter._instrument_polling_request(
+        _ControlledRequest(result=(200, b'{"ok":true,"result":[]}'))
+    )
+    await _request_for_generation(generation_two, request_two, "getUpdates")
+    assert progress_two.is_set()
+    await _await_runtime_redelivery(adapter)
+    assert runner.calls == [
+        (Platform.TELEGRAM, adapter._owner_profile),
+        (Platform.TELEGRAM, adapter._owner_profile),
+    ]
+
+
+def test_polling_progress_composes_real_gateway_runtime_redelivery(monkeypatch):
+    asyncio.run(_exercise_polling_runtime_redelivery_composition(monkeypatch))
+
+
+async def _exercise_polling_runtime_redelivery_composition(monkeypatch):
+    """A healthy polling edge must reach the real runner ledger boundary once."""
+    from gateway import delivery_ledger as ledger
+
+    owner_profile = "recovery-owner"
+    obligation_id = "polling-runtime-obligation"
+    session_key = "agent:recovery-owner:telegram:channel:owner-chat"
+    adapter = _make_adapter()
+    adapter.set_owner_profile(owner_profile)
+
+    target_delivery_adapter = MagicMock()
+    target_delivery_adapter.send = AsyncMock(
+        return_value=MagicMock(success=True, error="")
+    )
+    other_profile_adapter = MagicMock()
+    other_profile_adapter.send = AsyncMock(
+        return_value=MagicMock(success=True, error="")
+    )
+    default_profile_adapter = MagicMock()
+    default_profile_adapter.send = AsyncMock(
+        return_value=MagicMock(success=True, error="")
+    )
+
+    # Use the concrete production class, not a seam subclass. This is the same
+    # back-reference assignment performed when GatewayRunner installs adapters.
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._running = True
+    runner.adapters = {Platform.TELEGRAM: default_profile_adapter}
+    runner._profile_adapters = {
+        owner_profile: {Platform.TELEGRAM: target_delivery_adapter},
+        "other-owner": {Platform.TELEGRAM: other_profile_adapter},
+    }
+    runner.session_store = None  # type: ignore[assignment]
+    runner._async_session_store = MagicMock(_store=None)
+    runner._async_session_store.clear_resume_pending = AsyncMock()
+    setattr(adapter, "gateway_runner", runner)
+
+    peek_calls = []
+    claim_calls = []
+    settle_calls = []
+
+    def peek_failed(platform, *, profile):
+        peek_calls.append((platform, profile))
+        return [
+            {
+                "obligation_id": obligation_id,
+                "session_key": session_key,
+                "profile": owner_profile,
+            }
+        ]
+
+    def claim_failed(obligation, platform, *, profile):
+        claim_calls.append((obligation, platform, profile))
+        if (obligation, platform, profile) != (
+            obligation_id,
+            Platform.TELEGRAM.value,
+            owner_profile,
+        ):
+            return None
+        return {
+            "obligation_id": obligation_id,
+            "session_key": session_key,
+            "platform": Platform.TELEGRAM.value,
+            "chat_id": "owner-chat",
+            "thread_id": None,
+            "content": "durable recovery reply",
+            "needs_marker": True,
+            "marker": "[reconnected] ",
+            "profile": owner_profile,
+            "runtime_recovery": True,
+            "attempts": 1,
+            "runtime_claim_token": "a" * 32,
+        }
+
+    def settle_claim(obligation, *, claim_token, delivered, error):
+        settle_calls.append((obligation, claim_token, delivered, error))
+        return True
+
+    monkeypatch.setattr(ledger, "ledger_enabled", lambda: True)
+    monkeypatch.setattr(ledger, "peek_failed_for_runtime", peek_failed, raising=False)
+    monkeypatch.setattr(ledger, "claim_failed_for_runtime", claim_failed, raising=False)
+    monkeypatch.setattr(ledger, "settle_runtime_claim", settle_claim, raising=False)
+
+    generation, progress = adapter._begin_polling_generation()
+    request = adapter._instrument_polling_request(
+        _ControlledRequest(result=(200, b'{"ok":true,"result":[]}'))
+    )
+    result = await _request_for_generation(generation, request, "getUpdates")
+    await _await_runtime_redelivery(adapter)
+    await _request_for_generation(generation, request, "getUpdates")
+
+    assert result == (200, b'{"ok":true,"result":[]}')
+    assert progress.is_set()
+    assert (
+        callable(
+            getattr(runner, "_redeliver_failed_obligations_for_platform", None)
+        ),
+        peek_calls,
+        claim_calls,
+        target_delivery_adapter.send.await_count,
+        other_profile_adapter.send.await_count,
+        default_profile_adapter.send.await_count,
+        settle_calls,
+    ) == (
+        True,
+        [(Platform.TELEGRAM.value, owner_profile)],
+        [(obligation_id, Platform.TELEGRAM.value, owner_profile)],
+        1,
+        0,
+        0,
+        [(obligation_id, "a" * 32, True, "")],
+    )
+    runner._async_session_store.clear_resume_pending.assert_awaited_once_with(session_key)
+
+
+@pytest.mark.asyncio
+async def test_stale_shutdown_fatal_and_healthy_progress_do_not_signal_redelivery():
+    """Only a current degraded polling generation may signal the runner seam."""
+    adapter = _make_adapter()
+    runner = _RedeliveryRunner()
+    setattr(adapter, "gateway_runner", runner)
+
+    stale_generation, _ = adapter._begin_polling_generation()
+    adapter._begin_polling_generation()
+    stale_request = adapter._instrument_polling_request(
+        _ControlledRequest(result=(200, b'{"ok":true,"result":[]}'))
+    )
+    await _request_for_generation(stale_generation, stale_request, "getUpdates")
+    assert runner.calls == []
+
+    healthy_generation, _ = adapter._begin_polling_generation()
+    adapter._send_path_degraded = False
+    healthy_request = adapter._instrument_polling_request(
+        _ControlledRequest(result=(200, b'{"ok":true,"result":[]}'))
+    )
+    await _request_for_generation(healthy_generation, healthy_request, "getUpdates")
+    assert runner.calls == []
+
+    shutdown_generation, _ = adapter._begin_polling_generation()
+    await adapter.disconnect()
+    shutdown_request = adapter._instrument_polling_request(
+        _ControlledRequest(result=(200, b'{"ok":true,"result":[]}'))
+    )
+    await _request_for_generation(shutdown_generation, shutdown_request, "getUpdates")
+    assert runner.calls == []
+
+    fatal_adapter = _make_adapter()
+    fatal_runner = _RedeliveryRunner()
+    setattr(fatal_adapter, "gateway_runner", fatal_runner)
+    fatal_generation, _ = fatal_adapter._begin_polling_generation()
+    fatal_adapter._set_fatal_error("polling-fatal", "fatal polling failure", retryable=True)
+    fatal_request = fatal_adapter._instrument_polling_request(
+        _ControlledRequest(result=(200, b'{"ok":true,"result":[]}'))
+    )
+    await _request_for_generation(fatal_generation, fatal_request, "getUpdates")
+    assert fatal_runner.calls == []
+
+
+@pytest.mark.asyncio
+async def test_redelivery_callback_failure_is_sanitized_and_not_retried(caplog):
+    """The durable runner owns retrying; callback failure cannot abort polling."""
+    marker = "token=123456:TOP_SECRET /private/telegram/session/4242 payload=untrusted"
+
+    class CallbackFailure(RuntimeError):
+        pass
+
+    adapter = _make_adapter()
+    adapter.set_owner_profile("private-owner-canary")
+    runner = _RedeliveryRunner(failure=CallbackFailure(marker))
+    setattr(adapter, "gateway_runner", runner)
+    generation, progress = adapter._begin_polling_generation()
+    request = adapter._instrument_polling_request(
+        _ControlledRequest(result=(200, b'{"ok":true,"result":[]}'))
+    )
+
+    with caplog.at_level("WARNING", logger=tg_adapter.__name__):
+        result = await _request_for_generation(generation, request, "getUpdates")
+        await _await_runtime_redelivery(adapter)
+
+    assert result == (200, b'{"ok":true,"result":[]}')
+    assert progress.is_set()
+    assert adapter._send_path_degraded is False
+    await _request_for_generation(generation, request, "getUpdates")
+    assert runner.calls == [(Platform.TELEGRAM, adapter._owner_profile)]
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == tg_adapter.__name__
+        and "polling progress redelivery callback failed" in record.getMessage()
+    ]
+    assert messages == [
+        "Telegram polling progress redelivery callback failed (CallbackFailure)"
+    ]
+    logged = "\n".join(messages)
+    for forbidden in (
+        marker,
+        "TOP_SECRET",
+        "/private/telegram/session/4242",
+        "private-owner-canary",
+    ):
+        assert forbidden not in logged
 
 
 @pytest.mark.asyncio

@@ -16,17 +16,26 @@ import pytest
 
 
 
-def test_resolve_runtime_provider_raises_autherror_when_unresolved(monkeypatch):
+def test_resolve_runtime_provider_denies_vertex_before_credential_mint(monkeypatch):
     import agent.vertex_adapter as va
+    from agent.gemini_outbound_policy import GeminiOutboundDenied
     from hermes_cli import runtime_provider as rp
-    from hermes_cli.auth import AuthError
 
-    monkeypatch.setattr(va, "get_vertex_config", lambda: (None, None))
-    with pytest.raises(AuthError) as exc:
+    credential_calls = []
+
+    def unexpected_credential_mint():
+        credential_calls.append("vertex")
+        raise AssertionError("Vertex credential mint was reached")
+
+    monkeypatch.setattr(va, "get_vertex_config", unexpected_credential_mint)
+    with pytest.raises(GeminiOutboundDenied) as exc:
         rp.resolve_runtime_provider(requested="vertex")
-    msg = str(exc.value)
-    assert "OAuth2" in msg
-    assert "not a static API key" in msg
+
+    assert type(exc.value) is GeminiOutboundDenied
+    assert vars(exc.value) == {}
+    assert credential_calls == []
+    assert exc.value.code == "gemini_outbound_denied"
+    assert str(exc.value) == "Gemini outbound requests are disabled."
 
 
 def test_vertex_registered_in_provider_registry():

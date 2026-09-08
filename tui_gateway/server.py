@@ -2366,8 +2366,11 @@ def _start_agent_build(sid: str, session: dict) -> None:
                     # below, and a session reaped mid-build) must close it.
                     session_db = SessionDB(db_path=Path(profile_home) / "state.db")
                     owns_db = True
-                except Exception:
+                except Exception as exc:
                     session_db = None
+                    raise RuntimeError(
+                        f"failed to open session db for profile {profile_home!r}: {exc}"
+                    ) from exc
 
             try:
                 from tui_gateway.entry import ensure_mcp_discovery_started
@@ -2532,7 +2535,10 @@ def _start_agent_build(sid: str, session: dict) -> None:
 
 
 def _sess_nowait(params, rid):
-    s = _sessions.get(params.get("session_id") or "")
+    with _sessions_lock:
+        s = _sessions.get(params.get("session_id") or "")
+        if s is not None and s.get("_closing"):
+            s = None
     return (s, None) if s else (None, _err(rid, 4001, "session not found"))
 
 
@@ -3081,6 +3087,11 @@ def _persist_branch_seed(session: dict) -> None:
         seed = [dict(msg) for msg in (session.get("history") or [])]
     if not seed:
         return
+    seed.sort(
+        key=lambda msg: (
+            msg.get("timestamp") if isinstance(msg.get("timestamp"), (int, float)) else 0
+        )
+    )
     with _session_db(session) as db:
         if db is None:
             return
@@ -5111,8 +5122,18 @@ def _apply_model_switch(
             session.pop("one_turn_model_restore", None)
 
     # Record the switch as a PER-SESSION override so a later rebuild of THIS
-    # session (e.g. /new via _reset_session_agent, or resume) re-derives the
-    # user's chosen model/provider instead of falling back to global config.
+    # session re-derives the user's chosen model/provider instead of falling
+    # back to global config. Two rebuilds read it back: resume/reconnect
+    # (_start_agent_build's deferred _build() forwards session["model_override"]
+    # into _make_agent — see the lazy-resume kw assembly above) and the
+    # compute-host turn frame (ComputeHost forwards the same session field into
+    # its own _make_agent call — tui_gateway/compute_host.py). /new does NOT go
+    # through here: it re-derives via session.create/_init_session, a fresh
+    # session with no override to inherit. Nor does /tools enable|disable's
+    # _reset_session_agent — that path is the ONE real caller of
+    # _reset_session_agent, and it explicitly pops this override (a deliberate
+    # conversation-boundary reset, not a rebuild that re-derives session pins —
+    # see #48055/#23131 in _reset_session_agent).
     #
     # We deliberately do NOT write process-global env vars (HERMES_MODEL /
     # HERMES_INFERENCE_MODEL / HERMES_TUI_PROVIDER / HERMES_INFERENCE_PROVIDER)
@@ -5178,8 +5199,16 @@ def _sync_bot_capabilities(sid: str, session: dict) -> None:
         return
 
     # Capability surface changed — rebuild the agent in place. Same
-    # session_id/key, so the DB-backed history and (epoch-refreshed) system
-    # prompt carry over; only tool definitions and prompt bytes change.
+    # session_id/key, so the (epoch-refreshed) system prompt carries over; only
+    # tool definitions and prompt bytes change. DB-backed history only carries
+    # over if the rebuilt agent stays bound to the SAME database the outgoing
+    # one was using — _make_agent defaults session_db to the shared launch
+    # handle whenever the caller passes None, which silently rebinds a
+    # profile-scoped Bot Chat (app-global remote mode) to the wrong state.db.
+    # Reuse the outgoing agent's own handle instead of leaving that to chance
+    # (same fix and same reasoning as _reset_session_agent's profile-db bug).
+    old_db = getattr(agent, "_session_db", None)
+    old_db_owned = bool(getattr(agent, "_owns_session_db", False))
     try:
         tokens = _set_session_context(sid, cwd=_session_cwd(session))
         try:
@@ -5188,9 +5217,17 @@ def _sync_bot_capabilities(sid: str, session: dict) -> None:
                 session["session_key"],
                 session_id=session["session_key"],
                 platform_override=_session_source(session),
+                session_db=old_db,
             )
         finally:
             _clear_session_context(tokens)
+        if old_db_owned and _transfer_db_to_agent(new_agent, old_db):
+            # Real transfer, not a second claim — see _reset_session_agent.
+            agent._owns_session_db = False
+        # A refusal is left alone (do NOT close old_db, do NOT clear agent's
+        # flag) — same reasoning as _reset_session_agent: closing here would
+        # defeat _transfer_db_to_agent's own protection against ever tearing
+        # down the shared launch handle under another live session.
         new_agent._session_title_hint = "Bot Chat"
         session["agent"] = new_agent
         session["config_model_seen"] = _config_model_target()
@@ -6871,23 +6908,62 @@ def _preview_restart_callbacks(parent: str, task_id: str) -> dict:
 def _reset_session_agent(sid: str, session: dict) -> dict:
     tokens = _set_session_context(session["session_key"])
     try:
-        # /new is a full conversation boundary: session-scoped runtime
+        # This is a conversation-boundary reset: session-scoped runtime
         # overrides (/model, /reasoning, /fast) do NOT carry forward — the
         # fresh agent re-derives model/provider, reasoning, and service tier
         # from config.yaml (#48055, #23131). Session pins are cleared below so
         # a rebuild can't resurrect them. (Global process state is still never
         # touched — see the cross-session-contamination note in
-        # _apply_model_switch.)
+        # _apply_model_switch.) The ONLY real caller is tools.configure's
+        # /tools enable|disable (methods_tools.py); /new does not reach here —
+        # it re-derives via session.create/_init_session, a brand-new session
+        # with no session pins to clear in the first place.
         session.pop("model_override", None)
         session.pop("create_reasoning_override", None)
         session.pop("create_service_tier_override", None)
         session.pop("one_turn_model_restore", None)
+
+        # Keep the rebuilt agent on the SAME database the session was already
+        # using. _make_agent defaults session_db to the shared launch handle
+        # (_get_db()) whenever the caller passes None — fine for a launch
+        # session, wrong for a profile one (app-global remote mode), whose
+        # agent was bound to its own profile state.db. Reuse the outgoing
+        # agent's own handle rather than opening a second one: it is already
+        # open, it is exactly the db this session's rows live in (profile or
+        # shared — see _session_db()/_init_session() for the same
+        # profile_home-keyed selection), and reusing it means there is only
+        # ever one handle in play.
+        old_agent = session.get("agent")
+        existing_db = getattr(old_agent, "_session_db", None)
+        existing_db_owned = bool(getattr(old_agent, "_owns_session_db", False))
         new_agent = _make_agent(
             sid,
             session["session_key"],
             session_id=session["session_key"],
             platform_override=_session_source(session),
+            session_db=existing_db,
         )
+        if existing_db_owned and _transfer_db_to_agent(new_agent, existing_db):
+            # Make this a REAL transfer, not a second claim: clear the
+            # outgoing agent's flag so a stale reference to it can never
+            # close the handle the new agent is now using. The outgoing
+            # agent itself is still never explicitly closed here (unchanged
+            # from before this fix) — it is simply dropped once
+            # session["agent"] is reassigned below.
+            old_agent._owns_session_db = False
+        # A refusal is left alone — do NOT close existing_db here and do NOT
+        # clear old_agent's flag. _transfer_db_to_agent's identity/ownership
+        # checks exist SPECIFICALLY to protect the shared launch handle from
+        # ever being torn down under every other live session (its own
+        # docstring: "never called for the shared launch handle... transferring
+        # it would make session.close() tear down the process-wide database
+        # every other session shares" — #91610). Closing existing_db here on
+        # a refusal would defeat that exact protection the moment the checks
+        # ever disagree with existing_db_owned above — this function must
+        # never be the thing that cuts another session's db out from under
+        # it. Match the convention already documented at
+        # methods_session.py:871 for this same refusal: "the transfer is
+        # best-effort... a refusal leaves the old leak, which is survivable."
     finally:
         _clear_session_context(tokens)
     session["agent"] = new_agent
@@ -7817,7 +7893,11 @@ def _coerce_seed_history(value: Any) -> list[dict]:
         if not isinstance(content, str) or not content.strip():
             continue
 
-        history.append({"role": role, "content": content})
+        entry = {"role": role, "content": content}
+        timestamp = item.get("timestamp")
+        if isinstance(timestamp, (int, float)):
+            entry["timestamp"] = timestamp
+        history.append(entry)
 
     return history
 
@@ -10731,6 +10811,7 @@ def _run_prompt_submit(
     display_metadata: dict | None = None,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    turn_receipt=None,
 ) -> bool:
     with session["history_lock"]:
         if session.get("_closing"):
@@ -10866,7 +10947,7 @@ def _run_prompt_submit(
             streamer = make_stream_renderer(cols)
             prompt = text
 
-            if isinstance(prompt, str) and "@" in prompt:
+            if turn_receipt is None and isinstance(prompt, str) and "@" in prompt:
                 from agent.context_references import preprocess_context_references
                 from agent.model_metadata import get_model_context_length
 
@@ -10905,7 +10986,7 @@ def _run_prompt_submit(
             #            blocking the submit path on vision calls — #83291).
             # See agent/image_routing.py for the full decision table.
             run_message: Any = prompt
-            if images:
+            if images and turn_receipt is None:
                 try:
                     from agent.image_routing import (
                         decide_image_input_mode,
@@ -10961,13 +11042,18 @@ def _run_prompt_submit(
             # begin() first — it cuts any still-speaking previous turn, and
             # that cut IS this turn's barge-in, so it must latch before we
             # consume the latch below.
-            tts_queue = _tts_stream_begin()
+            if turn_receipt is None:
+                tts_queue = _tts_stream_begin()
 
             # Full-duplex agent-turn listener: armed at utterance-submit so
             # the user can interject DURING generation, not just during
             # playback. _tts_stream_begin arms it too when a pipeline
             # starts; this covers voice mode without working TTS.
-            if _voice_mode_enabled() and _voice_cfg_dict().get("barge_in", True):
+            if (
+                turn_receipt is None
+                and _voice_mode_enabled()
+                and _voice_cfg_dict().get("barge_in", True)
+            ):
                 _arm_full_duplex_listener()
 
             # Ambient "thinking" sound (voice mode only): calm bubble blips
@@ -10977,7 +11063,7 @@ def _run_prompt_submit(
             # stopped in the finally the instant the turn ends.
             # voice.thinking_sound config-gates it; macOS TCC handled inside.
             thinking_started = False
-            if _voice_mode_enabled():
+            if turn_receipt is None and _voice_mode_enabled():
                 try:
                     from tools.voice_mode import (
                         is_audio_output_active,
@@ -11005,15 +11091,18 @@ def _run_prompt_submit(
             # ("rude!") instead of being oblivious to its own interruption.
             from tools.tts_streaming import SPEECH_INTERRUPTED_NOTE, take_speech_interrupted
 
-            if take_speech_interrupted():
-                run_message = _prepend_note(run_message, SPEECH_INTERRUPTED_NOTE)
+            if turn_receipt is None:
+                if take_speech_interrupted():
+                    run_message = _prepend_note(run_message, SPEECH_INTERRUPTED_NOTE)
 
-            # Reactions the user added since the last turn.
-            run_message = _prepend_note(run_message, _pending_reaction_notes(session))
+                # Reactions the user added since the last turn.
+                run_message = _prepend_note(
+                    run_message, _pending_reaction_notes(session)
+                )
 
-            # Which window the message was typed into. HUD mode is per-turn
-            # state, so it cannot live in the (byte-stable) system prompt.
-            run_message = _prepend_note(run_message, _hud_surface_note(session))
+                # Which window the message was typed into. HUD mode is per-turn
+                # state, so it cannot live in the (byte-stable) system prompt.
+                run_message = _prepend_note(run_message, _hud_surface_note(session))
 
             def _stream(delta):
                 with session["history_lock"]:
@@ -11045,9 +11134,13 @@ def _run_prompt_submit(
                 "conversation_history": list(history),
                 "stream_callback": _stream,
                 "persist_user_message": (
-                    _build_persist_user_message(prompt, images, run_message) if images else prompt
+                    _build_persist_user_message(prompt, images, run_message)
+                    if images and turn_receipt is None
+                    else prompt
                 ),
             }
+            if turn_receipt is not None:
+                run_kwargs["turn_receipt"] = turn_receipt
             # Type a synthesized turn at turn START so the crash persist writes
             # its row as a timeline event, instead of leaving a raw user bubble
             # until the turn ends — and forever if it never does, which is
@@ -11263,6 +11356,10 @@ def _run_prompt_submit(
                 status = "complete"
 
             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
+            if isinstance(result, dict) and isinstance(result.get("turn_receipt"), dict):
+                payload["turn_receipt"] = _public_turn_receipt_disposition(
+                    result["turn_receipt"]
+                )
             if last_reasoning:
                 payload["reasoning"] = last_reasoning
             if status_note:

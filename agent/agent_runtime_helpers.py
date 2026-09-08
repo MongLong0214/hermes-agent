@@ -39,6 +39,10 @@ from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_res
 from agent.trajectory import convert_scratchpad_to_think
 from agent.credential_pool import STATUS_EXHAUSTED, credential_pool_matches_provider
 from agent.error_classifier import FailoverReason
+from agent.gemini_outbound_policy import (
+    GeminiOutboundDenied,
+    deny_gemini_outbound as _policy_deny_gemini_outbound,
+)
 from agent.turn_context import drop_stale_api_content
 from utils import base_url_host_matches, base_url_hostname, env_var_enabled, atomic_json_write
 
@@ -1322,6 +1326,15 @@ def try_recover_primary_transport(
     ):
         return False
 
+    rt = getattr(agent, "_primary_runtime", None) or {}
+    deny_gemini_outbound_route(
+        canonical_provider=rt.get("provider", ""),
+        model=rt.get("model", ""),
+        base_url=rt.get("base_url") or (rt.get("client_kwargs") or {}).get("base_url", ""),
+        api_mode=rt.get("api_mode", ""),
+        routing_hint=rt.get("requested_provider") or rt.get("provider", ""),
+    )
+
     try:
         # Retire the existing client to release stale connections. #70773:
         # never hard-close the shared client here — this runs on the
@@ -1384,6 +1397,8 @@ def try_recover_primary_transport(
         )
         time.sleep(wait_time)
         return True
+    except GeminiOutboundDenied:
+        raise
     except Exception as e:
         logger.warning("Primary transport recovery failed: %s", e)
         return False
@@ -1511,6 +1526,15 @@ def restore_primary_runtime(agent) -> bool:
     if getattr(agent, "_rate_limited_until", 0) > time.monotonic():
         return False  # primary still in rate-limit cooldown, stay on fallback
 
+    rt = getattr(agent, "_primary_runtime", None) or {}
+    deny_gemini_outbound_route(
+        canonical_provider=rt.get("provider", ""),
+        model=rt.get("model", ""),
+        base_url=rt.get("base_url") or (rt.get("client_kwargs") or {}).get("base_url", ""),
+        api_mode=rt.get("api_mode", ""),
+        routing_hint=rt.get("requested_provider") or rt.get("provider", ""),
+    )
+
     # ── Reset-aware gate ──
     # The 60s ``_rate_limited_until`` cooldown covers transient rate limits,
     # but subscription-style providers (Claude Pro/Max 5-hour windows, ChatGPT
@@ -1562,6 +1586,8 @@ def restore_primary_runtime(agent) -> bool:
                     agent.model,
                 )
             return False
+    except GeminiOutboundDenied:
+        raise
     except Exception:
         logger.debug(
             "Reset-aware restore gate failed; falling back to per-turn retry",
@@ -1768,6 +1794,8 @@ def restore_primary_runtime(agent) -> bool:
             agent.model, agent.provider,
         )
         return True
+    except GeminiOutboundDenied:
+        raise
     except Exception as e:
         logger.warning("Failed to restore primary runtime: %s", e)
         return False
@@ -2456,6 +2484,33 @@ def anthropic_prompt_cache_policy(
     return False, False
 
 
+def deny_gemini_outbound_route(
+    *,
+    canonical_provider: object = "",
+    model: object = "",
+    base_url: object = "",
+    api_mode: object = "",
+    routing_hint: object = "",
+) -> None:
+    """Fail closed using selected-endpoint authority, matching agent_init."""
+    if isinstance(base_url, str) and base_url.strip():
+        _policy_deny_gemini_outbound(base_url=base_url)
+        return
+    if str(canonical_provider or "").strip() or str(routing_hint or "").strip():
+        _policy_deny_gemini_outbound(
+            canonical_provider=canonical_provider,
+            routing_hint=routing_hint,
+            api_mode=api_mode,
+        )
+        return
+    _policy_deny_gemini_outbound(
+        canonical_provider=canonical_provider,
+        model=model,
+        base_url=base_url,
+        api_mode=api_mode,
+        routing_hint=routing_hint,
+    )
+
 
 def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: bool) -> Any:
     from agent.auxiliary_client import _validate_base_url, _validate_proxy_env_urls
@@ -2469,6 +2524,13 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     # copy locks the contract so future transport/keepalive work can't reintroduce
     # the same class of bug.
     client_kwargs = dict(client_kwargs)
+    deny_gemini_outbound_route(
+        canonical_provider=getattr(agent, "provider", ""),
+        model=getattr(agent, "model", ""),
+        base_url=client_kwargs.get("base_url") or getattr(agent, "base_url", ""),
+        api_mode=getattr(agent, "api_mode", ""),
+        routing_hint=getattr(agent, "requested_provider", "") or getattr(agent, "provider", ""),
+    )
     # The MoA virtual provider has no real OpenAI wire endpoint - the facade
     # *is* the client. Rebuilding a native OpenAI client while
     # agent.provider == "moa" (client replacement, stream-retry pool cleanup,
@@ -2614,14 +2676,29 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     change persists across turns (unlike fallback which is
     turn-scoped).
     """
-    from hermes_cli.providers import determine_api_mode
+    deny_gemini_outbound_route(
+        canonical_provider=new_provider,
+        model=new_model,
+        base_url=base_url,
+        api_mode=api_mode,
+        routing_hint=new_provider,
+    )
 
     # ── Determine api_mode if not provided ──
     # Pass model so dual-wire providers (Nous Portal anthropic/* → Messages)
     # resolve correctly; without it determine_api_mode falls back to the
     # openai_chat overlay default.
     if not api_mode:
+        from hermes_cli.providers import determine_api_mode
+
         api_mode = determine_api_mode(new_provider, base_url, model=new_model)
+        deny_gemini_outbound_route(
+            canonical_provider=new_provider,
+            model=new_model,
+            base_url=base_url,
+            api_mode=api_mode,
+            routing_hint=new_provider,
+        )
 
     # Defense-in-depth: ensure OpenCode base_url doesn't carry a trailing
     # /v1 into the anthropic_messages client, which would cause the SDK to

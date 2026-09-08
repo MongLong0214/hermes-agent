@@ -201,12 +201,15 @@ class TestDispatchGuardReleasedAfterHang:
             "id": "guard-sessiondb-hang",
             "name": "guard-sessiondb-hang",
             "prompt": "hello",
-            "schedule": "every 5m",
+            "schedule": {"kind": "interval", "minutes": 5, "display": "every 5m"},
             "enabled": True,
             "next_run_at": "2020-01-01T00:00:00",
             "deliver": "local",
         }
         timeouts: list = []
+
+        def _run_one_job_through_run_job(dispatched_job, **_kwargs):
+            return sched.run_job(dispatched_job)[0]
 
         try:
             with patch("cron.scheduler._hermes_home", tmp_path), \
@@ -224,7 +227,13 @@ class TestDispatchGuardReleasedAfterHang:
                      side_effect=_session_db_executor(timeouts),
                  ), \
                  patch.object(sched, "get_due_jobs", return_value=[job]), \
-                 patch.object(sched, "claim_job_for_fire", return_value=True), \
+                 patch.object(sched, "create_execution", return_value={"id": "sessiondb-execution"}), \
+                 patch.object(
+                     sched,
+                     "claim_job_for_fire",
+                     return_value={**job, "fire_claim": {"by": "test-owner", "at": "now"}},
+                 ), \
+                 patch.object(sched, "run_one_job", side_effect=_run_one_job_through_run_job), \
                  patch.object(sched, "save_job_output", return_value="/tmp/out"), \
                  patch.object(sched, "mark_job_run"), \
                  patch.object(sched, "_deliver_result", return_value=None):

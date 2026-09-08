@@ -25,12 +25,11 @@ Hermes' support is deliberately narrow (live verification, Aug 2026):
 
 Ownership model: Hermes' local compression stays fully armed as the
 fallback owner. The native threshold is clamped safely below the local
-compressor's trigger so the server compacts first; if it doesn't (native
-disabled mid-session, provider hiccup, non-eligible route), the local
-summarizer fires exactly as before. There is no new custody state — the
-captured compaction items ride the existing ``codex_reasoning_items``
-sidecar, which already handles persistence (state.db), gateway session
-replay, cross-issuer stamping, and the encrypted-replay kill switch.
+compressor's trigger, and a bounded in-memory grace lets the server capture
+then replay one checkpoint before local compression resumes. The captured
+compaction items ride the existing ``codex_reasoning_items`` sidecar, which
+already handles persistence (state.db), gateway session replay,
+cross-issuer stamping, and the encrypted-replay kill switch.
 
 This module stays free of transport/adapter dependencies so the transport,
 adapter, and conversation loop can share the gate without import cycles. The
@@ -56,6 +55,10 @@ logger = logging.getLogger(__name__)
 LOCAL_TRIGGER_SAFETY_MARGIN = 8_192
 
 DEFAULT_COMPACT_THRESHOLD = 200_000
+
+# Ephemeral agent state for one capture-and-replay opportunity.  It is not
+# persisted: a resumed/interrupted request must use the normal local fallback.
+_PREFLIGHT_GRACE_STATE_ATTR = "_native_compaction_preflight_grace"
 
 # Model-family gate. Substring match on the lowercased model id so dated
 # snapshots (gpt-5.6-2026-07-xx) and variants (gpt-5.6-mini) stay eligible.
@@ -152,6 +155,258 @@ def native_compaction_context_management(
         getattr(compressor, "threshold_tokens", None) if compressor is not None else None,
     )
     return [{"type": "compaction", "compact_threshold": threshold}]
+
+
+def _agent_route_flag(agent: Any, name: str) -> bool:
+    """Read an optional route predicate without making the gate fragile."""
+    value = getattr(agent, name, False)
+    try:
+        return bool(value() if callable(value) else value)
+    except Exception:
+        return False
+
+
+def native_compaction_preflight_eligible(agent: Any) -> bool:
+    """True only when the next direct Responses request can carry the field.
+
+    Delegating the final decision to ``native_compaction_context_management``
+    keeps preflight admission on the same model/route/configuration gate as the
+    outbound payload builder.
+    """
+    if getattr(agent, "api_mode", None) != "codex_responses":
+        return False
+    provider = str(getattr(agent, "provider", "") or "").lower()
+    base_url = str(getattr(agent, "base_url", "") or "").lower()
+    return native_compaction_context_management(
+        agent,
+        is_codex_backend=_agent_route_flag(agent, "_is_codex_backend"),
+        is_xai_responses=provider.startswith("xai") or "x.ai" in base_url,
+        is_github_responses=(
+            "copilot" in provider
+            or "github" in base_url
+            or _agent_route_flag(agent, "_is_copilot_url")
+        ),
+    ) is not None
+
+
+def _as_positive_int(value: Any) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return parsed if parsed > 0 else 0
+
+
+def _request_has_native_grace_headroom(agent: Any, rough_tokens: Any) -> bool:
+    """Require a known input/output budget before allowing native grace."""
+    compressor = getattr(agent, "context_compressor", None)
+    context_length = _as_positive_int(getattr(compressor, "context_length", None))
+    rough = _as_positive_int(rough_tokens)
+    if not context_length or not rough:
+        return False
+    max_output = _as_positive_int(getattr(compressor, "max_tokens", None))
+    if not max_output:
+        max_output = _as_positive_int(getattr(agent, "max_tokens", None))
+    input_limit = context_length - max_output
+    return input_limit > 0 and rough < input_limit
+
+
+def _messages_have_compaction_checkpoint(messages: Any) -> bool:
+    if not isinstance(messages, list):
+        return False
+    return any(
+        isinstance(message, dict)
+        and has_compaction_checkpoint(message.get("codex_reasoning_items"))
+        for message in messages
+    )
+
+
+def _get_preflight_grace(agent: Any) -> Optional[Dict[str, Any]]:
+    state = getattr(agent, _PREFLIGHT_GRACE_STATE_ATTR, None)
+    return state if isinstance(state, dict) else None
+
+
+def _clear_preflight_grace(agent: Any) -> None:
+    try:
+        setattr(agent, _PREFLIGHT_GRACE_STATE_ATTR, None)
+    except Exception:
+        pass
+
+
+def _preflight_grace_identity(agent: Any) -> tuple[str, str, str, str, str]:
+    """Return the route/session identity that may own one native chance."""
+    return (
+        str(getattr(agent, "session_id", "") or ""),
+        str(getattr(agent, "api_mode", "") or ""),
+        str(getattr(agent, "model", "") or ""),
+        str(getattr(agent, "provider", "") or ""),
+        str(getattr(agent, "base_url", "") or ""),
+    )
+
+
+def _mark_preflight_fallback(agent: Any) -> None:
+    """Require the next eligible preflight check to use local compression."""
+    state = _get_preflight_grace(agent)
+    if state is not None:
+        state["phase"] = "fallback"
+
+
+def defer_local_preflight_for_native_compaction(
+    agent: Any,
+    rough_tokens: Any,
+    *,
+    messages: Any = None,
+) -> bool:
+    """Give a safe native capture-and-replay sequence priority over local work.
+
+    Both preflight sites can consult this policy while assembling the same
+    request.  It is only consumed at the outbound-request boundary; a
+    usage-less failure, retry, unsafe request, or missing checkpoint clears it
+    so the next eligible check uses the existing local compressor.
+    """
+    state = _get_preflight_grace(agent)
+    identity = _preflight_grace_identity(agent)
+    if state is not None and state.get("identity") != identity:
+        # A route/model/session rebuild cannot consume a chance armed for the
+        # old request.  Preserve an explicit fallback marker so the next
+        # preflight check cannot be suppressed by stale real-usage optimism.
+        _mark_preflight_fallback(agent)
+    if state is not None and state.get("phase") == "fallback":
+        return False
+
+    compressor = getattr(agent, "context_compressor", None)
+    threshold = _as_positive_int(getattr(compressor, "threshold_tokens", None))
+    rough = _as_positive_int(rough_tokens)
+    if (
+        not threshold
+        or rough < threshold
+        or not native_compaction_preflight_eligible(agent)
+        or not _request_has_native_grace_headroom(agent, rough)
+    ):
+        _clear_preflight_grace(agent)
+        return False
+
+    if state is not None:
+        if (
+            state.get("phase") == "awaiting_replay"
+            and not _messages_have_compaction_checkpoint(messages)
+        ):
+            _mark_preflight_fallback(agent)
+            return False
+        return state.get("phase") in {"awaiting_capture", "awaiting_replay"}
+
+    if _messages_have_compaction_checkpoint(messages):
+        return False
+    last_real = _as_positive_int(getattr(compressor, "last_real_prompt_tokens", None))
+    if not last_real or last_real >= threshold:
+        return False
+    try:
+        setattr(
+            agent,
+            _PREFLIGHT_GRACE_STATE_ATTR,
+            {
+                "phase": "awaiting_capture",
+                "baseline_prompt_tokens": last_real,
+                "identity": identity,
+            },
+        )
+    except Exception:
+        return False
+    return True
+
+
+def consume_native_compaction_preflight_fallback(agent: Any) -> bool:
+    """Consume an explicit native failure so the caller runs local preflight.
+
+    ``should_defer_preflight_to_real_usage`` normally avoids summaries when a
+    prior real count fit below threshold.  It must not override a native
+    capture/replay failure: that state means the over-threshold request has no
+    safe native owner and needs the existing local fallback now.
+    """
+    state = _get_preflight_grace(agent)
+    if state is None or state.get("phase") != "fallback":
+        return False
+    _clear_preflight_grace(agent)
+    return True
+
+
+def start_native_compaction_preflight_request(agent: Any, api_kwargs: Any) -> bool:
+    """Consume an armed grace only at the native-bearing outbound boundary."""
+    state = _get_preflight_grace(agent)
+    if state is None or state.get("phase") not in {"awaiting_capture", "awaiting_replay"}:
+        return True
+    if state.get("identity") != _preflight_grace_identity(agent):
+        _mark_preflight_fallback(agent)
+        return False
+    context_management = api_kwargs.get("context_management") if isinstance(api_kwargs, dict) else None
+    if not (
+        isinstance(context_management, list)
+        and any(
+            isinstance(item, dict) and item.get("type") == "compaction"
+            for item in context_management
+        )
+    ):
+        _mark_preflight_fallback(agent)
+        return False
+    if state.get("phase") == "awaiting_replay":
+        input_items = api_kwargs.get("input") if isinstance(api_kwargs, dict) else None
+        if not has_compaction_checkpoint(input_items):
+            _mark_preflight_fallback(agent)
+            return False
+    state["request_phase"] = state["phase"]
+    state["phase"] = "in_flight"
+    return True
+
+
+def _response_has_compaction_checkpoint(response: Any) -> bool:
+    output = getattr(response, "output", None)
+    if not isinstance(output, list):
+        return False
+    return any(
+        (item.get("type") if isinstance(item, dict) else getattr(item, "type", None))
+        == "compaction"
+        for item in output
+    )
+
+
+def observe_native_compaction_preflight_response(
+    agent: Any,
+    response: Any,
+    *,
+    prompt_tokens: Any,
+) -> None:
+    """Resolve the grace from the matching provider response exactly once."""
+    state = _get_preflight_grace(agent)
+    if state is None or state.get("phase") != "in_flight":
+        return
+    request_phase = state.get("request_phase")
+    prompt = _as_positive_int(prompt_tokens)
+    if request_phase == "awaiting_capture":
+        if _response_has_compaction_checkpoint(response):
+            state["phase"] = "awaiting_replay"
+            state["capture_prompt_tokens"] = prompt
+        else:
+            _mark_preflight_fallback(agent)
+        return
+    if request_phase == "awaiting_replay":
+        baseline = _as_positive_int(state.get("baseline_prompt_tokens"))
+        capture = _as_positive_int(state.get("capture_prompt_tokens"))
+        reduction_sources = [value for value in (baseline, capture) if value]
+        if prompt and reduction_sources and prompt < min(reduction_sources):
+            _clear_preflight_grace(agent)
+        else:
+            _mark_preflight_fallback(agent)
+        return
+    _mark_preflight_fallback(agent)
+
+
+def cancel_native_compaction_preflight_request(agent: Any) -> bool:
+    """Expire an in-flight grace and report whether local fallback is due."""
+    state = _get_preflight_grace(agent)
+    was_in_flight = state is not None and state.get("phase") == "in_flight"
+    if state is not None:
+        _mark_preflight_fallback(agent)
+    return was_in_flight
 
 
 # Retention budget for plaintext user messages carried across a native

@@ -228,6 +228,11 @@ class SessionManager:
         logger.info("Created ACP session %s (cwd=%s)", session_id, cwd)
         return state
 
+    def _get_cached_session(self, session_id: str) -> Optional[SessionState]:
+        """Return an in-memory ACP state without attempting durable restoration."""
+        with self._lock:
+            return self._sessions.get(session_id)
+
     def get_session(self, session_id: str) -> Optional[SessionState]:
         """Return the session for *session_id*, or ``None``.
 
@@ -507,9 +512,7 @@ class SessionManager:
             logger.warning("Failed to persist ACP session %s", state.session_id, exc_info=True)
 
     def _restore(self, session_id: str) -> Optional[SessionState]:
-        """Load a session from the database into memory, recreating the AIAgent."""
-        import threading
-
+        """Load an ACP-owned session from the database into memory."""
         db = self._get_db()
         if db is None:
             return None
@@ -520,12 +523,43 @@ class SessionManager:
             logger.debug("Failed to query DB for ACP session %s", session_id, exc_info=True)
             return None
 
-        if row is None:
+        # Ordinary ACP entry points remain source-fenced.
+        if row is None or row.get("source") != "acp":
+            return None
+        return self._remember_restored_session(
+            self._materialize_persisted_session(session_id, db, row)
+        )
+
+    def _restore_authorized_terminal_receipt_target(
+        self, session_id: str, *, db: Any
+    ) -> Optional[SessionState]:
+        """Restore one non-ACP target after terminal-receipt admission.
+
+        This is intentionally private: ``HermesACPAgent.prompt`` calls it only
+        after the same ``SessionDB`` accepted the closed receipt tuple.  It does
+        not alter the source fence used by ordinary ACP restoration.
+        """
+        if db is None or db is not self._get_db():
+            return None
+        try:
+            row = db.get_session(session_id)
+        except Exception:
+            logger.debug(
+                "Failed to query terminal-receipt target session %s", session_id, exc_info=True
+            )
             return None
 
-        # Only restore ACP sessions.
-        if row.get("source") != "acp":
+        # An ACP row must travel through the ordinary source-fenced path. This
+        # exceptional capability is exclusively for a durable non-ACP target.
+        if row is None or row.get("source") == "acp":
             return None
+        return self._materialize_persisted_session(session_id, db, row)
+
+    def _materialize_persisted_session(
+        self, session_id: str, db: Any, row: dict[str, Any]
+    ) -> Optional[SessionState]:
+        """Materialize a source-authorized persisted row without creating it."""
+        import threading
 
         # Extract cwd from model_config.
         cwd = "."
@@ -580,10 +614,22 @@ class SessionManager:
             history=history,
             cancel_event=threading.Event(),
         )
-        with self._lock:
-            self._sessions[session_id] = state
         _register_task_cwd(session_id, cwd)
-        logger.info("Restored ACP session %s from DB (%d messages)", session_id, len(history))
+        return state
+
+    def _remember_restored_session(
+        self, state: Optional[SessionState]
+    ) -> Optional[SessionState]:
+        """Cache only a session admitted through the ordinary ACP source fence."""
+        if state is None:
+            return None
+        with self._lock:
+            self._sessions[state.session_id] = state
+        logger.info(
+            "Restored ACP session %s from DB (%d messages)",
+            state.session_id,
+            len(state.history),
+        )
         return state
 
     def _delete_persisted(self, session_id: str) -> bool:

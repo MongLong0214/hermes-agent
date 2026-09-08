@@ -616,3 +616,153 @@ async def test_empty_fallback_final_after_split_records_only_what_survives():
     # The head is gone from the chat, so the complete answer was NOT delivered:
     # the gateway must be told this is a mismatch and send it.
     assert consumer.delivered_final_matches(complete) is False
+
+
+def test_accepted_responses_transport_failure_delivers_partial_once_then_terminal_failure(
+    monkeypatch, tmp_path
+):
+    """Drive the real agent/Responses/finalizer/gateway delivery chain.
+
+    Only the physical Responses transport and the platform adapter's physical
+    send are replaced.  The accepted delta travels through ``relay_llm``,
+    ``ManagedLlmStream``, ``AIAgent.run_conversation`` and ``finalize_turn``
+    before the gateway sends the terminal failure as a distinct final message.
+    """
+    import httpx
+    import run_agent
+    import yaml
+
+    partial = "partial"
+    terminal_notice = "⚠️ No reply: streaming stopped early. Send `continue` to resume."
+    private_url = "https://api.example.test/v1/responses?access_token=TOP_SECRET_TOKEN"
+    private_path = "/Users/alice/.hermes/private/credential.json"
+    private_credential = "credential=TOP_SECRET_TOKEN"
+    wire_calls = []
+
+    class _AcceptedThenTransportFailure:
+        def __iter__(self):
+            yield SimpleNamespace(type="response.output_text.delta", delta=partial)
+            raise httpx.ReadTimeout(
+                f"transport failed {private_url} {private_path} {private_credential}",
+                request=httpx.Request("POST", "https://chatgpt.com/responses"),
+            )
+
+        def close(self):
+            return None
+
+    class _ResponsesTransport:
+        def create(self, **kwargs):
+            wire_calls.append(
+                {
+                    "context_management": tuple(
+                        item.get("type")
+                        for item in kwargs.get("context_management", [])
+                    ),
+                    "input": kwargs.get("input"),
+                    "stream": kwargs.get("stream"),
+                }
+            )
+            return _AcceptedThenTransportFailure()
+
+    client = SimpleNamespace(responses=_ResponsesTransport())
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_TURN_COMPLETION_EXPLAINER", "0")
+    monkeypatch.setattr(run_agent, "get_tool_definitions", lambda **kwargs: [])
+    monkeypatch.setattr(run_agent, "check_toolset_requirements", lambda: {})
+    monkeypatch.setattr(
+        run_agent.AIAgent,
+        "_create_request_openai_client",
+        lambda _agent, **_kwargs: client,
+    )
+    (tmp_path / "config.yaml").write_text(
+        yaml.dump(
+            {
+                "compression": {"codex_responses_native": True},
+                "display": {"tool_progress": "off", "interim_assistant_messages": False},
+                "streaming": {
+                    "enabled": True,
+                    "edit_interval": 0.01,
+                    "buffer_threshold": 1,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    runtime = {
+        "provider": "openai-codex",
+        "api_mode": "codex_responses",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "api_key": "codex-token",
+    }
+    monkeypatch.setattr(
+        gateway_run.GatewayRunner,
+        "_resolve_session_agent_runtime",
+        lambda *_args, **_kwargs: ("gpt-5.6", dict(runtime)),
+    )
+    monkeypatch.setattr(
+        gateway_run.GatewayRunner,
+        "_resolve_turn_agent_config",
+        lambda _self, _message, model, runtime_kwargs: {
+            "model": model,
+            "runtime": dict(runtime_kwargs),
+            "request_overrides": None,
+        },
+    )
+    monkeypatch.setattr(gateway_run.GatewayRunner, "_refresh_fallback_model", lambda *_a: None)
+    monkeypatch.setattr(gateway_run.GatewayRunner, "_agent_config_signature", lambda *_a, **_k: "b1")
+    monkeypatch.setattr(gateway_run.GatewayRunner, "_consume_pending_turn_sidecar_notes", lambda *_a: [])
+
+    adapter = FinalizeCaptureAdapter()
+    runner = _make_runner(adapter)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+    )
+    result = asyncio.run(runner._run_agent(
+        message="describe this photo",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-b1-accepted-failure",
+        session_key="agent:main:telegram:group:-1001",
+    ))
+
+    # ``_deliver_queued_first_response`` is the production GatewayRunner final
+    # delivery helper; the adapter records only the external platform wire.
+    asyncio.run(runner._deliver_queued_first_response(
+        result["final_response"],
+        source=source,
+        adapter=adapter,
+        metadata=None,
+        event_message_id=None,
+        text_already_delivered=False,
+        deliver_media=False,
+        stream_consumer=None,
+    ))
+
+    visible_partial_messages = [
+        sent for sent in adapter.sent if sent["content"].replace(" ▉", "") == partial
+    ]
+    terminal_messages = [sent for sent in adapter.sent if sent["content"] == terminal_notice]
+    history_partial_count = sum(
+        str(message.get("content", "")).count(partial)
+        for message in result["messages"]
+        if isinstance(message, dict)
+    )
+    assert len(wire_calls) == 1, wire_calls
+    assert wire_calls[0]["stream"] is True
+    assert wire_calls[0]["context_management"] == ("compaction",)
+    assert len(visible_partial_messages) == 1
+    assert result["final_response"] == terminal_notice
+    assert len(terminal_messages) == 1
+    assert partial not in terminal_messages[0]["content"]
+    assert history_partial_count == 1
+    assert result["response_previewed"] is True
+    assert result["failed"] is True
+    public_payloads = [result["final_response"], *(sent["content"] for sent in adapter.sent)]
+    for private_substring in (private_url, private_path, private_credential):
+        assert all(private_substring not in payload for payload in public_payloads)

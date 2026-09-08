@@ -236,7 +236,8 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     _setup_logging()
-    _load_env()
+    if os.environ.get("HERMES_ACP_SKIP_ENV_LOAD", "").strip() != "1":
+        _load_env()
 
     logger = logging.getLogger(__name__)
     logger.info("Starting hermes-agent ACP adapter")

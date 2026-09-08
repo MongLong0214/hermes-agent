@@ -1,6 +1,8 @@
+import ast
 import base64
 import json
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -28,6 +30,547 @@ def test_configured_api_key_provider_without_key_fails_closed(monkeypatch):
 
     with pytest.raises(rp.AuthError, match="No usable credentials.*deepseek"):
         rp.resolve_runtime_provider()
+
+
+@pytest.mark.parametrize("key_name", ("GOOGLE_API_KEY", "GEMINI_API_KEY"))
+def test_auto_selected_gemini_is_denied_before_pool_or_credential_resolution(monkeypatch, key_name):
+    """Auto-selected Gemini must stop before any pool or API-key lookup."""
+    from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+    calls = {"pool": 0, "credentials": 0}
+
+    class EmptyPool:
+        def has_credentials(self):
+            return False
+
+    def observing_pool(_provider):
+        calls["pool"] += 1
+        return EmptyPool()
+
+    def unexpected_credential_resolution(_provider):
+        calls["credentials"] += 1
+        raise AssertionError("Gemini API-key credential resolution was reached")
+
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {})
+    monkeypatch.setattr(rp, "load_pool", observing_pool)
+    monkeypatch.setattr(rp, "resolve_api_key_provider_credentials", unexpected_credential_resolution)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.setenv(key_name, "auto-selected-gemini-key")
+
+    with pytest.raises(GeminiOutboundDenied) as exc_info:
+        rp.resolve_runtime_provider(requested="auto")
+
+    assert calls == {"pool": 0, "credentials": 0}
+    assert exc_info.value.code == "gemini_outbound_denied"
+    assert str(exc_info.value) == "Gemini outbound requests are disabled."
+
+
+def test_lmstudio_base_url_env_gemini_host_is_denied_before_pool_or_credentials(monkeypatch):
+    """A provider-declared URL override must stop before pool or key lookup."""
+    from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+    calls = {"pool": 0, "credentials": 0}
+
+    class EmptyPool:
+        def has_credentials(self):
+            return False
+
+    def observing_pool(_provider):
+        calls["pool"] += 1
+        return EmptyPool()
+
+    def unexpected_credential_resolution(_provider):
+        calls["credentials"] += 1
+        raise AssertionError(
+            f"LM Studio API-key credential resolution was reached after pool={calls['pool']}"
+        )
+
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {"provider": "lmstudio", "default": "ordinary-model"},
+    )
+    monkeypatch.setattr(rp, "load_pool", observing_pool)
+    monkeypatch.setattr(rp, "resolve_api_key_provider_credentials", unexpected_credential_resolution)
+    monkeypatch.setenv("LM_BASE_URL", "https://GENERATIVELANGUAGE.GOOGLEAPIS.COM.:443/v1beta")
+    monkeypatch.setenv("LM_API_KEY", "ordinary-lm-key")
+
+    with pytest.raises(GeminiOutboundDenied) as exc_info:
+        rp.resolve_runtime_provider(requested="lmstudio")
+
+    assert calls == {"pool": 0, "credentials": 0}
+    assert exc_info.value.code == "gemini_outbound_denied"
+    assert str(exc_info.value) == "Gemini outbound requests are disabled."
+
+
+def test_lmstudio_pool_entry_gemini_base_url_is_denied_before_runtime_return(monkeypatch):
+    """A provider-scoped pool URL cannot return an outbound Gemini runtime."""
+    from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+    class Entry:
+        runtime_api_key = "pool-token"
+        runtime_base_url = "https://GENERATIVELANGUAGE.GOOGLEAPIS.COM.:443/v1beta"
+        source = "pool:lmstudio"
+
+    class Pool:
+        def has_credentials(self):
+            return True
+
+        def select(self):
+            return Entry()
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *_args, **_kwargs: "lmstudio")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {"provider": "lmstudio", "default": "ordinary-model"},
+    )
+    monkeypatch.setattr(rp, "load_pool", lambda _provider: Pool())
+    monkeypatch.setattr(rp, "credential_pool_matches_provider", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        rp,
+        "resolve_api_key_provider_credentials",
+        lambda _provider: (_ for _ in ()).throw(
+            AssertionError("credential resolution must not follow a pooled runtime")
+        ),
+    )
+
+    with pytest.raises(GeminiOutboundDenied) as exc_info:
+        rp.resolve_runtime_provider(requested="lmstudio")
+
+    assert exc_info.value.code == "gemini_outbound_denied"
+    assert str(exc_info.value) == "Gemini outbound requests are disabled."
+
+
+@pytest.mark.parametrize(
+    ("provider", "base_url_env", "credential_resolver"),
+    (
+        ("nous", "NOUS_INFERENCE_BASE_URL", "resolve_nous_runtime_credentials"),
+        ("openai-codex", "HERMES_CODEX_BASE_URL", "resolve_codex_runtime_credentials"),
+        ("qwen-oauth", "HERMES_QWEN_BASE_URL", "resolve_qwen_runtime_credentials"),
+    ),
+)
+def test_special_oauth_base_url_env_is_denied_before_pool_or_credentials(
+    monkeypatch, provider, base_url_env, credential_resolver
+):
+    """Non-registry OAuth URL overrides must stop before local auth work."""
+    from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+    calls = {"pool": 0, "credentials": 0}
+
+    class EmptyPool:
+        def has_credentials(self):
+            return False
+
+    def observing_pool(_provider):
+        calls["pool"] += 1
+        return EmptyPool()
+
+    def unexpected_credential_resolution(*_args, **_kwargs):
+        calls["credentials"] += 1
+        raise AssertionError("special OAuth credential resolution was reached")
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *_args, **_kwargs: provider)
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {"provider": provider, "default": "ordinary-model"},
+    )
+    monkeypatch.setattr(rp, "load_pool", observing_pool)
+    monkeypatch.setattr(rp, credential_resolver, unexpected_credential_resolution)
+    monkeypatch.setenv(base_url_env, "https://GENERATIVELANGUAGE.GOOGLEAPIS.COM.:443/v1beta")
+
+    with pytest.raises(GeminiOutboundDenied) as exc_info:
+        rp.resolve_runtime_provider(requested=provider)
+
+    assert calls == {"pool": 0, "credentials": 0}
+    assert exc_info.value.code == "gemini_outbound_denied"
+    assert str(exc_info.value) == "Gemini outbound requests are disabled."
+
+
+def test_bare_custom_base_url_gemini_host_is_denied_before_pool_or_credentials(monkeypatch):
+    """Bare custom must reject CUSTOM_BASE_URL before any local or remote work."""
+    from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+    calls = {"pool": 0, "credentials": 0, "token": 0, "client": 0, "network": 0}
+    canonical_requests = []
+
+    class EmptyPool:
+        def has_credentials(self):
+            return False
+
+    def canonical_custom(requested, **_kwargs):
+        canonical_requests.append(requested)
+        return "custom"
+
+    def observing_pool(provider):
+        calls["pool"] += 1
+        assert provider == "custom"
+        return EmptyPool()
+
+    def unexpected_credential(*_args, **_kwargs):
+        calls["credentials"] += 1
+        raise AssertionError("custom credential resolver was reached")
+
+    def unexpected_token(*_args, **_kwargs):
+        calls["token"] += 1
+        raise AssertionError("custom token selection was reached")
+
+    def unexpected_client(*_args, **_kwargs):
+        calls["client"] += 1
+        raise AssertionError("custom credential client was reached")
+
+    def unexpected_network(*_args, **_kwargs):
+        calls["network"] += 1
+        raise AssertionError("custom network probe was reached")
+
+    monkeypatch.setattr(rp, "resolve_provider", canonical_custom)
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {"provider": "custom", "default": "ordinary-model"},
+    )
+    monkeypatch.setattr(rp, "load_pool", observing_pool)
+    monkeypatch.setattr(rp, "resolve_api_key_provider_credentials", unexpected_credential)
+    monkeypatch.setattr(rp, "has_usable_secret", unexpected_token)
+    monkeypatch.setattr(rp, "_try_resolve_from_custom_pool", unexpected_client)
+    monkeypatch.setattr(rp, "_auto_detect_local_model", unexpected_network)
+    monkeypatch.setenv("CUSTOM_BASE_URL", "https://GENERATIVELANGUAGE.GOOGLEAPIS.COM.:443/v1beta")
+
+    with pytest.raises(GeminiOutboundDenied) as exc_info:
+        rp.resolve_runtime_provider(requested="custom")
+
+    assert canonical_requests == ["custom"]
+    assert calls == {"pool": 0, "credentials": 0, "token": 0, "client": 0, "network": 0}
+    assert exc_info.value.code == "gemini_outbound_denied"
+    assert str(exc_info.value) == "Gemini outbound requests are disabled."
+
+
+def test_generic_copilot_registry_google_route_denies_before_any_secret_or_runtime_effect(
+    monkeypatch,
+):
+    """A safe request label cannot authorize Google facts from the registry snapshot."""
+    import importlib
+    import socket
+
+    from agent import auxiliary_client as aux
+    from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+    calls = {
+        "pool": 0,
+        "credentials": 0,
+        "environment": 0,
+        "proxy": 0,
+        "client": 0,
+        "import": 0,
+        "network": 0,
+    }
+
+    def unexpected(effect):
+        def fail(*_args, **_kwargs):
+            calls[effect] += 1
+            raise AssertionError(f"generic {effect} effect reached")
+
+        return fail
+
+    # The requested label remains an ordinary Copilot label. The only Google
+    # route fact is the selected registry record, which is nonsecret and must
+    # be frozen/denied before generic pool or credential resolution.
+    monkeypatch.setattr(rp, "resolve_provider", lambda *_args, **_kwargs: "copilot")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {"provider": "copilot", "default": "ordinary-model"},
+    )
+    monkeypatch.setitem(
+        rp.PROVIDER_REGISTRY,
+        "copilot",
+        SimpleNamespace(
+            auth_type="api_key",
+            inference_base_url="https://GENERATIVELANGUAGE.GOOGLEAPIS.COM.:443/v1beta",
+            base_url_env_var="",
+            api_key_env_vars=(),
+        ),
+    )
+    monkeypatch.setattr(rp, "load_pool", unexpected("pool"))
+    monkeypatch.setattr(rp, "resolve_api_key_provider_credentials", unexpected("credentials"))
+    monkeypatch.setattr(rp, "_getenv", unexpected("environment"))
+    monkeypatch.setattr(aux, "_validate_proxy_env_urls", unexpected("proxy"))
+    monkeypatch.setattr(aux, "_create_openai_client", unexpected("client"))
+    monkeypatch.setattr(importlib, "import_module", unexpected("import"))
+    monkeypatch.setattr(socket, "create_connection", unexpected("network"))
+
+    with pytest.raises(GeminiOutboundDenied) as exc_info:
+        rp.resolve_runtime_provider(requested="copilot")
+
+    assert exc_info.type is GeminiOutboundDenied
+    assert exc_info.value.code == "gemini_outbound_denied"
+    assert str(exc_info.value) == "Gemini outbound requests are disabled."
+    assert vars(exc_info.value) == {}
+    assert calls == {
+        "pool": 0,
+        "credentials": 0,
+        "environment": 0,
+        "proxy": 0,
+        "client": 0,
+        "import": 0,
+        "network": 0,
+    }
+
+
+def test_final_runtime_guard_preserves_safe_result_object():
+    result = {
+        "provider": "lmstudio",
+        "model": "ordinary-model",
+        "base_url": "http://127.0.0.1:1234/v1",
+        "api_mode": "chat_completions",
+        "requested_provider": "lmstudio",
+    }
+
+    assert rp._guard_resolved_runtime(result) is result
+
+
+def test_public_runtime_resolver_uses_a_single_guarded_return_wrapper():
+    """New public returns cannot bypass the final resolved-runtime guard."""
+    module = ast.parse(Path(rp.__file__).read_text())
+    public_resolver = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.FunctionDef) and node.name == "resolve_runtime_provider"
+    )
+    returns = [node for node in ast.walk(public_resolver) if isinstance(node, ast.Return)]
+
+    assert len(returns) == 1
+    assert isinstance(returns[0].value, ast.Call)
+    assert isinstance(returns[0].value.func, ast.Name)
+    assert returns[0].value.func.id == "_guard_resolved_runtime"
+    assert len(returns[0].value.args) == 1
+    internal_call = returns[0].value.args[0]
+    assert isinstance(internal_call, ast.Call)
+    assert isinstance(internal_call.func, ast.Name)
+    assert internal_call.func.id == "_resolve_runtime_provider_impl"
+
+
+def test_vertex_alias_is_denied_before_credential_mint(monkeypatch):
+    """Vertex selection must stop before ADC or service-account resolution."""
+    from agent import vertex_adapter
+
+    credential_calls = []
+
+    def unexpected_credential_mint():
+        credential_calls.append("vertex")
+        raise AssertionError("Vertex credential mint was reached")
+
+    monkeypatch.setattr(vertex_adapter, "get_vertex_config", unexpected_credential_mint)
+    with pytest.raises(Exception) as exc_info:
+        rp.resolve_runtime_provider(requested="vertex-ai")
+
+    assert credential_calls == []
+    from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+    assert isinstance(exc_info.value, GeminiOutboundDenied)
+    assert exc_info.value.code == "gemini_outbound_denied"
+    assert str(exc_info.value) == "Gemini outbound requests are disabled."
+
+
+def test_named_custom_gemini_host_is_denied_before_pool_credentials(monkeypatch):
+    """A persisted custom route must stop before selecting its credential pool."""
+    from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+    pool_calls = []
+
+    def unexpected_pool(*_args, **_kwargs):
+        pool_calls.append("pool")
+        raise AssertionError("custom credential pool was reached")
+
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {"provider": "custom:relay", "default": "other-model"},
+    )
+    monkeypatch.setattr(
+        rp,
+        "_get_named_custom_provider",
+        lambda _requested: {
+            "name": "relay",
+            "base_url": "https://generativelanguage.googleapis.com/v1beta",
+            "model": "other-model",
+        },
+    )
+    monkeypatch.setattr(rp, "_try_resolve_from_custom_pool", unexpected_pool)
+
+    with pytest.raises(GeminiOutboundDenied) as exc_info:
+        rp.resolve_runtime_provider(requested="custom:relay")
+
+    assert pool_calls == []
+    assert exc_info.value.code == "gemini_outbound_denied"
+    assert str(exc_info.value) == "Gemini outbound requests are disabled."
+
+
+def test_public_named_custom_google_route_denies_before_key_environment_read(monkeypatch):
+    """Named runtime facts must be denied before their selected key_env is read."""
+    from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+    calls = {"key_env": 0, "pool": 0, "command": 0}
+
+    def unexpected_key_env(*_args, **_kwargs):
+        calls["key_env"] += 1
+        raise AssertionError("named custom key environment read reached")
+
+    def unexpected_pool(*_args, **_kwargs):
+        calls["pool"] += 1
+        raise AssertionError("named custom pool reached")
+
+    def unexpected_command(*_args, **_kwargs):
+        calls["command"] += 1
+        raise AssertionError("named custom key command reached")
+
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {"provider": "custom:relay", "default": "ordinary-model"},
+    )
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {
+            "providers": {
+                "relay": {
+                    "name": "Relay",
+                    "api": "https://generativelanguage.googleapis.com/v1beta",
+                    "key_env": "RELAY_KEY",
+                    "key_cmd": "printf should-not-run",
+                    "default_model": "ordinary-model",
+                }
+            }
+        },
+    )
+    monkeypatch.setattr(rp, "_getenv", unexpected_key_env)
+    monkeypatch.setattr(rp, "_try_resolve_from_custom_pool", unexpected_pool)
+    monkeypatch.setattr(
+        "agent.command_token_source.build_command_token_provider", unexpected_command
+    )
+
+    with pytest.raises(GeminiOutboundDenied) as exc_info:
+        rp.resolve_runtime_provider(requested="custom:relay")
+
+    assert exc_info.type is GeminiOutboundDenied
+    assert exc_info.value.code == "gemini_outbound_denied"
+    assert str(exc_info.value) == "Gemini outbound requests are disabled."
+    assert vars(exc_info.value) == {}
+    assert calls == {"key_env": 0, "pool": 0, "command": 0}
+
+
+def test_named_custom_metadata_lookup_does_not_discover_user_plugins_before_google_denial(
+    tmp_path, monkeypatch
+):
+    """Route metadata must not import an arbitrary user provider before denial."""
+    import sys
+    import providers
+
+    marker = tmp_path / "metadata-plugin-imported"
+    home = tmp_path / "hermes-home"
+    plugin = home / "plugins" / "model-providers" / "metadata-marker"
+    plugin.mkdir(parents=True)
+    (plugin / "__init__.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('imported')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {
+            "providers": {
+                "relay": {
+                    "name": "relay",
+                    "url": "https://generativelanguage.googleapis.com/v1beta",
+                    "default_model": "ordinary-model",
+                }
+            }
+        },
+    )
+
+    calls = {"auth": 0, "provider_list": 0, "key_env": 0}
+    original_resolve = rp.auth_mod.resolve_provider
+    original_list = providers.list_providers
+
+    def observing_resolve(*args, **kwargs):
+        calls["auth"] += 1
+        return original_resolve(*args, **kwargs)
+
+    def observing_list(*args, **kwargs):
+        calls["provider_list"] += 1
+        return original_list(*args, **kwargs)
+
+    def unexpected_key_env(*_args, **_kwargs):
+        calls["key_env"] += 1
+        raise AssertionError("metadata lookup read a credential environment variable")
+
+    monkeypatch.setattr(rp.auth_mod, "resolve_provider", observing_resolve)
+    monkeypatch.setattr(providers, "list_providers", observing_list)
+    monkeypatch.setattr(rp, "_getenv", unexpected_key_env)
+    monkeypatch.setattr(providers, "_discovered", False)
+    monkeypatch.setattr(providers, "_PROVIDER_LIST_CACHE", None)
+    monkeypatch.delitem(sys.modules, "_hermes_user_provider_metadata_marker", raising=False)
+
+    metadata = rp._get_named_custom_provider_metadata("relay")
+
+    assert metadata == {
+        "provider": "custom",
+        "routing_hint": "relay",
+        "model": "ordinary-model",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta",
+        "api_mode": "",
+    }
+    assert calls == {"auth": 0, "provider_list": 0, "key_env": 0}
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    "canonical_provider, model, base_url_host, api_mode, routing_hint",
+    (
+        ("gemini", "", "", "", ""),
+        ("google", "", "", "", ""),
+        ("google-gemini", "", "", "", ""),
+        ("google-ai-studio", "", "", "", ""),
+        ("google-vertex", "", "", "", ""),
+        ("vertex-ai", "", "", "", ""),
+        ("gcp-vertex", "", "", "", ""),
+        ("", "", "generativelanguage.googleapis.com", "", ""),
+        ("", "", "us-central1-aiplatform.googleapis.com", "", ""),
+        ("", "google/gemini-2.5-flash", "", "", ""),
+        ("", "google/nano-banana-2", "", "", ""),
+        ("", "", "", "vertex_ai", ""),
+        ("", "", "", "", "google-ai-studio"),
+    ),
+)
+def test_gemini_outbound_classifier_denies_every_route_indicator(
+    canonical_provider, model, base_url_host, api_mode, routing_hint
+):
+    from agent.gemini_outbound_policy import is_gemini_outbound
+
+    assert is_gemini_outbound(
+        canonical_provider=canonical_provider,
+        model=model,
+        base_url_host=base_url_host,
+        api_mode=api_mode,
+        routing_hint=routing_hint,
+    )
+
+
+def test_gemini_outbound_classifier_does_not_block_unrelated_google_service():
+    from agent.gemini_outbound_policy import is_gemini_outbound
+
+    assert not is_gemini_outbound(
+        canonical_provider="custom",
+        model="gpt-5-mini",
+        base_url_host="maps.googleapis.com",
+        api_mode="chat_completions",
+        routing_hint="maps",
+    )
 
 
 def test_noauth_lmstudio_still_resolves(monkeypatch):
@@ -350,63 +893,21 @@ def test_resolve_runtime_provider_openrouter_explicit(monkeypatch):
     assert resolved["source"] == "explicit"
 
 
-@pytest.mark.parametrize(
-    "case_name, model_cfg, expected_api_mode",
-    [
-        (
-            "stale_anthropic_api_mode_is_ignored_on_provider_switch",
-            {
-                "provider": "anthropic",
-                "api_mode": "anthropic_messages",
-                "default": "claude-3-5-sonnet",
-            },
-            "chat_completions",
-        ),
-        (
-            "matching_provider_still_honors_persisted_api_mode",
-            {
-                "provider": "gemini",
-                "api_mode": "anthropic_messages",
-                "default": "gemini-2.5-pro",
-            },
-            "anthropic_messages",
-        ),
-        (
-            "no_persisted_provider_still_honors_api_mode",
-            {
-                "api_mode": "anthropic_messages",
-                "default": "gemini-2.5-pro",
-            },
-            "anthropic_messages",
-        ),
-    ],
-)
-def test_resolve_runtime_provider_gemini_explicit_api_mode_provider_guard(
-    monkeypatch, case_name, model_cfg, expected_api_mode
-):
-    """A persisted model.api_mode from a different provider must not leak
-    into an explicitly-resolved provider after a switch (issue #74318).
+@pytest.mark.parametrize("requested", ("gemini", "google-gemini", "google-ai-studio"))
+def test_resolve_runtime_provider_gemini_aliases_are_denied(monkeypatch, requested):
+    """A persisted API mode cannot revive any Gemini-family runtime route."""
+    from agent.gemini_outbound_policy import GeminiOutboundDenied
 
-    Only when ``model_cfg["provider"]`` matches the provider actually being
-    resolved (or is unset) should the persisted api_mode be honoured.
-    """
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "gemini")
-    monkeypatch.setattr(rp, "_get_model_config", lambda: model_cfg)
-    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    monkeypatch.delenv("GEMINI_BASE_URL", raising=False)
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {"api_mode": "anthropic_messages"})
+    with pytest.raises(GeminiOutboundDenied) as exc_info:
+        rp.resolve_runtime_provider(
+            requested=requested,
+            explicit_api_key="fake-gemini-key",
+            explicit_base_url="https://fake-gemini-endpoint.example.com/v1beta/",
+        )
 
-    resolved = rp.resolve_runtime_provider(
-        requested="gemini",
-        explicit_api_key="fake-gemini-key",
-        explicit_base_url="https://fake-gemini-endpoint.example.com/v1beta/",
-    )
-
-    assert resolved["provider"] == "gemini", case_name
-    assert resolved["api_mode"] == expected_api_mode, case_name
-    assert resolved["api_key"] == "fake-gemini-key", case_name
-    assert resolved["base_url"] == "https://fake-gemini-endpoint.example.com/v1beta", case_name
-    assert resolved["source"] == "explicit", case_name
+    assert exc_info.value.code == "gemini_outbound_denied"
+    assert str(exc_info.value) == "Gemini outbound requests are disabled."
 
 
 def test_resolve_runtime_provider_auto_uses_openrouter_pool(monkeypatch):
@@ -1041,6 +1542,37 @@ class TestAzureFoundryResolution:
             rp.resolve_runtime_provider(requested="azure-foundry")
 
 
+    def test_azure_foundry_env_gemini_host_is_denied_before_entra_token_provider(self, monkeypatch):
+        """A helper-selected env URL must stop before Entra token construction."""
+        from agent import azure_identity_adapter
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+        token_calls = []
+
+        def unexpected_token_provider(*_args, **_kwargs):
+            token_calls.append("entra")
+            raise AssertionError("Azure Foundry Entra token provider was reached")
+
+        monkeypatch.setattr(azure_identity_adapter, "build_token_provider", unexpected_token_provider)
+        monkeypatch.setattr(
+            rp,
+            "_get_model_config",
+            lambda: {
+                "provider": "azure-foundry",
+                "default": "ordinary-model",
+                "auth_mode": "entra_id",
+            },
+        )
+        monkeypatch.setenv("AZURE_FOUNDRY_BASE_URL", "https://VERTEXAI.GOOGLEAPIS.COM.:443/v1")
+
+        with pytest.raises(GeminiOutboundDenied) as exc_info:
+            rp.resolve_runtime_provider(requested="azure-foundry")
+
+        assert token_calls == []
+        assert exc_info.value.code == "gemini_outbound_denied"
+        assert str(exc_info.value) == "Gemini outbound requests are disabled."
+
+
     # -- Model-family api_mode inference -------------------------------------
     # Azure rejects /chat/completions on GPT-5.x / codex / o-series with
     # ``400 "The requested operation is unsupported."`` — the resolver must
@@ -1653,6 +2185,98 @@ def test_resolve_runtime_provider_opencode_free_keyless_despite_exhausted_pool(m
     assert resolved["base_url"] == "https://opencode.ai/zen/v1"
     assert resolved["api_mode"] == "chat_completions"
     assert resolved["default_headers"]["Authorization"] == ""
+
+
+def test_named_custom_metadata_lookup_never_reads_key_env(monkeypatch):
+    """Route classification may inspect a named entry without touching its secret."""
+    class _KeyEnvReadReached(BaseException):
+        pass
+
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {
+            "providers": {
+                "local-route": {
+                    "name": "Local Route",
+                    "api": "https://generativelanguage.googleapis.com/v1beta",
+                    "key_env": "NAMED_CUSTOM_KEY",
+                    "default_model": "ordinary-model",
+                    "transport": "anthropic_messages",
+                },
+            },
+        },
+    )
+    monkeypatch.setattr(
+        rp,
+        "_getenv",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            _KeyEnvReadReached("key_env read reached")
+        ),
+    )
+
+    metadata = rp._get_named_custom_provider_metadata("custom:local-route")
+
+    assert metadata == {
+        "provider": "custom",
+        "routing_hint": "custom:local-route",
+        "model": "ordinary-model",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta",
+        "api_mode": "anthropic_messages",
+    }
+
+
+def test_dynamic_pool_google_route_denies_before_runtime_key_read(monkeypatch):
+    """The public runtime resolver classifies the selected pool route before its key."""
+    from agent.gemini_outbound_policy import GeminiOutboundDenied
+
+    calls = {"key": 0, "credentials": 0}
+
+    class Entry:
+        runtime_base_url = "https://generativelanguage.googleapis.com/v1beta"
+        api_mode = "anthropic_messages"
+
+        @property
+        def runtime_api_key(self):
+            calls["key"] += 1
+            raise AssertionError("pool runtime key read reached")
+
+    class Pool:
+        def has_credentials(self):
+            return True
+
+        def select(self):
+            return Entry()
+
+    profile = SimpleNamespace(
+        auth_type="api_key",
+        inference_base_url="https://safe.example.test/v1",
+        base_url_env_var="",
+        api_mode="chat_completions",
+        api_key_env_vars=(),
+    )
+
+    def unexpected_credentials(*_args, **_kwargs):
+        calls["credentials"] += 1
+        raise AssertionError("generic credential resolver reached")
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *_args, **_kwargs: "copilot")
+    monkeypatch.setattr(
+        rp, "_get_model_config", lambda: {"provider": "copilot", "default": "ordinary-model"}
+    )
+    monkeypatch.setattr(rp, "load_config", lambda: {})
+    monkeypatch.setattr(rp, "PROVIDER_REGISTRY", {"copilot": profile})
+    monkeypatch.setattr(rp, "load_pool", lambda _provider: Pool())
+    monkeypatch.setattr(rp, "resolve_api_key_provider_credentials", unexpected_credentials)
+
+    with pytest.raises(GeminiOutboundDenied) as exc_info:
+        rp.resolve_runtime_provider(requested="copilot")
+
+    assert exc_info.type is GeminiOutboundDenied
+    assert exc_info.value.code == "gemini_outbound_denied"
+    assert str(exc_info.value) == "Gemini outbound requests are disabled."
+    assert vars(exc_info.value) == {}
+    assert calls == {"key": 0, "credentials": 0}
 
 
 def test_resolve_runtime_provider_opencode_free_missing_env_still_resolves(monkeypatch):

@@ -78,6 +78,9 @@ gateway:
     switch_failed:         "Ramo criado, mas não foi possível mudar para ele."
     branched_one:          "⑂ Ramificado para **{title}** ({count} mensagem copiada)\nOriginal: `{parent}`\nRamo: `{new}`\nUsa `/resume` para voltar ao original."
     branched_many:         "⑂ Ramificado para **{title}** ({count} mensagens copiadas)\nOriginal: `{parent}`\nRamo: `{new}`\nUsa `/resume` para voltar ao original."
+    branched_one_untitled: "⑂ Branched ({count} message copied)\nOriginal: `{parent}`\nBranch: `{new}`\nUse `/resume` to switch back to the original."
+    branched_many_untitled: "⑂ Branched ({count} messages copied)\nOriginal: `{parent}`\nBranch: `{new}`\nUse `/resume` to switch back to the original."
+    title_not_set_note: "\n⚠️ Title \"{title}\" was not set: {error}"
 
   commands:
     usage:                 "Uso: `/commands [page]`"

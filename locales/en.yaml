@@ -93,6 +93,9 @@ gateway:
     switch_failed:         "Branch created but failed to switch to it."
     branched_one:          "⑂ Branched to **{title}** ({count} message copied)\nOriginal: `{parent}`\nBranch: `{new}`\nUse `/resume` to switch back to the original."
     branched_many:         "⑂ Branched to **{title}** ({count} messages copied)\nOriginal: `{parent}`\nBranch: `{new}`\nUse `/resume` to switch back to the original."
+    branched_one_untitled: "⑂ Branched ({count} message copied)\nOriginal: `{parent}`\nBranch: `{new}`\nUse `/resume` to switch back to the original."
+    branched_many_untitled: "⑂ Branched ({count} messages copied)\nOriginal: `{parent}`\nBranch: `{new}`\nUse `/resume` to switch back to the original."
+    title_not_set_note: "\n⚠️ Title \"{title}\" was not set: {error}"
 
   commands:
     usage:                 "Usage: `/commands [page]`"

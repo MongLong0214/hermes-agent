@@ -42,6 +42,7 @@ Requires:
 
 import asyncio
 import concurrent.futures
+from copy import deepcopy
 import errno
 import hashlib
 import hmac
@@ -241,7 +242,6 @@ CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 RESPONSES_AUTO_TRUNCATION_HISTORY_LIMIT = 100
-_COMPRESSED_SUMMARY_METADATA_KEY = "_compressed_summary"
 
 
 class ThreadSafeAsyncQueue(asyncio.Queue):
@@ -1423,6 +1423,83 @@ def _notify_cron_provider_jobs_changed() -> None:
     except Exception:
         pass
 
+
+# The bearer-authenticated /api/jobs surface is a management API, not a
+# serialization of cron's private persistence/runtime record. Keep this closed:
+# new internal fields must be deliberately reviewed before becoming public.
+_PUBLIC_CRON_JOB_FIELDS = (
+    "id",
+    "name",
+    "prompt",
+    "skill",
+    "skills",
+    "schedule",
+    "schedule_display",
+    "repeat",
+    "restart_policy",
+    "deliver",
+    "enabled",
+    "state",
+    "paused_at",
+    "paused_reason",
+    "next_run_at",
+    "last_run_at",
+    "last_status",
+    "last_delivery_error",
+    "last_fire_error",
+)
+
+_PUBLIC_CRON_STATUS_ERROR_LIMIT = 500
+_PUBLIC_CRON_STATUS_PATH_RE = re.compile(r"(?:^|[\s=:(\[{\"'])(?:/|~[\\/]|[A-Za-z]:[\\/])")
+
+
+def _project_public_cron_delivery_error(value: Any) -> str | None:
+    """Return a stable public delivery status without exposing adapter text."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return "Delivery status unavailable"
+    # Delivery adapters persist arbitrary exception text, including paths. Run
+    # the established HTTP redactor here, then keep this status generic so an
+    # unrecognized private exception fragment cannot cross the bearer boundary.
+    if not _redact_api_error_text(value, limit=_PUBLIC_CRON_STATUS_ERROR_LIMIT):
+        return "Delivery status unavailable"
+    return "Delivery failed"
+
+
+def _project_public_cron_fire_error(value: Any) -> dict[str, Any] | None:
+    """Return only the documented, independent fire-error status shape."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        return {"at": None, "detail": "Status detail unavailable"}
+
+    at = deepcopy(value.get("at"))
+    detail = value.get("detail")
+    if not isinstance(detail, str):
+        return {"at": at, "detail": "Status detail unavailable"}
+
+    redacted = _redact_api_error_text(detail, limit=_PUBLIC_CRON_STATUS_ERROR_LIMIT)
+    if not redacted or _PUBLIC_CRON_STATUS_PATH_RE.search(redacted):
+        return {"at": at, "detail": "Status detail unavailable"}
+    return {"at": at, "detail": redacted}
+
+
+def _project_public_cron_job(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a fresh, closed public representation of one cron job record."""
+    projected = {}
+    for field in _PUBLIC_CRON_JOB_FIELDS:
+        if field not in record:
+            continue
+        if field == "last_delivery_error":
+            projected[field] = _project_public_cron_delivery_error(record[field])
+        elif field == "last_fire_error":
+            projected[field] = _project_public_cron_fire_error(record[field])
+        else:
+            projected[field] = deepcopy(record[field])
+    return projected
+
+
 # Defense-in-depth: mirror the agent-facing cronjob tool, which scans the
 # user-supplied prompt for exfiltration/injection payloads at create/update
 # time (tools/cronjob_tools.py).  The REST cron endpoints are authenticated
@@ -2175,6 +2252,87 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return profile_prefix_middleware
 
+    async def _handle_canonical_surface_event(self, request: "web.Request"):
+        """Serve one authenticated, existing-only canonical event."""
+        auth_error = self._check_auth(request)
+        if auth_error:
+            return auth_error
+        from gateway.canonical_surface import (
+            CanonicalIngressEvent,
+            CanonicalTurnResult,
+            ExistingCanonicalBindingResolver,
+            request_local_reply_sink,
+        )
+
+        try:
+            event = CanonicalIngressEvent.from_json_bytes(await request.read())
+        except ValueError:
+            return web.json_response(
+                {"error": {"code": "canonical_invalid_request", "message": "Canonical request rejected."}},
+                status=400,
+            )
+        runner = self.gateway_runner
+        if runner is None:
+            return web.json_response(
+                {"error": {"code": "canonical_unavailable", "message": "Canonical request unavailable."}},
+                status=503,
+            )
+        binding = getattr(runner.config, "canonical_surface_bindings", {}).get(event.binding)
+        if binding is None:
+            return web.json_response(
+                {"error": {"code": "canonical_binding_unknown", "message": "Canonical request rejected."}},
+                status=404,
+            )
+        terminal_readback: list[str] = []
+
+        async def publish_to_this_request(result: CanonicalTurnResult) -> None:
+            if not isinstance(result, CanonicalTurnResult) or result.binding_name != binding.name:
+                raise ValueError("canonical_turn_refused")
+            terminal_readback.append(result.terminal_text)
+
+        reply_sink = request_local_reply_sink(publish_to_this_request)
+        try:
+            entry = await asyncio.to_thread(
+                ExistingCanonicalBindingResolver(runner.session_store).resolve,
+                binding,
+                event,
+            )
+            result = await runner.run_bound_existing_turn(
+                binding, event, entry, reply_sink=reply_sink
+            )
+            await reply_sink.publish(result)
+        except ValueError as exc:
+            code = str(exc)
+            if code == "canonical_principal_rejected":
+                status = 403
+            else:
+                status = 409
+                if code not in {
+                    "canonical_binding_stale",
+                    "canonical_agent_missing",
+                    "canonical_turn_busy",
+                    "canonical_turn_refused",
+                    "canonical_reply_publish_failed",
+                    "canonical_reply_already_published",
+                    "canonical_reply_sink_missing",
+                }:
+                    code = "canonical_turn_refused"
+            return web.json_response(
+                {"error": {"code": code, "message": "Canonical request rejected."}},
+                status=status,
+            )
+        except Exception:
+            return web.json_response(
+                {"error": {"code": "canonical_internal_error", "message": "Canonical request failed."}},
+                status=500,
+            )
+        if len(terminal_readback) != 1:
+            return web.json_response(
+                {"error": {"code": "canonical_turn_refused", "message": "Canonical request rejected."}},
+                status=409,
+            )
+        return web.json_response({"event_id": event.event_id, "text": terminal_readback[0]})
+
     def _http_route_table(self) -> List[tuple]:
         """Return (method, path, handler) rows registered by ``connect()``.
 
@@ -2188,6 +2346,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/models", self._handle_models),
             ("GET", "/api/model/options", self._handle_model_options),
             ("GET", "/v1/capabilities", self._handle_capabilities),
+            ("POST", "/v1/canonical-surface/events", self._handle_canonical_surface_event),
             # Authenticated browser-control surface: POST registration
             # mints a short-lived ticket; the controller then opens the WS with
             # that ticket. Both are gated on browser.extension_control.enabled
@@ -6522,7 +6681,7 @@ class APIServerAdapter(BasePlatformAdapter):
         try:
             include_disabled = request.query.get("include_disabled", "").lower() in {"true", "1"}
             jobs = _cron_list(include_disabled=include_disabled)
-            return web.json_response({"jobs": jobs})
+            return web.json_response({"jobs": [_project_public_cron_job(job) for job in jobs]})
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
@@ -6575,7 +6734,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 kwargs["repeat"] = repeat
 
             job = _cron_create(**kwargs)
-            return web.json_response({"job": job})
+            return web.json_response({"job": _project_public_cron_job(job)})
         except _CronSchedulerRegistrationError as e:
             return web.json_response(e.to_dict(), status=424)
         except Exception as e:
@@ -6596,7 +6755,7 @@ class APIServerAdapter(BasePlatformAdapter):
             job = _cron_get(job_id)
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
-            return web.json_response({"job": job})
+            return web.json_response({"job": _project_public_cron_job(job)})
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
@@ -6634,7 +6793,7 @@ class APIServerAdapter(BasePlatformAdapter):
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
             _notify_cron_provider_jobs_changed()
-            return web.json_response({"job": job})
+            return web.json_response({"job": _project_public_cron_job(job)})
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
@@ -6674,7 +6833,7 @@ class APIServerAdapter(BasePlatformAdapter):
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
             _notify_cron_provider_jobs_changed()
-            return web.json_response({"job": job})
+            return web.json_response({"job": _project_public_cron_job(job)})
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
@@ -6694,7 +6853,7 @@ class APIServerAdapter(BasePlatformAdapter):
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
             _notify_cron_provider_jobs_changed()
-            return web.json_response({"job": job})
+            return web.json_response({"job": _project_public_cron_job(job)})
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
@@ -6716,7 +6875,7 @@ class APIServerAdapter(BasePlatformAdapter):
             job = _cron_trigger(job_id)
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
-            return web.json_response({"job": job})
+            return web.json_response({"job": _project_public_cron_job(job)})
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 

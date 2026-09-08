@@ -11,6 +11,7 @@ import pytest
 
 from cron.scheduler import (
     SILENT_MARKER,
+    _CRON_DELIVERY_FAILURE,
     _build_job_prompt,
     _deliver_result,
     _merge_mcp_into_per_job_toolsets,
@@ -32,8 +33,9 @@ class TestSummarizeCronFailureForDelivery:
             "Script failed: path/hash429abc.md source snapshot failure",
         )
 
-        assert "provider rate limit" not in summary
-        assert "hash429abc.md" in summary
+        assert summary == _CRON_DELIVERY_FAILURE
+        assert "hash429abc.md" not in summary
+        assert "provider" not in summary.lower()
 
     def test_http_429_is_still_classified_as_a_rate_limit(self):
         summary = _summarize_cron_failure_for_delivery(
@@ -41,10 +43,9 @@ class TestSummarizeCronFailureForDelivery:
             "HTTP 429: Too Many Requests",
         )
 
-        assert "provider rate limit" in summary
-        # Chain wording is now honest (#85508): either the exhausted phrase
-        # (chain configured) or the "No fallback chain configured" guidance.
-        assert "fallback chain" in summary.lower()
+        assert summary == _CRON_DELIVERY_FAILURE
+        assert "HTTP 429" not in summary
+        assert "provider" not in summary.lower()
 
     def test_no_agent_rate_limit_does_not_claim_a_fallback_chain(self):
         summary = _summarize_cron_failure_for_delivery(
@@ -52,11 +53,9 @@ class TestSummarizeCronFailureForDelivery:
             "HTTP 429: Too Many Requests",
         )
 
-        # Composed with #77648: a no_agent job never gets provider-shaped
-        # classification at all — the generic cleaner reports the script's
-        # own error instead.
-        assert "provider" not in summary.lower()
-        assert "fallback chain" not in summary.lower()
+        assert summary == _CRON_DELIVERY_FAILURE
+        assert "HTTP 429" not in summary
+        assert "script" not in summary.lower()
 
     def test_no_agent_timeout_is_identified_as_a_script_timeout(self):
         summary = _summarize_cron_failure_for_delivery(
@@ -64,10 +63,10 @@ class TestSummarizeCronFailureForDelivery:
             "Script timed out after 3600s",
         )
 
-        assert "script timed out" in summary
-        assert "No model was invoked" in summary
-        assert "provider timeout" not in summary
-        assert "fallback chain" not in summary.lower()
+        assert summary == _CRON_DELIVERY_FAILURE
+        assert "3600" not in summary
+        assert "script" not in summary.lower()
+        assert "model" not in summary.lower()
 
 
 class TestPerJobToolsetMcpMerge:
@@ -531,8 +530,8 @@ class TestDeliverResultErrorReturns:
                 "origin": {"platform": "telegram", "chat_id": "123"},
             }
             result = _deliver_result(job, "Output.")
-        assert result is not None
-        assert "not configured" in result
+        assert result == _CRON_DELIVERY_FAILURE
+        assert "not configured" not in result
 
 
 class TestRunJobSessionPersistence:
@@ -549,7 +548,6 @@ class TestRunJobSessionPersistence:
              patch("cron.scheduler._resolve_origin", return_value=None), \
              patch("hermes_cli.env_loader.load_hermes_dotenv"), \
              patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-             patch("hermes_state.SessionDB", return_value=fake_db), \
              patch(
                  "hermes_cli.runtime_provider.resolve_runtime_provider",
                  return_value={
@@ -564,7 +562,10 @@ class TestRunJobSessionPersistence:
             mock_agent.run_conversation.return_value = {"final_response": "ok"}
             mock_agent_cls.return_value = mock_agent
 
-            success, output, final_response, error = run_job(job)
+            with patch("hermes_state.SessionDB", return_value=fake_db) as session_db_factory:
+                success, output, final_response, error = run_job(job)
+
+        session_db_factory.assert_called_once_with()
 
         assert success is True
         assert error is None
@@ -695,7 +696,7 @@ class TestRunJobSessionPersistence:
             "id": "empty-job",
             "name": "empty-test",
             "prompt": "do something",
-            "schedule": "every 1h",
+            "schedule": {"kind": "interval", "seconds": 3600},
             "enabled": True,
             "next_run_at": "2020-01-01T00:00:00",
             "deliver": "local",
@@ -711,14 +712,11 @@ class TestRunJobSessionPersistence:
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._resolve_origin", return_value=None), \
              patch("cron.scheduler.run_job", return_value=(True, "output", "", None)):
-            tick(verbose=False)
+            tick(verbose=False, sync=True)
 
-        # Should be called with success=False because final_response is empty
-        mock_mark.assert_called_once()
-        call_args = mock_mark.call_args
-        assert call_args[0][0] == "empty-job"
-        assert call_args[0][1] is False  # success should be False
-        assert "empty" in call_args[0][2].lower()  # error should mention empty
+        mock_mark.assert_called_once_with(
+            "empty-job", False, _CRON_DELIVERY_FAILURE, delivery_error=None
+        )
 
     def test_run_job_sets_auto_delivery_env_from_dotenv_home_channel(self, tmp_path, monkeypatch):
         job = {
@@ -1304,11 +1302,11 @@ class TestRunJobModelResolution:
              patch("hermes_cli.runtime_provider.resolve_runtime_provider",
                    return_value=self._RUNTIME), \
              patch("run_agent.AIAgent") as mock_agent_cls:
-            success, _, _, error = run_job(job)
+            success, output, _, error = run_job(job)
 
         assert success is False
-        assert error is not None
-        assert "no model configured" in error
+        assert error == _CRON_DELIVERY_FAILURE
+        assert output == _CRON_DELIVERY_FAILURE
         # AIAgent must never be constructed with an empty model — that's
         # precisely the bug we're guarding against.
         mock_agent_cls.assert_not_called()
@@ -1446,7 +1444,7 @@ class TestSilentDelivery:
              patch("cron.scheduler.mark_job_run"):
             from cron.scheduler import tick
             with caplog.at_level(logging.INFO, logger="cron.scheduler"):
-                tick(verbose=False)
+                tick(verbose=False, sync=True)
         deliver_mock.assert_not_called()
         assert any(SILENT_MARKER in r.message for r in caplog.records)
 
@@ -1540,21 +1538,25 @@ class TestSilentDelivery:
         deliver_mock.assert_not_called()
 
     def test_whitespace_only_response_is_marked_failed_not_delivered(self):
-        """Whitespace-only final responses should behave like empty responses."""
+        """Whitespace-only final responses persist and deliver the fixed failure."""
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
              patch("cron.scheduler.claim_job_for_fire", return_value=True), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", "   \n\t  ", None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
-             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.scheduler._deliver_result", return_value=None) as deliver_mock, \
              patch("cron.scheduler.mark_job_run") as mark_mock:
             from cron.scheduler import tick
-            tick(verbose=False)
+            tick(verbose=False, sync=True)
 
-        deliver_mock.assert_not_called()
+        deliver_mock.assert_called_once()
+        delivered_job, delivered_content = deliver_mock.call_args.args
+        assert {k: v for k, v in delivered_job.items() if k != "execution_id"} == self._make_job()
+        assert delivered_content == _CRON_DELIVERY_FAILURE
+        assert deliver_mock.call_args.kwargs == {"adapters": None, "loop": None}
         mark_mock.assert_called_once_with(
             "monitor-job",
             False,
-            "Agent completed but produced empty response (model error, timeout, or misconfiguration)",
+            _CRON_DELIVERY_FAILURE,
             delivery_error=None,
         )
 
@@ -1577,13 +1579,13 @@ class TestOneShotDispatchClaim:
         order = []
         with patch("cron.scheduler.get_due_jobs", return_value=[self._oneshot()]), \
              patch("cron.scheduler.claim_job_for_fire", return_value=True), \
-             patch("cron.scheduler.claim_dispatch", side_effect=lambda _id: order.append("claim") or True), \
+             patch("cron.scheduler.claim_dispatch", side_effect=lambda _id, claimed_job=None: order.append("claim") or True), \
              patch("cron.scheduler.run_job", side_effect=lambda _j, **_kw: order.append("run") or (True, "# out", "ok", None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result"), \
              patch("cron.scheduler.mark_job_run"):
             from cron.scheduler import tick
-            tick(verbose=False)
+            tick(verbose=False, sync=True)
         assert order == ["claim", "run"]  # claim strictly before side effect
 
     def test_refused_claim_skips_run_job(self):
@@ -2726,10 +2728,9 @@ class TestMultiTargetDeliveryContinuesOnFailure:
         assert mock_pool.submit.call_count == 2, (
             f"expected 2 delivery attempts, got {mock_pool.submit.call_count}"
         )
-        # First target's failure is surfaced in the returned error string.
-        assert result is not None
-        assert "a@example.com" in result
-        assert "SMTP connection refused" in result
+        assert result == _CRON_DELIVERY_FAILURE
+        assert "a@example.com" not in result
+        assert "SMTP connection refused" not in result
 
     def test_all_targets_fail_returns_combined_errors(self):
         """When every target fails, the result reports all of them."""
@@ -2751,9 +2752,9 @@ class TestMultiTargetDeliveryContinuesOnFailure:
 
             result = _deliver_result(job, "Report content")
 
-        assert result is not None
-        assert "a@example.com" in result
-        assert "b@example.com" in result
+        assert result == _CRON_DELIVERY_FAILURE
+        assert "a@example.com" not in result
+        assert "b@example.com" not in result
         assert mock_pool.submit.call_count == 2
 
 class TestBuildJobPromptExtraPrompt:

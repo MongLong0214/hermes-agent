@@ -22,6 +22,36 @@ _SESSIONS_DIR = get_hermes_home() / "sessions"
 _SESSIONS_INDEX = _SESSIONS_DIR / "sessions.json"
 
 
+def _log_safely(log_fn, msg, *args) -> None:
+    """Call a logger method without letting an ordinary logging failure
+    change the caller's control flow.
+
+    A user- or plugin-installed logging handler/filter can itself raise.
+    ``mirror_to_session`` / ``_append_to_sqlite`` return a truthful
+    committed/not-committed answer that real callers (cron/scheduler.py,
+    tools/send_message_tool.py) branch on -- that answer must never be
+    decided by whether an incidental log line happened to blow up.
+
+    Guarantee, precisely: catches ``Exception`` -- an ordinary logging
+    failure (a broken handler, a bad format string, a filter that raises)
+    cannot escape this call. It deliberately does NOT catch
+    ``BaseException`` -- ``SystemExit``, ``KeyboardInterrupt``, and
+    ``GeneratorExit`` still propagate through here, because swallowing an
+    interpreter-exit or Ctrl-C request would be worse than the bug this
+    function fixes.
+
+    This guarantee belongs to the specific call being wrapped, not to
+    ``mirror_to_session``/``_append_to_sqlite`` as a whole: a bare
+    ``logger.debug(...)`` added next to an existing ``_log_safely(...)``
+    call is NOT protected just by proximity -- it has to be routed
+    through this function itself to get the guarantee.
+    """
+    try:
+        log_fn(msg, *args)
+    except Exception:
+        pass
+
+
 def mirror_to_session(
     platform: str,
     chat_id: str,
@@ -60,8 +90,15 @@ def mirror_to_session(
     providers (issue #2221). A user-role mirror collapses safely via
     ``repair_message_sequence``'s consecutive-user merge on every provider.
 
-    Returns True if mirrored successfully, False if no matching session or error.
-    All errors are caught -- this is never fatal.
+    Returns True if the message was actually committed to the session's
+    SQLite transcript, False if no matching session was found OR the
+    SQLite append itself was refused. Main's mirror path calls
+    ``append_message`` with no ``turn_lease_holder``, so a lost-lease
+    refusal (``SessionTurnLeaseLostError``) cannot happen HERE -- what can
+    refuse is a closed compression session (``CompressionSessionClosedError``)
+    or any other exception the SQLite layer raises (lock contention, a
+    disk error, etc.). A refused write is never reported as mirrored.
+    All errors are caught -- this is never fatal to the caller.
     """
     try:
         if not session_id:
@@ -72,7 +109,8 @@ def mirror_to_session(
                 user_id=user_id,
             )
         if not session_id:
-            logger.warning(
+            _log_safely(
+                logger.warning,
                 "Mirror: no session found for %s:%s thread=%s user=%s "
                 "(explicit_id=none, origin-scan bailed)",
                 platform,
@@ -90,17 +128,28 @@ def mirror_to_session(
             "mirror_source": source_label,
         }
 
-        _append_to_sqlite(session_id, mirror_msg)
+        append_committed = _append_to_sqlite(session_id, mirror_msg)
 
-        logger.debug("Mirror: wrote to session %s (from %s)", session_id, source_label)
-        return True
+        if append_committed:
+            _log_safely(
+                logger.debug,
+                "Mirror: wrote to session %s (from %s)",
+                session_id,
+                source_label,
+            )
+        return append_committed
 
     except Exception as e:
         # WARNING with the exception: a silent mirror drop IS the cron
         # continuation-amnesia bug (Alice 2026-08-19 — the seed's own
         # deterministic session_id was in hand and the append STILL failed
-        # invisibly at debug level).
-        logger.warning(
+        # invisibly at debug level). Routed through _log_safely so a
+        # misbehaving handler on THIS log call can't make an already-decided
+        # False escape as a raised exception instead -- the function's
+        # documented "always returns a bool" contract must hold even here,
+        # where no committed row is at stake either way.
+        _log_safely(
+            logger.warning,
             "Mirror failed for %s:%s thread=%s user=%s session=%s: %s",
             platform,
             chat_id,
@@ -207,9 +256,32 @@ def _find_session_id(
 
 
 
-def _append_to_sqlite(session_id: str, message: dict) -> None:
-    """Append a message to the SQLite session database."""
+def _append_to_sqlite(session_id: str, message: dict) -> bool:
+    """Append a message to the SQLite session database.
+
+    Returns True only if ``append_message`` actually committed the row. A
+    refused write -- ``CompressionSessionClosedError``, or any other
+    exception from the SQLite layer (this call passes no
+    ``turn_lease_holder``, so ``SessionTurnLeaseLostError`` cannot be
+    raised on this path; the lease fence is simply not engaged here) -- is
+    logged at debug level and reported back as False. It must never be
+    mistaken by the caller for a successful mirror.
+
+    ``append_committed`` is decided the instant ``append_message`` returns
+    and must not be overturned by anything that happens afterward.
+    Nothing between that point and the ``return`` may raise:
+
+    * a ``close()`` failure is cleanup, not commit status -- the row is on
+      disk whether or not the connection tears down cleanly -- so it is
+      caught and never allowed to propagate;
+    * the debug logging for either failure mode is routed through
+      ``_log_safely`` (see its docstring for the precise guarantee: an
+      ordinary logging ``Exception`` cannot escape it, though it is not a
+      blanket "logging near here is always safe" -- only calls that
+      actually go through it are covered).
+    """
     db = None
+    append_committed = False
     try:
         from hermes_state import SessionDB
         db = SessionDB()
@@ -218,8 +290,13 @@ def _append_to_sqlite(session_id: str, message: dict) -> None:
             role=message.get("role", "assistant"),
             content=message.get("content"),
         )
+        append_committed = True
     except Exception as e:
-        logger.debug("Mirror SQLite write failed: %s", e)
+        _log_safely(logger.debug, "Mirror SQLite write failed: %s", e)
     finally:
         if db is not None:
-            db.close()
+            try:
+                db.close()
+            except Exception as e:
+                _log_safely(logger.debug, "Mirror SQLite close failed: %s", e)
+    return append_committed

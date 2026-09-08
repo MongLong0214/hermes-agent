@@ -10,9 +10,11 @@ read-only engine open creates -wal/-shm sidecar files next to a WAL database.
 import os
 import re
 import sqlite3
+from pathlib import Path
 
 import pytest
 
+import hermes_state
 import hermes_cli.doctor as doctor
 from hermes_cli.sqlite_safe_read import (
     connect_tracked,
@@ -42,6 +44,130 @@ def _sidecars(directory):
     return sorted(
         p.name for p in directory.iterdir() if p.name.endswith(("-wal", "-shm"))
     )
+
+
+def _build_state_db(path: Path) -> None:
+    db = hermes_state.SessionDB(db_path=path)
+    try:
+        db.create_session("doctor-state-db", source="cli")
+    finally:
+        db.close()
+
+
+def _install_rebuild_claim(path: Path, value: str | None) -> None:
+    with sqlite3.connect(str(path), isolation_level=None) as conn:
+        conn.execute(
+            "INSERT INTO state_meta(key, value) VALUES (?, ?)",
+            (hermes_state._OFFLINE_REBUILD_EPOCH_KEY, value),
+        )
+
+
+def _make_malformed_rebuild_metadata(path: Path) -> None:
+    with sqlite3.connect(str(path), isolation_level=None) as conn:
+        conn.execute("DROP TABLE state_meta")
+        conn.execute("CREATE TABLE state_meta (key TEXT PRIMARY KEY, broken TEXT)")
+
+
+@pytest.mark.parametrize("claim_state", ("foreign", "null", "malformed"))
+def test_large_wal_fix_refuses_unprovable_state_db_authority(
+    tmp_path, monkeypatch, claim_state
+):
+    """Doctor's real large-WAL fix path never turns a fence refusal into success."""
+    db_path = tmp_path / "state.db"
+    _build_state_db(db_path)
+    if claim_state == "foreign":
+        _install_rebuild_claim(db_path, "foreign-doctor-owner")
+    elif claim_state == "null":
+        _install_rebuild_claim(db_path, None)
+    else:
+        _make_malformed_rebuild_metadata(db_path)
+
+    statements: list[str] = []
+    real_connect = sqlite3.connect
+
+    def traced_connect(path, *args, **kwargs):
+        conn = real_connect(path, *args, **kwargs)
+        if Path(path) == db_path:
+            conn.set_trace_callback(statements.append)
+        return conn
+
+    monkeypatch.setattr(doctor.sqlite3, "connect", traced_connect)
+    ok, error = doctor._checkpoint_large_state_wal(db_path)
+
+    assert ok is False
+    assert error and "offline rebuild" in error
+    assert not any("wal_checkpoint" in sql.lower() for sql in statements)
+    assert not any("checkpoint performed" in sql.lower() for sql in statements)
+    with sqlite3.connect(str(db_path)) as conn:
+        if claim_state == "foreign":
+            assert conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?",
+                (hermes_state._OFFLINE_REBUILD_EPOCH_KEY,),
+            ).fetchone() == ("foreign-doctor-owner",)
+        elif claim_state == "null":
+            assert conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?",
+                (hermes_state._OFFLINE_REBUILD_EPOCH_KEY,),
+            ).fetchone() == (None,)
+
+
+@pytest.mark.parametrize("marker", ("foreign-doctor-owner", None))
+def test_large_wal_fix_holds_sqlite_exclusion_through_checkpoint(
+    tmp_path, monkeypatch, marker
+):
+    """Doctor cannot publish a foreign claim after its authority proof."""
+    db_path = tmp_path / "state.db"
+    _build_state_db(db_path)
+    statements: list[str] = []
+    state = {"attempted": False, "committed": False, "error": None}
+    real_connect = sqlite3.connect
+    real_assert = hermes_state._assert_offline_rebuild_maintenance_authority
+
+    def traced_connect(path, *args, **kwargs):
+        conn = real_connect(path, *args, **kwargs)
+        if Path(path) == db_path:
+            conn.set_trace_callback(statements.append)
+        return conn
+
+    def assert_then_attempt_takeover(conn, *, local_marker):
+        real_assert(conn, local_marker=local_marker)
+        state["attempted"] = True
+        writer = real_connect(str(db_path), isolation_level=None, timeout=0.0)
+        try:
+            writer.execute("BEGIN IMMEDIATE")
+            writer.execute(
+                "INSERT INTO state_meta(key, value) VALUES (?, ?)",
+                (hermes_state._OFFLINE_REBUILD_EPOCH_KEY, marker),
+            )
+            writer.execute("COMMIT")
+            state["committed"] = True
+        except sqlite3.OperationalError as exc:
+            state["error"] = exc
+            if writer.in_transaction:
+                writer.execute("ROLLBACK")
+        finally:
+            writer.close()
+
+    monkeypatch.setattr(doctor.sqlite3, "connect", traced_connect)
+    monkeypatch.setattr(
+        hermes_state,
+        "_assert_offline_rebuild_maintenance_authority",
+        assert_then_attempt_takeover,
+    )
+
+    assert doctor._checkpoint_large_state_wal(db_path) == (True, None)
+    assert state["attempted"] is True
+    assert state["committed"] is False
+    assert isinstance(state["error"], sqlite3.OperationalError)
+    assert any("PRAGMA WAL_CHECKPOINT" in sql.upper() for sql in statements)
+
+    with real_connect(str(db_path), isolation_level=None, timeout=0.0) as writer:
+        writer.execute("BEGIN IMMEDIATE")
+        writer.execute(
+            "INSERT INTO state_meta(key, value) VALUES (?, ?)",
+            ("after-doctor-fence", marker),
+        )
+        writer.execute("COMMIT")
 
 
 @pytest.fixture

@@ -234,7 +234,7 @@ def test_run_job_fails_fast_when_cwd_lock_is_stuck(monkeypatch):
         sched._terminal_cwd_lock.release_write()
 
     assert success is False
-    assert "TERMINAL_CWD read lock" in (error or "")
+    assert error == "Cron delivery failed"
     assert time.monotonic() - start < 10.0
 
 
@@ -260,7 +260,7 @@ def test_run_job_writer_fails_fast_and_never_sets_env(monkeypatch, tmp_path):
         sched._terminal_cwd_lock.release_write()
 
     assert success is False
-    assert "TERMINAL_CWD write lock" in (error or "")
+    assert error == "Cron delivery failed"
     assert observed_during == "/holder/dir", (
         "timed-out writer mutated the active holder's TERMINAL_CWD override"
     )

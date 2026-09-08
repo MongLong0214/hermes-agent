@@ -58,11 +58,20 @@ def _scoped_gate_env(name: str, default: str = "") -> str:
 def _consume_abandoned_task(task: asyncio.Task) -> None:
     """Observe a detached task's terminal exception to avoid noisy loop logs."""
     try:
-        task.exception()
+        exception = task.exception()
     except asyncio.CancelledError:
-        pass
-    except Exception:
-        logger.debug("Abandoned Telegram init task failed after timeout", exc_info=True)
+        return
+    except Exception as exc:
+        logger.debug(
+            "Abandoned Telegram task exception inspection failed (%s)",
+            type(exc).__name__,
+        )
+        return
+    if exception is not None:
+        logger.debug(
+            "Abandoned Telegram task failed after timeout (%s)",
+            type(exception).__name__,
+        )
 
 
 # Grace period after the wall-clock deadline fires: if the event loop still
@@ -94,7 +103,9 @@ def _dump_loop_blocked_diagnostics(timeout: float, grace: float) -> None:
         logger.debug("faulthandler traceback dump failed", exc_info=True)
 
 
-async def _await_with_thread_deadline(awaitable, timeout: float, *, on_abandon=None):
+async def _await_with_thread_deadline(
+    awaitable, timeout: float, *, on_abandon=None, on_abandon_task=None
+):
     """Await with a wall-clock deadline that does not depend on loop timers.
 
     ``asyncio.wait_for`` schedules its timeout on the event loop and then waits
@@ -105,12 +116,13 @@ async def _await_with_thread_deadline(awaitable, timeout: float, *, on_abandon=N
     the shielded task instead of awaiting cancellation completion.
 
     ``on_abandon`` (optional) is a zero-arg callable returning an awaitable that
-    is scheduled as a detached best-effort cleanup when the task is abandoned on
-    timeout.  The abandoned initialize() may leave a half-built httpx client /
-    connection pool open (it never completed and we do not await its
-    cancellation), so the caller uses this to shut that state down and avoid
-    leaking a pool per retry attempt.  Cleanup runs detached and its own errors
-    are swallowed, so it can never re-block the retry ladder.
+    is scheduled as detached best-effort cleanup whenever this helper abandons
+    its child—after either a deadline or owner cancellation. ``on_abandon_task``
+    is the lifecycle-aware variant: it receives the abandoned child and must
+    synchronously register the exact-once owner task. The abandoned initialize()
+    may leave a half-built httpx client / connection pool open (it never
+    completed and we do not await its cancellation), so the caller uses one of
+    these hooks to shut that state down without re-blocking the retry ladder.
     """
     task = asyncio.ensure_future(awaitable)
     loop = asyncio.get_running_loop()
@@ -143,6 +155,34 @@ async def _await_with_thread_deadline(awaitable, timeout: float, *, on_abandon=N
     )
     watchdog.daemon = True
     watchdog.start()
+    abandoned = False
+
+    def _abandon_child() -> bool:
+        """Cancel/observe the child and hand cleanup to its sole owner once."""
+        nonlocal abandoned
+        if abandoned:
+            return True
+        abandoned = True
+        task.cancel()
+        task.add_done_callback(_consume_abandoned_task)
+        if on_abandon_task is not None:
+            try:
+                return on_abandon_task(task) is not False
+            except Exception as exc:
+                logger.debug(
+                    "Abandoned Telegram init cleanup scheduling failed (%s)",
+                    type(exc).__name__,
+                )
+                return False
+        elif on_abandon is not None:
+            # Detached best-effort cleanup: close the half-built app's httpx
+            # client/pool so an abandoned attempt can't leak sockets across the
+            # retry ladder. Detached + exception-observed so it never re-blocks
+            # or re-hangs the ladder we are trying to advance.
+            cleanup = asyncio.ensure_future(_run_abandon_cleanup(on_abandon))
+            cleanup.add_done_callback(_consume_abandoned_task)
+        return True
+
     try:
         done, _ = await asyncio.wait(
             {task, deadline},
@@ -153,16 +193,14 @@ async def _await_with_thread_deadline(awaitable, timeout: float, *, on_abandon=N
                 deadline.cancel()
             return await task
 
-        task.cancel()
-        task.add_done_callback(_consume_abandoned_task)
-        if on_abandon is not None:
-            # Detached best-effort cleanup: close the half-built app's httpx
-            # client/pool so an abandoned attempt can't leak sockets across the
-            # retry ladder. Detached + exception-observed so it never re-blocks
-            # or re-hangs the ladder we are trying to advance.
-            cleanup = asyncio.ensure_future(_run_abandon_cleanup(on_abandon))
-            cleanup.add_done_callback(_consume_abandoned_task)
+        _abandon_child()
         raise asyncio.TimeoutError()
+    except asyncio.CancelledError:
+        # Owner cancellation cannot leave a cancellation-resistant child
+        # running after the drain has returned to its caller. Release the same
+        # partial app resources as the deadline path while cancellation unwinds.
+        _abandon_child()
+        raise
     finally:
         timer.cancel()
         watchdog.cancel()
@@ -747,6 +785,10 @@ class TelegramAdapter(BasePlatformAdapter):
         super().__init__(config, Platform.TELEGRAM)
         self._app: Optional[Application] = None
         self._bot: Optional[Bot] = None
+        # Base teardown may bounded-cancel then clear ``_background_tasks``.
+        # Keep an abandoned initialize child and its final cleanup owner in this
+        # adapter-owned registry until the child's terminal shutdown completes.
+        self._abandoned_initialize_owners: dict[asyncio.Task, asyncio.Task] = {}
         self._webhook_mode: bool = False
         self._mention_patterns = self._compile_mention_patterns()
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
@@ -829,6 +871,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_progress_event = asyncio.Event()
         self._polling_progress_accepting: bool = False
         self._polling_progress_verifier_task: Optional[asyncio.Task] = None
+        self._polling_runtime_redelivery_task: Optional[asyncio.Task] = None
         self._polling_teardown_started: bool = False
         self._polling_error_callback_ref = None
         self._polling_heartbeat_task: Optional[asyncio.Task] = None
@@ -954,6 +997,7 @@ class TelegramAdapter(BasePlatformAdapter):
     def _set_fatal_error(self, code: str, message: str, *, retryable: bool) -> None:
         self._drop_delayed_deliveries = True
         super()._set_fatal_error(code, message, retryable=retryable)
+        self._cancel_polling_runtime_redelivery()
         # Permanent fatal: no reconnect will drain. Discard the hold queue now
         # and refuse further holds (teardown salvage / late enqueue must not
         # re-populate a queue that can never drain — review #83878).
@@ -2517,14 +2561,18 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             # Bounded: a wedged CLOSE-WAIT socket can make this close hang
             # forever and freeze the reconnect ladder (#66377).
-            await asyncio.wait_for(polling_req.shutdown(), timeout=_DRAIN_TIMEOUT)
+            await _await_with_thread_deadline(
+                polling_req.shutdown(), timeout=_DRAIN_TIMEOUT
+            )
         except Exception:
             logger.debug(
                 "[%s] Polling request shutdown failed/timed out (non-fatal)",
                 self.name, exc_info=True,
             )
         try:
-            await asyncio.wait_for(polling_req.initialize(), timeout=_DRAIN_TIMEOUT)
+            await _await_with_thread_deadline(
+                polling_req.initialize(), timeout=_DRAIN_TIMEOUT
+            )
             logger.debug(
                 "[%s] Polling request pool drained before reconnect", self.name
             )
@@ -2533,6 +2581,21 @@ class TelegramAdapter(BasePlatformAdapter):
                 "[%s] Polling request re-initialize failed/timed out (non-fatal)",
                 self.name, exc_info=True,
             )
+
+    def _cancel_polling_runtime_redelivery(self) -> None:
+        """Cancel a pending redelivery handoff without cancelling its owner."""
+        task = getattr(self, "_polling_runtime_redelivery_task", None)
+        if task is None:
+            return
+        try:
+            current_task = asyncio.current_task()
+        except RuntimeError:
+            current_task = None
+        if task is current_task:
+            return
+        if not task.done():
+            task.cancel()
+        self._polling_runtime_redelivery_task = None
 
     def _begin_polling_generation(self) -> tuple[int, asyncio.Event]:
         """Start accepting progress for a new getUpdates polling generation."""
@@ -2545,6 +2608,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._polling_progress_event = progress
             return getattr(self, "_polling_generation", 0), progress
 
+        self._cancel_polling_runtime_redelivery()
         verifier = getattr(self, "_polling_progress_verifier_task", None)
         if verifier is not None and not verifier.done():
             verifier.cancel()
@@ -2555,9 +2619,69 @@ class TelegramAdapter(BasePlatformAdapter):
         self._send_path_degraded = True
         return self._polling_generation, self._polling_progress_event
 
+    def _schedule_polling_runtime_redelivery(
+        self, generation: int, platform: Platform, profile: Optional[str]
+    ) -> None:
+        """Schedule the runner-owned redelivery handoff for one healthy edge."""
+        runner = getattr(self, "gateway_runner", None)
+        if runner is None:
+            return
+        handoff = self._run_polling_runtime_redelivery(
+            generation, platform, profile, runner
+        )
+        try:
+            task = asyncio.get_running_loop().create_task(handoff)
+        except Exception as exc:
+            handoff.close()
+            logger.warning(
+                "Telegram polling progress redelivery scheduling failed (%s)",
+                type(exc).__name__,
+            )
+            return
+        self._polling_runtime_redelivery_task = task
+        self._background_tasks.add(task)
+
+        def _clear_finished_redelivery(finished: asyncio.Task) -> None:
+            self._background_tasks.discard(finished)
+            if self._polling_runtime_redelivery_task is finished:
+                self._polling_runtime_redelivery_task = None
+
+        task.add_done_callback(_clear_finished_redelivery)
+
+    async def _run_polling_runtime_redelivery(
+        self, generation: int, platform: Platform, profile: Optional[str], runner
+    ) -> None:
+        """Invoke one current-generation redelivery handoff without polling impact."""
+        try:
+            if (
+                getattr(self, "_polling_teardown_started", False)
+                or self.has_fatal_error
+                or not self._polling_progress_accepting
+                or generation != self._polling_generation
+                or self._send_path_degraded
+                or getattr(self, "gateway_runner", None) is not runner
+                or not getattr(runner, "_running", False)
+            ):
+                return
+            redeliver = getattr(runner, "_redeliver_failed_obligations_for_platform", None)
+            if not callable(redeliver):
+                return
+            result = redeliver(platform, profile=profile)
+            if inspect.isawaitable(result):
+                await result
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Telegram polling progress redelivery callback failed (%s)",
+                type(exc).__name__,
+            )
+
     def _record_polling_progress(self, generation: int) -> None:
         """Record successful getUpdates I/O for the current generation only."""
         if getattr(self, "_polling_teardown_started", False):
+            return
+        if self.has_fatal_error:
             return
         if not self._polling_progress_accepting:
             return
@@ -2576,6 +2700,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 self.name,
                 generation,
             )
+        was_degraded = self._send_path_degraded
         self._polling_progress_event.set()
         self._polling_network_error_count = 0
         if generation == self._polling_conflict_recovery_generation:
@@ -2583,6 +2708,12 @@ class TelegramAdapter(BasePlatformAdapter):
         else:
             self._polling_conflict_count = 0
         self._send_path_degraded = False
+        if was_degraded:
+            self._schedule_polling_runtime_redelivery(
+                generation,
+                self.platform,
+                getattr(self, "_owner_profile", None),
+            )
 
     def _observe_polling_request_result(self, request, generation, result):
         """Record getUpdates progress from an observed do_request result.
@@ -4316,6 +4447,77 @@ class TelegramAdapter(BasePlatformAdapter):
         # it observes alongside, never displaces, the core handlers.
         app.add_handler(TypeHandler(Update, self._on_platform_update), group=99)
 
+    def _has_pending_abandoned_initialize_owner(self) -> bool:
+        """Whether an abandoned initialize cleanup still owns an old app."""
+        owners = getattr(self, "_abandoned_initialize_owners", {})
+        return any(not cleanup.done() for cleanup in owners.values())
+
+    def _schedule_abandoned_initialize_cleanup(
+        self, initialize_task: asyncio.Task, app, *, fallback: bool = False
+    ) -> bool:
+        """Shut down an abandoned app only after its initialize task exits.
+
+        A cancellation-resistant PTB initialize can complete after the retry
+        ladder has rebuilt the application.  Retaining this owner in the
+        adapter-owned registry keeps the late completion observable even after
+        generic background-task teardown clears its task set, without making
+        the reconnect path await it. The final shutdown remains the sole owner.
+        """
+        owners = getattr(self, "_abandoned_initialize_owners", None)
+        if owners is None:
+            owners = {}
+            self._abandoned_initialize_owners = owners
+        if self._has_pending_abandoned_initialize_owner():
+            return False
+
+        async def _shutdown_after_initialize() -> None:
+            try:
+                await initialize_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                # The helper's observer reports a terminal child failure with a
+                # sanitized class-only diagnostic. Cleanup still owns shutdown.
+                pass
+            await _shutdown_abandoned_app(app)
+
+        cleanup_coro = _shutdown_after_initialize()
+        try:
+            if fallback:
+                cleanup = asyncio.get_running_loop().create_task(cleanup_coro)
+            else:
+                cleanup = asyncio.ensure_future(cleanup_coro)
+        except BaseException:
+            cleanup_coro.close()
+            raise
+        try:
+            owners[initialize_task] = cleanup
+        except BaseException:
+            cleanup.cancel()
+            cleanup.add_done_callback(_consume_abandoned_task)
+            raise
+
+        def _finish_abandoned_initialize_cleanup(finished: asyncio.Task) -> None:
+            if owners.get(initialize_task) is finished:
+                owners.pop(initialize_task, None)
+            _consume_abandoned_task(finished)
+
+        cleanup.add_done_callback(_finish_abandoned_initialize_cleanup)
+        return True
+
+    def _transfer_abandoned_initialize_ownership(
+        self, initialize_task: asyncio.Task, app, *, fallback: bool = False
+    ) -> bool:
+        """Atomically retire an active app after its retained owner is registered."""
+        if not self._schedule_abandoned_initialize_cleanup(
+            initialize_task, app, fallback=fallback
+        ):
+            return False
+        if self._app is app:
+            self._app = None
+            self._bot = None
+        return True
+
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to Telegram via polling or webhook.
 
@@ -4360,7 +4562,14 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.error("[%s] No bot token configured", self.name)
             self._set_fatal_error("missing_credentials", "No bot token configured", retryable=False)
             return False
-        
+
+        if self._has_pending_abandoned_initialize_owner():
+            logger.warning(
+                "[%s] Refusing a new Telegram connect while abandoned initialization cleanup is pending",
+                self.name,
+            )
+            return False
+
         try:
             if not self._acquire_platform_lock('telegram-bot-token', self.config.token, 'Telegram bot token'):
                 return False
@@ -4577,6 +4786,17 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             for _attempt in range(_max_connect):
                 rebuild_app = False
+                abandoned_initialize = False
+                abandoned_initialize_task: Optional[asyncio.Task] = None
+
+                def _transfer_initialize_task(initialize_task, app=self._app) -> bool:
+                    nonlocal abandoned_initialize, abandoned_initialize_task
+                    abandoned_initialize_task = initialize_task
+                    abandoned_initialize = self._transfer_abandoned_initialize_ownership(
+                        initialize_task, app
+                    )
+                    return abandoned_initialize
+
                 try:
                     # Check total watchdog deadline — if we blew past it the
                     # retry ladder must yield even if no individual attempt
@@ -4603,11 +4823,26 @@ class TelegramAdapter(BasePlatformAdapter):
                         # app's httpx client/connection pool so it isn't leaked
                         # across the retry ladder (mirrors the client-close-on-
                         # timeout pattern in agent/auxiliary_client.py).
-                        on_abandon=lambda app=self._app: _shutdown_abandoned_app(app),
+                        on_abandon_task=_transfer_initialize_task,
                     )
                     break
                 except asyncio.TimeoutError:
                     rebuild_app = True
+                    if not abandoned_initialize and abandoned_initialize_task is not None:
+                        try:
+                            abandoned_initialize = self._transfer_abandoned_initialize_ownership(
+                                abandoned_initialize_task, self._app, fallback=True
+                            )
+                        except Exception as exc:
+                            logger.debug(
+                                "Abandoned Telegram init fallback cleanup scheduling failed (%s)",
+                                type(exc).__name__,
+                            )
+                    if not abandoned_initialize:
+                        rebuild_app = False
+                        raise OSError(
+                            "Telegram initialization cleanup ownership could not be retained"
+                        )
                     if _attempt < _max_connect - 1:
                         wait = min(2 ** _attempt, 15)
                         logger.warning(
@@ -4671,16 +4906,21 @@ class TelegramAdapter(BasePlatformAdapter):
                     # and will be GC'd (#67498).
                     if rebuild_app and _attempt < _max_connect - 1:
                         old_app = self._app
-                        self._app = builder.build()
-                        self._bot = self._app.bot
+                        new_app = builder.build()
+                        self._app = new_app
+                        self._bot = new_app.bot
                         # Keep core and observer handlers in lockstep after a
                         # transient-init rebuild (#64176).
                         self._register_handlers(self._app)
-                        # Best-effort discard the old app's resources
-                        try:
-                            await _shutdown_abandoned_app(old_app)
-                        except Exception:
-                            pass
+                        # A deadline/owner cancellation already handed this
+                        # old app to its single retained cleanup owner. Other
+                        # init failures have no abandoned child, so dispose it
+                        # synchronously before retrying as before.
+                        if not abandoned_initialize:
+                            try:
+                                await _shutdown_abandoned_app(old_app)
+                            except Exception:
+                                pass
             await self._app.start()
 
             # Decide between webhook and polling mode
@@ -4944,6 +5184,7 @@ class TelegramAdapter(BasePlatformAdapter):
             collect(task)
         collect(getattr(self, "_polling_error_task", None))
         collect(getattr(self, "_polling_progress_verifier_task", None))
+        collect(getattr(self, "_polling_runtime_redelivery_task", None))
         # Hold-queue redispatch must be cancellable+awaitable on teardown so it
         # cannot dispatch handle_message into a torn-down session (same lifecycle
         # rule teknium called out on #72037 for shielded flush dispatch).
@@ -4986,6 +5227,8 @@ class TelegramAdapter(BasePlatformAdapter):
             self._polling_error_task = None
         if getattr(self, "_polling_progress_verifier_task", None) is not current_task:
             self._polling_progress_verifier_task = None
+        if getattr(self, "_polling_runtime_redelivery_task", None) is not current_task:
+            self._polling_runtime_redelivery_task = None
         if getattr(self, "_held_inbound_redispatch_task", None) is not current_task:
             self._held_inbound_redispatch_task = None
 
@@ -5056,6 +5299,7 @@ class TelegramAdapter(BasePlatformAdapter):
         for task in (
             getattr(self, "_polling_error_task", None),
             getattr(self, "_polling_progress_verifier_task", None),
+            getattr(self, "_polling_runtime_redelivery_task", None),
         ):
             if not task or task.done() or task is current_task:
                 continue
@@ -5076,6 +5320,8 @@ class TelegramAdapter(BasePlatformAdapter):
             self._polling_error_task = None
         if getattr(self, "_polling_progress_verifier_task", None) is not current_task:
             self._polling_progress_verifier_task = None
+        if getattr(self, "_polling_runtime_redelivery_task", None) is not current_task:
+            self._polling_runtime_redelivery_task = None
 
         # Cancellation callbacks may have run while awaited; the teardown fence
         # remains authoritative regardless of their finalizers.

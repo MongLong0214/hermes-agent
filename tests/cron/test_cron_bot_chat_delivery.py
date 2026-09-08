@@ -14,6 +14,7 @@ import pytest
 from cron import scheduler as sched
 from cron.scheduler import (
     BOT_CHAT_PLATFORM,
+    _CRON_DELIVERY_FAILURE,
     _deliver_to_bot_chat,
     _preflight_check_delivery,
     _resolve_bot_chat_target,
@@ -170,7 +171,7 @@ def test_deliver_failure_returns_error_string():
     ), mock.patch.object(sched.shutil, "which", return_value="/usr/bin/hermes"):
         err = _deliver_to_bot_chat({"id": "j1", "name": "n"}, "out", "")
     assert err is not None
-    assert "boom" in err
+    assert err == _CRON_DELIVERY_FAILURE
 
 
 def test_deliver_timeout_returns_error_string():
@@ -180,7 +181,7 @@ def test_deliver_timeout_returns_error_string():
     ), mock.patch.object(sched.shutil, "which", return_value="/usr/bin/hermes"):
         err = _deliver_to_bot_chat({"id": "j1", "name": "n"}, "out", "")
     assert err is not None
-    assert "timed out" in err
+    assert err == _CRON_DELIVERY_FAILURE
 
 
 def test_deliver_message_carries_cron_attribution(tmp_path):

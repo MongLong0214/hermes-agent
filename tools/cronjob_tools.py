@@ -677,6 +677,7 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "base_url": job.get("base_url"),
         "schedule": job.get("schedule_display") or "?",
         "repeat": _repeat_display(job),
+        "restart_policy": job.get("restart_policy", "terminal"),
         "deliver": job.get("deliver", "local"),
         "next_run_at": job.get("next_run_at"),
         "last_run_at": job.get("last_run_at"),
@@ -1194,7 +1195,7 @@ def _try_dispatch_background_run(
         "cronjob run: background pool unavailable (%s); running job '%s' inline.",
         dispatch.get("error", "rejected"), job_name,
     )
-    result = _run_claimed_job(job, extra_prompt=extra_prompt)
+    result = _run_claimed_job(claimed_job, extra_prompt=extra_prompt)
     result["dispatched"] = False
     return result
 
@@ -1230,6 +1231,7 @@ def cronjob(
     schedule: Optional[str] = None,
     name: Optional[str] = None,
     repeat: Optional[int] = None,
+    restart_policy: Optional[str] = None,
     deliver: Optional[str] = None,
     include_disabled: bool = False,
     skill: Optional[str] = None,
@@ -1338,6 +1340,9 @@ def cronjob(
                     schedule=schedule,
                     name=name,
                     repeat=repeat,
+                    restart_policy=(
+                        "terminal" if restart_policy is None else restart_policy
+                    ),
                     deliver=_resolve_cron_context_deliver(
                         _normalize_deliver_param(deliver)
                     ),
@@ -1657,6 +1662,8 @@ def cronjob(
                 repeat_state = dict(job.get("repeat") or {})
                 repeat_state["times"] = normalized_repeat
                 updates["repeat"] = repeat_state
+            if restart_policy is not None:
+                updates["restart_policy"] = restart_policy
             if schedule is not None:
                 parsed_schedule = parse_schedule(schedule)
                 updates["schedule"] = parsed_schedule
@@ -1724,6 +1731,12 @@ Scheduling from cron-run sessions is disabled by default and enabled via cron.al
             "repeat": {
                 "type": "integer",
                 "description": "Optional repeat count. Omit for defaults (once for one-shot, forever for recurring)."
+            },
+            "restart_policy": {
+                "type": "string",
+                "enum": ["terminal", "resume"],
+                "default": "terminal",
+                "description": "One-shot restart behavior: terminal preserves at-most-once dispatch; resume retries the same interrupted occurrence with a stable occurrence ID."
             },
             "deliver": {
                 "type": "string",
@@ -1845,6 +1858,7 @@ registry.register(
         schedule=args.get("schedule"),
         name=args.get("name"),
         repeat=args.get("repeat"),
+        restart_policy=args.get("restart_policy"),
         deliver=args.get("deliver"),
         include_disabled=args.get("include_disabled", True),
         skill=args.get("skill"),

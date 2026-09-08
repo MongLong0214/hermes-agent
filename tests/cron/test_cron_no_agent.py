@@ -142,8 +142,7 @@ def test_timed_out_no_agent_script_delivery_is_not_mislabeled_as_provider_failur
 ):
     """A watchdog timeout happens before any LLM/provider call.
 
-    The delivery summary must preserve that process-level failure taxonomy and
-    must not claim a provider fallback was attempted or exhausted.
+    The delivery boundary must close both the timeout and its script path.
     """
     from cron.jobs import create_job
     import cron.scheduler as scheduler
@@ -198,13 +197,15 @@ def test_timed_out_no_agent_script_delivery_is_not_mislabeled_as_provider_failur
 
     assert scheduler.run_one_job(job) is True
     assert len(delivered) == 1
-    assert "script timed out" in delivered[0].lower()
+    assert delivered == ["Cron delivery failed"]
+    assert "slow.py" not in delivered[0]
+    assert "timed out" not in delivered[0].lower()
     assert "provider" not in delivered[0].lower()
     assert "fallback" not in delivered[0].lower()
 
 
-def test_agent_provider_timeout_delivery_keeps_fallback_guidance(hermes_env, monkeypatch):
-    """Provider timeout classification remains available to agent-backed jobs."""
+def test_agent_provider_timeout_delivery_closes_private_details(hermes_env, monkeypatch):
+    """Agent-backed provider failures use the same fixed public contract."""
     from cron.jobs import create_job
     import cron.scheduler as scheduler
 
@@ -234,10 +235,10 @@ def test_agent_provider_timeout_delivery_keeps_fallback_guidance(hermes_env, mon
 
     assert scheduler.run_one_job(job) is True
     assert len(delivered) == 1
-    assert "provider timeout" in delivered[0].lower()
-    # Chain wording is now honest (#85508): exhausted when configured,
-    # "no fallback chain configured" guidance otherwise.
-    assert "fallback chain" in delivered[0].lower()
+    assert delivered == ["Cron delivery failed"]
+    assert "ReadTimeout" not in delivered[0]
+    assert "provider request timed out" not in delivered[0].lower()
+    assert "fallback" not in delivered[0].lower()
 
 
 # ---------------------------------------------------------------------------
@@ -341,29 +342,31 @@ def test_run_job_script_accepts_pathlike_script_path(hermes_env):
     ],
 )
 def test_no_agent_failure_never_blamed_on_a_provider(error):
-    """A script job's failure must never be reported as a provider/fallback failure."""
+    """A script failure closes raw script and provider-looking text alike."""
     from cron.scheduler import _summarize_cron_failure_for_delivery
 
     job = {"name": "nightly-job", "no_agent": True, "script": "nightly.sh"}
     msg = _summarize_cron_failure_for_delivery(job, error)
 
+    assert msg == "Cron delivery failed"
+    assert error not in msg
     assert "provider" not in msg.lower()
-    assert "fallback chain" not in msg.lower()
-    # The operator must be pointed at what actually failed.
-    assert "script" in msg.lower()
+    assert "script" not in msg.lower()
 
 
 @pytest.mark.parametrize(
-    ("error", "expected"),
+    "error",
     [
-        ("ReadTimeout: provider did not respond", "provider timeout"),
-        ("HTTP 429 rate limit exceeded", "provider rate limit"),
-        ("HTTP 401 authentication failed", "provider authentication error"),
+        "ReadTimeout: provider did not respond",
+        "HTTP 429 rate limit exceeded",
+        "HTTP 401 authentication failed",
     ],
 )
-def test_agent_job_provider_classification_unchanged(error, expected):
-    """Regression guard: agent-mode jobs keep the provider-shaped summaries."""
+def test_agent_job_provider_failure_is_closed_at_delivery_boundary(error):
+    """Provider diagnostics never cross the public delivery boundary."""
     from cron.scheduler import _summarize_cron_failure_for_delivery
 
     job = {"name": "daily-digest", "no_agent": False}
-    assert expected in _summarize_cron_failure_for_delivery(job, error)
+    msg = _summarize_cron_failure_for_delivery(job, error)
+    assert msg == "Cron delivery failed"
+    assert error not in msg

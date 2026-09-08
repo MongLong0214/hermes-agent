@@ -35,6 +35,7 @@ from typing import List, Dict, Any, Optional
 import fire
 from dotenv import load_dotenv
 from agent.tool_dispatch_helpers import make_tool_result_message
+from agent.gemini_outbound_policy import deny_gemini_outbound
 
 # Load environment variables
 load_dotenv()
@@ -186,6 +187,8 @@ class MiniSWERunner:
             command_timeout: Default timeout for commands
             verbose: Enable verbose logging
         """
+        deny_gemini_outbound(model=model, base_url=base_url)
+
         self.model = model
         self.max_iterations = max_iterations
         self.command_timeout = command_timeout

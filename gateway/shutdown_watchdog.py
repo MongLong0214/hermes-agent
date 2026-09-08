@@ -57,6 +57,10 @@ DEFAULT_LOOP_WATCHDOG_TIMEOUT_S = 10.0
 DEFAULT_LOOP_WATCHDOG_MAX_STRIKES = 3
 _HEARTBEAT_RELATIVE = ("state", "gateway.heartbeat")
 _WATCHDOG_DUMP_RELATIVE = ("logs", "gateway-shutdown-watchdog.log")
+_LOOP_LIVENESS_WATCHDOG_DUMP_RELATIVE = (
+    "logs",
+    "gateway-loop-liveness-watchdog.log",
+)
 
 
 class _LoopFloorTimerHandle:
@@ -185,10 +189,22 @@ def start_loop_liveness_watchdog(
                 )
             except Exception:
                 pass
-            try:
-                faulthandler.dump_traceback(all_threads=True)
-            except Exception:
-                logger.debug("Loop liveness faulthandler dump failed", exc_info=True)
+            if stop_event.is_set():
+                return
+            target = get_loop_liveness_watchdog_dump_path()
+            if not _write_loop_liveness_watchdog_dump(
+                target,
+                strikes=strikes,
+                probe_interval=interval,
+                probe_timeout=timeout,
+            ):
+                try:
+                    logger.warning(
+                        "Gateway loop liveness watchdog durable dump failed; "
+                        "continuing forced recovery."
+                    )
+                except Exception:
+                    pass
             if stop_event.is_set():
                 return
             # Record the watchdog exit in the lifecycle sentinel so the next
@@ -233,6 +249,12 @@ def get_shutdown_watchdog_dump_path(home: Optional[Path] = None) -> Path:
     """Return the faulthandler / metadata dump path for a fired watchdog."""
     base = home if home is not None else _process_hermes_home()
     return base.joinpath(*_WATCHDOG_DUMP_RELATIVE)
+
+
+def get_loop_liveness_watchdog_dump_path(home: Optional[Path] = None) -> Path:
+    """Return the private replacement dump path for a liveness final strike."""
+    base = home if home is not None else _process_hermes_home()
+    return base.joinpath(*_LOOP_LIVENESS_WATCHDOG_DUMP_RELATIVE)
 
 
 def write_loop_heartbeat(
@@ -294,6 +316,19 @@ def resolve_shutdown_watchdog_delay(
     return drain + grace
 
 
+def _write_watchdog_dump_contents(fh, header: Dict[str, Any]) -> None:
+    """Write one header and all-thread traceback to an already-open dump file."""
+    fh.write(json.dumps(header, default=str) + "\n")
+    fh.write("--- faulthandler dump (all threads) ---\n")
+    fh.flush()
+    try:
+        faulthandler.dump_traceback(file=fh, all_threads=True)
+    except Exception:
+        fh.write("(faulthandler.dump_traceback failed)\n")
+    fh.write("--- end dump ---\n")
+    fh.flush()
+
+
 def _write_watchdog_dump(
     dump_path: Path,
     *,
@@ -315,15 +350,7 @@ def _write_watchdog_dump(
     }
     try:
         with open(dump_path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(header, default=str) + "\n")
-            fh.write("--- faulthandler dump (all threads) ---\n")
-            fh.flush()
-            try:
-                faulthandler.dump_traceback(file=fh, all_threads=True)
-            except Exception:
-                fh.write("(faulthandler.dump_traceback failed)\n")
-            fh.write("--- end dump ---\n")
-            fh.flush()
+            _write_watchdog_dump_contents(fh, header)
     except Exception:
         pass
 
@@ -338,6 +365,64 @@ def _write_watchdog_dump(
         faulthandler.dump_traceback(all_threads=True)
     except Exception:
         pass
+
+
+def _write_loop_liveness_watchdog_dump(
+    dump_path: Path,
+    *,
+    strikes: int,
+    probe_interval: float,
+    probe_timeout: float,
+) -> bool:
+    """Best-effort private replacement dump for the liveness final strike."""
+    header: Dict[str, Any] = {
+        "event_kind": "loop_liveness_watchdog_final_strike",
+        "pid": os.getpid(),
+        "strike_count": strikes,
+        "probe_interval_s": probe_interval,
+        "probe_timeout_s": probe_timeout,
+        "utc_timestamp": datetime.now(timezone.utc).isoformat(),
+        "runtime_state": {"loop_liveness": "unresponsive"},
+    }
+    fd: Optional[int] = None
+    temporary_path: Optional[Path] = dump_path.with_name(f".{dump_path.name}.tmp")
+    try:
+        dump_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(
+            temporary_path,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            0o600,
+        )
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fd = None
+            _write_watchdog_dump_contents(fh, header)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(temporary_path, dump_path)
+        temporary_path = None
+        directory_fd = os.open(
+            dump_path.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except Exception:
+        return False
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except Exception:
+                pass
+    return True
 
 
 def arm_shutdown_watchdog(

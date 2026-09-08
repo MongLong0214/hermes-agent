@@ -302,7 +302,85 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
     )
 
 
-SCHEMA_VERSION = 26
+SCHEMA_VERSION = 28
+TURN_FENCE_GENERATION = 28
+
+# Session/process authority records are bound to one durable SessionDB family
+# and one database instance.  The database id is generated once in state_meta;
+# it is deliberately not derived from a filesystem path, which is movable.
+SESSION_PROCESS_AUTHORITY_STATE_FAMILY = "sessiondb-v1"
+SESSION_PROCESS_AUTHORITY_STATE_DB_ID_BYTES = 32
+SESSION_PROCESS_AUTHORITY_RESERVATION_TTL_SECONDS = 30.0
+SESSION_PROCESS_AUTHORITY_MAX_RESERVATION_TTL_SECONDS = 60.0
+
+TURN_FENCE_GOVERNED_TABLES = (
+    "messages",
+    "sessions",
+    "system_prompts",
+    "session_model_usage",
+    "session_turn_leases",
+    "compression_locks",
+    "gateway_routing",
+    "async_delegations",
+    "session_process_authorities",
+    "session_process_reservations",
+)
+TURN_FENCE_OPERATIONS = ("INSERT", "UPDATE", "DELETE")
+
+
+def register_turn_fence_generation(conn) -> None:
+    """Register the package generation scalar on one SQLite connection."""
+    conn.create_function(
+        "hermes_turn_fence_generation", 0, lambda: TURN_FENCE_GENERATION
+    )
+
+
+def turn_fence_trigger_name(table: str, operation: str) -> str:
+    return f"turn_fence_{table}_{operation.lower()}"
+
+
+def turn_fence_trigger_sql(table: str, operation: str) -> str:
+    """Build one governed-table generation trigger with a literal barrier."""
+    name = turn_fence_trigger_name(table, operation)
+    return (
+        f"CREATE TRIGGER {name} BEFORE {operation} ON {table} "
+        "BEGIN "
+        "SELECT CASE "
+        "WHEN typeof(hermes_turn_fence_generation()) != 'integer' "
+        f"OR hermes_turn_fence_generation() != {TURN_FENCE_GENERATION} "
+        "THEN RAISE(ABORT, 'state DB generation incompatible') "
+        "END; "
+        "END"
+    )
+
+
+def turn_fence_trigger_definitions() -> tuple[tuple[str, str], ...]:
+    return tuple(
+        (
+            turn_fence_trigger_name(table, operation),
+            turn_fence_trigger_sql(table, operation),
+        )
+        for table in TURN_FENCE_GOVERNED_TABLES
+        for operation in TURN_FENCE_OPERATIONS
+    )
+
+
+#: Back-compat views over the declaration above, for the offline rollback tool
+#: (hermes_cli/session_fence_rollback*.py) and its tests: they read the fence
+#: surface as (table, operation) pairs / trigger names rather than the
+#: table-list x operation-list split above. Derived, not duplicated — moving
+#: TURN_FENCE_GOVERNED_TABLES or TURN_FENCE_OPERATIONS moves these with it.
+TURN_FENCE_SURFACE = tuple(
+    (table, operation)
+    for table in TURN_FENCE_GOVERNED_TABLES
+    for operation in TURN_FENCE_OPERATIONS
+)
+TURN_FENCE_TRIGGERS = tuple(name for name, _sql in turn_fence_trigger_definitions())
+
+#: The scalar function name each trigger body calls (see
+#: :func:`register_turn_fence_generation` / :func:`turn_fence_trigger_sql`),
+#: named so callers do not re-embed the literal.
+TURN_FENCE_FUNCTION_NAME = "hermes_turn_fence_generation"
 
 
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
@@ -372,6 +450,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     git_branch TEXT,
     git_repo_root TEXT,
     git_metadata_generation INTEGER NOT NULL DEFAULT 0,
+    session_generation INTEGER NOT NULL DEFAULT 0 CHECK (session_generation >= 0),
     billing_provider TEXT,
     billing_base_url TEXT,
     billing_mode TEXT,
@@ -456,6 +535,222 @@ CREATE TABLE IF NOT EXISTS state_meta (
     value TEXT
 );
 
+-- The current authority for each issued session generation.  Historical
+-- lifecycle facts live in the append-only event table below; this table is the
+-- bounded current-state lookup used by reservation admission.
+CREATE TABLE IF NOT EXISTS session_process_authorities (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    session_generation INTEGER NOT NULL CHECK (session_generation >= 1),
+    state_db_id TEXT NOT NULL CHECK (
+        length(state_db_id) = 64 AND state_db_id NOT GLOB '*[^0-9a-f]*'
+    ),
+    state_family TEXT NOT NULL CHECK (state_family = 'sessiondb-v1'),
+    authority_token TEXT NOT NULL CHECK (
+        length(authority_token) = 64 AND authority_token NOT GLOB '*[^0-9a-f]*'
+    ),
+    status TEXT NOT NULL CHECK (status IN ('ISSUED', 'CLOSED', 'REVOKED')),
+    issued_at REAL NOT NULL,
+    terminal_at REAL,
+    PRIMARY KEY (session_id, session_generation)
+);
+
+-- Authority evidence is intentionally independent of session-row foreign keys:
+-- ordinary session pruning may remove current rows, but it must not erase the
+-- durable audit trail that explains why a presented capability was rejected.
+CREATE TABLE IF NOT EXISTS session_process_authority_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    session_generation INTEGER NOT NULL CHECK (session_generation >= 1),
+    state_db_id TEXT NOT NULL CHECK (
+        length(state_db_id) = 64 AND state_db_id NOT GLOB '*[^0-9a-f]*'
+    ),
+    state_family TEXT NOT NULL CHECK (state_family = 'sessiondb-v1'),
+    event_type TEXT NOT NULL CHECK (event_type IN (
+        'SESSION_ISSUED', 'SESSION_CLOSED', 'SESSION_REVOKED',
+        'PROCESS_RESERVATION', 'PROCESS_BOUND', 'PROCESS_TERMINAL',
+        'PROCESS_ABORTED'
+    )),
+    reservation_id TEXT,
+    occurred_at REAL NOT NULL
+);
+
+-- Reservation secrets are never stored in plaintext.  A reservation can be
+-- consumed exactly once, and only its SHA-256 digest survives at rest.
+CREATE TABLE IF NOT EXISTS session_process_reservations (
+    reservation_id TEXT PRIMARY KEY,
+    reservation_token_sha256 TEXT NOT NULL CHECK (
+        length(reservation_token_sha256) = 64
+        AND reservation_token_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    session_id TEXT NOT NULL,
+    session_generation INTEGER NOT NULL CHECK (session_generation >= 1),
+    state_db_id TEXT NOT NULL CHECK (
+        length(state_db_id) = 64 AND state_db_id NOT GLOB '*[^0-9a-f]*'
+    ),
+    state_family TEXT NOT NULL CHECK (state_family = 'sessiondb-v1'),
+    status TEXT NOT NULL CHECK (status IN ('RESERVED', 'BOUND', 'TERMINAL', 'ABORTED')),
+    reserved_at REAL NOT NULL,
+    expires_at REAL NOT NULL CHECK (expires_at > reserved_at),
+    consumed_at REAL
+);
+
+CREATE TRIGGER IF NOT EXISTS session_process_authority_identity_immutable_update
+BEFORE UPDATE ON state_meta
+WHEN OLD.key IN ('session_process_state_db_id', 'session_process_state_family')
+BEGIN
+    SELECT RAISE(ABORT, 'session process authority identity is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS session_process_authority_identity_immutable_delete
+BEFORE DELETE ON state_meta
+WHEN OLD.key IN ('session_process_state_db_id', 'session_process_state_family')
+BEGIN
+    SELECT RAISE(ABORT, 'session process authority identity is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS session_process_authority_generation_insert_guard
+BEFORE INSERT ON sessions
+WHEN NEW.session_generation <> 0
+BEGIN
+    SELECT RAISE(ABORT, 'session authority generation must start at zero');
+END;
+
+CREATE TRIGGER IF NOT EXISTS session_process_authority_generation_monotonic_guard
+BEFORE UPDATE OF session_generation ON sessions
+WHEN NEW.session_generation <> OLD.session_generation + 1
+BEGIN
+    SELECT RAISE(ABORT, 'session authority generation must be monotonic');
+END;
+
+CREATE TRIGGER IF NOT EXISTS session_process_authority_sessions_issue
+AFTER INSERT ON sessions
+BEGIN
+    UPDATE sessions
+    SET session_generation = CASE
+        WHEN session_generation < 1 THEN 1 ELSE session_generation END
+    WHERE id = NEW.id;
+    INSERT INTO session_process_authorities (
+        session_id, session_generation, state_db_id, state_family,
+        authority_token, status, issued_at
+    )
+    SELECT s.id, s.session_generation,
+           (SELECT value FROM state_meta WHERE key = 'session_process_state_db_id'),
+           (SELECT value FROM state_meta WHERE key = 'session_process_state_family'),
+           lower(hex(randomblob(32))), 'ISSUED', s.started_at
+    FROM sessions AS s WHERE s.id = NEW.id;
+    INSERT INTO session_process_authority_events (
+        session_id, session_generation, state_db_id, state_family,
+        event_type, occurred_at
+    )
+    SELECT session_id, session_generation, state_db_id, state_family,
+           'SESSION_ISSUED', issued_at
+    FROM session_process_authorities
+    WHERE session_id = NEW.id
+      AND session_generation = (SELECT session_generation FROM sessions WHERE id = NEW.id);
+END;
+
+CREATE TRIGGER IF NOT EXISTS session_process_authority_sessions_close
+AFTER UPDATE OF ended_at ON sessions
+WHEN OLD.ended_at IS NULL AND NEW.ended_at IS NOT NULL
+BEGIN
+    UPDATE session_process_authorities
+    SET status = CASE WHEN NEW.end_reason = 'authority_revoked'
+                      THEN 'REVOKED' ELSE 'CLOSED' END,
+        terminal_at = NEW.ended_at
+    WHERE session_id = NEW.id
+      AND session_generation = NEW.session_generation
+      AND status = 'ISSUED';
+    INSERT INTO session_process_authority_events (
+        session_id, session_generation, state_db_id, state_family,
+        event_type, occurred_at
+    )
+    SELECT session_id, session_generation, state_db_id, state_family,
+           CASE WHEN NEW.end_reason = 'authority_revoked'
+                THEN 'SESSION_REVOKED' ELSE 'SESSION_CLOSED' END,
+           NEW.ended_at
+    FROM session_process_authorities
+    WHERE session_id = NEW.id
+      AND session_generation = NEW.session_generation
+      AND status = CASE WHEN NEW.end_reason = 'authority_revoked'
+                        THEN 'REVOKED' ELSE 'CLOSED' END;
+END;
+
+CREATE TRIGGER IF NOT EXISTS session_process_authority_sessions_reopen
+AFTER UPDATE OF ended_at ON sessions
+WHEN OLD.ended_at IS NOT NULL AND NEW.ended_at IS NULL
+BEGIN
+    UPDATE sessions SET session_generation = session_generation + 1 WHERE id = NEW.id;
+    INSERT INTO session_process_authorities (
+        session_id, session_generation, state_db_id, state_family,
+        authority_token, status, issued_at
+    )
+    SELECT s.id, s.session_generation,
+           (SELECT value FROM state_meta WHERE key = 'session_process_state_db_id'),
+           (SELECT value FROM state_meta WHERE key = 'session_process_state_family'),
+           lower(hex(randomblob(32))), 'ISSUED', strftime('%s', 'now')
+    FROM sessions AS s WHERE s.id = NEW.id;
+    INSERT INTO session_process_authority_events (
+        session_id, session_generation, state_db_id, state_family,
+        event_type, occurred_at
+    )
+    SELECT session_id, session_generation, state_db_id, state_family,
+           'SESSION_ISSUED', issued_at
+    FROM session_process_authorities
+    WHERE session_id = NEW.id
+      AND session_generation = (SELECT session_generation FROM sessions WHERE id = NEW.id);
+END;
+
+CREATE TRIGGER IF NOT EXISTS session_process_reservation_issue
+AFTER INSERT ON session_process_reservations
+BEGIN
+    INSERT INTO session_process_authority_events (
+        session_id, session_generation, state_db_id, state_family,
+        event_type, reservation_id, occurred_at
+    ) VALUES (
+        NEW.session_id, NEW.session_generation, NEW.state_db_id, NEW.state_family,
+        'PROCESS_RESERVATION', NEW.reservation_id, NEW.reserved_at
+    );
+END;
+
+CREATE TRIGGER IF NOT EXISTS session_process_reservation_transition_guard
+BEFORE UPDATE OF status ON session_process_reservations
+WHEN NOT (
+    (OLD.status = 'RESERVED' AND NEW.status IN ('BOUND', 'ABORTED'))
+    OR (OLD.status = 'BOUND' AND NEW.status IN ('TERMINAL', 'ABORTED'))
+)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid session process reservation transition');
+END;
+
+CREATE TRIGGER IF NOT EXISTS session_process_reservation_transition_event
+AFTER UPDATE OF status ON session_process_reservations
+WHEN OLD.status <> NEW.status
+BEGIN
+    INSERT INTO session_process_authority_events (
+        session_id, session_generation, state_db_id, state_family,
+        event_type, reservation_id, occurred_at
+    ) VALUES (
+        NEW.session_id, NEW.session_generation, NEW.state_db_id, NEW.state_family,
+        CASE NEW.status WHEN 'BOUND' THEN 'PROCESS_BOUND'
+                        WHEN 'TERMINAL' THEN 'PROCESS_TERMINAL'
+                        ELSE 'PROCESS_ABORTED' END,
+        NEW.reservation_id,
+        COALESCE(NEW.consumed_at, strftime('%s', 'now'))
+    );
+END;
+
+CREATE TRIGGER IF NOT EXISTS session_process_authority_events_append_only_update
+BEFORE UPDATE ON session_process_authority_events
+BEGIN
+    SELECT RAISE(ABORT, 'session process authority events are append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS session_process_authority_events_append_only_delete
+BEFORE DELETE ON session_process_authority_events
+BEGIN
+    SELECT RAISE(ABORT, 'session process authority events are append-only');
+END;
+
 CREATE TABLE IF NOT EXISTS gateway_routing (
     scope TEXT NOT NULL DEFAULT '',
     session_key TEXT NOT NULL,
@@ -481,6 +776,31 @@ CREATE TABLE IF NOT EXISTS session_turn_leases (
     holder TEXT NOT NULL,
     acquired_at REAL NOT NULL,
     expires_at REAL NOT NULL
+);
+
+-- A dormant terminal-outcome record.  The terminal assistant row and its
+-- COMPLETED receipt are written through SessionDB's one canonical transcript
+-- transaction; this table intentionally has no prompt/model ingress of its
+-- own.
+CREATE TABLE IF NOT EXISTS turn_receipts (
+    turn_request_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    binding_digest TEXT NOT NULL CHECK (binding_digest <> ''),
+    receipt_identity_json TEXT,
+    receipt_identity_digest TEXT,
+    target_bind_receipt_json TEXT,
+    target_bind_receipt_digest TEXT,
+    status TEXT NOT NULL,
+    claim_token TEXT,
+    terminal_message_id INTEGER REFERENCES messages(id) ON DELETE CASCADE,
+    response_digest TEXT,
+    abort_receipt_id TEXT,
+    abort_evidence_digest TEXT,
+    abort_reason_code TEXT,
+    created_at REAL NOT NULL,
+    claimed_at REAL,
+    completed_at REAL,
+    aborted_at REAL
 );
 
 CREATE TABLE IF NOT EXISTS async_delegations (
@@ -524,6 +844,10 @@ CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usag
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
 CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
     ON async_delegations(delivery_state, completed_at);
+CREATE INDEX IF NOT EXISTS idx_session_process_authorities_current
+    ON session_process_authorities(session_id, session_generation DESC);
+CREATE INDEX IF NOT EXISTS idx_session_process_reservations_current
+    ON session_process_reservations(session_id, session_generation, status, expires_at);
 """
 
 
@@ -544,6 +868,10 @@ CREATE INDEX IF NOT EXISTS idx_sessions_handoff_state
     ON sessions(handoff_state, started_at);
 CREATE INDEX IF NOT EXISTS idx_sessions_system_prompt_hash
     ON sessions(system_prompt_hash);
+CREATE INDEX IF NOT EXISTS idx_turn_receipts_session_status
+    ON turn_receipts(session_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_turn_receipts_completed_prune
+    ON turn_receipts(status, completed_at);
 """
 
 

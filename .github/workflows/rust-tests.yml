@@ -29,11 +29,12 @@ jobs:
     name: cargo test (bootstrap installer)
     # cargo builds codegen units and test binaries in parallel across the
     # cores. This lane also builds the crate from the start when Cargo.toml
-    # changes.
-    runs-on: ubuntu-latest
+    # changes. Forks use the standard GitHub-hosted runner so this reusable
+    # job remains schedulable.
+    runs-on: ${{ github.repository_owner == 'NousResearch' && 'ubuntu-latest-32-core' || 'ubuntu-latest' }}
     timeout-minutes: 30
     env:
-      CARGO_BUILD_JOBS: 4
+      CARGO_BUILD_JOBS: ${{ github.repository_owner == 'NousResearch' && 32 || 4 }}
     defaults:
       run:
         working-directory: apps/bootstrap-installer/src-tauri

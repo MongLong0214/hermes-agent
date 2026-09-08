@@ -7,6 +7,7 @@ errors even though the key is configured. Same class of bug as #15914 (auth)
 already addressed for ``agent/credential_pool`` and ``hermes_cli/auth``.
 """
 
+import builtins
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -81,51 +82,40 @@ class TestDotenvFallbackPerProvider:
         assert captured["headers"]["Authorization"] == "Bearer xai-dotenv-key"
 
 
-    def test_gemini_reads_dotenv_key(self, tmp_path):
+    def test_gemini_denies_before_dotenv_key_or_side_effects(self, tmp_path):
+        from agent.gemini_outbound_policy import GeminiOutboundDenied
         from tools import tts_tool
 
-        captured: dict = {}
+        def _explode(*_args, **_kwargs):
+            raise AssertionError("Gemini/Google key or environment lookup reached")
 
-        def fake_post(url, **kwargs):
-            captured["params"] = kwargs.get("params", {})
-            response = MagicMock()
-            response.status_code = 200
-            response.json.return_value = {
-                "candidates": [
-                    {
-                        "content": {
-                            "parts": [
-                                {
-                                    "inlineData": {
-                                        "data": "AAAA",
-                                        "mimeType": "audio/L16;codec=pcm;rate=24000",
-                                    }
-                                }
-                            ]
-                        }
-                    }
-                ]
-            }
-            response.raise_for_status = MagicMock()
-            return response
+        real_import = builtins.__import__
 
-        # GEMINI_API_KEY hits the first branch; GOOGLE_API_KEY would only be
-        # consulted if the first returned None. Use a side-effect-style mock
-        # to verify the lookup order matches the production code.
-        seen_lookups: list = []
+        def _guard_import(name, *args, **kwargs):
+            if name == "requests":
+                raise AssertionError("HTTP client import reached")
+            return real_import(name, *args, **kwargs)
 
-        def fake_get_env_value(key):
-            seen_lookups.append(key)
-            if key == "GEMINI_API_KEY":
-                return "gemini-dotenv-key"
-            return None
+        output_path = tmp_path / "out.wav"
+        with patch.object(
+            tts_tool, "_resolve_provider_key", side_effect=_explode
+        ) as resolve_key, patch.object(
+            tts_tool, "get_env_value", side_effect=_explode
+        ) as env_lookup, patch.object(
+            builtins, "__import__", side_effect=_guard_import
+        ) as import_module:
+            with pytest.raises(GeminiOutboundDenied) as exc_info:
+                tts_tool._generate_gemini_tts("hi", str(output_path), {})
 
-        with patch.object(tts_tool, "get_env_value", side_effect=fake_get_env_value), \
-             patch("requests.post", side_effect=fake_post):
-            tts_tool._generate_gemini_tts("hi", str(tmp_path / "out.wav"), {})
-
-        assert "GEMINI_API_KEY" in seen_lookups
-        assert captured["params"]["key"] == "gemini-dotenv-key"
+        assert exc_info.type is GeminiOutboundDenied
+        assert type(exc_info.value) is GeminiOutboundDenied
+        assert exc_info.value.code == "gemini_outbound_denied"
+        assert str(exc_info.value) == "Gemini outbound requests are disabled."
+        assert vars(exc_info.value) == {}
+        resolve_key.assert_not_called()
+        env_lookup.assert_not_called()
+        assert all(call.args[0] != "requests" for call in import_module.call_args_list)
+        assert not output_path.exists()
 
 
 class TestRegressionGuard:

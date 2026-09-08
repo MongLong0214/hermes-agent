@@ -17,6 +17,8 @@ These tests drive the real ``compress_context`` path against a real SessionDB.
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 import time
 from pathlib import Path
@@ -827,3 +829,331 @@ class TestAbortedRotationDoesNotGrowParent:
 
         assert calls["n"] == 1, "the pre-flush guard never read the parent row"
         assert agent.session_id != parent  # rotation still happened
+
+
+class TestCompressionTitlePublicationTransaction:
+    """Titles and provenance move with the durable compression child."""
+
+    @staticmethod
+    def _telemetry(caplog):
+        line = next(
+            record.getMessage()
+            for record in reversed(caplog.records)
+            if "compression attempt telemetry" in record.getMessage()
+        )
+        return json.loads(line.split(": ", 1)[1])
+
+    @staticmethod
+    def _child_ids(db: SessionDB, parent_session_id: str):
+        with db._lock:
+            rows = db._conn.execute(
+                "SELECT id FROM sessions WHERE parent_session_id = ? ORDER BY id",
+                (parent_session_id,),
+            ).fetchall()
+        return [row["id"] for row in rows]
+
+    def test_aborted_title_publication_restores_count_without_success_event(
+        self, tmp_path: Path
+    ):
+        """A real caller rollback cannot advertise an uncommitted compression."""
+        db = SessionDB(db_path=tmp_path / "state.db")
+        parent = "PARENT_ABORTED_COUNT"
+        title = "Derived title with late publication failure"
+        db.create_session(parent, source="cli")
+        db.set_auto_title(parent, title, source=SessionDB.TITLE_SOURCE_DERIVED)
+        agent = _build_agent_with_db(db, parent, platform="cli")
+        compressor = _bound_context_compressor(db, parent)
+        compressor.compression_count = 3
+
+        def _successful_compress(*_args, **_kwargs):
+            compressor.compression_count += 1
+            compressor._last_compression_made_progress = True
+            return [
+                {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
+                {"role": "user", "content": "tail"},
+            ]
+
+        compressor.compress = _successful_compress
+        agent.context_compressor = compressor
+        success_events = []
+        agent.event_callback = lambda name, payload: success_events.append((name, payload))
+        db._execute_write(
+            lambda conn: conn.execute(
+                """
+                CREATE TEMP TRIGGER c5_s6_aborted_count_title_transfer
+                BEFORE UPDATE OF title ON sessions
+                WHEN OLD.id = 'PARENT_ABORTED_COUNT'
+                  AND OLD.title IS 'Derived title with late publication failure'
+                  AND EXISTS (
+                      SELECT 1 FROM sessions AS child
+                      WHERE child.parent_session_id = OLD.id
+                  )
+                BEGIN
+                    SELECT RAISE(ABORT, 'c5_s6_aborted_count_title_transfer');
+                END
+                """
+            )
+        )
+
+        original = _msgs()
+        returned, _ = agent._compress_context(original, "sys", approx_tokens=120_000)
+
+        parent_row = db.get_session(parent)
+        assert returned is original
+        assert agent.session_id == parent
+        assert db.find_live_compression_child(parent) is None
+        assert parent_row["ended_at"] is None
+        assert parent_row["title"] == title
+        assert compressor.compression_count == 3
+        assert compressor.awaiting_real_usage_after_compression is False
+        assert success_events == []
+
+    def test_title_transfer_failure_after_child_publish_aborts_atomically(
+        self, tmp_path: Path, caplog
+    ):
+        """A late title failure cannot leave a published-but-untitled child."""
+        db = SessionDB(db_path=tmp_path / "state.db")
+        parent = "PARENT_TITLE_TX"
+        title = "Derived title must move atomically"
+        sentinel = "SENTINEL_TITLE_TX"
+        db.create_session(parent, source="cli")
+        db.set_auto_title(parent, title, source=SessionDB.TITLE_SOURCE_DERIVED)
+        db.create_session(sentinel, source="cli")
+        db.set_session_title(sentinel, "Unrelated sentinel title")
+        agent = _build_agent_with_db(db, parent, platform="cli")
+
+        # The historical post-publication transfer clears the hidden parent to
+        # satisfy title uniqueness. Fail exactly there, after a child exists.
+        db._execute_write(
+            lambda conn: conn.execute(
+                """
+                CREATE TEMP TRIGGER c5_s6_title_transfer_after_child
+                BEFORE UPDATE OF title ON sessions
+                WHEN OLD.id = 'PARENT_TITLE_TX'
+                  AND OLD.title IS 'Derived title must move atomically'
+                  AND EXISTS (
+                      SELECT 1 FROM sessions AS child
+                      WHERE child.parent_session_id = OLD.id
+                  )
+                BEGIN
+                    SELECT RAISE(ABORT, 'c5_s6_title_transfer_after_child');
+                END
+                """
+            )
+        )
+        real_publish = db.publish_compression_child
+        publish_returned = []
+
+        def _record_real_publish(*args, **kwargs):
+            result = real_publish(*args, **kwargs)
+            publish_returned.append(True)
+            return result
+
+        original = _msgs()
+        with patch.object(
+            db, "publish_compression_child", side_effect=_record_real_publish
+        ), caplog.at_level(logging.INFO, logger="agent.conversation_compression"):
+            returned, _ = agent._compress_context(
+                original, "sys", approx_tokens=120_000
+            )
+
+        child_ids = self._child_ids(db, parent)
+        child = db.get_session(child_ids[0]) if child_ids else None
+        parent_row = db.get_session(parent)
+        sentinel_row = db.get_session(sentinel)
+        observed = {
+            "publish_returned": publish_returned,
+            "returned_original": returned is original,
+            "agent_session_id": agent.session_id,
+            "child_ids": child_ids,
+            "child_title": child["title"] if child else None,
+            "child_source": child["title_source"] if child else None,
+            "parent_ended": parent_row["ended_at"] is not None,
+            "parent_title": parent_row["title"],
+            "parent_source": parent_row["title_source"],
+            "telemetry": self._telemetry(caplog),
+            "sentinel_title": sentinel_row["title"],
+            "sentinel_source": sentinel_row["title_source"],
+        }
+        assert observed == {
+            "publish_returned": [],
+            "returned_original": True,
+            "agent_session_id": parent,
+            "child_ids": [],
+            "child_title": None,
+            "child_source": None,
+            "parent_ended": False,
+            "parent_title": title,
+            "parent_source": SessionDB.TITLE_SOURCE_DERIVED,
+            "telemetry": {
+                **observed["telemetry"],
+                "commit_status": "aborted",
+                "split_status": "aborted",
+            },
+            "sentinel_title": "Unrelated sentinel title",
+            "sentinel_source": SessionDB.TITLE_SOURCE_USER,
+        }
+
+    def test_carried_derived_title_keeps_truthful_source_and_is_not_reautotitled(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """A carried derived title is not an opening-turn title attempt."""
+        import threading
+
+        from agent.title_generator import maybe_auto_title
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        parent = "PARENT_DERIVED_TITLE"
+        title = "Derived title from the original request"
+        db.create_session(parent, source="cli")
+        db.set_auto_title(parent, title, source=SessionDB.TITLE_SOURCE_DERIVED)
+        agent = _build_agent_with_db(db, parent, platform="cli")
+        agent.context_compressor.compress.return_value = [
+            {
+                "role": "user",
+                "content": "[CONTEXT COMPACTION — REFERENCE ONLY] summary",
+            }
+        ]
+        agent._compress_context(_msgs(), "sys", approx_tokens=120_000)
+        child = agent.session_id
+        assert db.get_session_title(child) == title
+        assert db.get_session_title_source(child) == SessionDB.TITLE_SOURCE_DERIVED
+
+        real_thread = threading.Thread
+        threads = []
+
+        def _capture_thread(*args, **kwargs):
+            thread = real_thread(*args, **kwargs)
+            threads.append(thread)
+            return thread
+
+        with patch(
+            "agent.title_generator.threading.Thread", side_effect=_capture_thread
+        ), patch(
+            "agent.title_generator.generate_title", return_value="Unrelated LLM title"
+        ) as generate_title, patch(
+            "agent.title_generator._auto_title_enabled", return_value=True
+        ):
+            try:
+                maybe_auto_title(
+                    db,
+                    child,
+                    "A completely unrelated new request",
+                    db.get_messages_as_conversation(child),
+                )
+            finally:
+                for thread in threads:
+                    thread.join(timeout=10)
+                    assert not thread.is_alive(), "captured title worker did not finish"
+
+        assert {
+            "title": db.get_session_title(child),
+            "source": db.get_session_title_source(child),
+            "threads_started": len(threads),
+            "model_calls": generate_title.call_count,
+        } == {
+            "title": title,
+            "source": SessionDB.TITLE_SOURCE_DERIVED,
+            "threads_started": 0,
+            "model_calls": 0,
+        }
+
+    @pytest.mark.parametrize(
+        ("title", "source"),
+        [
+            ("Derived source survives", SessionDB.TITLE_SOURCE_DERIVED),
+            ("LLM source survives", SessionDB.TITLE_SOURCE_LLM),
+            ("User source survives", SessionDB.TITLE_SOURCE_USER),
+            ("Legacy source is unknown", None),
+            (None, None),
+        ],
+    )
+    def test_title_transfer_source_controls(
+        self, tmp_path: Path, title: str | None, source: str | None
+    ):
+        """Publication moves title/source exactly and never touches a bystander."""
+        db = SessionDB(db_path=tmp_path / "state.db")
+        parent = "PARENT_TITLE_SOURCE_CONTROL"
+        sentinel = "SENTINEL_TITLE_SOURCE_CONTROL"
+        db.create_session(parent, source="cli")
+        db.create_session(sentinel, source="cli")
+        db.set_session_title(sentinel, "Unrelated sentinel title")
+        if source == SessionDB.TITLE_SOURCE_DERIVED:
+            db.set_auto_title(parent, title, source=source)
+        elif source == SessionDB.TITLE_SOURCE_LLM:
+            db.set_auto_title(parent, title, source=source)
+        elif source == SessionDB.TITLE_SOURCE_USER:
+            db.set_session_title(parent, title)
+        elif title is not None:
+            db._execute_write(
+                lambda conn: conn.execute(
+                    "UPDATE sessions SET title = ?, title_source = NULL WHERE id = ?",
+                    (title, parent),
+                )
+            )
+
+        agent = _build_agent_with_db(db, parent, platform="cli")
+        agent._compress_context(_msgs(), "sys", approx_tokens=120_000)
+        child = db.get_session(agent.session_id)
+        parent_row = db.get_session(parent)
+        sentinel_row = db.get_session(sentinel)
+
+        assert child["title"] == title
+        assert child["title_source"] == source
+        assert parent_row["title"] is None
+        assert parent_row["title_source"] is None
+        assert sentinel_row["title"] == "Unrelated sentinel title"
+        assert sentinel_row["title_source"] == SessionDB.TITLE_SOURCE_USER
+
+
+class TestInPlaceCompactionDurableBoundary:
+    def test_prompt_failure_after_in_place_commit_resets_file_read_dedup(
+        self, tmp_path: Path
+    ):
+        """A durable compacted transcript cannot retain an obsolete read stub."""
+        from tools.file_tools import read_file_tool, reset_file_dedup
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        session_id = "IN_PLACE_DEDUP_BOUNDARY"
+        db.create_session(session_id, source="cli")
+        agent = _build_agent_with_db(db, session_id, platform="cli")
+        agent.compression_in_place = True
+        events = []
+        agent.event_callback = lambda name, payload: events.append((name, payload))
+
+        task_id = "in-place-dedup-boundary"
+        read_path = tmp_path / "context.txt"
+        read_path.write_text("the durable file content\n", encoding="utf-8")
+        reset_file_dedup(task_id)
+        first_read = json.loads(read_file_tool(str(read_path), task_id=task_id))
+        stale_read = json.loads(read_file_tool(str(read_path), task_id=task_id))
+        assert "the durable file content" in first_read["content"]
+        assert stale_read["status"] == "unchanged"
+
+        with patch.object(
+            db,
+            "update_system_prompt",
+            side_effect=RuntimeError("simulated prompt publication failure"),
+        ):
+            returned, _ = agent._compress_context(
+                _msgs(),
+                "sys",
+                approx_tokens=120_000,
+                task_id=task_id,
+            )
+
+        reread_after_compaction = json.loads(
+            read_file_tool(str(read_path), task_id=task_id)
+        )
+        persisted = db.get_messages_as_conversation(session_id)
+        assert "the durable file content" in reread_after_compaction["content"]
+        assert [message["content"] for message in persisted] == [
+            "[CONTEXT COMPACTION] summary",
+            "tail",
+        ]
+        assert [message["content"] for message in returned] == [
+            "[CONTEXT COMPACTION] summary",
+            "tail",
+        ]
+        assert agent._last_compaction_in_place is True
+        assert not any(name == "session:compress" for name, _payload in events)
