@@ -63,7 +63,7 @@ jobs:
         with:
           command: npm ci
 
-      # Every check runs at the same time. The step fails only after all of
+      # Every check runs with bounded concurrency. The step fails only after all of
       # them finish. There are two reasons this is not ``npm run --ws check``.
       #
       #   * ``--ws`` is serial and stops at the first workspace that fails. A
@@ -73,7 +73,7 @@ jobs:
       #     most of the payload, and its own ``check`` is a serial && chain.
       #     A spread across workspaces alone leaves that chain as the long
       #     pole. This expands the ``check:*`` sub-scripts of a package, so
-      #     its lint, ui, electron and plugin suites all run together. That
+      #     its lint, ui, electron and plugin suites all remain selected. That
       #     is the same selection rule the old matrix job used.
       #
       # Discovery is ``npm query .workspace``. A new package or a new
@@ -81,4 +81,5 @@ jobs:
       # not an empty run, because an empty run reports green after it checks
       # nothing.
       - name: Run all workspace checks
-        run: node .github/scripts/run-workspace-checks.mjs
+        # Keep the larger runner's parallelism; forks schedule one check at a time.
+        run: node .github/scripts/run-workspace-checks.mjs --concurrency ${{ github.repository_owner == 'NousResearch' && 32 || 1 }}

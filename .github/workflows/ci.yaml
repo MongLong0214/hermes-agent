@@ -147,6 +147,16 @@ jobs:
     if: needs.detect.outputs.event_name == 'pull_request'
     uses: ./.github/workflows/history-check.yml
 
+  # Deliberately not gated on a detect lane. Whitespace can be added to any file
+  # type, and the check is range-scoped: it stays silent unless this PR's own
+  # added lines carry the defect, so running it on every PR costs one cheap job
+  # and never reports on dirt the PR did not create.
+  whitespace-check:
+    name: Whitespace check
+    needs: detect
+    if: needs.detect.outputs.event_name == 'pull_request'
+    uses: ./.github/workflows/whitespace-check.yml
+
   contributor-check:
     name: Check contributors
     needs: detect
@@ -208,8 +218,8 @@ jobs:
 
   # ─────────────────────────────────────────────────────────────────────
   # Gate: runs after everything. ``if: always()`` ensures it reports a
-  # status even when some deps were skipped. Only actual ``failure``
-  # results cause it to fail; ``skipped`` is treated as success.
+  # status even when deps were skipped. Require success unless the current
+  # lane condition proves a skip legitimate; incomplete results fail closed.
   #
   # Branch protection should require ONLY this check.
   #
@@ -229,8 +239,10 @@ jobs:
       - e2e-desktop
       - docs-site
       - history-check
+      - whitespace-check
       - contributor-check
       - uv-lockfile
+      - infographic-check
       - lockfile-diff
       - docker-lint
       - supply-chain
@@ -254,20 +266,46 @@ jobs:
           echo "$NEEDS" | python3 -c "
           import json, sys
           needs = json.load(sys.stdin)
+          outputs = needs.get('detect', {}).get('outputs', {})
+          lanes = 'python frontend installer rust site uv_lock npm_lock docker_meta scan deps ci_review mcp_catalog'.split()
+          invalid = [key for key in lanes if outputs.get(key) not in ('true', 'false')]
+          event = outputs.get('event_name')
+          if event not in ('pull_request', 'push'):
+              invalid.append('event_name')
+          pr = event == 'pull_request'
+          enabled = lambda key: outputs.get(key) == 'true'
+          critical = needs.get('supply-chain', {}).get('outputs', {}).get('critical_findings') == 'true'
+          # Mirror the job conditions above, including the disabled Desktop lane.
+          required = {
+              'detect': True, 'infographic-check': True, 'osv-scanner': True,
+              'tests': enabled('python'), 'tests-os': enabled('python'),
+              'lint': enabled('python'), 'contributor-check': enabled('python'),
+              'js-tests': enabled('frontend'), 'installer-tests': enabled('installer'),
+              'rust-tests': enabled('rust'), 'docs-site': enabled('site'),
+              'uv-lockfile': enabled('uv_lock'), 'docker-lint': enabled('docker_meta'),
+              'history-check': pr, 'whitespace-check': pr, 'e2e-desktop': False,
+              'lockfile-diff': pr and enabled('npm_lock'),
+              'supply-chain': pr and (enabled('scan') or enabled('deps')),
+              'review-labels': pr and (enabled('ci_review') or enabled('mcp_catalog') or critical),
+          }
           # Emit compact {job_name: result} for the comment assembler.
-          compact = {name: info['result'] for name, info in needs.items()}
+          compact = {name: needs.get(name, {}).get('result', 'missing') for name in required.keys() | needs.keys()}
           print(f'needs-json={json.dumps(compact)}')
           with open('$GITHUB_OUTPUT', 'a') as f:
               f.write(f'needs-json={json.dumps(compact)}\n')
-          failed = [name for name, info in needs.items() if info['result'] == 'failure']
-          for name, info in sorted(needs.items()):
-              result = info['result']
-              icon = '✅' if result in ('success', 'skipped') else '❌'
+          failed = []
+          for name, result in sorted(compact.items()):
+              accepted = result == 'success' or (result == 'skipped' and not required.get(name, True))
+              if not accepted:
+                  failed.append(name)
+              icon = '✅' if accepted else '❌'
               print(f'{icon} {name}: {result}')
-          if failed:
-              print(f'::error::{len(failed)} job(s) failed: {\", \".join(failed)}')
+          if invalid:
+              print(f'::error::Invalid detect outputs: {invalid}')
+          if failed or invalid:
+              print(f'::error::{len(failed)} job(s) did not pass: {\", \".join(failed)}')
               sys.exit(1)
-          print('All checks passed (or were skipped)')
+          print('All required checks passed (inactive lanes may be skipped)')
           "
 
   # ─────────────────────────────────────────────────────────────────────
