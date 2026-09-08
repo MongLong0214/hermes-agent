@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping, Protocol
 
@@ -123,6 +125,75 @@ class CanonicalIngressEvent:
             channel_id=_required_text(payload["channel_id"], limit=_MAX_ID_CHARS),
             text=_required_text(payload["text"], limit=_MAX_TEXT_CHARS),
         )
+
+
+class CanonicalEventReceipt:
+    """Durable admission in the existing metadata store; never expire/reclaim.
+
+    Terminal text is independent of transcript retention. A crash between a
+    claim and its terminal commit leaves explicit uncertainty, not permission
+    to execute again. No transcript row or actor is created by this ledger.
+    """
+
+    def __init__(self, db: Any, binding: CanonicalSurfaceBinding, event: CanonicalIngressEvent):
+        self.db = db
+        self.binding = binding
+        identity = [
+            binding.name, binding.session_key, binding.session_id,
+            binding.telegram_chat_id, binding.telegram_chat_type,
+            binding.telegram_user_id, binding.telegram_thread_id, event.event_id,
+        ]
+        self.key = "canonical_event:v1:" + self._digest(identity)
+        self.digest = self._digest([event.author_id, event.channel_id, event.text])
+        self.owner = uuid.uuid4().hex
+        self.claimed = json.dumps({"digest": self.digest, "owner": self.owner})
+
+    @staticmethod
+    def _digest(value: Any) -> str:
+        return hashlib.sha256(json.dumps(value, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+    def claim(self) -> CanonicalTurnResult | None:
+        def write(conn):
+            changed = conn.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO NOTHING", (self.key, self.claimed),
+            ).rowcount
+            if changed == 1:
+                return None
+            row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (self.key,)).fetchone()
+            record = json.loads(row[0])
+            if record["digest"] != self.digest:
+                raise ValueError("canonical_event_conflict")
+            if "text" in record:
+                return CanonicalTurnResult(self.binding.name, record["text"])
+            if "error" in record:
+                raise ValueError(record["error"])
+            raise ValueError("canonical_event_uncertain")
+
+        return self.db._execute_write(write)
+
+    def complete(self, result: CanonicalTurnResult) -> None:
+        if not isinstance(result, CanonicalTurnResult) or result.binding_name != self.binding.name:
+            raise ValueError("canonical_turn_refused")
+        self._finish({"digest": self.digest, "text": result.terminal_text})
+
+    def reject(self, code: str) -> None:
+        if code not in {"canonical_agent_missing", "canonical_turn_busy", "canonical_binding_stale", "canonical_turn_refused"}:
+            raise ValueError("canonical_event_uncertain")
+        self._finish({"digest": self.digest, "error": code})
+
+    def _finish(self, record: dict[str, str]) -> None:
+        terminal = json.dumps(record)
+
+        def write(conn):
+            changed = conn.execute(
+                "UPDATE state_meta SET value = ? WHERE key = ? AND value = ?",
+                (terminal, self.key, self.claimed),
+            ).rowcount
+            if changed != 1:
+                raise ValueError("canonical_event_uncertain")
+
+        self.db._execute_write(write)
 
 
 class ExistingCanonicalBindingResolver:
