@@ -457,7 +457,7 @@ class TestCompress:
             {"role": "user" if i % 2 == 0 else "assistant", "content": f"m{i}", "_db_persisted": True}
             for i in range(10)
         ]
-        with patch("agent.context_compressor.call_llm", side_effect=RuntimeError("no provider")):
+        with patch("agent.context_compressor.call_llm", return_value=MagicMock(choices=[MagicMock(message=MagicMock(content="Completed work and preserved context."))])):
             result = compressor.compress(msgs)
         assert len(result) < len(msgs)
         assert all("_db_persisted" not in msg for msg in result)
@@ -476,7 +476,7 @@ class TestCompress:
         ]
         # Make the per-site helper leak the marker (dict.copy keeps it).
         with patch.object(_cc, "_fresh_compaction_message_copy", lambda m: m.copy()), \
-             patch("agent.context_compressor.call_llm", side_effect=RuntimeError("no provider")):
+             patch("agent.context_compressor.call_llm", return_value=MagicMock(choices=[MagicMock(message=MagicMock(content="Completed work and preserved context."))])):
             result = compressor.compress(msgs)
         assert len(result) < len(msgs)
         assert all("_db_persisted" not in msg for msg in result), (
@@ -652,7 +652,7 @@ class TestGenerateSummaryNoneContent:
             {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
             for i in range(10)
         ]
-        with patch("agent.context_compressor.call_llm", side_effect=RuntimeError("no provider")):
+        with patch("agent.context_compressor.call_llm", return_value=MagicMock(choices=[MagicMock(message=MagicMock(content="Completed work and preserved context."))])):
             result = c.compress(msgs)
         assert len(result) < len(msgs)
 
@@ -880,8 +880,8 @@ class TestAuthFailureAborts:
         assert c._last_summary_fallback_used is False
         assert c._last_summary_dropped_count == 0
 
-    def test_402_quota_with_retry_uses_existing_fallback(self):
-        """A reset-window quota remains transient instead of aborting compression."""
+    def test_402_quota_with_retry_preserves_history(self):
+        """Transient quota is not terminal auth failure, but cannot drop history."""
         err = StubProviderError(
             "quota exceeded, please retry after the window resets",
             status_code=402,
@@ -898,10 +898,12 @@ class TestAuthFailureAborts:
         with patch("agent.context_compressor.call_llm", side_effect=err):
             result = c.compress(msgs, current_tokens=999999, force=True)
 
-        assert result != msgs
+        assert result is msgs
         assert c._last_summary_auth_failure is False
-        assert c._last_compress_aborted is False
-        assert c._last_summary_fallback_used is True
+        assert c._last_compress_aborted is True
+        assert c._last_summary_fallback_used is False
+        assert c._last_summary_dropped_count == 0
+        assert c.compression_count == 0
 
 
     def test_403_also_flags_auth_failure(self):
@@ -1219,12 +1221,11 @@ class TestAuxModelFallbackSurfacedToCallers:
 
 
 class TestSummaryFailureTrackingForGatewayWarning:
-    """Default behavior (compression.abort_on_summary_failure=False):
-    summary-generation failure inserts a static fallback placeholder and
-    records dropped count + fallback flag so gateway hygiene & /compress
-    can surface a visible warning."""
+    """Summary failure preserves history even with the legacy abort flag off.
+    Gateway hygiene receives aborted/error state, never fabricated summary loss.
+    """
 
-    def test_compress_records_fallback_and_dropped_count_on_summary_failure(self):
+    def test_compress_records_abort_without_dropping_on_summary_failure(self):
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
 
@@ -1242,17 +1243,14 @@ class TestSummaryFailureTrackingForGatewayWarning:
         with patch("agent.context_compressor.call_llm", side_effect=Exception("404 model not found")):
             result = c.compress(msgs)
 
-        assert c._last_summary_fallback_used is True
-        assert c._last_summary_dropped_count > 0
+        assert result is msgs
+        assert c._last_summary_fallback_used is False
+        assert c._last_summary_dropped_count == 0
         assert c._last_summary_error is not None
-        # Default mode: abort flag must NOT fire.
-        assert c._last_compress_aborted is False
-        assert any(
-            isinstance(m.get("content"), str) and "Summary generation was unavailable" in m["content"]
-            for m in result
-        )
+        assert c._last_compress_aborted is True
+        assert c.compression_count == 0
 
-    def test_summary_failure_fallback_preserves_tool_paths_and_redacts_secret_context(self):
+    def test_summary_failure_preserves_original_tool_context_without_publishing_fallback(self):
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=1, protect_last_n=1)
 
@@ -1283,11 +1281,14 @@ class TestSummaryFailureTrackingForGatewayWarning:
         with patch("agent.context_compressor.call_llm", side_effect=Exception("timeout")):
             result = c.compress(msgs)
 
-        fallback = next(m["content"] for m in result if "Summary generation was unavailable" in m.get("content", ""))
-        assert "Called tool(s): read_file" in fallback
-        assert "/tmp/project/app.py" in fallback
-        assert secret not in fallback
-        assert "ghp_" not in fallback
+        # Preservation does not redact or rewrite the source transcript.
+        # No replacement summary is published on this failure path.
+        assert result is msgs
+        assert result[3]["content"] == f"read /tmp/project/app.py with token {secret}"
+        assert c._last_compress_aborted is True
+        assert c._last_summary_fallback_used is False
+        assert c._last_summary_dropped_count == 0
+        assert c.compression_count == 0
 
 
 
@@ -1718,7 +1719,7 @@ class TestSummaryTargetRatio:
             + [{"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
                for i in range(8)]
         )
-        with patch("agent.context_compressor.call_llm", side_effect=RuntimeError("no provider")):
+        with patch("agent.context_compressor.call_llm", return_value=MagicMock(choices=[MagicMock(message=MagicMock(content="Completed work and preserved context."))])):
             result = c.compress(msgs)
         # System prompt (msg[0]) survives as head
         assert result[0]["role"] == "system"
@@ -3336,19 +3337,136 @@ class TestPreLlmFeasibilityCheck:
 
         assert compressor._fallback_compression_streak == 1
 
-    def test_real_fallback_still_feeds_streak(self, compressor):
-        """Negative control: a genuine summary-failure fallback boundary
-        (no feasibility skip) must keep incrementing the streak breaker."""
+    def test_summary_failure_does_not_complete_or_feed_fallback_streak(self, compressor):
+        """An aborted summary is neither a feasibility skip nor a completed fallback."""
         compressor._ineffective_compression_count = 1
         msgs = self._make_messages(content="filler " * 3000)  # fat middle → no skip
 
         with patch.object(compressor, "_generate_summary", return_value=None):
-            compressor.compress(list(msgs), force=False)
+            result = compressor.compress(msgs, force=False)
 
+        assert result is msgs
         assert compressor._last_feasibility_skip is False
-        assert compressor._last_summary_fallback_used is True
-        compressor.record_completed_compaction(
-            used_fallback=compressor._last_summary_fallback_used,
-            feasibility_skip=compressor._last_feasibility_skip,
-        )
-        assert compressor._fallback_compression_streak == 1
+        assert compressor._last_compress_aborted is True
+        assert compressor._last_summary_fallback_used is False
+        assert compressor._last_summary_dropped_count == 0
+        assert compressor.compression_count == 0
+        assert compressor._fallback_compression_streak == 0
+
+
+import copy
+from unittest.mock import MagicMock
+
+import pytest
+
+from agent.context_compressor import ContextCompressor
+
+
+def _failure_compressor(monkeypatch):
+    monkeypatch.setattr('agent.context_compressor.get_model_context_length', lambda *a, **k: 100000)
+    return ContextCompressor(model='test', quiet_mode=True, protect_first_n=1,
+                             protect_last_n=1, abort_on_summary_failure=False)
+
+
+def _failure_messages():
+    return [{'role': 'system', 'content': 'system'}] + [
+        {'role': 'user' if i % 2 == 0 else 'assistant', 'content': f'fact {i}'}
+        for i in range(12)
+    ]
+
+
+@pytest.mark.parametrize('failure', [RuntimeError('provider rejected summary'),
+    TimeoutError('summary timed out'), ConnectionError('connection reset'),
+    RuntimeError('401 unauthorized'), None, '', '   '])
+def test_generic_summary_failure_preserves_transaction(monkeypatch, failure):
+    c = _failure_compressor(monkeypatch)
+    original = _failure_messages()
+    before = copy.deepcopy(original)
+    c._previous_summary = 'prior durable summary'
+    c._summary_has_user_turn = True
+    response = MagicMock()
+    response.choices[0].message.content = failure
+    llm = MagicMock(side_effect=failure) if isinstance(failure, Exception) else MagicMock(return_value=response)
+    monkeypatch.setattr('agent.context_compressor.call_llm', llm)
+
+    result = c.compress(original)
+
+    assert result is original
+    assert original == before
+    assert c._previous_summary == 'prior durable summary'
+    assert c._summary_has_user_turn is True
+    assert c.compression_count == 0
+    assert c._last_compress_aborted is True
+    assert c._last_summary_fallback_used is False
+    assert c._last_summary_dropped_count == 0
+    assert c._last_summary_error
+    assert llm.call_count == 1
+
+
+@pytest.mark.parametrize('failure', [RuntimeError('provider rejected summary'), TimeoutError('timed out')])
+def test_same_context_cooldown_never_reissues_summary(monkeypatch, failure):
+    import agent.context_compressor as module
+    clock = [1000.0]
+    monkeypatch.setattr(module.time, 'monotonic', lambda: clock[0])
+    c = _failure_compressor(monkeypatch)
+    original = _failure_messages()
+    llm = MagicMock(side_effect=failure)
+    monkeypatch.setattr(module, 'call_llm', llm)
+    assert c.compress(original) is original
+    cooldown = c.get_active_compression_failure_cooldown()
+    assert cooldown['remaining_seconds'] == 60
+    for _ in range(5):
+        assert c.compress(original) is original
+        assert c._last_compress_aborted
+    assert llm.call_count == 1
+    assert c.get_active_compression_failure_cooldown()['remaining_seconds'] == 60
+
+
+def test_success_is_a_real_compression_control(monkeypatch):
+    c = _failure_compressor(monkeypatch)
+    original = _failure_messages()
+    before = copy.deepcopy(original)
+    response = MagicMock()
+    response.choices[0].message.content = 'Completed work and current task.'
+    monkeypatch.setattr('agent.context_compressor.call_llm', MagicMock(return_value=response))
+    result = c.compress(original)
+    assert result is not original
+    assert len(result) < len(original)
+    assert original == before
+    assert not c._last_compress_aborted
+    assert c.compression_count == 1
+    assert c._previous_summary
+
+
+def test_failure_rolls_back_pruning_and_blank_echo_removal(monkeypatch):
+    c = _failure_compressor(monkeypatch)
+    original = _failure_messages()
+    original.insert(3, {'role': 'tool', 'tool_call_id': 'old-tool', 'content': 'large output ' * 1000})
+    original.append({'role': 'user', 'content': ' '})
+    before = copy.deepcopy(original)
+    c.tail_token_budget = 20
+    monkeypatch.setattr('agent.context_compressor.call_llm', MagicMock(side_effect=RuntimeError('failed')))
+    result = c.compress(original)
+    assert result is original
+    assert original == before
+
+
+@pytest.mark.parametrize('kind', ['explicit', 'async', 'keyboard', 'unexpected'])
+def test_explicit_cancellation_preserves_summary_and_input(monkeypatch, kind):
+    import asyncio
+    from agent.auxiliary_client import AuxiliaryExplicitCancellation
+    c = _failure_compressor(monkeypatch)
+    original = _failure_messages()
+    before = copy.deepcopy(original)
+    c._previous_summary = 'previous summary'
+    c._summary_has_user_turn = True
+    failure = {'explicit': AuxiliaryExplicitCancellation(), 'async': asyncio.CancelledError(),
+               'keyboard': KeyboardInterrupt(), 'unexpected': RuntimeError('summary hook failed')}[kind]
+    monkeypatch.setattr(c, '_generate_summary', MagicMock(side_effect=failure))
+    with pytest.raises(type(failure)):
+        c.compress(original)
+    assert original == before
+    assert c._previous_summary == 'previous summary'
+    assert c._summary_has_user_turn is True
+    assert c.compression_count == 0
+    assert c.get_active_compression_failure_cooldown() is None
