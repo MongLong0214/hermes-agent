@@ -16,6 +16,7 @@ import sqlite3
 from typing import Dict, Optional
 
 from hermes_constants import get_hermes_home
+from hermes_state_fence_classifier import owned_turn_fence_triggers
 from hermes_state_common import (
     DEFERRED_INDEX_SQL,
     FTS_CJK_STALE_KEY,
@@ -29,7 +30,6 @@ from hermes_state_common import (
     SCHEMA_VERSION,
     SESSION_PROCESS_AUTHORITY_STATE_DB_ID_BYTES,
     SESSION_PROCESS_AUTHORITY_STATE_FAMILY,
-    TURN_FENCE_GENERATION,
     TURN_FENCE_GOVERNED_TABLES,
     TURN_FENCE_OPERATIONS,
     _FTS_CJK_TRIGGERS,
@@ -196,6 +196,49 @@ class SessionSchemaMixin:
                            ELSE 'SESSION_CLOSED' END
                  )"""
         )
+
+    @staticmethod
+    def _validate_session_process_authority_state(cursor: sqlite3.Cursor) -> None:
+        """Prove own-epoch authority and lifecycle coverage without rewriting history."""
+        missing_authority = cursor.execute(
+            """SELECT 1 FROM sessions AS s
+               WHERE s.session_generation IS NULL OR s.session_generation < 1
+                  OR NOT EXISTS (
+                      SELECT 1 FROM session_process_authorities AS a
+                      WHERE a.session_id = s.id
+                        AND a.session_generation = s.session_generation
+                  ) LIMIT 1"""
+        ).fetchone()
+        missing_event = cursor.execute(
+            """SELECT 1 FROM session_process_authorities AS a
+               WHERE a.state_db_id IS NOT (
+                   SELECT value FROM state_meta WHERE key = 'session_process_state_db_id'
+               ) OR a.state_family IS NOT (
+                   SELECT value FROM state_meta WHERE key = 'session_process_state_family'
+               ) OR NOT EXISTS (
+                   SELECT 1 FROM session_process_authority_events AS e
+                   WHERE e.session_id = a.session_id
+                     AND e.session_generation = a.session_generation
+                     AND e.state_db_id = a.state_db_id
+                     AND e.state_family = a.state_family
+                     AND e.event_type = 'SESSION_ISSUED'
+               ) OR (a.status IN ('CLOSED', 'REVOKED') AND (
+                   a.terminal_at IS NULL OR NOT EXISTS (
+                       SELECT 1 FROM session_process_authority_events AS e
+                       WHERE e.session_id = a.session_id
+                         AND e.session_generation = a.session_generation
+                         AND e.state_db_id = a.state_db_id
+                         AND e.state_family = a.state_family
+                         AND e.event_type = CASE a.status
+                             WHEN 'REVOKED' THEN 'SESSION_REVOKED'
+                             ELSE 'SESSION_CLOSED' END
+                   )
+               )) LIMIT 1"""
+        ).fetchone()
+        if missing_authority or missing_event:
+            raise sqlite3.DatabaseError(
+                "AUTHORITY_MIGRATION_INCOMPLETE: missing own-epoch authority or lifecycle evidence"
+            )
 
     def _dedupe_legacy_system_prompts(self, cursor: sqlite3.Cursor) -> None:
         """Move inline prompt snapshots into the shared content-addressed table.
@@ -1317,24 +1360,15 @@ class SessionSchemaMixin:
         ):
             raise RuntimeError("turn-fence trigger declaration is incomplete")
         expected = dict(definitions)
-        with self.write_transaction():
-            for name, _sql in definitions:
-                cursor.execute(f"DROP TRIGGER IF EXISTS {name}")
-            for _name, sql in definitions:
-                cursor.execute(sql)
-            placeholders = ", ".join("?" for _name in expected)
-            rows = cursor.execute(
-                "SELECT name, sql FROM sqlite_master "
-                f"WHERE type = 'trigger' AND name IN ({placeholders})",
-                tuple(expected),
-            ).fetchall()
-            if {row[0]: row[1] for row in rows} != expected:
-                raise RuntimeError("turn-fence trigger verification failed")
-            cursor.execute("DELETE FROM schema_version")
-            cursor.execute(
-                "INSERT INTO schema_version (version) VALUES (?)",
-                (SCHEMA_VERSION,),
-            )
+        # _init_schema's outer write_transaction owns the entire migration.
+        owned = owned_turn_fence_triggers(cursor)
+        for name in owned:
+            quoted = name.replace('"', '""')
+            cursor.execute(f'DROP TRIGGER "{quoted}"')
+        for _name, sql in definitions:
+            cursor.execute(sql)
+        if owned_turn_fence_triggers(cursor) != expected:
+            raise RuntimeError("turn-fence trigger verification failed")
 
     def _init_schema(self):
         """Run writable startup schema work under guarded transactions."""
@@ -1426,10 +1460,8 @@ class SessionSchemaMixin:
         # column gets created here.
         self._reconcile_columns(cursor)
 
-        # The v28 trigger barrier must replace a retained older-generation
-        # barrier before any data migration or initialization writes a governed
-        # table.  Keep the entry version for the legacy data-migration gates
-        # below: _apply_turn_fence_generation_delta() publishes v28 eagerly.
+        # Install the current barrier before governed migration DML. Preserve
+        # the entry version for legacy gates; publish only after final checks.
         initial_version_row = cursor.execute(
             "SELECT version FROM schema_version LIMIT 1"
         ).fetchone()
@@ -1441,7 +1473,10 @@ class SessionSchemaMixin:
                 if isinstance(initial_version_row, sqlite3.Row)
                 else initial_version_row[0]
             )
-        if current_version < SCHEMA_VERSION:
+        if (
+            current_version < SCHEMA_VERSION
+            or owned_turn_fence_triggers(cursor) != dict(turn_fence_trigger_definitions())
+        ):
             self._apply_turn_fence_generation_delta(cursor)
 
         # The identity must exist before a raw SQL writer can insert a session
@@ -1500,7 +1535,6 @@ class SessionSchemaMixin:
             pass
 
         fts5_available = self._sqlite_supports_fts5(cursor)
-        fts_migrations_complete = True
         self._fts_stale = cursor.execute(
             "SELECT 1 FROM state_meta WHERE key = ? LIMIT 1",
             (FTS_STALE_KEY,),
@@ -1551,12 +1585,6 @@ class SessionSchemaMixin:
                                 "INSERT INTO messages_fts_trigram(rowid, content) "
                                 "SELECT id, content FROM messages WHERE content IS NOT NULL"
                             )
-                        else:
-                            fts_migrations_complete = False
-                    elif _fts_trigram_exists is None:
-                        fts_migrations_complete = False
-                else:
-                    fts_migrations_complete = False
             if current_version < 11 and SCHEMA_VERSION < 23:
                 # v11 (SUPERSEDED by v23): re-index FTS5 tables to cover
                 # tool_name + tool_calls in inline mode (#16751). v23 drops
@@ -1782,23 +1810,6 @@ class SessionSchemaMixin:
                     "fts_storage_version", str(FTS_STORAGE_VERSION), cursor=cursor
                 )
 
-            # Advance schema_version to current for ALL non-FTS-layout
-            # migrations. This is deliberately NOT gated on the FTS opt-in —
-            # holding the whole version back would block every future schema
-            # migration for a user who never optimizes. FTS5 being unavailable
-            # is the one case we skip (we can't have created the current FTS
-            # objects, so claiming the current schema would be a lie).
-            if (
-                current_version < TURN_FENCE_GENERATION - 1
-                and fts_migrations_complete
-                and fts5_available
-            ):
-                cursor.execute(
-                    "UPDATE schema_version SET version = "
-                    "CASE WHEN version < ? THEN ? ELSE version END",
-                    (TURN_FENCE_GENERATION - 1, TURN_FENCE_GENERATION - 1),
-                )
-
         # Unique title index — always ensure it exists. Older databases may
         # contain duplicate aliases from before the constraint was enforced;
         # preserve every session while letting the newest one retain the alias.
@@ -1834,6 +1845,14 @@ class SessionSchemaMixin:
                 )
         except sqlite3.OperationalError:
             pass  # Index already exists
+
+        # Legacy table rebuilds drop their attached triggers. Restore only
+        # missing declarations after those migrations; never discard an extra
+        # or unknown trigger to make the final exact barrier check pass.
+        owned = owned_turn_fence_triggers(cursor)
+        for name, sql in turn_fence_trigger_definitions():
+            if name not in owned:
+                cursor.execute(sql)
 
         if fts5_available:
             # Keep one durable owner across setup and any later raw repair.
@@ -1912,6 +1931,16 @@ class SessionSchemaMixin:
                 # AFTER UPDATE OF variants. IF NOT EXISTS cannot rewrite them.
                 if getattr(self, "_fts_enabled", False):
                     self._migrate_broad_fts_update_triggers(cursor)
+
+        self._validate_session_process_authority_state(cursor)
+        if owned_turn_fence_triggers(cursor) != dict(turn_fence_trigger_definitions()):
+            raise RuntimeError("turn-fence trigger verification failed")
+        if current_version < SCHEMA_VERSION:
+            # The version is the last migration write, not an installation receipt.
+            cursor.execute("DELETE FROM schema_version")
+            cursor.execute(
+                "INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,)
+            )
 
     def _backfill_gateway_metadata_from_sessions_json(
         self, cursor: sqlite3.Cursor

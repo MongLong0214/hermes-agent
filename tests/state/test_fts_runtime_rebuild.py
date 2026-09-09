@@ -778,6 +778,107 @@ class TestRuntimeFtsRebuild:
         finally:
             db.close()
 
+    def test_committed_legacy_inline_fts_corruption_fails_open_and_recovers(
+        self, tmp_path, monkeypatch
+    ):
+        """Precommitted index damage cannot disappear with canonical rollback."""
+        db_path = tmp_path / "legacy-durable-state.db"
+        raw = sqlite3.connect(str(db_path))
+        try:
+            raw.executescript(SCHEMA_SQL)
+            raw.execute(
+                "INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,)
+            )
+            try:
+                raw.executescript(LEGACY_FTS_SQL + LEGACY_FTS_TRIGRAM_SQL)
+            except sqlite3.OperationalError as exc:
+                pytest.skip(f"required FTS tokenizer unavailable: {exc}")
+            raw.commit()
+        finally:
+            raw.close()
+
+        legacy = SessionDB(db_path=db_path)
+        try:
+            assert legacy._db_has_legacy_inline_fts(legacy._conn.cursor())
+            legacy.create_session("s1", source="test")
+            seed_id = legacy.append_message("s1", "user", "legacy seed")
+            assert legacy._conn.in_transaction is False
+            assert _base_fts_triggers(db_path) == set(_FTS_TRIGGERS)
+
+            # Reuse the boundary probe's independently committed damage, not
+            # the canonical commit-fault seam in the separate test below.
+            _corrupt_fts(db_path)
+            observer = sqlite3.connect(str(db_path))
+            try:
+                seed_rows = observer.execute(
+                    "SELECT * FROM messages ORDER BY id"
+                ).fetchall()
+                assert len(seed_rows) == 1
+                with pytest.raises(sqlite3.DatabaseError) as corrupted:
+                    observer.execute(
+                        "SELECT rowid FROM messages_fts "
+                        "WHERE messages_fts MATCH 'legacy'"
+                    ).fetchall()
+                assert SessionDB._is_fts_write_corruption_error(corrupted.value)
+            finally:
+                observer.close()
+
+            rebuild_calls = []
+
+            def failed_rebuild():
+                rebuild_calls.append(True)
+                raise sqlite3.DatabaseError("legacy rebuild failed")
+
+            monkeypatch.setattr(legacy, "rebuild_fts", failed_rebuild)
+            message_id = legacy.append_message(
+                "s1", "user", "legacy canonical survives"
+            )
+            assert rebuild_calls == [True]
+            assert message_id is not None and message_id != seed_id
+            assert legacy._fts_stale is True
+            assert _meta_value(db_path, FTS_STALE_KEY) == "1"
+            assert _base_fts_triggers(db_path) == set()
+            assert _message_contents(db_path) == [
+                "legacy seed", "legacy canonical survives"
+            ]
+            observer = sqlite3.connect(str(db_path))
+            try:
+                canonical_rows = observer.execute(
+                    "SELECT * FROM messages ORDER BY id"
+                ).fetchall()
+                assert canonical_rows[:1] == seed_rows
+                assert observer.execute(
+                    "SELECT id, session_id, role, content FROM messages ORDER BY id"
+                ).fetchall() == [
+                    (seed_id, "s1", "user", "legacy seed"),
+                    (message_id, "s1", "user", "legacy canonical survives"),
+                ]
+            finally:
+                observer.close()
+            assert legacy.search_messages("canonical survives")
+        finally:
+            legacy.close()
+
+        recovered = SessionDB(db_path=db_path)
+        try:
+            assert recovered._fts_stale is False
+            assert _meta_value(db_path, FTS_STALE_KEY) is None
+            assert _base_fts_triggers(db_path) == set(_FTS_TRIGGERS)
+            assert recovered.search_messages("canonical survives")
+            observer = sqlite3.connect(str(db_path))
+            try:
+                assert observer.execute(
+                    "SELECT * FROM messages ORDER BY id"
+                ).fetchall() == canonical_rows
+                assert observer.execute(
+                    "SELECT rowid FROM messages_fts "
+                    "WHERE messages_fts MATCH 'survives'"
+                ).fetchall() == [(message_id,)]
+            finally:
+                observer.close()
+        finally:
+            recovered.close()
+
     def test_legacy_inline_fts_fails_open_and_recovers(self, tmp_path, monkeypatch):
         db_path = tmp_path / "legacy-state.db"
         raw = sqlite3.connect(str(db_path))
@@ -804,9 +905,38 @@ class TestRuntimeFtsRebuild:
             assert isinstance(legacy._conn, _FtsCommitErrorConnection)
             legacy.create_session("s1", source="test")
             legacy.append_message("s1", "user", "legacy seed")
-            _corrupt_fts(db_path)
-            legacy._conn.fts_commit_transaction_states = []
-            legacy._conn.fail_next_fts_commit = "before_real_commit"
+            conn = legacy._conn
+            conn.fts_commit_transaction_states = []
+            commit = _FtsCommitErrorConnection.commit
+            corrupt_commit_states = []
+
+            def corrupt_canonical_commit(connection):
+                if connection is conn and not corrupt_commit_states:
+                    # The original seam failed the canonical append commit,
+                    # not the later atomic stale-marker/detach commit. Fence
+                    # triggers can flush FTS earlier during the counter UPDATE;
+                    # introduce the damage only once that DML has completed.
+                    assert connection.in_transaction
+                    assert connection.execute(
+                        "SELECT content FROM messages ORDER BY id DESC LIMIT 1"
+                    ).fetchone()[0] == "legacy canonical survives"
+                    connection.execute(
+                        "UPDATE messages_fts_data SET block = "
+                        "X'DEADBEEFDEADBEEFDEADBEEFDEADBEEF'"
+                    )
+                    with pytest.raises(sqlite3.DatabaseError) as corrupted:
+                        connection.execute(
+                            "SELECT rowid FROM messages_fts "
+                            "WHERE messages_fts MATCH 'legacy'"
+                        ).fetchall()
+                    assert SessionDB._is_fts_write_corruption_error(corrupted.value)
+                    corrupt_commit_states.append(connection.in_transaction)
+                    connection.fail_next_fts_commit = "before_real_commit"
+                return commit(connection)
+
+            monkeypatch.setattr(
+                _FtsCommitErrorConnection, "commit", corrupt_canonical_commit
+            )
             monkeypatch.setattr(
                 legacy,
                 "rebuild_fts",
@@ -815,7 +945,12 @@ class TestRuntimeFtsRebuild:
                 ),
             )
             legacy.append_message("s1", "user", "legacy canonical survives")
+            assert corrupt_commit_states == [True]
+            assert conn.fail_next_fts_commit is None
             assert legacy._conn.fts_commit_transaction_states == [True]
+            assert _message_contents(db_path) == [
+                "legacy seed", "legacy canonical survives"
+            ]
             assert _message_contents(db_path)[-1] == "legacy canonical survives"
             assert _meta_value(db_path, FTS_STALE_KEY) == "1"
         finally:
