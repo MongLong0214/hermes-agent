@@ -6,7 +6,7 @@ import pytest
 
 import hermes_state
 from hermes_state import SCHEMA_SQL, SessionDB
-from hermes_state_common import TURN_FENCE_GENERATION, TURN_FENCE_GOVERNED_TABLES
+from hermes_state_common import SCHEMA_VERSION, TURN_FENCE_GENERATION, TURN_FENCE_GOVERNED_TABLES
 
 
 class _FailAfterOneTurnFenceTriggerCursor(sqlite3.Cursor):
@@ -321,7 +321,7 @@ def test_v28_migrates_empty_and_populated_v27_databases_before_authority_backfil
         assert [
             tuple(row)
             for row in db._conn.execute("SELECT version FROM schema_version")
-        ] == [(28,)]
+        ] == [(SCHEMA_VERSION,)]
         expected_sessions = [(session_id, 1) for session_id in session_ids]
         assert [
             tuple(row)

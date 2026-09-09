@@ -302,8 +302,8 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
     )
 
 
-SCHEMA_VERSION = 28
-TURN_FENCE_GENERATION = 28
+SCHEMA_VERSION = 29
+TURN_FENCE_GENERATION = 29
 
 # Session/process authority records are bound to one durable SessionDB family
 # and one database instance.  The database id is generated once in state_meta;
