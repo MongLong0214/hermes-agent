@@ -1441,28 +1441,29 @@ def test_recover_into_destination_without_fence_triggers_still_works(
     """The fix must not depend on the destination having fence triggers.
 
     Simulates an older-shaped destination schema (canonical tables present,
-    turn-fence trigger barrier never installed) by disabling the delta that
-    installs it while ``recover_session_database`` builds the destination.
+    turn-fence trigger barrier absent) by removing it after real schema
+    initialization while ``recover_session_database`` builds the destination.
     ``register_turn_fence_generation`` is harmless either way — it only
     registers a scalar function, and nothing in the destination references
     it when there are no triggers to call it — so recovery must still
     succeed.
     """
-    def _stamp_schema_version_without_triggers(self, cursor) -> None:
-        # Stamp schema_version as the real delta does, but skip installing
-        # the turn-fence triggers themselves — reproducing the shape of an
-        # older store that is otherwise fully migrated.
-        cursor.execute("DELETE FROM schema_version")
-        cursor.execute(
-            "INSERT INTO schema_version (version) VALUES (?)",
-            (hermes_state.SCHEMA_VERSION,),
-        )
-        self._conn.commit()
+    from hermes_state_common import turn_fence_trigger_definitions
+
+    initialize = hermes_state.SessionDB._init_schema
+
+    def _initialize_without_retained_triggers(self) -> None:
+        # Keep migration validation and version-last publication real. The
+        # recovery copy itself must also tolerate a triggerless destination.
+        initialize(self)
+        with self.write_transaction() as conn:
+            for name, _sql in turn_fence_trigger_definitions():
+                conn.execute(f'DROP TRIGGER "{name}"')
 
     monkeypatch.setattr(
         hermes_state.SessionDB,
-        "_apply_turn_fence_generation_delta",
-        _stamp_schema_version_without_triggers,
+        "_init_schema",
+        _initialize_without_retained_triggers,
     )
 
     source = tmp_path / "healthy-source-notriggers.db"

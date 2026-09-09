@@ -804,9 +804,38 @@ class TestRuntimeFtsRebuild:
             assert isinstance(legacy._conn, _FtsCommitErrorConnection)
             legacy.create_session("s1", source="test")
             legacy.append_message("s1", "user", "legacy seed")
-            _corrupt_fts(db_path)
-            legacy._conn.fts_commit_transaction_states = []
-            legacy._conn.fail_next_fts_commit = "before_real_commit"
+            conn = legacy._conn
+            conn.fts_commit_transaction_states = []
+            commit = _FtsCommitErrorConnection.commit
+            corrupt_commit_states = []
+
+            def corrupt_canonical_commit(connection):
+                if connection is conn and not corrupt_commit_states:
+                    # The original seam failed the canonical append commit,
+                    # not the later atomic stale-marker/detach commit. Fence
+                    # triggers can flush FTS earlier during the counter UPDATE;
+                    # introduce the damage only once that DML has completed.
+                    assert connection.in_transaction
+                    assert connection.execute(
+                        "SELECT content FROM messages ORDER BY id DESC LIMIT 1"
+                    ).fetchone()[0] == "legacy canonical survives"
+                    connection.execute(
+                        "UPDATE messages_fts_data SET block = "
+                        "X'DEADBEEFDEADBEEFDEADBEEFDEADBEEF'"
+                    )
+                    with pytest.raises(sqlite3.DatabaseError) as corrupted:
+                        connection.execute(
+                            "SELECT rowid FROM messages_fts "
+                            "WHERE messages_fts MATCH 'legacy'"
+                        ).fetchall()
+                    assert SessionDB._is_fts_write_corruption_error(corrupted.value)
+                    corrupt_commit_states.append(connection.in_transaction)
+                    connection.fail_next_fts_commit = "before_real_commit"
+                return commit(connection)
+
+            monkeypatch.setattr(
+                _FtsCommitErrorConnection, "commit", corrupt_canonical_commit
+            )
             monkeypatch.setattr(
                 legacy,
                 "rebuild_fts",
@@ -815,7 +844,12 @@ class TestRuntimeFtsRebuild:
                 ),
             )
             legacy.append_message("s1", "user", "legacy canonical survives")
+            assert corrupt_commit_states == [True]
+            assert conn.fail_next_fts_commit is None
             assert legacy._conn.fts_commit_transaction_states == [True]
+            assert _message_contents(db_path) == [
+                "legacy seed", "legacy canonical survives"
+            ]
             assert _message_contents(db_path)[-1] == "legacy canonical survives"
             assert _meta_value(db_path, FTS_STALE_KEY) == "1"
         finally:

@@ -1473,7 +1473,10 @@ class SessionSchemaMixin:
                 if isinstance(initial_version_row, sqlite3.Row)
                 else initial_version_row[0]
             )
-        if current_version < SCHEMA_VERSION:
+        if (
+            current_version < SCHEMA_VERSION
+            or owned_turn_fence_triggers(cursor) != dict(turn_fence_trigger_definitions())
+        ):
             self._apply_turn_fence_generation_delta(cursor)
 
         # The identity must exist before a raw SQL writer can insert a session
@@ -1842,6 +1845,14 @@ class SessionSchemaMixin:
                 )
         except sqlite3.OperationalError:
             pass  # Index already exists
+
+        # Legacy table rebuilds drop their attached triggers. Restore only
+        # missing declarations after those migrations; never discard an extra
+        # or unknown trigger to make the final exact barrier check pass.
+        owned = owned_turn_fence_triggers(cursor)
+        for name, sql in turn_fence_trigger_definitions():
+            if name not in owned:
+                cursor.execute(sql)
 
         if fts5_available:
             # Keep one durable owner across setup and any later raw repair.
