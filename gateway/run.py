@@ -21540,6 +21540,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("Failed to persist inbound user message after agent exception", exc_info=True)
             # Log full details server-side only; never expose raw exception
             # types or messages to end users (info-leakage risk).
+            from hermes_state import IncompatibleSchemaError
+
+            if isinstance(e, IncompatibleSchemaError):
+                generations = ""
+                if (
+                    type(e.expected_generation) is int
+                    and type(e.actual_generation) is int
+                ):
+                    generations = (
+                        f" (expected generation {e.expected_generation}, "
+                        f"actual generation {e.actual_generation})"
+                    )
+                return (
+                    f"⚠️ Session state schema is incompatible with this Hermes build{generations}.\n"
+                    "Use a compatible Hermes build to open this session state."
+                )
             status_hint = ""
             status_code = getattr(e, "status_code", None)
             _hist_len = len(history) if 'history' in locals() else 0
