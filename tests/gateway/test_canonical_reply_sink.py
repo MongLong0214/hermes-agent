@@ -537,11 +537,14 @@ def test_c2_b1_rotation_refusal_and_internal_exception_are_safe(tmp_path, monkey
             failing_title = failing._on_session_title
             with runner._agent_cache_lock:
                 runner._agent_cache[entry.session_key] = (failing, "exact", 0, entry.session_id)
-            response = await client.post(_ROUTE, headers={"Authorization": f"Bearer {_KEY}"}, json=payload)
+            response = await client.post(
+                _ROUTE, headers={"Authorization": f"Bearer {_KEY}"},
+                json={**payload, "event_id": "safe-boundary-exception"},
+            )
             body = await response.text()
-            assert response.status == 500
+            assert response.status == 409
             assert response.headers["Content-Type"].startswith("application/json")
-            assert body == '{"error": {"code": "canonical_internal_error", "message": "Canonical request failed."}}'
+            assert body == '{"error": {"code": "canonical_event_uncertain", "message": "Canonical request rejected."}}'
             assert "private" not in body
             assert "request-body" not in body
             assert failing.calls == 1

@@ -2180,6 +2180,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_error:
             return auth_error
         from gateway.canonical_surface import (
+            CanonicalEventReceipt,
             CanonicalIngressEvent,
             CanonicalTurnResult,
             ExistingCanonicalBindingResolver,
@@ -2219,9 +2220,37 @@ class APIServerAdapter(BasePlatformAdapter):
                 binding,
                 event,
             )
-            result = await runner.run_bound_existing_turn(
-                binding, event, entry, reply_sink=reply_sink
-            )
+            receipt = CanonicalEventReceipt(runner.session_store._db, binding, event)
+            # Volatile state only refines the error: SQLite alone authorizes a
+            # turn. An absent local owner never permits reclaim after a crash.
+            active = getattr(self, "_canonical_active_events", None)
+            if active is None:
+                active = self._canonical_active_events = set()
+            try:
+                result = await asyncio.to_thread(receipt.claim)
+            except ValueError as exc:
+                if str(exc) == "canonical_event_uncertain" and receipt.key in active:
+                    raise ValueError("canonical_turn_busy") from None
+                raise
+            if result is None:
+                active.add(receipt.key)
+                try:
+                    try:
+                        result = await runner.run_bound_existing_turn(
+                            binding, event, entry, reply_sink=reply_sink
+                        )
+                    except ValueError as exc:
+                        await asyncio.to_thread(receipt.reject, str(exc))
+                        raise
+                    await asyncio.to_thread(receipt.complete, result)
+                except ValueError:
+                    raise
+                except Exception:
+                    # Execution or terminal durability cannot be proved. Keep
+                    # the admission claim permanently; never retry the turn.
+                    raise ValueError("canonical_event_uncertain") from None
+                finally:
+                    active.discard(receipt.key)
             await reply_sink.publish(result)
         except ValueError as exc:
             code = str(exc)
@@ -2230,6 +2259,8 @@ class APIServerAdapter(BasePlatformAdapter):
             else:
                 status = 409
                 if code not in {
+                    "canonical_event_conflict",
+                    "canonical_event_uncertain",
                     "canonical_binding_stale",
                     "canonical_agent_missing",
                     "canonical_turn_busy",

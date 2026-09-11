@@ -20879,12 +20879,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     agent_result.get("error", "processing incomplete"),
                 )
 
-            # When compression is exhausted, the session is permanently too
-            # large to process.  Auto-reset it so the next message starts
-            # fresh instead of replaying the same oversized context in an
-            # infinite fail loop.  (#9893)
+            # Compression exhaustion blocks the current request without
+            # resetting its actor, history, topic binding, or conversation scope.
             #
-            # A lock-contended defer is the OPPOSITE case: the session is
+            # A lock-contended defer is a soft result: the session is
             # temporarily uncompressible only because a concurrent path holds
             # the compression lock and is actively shrinking it. Never wipe
             # the session for that — retry-next-message semantics apply
@@ -20897,40 +20895,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_entry.session_id if session_entry else "?",
                 )
             elif agent_result.get("compression_exhausted") and session_entry and session_key:
-                logger.info(
-                    "Auto-resetting session %s after compression exhaustion.",
-                    session_entry.session_id,
-                )
-                new_entry = await self.async_session_store.reset_session(session_key)
-                self._evict_cached_agent(session_key)
-                # Conversation boundary: one funnel call clears every
-                # conversation-scoped per-session dict (#58403 and siblings).
-                # See _CONVERSATION_SCOPED_STATE.
-                self._clear_conversation_scope(
-                    session_key, reason="compression_exhausted_reset"
-                )
-                if new_entry is not None:
-                    # Drop the stale reference to the bloated compressed child and
-                    # re-point the Telegram topic binding at the fresh session.
-                    # Compression rotated session_entry.session_id to the oversized
-                    # compressed child earlier this turn (the agent-result sync
-                    # above), and that _sync also rewrote the (chat_id, thread_id)
-                    # -> bloated-child binding. reset_session swaps in a clean,
-                    # parentless session, but without re-syncing the binding the
-                    # next inbound message in this topic gets switch_session'd back
-                    # onto the bloated child by the binding-heal walk, reloads the
-                    # oversized transcript, and re-triggers compression exhaustion
-                    # forever (#35809 — regression of the #9893/#10063 auto-reset).
-                    # No-op on non-topic lanes.
-                    session_entry = new_entry
-                    await asyncio.to_thread(
-                        self._sync_telegram_topic_binding,
-                        source, session_entry, reason="compression-exhausted-reset",
-                    )
+                # Exhaustion blocks this request, not the actor's identity.
+                # Only an explicit session command may reset or rebind it.
+                logger.warning("Context request blocked after compression exhaustion; session retained")
                 response = (response or "") + (
-                    "\n\n🔄 Session auto-reset — the conversation exceeded the "
-                    "maximum context size and could not be compressed further. "
-                    "Your next message will start a fresh session."
+                    "\n\n⚠ Context request blocked: compression attempts were exhausted. "
+                    "History and routing remain in the same session; no automatic reset occurred. "
+                    "Automatic compression retries respect any active cooldown. "
+                    "Use /compress for an explicit retry after resolving the summary failure."
                 )
 
             ts = time.time()  # Unix epoch float — consistent with DB storage
