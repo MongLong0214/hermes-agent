@@ -1501,6 +1501,14 @@ def load_gateway_config() -> GatewayConfig:
             # write_sessions_json: top-level wins, nested gateway.* falls back.
             gateway_section = yaml_cfg.get("gateway")
 
+            if "canonical_surface_bindings" in yaml_cfg:
+                gw_data["canonical_surface_bindings"] = yaml_cfg["canonical_surface_bindings"]
+            elif (
+                isinstance(gateway_section, dict)
+                and "canonical_surface_bindings" in gateway_section
+            ):
+                gw_data["canonical_surface_bindings"] = gateway_section["canonical_surface_bindings"]
+
             # Map config.yaml keys → GatewayConfig.from_dict() schema.
             # Each key overwrites whatever gateway.json may have set.
             # Precedence contract: key-presence at the TOP LEVEL wins; the
