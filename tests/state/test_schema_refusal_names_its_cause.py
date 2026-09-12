@@ -12,6 +12,7 @@ the owner should run**, and a blind review caught the first version of this
 change getting that wrong in two places:
 
     STORE_DAMAGED              malformed schema text -> `hermes sessions repair`
+    STORE_CORRUPT              corrupt page image    -> `hermes sessions recover`
     SCHEMA_VERSION_UNREADABLE  the scalar is wrong   -> `hermes sessions recover`
     STORE_UNREADABLE           locked / transient    -> retry; assert nothing
 
@@ -20,13 +21,23 @@ sessions repair --check-only` on a store with two `schema_version` rows prints
 *"opens cleanly — no repair needed"* — `_db_opens_cleanly` never reads that
 table. And a sibling holding `BEGIN EXCLUSIVE` on a non-WAL store raised the
 same refusal as real corruption, so a healthy store was reported damaged.
+
+The second round then caught the mistake in the other direction, which is the
+one these cases exist to keep closed: narrowing to `is_malformed_schema_error`
+sent `database disk image is malformed` — SQLITE_CORRUPT, real page damage — to
+`STORE_UNREADABLE`, whose message says the failure is often temporary and to try
+again. That predicate gates *unattended automatic surgery*, deliberately narrow
+because a wrong automatic rewrite spreads damage; it is not a statement that the
+owner has nothing to do. Reading a narrow gate as a broad diagnosis is how one
+wrong remedy becomes the opposite wrong remedy.
 """
 
 import sqlite3
 
 import pytest
 
-from hermes_state import IncompatibleSchemaError, SessionDB, _db_opens_cleanly
+from hermes_state import IncompatibleSchemaError, SessionDB, _database_error_cause
+from hermes_state import _db_opens_cleanly, is_malformed_db_error, is_malformed_schema_error
 from hermes_state import _validate_connection_schema, _validate_schema_version_scalar
 from hermes_state_common import (
     SCHEMA_VERSION,
@@ -231,3 +242,94 @@ def test_sessions_repair_does_not_see_a_schema_version_defect(tmp_path):
 
     # And the command an earlier draft of that message named, which sees nothing.
     assert _db_opens_cleanly(db) is None
+
+
+@pytest.mark.parametrize(
+    ("message", "cause"),
+    [
+        # The one class `hermes sessions repair` repairs.
+        ("malformed database schema (messages_fts)",
+         IncompatibleSchemaError.STORE_DAMAGED),
+        # SQLITE_CORRUPT. Runtime repair fails closed here by design, so this
+        # must not be answered with in-place repair — and must not be answered
+        # with "try again" either, which is the regression round 2 caught.
+        ("database disk image is malformed", IncompatibleSchemaError.STORE_CORRUPT),
+        # Genuinely transient. `OperationalError` is a `DatabaseError`, which is
+        # why these ever reached a damage claim.
+        ("database is locked", IncompatibleSchemaError.STORE_UNREADABLE),
+        ("disk I/O error", IncompatibleSchemaError.STORE_UNREADABLE),
+        ("unable to open database file", IncompatibleSchemaError.STORE_UNREADABLE),
+        ("attempt to write a readonly database",
+         IncompatibleSchemaError.STORE_UNREADABLE),
+    ],
+)
+def test_a_database_error_is_classified_by_what_the_owner_must_do(message, cause):
+    """One assertion per class, because each one names a different command.
+
+    `_database_error_cause` is the seam every `DatabaseError` site goes through,
+    so this is the whole classification in one place rather than six reproduced
+    failures. The two predicates it consults already existed; what was wrong was
+    reading the narrow one as an answer to the broad question.
+    """
+    assert _database_error_cause(sqlite3.DatabaseError(message)) == cause
+
+
+def test_the_two_malformed_predicates_are_not_the_same_question():
+    """The control for the case above: the predicates must actually differ here.
+
+    If `_MALFORMED_SCHEMA_MARKERS` ever grew to include the corrupt-image
+    string, `STORE_CORRUPT` would become unreachable and the parametrised case
+    above would still pass — every message would simply land one bucket over.
+    """
+    corrupt = sqlite3.DatabaseError("database disk image is malformed")
+    assert is_malformed_db_error(corrupt) is True
+    assert is_malformed_schema_error(corrupt) is False
+
+    schema = sqlite3.DatabaseError("malformed database schema (messages_fts)")
+    assert is_malformed_db_error(schema) is True
+    assert is_malformed_schema_error(schema) is True
+
+
+def test_recover_rebuilds_a_store_whose_schema_version_is_unusable(tmp_path):
+    """The positive half of the remedy, which review flagged as unpinned.
+
+    `test_sessions_repair_does_not_see_a_schema_version_defect` pins that the
+    command the message does *not* name is blind to this. Nothing pinned that
+    the command it *does* name works, so the owner-facing sentence rested only
+    on two manual measurements. If `_CANONICAL_TABLES` stops excluding
+    `schema_version`, or the destination verification changes, this fails and
+    the message has to change with it.
+    """
+    from hermes_cli.session_recovery import (
+        inspect_session_database,
+        recover_session_database,
+    )
+
+    db = tmp_path / "state.db"
+    SessionDB(db).close()
+    conn = sqlite3.connect(db, isolation_level=None)
+    conn.execute("INSERT INTO schema_version VALUES (?)", (SCHEMA_VERSION,))
+    conn.close()
+
+    probe = sqlite3.connect(db, isolation_level=None)
+    try:
+        with pytest.raises(IncompatibleSchemaError) as excinfo:
+            _validate_schema_version_scalar(probe)
+    finally:
+        probe.close()
+    assert excinfo.value.cause == IncompatibleSchemaError.SCHEMA_VERSION_UNREADABLE
+
+    assert inspect_session_database(db).get("recoverable") is True
+    output = tmp_path / "recovered.db"
+    recover_session_database(db, output, work_dir=tmp_path)
+
+    rebuilt = sqlite3.connect(output, isolation_level=None)
+    try:
+        rows = rebuilt.execute(
+            "SELECT version, typeof(version) FROM schema_version"
+        ).fetchall()
+    finally:
+        rebuilt.close()
+    # One row, correct type, correct value — and the source is left alone.
+    assert rows == [(SCHEMA_VERSION, "integer")]
+    assert db.exists()

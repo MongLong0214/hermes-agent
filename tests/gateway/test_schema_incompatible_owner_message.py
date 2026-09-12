@@ -33,6 +33,7 @@ from hermes_state import IncompatibleSchemaError
         "build_too_old",
         "fence_mismatch",
         "store_damaged",
+        "store_corrupt",
         "schema_version_unreadable",
         "store_unreadable",
         "schema_absent",
@@ -83,6 +84,10 @@ def test_schema_incompatible_owner_message(monkeypatch, tmp_path, case):
     elif case == "store_damaged":
         error = IncompatibleSchemaError(
             cause=IncompatibleSchemaError.STORE_DAMAGED
+        )
+    elif case == "store_corrupt":
+        error = IncompatibleSchemaError(
+            cause=IncompatibleSchemaError.STORE_CORRUPT
         )
     elif case == "schema_version_unreadable":
         error = IncompatibleSchemaError(
@@ -157,6 +162,20 @@ def test_schema_incompatible_owner_message(monkeypatch, tmp_path, case):
         assert "malformed" in response
         assert "no Hermes build will open it" in response
         assert "sessions recover" not in response
+        # The owner is reading this from the running gateway, and repair
+        # refuses while a live writer holds the file. A remedy that fails on
+        # its first attempt is the dead end this whole path is fixing.
+        assert "hermes gateway stop" in response
+        assert not any(char.isdigit() for char in response)
+    elif case == "store_corrupt":
+        # SQLITE_CORRUPT: no in-place repair, and emphatically not "try again".
+        # Round 2 caught this class falling through to the transient message.
+        assert "corrupt" in response
+        assert "hermes sessions recover" in response
+        assert "no in-place repair will touch" in response
+        assert "temporary" not in response
+        assert "Try again" not in response
+        assert "sessions repair" not in response
         assert not any(char.isdigit() for char in response)
     elif case in ("schema_version_unreadable", "schema_absent"):
         # Measured: `hermes sessions repair` prints "opens cleanly — no repair

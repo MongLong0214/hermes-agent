@@ -203,10 +203,17 @@ class IncompatibleSchemaError(RuntimeError):
     #: direction.  Carries both numbers; must not be phrased as "newer".
     FENCE_GENERATION_MISMATCH = "fence_generation_mismatch"
     #: SQLite reported explicitly malformed schema text.  This is the one
-    #: damage shape `hermes sessions repair` repairs, and it is classified by
-    #: the same predicate this module already uses to decide whether runtime
-    #: repair may be attempted at all — `is_malformed_schema_error`.
+    #: damage shape `hermes sessions repair` repairs — the classifier is
+    #: `is_malformed_schema_error`, the predicate this module already uses to
+    #: decide whether runtime repair may be attempted at all.
     STORE_DAMAGED = "store_damaged"
+    #: `database disk image is malformed` — SQLITE_CORRUPT, page damage that
+    #: may come from any B-tree or freelist page.  Runtime repair deliberately
+    #: fails closed here, so it is neither repairable in place nor transient,
+    #: and answering it with "try again" costs every turn until someone stops
+    #: believing the message.  Review caught exactly that regression: narrowing
+    #: to `is_malformed_schema_error` sent this class to STORE_UNREADABLE.
+    STORE_CORRUPT = "store_corrupt"
     #: The `schema_version` scalar itself is wrong: not one row, not an
     #: integer, or out of range.  Measured: `hermes sessions repair` reports
     #: such a store "opens cleanly — no repair needed", because
@@ -267,6 +274,11 @@ class IncompatibleSchemaError(RuntimeError):
         elif cause == self.STORE_DAMAGED:
             message = (
                 "Session state schema is malformed "
+                f"(build identity {identity})."
+            )
+        elif cause == self.STORE_CORRUPT:
+            message = (
+                "Session state is corrupt and cannot be repaired in place "
                 f"(build identity {identity})."
             )
         elif cause == self.SCHEMA_VERSION_UNREADABLE:
@@ -1915,16 +1927,30 @@ def is_malformed_schema_error(exc: BaseException) -> bool:
 def _database_error_cause(exc: sqlite3.DatabaseError) -> str:
     """Which refusal a SQLite failure during schema validation is.
 
-    Only explicitly malformed schema text is damage the owner can repair, and
-    that is not this function's judgement — it is `is_malformed_schema_error`,
-    the same predicate `_probe_existing_state_db_schema` uses to decide whether
-    runtime repair may be attempted. Anything else is "could not read": a
-    sibling holding the write lock, a transient `disk i/o error`, an unreadable
-    file. Those clear on their own, and telling the owner the store is damaged
-    would be false in the direction that costs a backup-and-rewrite.
+    Three answers, because the owner has three different things to do, and the
+    two predicates that separate them already exist in this module.
+
+    `is_malformed_schema_error` is the narrow one, and it answers a question
+    that is **not** the one asked here. Its own docstring says why it is narrow:
+    a generic corrupt-image error "does not prove that canonical rows are
+    intact, so runtime schema/FTS repair must fail closed." That is a gate on
+    unattended automatic surgery. It is not a statement that the owner has
+    nothing to do — and reading it as one is a measured regression, caught in
+    review: `database disk image is malformed` fell through to
+    STORE_UNREADABLE, whose message tells the owner the failure is often
+    temporary and to try again. It is neither, retrying never works, and every
+    turn fails for as long as they believe the first sentence.
+
+    So the wider `is_malformed_db_error` carries the corrupt-image class to its
+    own cause, whose remedy is the offline rebuild rather than in-place repair.
+    What is left — a sibling holding the write lock, a transient `disk i/o
+    error`, an unreadable file — is genuinely "could not read", and those clear
+    on their own.
     """
     if is_malformed_schema_error(exc):
         return IncompatibleSchemaError.STORE_DAMAGED
+    if is_malformed_db_error(exc):
+        return IncompatibleSchemaError.STORE_CORRUPT
     return IncompatibleSchemaError.STORE_UNREADABLE
 
 

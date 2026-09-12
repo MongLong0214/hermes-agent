@@ -21581,12 +21581,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # is the only cause it repairs: the classifier is
                     # `is_malformed_schema_error`, the same predicate the state
                     # module uses to decide whether runtime repair may run.
+                    #
+                    # "Stop the gateway first" is not politeness. The owner is
+                    # reading this *from the running gateway*, and
+                    # `repair_state_db_schema` refuses while a live writer holds
+                    # the file — `_live_writer_holds_db` then
+                    # "Stop the gateway (hermes gateway stop) and retry."
+                    # Omitting it makes the remedy fail on the first attempt,
+                    # which is the same dead end review found for the
+                    # schema-version class.
                     return (
                         "⚠️ Session state schema is malformed, so no Hermes "
                         "build will open it.\n"
-                        "Run `hermes sessions repair --check-only` to see what "
-                        "is wrong, then `hermes sessions repair` to fix it "
-                        "(it makes a timestamped backup first)."
+                        "Run `hermes gateway stop` first — repair refuses while "
+                        "this process holds the database. Then `hermes sessions "
+                        "repair --check-only` to see what is wrong, and `hermes "
+                        "sessions repair` to fix it (it makes a timestamped "
+                        "backup first)."
+                    )
+                if cause == IncompatibleSchemaError.STORE_CORRUPT:
+                    # SQLITE_CORRUPT. Runtime repair deliberately fails closed
+                    # for this class, so in-place repair is not on offer and
+                    # saying "try again" would be false — that was the
+                    # regression review caught in the first remediation.
+                    return (
+                        "⚠️ Session state is corrupt — SQLite reports the "
+                        "database image itself as damaged, which no build "
+                        "opens and no in-place repair will touch.\n"
+                        "Run `hermes sessions recover --source "
+                        "<path-to-state.db> --inspect-only` to see what is "
+                        "still readable, then the same command with `--output "
+                        "<new-db>` to rebuild what it can. It copies the file "
+                        "before reading it and never replaces the active "
+                        "database."
                     )
                 if cause in (
                     IncompatibleSchemaError.SCHEMA_VERSION_UNREADABLE,
