@@ -21543,6 +21543,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from hermes_state import IncompatibleSchemaError
 
             if isinstance(e, IncompatibleSchemaError):
+                # The advice has to match the cause.  A damaged store does not
+                # open under any build, so the build advice sends the owner
+                # looking for a release while `hermes sessions repair` sits
+                # unmentioned.  That is the half of #784 that stayed open: the
+                # refusal was singular and legible and still pointed the wrong
+                # way for four of the five causes.
+                cause = getattr(e, "cause", None)
                 generations = ""
                 if (
                     type(e.expected_generation) is int
@@ -21551,6 +21558,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     generations = (
                         f" (expected generation {e.expected_generation}, "
                         f"actual generation {e.actual_generation})"
+                    )
+                if cause == IncompatibleSchemaError.BUILD_TOO_OLD and generations:
+                    return (
+                        "⚠️ Session state schema is newer than this Hermes "
+                        f"build{generations}.\n"
+                        f"Use a Hermes build at generation {e.actual_generation} "
+                        "or newer to open this session state."
+                    )
+                if (
+                    cause == IncompatibleSchemaError.FENCE_GENERATION_MISMATCH
+                    and generations
+                ):
+                    return (
+                        "⚠️ Session state turn-fence generation does not match "
+                        f"this Hermes build{generations}.\n"
+                        "Use the Hermes build whose turn-fence generation is "
+                        f"{e.actual_generation} to open this session state."
+                    )
+                if cause in (
+                    IncompatibleSchemaError.STORE_DAMAGED,
+                    IncompatibleSchemaError.SCHEMA_ABSENT,
+                ):
+                    return (
+                        "⚠️ Session state could not be validated — the store "
+                        "itself is damaged, so no Hermes build will open it.\n"
+                        "Run `hermes sessions repair --check-only` to see what "
+                        "is wrong, then `hermes sessions repair` to fix it "
+                        "(it makes a timestamped backup first)."
+                    )
+                if cause == IncompatibleSchemaError.NOT_OPEN:
+                    return (
+                        "⚠️ Session state is not open, so this turn could not "
+                        "be recorded.\n"
+                        "Restart the gateway with `hermes gateway restart`."
                     )
                 return (
                     f"⚠️ Session state schema is incompatible with this Hermes build{generations}.\n"

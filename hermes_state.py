@@ -183,11 +183,38 @@ class SessionExportTooLargeError(ValueError):
 
 
 class IncompatibleSchemaError(RuntimeError):
-    """The on-disk session state cannot be safely opened by this version."""
+    """The on-disk session state cannot be safely opened by this version.
+
+    Nine call sites raise this for five different failures, and **only one of
+    them is fixed by installing a different build.**  A ``schema_version``
+    table holding two rows, a version that is not an integer, and a SQLite
+    ``DatabaseError`` from the validating SELECT are all damage: no build
+    opens them.  Telling the owner to find a compatible build in those cases
+    is worse than telling them nothing, because it names an action that
+    cannot work and hides ``hermes sessions repair``, which can.
+
+    So the cause is a required argument.  A site that cannot say which of
+    these it is has not diagnosed the failure it is reporting.
+    """
+
+    #: The stored generation is ahead of this build.  Carries both numbers.
+    BUILD_TOO_OLD = "build_too_old"
+    #: The turn-fence generation differs from this build's, in either
+    #: direction.  Carries both numbers; must not be phrased as "newer".
+    FENCE_GENERATION_MISMATCH = "fence_generation_mismatch"
+    #: The schema exists but cannot be validated — row count, type, range, or
+    #: a DatabaseError from the SELECT itself.  No build opens this.
+    STORE_DAMAGED = "store_damaged"
+    #: There is no ``schema_version`` table and the caller does not accept an
+    #: uninitialized store.
+    SCHEMA_ABSENT = "schema_absent"
+    #: The handle has no connection.  Not a property of any stored schema.
+    NOT_OPEN = "not_open"
 
     __slots__ = (
         "actual_generation",
         "build_identity",
+        "cause",
         "code",
         "expected_generation",
     )
@@ -195,20 +222,50 @@ class IncompatibleSchemaError(RuntimeError):
     def __init__(
         self,
         *,
+        cause: str,
         expected_generation: Optional[int] = None,
         actual_generation: Optional[int] = None,
     ):
+        self.cause = cause
         self.expected_generation = expected_generation
         self.actual_generation = actual_generation
         self.build_identity = _state_schema_build_identity()
-        if expected_generation is None or actual_generation is None:
-            message = "Session state is incompatible with this Hermes version."
-        else:
+        identity = _format_state_schema_build_identity(self.build_identity)
+        both_generations = (
+            type(expected_generation) is int and type(actual_generation) is int
+        )
+        if cause == self.BUILD_TOO_OLD and both_generations:
             message = (
                 "Session state schema is newer than this Hermes build "
                 f"(expected generation {expected_generation}, "
                 f"actual generation {actual_generation}, "
-                f"build identity {_format_state_schema_build_identity(self.build_identity)})."
+                f"build identity {identity})."
+            )
+        elif cause == self.FENCE_GENERATION_MISMATCH and both_generations:
+            message = (
+                "Session state turn-fence generation does not match this "
+                f"Hermes build (build generation {expected_generation}, "
+                f"stored generation {actual_generation}, "
+                f"build identity {identity})."
+            )
+        elif cause == self.STORE_DAMAGED:
+            message = (
+                "Session state schema cannot be validated and is damaged "
+                f"(build identity {identity})."
+            )
+        elif cause == self.SCHEMA_ABSENT:
+            message = (
+                "Session state has no schema_version table "
+                f"(build identity {identity})."
+            )
+        elif cause == self.NOT_OPEN:
+            message = "Session state is not open."
+        else:
+            # An unknown cause, or a generation-bearing cause raised without
+            # its numbers.  Say so rather than inventing either.
+            message = (
+                "Session state is incompatible with this Hermes version "
+                f"(cause {cause!r}, build identity {identity})."
             )
         super().__init__(message)
         self.code = "STATE_DB_SCHEMA_INCOMPATIBLE"
@@ -1835,7 +1892,7 @@ def _validate_schema_version_scalar(conn: sqlite3.Connection) -> int:
         "SELECT version, typeof(version) FROM schema_version"
     ).fetchall()
     if len(rows) != 1:
-        raise IncompatibleSchemaError()
+        raise IncompatibleSchemaError(cause=IncompatibleSchemaError.STORE_DAMAGED)
     version, value_type = rows[0]
     if (
         value_type == "integer"
@@ -1843,6 +1900,7 @@ def _validate_schema_version_scalar(conn: sqlite3.Connection) -> int:
         and version > SCHEMA_VERSION
     ):
         raise IncompatibleSchemaError(
+            cause=IncompatibleSchemaError.BUILD_TOO_OLD,
             expected_generation=SCHEMA_VERSION,
             actual_generation=version,
         )
@@ -1852,7 +1910,7 @@ def _validate_schema_version_scalar(conn: sqlite3.Connection) -> int:
         or version < 0
         or version > (2**63 - 1)
     ):
-        raise IncompatibleSchemaError()
+        raise IncompatibleSchemaError(cause=IncompatibleSchemaError.STORE_DAMAGED)
     return version
 
 
@@ -1867,7 +1925,9 @@ def _validate_connection_schema(
         ).fetchone() is not None
         if not has_schema_version:
             if not allow_uninitialized_schema:
-                raise IncompatibleSchemaError()
+                raise IncompatibleSchemaError(
+                    cause=IncompatibleSchemaError.SCHEMA_ABSENT
+                )
             version = None
         else:
             version = _validate_schema_version_scalar(conn)
@@ -1878,13 +1938,23 @@ def _validate_connection_schema(
     except IncompatibleSchemaError:
         raise
     except sqlite3.DatabaseError:
-        raise IncompatibleSchemaError() from None
+        raise IncompatibleSchemaError(
+            cause=IncompatibleSchemaError.STORE_DAMAGED
+        ) from None
     if (
         generation_type != "integer"
         or type(generation) is not int
         or generation != TURN_FENCE_GENERATION
     ):
-        raise IncompatibleSchemaError()
+        raise IncompatibleSchemaError(
+            cause=(
+                IncompatibleSchemaError.FENCE_GENERATION_MISMATCH
+                if type(generation) is int and generation_type == "integer"
+                else IncompatibleSchemaError.STORE_DAMAGED
+            ),
+            expected_generation=TURN_FENCE_GENERATION,
+            actual_generation=generation if type(generation) is int else None,
+        )
     return version
 
 
@@ -1924,7 +1994,9 @@ def _probe_existing_state_db_schema(
             # post-open authority check fences before schema DDL runs.
             return None
         else:
-            raise IncompatibleSchemaError() from None
+            raise IncompatibleSchemaError(
+                cause=IncompatibleSchemaError.STORE_DAMAGED
+            ) from None
         if not _claim_repair_attempt(db_path):
             raise
         report = repair_state_db_schema(db_path)
@@ -1936,7 +2008,9 @@ def _probe_existing_state_db_schema(
     except IncompatibleSchemaError:
         raise
     except sqlite3.DatabaseError:
-        raise IncompatibleSchemaError() from None
+        raise IncompatibleSchemaError(
+            cause=IncompatibleSchemaError.STORE_DAMAGED
+        ) from None
 
 
 def _canonical_state_db_home(db_path: Path) -> Optional[Path]:
@@ -5107,7 +5181,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     def ensure_compatible_schema(self) -> None:
         """Recheck this open connection without repairing or mutating state."""
         if self._conn is None:
-            raise IncompatibleSchemaError()
+            raise IncompatibleSchemaError(cause=IncompatibleSchemaError.NOT_OPEN)
         _validate_connection_schema(self._conn)
 
     # ── Read-path split ──
