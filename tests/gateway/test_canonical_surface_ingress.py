@@ -352,3 +352,52 @@ def test_two_connections_claim_once_and_binding_identity_scopes_event(ingress):
         assert ingress.agent.calls == []
     finally:
         other.close()
+
+
+def test_refusal_paths_never_reach_the_cached_actor(ingress):
+    """Every refusal happens before the cached actor runs.
+
+    Unknown binding, a principal outside the binding's allow-lists, an
+    oversize or heartbeat-shaped payload (no author/channel), a missing or
+    wrong bearer, and a replayed event_id whose payload changed are all
+    refused; only the one exact admitted event runs, exactly once.
+    """
+
+    async def raw(body: bytes, *, bearer: str | None = _API_KEY):
+        async def read():
+            return body
+        headers = {"Authorization": f"Bearer {bearer}"} if bearer is not None else {}
+        # The 401 audit log reads method/path/transport off the request.
+        request = SimpleNamespace(
+            headers=headers, read=read, method="POST", path_qs=_ROUTE, transport=None
+        )
+        response = await ingress.adapter._handle_canonical_surface_event(request)
+        return response.status, json.loads(response.text)
+
+    def code(result):
+        return result[0], result[1]["error"]["code"]
+
+    async def exercise():
+        assert code(await ingress.send(binding="not-configured")) == (404, "canonical_binding_unknown")
+        assert code(await ingress.send(author_id="stranger")) == (403, "canonical_principal_rejected")
+        assert code(await ingress.send(channel_id="elsewhere")) == (403, "canonical_principal_rejected")
+        assert code(await ingress.send(text="x" * 16_385)) == (400, "canonical_invalid_request")
+        heartbeat_shaped = json.dumps(
+            {"binding": "canonical", "event_id": "tick", "text": "[System: Heartbeat]"}
+        ).encode()
+        assert code(await raw(heartbeat_shaped)) == (400, "canonical_invalid_request")
+        admitted = json.dumps(
+            dict(binding="canonical", event_id="event", author_id="author", channel_id="channel", text="hello")
+        ).encode()
+        assert code(await raw(admitted, bearer=None)) == (401, "gateway_auth_failed")
+        assert code(await raw(admitted, bearer="not-the-key")) == (401, "gateway_auth_failed")
+        assert ingress.agent.calls == []
+
+        first = await ingress.send()
+        assert first == (200, {"event_id": "event", "text": "request-owned terminal"})
+        assert code(await ingress.send(text="changed payload")) == (409, "canonical_event_conflict")
+        assert code(await ingress.send(author_id="stranger")) == (403, "canonical_principal_rejected")
+        assert await ingress.send() == first
+        assert ingress.agent.calls == [("hello", [], ingress.entry.session_id)]
+
+    asyncio.run(exercise())
