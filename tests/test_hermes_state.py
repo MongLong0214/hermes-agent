@@ -142,12 +142,27 @@ class TestConnectionLifecycle:
         error = raised.value
         assert isinstance(error, hermes_state.IncompatibleSchemaError)
         assert error.code == "STATE_DB_SCHEMA_INCOMPATIBLE"
-        assert error.args == ("Session state is incompatible with this Hermes version.",)
-        assert str(error) == "Session state is incompatible with this Hermes version."
-        assert hermes_state.get_last_init_error() == (
-            "STATE_DB_SCHEMA_INCOMPATIBLE: "
-            "Session state is incompatible with this Hermes version."
-        )
+        # The two numbers, not only the verdict. This test used to require the message to be
+        # exactly "Session state is incompatible with this Hermes version." -- it pinned the
+        # silence that left an owner with nothing to act on for two and a half hours while the
+        # process kept heartbeating (#784). The refusal knows which side to move; it has to say.
+        assert str(SCHEMA_VERSION + 1) in str(error)
+        assert str(SCHEMA_VERSION) in str(error)
+        assert error.detail is not None
+        assert str(SCHEMA_VERSION + 1) in error.detail
+
+        # And it has to survive the hop to the owner-facing surface: `_set_last_init_error`
+        # replaced the detail with a fixed sentence, so whatever the raise knew stopped here.
+        last = hermes_state.get_last_init_error()
+        assert last is not None
+        assert last.startswith("STATE_DB_SCHEMA_INCOMPATIBLE: ")
+        assert str(SCHEMA_VERSION + 1) in last
+        assert str(SCHEMA_VERSION) in last
+
+        # Numbers and identifiers only. This string reaches an owner; a refusal is not a place
+        # to start disclosing filesystem layout.
+        assert str(db_path) not in last
+        assert "future-state.db" not in last
         assert not any(
             statement.lstrip().upper().startswith(
                 ("PRAGMA", "CREATE", "ALTER", "INSERT", "UPDATE", "DELETE")

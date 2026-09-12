@@ -183,13 +183,34 @@ class SessionExportTooLargeError(ValueError):
 
 
 class IncompatibleSchemaError(RuntimeError):
-    """The on-disk session state cannot be safely opened by this version."""
+    """The on-disk session state cannot be safely opened by this version.
 
-    __slots__ = ("code",)
+    Carries ``detail``: the two numbers that decide the refusal, in the caller's
+    own words. The refusal already knows them -- ``_validate_schema_version_scalar``
+    compares a stored version against ``SCHEMA_VERSION``, and
+    ``_validate_connection_schema`` compares a stored turn-fence generation against
+    ``TURN_FENCE_GENERATION`` -- and until this they were discarded at the raise.
 
-    def __init__(self):
-        super().__init__("Session state is incompatible with this Hermes version.")
+    That cost an outage two hours and thirty minutes of silence. On 2026-09-05 both
+    owner channels were dead while the process stayed alive and heartbeating, and
+    the owner saw exactly one thing: "Sorry, I encountered an unexpected error."
+    The live database was at 28 and the gateway was running 27 -- a fact this class
+    held in its hand and never said (#784).
+
+    ``detail`` is numbers and identifiers only, never a path or a raw driver
+    message: this string reaches an owner-facing surface, and a refusal is not a
+    place to widen what that surface discloses.
+    """
+
+    __slots__ = ("code", "detail")
+
+    def __init__(self, detail: Optional[str] = None):
+        message = "Session state is incompatible with this Hermes version."
+        if detail:
+            message = f"{message} {detail}"
+        super().__init__(message)
         self.code = "STATE_DB_SCHEMA_INCOMPATIBLE"
+        self.detail = detail
 
 
 _COMPRESSION_LOCK_HOLDER_PID_RE = re.compile(r"(?:^|:)pid=(\d+)(?::|$)")
@@ -1769,7 +1790,9 @@ def _validate_schema_version_scalar(conn: sqlite3.Connection) -> int:
         "SELECT version, typeof(version) FROM schema_version"
     ).fetchall()
     if len(rows) != 1:
-        raise IncompatibleSchemaError()
+        raise IncompatibleSchemaError(
+            f"schema_version holds {len(rows)} row(s); exactly one is required."
+        )
     version, value_type = rows[0]
     if (
         value_type != "integer"
@@ -1778,7 +1801,12 @@ def _validate_schema_version_scalar(conn: sqlite3.Connection) -> int:
         or version > (2**63 - 1)
         or version > SCHEMA_VERSION
     ):
-        raise IncompatibleSchemaError()
+        # The one an owner can act on: a database written by a newer build. Reported as the
+        # pair rather than a verdict, because "28 against 27" tells the reader which side to
+        # move and a bare incompatibility does not.
+        raise IncompatibleSchemaError(
+            f"Stored schema version is {version!r}; this build supports {SCHEMA_VERSION}."
+        )
     return version
 
 
@@ -1793,7 +1821,9 @@ def _validate_connection_schema(
         ).fetchone() is not None
         if not has_schema_version:
             if not allow_uninitialized_schema:
-                raise IncompatibleSchemaError()
+                raise IncompatibleSchemaError(
+                    "The state database has no schema_version table."
+                )
             version = None
         else:
             version = _validate_schema_version_scalar(conn)
@@ -1803,14 +1833,21 @@ def _validate_connection_schema(
         ).fetchone()
     except IncompatibleSchemaError:
         raise
-    except sqlite3.DatabaseError:
-        raise IncompatibleSchemaError() from None
+    except sqlite3.DatabaseError as exc:
+        # The driver's own message can name the database path; only its class is reported,
+        # because this string reaches an owner-facing surface.
+        raise IncompatibleSchemaError(
+            f"The state database could not be read ({type(exc).__name__})."
+        ) from None
     if (
         generation_type != "integer"
         or type(generation) is not int
         or generation != TURN_FENCE_GENERATION
     ):
-        raise IncompatibleSchemaError()
+        raise IncompatibleSchemaError(
+            f"Stored turn-fence generation is {generation!r}; "
+            f"this build requires {TURN_FENCE_GENERATION}."
+        )
     return version
 
 
@@ -1850,7 +1887,9 @@ def _probe_existing_state_db_schema(
             # post-open authority check fences before schema DDL runs.
             return None
         else:
-            raise IncompatibleSchemaError() from None
+            raise IncompatibleSchemaError(
+                f"The state database could not be opened ({type(exc).__name__})."
+            ) from None
         if not _claim_repair_attempt(db_path):
             raise
         report = repair_state_db_schema(db_path)
@@ -1861,8 +1900,10 @@ def _probe_existing_state_db_schema(
         return probe()
     except IncompatibleSchemaError:
         raise
-    except sqlite3.DatabaseError:
-        raise IncompatibleSchemaError() from None
+    except sqlite3.DatabaseError as exc:
+        raise IncompatibleSchemaError(
+            f"The state database could not be probed ({type(exc).__name__})."
+        ) from None
 
 
 # Markers that mean the host filesystem cannot accept another write. Kept as
@@ -4908,11 +4949,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # an unattended open. (An interrupted optimize resumes when the
             # user re-runs the command.)
             initialization_complete = True
-        except IncompatibleSchemaError:
-            _set_last_init_error(
-                "STATE_DB_SCHEMA_INCOMPATIBLE: "
-                "Session state is incompatible with this Hermes version."
-            )
+        except IncompatibleSchemaError as exc:
+            # `str(exc)` rather than the sentence again. The refusal already knows which two
+            # numbers disagree, and this line used to replace that with a fixed string — so the
+            # surface that reads `last_init_error` told an owner only that something was
+            # incompatible, never what to move (#784). The detail is numbers and identifiers
+            # only; the raise sites keep paths and driver text out of it.
+            _set_last_init_error(f"STATE_DB_SCHEMA_INCOMPATIBLE: {exc}")
             raise
         except Exception as exc:
             # Capture the cause so /resume and friends can surface WHY the
@@ -4937,7 +4980,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     def ensure_compatible_schema(self) -> None:
         """Recheck this open connection without repairing or mutating state."""
         if self._conn is None:
-            raise IncompatibleSchemaError()
+            raise IncompatibleSchemaError("The state database is not open.")
         _validate_connection_schema(self._conn)
 
     # ── Read-path split ──
