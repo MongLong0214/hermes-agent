@@ -21543,6 +21543,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from hermes_state import IncompatibleSchemaError
 
             if isinstance(e, IncompatibleSchemaError):
+                # The advice has to match the cause.  A damaged store does not
+                # open under any build, so the build advice sends the owner
+                # looking for a release while `hermes sessions repair` sits
+                # unmentioned.  That is the half of #784 that stayed open: the
+                # refusal was singular and legible and still pointed the wrong
+                # way for four of the five causes.
+                cause = getattr(e, "cause", None)
                 generations = ""
                 if (
                     type(e.expected_generation) is int
@@ -21551,6 +21558,122 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     generations = (
                         f" (expected generation {e.expected_generation}, "
                         f"actual generation {e.actual_generation})"
+                    )
+                if cause == IncompatibleSchemaError.BUILD_TOO_OLD and generations:
+                    return (
+                        "⚠️ Session state schema is newer than this Hermes "
+                        f"build{generations}.\n"
+                        f"Use a Hermes build at generation {e.actual_generation} "
+                        "or newer to open this session state."
+                    )
+                if (
+                    cause == IncompatibleSchemaError.FENCE_GENERATION_MISMATCH
+                    and generations
+                ):
+                    return (
+                        "⚠️ Session state turn-fence generation does not match "
+                        f"this Hermes build{generations}.\n"
+                        "Use the Hermes build whose turn-fence generation is "
+                        f"{e.actual_generation} to open this session state."
+                    )
+                if cause == IncompatibleSchemaError.STORE_DAMAGED:
+                    # `hermes sessions repair` is named only here, because this
+                    # is the only cause it repairs: the classifier is
+                    # `is_malformed_schema_error`, the same predicate the state
+                    # module uses to decide whether runtime repair may run.
+                    #
+                    # "Stop the gateway first" is not politeness. The owner is
+                    # reading this *from the running gateway*, and
+                    # `repair_state_db_schema` refuses while a live writer holds
+                    # the file — `_live_writer_holds_db` then
+                    # "Stop the gateway (hermes gateway stop) and retry."
+                    # Omitting it makes the remedy fail on the first attempt,
+                    # which is the same dead end review found for the
+                    # schema-version class.
+                    return (
+                        "⚠️ Session state schema is malformed, so no Hermes "
+                        "build will open it.\n"
+                        "Run `hermes gateway stop` first — repair refuses while "
+                        "this process holds the database. Then `hermes sessions "
+                        "repair --check-only` to see what is wrong, and `hermes "
+                        "sessions repair` to fix it (it makes a timestamped "
+                        "backup first)."
+                    )
+                if cause == IncompatibleSchemaError.STORE_CORRUPT:
+                    # SQLITE_CORRUPT. Runtime repair deliberately fails closed
+                    # for this class, so in-place repair is not on offer and
+                    # saying "try again" would be false — that was the
+                    # regression review caught in the first remediation.
+                    # `--allow-partial` is named, not left to be discovered.
+                    # Page damage is precisely the class where `recoverable`
+                    # comes back false — it requires `sessions` and `messages`
+                    # to be *completely* readable — and a plain `--output` run
+                    # then refuses. Measured on a store with 124 zeroed page
+                    # regions: refused without the flag, and with it salvaged
+                    # 3,433 of 4,000 messages. "Rebuild what it can" IS that
+                    # flag's contract, so promising it without naming it is the
+                    # same shape as the schema-version dead end above.
+                    return (
+                        "⚠️ Session state is corrupt — SQLite reports the "
+                        "database image itself as damaged, which no build "
+                        "opens and no in-place repair will touch.\n"
+                        "Run `hermes sessions recover --source "
+                        "<path-to-state.db> --inspect-only` to see what is "
+                        "still readable. Then rebuild with `--output <new-db> "
+                        "--allow-partial` — plain `--output` refuses unless "
+                        "every canonical row is readable, which page damage "
+                        "usually breaks. It copies the file before reading it "
+                        "and never replaces the active database.\n"
+                        "If it reports that it still needs readable table "
+                        "schemas, it is asking for a `.recover`-capable "
+                        "`sqlite3` on PATH — install one and re-run the same "
+                        "command; only if that fails too is a backup the "
+                        "remaining route."
+                    )
+                if cause in (
+                    IncompatibleSchemaError.SCHEMA_VERSION_UNREADABLE,
+                    IncompatibleSchemaError.SCHEMA_ABSENT,
+                ):
+                    # NOT `hermes sessions repair`. Measured on a store with
+                    # two `schema_version` rows: it prints "opens cleanly — no
+                    # repair needed" and exits, because `_db_opens_cleanly`
+                    # never reads `schema_version` and `repair_state_db_schema`
+                    # never writes it. Naming it here would send the owner in a
+                    # circle, which is the defect this whole path is fixing.
+                    #
+                    # `hermes sessions recover` does fix it, measured end to
+                    # end on the same store: two rows in, one correct row out,
+                    # in a new database, with the active one untouched.
+                    return (
+                        "⚠️ Session state does not record a usable schema "
+                        "version, so no Hermes build will open it.\n"
+                        "`hermes sessions repair` does not cover this and will "
+                        "report the store as clean. Run `hermes sessions "
+                        "recover --source <path-to-state.db> --inspect-only` "
+                        "first, then the same command with `--output <new-db>` "
+                        "to rebuild it. The active database is never replaced "
+                        "automatically."
+                    )
+                if cause == IncompatibleSchemaError.STORE_UNREADABLE:
+                    # Do not assert damage. `OperationalError` is a
+                    # `DatabaseError`, so this cause covers `database is
+                    # locked` and `disk i/o error` — measured: a sibling
+                    # holding BEGIN EXCLUSIVE on a non-WAL store lands here
+                    # with the store perfectly healthy. Sending that owner to
+                    # a backup-and-rewrite is worse than saying nothing.
+                    return (
+                        "⚠️ Session state could not be read to check its "
+                        "schema. This is often temporary — another process "
+                        "holding the write lock, or a transient I/O error.\n"
+                        "Try again. If it keeps happening, run `hermes "
+                        "sessions repair --check-only`, which inspects the "
+                        "store without modifying it."
+                    )
+                if cause == IncompatibleSchemaError.NOT_OPEN:
+                    return (
+                        "⚠️ Session state is not open, so this turn could not "
+                        "be recorded.\n"
+                        "Restart the gateway with `hermes gateway restart`."
                     )
                 return (
                     f"⚠️ Session state schema is incompatible with this Hermes build{generations}.\n"

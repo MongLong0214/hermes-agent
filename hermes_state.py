@@ -183,11 +183,61 @@ class SessionExportTooLargeError(ValueError):
 
 
 class IncompatibleSchemaError(RuntimeError):
-    """The on-disk session state cannot be safely opened by this version."""
+    """The on-disk session state cannot be safely opened by this version.
+
+    Nine call sites raise this for five different failures, and **only one of
+    them is fixed by installing a different build.**  A ``schema_version``
+    table holding two rows, a version that is not an integer, and a SQLite
+    ``DatabaseError`` from the validating SELECT are all damage: no build
+    opens them.  Telling the owner to find a compatible build in those cases
+    is worse than telling them nothing, because it names an action that
+    cannot work and hides ``hermes sessions repair``, which can.
+
+    So the cause is a required argument.  A site that cannot say which of
+    these it is has not diagnosed the failure it is reporting.
+    """
+
+    #: The stored generation is ahead of this build.  Carries both numbers.
+    BUILD_TOO_OLD = "build_too_old"
+    #: The turn-fence generation differs from this build's, in either
+    #: direction.  Carries both numbers; must not be phrased as "newer".
+    FENCE_GENERATION_MISMATCH = "fence_generation_mismatch"
+    #: SQLite reported explicitly malformed schema text.  This is the one
+    #: damage shape `hermes sessions repair` repairs — the classifier is
+    #: `is_malformed_schema_error`, the predicate this module already uses to
+    #: decide whether runtime repair may be attempted at all.
+    STORE_DAMAGED = "store_damaged"
+    #: `database disk image is malformed` — SQLITE_CORRUPT, page damage that
+    #: may come from any B-tree or freelist page.  Runtime repair deliberately
+    #: fails closed here, so it is neither repairable in place nor transient,
+    #: and answering it with "try again" costs every turn until someone stops
+    #: believing the message.  Review caught exactly that regression: narrowing
+    #: to `is_malformed_schema_error` sent this class to STORE_UNREADABLE.
+    STORE_CORRUPT = "store_corrupt"
+    #: The `schema_version` scalar itself is wrong: not one row, not an
+    #: integer, or out of range.  Measured: `hermes sessions repair` reports
+    #: such a store "opens cleanly — no repair needed", because
+    #: `_db_opens_cleanly` never reads `schema_version` and
+    #: `repair_state_db_schema` never writes it.  Naming that command here
+    #: would send the owner in a circle.
+    SCHEMA_VERSION_UNREADABLE = "schema_version_unreadable"
+    #: The validating SELECT raised a `sqlite3.DatabaseError` that is not
+    #: malformed schema.  `OperationalError` is a `DatabaseError`, so this
+    #: covers `database is locked` and `disk i/o error` — states this module
+    #: documents as transient and survivable (see the write-lock patience
+    #: path and the virtualized-block-device note).  Asserting damage here
+    #: is false, and sending the owner to a rewriting repair is worse.
+    STORE_UNREADABLE = "store_unreadable"
+    #: There is no ``schema_version`` table and the caller does not accept an
+    #: uninitialized store.
+    SCHEMA_ABSENT = "schema_absent"
+    #: The handle has no connection.  Not a property of any stored schema.
+    NOT_OPEN = "not_open"
 
     __slots__ = (
         "actual_generation",
         "build_identity",
+        "cause",
         "code",
         "expected_generation",
     )
@@ -195,20 +245,65 @@ class IncompatibleSchemaError(RuntimeError):
     def __init__(
         self,
         *,
+        cause: str,
         expected_generation: Optional[int] = None,
         actual_generation: Optional[int] = None,
     ):
+        self.cause = cause
         self.expected_generation = expected_generation
         self.actual_generation = actual_generation
         self.build_identity = _state_schema_build_identity()
-        if expected_generation is None or actual_generation is None:
-            message = "Session state is incompatible with this Hermes version."
-        else:
+        identity = _format_state_schema_build_identity(self.build_identity)
+        both_generations = (
+            type(expected_generation) is int and type(actual_generation) is int
+        )
+        if cause == self.BUILD_TOO_OLD and both_generations:
             message = (
                 "Session state schema is newer than this Hermes build "
                 f"(expected generation {expected_generation}, "
                 f"actual generation {actual_generation}, "
-                f"build identity {_format_state_schema_build_identity(self.build_identity)})."
+                f"build identity {identity})."
+            )
+        elif cause == self.FENCE_GENERATION_MISMATCH and both_generations:
+            message = (
+                "Session state turn-fence generation does not match this "
+                f"Hermes build (build generation {expected_generation}, "
+                f"stored generation {actual_generation}, "
+                f"build identity {identity})."
+            )
+        elif cause == self.STORE_DAMAGED:
+            message = (
+                "Session state schema is malformed "
+                f"(build identity {identity})."
+            )
+        elif cause == self.STORE_CORRUPT:
+            message = (
+                "Session state is corrupt and cannot be repaired in place "
+                f"(build identity {identity})."
+            )
+        elif cause == self.SCHEMA_VERSION_UNREADABLE:
+            message = (
+                "Session state does not record exactly one integer schema "
+                f"version (build identity {identity})."
+            )
+        elif cause == self.STORE_UNREADABLE:
+            message = (
+                "Session state could not be read to validate its schema "
+                f"(build identity {identity})."
+            )
+        elif cause == self.SCHEMA_ABSENT:
+            message = (
+                "Session state has no schema_version table "
+                f"(build identity {identity})."
+            )
+        elif cause == self.NOT_OPEN:
+            message = "Session state is not open."
+        else:
+            # An unknown cause, or a generation-bearing cause raised without
+            # its numbers.  Say so rather than inventing either.
+            message = (
+                "Session state is incompatible with this Hermes version "
+                f"(cause {cause!r}, build identity {identity})."
             )
         super().__init__(message)
         self.code = "STATE_DB_SCHEMA_INCOMPATIBLE"
@@ -1829,13 +1924,45 @@ def is_malformed_schema_error(exc: BaseException) -> bool:
     return any(marker in str(exc).lower() for marker in _MALFORMED_SCHEMA_MARKERS)
 
 
+def _database_error_cause(exc: sqlite3.DatabaseError) -> str:
+    """Which refusal a SQLite failure during schema validation is.
+
+    Three answers, because the owner has three different things to do, and the
+    two predicates that separate them already exist in this module.
+
+    `is_malformed_schema_error` is the narrow one, and it answers a question
+    that is **not** the one asked here. Its own docstring says why it is narrow:
+    a generic corrupt-image error "does not prove that canonical rows are
+    intact, so runtime schema/FTS repair must fail closed." That is a gate on
+    unattended automatic surgery. It is not a statement that the owner has
+    nothing to do — and reading it as one is a measured regression, caught in
+    review: `database disk image is malformed` fell through to
+    STORE_UNREADABLE, whose message tells the owner the failure is often
+    temporary and to try again. It is neither, retrying never works, and every
+    turn fails for as long as they believe the first sentence.
+
+    So the wider `is_malformed_db_error` carries the corrupt-image class to its
+    own cause, whose remedy is the offline rebuild rather than in-place repair.
+    What is left — a sibling holding the write lock, a transient `disk i/o
+    error`, an unreadable file — is genuinely "could not read", and those clear
+    on their own.
+    """
+    if is_malformed_schema_error(exc):
+        return IncompatibleSchemaError.STORE_DAMAGED
+    if is_malformed_db_error(exc):
+        return IncompatibleSchemaError.STORE_CORRUPT
+    return IncompatibleSchemaError.STORE_UNREADABLE
+
+
 def _validate_schema_version_scalar(conn: sqlite3.Connection) -> int:
     """Validate the one canonical, SQLite-typed schema-version scalar."""
     rows = conn.execute(
         "SELECT version, typeof(version) FROM schema_version"
     ).fetchall()
     if len(rows) != 1:
-        raise IncompatibleSchemaError()
+        raise IncompatibleSchemaError(
+            cause=IncompatibleSchemaError.SCHEMA_VERSION_UNREADABLE
+        )
     version, value_type = rows[0]
     if (
         value_type == "integer"
@@ -1843,6 +1970,7 @@ def _validate_schema_version_scalar(conn: sqlite3.Connection) -> int:
         and version > SCHEMA_VERSION
     ):
         raise IncompatibleSchemaError(
+            cause=IncompatibleSchemaError.BUILD_TOO_OLD,
             expected_generation=SCHEMA_VERSION,
             actual_generation=version,
         )
@@ -1852,7 +1980,9 @@ def _validate_schema_version_scalar(conn: sqlite3.Connection) -> int:
         or version < 0
         or version > (2**63 - 1)
     ):
-        raise IncompatibleSchemaError()
+        raise IncompatibleSchemaError(
+            cause=IncompatibleSchemaError.SCHEMA_VERSION_UNREADABLE
+        )
     return version
 
 
@@ -1867,7 +1997,9 @@ def _validate_connection_schema(
         ).fetchone() is not None
         if not has_schema_version:
             if not allow_uninitialized_schema:
-                raise IncompatibleSchemaError()
+                raise IncompatibleSchemaError(
+                    cause=IncompatibleSchemaError.SCHEMA_ABSENT
+                )
             version = None
         else:
             version = _validate_schema_version_scalar(conn)
@@ -1877,14 +2009,22 @@ def _validate_connection_schema(
         ).fetchone()
     except IncompatibleSchemaError:
         raise
-    except sqlite3.DatabaseError:
-        raise IncompatibleSchemaError() from None
+    except sqlite3.DatabaseError as exc:
+        raise IncompatibleSchemaError(cause=_database_error_cause(exc)) from None
     if (
         generation_type != "integer"
         or type(generation) is not int
         or generation != TURN_FENCE_GENERATION
     ):
-        raise IncompatibleSchemaError()
+        raise IncompatibleSchemaError(
+            cause=(
+                IncompatibleSchemaError.FENCE_GENERATION_MISMATCH
+                if type(generation) is int and generation_type == "integer"
+                else IncompatibleSchemaError.SCHEMA_VERSION_UNREADABLE
+            ),
+            expected_generation=TURN_FENCE_GENERATION,
+            actual_generation=generation if type(generation) is int else None,
+        )
     return version
 
 
@@ -1923,8 +2063,20 @@ def _probe_existing_state_db_schema(
             # Its tables can still carry a durable rebuild marker, which the
             # post-open authority check fences before schema DDL runs.
             return None
+        elif (
+            isinstance(exc, sqlite3.OperationalError)
+            and "no such table: schema_version" in str(exc).lower()
+        ):
+            # Same condition as the branch above, reached when the caller does
+            # not accept an uninitialized store. The table is absent, which is
+            # a different fact from damaged — the class says so and the owner
+            # message merges them, so naming it costs nothing and keeps the
+            # site honest about what it measured.
+            raise IncompatibleSchemaError(
+                cause=IncompatibleSchemaError.SCHEMA_ABSENT
+            ) from None
         else:
-            raise IncompatibleSchemaError() from None
+            raise IncompatibleSchemaError(cause=_database_error_cause(exc)) from None
         if not _claim_repair_attempt(db_path):
             raise
         report = repair_state_db_schema(db_path)
@@ -1935,8 +2087,8 @@ def _probe_existing_state_db_schema(
         return probe()
     except IncompatibleSchemaError:
         raise
-    except sqlite3.DatabaseError:
-        raise IncompatibleSchemaError() from None
+    except sqlite3.DatabaseError as exc:
+        raise IncompatibleSchemaError(cause=_database_error_cause(exc)) from None
 
 
 def _canonical_state_db_home(db_path: Path) -> Optional[Path]:
@@ -5107,7 +5259,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     def ensure_compatible_schema(self) -> None:
         """Recheck this open connection without repairing or mutating state."""
         if self._conn is None:
-            raise IncompatibleSchemaError()
+            raise IncompatibleSchemaError(cause=IncompatibleSchemaError.NOT_OPEN)
         _validate_connection_schema(self._conn)
 
     # ── Read-path split ──
