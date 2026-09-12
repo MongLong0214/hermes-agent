@@ -21604,16 +21604,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # for this class, so in-place repair is not on offer and
                     # saying "try again" would be false — that was the
                     # regression review caught in the first remediation.
+                    # `--allow-partial` is named, not left to be discovered.
+                    # Page damage is precisely the class where `recoverable`
+                    # comes back false — it requires `sessions` and `messages`
+                    # to be *completely* readable — and a plain `--output` run
+                    # then refuses. Measured on a store with 124 zeroed page
+                    # regions: refused without the flag, and with it salvaged
+                    # 3,433 of 4,000 messages. "Rebuild what it can" IS that
+                    # flag's contract, so promising it without naming it is the
+                    # same shape as the schema-version dead end above.
                     return (
                         "⚠️ Session state is corrupt — SQLite reports the "
                         "database image itself as damaged, which no build "
                         "opens and no in-place repair will touch.\n"
                         "Run `hermes sessions recover --source "
                         "<path-to-state.db> --inspect-only` to see what is "
-                        "still readable, then the same command with `--output "
-                        "<new-db>` to rebuild what it can. It copies the file "
-                        "before reading it and never replaces the active "
-                        "database."
+                        "still readable. Then rebuild with `--output <new-db> "
+                        "--allow-partial` — plain `--output` refuses unless "
+                        "every canonical row is readable, which page damage "
+                        "usually breaks. It copies the file before reading it "
+                        "and never replaces the active database.\n"
+                        "If even that cannot read the table schemas, restore a "
+                        "backup: the damage is past what this tool salvages."
                     )
                 if cause in (
                     IncompatibleSchemaError.SCHEMA_VERSION_UNREADABLE,

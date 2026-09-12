@@ -278,8 +278,14 @@ def test_the_two_malformed_predicates_are_not_the_same_question():
     """The control for the case above: the predicates must actually differ here.
 
     If `_MALFORMED_SCHEMA_MARKERS` ever grew to include the corrupt-image
-    string, `STORE_CORRUPT` would become unreachable and the parametrised case
-    above would still pass — every message would simply land one bucket over.
+    string, `STORE_CORRUPT` would become unreachable.
+
+    This docstring used to claim the parametrised case above "would still pass,
+    every message simply landing one bucket over". Review measured it and that
+    is wrong: widening the narrow marker routes the corrupt string to
+    `STORE_DAMAGED`, so that case fails too. The control does more than it said
+    — it holds the predicates apart as a statement in its own right, rather than
+    only covering a gap.
     """
     corrupt = sqlite3.DatabaseError("database disk image is malformed")
     assert is_malformed_db_error(corrupt) is True
@@ -333,3 +339,105 @@ def test_recover_rebuilds_a_store_whose_schema_version_is_unusable(tmp_path):
     # One row, correct type, correct value — and the source is left alone.
     assert rows == [(SCHEMA_VERSION, "integer")]
     assert db.exists()
+
+
+def _corrupt_store(tmp_path, *, rows=4000, span=500 * 1024, stride=4096, width=300):
+    """A real store with real page damage, opened the way production opens it.
+
+    `STORE_CORRUPT` was guarded by one comparison of two constants against a
+    hand-written message string. `STORE_UNREADABLE` next to it has a real store,
+    a real sibling lock and a control — review pointed out the asymmetry and
+    that closing it costs a few lines, because page damage is constructible.
+
+    `timestamp` is REAL, not an ISO string. My first fixture wrote text there
+    and `--allow-partial` died on `could not convert string to float`, which
+    looked like a product refusal and was mine.
+    """
+    db = tmp_path / "state.db"
+    SessionDB(db).close()
+    conn = sqlite3.connect(db, isolation_level=None)
+    register_turn_fence_generation(conn)
+    # DELETE journalling so the damage is in the main file rather than a WAL
+    # that a checkpoint would rewrite.
+    conn.execute("PRAGMA journal_mode=DELETE")
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at) VALUES ('s1','cli',?)",
+        (1757635200.0,),
+    )
+    for index in range(rows):
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) "
+            "VALUES ('s1','user',?,?)",
+            ("x" * 200, 1757635200.0 + index),
+        )
+    conn.close()
+
+    size = db.stat().st_size
+    with open(db, "r+b") as handle:
+        offset = stride
+        while offset < min(size, span):
+            handle.seek(offset)
+            handle.write(b"\x00" * width)
+            offset += stride
+    return db
+
+
+def test_page_damage_reaches_store_corrupt_through_a_real_open(tmp_path):
+    """The database-level witness the class was missing."""
+    db = _corrupt_store(tmp_path)
+
+    # Through `SessionDB`, the way production opens it — not through the
+    # classifier with a string someone typed.
+    with pytest.raises(IncompatibleSchemaError) as excinfo:
+        SessionDB(db).close()
+
+    assert excinfo.value.cause == IncompatibleSchemaError.STORE_CORRUPT
+    # And SQLite's own account of it, so the marker tuple is not being trusted
+    # on faith.
+    assert "malformed" in str(_db_opens_cleanly(db))
+    # The transient wording must be unreachable here: this never clears.
+    assert "temporary" not in str(excinfo.value)
+
+
+def test_recovering_a_corrupt_store_needs_allow_partial(tmp_path):
+    """Why the owner message names `--allow-partial` rather than implying it.
+
+    `recoverable` requires `sessions` and `messages` to be *completely*
+    readable, and page damage is the class that breaks exactly that. A plain
+    `--output` run refuses; the flag salvages what survives. The message
+    promises "rebuild what it can", which is this flag's contract, so naming it
+    is what makes the promise true.
+    """
+    from hermes_cli.session_recovery import (
+        SessionRecoverySourceError,
+        inspect_session_database,
+        recover_session_database,
+    )
+
+    db = _corrupt_store(tmp_path)
+
+    report = inspect_session_database(db, work_dir=tmp_path)
+    assert report.get("recoverable") is False
+
+    with pytest.raises(SessionRecoverySourceError) as refusal:
+        recover_session_database(db, tmp_path / "plain.db", work_dir=tmp_path)
+    # The CLI hands over the flag, which is why this costs a step rather than
+    # stranding the owner — and why the message should have said it first.
+    assert "--allow-partial" in str(refusal.value)
+
+    recover_session_database(
+        db, tmp_path / "salvaged.db", work_dir=tmp_path, allow_partial=True
+    )
+    rebuilt = sqlite3.connect(tmp_path / "salvaged.db", isolation_level=None)
+    try:
+        messages = rebuilt.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        sessions = rebuilt.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+    finally:
+        rebuilt.close()
+
+    # Partial means partial: some rows are gone, and the point is that most are
+    # not. Measured at 3,433 of 4,000 on this damage; asserting a band rather
+    # than a number, because the exact count is SQLite's business.
+    assert sessions == 1
+    assert 0 < messages < 4000
+    assert messages > 2000

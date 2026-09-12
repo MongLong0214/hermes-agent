@@ -176,6 +176,13 @@ def test_schema_incompatible_owner_message(monkeypatch, tmp_path, case):
         assert "temporary" not in response
         assert "Try again" not in response
         assert "sessions repair" not in response
+        # Round 3: a plain `--output` run refuses on page damage, because
+        # `recoverable` needs every canonical row readable. The message promises
+        # "rebuild what it can", which is this flag's contract, so it has to
+        # name the flag or the second step fails on its own.
+        assert "--allow-partial" in response
+        # And a way out when even that cannot read the schemas.
+        assert "restore a backup" in response
         assert not any(char.isdigit() for char in response)
     elif case in ("schema_version_unreadable", "schema_absent"):
         # Measured: `hermes sessions repair` prints "opens cleanly — no repair
