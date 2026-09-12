@@ -1,0 +1,27 @@
+Limit: the cause is stated by the raising site, so a site that misclassifies its own failure gets confidently wrong advice rendered for it — the tests pin the nine sites that exist, not the classification of a tenth
+Ruled-out: passing expected_generation=SCHEMA_VERSION at the damage sites | the build number is always known, but naming it there tells the owner to find a release for a database no release opens
+Warn: the fence-generation check fires in either direction, so any message about it must not say the store is newer; that wording was hardcoded into the single message this change replaces
+Provenance: inherited 039ace130cb3cb1e29d7861ba43c4979535744ae
+
+Limit: STORE_UNREADABLE covers every DatabaseError that is not malformed schema, so a genuinely corrupt store whose first symptom is not malformed schema text gets "try again" before it gets a remedy; the retry costs one turn and the wrong-damage claim cost a rewrite
+Ruled-out: naming `hermes sessions repair` for a schema_version defect | measured — `_db_opens_cleanly` never reads that table, so the command reports the store clean and exits
+Ruled-out: keeping one STORE_DAMAGED cause and softening its wording | the wording was not the defect; a locked store and a corrupt store need different commands, and one cause cannot carry two
+Warn: the "does not cover this" sentence in gateway/run.py is load-bearing and pinned by test_sessions_repair_does_not_see_a_schema_version_defect; if repair gains that coverage, change both together
+Provenance: inherited d9646ca5bcbef94411fe5f25d8f2f168056de5a2
+
+Limit: STORE_CORRUPT rests on SQLite's message text, like every classifier here; a corrupt store whose first symptom is some other message still gets "try again" for one turn
+Ruled-out: widening _MALFORMED_SCHEMA_MARKERS to include the corrupt-image string | that predicate gates automatic in-place repair, which must keep failing closed on page damage; widening it would authorise the surgery, not fix the message
+Warn: is_malformed_schema_error is a gate on unattended repair, not a diagnosis; anything asking "what should the owner do" needs is_malformed_db_error as well, and reading the narrow one as broad produced this regression
+Provenance: inherited 78f278d8fd4527f91e4184767a1a0c7105c903f8
+
+Limit: the message now matches what `recover --allow-partial` does on the damage tier measured here; a store damaged past schema readability gets "restore a backup", which is true and is not a remedy this tool provides
+Ruled-out: leaving --allow-partial to be discovered from the CLI's error | that is one extra round trip in the state where every turn is already failing, and the message was promising the flag's behaviour while omitting its name
+Ruled-out: asserting an exact salvaged row count | 3,433 of 4,000 is SQLite's business, so the test asserts a band and that the source is untouched
+Warn: messages.timestamp is REAL; a fixture writing an ISO string there makes --allow-partial die in float conversion, which reads as a product refusal and is not one
+Provenance: inherited 9b090adc6f6f94b05978d8d02433b6d3fccfbcee
+
+Limit: the salvage assertion runs only where a `.recover`-capable sqlite3 exists, so CI proves the refusal and this machine proved the recovery; neither proves the other
+Ruled-out: keeping "restore a backup" as the next step after --allow-partial refuses | the CLI asks for a sqlite3 CLI first and can still salvage rows after one is installed, so a backup discards what is recoverable
+Ruled-out: asserting digit-freedom to keep the test simple | a command name with a digit in it is not a number being reported, and the proxy failed the first time a message needed one
+Warn: --allow-partial's page-level salvage shells out to the sqlite3 CLI's `.recover`, which is shell-only and missing from some builds; a test that asserts it succeeds is asserting a property of the host
+Provenance: inherited a4dace51efa6d851376de02845a64dc333626c05
