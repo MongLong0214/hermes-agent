@@ -21624,8 +21624,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "every canonical row is readable, which page damage "
                         "usually breaks. It copies the file before reading it "
                         "and never replaces the active database.\n"
-                        "If even that cannot read the table schemas, restore a "
-                        "backup: the damage is past what this tool salvages."
+                        "If it reports that it still needs readable table "
+                        "schemas, it is asking for a `.recover`-capable "
+                        "`sqlite3` on PATH — install one and re-run the same "
+                        "command; only if that fails too is a backup the "
+                        "remaining route."
                     )
                 if cause in (
                     IncompatibleSchemaError.SCHEMA_VERSION_UNREADABLE,

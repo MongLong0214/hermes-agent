@@ -425,6 +425,21 @@ def test_recovering_a_corrupt_store_needs_allow_partial(tmp_path):
     # stranding the owner — and why the message should have said it first.
     assert "--allow-partial" in str(refusal.value)
 
+    # The salvage half is host-dependent and says so. `--allow-partial` falls
+    # back to the sqlite3 CLI's `.recover`, which is shell-only and absent from
+    # some builds; this machine had 3.51.0 on PATH and salvaged 3,433 of 4,000
+    # messages, and CI's runner does not, where the same call refuses with
+    # "Install such a sqlite3 CLI … then re-run with --allow-partial".
+    #
+    # So the environment-independent fact is asserted above — plain `--output`
+    # refuses and hands over the flag — and the salvage is asserted only where
+    # it can run. Asserting it unconditionally is how a green local suite
+    # becomes a red CI one, which is exactly what happened.
+    from hermes_cli.session_lost_and_found import find_sqlite3_cli
+
+    if find_sqlite3_cli() is None:
+        pytest.skip("no .recover-capable sqlite3 CLI on PATH")
+
     recover_session_database(
         db, tmp_path / "salvaged.db", work_dir=tmp_path, allow_partial=True
     )

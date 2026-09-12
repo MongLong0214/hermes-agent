@@ -15,6 +15,7 @@ cases pin the command each cause actually needs.
 """
 
 import asyncio
+import re
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock
 
@@ -25,6 +26,18 @@ from gateway.config import GatewayConfig, Platform
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionEntry, SessionSource
 from hermes_state import IncompatibleSchemaError
+
+
+def _has_bare_number(text: str) -> bool:
+    """A digit that is not part of an identifier — i.e. a number being reported.
+
+    The property these cases assert is that a cause carrying no generations
+    leaks none, and `not any(char.isdigit())` was a proxy for it. The proxy
+    broke the moment a message had to name `sqlite3`: a digit inside a command
+    name is not a number the owner is being told. Anchoring on "not preceded by
+    a letter" keeps `sqlite3` and rejects `generation 41`.
+    """
+    return re.search(r"(?<![A-Za-z])\d", text) is not None
 
 
 @pytest.mark.parametrize(
@@ -166,7 +179,7 @@ def test_schema_incompatible_owner_message(monkeypatch, tmp_path, case):
         # refuses while a live writer holds the file. A remedy that fails on
         # its first attempt is the dead end this whole path is fixing.
         assert "hermes gateway stop" in response
-        assert not any(char.isdigit() for char in response)
+        assert not _has_bare_number(response)
     elif case == "store_corrupt":
         # SQLITE_CORRUPT: no in-place repair, and emphatically not "try again".
         # Round 2 caught this class falling through to the transient message.
@@ -181,9 +194,13 @@ def test_schema_incompatible_owner_message(monkeypatch, tmp_path, case):
         # "rebuild what it can", which is this flag's contract, so it has to
         # name the flag or the second step fails on its own.
         assert "--allow-partial" in response
-        # And a way out when even that cannot read the schemas.
-        assert "restore a backup" in response
-        assert not any(char.isdigit() for char in response)
+        # And the real next step when even that refuses: the CLI wants a
+        # `.recover`-capable sqlite3 on PATH, which is what it says itself. An
+        # earlier draft jumped straight to "restore a backup" and skipped the
+        # step that actually works.
+        assert "`.recover`-capable" in response
+        assert "sqlite3" in response
+        assert not _has_bare_number(response)
     elif case in ("schema_version_unreadable", "schema_absent"):
         # Measured: `hermes sessions repair` prints "opens cleanly — no repair
         # needed" for this store, because `_db_opens_cleanly` never reads
@@ -193,7 +210,7 @@ def test_schema_incompatible_owner_message(monkeypatch, tmp_path, case):
         assert "hermes sessions recover" in response
         assert "does not cover this" in response
         assert "report the store as clean" in response
-        assert not any(char.isdigit() for char in response)
+        assert not _has_bare_number(response)
     elif case == "store_unreadable":
         # A sibling holding the write lock reaches this. The store is healthy,
         # so the message must not claim damage and must not send the owner to
@@ -203,13 +220,13 @@ def test_schema_incompatible_owner_message(monkeypatch, tmp_path, case):
         assert "damaged" not in response
         assert "malformed" not in response
         assert "sessions recover" not in response
-        assert not any(char.isdigit() for char in response)
+        assert not _has_bare_number(response)
     elif case == "not_open":
         assert "hermes gateway restart" in response
         assert "sessions repair" not in response
-        assert not any(char.isdigit() for char in response)
+        assert not _has_bare_number(response)
     else:
         assert case == "unknown_cause"
         assert "compatible Hermes build" in response
         assert "sessions repair" not in response
-        assert not any(char.isdigit() for char in response)
+        assert not _has_bare_number(response)
