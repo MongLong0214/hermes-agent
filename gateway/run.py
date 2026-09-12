@@ -21576,16 +21576,56 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "Use the Hermes build whose turn-fence generation is "
                         f"{e.actual_generation} to open this session state."
                     )
-                if cause in (
-                    IncompatibleSchemaError.STORE_DAMAGED,
-                    IncompatibleSchemaError.SCHEMA_ABSENT,
-                ):
+                if cause == IncompatibleSchemaError.STORE_DAMAGED:
+                    # `hermes sessions repair` is named only here, because this
+                    # is the only cause it repairs: the classifier is
+                    # `is_malformed_schema_error`, the same predicate the state
+                    # module uses to decide whether runtime repair may run.
                     return (
-                        "⚠️ Session state could not be validated — the store "
-                        "itself is damaged, so no Hermes build will open it.\n"
+                        "⚠️ Session state schema is malformed, so no Hermes "
+                        "build will open it.\n"
                         "Run `hermes sessions repair --check-only` to see what "
                         "is wrong, then `hermes sessions repair` to fix it "
                         "(it makes a timestamped backup first)."
+                    )
+                if cause in (
+                    IncompatibleSchemaError.SCHEMA_VERSION_UNREADABLE,
+                    IncompatibleSchemaError.SCHEMA_ABSENT,
+                ):
+                    # NOT `hermes sessions repair`. Measured on a store with
+                    # two `schema_version` rows: it prints "opens cleanly — no
+                    # repair needed" and exits, because `_db_opens_cleanly`
+                    # never reads `schema_version` and `repair_state_db_schema`
+                    # never writes it. Naming it here would send the owner in a
+                    # circle, which is the defect this whole path is fixing.
+                    #
+                    # `hermes sessions recover` does fix it, measured end to
+                    # end on the same store: two rows in, one correct row out,
+                    # in a new database, with the active one untouched.
+                    return (
+                        "⚠️ Session state does not record a usable schema "
+                        "version, so no Hermes build will open it.\n"
+                        "`hermes sessions repair` does not cover this and will "
+                        "report the store as clean. Run `hermes sessions "
+                        "recover --source <path-to-state.db> --inspect-only` "
+                        "first, then the same command with `--output <new-db>` "
+                        "to rebuild it. The active database is never replaced "
+                        "automatically."
+                    )
+                if cause == IncompatibleSchemaError.STORE_UNREADABLE:
+                    # Do not assert damage. `OperationalError` is a
+                    # `DatabaseError`, so this cause covers `database is
+                    # locked` and `disk i/o error` — measured: a sibling
+                    # holding BEGIN EXCLUSIVE on a non-WAL store lands here
+                    # with the store perfectly healthy. Sending that owner to
+                    # a backup-and-rewrite is worse than saying nothing.
+                    return (
+                        "⚠️ Session state could not be read to check its "
+                        "schema. This is often temporary — another process "
+                        "holding the write lock, or a transient I/O error.\n"
+                        "Try again. If it keeps happening, run `hermes "
+                        "sessions repair --check-only`, which inspects the "
+                        "store without modifying it."
                     )
                 if cause == IncompatibleSchemaError.NOT_OPEN:
                     return (

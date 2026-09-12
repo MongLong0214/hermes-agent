@@ -8,7 +8,10 @@ fixed by a different build; the other three are damage, and the old single
 message told the owner to go find a release for those too.
 
 So each case asserts the advice, not merely that a schema message appeared.
-A test that only checks for the word "schema" passes on advice that cannot work.
+A test that only checks for the word "schema" passes on advice that cannot work
+— and the first version of this file proved it, by asserting `hermes sessions
+repair` for a store that command reports as clean. Review caught it; these
+cases pin the command each cause actually needs.
 """
 
 import asyncio
@@ -30,6 +33,8 @@ from hermes_state import IncompatibleSchemaError
         "build_too_old",
         "fence_mismatch",
         "store_damaged",
+        "schema_version_unreadable",
+        "store_unreadable",
         "schema_absent",
         "not_open",
         "unknown_cause",
@@ -78,6 +83,14 @@ def test_schema_incompatible_owner_message(monkeypatch, tmp_path, case):
     elif case == "store_damaged":
         error = IncompatibleSchemaError(
             cause=IncompatibleSchemaError.STORE_DAMAGED
+        )
+    elif case == "schema_version_unreadable":
+        error = IncompatibleSchemaError(
+            cause=IncompatibleSchemaError.SCHEMA_VERSION_UNREADABLE
+        )
+    elif case == "store_unreadable":
+        error = IncompatibleSchemaError(
+            cause=IncompatibleSchemaError.STORE_UNREADABLE
         )
     elif case == "schema_absent":
         error = IncompatibleSchemaError(
@@ -137,12 +150,33 @@ def test_schema_incompatible_owner_message(monkeypatch, tmp_path, case):
             assert "newer" not in response
         else:
             assert "newer" in response
-    elif case in ("store_damaged", "schema_absent"):
-        # No build opens a damaged store. Sending the owner after a release
-        # is the wrong action, and it hides the right one.
+    elif case == "store_damaged":
+        # Malformed schema text is the one shape `hermes sessions repair`
+        # repairs, so it is the only cause allowed to name that command.
         assert "hermes sessions repair --check-only" in response
-        assert "damaged" in response
+        assert "malformed" in response
         assert "no Hermes build will open it" in response
+        assert "sessions recover" not in response
+        assert not any(char.isdigit() for char in response)
+    elif case in ("schema_version_unreadable", "schema_absent"):
+        # Measured: `hermes sessions repair` prints "opens cleanly — no repair
+        # needed" for this store, because `_db_opens_cleanly` never reads
+        # `schema_version`. So the message must name `recover` AND say plainly
+        # that repair does not cover it — otherwise the owner tries repair
+        # first, is told the store is fine, and is back where they started.
+        assert "hermes sessions recover" in response
+        assert "does not cover this" in response
+        assert "report the store as clean" in response
+        assert not any(char.isdigit() for char in response)
+    elif case == "store_unreadable":
+        # A sibling holding the write lock reaches this. The store is healthy,
+        # so the message must not claim damage and must not send the owner to
+        # anything that rewrites the file.
+        assert "temporary" in response
+        assert "Try again" in response
+        assert "damaged" not in response
+        assert "malformed" not in response
+        assert "sessions recover" not in response
         assert not any(char.isdigit() for char in response)
     elif case == "not_open":
         assert "hermes gateway restart" in response

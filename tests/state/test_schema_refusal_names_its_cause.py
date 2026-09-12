@@ -7,16 +7,26 @@ proves nothing about which cause a real database produces. These cases enter
 through `_validate_schema_version_scalar` and `_validate_connection_schema`
 with real SQLite connections and real damage.
 
-The distinction that matters: `BUILD_TOO_OLD` and `FENCE_GENERATION_MISMATCH`
-are skews a different build fixes. Every other shape here is damage that no
-build opens, and answering it with build advice is what `#784` was about.
+The distinction that matters is not build-versus-damage. It is **which command
+the owner should run**, and a blind review caught the first version of this
+change getting that wrong in two places:
+
+    STORE_DAMAGED              malformed schema text -> `hermes sessions repair`
+    SCHEMA_VERSION_UNREADABLE  the scalar is wrong   -> `hermes sessions recover`
+    STORE_UNREADABLE           locked / transient    -> retry; assert nothing
+
+Measured, because the first version asserted rather than measured: `hermes
+sessions repair --check-only` on a store with two `schema_version` rows prints
+*"opens cleanly — no repair needed"* — `_db_opens_cleanly` never reads that
+table. And a sibling holding `BEGIN EXCLUSIVE` on a non-WAL store raised the
+same refusal as real corruption, so a healthy store was reported damaged.
 """
 
 import sqlite3
 
 import pytest
 
-from hermes_state import IncompatibleSchemaError
+from hermes_state import IncompatibleSchemaError, SessionDB, _db_opens_cleanly
 from hermes_state import _validate_connection_schema, _validate_schema_version_scalar
 from hermes_state_common import (
     SCHEMA_VERSION,
@@ -51,15 +61,19 @@ def _conn(*, version=None, version_sql=None, rows=1, fence=TURN_FENCE_GENERATION
         ({"version": SCHEMA_VERSION + 1}, IncompatibleSchemaError.BUILD_TOO_OLD,
          (SCHEMA_VERSION, SCHEMA_VERSION + 1)),
         # Two rows: there is no single stored version to compare against.
+        # This is the shape `hermes sessions repair` reports as clean.
         ({"version": SCHEMA_VERSION, "rows": 2},
-         IncompatibleSchemaError.STORE_DAMAGED, (None, None)),
+         IncompatibleSchemaError.SCHEMA_VERSION_UNREADABLE, (None, None)),
         # Zero rows: same.
         ({"version": SCHEMA_VERSION, "rows": 0},
-         IncompatibleSchemaError.STORE_DAMAGED, (None, None)),
-        # Stored as TEXT. A build at that number would still not open it.
-        ({"version_sql": "'29'"}, IncompatibleSchemaError.STORE_DAMAGED,
-         (None, None)),
-        ({"version": -1}, IncompatibleSchemaError.STORE_DAMAGED, (None, None)),
+         IncompatibleSchemaError.SCHEMA_VERSION_UNREADABLE, (None, None)),
+        # Non-numeric TEXT. Production DDL is `version INTEGER NOT NULL`, which
+        # coerces '29' to the integer 29 — so the numeric spelling is not a
+        # reachable store and this uses a value no affinity can convert.
+        ({"version_sql": "'twenty-nine'"},
+         IncompatibleSchemaError.SCHEMA_VERSION_UNREADABLE, (None, None)),
+        ({"version": -1},
+         IncompatibleSchemaError.SCHEMA_VERSION_UNREADABLE, (None, None)),
     ],
 )
 def test_scalar_validation_names_its_cause(kwargs, cause, generations):
@@ -117,7 +131,7 @@ def test_a_fence_skew_carries_both_numbers_in_either_direction(stored):
     assert "newer" not in str(error)
 
 
-def test_a_non_integer_fence_generation_is_damage_not_a_skew():
+def test_a_non_integer_fence_generation_is_unreadable_not_a_skew():
     """A fence scalar returning TEXT has no generation to name a build by."""
     conn = _conn(version=SCHEMA_VERSION, fence="twenty-nine")
     try:
@@ -125,19 +139,95 @@ def test_a_non_integer_fence_generation_is_damage_not_a_skew():
             _validate_connection_schema(conn)
     finally:
         conn.close()
-    assert excinfo.value.cause == IncompatibleSchemaError.STORE_DAMAGED
+    assert excinfo.value.cause == IncompatibleSchemaError.SCHEMA_VERSION_UNREADABLE
     assert excinfo.value.actual_generation is None
     assert "None" not in str(excinfo.value)
 
 
-def test_a_database_error_from_the_select_is_damage():
-    """No schema_master at all: the validating SELECT itself fails."""
+def test_a_database_error_that_is_not_malformed_schema_is_unreadable():
+    """An OperationalError from the SELECT is not evidence of damage."""
     conn = _conn(version=SCHEMA_VERSION, fence=None)
     try:
         # The fence scalar is unregistered, so the SELECT raises
-        # OperationalError — a sqlite3.DatabaseError, not a version skew.
+        # OperationalError — a sqlite3.DatabaseError, and not corruption.
         with pytest.raises(IncompatibleSchemaError) as excinfo:
             _validate_connection_schema(conn)
     finally:
         conn.close()
-    assert excinfo.value.cause == IncompatibleSchemaError.STORE_DAMAGED
+    assert excinfo.value.cause == IncompatibleSchemaError.STORE_UNREADABLE
+    # The wording must not claim damage: the owner acts on this sentence.
+    assert "damaged" not in str(excinfo.value)
+    assert "malformed" not in str(excinfo.value)
+
+
+def test_a_locked_store_is_unreadable_not_damaged(tmp_path):
+    """The blocking case from review: a healthy store held by a sibling.
+
+    `sqlite3.OperationalError` is a `sqlite3.DatabaseError`, so `database is
+    locked` reached the same refusal as real corruption. The old single message
+    then told the owner the store was damaged and to run a rewriting repair —
+    both false, and the store opens on the next attempt.
+    """
+    db = tmp_path / "state.db"
+    seed = sqlite3.connect(db, isolation_level=None)
+    seed.execute("PRAGMA journal_mode=DELETE")
+    seed.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
+    seed.execute("INSERT INTO schema_version VALUES (?)", (SCHEMA_VERSION,))
+    seed.close()
+
+    holder = sqlite3.connect(db, isolation_level=None, timeout=0)
+    holder.execute("BEGIN EXCLUSIVE")
+    victim = sqlite3.connect(db, isolation_level=None, timeout=0)
+    register_turn_fence_generation(victim)
+    try:
+        with pytest.raises(IncompatibleSchemaError) as excinfo:
+            _validate_connection_schema(victim)
+    finally:
+        victim.close()
+        holder.rollback()
+        holder.close()
+
+    assert excinfo.value.cause == IncompatibleSchemaError.STORE_UNREADABLE
+    assert "damaged" not in str(excinfo.value)
+
+    # The control that makes this a measurement: the very same store validates
+    # once the lock is gone. Without it, "unreadable" could be masking a store
+    # that was genuinely broken all along.
+    survivor = sqlite3.connect(db, isolation_level=None)
+    register_turn_fence_generation(survivor)
+    try:
+        assert _validate_connection_schema(survivor) == SCHEMA_VERSION
+    finally:
+        survivor.close()
+
+
+def test_sessions_repair_does_not_see_a_schema_version_defect(tmp_path):
+    """Why `SCHEMA_VERSION_UNREADABLE` must not name `hermes sessions repair`.
+
+    Both entry points for that command gate on `_db_opens_cleanly` and return
+    early with "opens cleanly — no repair needed" when it answers `None`. That
+    probe checks `journal_mode`, `integrity_check`, a `sessions` count and the
+    FTS index — it never reads `schema_version`, and `repair_state_db_schema`
+    never writes it.
+
+    So this pins the measurement the owner message rests on. If someone teaches
+    the repair path to cover this, the assertion below fails, and the message in
+    `gateway/run.py` that says "does not cover this" has to change with it.
+    """
+    db = tmp_path / "state.db"
+    SessionDB(db).close()
+    conn = sqlite3.connect(db, isolation_level=None)
+    conn.execute("INSERT INTO schema_version VALUES (?)", (SCHEMA_VERSION,))
+    conn.close()
+
+    # The refusal the gateway will render.
+    probe = sqlite3.connect(db, isolation_level=None)
+    try:
+        with pytest.raises(IncompatibleSchemaError) as excinfo:
+            _validate_schema_version_scalar(probe)
+    finally:
+        probe.close()
+    assert excinfo.value.cause == IncompatibleSchemaError.SCHEMA_VERSION_UNREADABLE
+
+    # And the command an earlier draft of that message named, which sees nothing.
+    assert _db_opens_cleanly(db) is None
