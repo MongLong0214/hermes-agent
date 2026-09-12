@@ -1318,6 +1318,31 @@ class SessionSchemaMixin:
             raise RuntimeError("turn-fence trigger declaration is incomplete")
         expected = dict(definitions)
         with self.write_transaction():
+            # Drop what EXISTS, not what this build declares. Dropping only the declared names
+            # means a rename leaves the previous family in place, on the same governed tables,
+            # known to no code: the `hermes_` prefix was removed at some point and the live
+            # database still carried 24 `hermes_turn_fence_*` triggers beside 30 current ones
+            # (#757). They are harmless only by accident -- their bodies are a bare
+            # `SELECT hermes_turn_fence_generation();`, which passes whenever the UDF is
+            # registered -- and nothing would have removed them.
+            #
+            # Scanning `sqlite_master` makes the orphan state unreachable rather than tidied up
+            # afterwards. It also covers the reverse case the old loop could not: a fence this
+            # build no longer declares at all, because a table left `TURN_FENCE_GOVERNED_TABLES`.
+            #
+            # `LIKE '%turn_fence%'` is the boundary, and it holds only while every fence trigger
+            # carries that substring. A future rename that drops it recreates this defect, so the
+            # verification below is deliberately the one that would notice: it compares the whole
+            # declared set against what is installed.
+            existing_fences = [
+                row[0]
+                for row in cursor.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type = 'trigger' AND name LIKE '%turn_fence%'"
+                ).fetchall()
+            ]
+            for name in existing_fences:
+                cursor.execute(f'DROP TRIGGER IF EXISTS "{name}"')
             for name, _sql in definitions:
                 cursor.execute(f"DROP TRIGGER IF EXISTS {name}")
             for _name, sql in definitions:

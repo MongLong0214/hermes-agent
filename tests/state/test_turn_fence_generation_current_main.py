@@ -6,7 +6,11 @@ import pytest
 
 import hermes_state
 from hermes_state import SCHEMA_SQL, SessionDB
-from hermes_state_common import TURN_FENCE_GENERATION, TURN_FENCE_GOVERNED_TABLES
+from hermes_state_common import (
+    TURN_FENCE_GENERATION,
+    TURN_FENCE_GOVERNED_TABLES,
+    TURN_FENCE_OPERATIONS,
+)
 
 
 class _FailAfterOneTurnFenceTriggerCursor(sqlite3.Cursor):
@@ -418,3 +422,52 @@ def test_v28_fence_install_failure_rolls_back_a_populated_v27_upgrade(tmp_path, 
         ] == [("v27-a", "cli", 1.0), ("v27-b", "cli", 1.0)]
     finally:
         check.close()
+
+
+def test_renamed_fence_family_is_dropped_rather_than_orphaned(tmp_path, monkeypatch):
+    """#757: the delta drops what exists, not only the names this build declares.
+
+    Dropping only declared names means a rename leaves the previous family installed on the
+    same governed tables, known to no code. Measured on the live deployment before this fix:
+    24 `hermes_turn_fence_*` triggers beside 30 current ones. They pass only by accident —
+    their bodies are a bare `SELECT hermes_turn_fence_generation();`, which succeeds whenever
+    the UDF is registered — and nothing in the codebase would ever have removed them.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    db_path = tmp_path / "state.db"
+    SessionDB(db_path=db_path)
+
+    fences = (
+        "SELECT name FROM sqlite_master "
+        "WHERE type = 'trigger' AND name LIKE '%turn_fence%'"
+    )
+
+    # Plant an orphan shaped exactly like what a rename leaves behind: the old prefix, a body
+    # that only calls the UDF, on a governed table.
+    seed = sqlite3.connect(str(db_path))
+    seed.execute(
+        "CREATE TRIGGER hermes_turn_fence_orphan_probe BEFORE INSERT ON sessions "
+        "BEGIN SELECT hermes_turn_fence_generation(); END"
+    )
+    # Force the delta to run again on the next open.
+    seed.execute("DELETE FROM schema_version")
+    seed.execute("INSERT INTO schema_version (version) VALUES (1)")
+    seed.commit()
+    planted = [row[0] for row in seed.execute(fences).fetchall()]
+    seed.close()
+
+    assert "hermes_turn_fence_orphan_probe" in planted
+
+    SessionDB(db_path=db_path)
+
+    check = sqlite3.connect(str(db_path))
+    remaining = [row[0] for row in check.execute(fences).fetchall()]
+    check.close()
+
+    # The orphan is gone, and the declared family is intact — the point is both, because a
+    # sweep that removed everything and rebuilt nothing would also pass the first assertion.
+    assert "hermes_turn_fence_orphan_probe" not in remaining
+    # Derived from the same two constants the delta checks itself against, never a literal:
+    # I wrote 5 here first and the test caught it at 30 vs 50.
+    assert len(remaining) == len(TURN_FENCE_GOVERNED_TABLES) * len(TURN_FENCE_OPERATIONS)
+    assert all(name.startswith("turn_fence_") for name in remaining)
