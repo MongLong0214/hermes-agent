@@ -108,6 +108,173 @@ def cold(tmp_path, monkeypatch):
     runner.session_store.close_all_db_handles()
 
 
+async def telegram_handoff(cold, monkeypatch, *, external=False):
+    """Enter the real Telegram cache guard with the cold actor's signature."""
+    import gateway.run as gateway_run
+    import run_agent
+    from gateway.run import TurnRunner
+    from gateway.turn_context import TurnContext
+
+    runner = cold.runner
+    cached = runner._agent_cache[cold.entry.session_key]
+    kwargs = cold.constructors[0]
+    ctx = TurnContext(
+        source=cold.entry.origin, message="continue on Telegram",
+        history=cold.db.get_messages_as_conversation(cold.entry.session_id),
+        context_prompt=kwargs["ephemeral_system_prompt"],
+        session_id=cold.entry.session_id, session_key=cold.entry.session_key,
+        user_config=gateway_run._load_gateway_config(),
+        enabled_toolsets=kwargs["enabled_toolsets"],
+        disabled_toolsets=kwargs["disabled_toolsets"], AIAgent=run_agent.AIAgent,
+        resolve_display_setting=lambda *_: False, _run_still_current=lambda: True,
+        _hooks_ref=runner.hooks,
+    )
+    signature = runner._agent_config_signature
+
+    def verify_signature(*args, **kw):
+        actual = signature(*args, **kw)
+        assert actual == cached[1], "handoff configuration drift"
+        return actual
+
+    class ExternalInvalidation(Exception):
+        pass
+
+    def rebuild(*args, **kw):
+        if external:
+            raise ExternalInvalidation
+        pytest.fail(f"Telegram rebuilt cold actor: cache={cached[2]}, "
+                    f"DB={cold.db.get_session(cold.entry.session_id)['message_count']}")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(runner, "_agent_config_signature", verify_signature)
+        patch.setattr(runner, "_construct_gateway_agent", rebuild)
+        patch.setattr(runner, "_release_evicted_agent_soft", lambda actor: None)
+        if external:
+            with pytest.raises(ExternalInvalidation):
+                await asyncio.to_thread(TurnRunner(runner, ctx).run_sync)
+            assert cold.entry.session_key not in runner._agent_cache
+        else:
+            await asyncio.to_thread(TurnRunner(runner, ctx).run_sync)
+            assert runner._agent_cache[cold.entry.session_key][0] is cached[0]
+
+
+@pytest.mark.parametrize("external_at", [None, "before", "during", "after"])
+def test_cold_to_telegram_owns_only_its_persisted_count(cold, monkeypatch, external_at):
+    def external_write():
+        cold.db.append_message(cold.entry.session_id, role="user", content="external writer")
+
+    construct = cold.runner._construct_gateway_agent
+
+    def observed(*args, **kwargs):
+        actor = construct(*args, **kwargs)
+        run = actor.run_conversation
+
+        def run_observed(*a, **kw):
+            if external_at == "before":
+                external_write()
+            result = run(*a, **kw)
+            if external_at == "during":
+                external_write()
+            return result
+
+        actor.run_conversation = run_observed
+        return actor
+
+    monkeypatch.setattr(cold.runner, "_construct_gateway_agent", observed)
+
+    async def exercise():
+        async with TestClient(TestServer(cold.app)) as client:
+            assert (await post(client, cold.payload))[0] == 200, cold.errors
+            if external_at is None:
+                # Also preserve a canonical warm turn before ordinary Telegram.
+                assert (await post(client, {**cold.payload, "event_id": "warm"}))[0] == 200
+        if external_at == "after":
+            external_write()
+        await telegram_handoff(cold, monkeypatch, external=external_at is not None)
+        if external_at is None:
+            assert len(cold.constructors) == 1
+            assert len(cold.provider_calls) == 3
+            for before, after in zip(cold.provider_calls, cold.provider_calls[1:]):
+                assert after["messages"][:len(before["messages"])] == before["messages"]
+                assert after.get("tools") == before.get("tools")
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("external", [False, True])
+def test_cancelled_late_persistence_reconciles_before_lease_release(cold, monkeypatch, external):
+    import threading
+    from gateway.canonical_surface import CanonicalIngressEvent, request_local_reply_sink
+
+    async def exercise():
+        runner = cold.runner
+        loop = asyncio.get_running_loop()
+        entered, interrupted = asyncio.Event(), asyncio.Event()
+        release = threading.Event()
+        construct = runner._construct_gateway_agent
+        release_lease = runner._turn_leases.release
+        counts_at_release = []
+
+        def observed(*args, **kwargs):
+            actor = construct(*args, **kwargs)
+            flush = actor._flush_messages_to_session_db
+            interrupt = actor.interrupt
+            blocked = False
+
+            def late_flush(messages, *a, **kw):
+                nonlocal blocked
+                if not blocked and any(m.get("content") == "restored terminal" for m in messages):
+                    blocked = True
+                    loop.call_soon_threadsafe(entered.set)
+                    assert release.wait(10)
+                    if external:
+                        cold.db.append_message(cold.entry.session_id, role="user", content="external during cancel")
+                return flush(messages, *a, **kw)
+
+            def stop(**kw):
+                interrupt(**kw)
+                interrupted.set()
+
+            actor._flush_messages_to_session_db = late_flush
+            actor.interrupt = stop
+            return actor
+
+        def observe_release(token):
+            counts_at_release.append((
+                runner._agent_cache[cold.entry.session_key][2],
+                cold.db.get_session(cold.entry.session_id)["message_count"],
+            ))
+            return release_lease(token)
+
+        monkeypatch.setattr(runner, "_construct_gateway_agent", observed)
+        monkeypatch.setattr(runner._turn_leases, "release", observe_release)
+        task = asyncio.create_task(runner.run_bound_existing_turn(
+            runner.config.canonical_surface_bindings["bound"], CanonicalIngressEvent(**cold.payload),
+            cold.entry, reply_sink=request_local_reply_sink(lambda result: None),
+        ))
+        try:
+            await asyncio.wait_for(entered.wait(), 10)
+            task.cancel()
+            await asyncio.wait_for(interrupted.wait(), 10)
+            assert not task.done()
+            assert counts_at_release == []
+            assert runner._turn_leases._leases[cold.entry.session_id].holder is not None
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
+        assert task.cancelled()
+        assert counts_at_release == ([(2, 5)] if external else [(4, 4)])
+        assert cold.db.get_messages_as_conversation(cold.entry.session_id)[-1]["content"] == "restored terminal"
+        await telegram_handoff(cold, monkeypatch, external=external)
+        if not external:
+            assert len(cold.constructors) == 1
+            before, after = cold.provider_calls
+            assert after["messages"][:len(before["messages"])] == before["messages"]
+            assert after.get("tools") == before.get("tools")
+
+    asyncio.run(exercise())
+
+
 async def post(client, payload):
     response = await client.post("/v1/canonical-surface/events", headers={"Authorization": "Bearer test-key"}, json=payload)
     return response.status, await response.json()

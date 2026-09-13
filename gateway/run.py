@@ -19610,13 +19610,51 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 history = await self.async_session_store.load_transcript(entry.session_id)
                 agent_history, _ = _build_gateway_agent_history(history)
                 self._init_cached_agent_for_turn(agent, 0)
-                result = await self._await_canonical_worker(
-                    agent.run_conversation,
-                    event.text,
-                    on_cancel=lambda: agent.interrupt(hard_cancel=True),
-                    conversation_history=agent_history,
-                    task_id=entry.session_id,
-                )
+                with self._agent_cache_lock:
+                    count_owner = self._agent_cache.get(entry.session_key)
+                history_prefix = tuple(agent_history)
+                prior_flush = getattr(agent, "_db_flush_scan_prefix", None)
+                try:
+                    result = await self._await_canonical_worker(
+                        agent.run_conversation,
+                        event.text,
+                        on_cancel=lambda: agent.interrupt(hard_cancel=True),
+                        conversation_history=agent_history,
+                        task_id=entry.session_id,
+                    )
+                finally:
+                    # The await also drains cancelled/late persistence workers.
+                    # Advance only this actor's durable append delta, never copy
+                    # the DB count: an external append must still invalidate it.
+                    # Compression/repair without an identity-preserved history
+                    # prefix cannot prove ownership and keeps the old baseline.
+                    flushed = getattr(agent, "_db_flush_scan_prefix", None)
+                    if (
+                        isinstance(count_owner, tuple) and len(count_owner) == 4
+                        and count_owner[0] is agent
+                        and count_owner[3] == entry.session_id == agent.session_id
+                        and type(count_owner[2]) is int
+                        and isinstance(flushed, list) and flushed is not prior_flush
+                        and len(flushed) >= len(history_prefix)
+                        and all(a is b for a, b in zip(history_prefix, flushed))
+                    ):
+                        owned_count = sum(
+                            isinstance(message, dict) and message.get("_db_persisted") is True
+                            for message in flushed[len(history_prefix):]
+                        )
+                        expected_count = count_owner[2] + owned_count
+                        try:
+                            row = self.session_store._db.get_session(entry.session_id)
+                            if row and row.get("message_count") == expected_count:
+                                with self._agent_cache_lock:
+                                    if self._agent_cache.get(entry.session_key) is count_owner:
+                                        self._agent_cache[entry.session_key] = (
+                                            agent, count_owner[1], expected_count, entry.session_id,
+                                        )
+                        except Exception:
+                            # Cache bookkeeping must not mask cancellation or
+                            # turn errors; an unproven baseline stays invalidatable.
+                            logger.debug("Canonical cache count reconciliation failed", exc_info=True)
                 boundary = getattr(agent, "_persist_user_message_idx", None)
                 if isinstance(boundary, bool) or not isinstance(boundary, int):
                     raise ValueError("canonical_turn_refused")
