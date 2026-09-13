@@ -5753,7 +5753,8 @@ class TurnRunner:
 
         if agent is None:
             # Config changed or first message — create fresh agent
-            agent = ctx.AIAgent(
+            agent = self._runner._construct_gateway_agent(
+                ctx.AIAgent,
                 model=turn_route["model"],
                 **turn_route["runtime"],
                 **_checkpoint_agent_kwargs(ctx.user_config),
@@ -5767,29 +5768,10 @@ class TurnRunner:
                 reasoning_config=reasoning_config,
                 service_tier=self._runner._service_tier,
                 request_overrides=turn_route.get("request_overrides"),
-                providers_allowed=pr.get("only"),
-                providers_ignored=pr.get("ignore"),
-                providers_order=pr.get("order"),
-                provider_sort=pr.get("sort"),
-                provider_require_parameters=pr.get("require_parameters", False),
-                provider_data_collection=pr.get("data_collection"),
                 session_id=ctx.session_id,
-                platform=platform_key,
-                user_id=ctx.source.user_id,
-                user_id_alt=ctx.source.user_id_alt,
-                user_name=ctx.source.user_name,
-                chat_id=ctx.source.chat_id,
-                chat_name=ctx.source.chat_name,
-                chat_type=ctx.source.chat_type,
-                thread_id=ctx.source.thread_id,
-                gateway_session_key=ctx.session_key,
-                session_db=getattr(self._runner._session_db, "_db", self._runner._session_db),
-                # Reload from disk — do not reuse the startup snapshot (#60955).
-                fallback_model=self._runner._refresh_fallback_model(),
+                source=ctx.source,
+                session_key=ctx.session_key,
                 skip_context_files=skip_context_files,
-                # Keep the persona even with minimal context: soul identity is
-                # a single small file, not part of the expensive walk.
-                load_soul_identity=True,
             )
             if _cache_lock and _cache is not None:
                 with _cache_lock:
@@ -19423,34 +19405,198 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             raise ValueError("canonical_turn_refused")
         return CanonicalTurnResult(binding_name=binding_name, terminal_text=terminal)
 
+    def _construct_gateway_agent(
+        self, agent_class, *, source, session_key, session_id, **kwargs
+    ):
+        """Shared gateway actor construction; callers own admission and caching."""
+        pr = self._provider_routing
+        return agent_class(
+            **kwargs,
+            session_id=session_id,
+            platform="cli" if source.platform == Platform.LOCAL else source.platform.value,
+            user_id=source.user_id, user_id_alt=source.user_id_alt,
+            user_name=source.user_name, chat_id=source.chat_id,
+            chat_name=source.chat_name, chat_type=source.chat_type,
+            thread_id=source.thread_id, gateway_session_key=session_key,
+            session_db=getattr(self._session_db, "_db", self._session_db),
+            fallback_model=self._refresh_fallback_model(),
+            load_soul_identity=True,
+            providers_allowed=pr.get("only"), providers_ignored=pr.get("ignore"),
+            providers_order=pr.get("order"), provider_sort=pr.get("sort"),
+            provider_require_parameters=pr.get("require_parameters", False),
+            provider_data_collection=pr.get("data_collection"),
+        )
+
+    def _restore_bound_existing_agent(self, binding, event):
+        """Cold-only initialization inside the existing session turn lease."""
+        from agent.skill_utils import parse_config_string_list
+        from gateway.canonical_surface import ExistingCanonicalBindingResolver
+        from run_agent import AIAgent
+
+        resolver = ExistingCanonicalBindingResolver(self.session_store)
+        entry = resolver.resolve(binding, event)
+        source = entry.origin
+        config = _load_gateway_config()
+        platform_key = _platform_config_key(source.platform)
+        enabled = self._resolve_enabled_toolsets_for_source(config, source, platform_key)
+        disabled = parse_config_string_list((config.get("agent") or {}).get("disabled_toolsets")) or None
+        model, runtime = self._resolve_session_agent_runtime(
+            source=source, session_key=entry.session_key, user_config=config,
+        )
+        route = self._resolve_turn_agent_config(event.text, model, runtime)
+        context = build_session_context(source, self.config, entry)
+        prompt = self._pinned_session_context_prompt(
+            context, bool((config.get("privacy") or {}).get("redact_pii", False)), entry.session_key,
+        ) or ""
+        channel_prompt = self._get_system_prompt_for_channel(
+            source.platform, source.chat_id or "", thread_id=source.thread_id,
+            parent_id=source.parent_chat_id,
+        )
+        if channel_prompt:
+            prompt = (prompt + "\n\n" + channel_prompt).strip()
+        platforms = (config.get("gateway") or {}).get("platforms") or {}
+        skip_context = bool((platforms.get(platform_key) or {}).get("skip_context_files")) if isinstance(platforms, dict) else False
+        signature = self._agent_config_signature(
+            route["model"], route["runtime"], enabled, prompt,
+            cache_keys=self._extract_cache_busting_config(config),
+            user_id=source.user_id, user_id_alt=source.user_id_alt,
+            skip_context_files=skip_context,
+        )
+        agent = self._construct_gateway_agent(
+            AIAgent, source=source, session_key=entry.session_key, session_id=entry.session_id,
+            model=route["model"], **route["runtime"], **_checkpoint_agent_kwargs(config),
+            max_iterations=_current_max_iterations(), quiet_mode=True, verbose_logging=False,
+            enabled_toolsets=enabled, disabled_toolsets=disabled,
+            ephemeral_system_prompt=prompt or None, prefill_messages=self._prefill_messages or None,
+            reasoning_config=self._resolve_session_reasoning_config(
+                source=source, session_key=entry.session_key, model=model,
+            ),
+            service_tier=self._resolve_session_service_tier(source=source, session_key=entry.session_key),
+            request_overrides=route.get("request_overrides"), skip_context_files=skip_context,
+        )
+        try:
+            # Construction may block on provider initialization. Revalidate the
+            # exact server binding before publishing an actor or loading history.
+            resolver.resolve(binding, event)
+            if agent.session_id != binding.session_id:
+                raise ValueError("canonical_agent_missing")
+            row = self.session_store._db.get_session(binding.session_id)
+            agent._session_db_created = True  # existing-only: never call create_session
+            if row.get("system_prompt"):
+                _seed_hygiene_system_prompt(agent, row)
+            # Publication belongs to the awaiting lease owner, never the thread:
+            # cancellation can leave this constructor running after its await.
+            return agent, signature, row.get("message_count", 0), entry.session_id
+        except BaseException:
+            self._release_evicted_agent_soft(agent)
+            raise
+
+    async def _await_canonical_worker(self, function, *args, on_cancel=None,
+                                     discard=None, **kwargs):
+        """Join a threaded operation before surrendering its turn ownership.
+
+        Python cannot kill a worker thread. Interrupt cooperatively, then drain
+        even repeated cancellation; callbacks and lease remain owned until the
+        worker (including persistence) has stopped. Never start a cancelled turn
+        merely to finish a shielded outer coroutine.
+        """
+        def owned_call():
+            from agent.chat_completion_helpers import request_worker_ownership
+
+            with request_worker_ownership():
+                return function(*args, **kwargs)
+
+        worker = asyncio.create_task(asyncio.to_thread(owned_call))
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            if on_cancel is not None:
+                try:
+                    on_cancel()
+                except Exception:
+                    pass
+            while not worker.done():
+                try:
+                    await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    continue
+                except BaseException:
+                    break
+            try:
+                value = worker.result()
+            except BaseException:
+                pass
+            else:
+                if discard is not None:
+                    discard(value)
+            raise
+
     async def run_bound_existing_turn(
         self, binding: Any, event: Any, entry: Any, *, reply_sink: Any = None
     ) -> Any:
-        """Run only an exact pre-existing cached session for canonical ingress."""
-        from gateway.canonical_surface import require_request_local_reply_sink
+        """Run an exact existing session, restoring only a cold actor cache."""
+        from gateway.canonical_surface import (
+            ExistingCanonicalBindingResolver, require_request_local_reply_sink,
+        )
 
         require_request_local_reply_sink(reply_sink)
         if entry.session_key != binding.session_key or entry.session_id != binding.session_id:
             raise ValueError("canonical_binding_stale")
-        with self._agent_cache_lock:
-            cached = self._agent_cache.get(entry.session_key)
-            if not cached:
-                raise ValueError("canonical_agent_missing")
-            agent = cached[0] if isinstance(cached, tuple) else cached
-            cached_session_id = cached[3] if isinstance(cached, tuple) and len(cached) > 3 else getattr(agent, "session_id", None)
-            if cached_session_id != entry.session_id or getattr(agent, "session_id", None) != entry.session_id:
-                raise ValueError("canonical_agent_missing")
 
-        generation = self._begin_session_run_generation(entry.session_key)
+        # Canonical requests own a separate lease identity; they must not
+        # invalidate a Telegram run generation while waiting behind its turn.
         try:
             lease = await self._turn_leases.acquire(
                 entry.session_id,
                 owner_key=f"canonical:{id(event)}",
-                generation=generation,
+                generation=0,
             )
         except Exception:
             raise ValueError("canonical_turn_busy") from None
+        agent = None
+        active = self.__dict__.setdefault("_canonical_active_agents", {})
         try:
+            # Admission and the cache must be fresh AFTER a contended lease.
+            entry = await self._await_canonical_worker(
+                ExistingCanonicalBindingResolver(self.session_store).resolve, binding, event,
+            )
+            with self._agent_cache_lock:
+                cached = self._agent_cache.get(entry.session_key)
+                if cached:
+                    active[entry.session_id] = cached[0] if isinstance(cached, tuple) else cached
+            if cached:
+                agent = cached[0] if isinstance(cached, tuple) else cached
+                cached_session_id = cached[3] if isinstance(cached, tuple) and len(cached) > 3 else getattr(agent, "session_id", None)
+                if cached_session_id != entry.session_id or getattr(agent, "session_id", None) != entry.session_id:
+                    raise ValueError("canonical_agent_missing")
+            else:
+                try:
+                    restored = await self._await_canonical_worker(
+                        self._restore_bound_existing_agent, binding, event,
+                        discard=lambda value: self._release_evicted_agent_soft(value[0]),
+                    )
+                    agent = restored[0]
+                    try:
+                        ExistingCanonicalBindingResolver(self.session_store).resolve(binding, event)
+                        with self._agent_cache_lock:
+                            if self._agent_cache.get(entry.session_key):
+                                raise ValueError("canonical_turn_busy")
+                            active[entry.session_id] = agent
+                            self._agent_cache[entry.session_key] = restored
+                            self._enforce_agent_cache_cap()
+                    except BaseException:
+                        with self._agent_cache_lock:
+                            if self._agent_cache.get(entry.session_key) is restored:
+                                self._agent_cache.pop(entry.session_key, None)
+                        self._release_evicted_agent_soft(agent)
+                        raise
+                except ValueError as exc:
+                    if str(exc) in {"canonical_binding_stale", "canonical_agent_missing", "canonical_turn_busy"}:
+                        raise
+                    raise ValueError("canonical_agent_missing") from None
+                except Exception:
+                    raise ValueError("canonical_agent_missing") from None
+            active[entry.session_id] = agent
             if not bool(getattr(agent, "compression_in_place", True)):
                 raise ValueError("canonical_turn_refused")
             outward_callbacks = {
@@ -19464,9 +19610,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 history = await self.async_session_store.load_transcript(entry.session_id)
                 agent_history, _ = _build_gateway_agent_history(history)
                 self._init_cached_agent_for_turn(agent, 0)
-                result = await asyncio.to_thread(
+                result = await self._await_canonical_worker(
                     agent.run_conversation,
                     event.text,
+                    on_cancel=lambda: agent.interrupt(hard_cancel=True),
                     conversation_history=agent_history,
                     task_id=entry.session_id,
                 )
@@ -19483,6 +19630,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 for name, value in outward_callbacks.items():
                     setattr(agent, name, value)
         finally:
+            if active.get(entry.session_id) is agent:
+                active.pop(entry.session_id, None)
             self._turn_leases.release(lease)
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
@@ -27870,7 +28019,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             for _, a in self._running_agent_items()
             if a is not None and a is not _AGENT_PENDING_SENTINEL
         }
-        if id(agent) in running_ids:
+        if id(agent) in running_ids or self._canonical_agent_is_active(agent):
             return
 
         try:
@@ -28019,6 +28168,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if hasattr(agent, "_db_flush_scan_prefix"):
             agent._db_flush_scan_prefix = None
 
+    def _canonical_agent_is_active(self, agent: Any) -> bool:
+        return any(
+            value is agent
+            for value in tuple(self.__dict__.get("_canonical_active_agents", {}).values())
+        )
+
     def _agent_cache_bounds(self):
         """Operator-configured agent-cache bounds, resolved once per process.
 
@@ -28105,7 +28260,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         def _is_evictable(key: str, agent: Any) -> bool:
             if agent is None or agent is _AGENT_PENDING_SENTINEL:
                 return False
-            if id(agent) in running_ids:
+            if id(agent) in running_ids or self._canonical_agent_is_active(agent):
                 return False
             return transcript_persistence_caught_up(agent)
 
@@ -28247,7 +28402,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             for key in ordered_keys[:excess]:
                 entry = _cache.get(key)
                 agent = entry[0] if isinstance(entry, tuple) and entry else None
-                if agent is not None and id(agent) in running_ids:
+                if agent is not None and (
+                    id(agent) in running_ids or self._canonical_agent_is_active(agent)
+                ):
                     continue  # active mid-turn; don't evict, don't substitute
                 evict_plan.append((key, agent))
 
@@ -28309,7 +28466,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 agent = entry[0] if isinstance(entry, tuple) and entry else None
                 if agent is None:
                     continue
-                if id(agent) in running_ids:
+                if id(agent) in running_ids or self._canonical_agent_is_active(agent):
                     continue  # mid-turn — don't tear it down
                 last_activity = getattr(agent, "_last_activity_ts", None)
                 if last_activity is None:
