@@ -16,6 +16,7 @@ sites unchanged.  Symbols that tests patch on ``run_agent`` (e.g.
 from __future__ import annotations
 
 import contextvars
+from contextlib import contextmanager
 import json
 import logging
 import math
@@ -70,6 +71,36 @@ def _context_thread_target(callback):
     """Bind a no-argument thread target to the caller's ContextVars."""
     context = contextvars.copy_context()
     return lambda: context.run(callback)
+
+
+_owned_request_workers = contextvars.ContextVar("owned_request_workers", default=None)
+
+
+@contextmanager
+def request_worker_ownership():
+    """Keep request threads inside a caller-owned turn/lease lifetime.
+
+    Interrupts still abort transports normally. A provider ignoring abort may
+    delay exit, but cannot outlive the owner and overlap a subsequent turn.
+    Ordinary interactive callers retain their existing bounded teardown.
+    """
+    workers = []
+    token = _owned_request_workers.set(workers)
+    try:
+        yield
+    finally:
+        try:
+            for worker in workers:
+                worker.join()
+        finally:
+            _owned_request_workers.reset(token)
+
+
+def _start_request_worker(worker):
+    workers = _owned_request_workers.get()
+    worker.start()
+    if workers is not None:
+        workers.append(worker)
 
 
 def _join_worker_for_relay_teardown(worker, *, label: str) -> None:
@@ -1601,7 +1632,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
     agent._touch_activity("waiting for non-streaming API response")
 
     t = threading.Thread(target=_context_thread_target(_call), daemon=True)
-    t.start()
+    _start_request_worker(t)
     _poll_count = 0
     while t.is_alive():
         t.join(timeout=0.3)
@@ -3521,7 +3552,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             t = threading.Thread(
                 target=_context_thread_target(_bedrock_call), daemon=True
             )
-            t.start()
+            _start_request_worker(t)
             while t.is_alive():
                 t.join(timeout=0.3)
                 if agent._interrupt_requested:
@@ -5087,7 +5118,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             _stream_stale_timeout = max(_stream_stale_timeout, _reasoning_floor)
 
     t = threading.Thread(target=_context_thread_target(_call), daemon=True)
-    t.start()
+    _start_request_worker(t)
     _last_heartbeat = time.time()
     _HEARTBEAT_INTERVAL = 30.0  # seconds between gateway activity touches
     while t.is_alive():
