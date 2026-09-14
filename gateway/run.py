@@ -16581,24 +16581,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return None
             if _end_reason != "compression":
-                # Idle/timeout/lifecycle end (scale-to-zero norm): the chat
-                # route remains valid and ``session_entry`` IS the routing
-                # key's current session for this same chat, so deliver the
-                # finished work there instead of dropping it. This is the
-                # delivery leg _classify_completion_target promises when it
-                # returns "deliver" for non-boundary ends — without it the
-                # pre-flight verdict and this resolver disagree, and the
-                # durable row is acked at adapter acceptance then silently
-                # dropped here (falsely-acknowledged permanent loss;
-                # staging incident 2026-08-09 defect #2).
-                logger.info(
-                    "Async-delegation completion pinned to %s-ended session %s; "
-                    "retargeting to the chat's current session %s.",
-                    _end_reason or "idle",
-                    pinned_session_id,
-                    session_entry.session_id,
-                )
-                return session_entry
+                # A lifecycle end does not prove that a different current
+                # session owns this work. Never retarget across that boundary.
+                return session_entry if session_entry.session_id == pinned_session_id else None
 
             follows_compression = True
             try:
@@ -16667,19 +16652,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if target_session_id == session_entry.session_id:
             return session_entry
+        if not follows_compression:
+            # Completion ownership is not permission to switch the user's chat.
+            return None
 
         prior_session_id = session_entry.session_id
-        if follows_compression:
-            switched = await self.async_session_store.advance_compression_session(
-                session_entry.session_key,
-                prior_session_id,
-                target_session_id,
-            )
-        else:
-            switched = await self.async_session_store.switch_session(
-                session_entry.session_key,
-                target_session_id,
-            )
+        switched = await self.async_session_store.advance_compression_session(
+            session_entry.session_key,
+            prior_session_id,
+            target_session_id,
+        )
         if switched is None:
             logger.warning(
                 "Async-delegation completion could not bind routing key %s to "
@@ -19546,6 +19528,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     pinned_session_id or "missing",
                     expected_session_key or "missing",
                 )
+                return
+        elif pinned_session_id:
+            # Background completions may observe an existing route, never
+            # create/reset one or acquire the authority of a user message.
+            session_entry = await self.async_session_store.lookup_by_session_key(
+                expected_session_key or self._session_key_for_source(source)
+            )
+            if session_entry is None:
                 return
         else:
             # Internal wakes must observe reset policy without becoming user
@@ -25959,7 +25949,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             metadata = {}
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             if parent_session_id:
-                metadata["gateway_session_id"] = parent_session_id
+                session_key = self._session_key_for_source(source)
+                entry = await self.async_session_store.lookup_by_session_key(session_key)
+                if entry is None:
+                    return None
+                resolved = await self._resolve_async_delegation_session(entry, parent_session_id)
+                if resolved is None:
+                    return None
+                metadata["gateway_session_id"] = resolved.session_id
+                metadata["gateway_session_key"] = session_key
             synth_event = MessageEvent(
                 text=synth_text,
                 message_type=MessageType.TEXT,

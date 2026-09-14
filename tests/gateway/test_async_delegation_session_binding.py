@@ -100,7 +100,7 @@ class TestGatewayPinningFailsClosed:
 
 
     @pytest.mark.asyncio
-    async def test_live_spawning_session_rebinds_from_different_route(self):
+    async def test_live_spawning_session_cannot_rebind_different_route(self):
         current = self._entry("sess_current")
         pinned = self._entry("sess_live")
         runner = self._make_runner(
@@ -112,10 +112,73 @@ class TestGatewayPinningFailsClosed:
             current, "sess_live"
         )
 
-        assert resolved is pinned
-        getattr(runner.session_store, "switch_session").assert_called_once_with(
-            current.session_key, "sess_live"
-        )
+        assert resolved is None
+        self._assert_no_route_change(runner)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", ["delegation", "process"])
+    @pytest.mark.parametrize("state", ["cold", "busy", "mismatch", "idle", "same"])
+    async def test_completion_handler_observes_existing_route(self, kind, state):
+        from types import SimpleNamespace
+        from gateway.config import Platform
+
+        current = self._entry("sess_parent")
+        pinned_id = "sess_parent" if state == "same" else "sess_child"
+        row = {"id": pinned_id, "ended_at": None}
+        if state == "idle":
+            row.update(ended_at="2026-08-09T00:00:00", end_reason="idle")
+        runner = self._make_runner({pinned_id: row}, switched_entry=self._entry(pinned_id))
+        runner._recover_telegram_topic_thread_id = lambda source: None
+        runner._session_key_for_source = lambda source: current.session_key
+        runner.session_store.lookup_by_session_key.return_value = None if state == "cold" else current
+        runner.session_store.get_or_create_session.return_value = current
+        runner._running_agents = {current.session_key: object()} if state == "busy" else {}
+        # Stop at the real handler's post-resolution seam, before any LLM/I/O.
+        class Delivered(Exception):
+            pass
+        runner._cache_session_source = MagicMock(side_effect=Delivered)
+        source = SimpleNamespace(platform=Platform.TELEGRAM, user_name="user",
+                                 user_id="1", chat_id="1", thread_id=None)
+        event = SimpleNamespace(text="completed", internal=True, metadata={
+            "gateway_session_key": current.session_key,
+            "gateway_session_id": pinned_id,
+            "completion_kind": kind,
+        })
+        if state == "same":
+            with pytest.raises(Delivered):
+                await runner._handle_message_with_agent(event, source, current.session_key, 1)
+            runner._cache_session_source.assert_called_once_with(current.session_key, source)
+        else:
+            await runner._handle_message_with_agent(event, source, current.session_key, 1)
+            runner._cache_session_source.assert_not_called()
+        runner.session_store.get_or_create_session.assert_not_called()
+        self._assert_no_route_change(runner)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("state", ["cold", "mismatch", "same"])
+    async def test_injection_checks_owner_before_adapter_acceptance(self, state):
+        from types import SimpleNamespace
+        from gateway.config import Platform
+
+        current = self._entry("sess_parent")
+        runner = self._make_runner({"sess_child": {"id": "sess_child", "ended_at": None}})
+        source = SimpleNamespace(platform=Platform.TELEGRAM, chat_id="1", thread_id=None)
+        runner._build_process_event_source = lambda evt: source
+        runner._session_key_for_source = lambda src: current.session_key
+        runner.session_store.lookup_by_session_key.return_value = None if state == "cold" else current
+        runner.adapters = {Platform.TELEGRAM: SimpleNamespace(handle_message=AsyncMock())}
+        parent = "sess_parent" if state == "same" else "sess_child"
+        runner._session_db.get_session = AsyncMock(return_value={"id": parent, "ended_at": None})
+        result = await runner._inject_watch_notification("completed", {"parent_session_id": parent})
+        adapter = runner.adapters[Platform.TELEGRAM]
+        if state == "same":
+            assert result is True
+            adapter.handle_message.assert_awaited_once()
+            assert adapter.handle_message.call_args.args[0].metadata["gateway_session_id"] == parent
+        else:
+            assert result is None
+            adapter.handle_message.assert_not_awaited()
+        self._assert_no_route_change(runner)
 
     @pytest.mark.asyncio
     async def test_non_compression_ended_parent_drops(self):
