@@ -80,10 +80,9 @@ def _runner_with_rows(rows, *, switched_entry=None):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("end_reason", ["idle", "idle_timeout", "timeout", None, ""])
-async def test_resolver_retargets_idle_ended_pin_to_current_session(end_reason):
-    """The delivery leg the classifier's "deliver" verdict promises: an
-    idle-ended pin must resolve to the chat's CURRENT session, not drop."""
-    current = _entry("sess_current")
+async def test_resolver_preserves_idle_ended_pin_in_same_session(end_reason):
+    """Idle completion remains deliverable only in its existing owner route."""
+    current = _entry("sess_idle")
     runner = _runner_with_rows(
         {
             "sess_idle": {
@@ -141,7 +140,7 @@ async def test_classifier_and_resolver_agree_on_ended_parents(end_reason):
         "ended_at": "2026-08-09T00:00:00",
         "end_reason": end_reason,
     }
-    current = _entry("sess_current")
+    current = _entry("sess_x")
     runner = _runner_with_rows({"sess_x": row})
 
     verdict = await runner._classify_completion_target("sess_x")
