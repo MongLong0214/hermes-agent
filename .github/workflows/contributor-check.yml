@@ -23,9 +23,38 @@ jobs:
 
       - name: Check for unmapped contributor emails
         id: check-emails
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref || '' }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
         run: |
-          # Get the merge base between this PR and main
-          MERGE_BASE=$(git merge-base origin/main HEAD)
+          # Use the PR's declared base.  A workflow_call retains the caller's
+          # event context, while push and other non-PR callers use main.
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            if [ -z "$PR_BASE_REF" ]; then
+              echo "Pull request base ref is missing; refusing to scan the wrong commit range."
+              exit 1
+            fi
+            [ -n "$PR_BASE_SHA" ] || {
+              echo "Pull request base SHA is missing; refusing to scan the wrong commit range."
+              exit 1
+            }
+            if ! git cat-file -e "${PR_BASE_SHA}^{commit}"; then
+              echo "Pull request base SHA is unavailable locally; refusing to scan the wrong commit range."
+              exit 1
+            fi
+            EXPECTED_BASE_SHA=$(git rev-parse "origin/${PR_BASE_REF}^{commit}") || {
+              echo "Pull request base ref is unavailable locally; refusing to scan the wrong commit range."
+              exit 1
+            }
+            if [ "$EXPECTED_BASE_SHA" != "$PR_BASE_SHA" ]; then
+              echo "Pull request base SHA does not match its base ref; refusing to scan the wrong commit range."
+              exit 1
+            fi
+            MERGE_BASE="$PR_BASE_SHA"
+          else
+            MERGE_BASE=$(git merge-base origin/main HEAD)
+          fi
 
           # Find any new author emails in this PR's commits
           NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges | sort -u)
