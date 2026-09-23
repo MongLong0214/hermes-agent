@@ -3460,6 +3460,191 @@ class GatewayRunner(
         state = self._peek_session_state(session_key)
         return state is not None and state.turn.agent is not None
 
+    @staticmethod
+    def _is_canonical_outward_callback_attribute(name: str) -> bool:
+        """Whether a cached actor attribute can emit beyond a canonical request."""
+        return (
+            name == "callback"
+            or name.endswith("_callback")
+            or name == "_on_session_title"
+        )
+
+    @staticmethod
+    def _select_canonical_turn_result(
+        result: Any,
+        *,
+        binding_name: str,
+        history_boundary: int,
+        expected_session_id: str,
+    ) -> Any:
+        """Select exactly one terminal assistant message from the current turn."""
+        from gateway.canonical_surface import CanonicalTurnResult
+
+        if (
+            not isinstance(result, dict)
+            or result.get("completed") is not True
+            or any(bool(result.get(flag)) for flag in ("failed", "partial", "interrupted"))
+            or result.get("session_id", expected_session_id) != expected_session_id
+            or not isinstance(result.get("final_response"), str)
+            or not result["final_response"].strip()
+            or not isinstance(result.get("messages"), list)
+            or isinstance(history_boundary, bool)
+            or not isinstance(history_boundary, int)
+        ):
+            raise ValueError("canonical_turn_refused")
+        messages = result["messages"]
+        if history_boundary < 0 or history_boundary >= len(messages):
+            raise ValueError("canonical_turn_refused")
+        suffix = messages[history_boundary:]
+        if len(suffix) < 2:
+            raise ValueError("canonical_turn_refused")
+        user = suffix[0]
+        if (
+            not isinstance(user, dict)
+            or user.get("role") != "user"
+            or not isinstance(user.get("content"), str)
+            or not user["content"].strip()
+        ):
+            raise ValueError("canonical_turn_refused")
+
+        expecting_tool = False
+        expected_tool_call_id: Optional[str] = None
+        terminal: Optional[str] = None
+        for index, row in enumerate(suffix[1:], start=1):
+            if not isinstance(row, dict) or not isinstance(row.get("role"), str):
+                raise ValueError("canonical_turn_refused")
+            role = row["role"]
+            if expecting_tool:
+                if (
+                    role != "tool"
+                    or row.get("tool_call_id") != expected_tool_call_id
+                    or not isinstance(row.get("content"), str)
+                    or not row["content"].strip()
+                ):
+                    raise ValueError("canonical_turn_refused")
+                expecting_tool = False
+                expected_tool_call_id = None
+                continue
+            if role != "assistant":
+                raise ValueError("canonical_turn_refused")
+            if "tool_calls" in row:
+                tool_calls = row["tool_calls"]
+                if (
+                    not isinstance(tool_calls, list)
+                    or len(tool_calls) != 1
+                    or not isinstance(tool_calls[0], dict)
+                    or not isinstance(tool_calls[0].get("id"), str)
+                    or not tool_calls[0]["id"].strip()
+                ):
+                    raise ValueError("canonical_turn_refused")
+                expected_tool_call_id = tool_calls[0]["id"]
+                expecting_tool = True
+                continue
+            content = row.get("content")
+            if (
+                not isinstance(content, str)
+                or not content.strip()
+                or content != result["final_response"]
+                or index != len(suffix) - 1
+            ):
+                raise ValueError("canonical_turn_refused")
+            terminal = content
+        if expecting_tool or terminal is None:
+            raise ValueError("canonical_turn_refused")
+        return CanonicalTurnResult(binding_name=binding_name, terminal_text=terminal)
+
+    async def run_bound_existing_turn(
+        self, binding: Any, event: Any, entry: Any, *, reply_sink: Any = None
+    ) -> Any:
+        """Run one exact cached actor without creating, routing, or delivering anything."""
+        from gateway.canonical_surface import require_request_local_reply_sink
+
+        require_request_local_reply_sink(reply_sink)
+        session_id = getattr(entry, "session_id", None)
+        origin = getattr(entry, "origin", None)
+        if (
+            getattr(entry, "session_key", None) != getattr(binding, "session_key", None)
+            or not isinstance(session_id, str)
+            or not session_id
+            or origin is None
+            or getattr(origin, "chat_id", None) != getattr(binding, "telegram_chat_id", None)
+            or getattr(origin, "chat_type", None) != getattr(binding, "telegram_chat_type", None)
+            or getattr(origin, "user_id", None) != getattr(binding, "telegram_user_id", None)
+            or getattr(origin, "thread_id", None) != getattr(binding, "telegram_thread_id", None)
+        ):
+            raise ValueError("canonical_binding_stale")
+        try:
+            lease = await self._turn_leases.acquire(
+                session_id,
+                owner_key=f"canonical:{id(event)}",
+                generation=0,
+            )
+        except Exception:
+            raise ValueError("canonical_turn_busy") from None
+        try:
+            def require_current_head() -> None:
+                current_entry = self.session_store.lookup_by_session_key_existing(
+                    binding.session_key
+                )
+                if (
+                    current_entry is not entry
+                    or getattr(entry, "session_id", None) != session_id
+                    or getattr(current_entry, "session_id", None) != session_id
+                ):
+                    raise ValueError("canonical_binding_stale")
+
+            require_current_head()
+            with self._agent_cache_lock:
+                cached = self._agent_cache.get(entry.session_key)
+                if not cached:
+                    raise ValueError("canonical_agent_missing")
+                agent = cached[0] if isinstance(cached, tuple) else cached
+                cached_session_id = (
+                    cached[3]
+                    if isinstance(cached, tuple) and len(cached) > 3
+                    else getattr(agent, "session_id", None)
+                )
+                if (
+                    cached_session_id != session_id
+                    or getattr(agent, "session_id", None) != session_id
+                ):
+                    raise ValueError("canonical_agent_missing")
+            if not bool(getattr(agent, "compression_in_place", True)):
+                raise ValueError("canonical_turn_refused")
+            outward_callbacks = {
+                name: value
+                for name, value in vars(agent).items()
+                if self._is_canonical_outward_callback_attribute(name)
+            }
+            for name in outward_callbacks:
+                setattr(agent, name, None)
+            try:
+                history = await self.async_session_store.load_transcript(session_id)
+                agent_history, _ = _build_gateway_agent_history(history)
+                require_current_head()
+                self._init_cached_agent_for_turn(agent, 0)
+                result = await asyncio.to_thread(
+                    agent.run_conversation,
+                    event.text,
+                    conversation_history=agent_history,
+                    task_id=session_id,
+                )
+                require_current_head()
+                boundary = getattr(agent, "_persist_user_message_idx", None)
+                if isinstance(boundary, bool) or not isinstance(boundary, int):
+                    raise ValueError("canonical_turn_refused")
+                return self._select_canonical_turn_result(
+                    result,
+                    binding_name=binding.name,
+                    history_boundary=boundary,
+                    expected_session_id=session_id,
+                )
+            finally:
+                for name, value in outward_callbacks.items():
+                    setattr(agent, name, value)
+        finally:
+            self._turn_leases.release(lease)
+
     def _running_agent_items(self) -> List[tuple]:
         """(session_key, agent) pairs for sessions with a running turn (incl. pending sentinels)."""
         return [(key, state.turn.agent) for key, state in self._sessions_map().items()

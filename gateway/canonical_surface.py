@@ -3,12 +3,64 @@
 This module deliberately does not receive ingress, create sessions, or deliver replies.
 """
 
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable, Protocol
 
 from gateway.config import Platform
 from gateway.session_persistence import _DB_UNPINNED
+
+
+@dataclass(frozen=True)
+class CanonicalTurnResult:
+    """The terminal selected from one canonical turn, before request readback."""
+
+    binding_name: str
+    terminal_text: str
+
+
+class RequestLocalReplySink(Protocol):
+    """Opaque request-scoped capability for accepting exactly one terminal."""
+
+    async def publish(self, result: CanonicalTurnResult) -> None: ...
+
+
+class _RequestReplySink:
+    """One-use sink whose publisher remains private to the creating request."""
+
+    def __init__(
+        self, publisher: Callable[[CanonicalTurnResult], Awaitable[None]]
+    ) -> None:
+        self._publisher = publisher
+        self._published = False
+        self._lock = asyncio.Lock()
+
+    async def publish(self, result: CanonicalTurnResult) -> None:
+        async with self._lock:
+            if self._published:
+                raise ValueError("canonical_reply_already_published")
+            self._published = True
+            try:
+                await self._publisher(result)
+            except Exception:
+                raise ValueError("canonical_reply_publish_failed") from None
+
+
+def request_local_reply_sink(
+    publisher: Callable[[CanonicalTurnResult], Awaitable[None]],
+) -> RequestLocalReplySink:
+    """Create a reply capability that cannot select or retain a destination."""
+
+    return _RequestReplySink(publisher)
+
+
+def require_request_local_reply_sink(value: Any) -> RequestLocalReplySink:
+    """Reject caller-supplied lookalikes in the existing-actor turn path."""
+
+    if not isinstance(value, _RequestReplySink):
+        raise ValueError("canonical_reply_sink_missing")
+    return value
 
 
 @dataclass(frozen=True)
