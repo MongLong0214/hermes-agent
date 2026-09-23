@@ -1254,6 +1254,19 @@ class SessionStore(
         with self._lock:
             return self._entry_locked(session_key)
 
+    def lookup_by_session_key_existing(self, session_key: str) -> Optional[SessionEntry]:
+        """Return an already-loaded entry without creating, healing, or recovering it."""
+        if not isinstance(session_key, str) or not session_key:
+            return None
+        with self._lock:
+            if not self._loaded:
+                return None
+            return self._entries.get(session_key)
+
+    def _should_reset(self, entry: SessionEntry, source: SessionSource) -> Optional[str]:
+        """Return the current explicit-reset reason for an existing route, if any."""
+        return self._route_reset_reason(entry)
+
     def peek_session_id(self, session_key: str) -> Optional[str]:
         """Lock-held accessor for the key -> session_id mapping (None if unknown)."""
         if not session_key:
