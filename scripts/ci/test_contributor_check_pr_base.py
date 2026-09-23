@@ -22,7 +22,7 @@ def git(cwd: Path, *args: str) -> str:
 
 
 def commit(cwd: Path, message: str, email: str) -> str:
-    (cwd / "fixture.txt").write_text(message + "\n")
+    (cwd / "fixture.txt").write_text(message + "\n", encoding="utf-8")
     git(cwd, "add", "fixture.txt")
     git(cwd, "-c", "user.name=Fixture", "-c", f"user.email={email}", "commit", "-m", message)
     return git(cwd, "rev-parse", "HEAD")
@@ -54,7 +54,7 @@ class ContributorCheckPrBaseTest(unittest.TestCase):
             self.assertIn("existing@example.invalid", wrong_emails)
             self.assertEqual(right_emails, {"new@example.invalid"})
 
-        workflow = yaml.safe_load(WORKFLOW.read_text())
+        workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
         check_step = workflow["jobs"]["check-attribution"]["steps"][1]
         self.assertEqual(
             check_step.get("env", {}).get("PR_BASE_SHA"),
