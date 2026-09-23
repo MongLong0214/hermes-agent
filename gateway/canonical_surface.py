@@ -4,12 +4,26 @@ This module deliberately does not receive ingress, create sessions, or deliver r
 """
 
 import asyncio
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol
 
 from gateway.config import Platform
 from gateway.session_persistence import _DB_UNPINNED
+
+
+_EVENT_FIELDS = frozenset({"binding", "event_id", "author_id", "channel_id", "text"})
+_MAX_ID_CHARS = 256
+_MAX_TEXT_CHARS = 16_384
+
+
+def _required_text(value: Any, *, limit: int) -> str:
+    """Validate text without normalizing caller-provided event identity."""
+
+    if not isinstance(value, str) or not value.strip() or len(value) > limit:
+        raise ValueError("canonical_invalid_request")
+    return value
 
 
 @dataclass(frozen=True)
@@ -74,6 +88,46 @@ class CanonicalSurfaceBinding:
     telegram_thread_id: str | None
     allowed_author_ids: tuple[str, ...]
     allowed_channel_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CanonicalIngressEvent:
+    """Closed canonical ingress payload with no caller-controlled destination."""
+
+    binding: str
+    event_id: str
+    author_id: str
+    channel_id: str
+    text: str
+
+    @classmethod
+    def from_json_bytes(cls, raw: bytes) -> "CanonicalIngressEvent":
+        """Parse the exact canonical event object, rejecting ambiguity at ingress."""
+
+        duplicate = False
+
+        def closed_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            nonlocal duplicate
+            result: dict[str, Any] = {}
+            for key, value in pairs:
+                if key in result:
+                    duplicate = True
+                result[key] = value
+            return result
+
+        try:
+            payload = json.loads(raw.decode("utf-8"), object_pairs_hook=closed_object)
+        except (AttributeError, UnicodeDecodeError, json.JSONDecodeError):
+            raise ValueError("canonical_invalid_request") from None
+        if duplicate or not isinstance(payload, dict) or set(payload) != _EVENT_FIELDS:
+            raise ValueError("canonical_invalid_request")
+        return cls(
+            binding=_required_text(payload["binding"], limit=_MAX_ID_CHARS),
+            event_id=_required_text(payload["event_id"], limit=_MAX_ID_CHARS),
+            author_id=_required_text(payload["author_id"], limit=_MAX_ID_CHARS),
+            channel_id=_required_text(payload["channel_id"], limit=_MAX_ID_CHARS),
+            text=_required_text(payload["text"], limit=_MAX_TEXT_CHARS),
+        )
 
 
 class ExistingCanonicalBindingResolver:
