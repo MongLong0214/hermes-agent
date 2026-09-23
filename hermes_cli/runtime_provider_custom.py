@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import os
 from typing import Any, Callable, Dict, Optional, Tuple
+from urllib.parse import urlparse
 
 from hermes_cli.providers import custom_provider_aliases, custom_provider_slug
 from agent.secret_scope import get_secret_str
@@ -68,6 +69,18 @@ def _model_cfg_key_env_for(model_cfg: Dict[str, Any], base_url: str) -> str:
 
 def _entry_url(entry: Dict[str, Any]) -> str:
     return entry.get("api") or entry.get("url") or entry.get("base_url") or ""
+
+
+def is_usable_custom_provider_url(value: Any) -> bool:
+    """Whether a configured custom endpoint is an HTTP(S) URL with a valid host/port."""
+    if not isinstance(value, str) or not value.strip():
+        return False
+    try:
+        parsed = urlparse(value.strip())
+        parsed.port  # Access validates numeric range as well as syntax.
+    except ValueError:
+        return False
+    return parsed.scheme.lower() in {"http", "https"} and bool(parsed.hostname)
 
 
 # ── field lifting shared by ``providers:`` and legacy ``custom_providers:`` entries ────────
@@ -136,19 +149,23 @@ def _shadowed_by_builtin(requested_norm: str) -> bool:
     return (canonical or "").strip().lower() == requested_norm
 
 
-def _match_new_style_provider(requested_norm: str, providers: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _match_new_style_provider(requested_norm: str, providers: Dict[str, Any], *, route_facts_only: bool = False) -> Optional[Dict[str, Any]]:
     """Scan ``providers:`` (new-style, keyed) for ``requested_norm``."""
     from hermes_cli.config import is_provider_enabled
     rp = _rp()
+    matched = False
     for ep_name, entry in providers.items():
         # ``providers.<name>.enabled: false`` entries stay in config but are invisible here.
         if not isinstance(entry, dict) or not is_provider_enabled(entry):
             continue
         if requested_norm not in custom_provider_aliases(str(entry.get("name", "") or ep_name), str(ep_name)):
             continue
-        base_url = _entry_url(entry)
-        if not base_url:
+        matched = True
+        base_url = _clean(_entry_url(entry))
+        if not is_usable_custom_provider_url(base_url):
             continue
+        if route_facts_only:
+            return {"base_url": base_url.strip()}
         # Resolve credentials only after identity and endpoint validation. Merely scanning an
         # unrelated entry must not read its profile-scoped secret.
         key_env = _clean(entry.get("key_env") or entry.get("api_key_env"))
@@ -166,18 +183,25 @@ def _match_new_style_provider(requested_norm: str, providers: Dict[str, Any]) ->
             api_mode=rp._parse_api_mode(entry.get("api_mode") or entry.get("transport")),
         )
         return result
-    return None
+    return {"base_url": ""} if route_facts_only and matched else None
 
 
-def _match_legacy_custom_provider(requested_norm: str, custom_providers) -> Optional[Dict[str, Any]]:
+def _match_legacy_custom_provider(requested_norm: str, custom_providers, *, route_facts_only: bool = False) -> Optional[Dict[str, Any]]:
     """Scan the legacy ``custom_providers:`` list for ``requested_norm``."""
+    matched = False
     for entry in custom_providers:
         name, base_url = (entry.get("name"), entry.get("base_url")) if isinstance(entry, dict) else (None, None)
-        if not isinstance(name, str) or not isinstance(base_url, str):
+        if not isinstance(name, str) or not name.strip():
             continue
         provider_key = _clean(entry.get("provider_key", ""))
         if requested_norm not in custom_provider_aliases(name, provider_key):
             continue
+        matched = True
+        base_url = _clean(base_url)
+        if not is_usable_custom_provider_url(base_url):
+            continue
+        if route_facts_only:
+            return {"base_url": base_url.strip()}
         result = {"name": name.strip(), "base_url": base_url.strip(), "api_key": _clean(entry.get("api_key", ""))}
         model_name = _clean(entry.get("model", ""))
         if model_name:
@@ -185,7 +209,7 @@ def _match_legacy_custom_provider(requested_norm: str, custom_providers) -> Opti
         _lift_common_custom_fields(entry, result, provider_key=provider_key, key_env=_clean(entry.get("key_env", "")),
                                    api_mode=_rp()._parse_api_mode(entry.get("api_mode")))
         return result
-    return None
+    return {"base_url": ""} if route_facts_only and matched else None
 
 
 def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, Any]]:
@@ -205,6 +229,29 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
         return None
     custom_providers = rp.get_compatible_custom_providers(config)
     return _match_legacy_custom_provider(requested_norm, custom_providers) if custom_providers else None
+
+
+def peek_named_custom_provider_route(requested_provider: str) -> Optional[Dict[str, str]]:
+    """Return a named custom provider's non-secret route fact, if configured.
+
+    This follows the runtime resolver's alias matching and new-style-before-legacy
+    precedence, but deliberately stops before ``key_env`` or ``key_cmd`` handling.
+    An empty ``base_url`` marks a configured alias whose route is unknown.
+    """
+    requested_norm = _normalize_custom_provider_name(requested_provider or "")
+    if not requested_norm or requested_norm == "auto" or _shadowed_by_builtin(requested_norm):
+        return None
+    rp = _rp()
+    config = rp.load_config()
+    providers = config.get("providers")
+    found = (_match_new_style_provider(requested_norm, providers, route_facts_only=True)
+             if isinstance(providers, dict) else None)
+    if found and found.get("base_url"):
+        return found
+    custom_providers = rp.get_compatible_custom_providers(config)
+    legacy = (_match_legacy_custom_provider(requested_norm, custom_providers, route_facts_only=True)
+              if custom_providers else None)
+    return legacy if legacy and legacy.get("base_url") else found or legacy
 
 
 def has_named_custom_provider(requested_provider: str) -> bool:

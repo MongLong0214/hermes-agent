@@ -844,6 +844,19 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[
     # #17929.
     _explicit = (agent.provider or "").strip().lower()
     for _fb in _fallback_entries(fallback_model):
+        _fb_provider = str(_fb.get("provider") or "").strip().lower()
+        _fb_model = str(_fb.get("model") or "").strip()
+        # Keep init-time recovery subject to the same fail-closed Google route
+        # policy as runtime failover.  This is deliberately before fallback-key
+        # resolution and client construction, so an unavailable primary cannot
+        # make Gemini/Vertex fallback entries touch credentials or transport
+        # state merely while scanning the chain.
+        from agent.chat_completion_helpers import _main_fallback_google_route
+        if _main_fallback_google_route(_fb_provider, _fb_model, _fb):
+            _skip_reason = ("automatic route cannot be verified before resolver effects"
+                            if _fb_provider == "auto" else "targets a disabled Google inference route")
+            logger.warning("Init-time fallback skip: %s/%s %s", _fb_provider, _fb_model, _skip_reason)
+            continue
         try:
             from hermes_cli.fallback_config import resolve_entry_api_key
             _fb_explicit_key = resolve_entry_api_key(_fb)
