@@ -122,17 +122,18 @@ def _parse_managed_env(path: Path) -> Dict[str, str]:
     return load_env_file(path)
 
 
-def apply_managed_overlay(config: dict) -> dict:
+def apply_managed_overlay(config: dict, *, managed_config: Optional[dict] = None) -> dict:
     """Overlay administrator-pinned config values on top of an already-built dict.
 
     ``${VAR}`` refs in the managed config expand against the PROCESS env only, so a user cannot
-    shadow a managed literal via a ref they control; a bare root ``model: x/y`` string is promoted
+    shadow a managed literal via a ref they control; *managed_config* lets a caller pass one already-read
+    snapshot; a bare root ``model: x/y`` string is promoted
     to ``model.default`` so it can't clobber the dict shape callers expect; managed values
     deep-merge ON TOP per leaf while sibling keys stay user-controlled. Fail-open: returns
     ``config`` unchanged when no scope is present or on any error. Mutates and returns ``config``.
     """
     try:
-        managed = load_managed_config()
+        managed = load_managed_config() if managed_config is None else managed_config
         if not managed:
             return config
         # Imported lazily to avoid an import cycle (config imports managed_scope).
