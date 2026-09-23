@@ -1573,6 +1573,90 @@ class SessionDB(
         else:
             self._write_sql(sql, (key, value))
 
+    def _require_proven_meta_write_handle(
+        self,
+        *,
+        proven_db_path: Path,
+        proven_db_identity: Optional[Tuple[int, int]],
+    ) -> None:
+        """Refuse metadata writes unless the caller proves this live open generation."""
+        if (
+            proven_db_path != self.db_path
+            or proven_db_identity is None
+            or self._db_file_identity is None
+            or proven_db_identity != self._db_file_identity
+        ):
+            raise sqlite3.ProgrammingError(
+                "state metadata write requires a matching proven database path and identity"
+            )
+        if self.read_only:
+            raise sqlite3.OperationalError("cannot write state metadata on a read-only SessionDB")
+        if self._conn is None:
+            raise sqlite3.ProgrammingError("cannot write state metadata on a closed SessionDB")
+        self._raise_if_db_corrupt()
+        # The caller's proof identifies the handle we opened, not necessarily
+        # the file currently named by its path.  Refuse a stale descriptor
+        # before issuing DML if an out-of-band replacement occurred meanwhile.
+        self._raise_if_db_replaced()
+
+    def claim_meta_once(
+        self,
+        key: str,
+        receipt: str,
+        *,
+        proven_db_path: Path,
+        proven_db_identity: Optional[Tuple[int, int]],
+    ) -> bool:
+        """Insert ``state_meta[key]`` once on a caller-proven already-open writable handle.
+
+        Callers must bind their receipt to this exact path and the ``(st_dev,
+        st_ino)`` identity captured for this handle.  It makes no connection,
+        schema, recovery, or write-wrapper lifecycle call; after validating the
+        caller proof and that the pathname still names this generation, it uses
+        SQLite's one-statement compare-and-set without reading or overwriting an
+        existing receipt.
+        """
+        with self._lock:
+            self._require_proven_meta_write_handle(
+                proven_db_path=proven_db_path,
+                proven_db_identity=proven_db_identity,
+            )
+            assert self._conn is not None
+            cursor = self._conn.execute(
+                "INSERT OR IGNORE INTO state_meta (key, value) VALUES (?, ?)",
+                (key, receipt),
+            )
+            self._conn.commit()
+            return cursor.rowcount == 1
+
+    def compare_and_set_meta(
+        self,
+        key: str,
+        expected_value: str,
+        value: str,
+        *,
+        proven_db_path: Path,
+        proven_db_identity: Optional[Tuple[int, int]],
+    ) -> bool:
+        """Atomically replace matching metadata on this proven existing handle.
+
+        This is the companion to :meth:`claim_meta_once` for receipt transitions:
+        a terminal receipt replaces only the exact pending value it owns.  It
+        does not read, open, reopen, initialize, or recover the database.
+        """
+        with self._lock:
+            self._require_proven_meta_write_handle(
+                proven_db_path=proven_db_path,
+                proven_db_identity=proven_db_identity,
+            )
+            assert self._conn is not None
+            cursor = self._conn.execute(
+                "UPDATE state_meta SET value = ? WHERE key = ? AND value = ?",
+                (value, key, expected_value),
+            )
+            self._conn.commit()
+            return cursor.rowcount == 1
+
     def retag_kanban_worker_sessions(self, workspaces_root: str) -> int:
         """Retag legacy kanban worker rows from ``cli`` to ``kanban`` by cwd under the board's workspaces
         root; gated once per root via state_meta. Returns rows retagged."""
