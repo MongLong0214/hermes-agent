@@ -1228,6 +1228,43 @@ class TestQuickSnapshot:
         assert len(rows) == 1
         assert rows[0] == ("s1", "hello world")
 
+    def test_notepad_db_wal_copy_is_readable_and_absent_file_is_skipped(self, hermes_home):
+        """The optional notepad store is safely copied when it exists."""
+        from hermes_cli.backup import create_quick_snapshot
+
+        absent_snapshot_id = create_quick_snapshot(hermes_home=hermes_home)
+        assert absent_snapshot_id is not None
+        absent_manifest = json.loads(
+            (hermes_home / "state-snapshots" / absent_snapshot_id / "manifest.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert "cron/notepad.db" not in absent_manifest["files"]
+
+        notepad_db = hermes_home / "cron" / "notepad.db"
+        source_conn = sqlite3.connect(notepad_db)
+        try:
+            assert source_conn.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+            source_conn.execute("PRAGMA wal_autocheckpoint=0")
+            source_conn.execute("CREATE TABLE notes (id TEXT PRIMARY KEY, body TEXT)")
+            source_conn.execute("INSERT INTO notes VALUES ('n1', 'remember this')")
+            source_conn.commit()
+            assert notepad_db.with_name("notepad.db-wal").exists()
+
+            snapshot_id = create_quick_snapshot(hermes_home=hermes_home)
+            assert snapshot_id is not None
+            snapshot_dir = hermes_home / "state-snapshots" / snapshot_id
+            copied_db = snapshot_dir / "cron" / "notepad.db"
+            manifest = json.loads((snapshot_dir / "manifest.json").read_text(encoding="utf-8"))
+
+            assert "cron/notepad.db" in manifest["files"]
+            with sqlite3.connect(copied_db) as copied_conn:
+                assert copied_conn.execute("SELECT id, body FROM notes").fetchall() == [
+                    ("n1", "remember this")
+                ]
+        finally:
+            source_conn.close()
+
     def test_failed_state_db_copy_is_loud(self, hermes_home, monkeypatch, capsys):
         """#68474: unreadable state.db must not look like a silent success."""
         from hermes_cli import backup as backup_mod
