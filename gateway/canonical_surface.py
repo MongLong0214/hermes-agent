@@ -91,6 +91,21 @@ class CanonicalSurfaceBinding:
 
 
 @dataclass(frozen=True)
+class CanonicalBindingProof:
+    """The exact live head and physical DB generation a resolver just validated.
+
+    This is evidence for a later existing-actor claimant to re-check. It does
+    not reserve the route or make a subsequent turn safe by itself.
+    """
+
+    entry: Any
+    session_key: str
+    session_id: str
+    db_path: Path
+    db_identity: tuple[int, int]
+
+
+@dataclass(frozen=True)
 class CanonicalIngressEvent:
     """Closed canonical ingress payload with no caller-controlled destination."""
 
@@ -166,9 +181,11 @@ class ExistingCanonicalBindingResolver:
             return None
         return None
 
-    def _read_db_for_existing_path(self, session_key: str) -> tuple[Any, bool] | tuple[None, bool]:
+    def _read_db_for_existing_path(
+        self, session_key: str, *, existing_path: Path | None = None
+    ) -> tuple[Any, bool] | tuple[None, bool]:
         """Return a separately-owned read-only DB, or the narrow fake-store compatibility DB."""
-        path = self._existing_db_path(session_key)
+        path = existing_path if existing_path is not None else self._existing_db_path(session_key)
         if path is not None:
             from hermes_state import SessionDB
 
@@ -180,6 +197,29 @@ class ExistingCanonicalBindingResolver:
         return getattr(self._session_store, "_db", None), False
 
     def resolve(self, binding: CanonicalSurfaceBinding, event: Any) -> Any:
+        """Return the existing entry exactly as before, without exposing a proof."""
+        entry, _ = self._resolve(binding, event, require_proof=False)
+        return entry
+
+    def resolve_with_proof(
+        self, binding: CanonicalSurfaceBinding, event: Any
+    ) -> tuple[Any, CanonicalBindingProof]:
+        """Return an existing live entry together with its frozen validation evidence."""
+        entry, proof = self._resolve(binding, event, require_proof=True)
+        assert proof is not None
+        return entry, proof
+
+    @staticmethod
+    def _db_identity(path: Path) -> tuple[int, int] | None:
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        return stat.st_dev, stat.st_ino
+
+    def _resolve(
+        self, binding: CanonicalSurfaceBinding, event: Any, *, require_proof: bool
+    ) -> tuple[Any, CanonicalBindingProof | None]:
         if (
             getattr(event, "author_id", None) not in binding.allowed_author_ids
             or getattr(event, "channel_id", None) not in binding.allowed_channel_ids
@@ -200,10 +240,14 @@ class ExistingCanonicalBindingResolver:
 
         db = None
         close_db = False
+        db_path = self._existing_db_path(binding.session_key) if require_proof else None
+        db_identity = self._db_identity(db_path) if db_path is not None else None
         try:
             if self._session_store._should_reset(entry, origin) is not None:
                 raise ValueError("canonical_binding_stale")
-            db, close_db = self._read_db_for_existing_path(binding.session_key)
+            db, close_db = self._read_db_for_existing_path(
+                binding.session_key, existing_path=db_path
+            )
             session_id = getattr(entry, "session_id", None)
             if db is None or not session_id:
                 raise ValueError("canonical_binding_stale")
@@ -213,6 +257,22 @@ class ExistingCanonicalBindingResolver:
             current_entry = self._session_store.lookup_by_session_key_existing(binding.session_key)
             if current_entry is not entry or getattr(current_entry, "session_id", None) != session_id:
                 raise ValueError("canonical_binding_stale")
+            if require_proof:
+                if (
+                    db_path is None
+                    or db_identity is None
+                    or self._db_identity(db_path) != db_identity
+                ):
+                    raise ValueError("canonical_binding_stale")
+                proof: CanonicalBindingProof | None = CanonicalBindingProof(
+                    entry=entry,
+                    session_key=binding.session_key,
+                    session_id=session_id,
+                    db_path=db_path,
+                    db_identity=db_identity,
+                )
+            else:
+                proof = None
         except ValueError:
             raise ValueError("canonical_binding_stale")
         except Exception:
@@ -223,4 +283,4 @@ class ExistingCanonicalBindingResolver:
                     db.close()
                 except Exception:
                     pass
-        return entry
+        return entry, proof

@@ -3,6 +3,7 @@
 from datetime import datetime, timezone
 from threading import Event, Lock
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -273,6 +274,52 @@ def test_resolver_reads_real_head_without_flushing_queued_token_writer(tmp_path,
         db.flush_token_counts = original_flush
         db.update_token_counts = original_update
         release.set()
+        store.close_all_db_handles()
+
+
+def test_resolver_proof_captures_the_validated_live_head_and_db_identity(tmp_path, monkeypatch):
+    """A future claimant can re-check the exact head and physical DB the resolver validated."""
+    from gateway.canonical_surface import ExistingCanonicalBindingResolver
+    from gateway.config import GatewayConfig
+
+    root = tmp_path / "root"
+    root.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setattr("hermes_state.DEFAULT_DB_PATH", root / "state.db")
+    store = SessionStore(root / "sessions", GatewayConfig())
+    now = datetime.now(timezone.utc)
+    binding = _binding()
+    entry = SessionEntry(
+        session_key=binding.session_key,
+        session_id="synthetic-live-head",
+        created_at=now,
+        updated_at=now,
+        platform=Platform.TELEGRAM,
+        origin=SessionSource(
+            platform=Platform.TELEGRAM, chat_id="synthetic-chat", chat_type="dm", user_id="synthetic-user"
+        ),
+    )
+    store._loaded = True
+    store._entries[binding.session_key] = entry
+    db: Any = store._db
+    db.create_session(entry.session_id, "telegram")
+    event = SimpleNamespace(author_id="synthetic-author", channel_id="synthetic-channel")
+    expected_identity = (db.db_path.stat().st_dev, db.db_path.stat().st_ino)
+
+    try:
+        resolver = ExistingCanonicalBindingResolver(store)
+        # The established entry-only API stays compatible for existing callers.
+        assert resolver.resolve(binding, event) is entry
+
+        resolved, proof = resolver.resolve_with_proof(binding, event)
+
+        assert resolved is entry
+        assert proof.entry is entry
+        assert proof.session_key == binding.session_key
+        assert proof.session_id == entry.session_id
+        assert proof.db_path == db.db_path
+        assert proof.db_identity == expected_identity
+    finally:
         store.close_all_db_handles()
 
 
