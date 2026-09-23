@@ -330,7 +330,8 @@ class SessionFtsSetupMixin:
             return False
         try:
             # Run even when the table exists: recreates triggers a no-FTS5 runtime dropped.
-            cursor.executescript(ddl)
+            # This can run inside the v30 alignment savepoint, so avoid executescript's commit.
+            self._execute_ddl_script_transactional(cursor, ddl)
             return True
         except sqlite3.OperationalError as exc:
             if not self._is_fts5_unavailable_error(exc):
