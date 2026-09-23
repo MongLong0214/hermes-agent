@@ -4315,15 +4315,26 @@ def _try_configured_fallback_chain(
         if not fb_provider:
             continue
         fb_model_raw = str(entry.get("model", "")).strip()
-        fb_base_url = _custom_health_base_url(fb_provider, entry.get("base_url"))
+        label = f"fallback_chain[{i}]({fb_provider})"
+        route_admitted, fb_route_base_url = _fallback_named_custom_route(
+            fb_provider, entry.get("base_url"),
+        )
+        if not route_admitted:
+            tried.append(f"{label} (custom route unresolved)")
+            continue
+        if _fallback_google_route(
+            fb_provider, fb_model_raw, fb_route_base_url or str(entry.get("base_url") or ""),
+        ):
+            tried.append(f"{label} (Google outbound disabled)")
+            continue
+        fb_base_url = _custom_health_base_url(fb_provider, fb_route_base_url or entry.get("base_url"))
         if skip(fb_provider, fb_model_raw, fb_base_url):
             continue
         if _is_provider_unhealthy(fb_provider, fb_base_url):
             _log_skip_unhealthy(fb_provider, task, base_url=fb_base_url)
-            tried.append(f"fallback_chain[{i}]({fb_provider}) (unhealthy)")
+            tried.append(f"{label} (unhealthy)")
             continue
         fb_model = fb_model_raw or None
-        label = f"fallback_chain[{i}]({fb_provider})"
         try:
             fb_client, resolved_model = _resolve_fallback_entry(entry)
         except Exception:
@@ -4378,6 +4389,87 @@ def _resolve_fallback_entry(entry: Dict[str, Any]) -> Tuple[Optional[Any], Optio
     return client, resolved_model
 
 
+def _main_fallback_ambiguous_custom_route(provider: str, explicit_base_url: Any) -> bool:
+    """Whether a custom fallback lacks a trustworthy explicit endpoint.
+
+    This uses only the fallback entry's route facts and deliberately runs before
+    custom health lookup, which may otherwise consult ambient custom-route state.
+    """
+    normalized_provider = (provider or "").strip().lower()
+    if normalized_provider != "custom" and not normalized_provider.startswith("custom:"):
+        return False
+    route = str(explicit_base_url or "").strip()
+    if not route:
+        return True
+    try:
+        parsed = urlparse(route)
+        _ = parsed.port  # Access validates malformed and out-of-range explicit ports.
+        return parsed.scheme not in {"http", "https"} or not parsed.hostname
+    except ValueError:
+        return True
+
+
+def _fallback_named_custom_route(provider: str, explicit_base_url: Any) -> Tuple[bool, str]:
+    """Return a named custom fallback's admitted non-secret endpoint fact.
+
+    Entries may name a configured provider without repeating its endpoint.  Peek
+    only at that endpoint before fallback resolution: this lets admission inspect
+    the same route as the resolver without reading a key or building a client.
+    A configured alias with no endpoint fails closed; unrelated providers retain
+    their existing routing behavior.
+    """
+    route = str(explicit_base_url or "").strip()
+    normalized_provider = (provider or "").strip().lower()
+    if not route:
+        if normalized_provider == "custom":
+            return False, route
+        if normalized_provider in {"", "auto", "moa"}:
+            return True, route
+        try:
+            from hermes_cli.runtime_provider_custom import peek_named_custom_provider_route
+            route_fact = peek_named_custom_provider_route(provider)
+        except Exception:
+            route_fact = None
+        if route_fact is None:
+            return not normalized_provider.startswith("custom:"), route
+        route = str(route_fact.get("base_url") or "").strip()
+        if not route:
+            return False, route
+    try:
+        parsed = urlparse(route)
+        _ = parsed.port  # Access validates malformed and out-of-range ports.
+        return parsed.scheme in {"http", "https"} and bool(parsed.hostname), route
+    except ValueError:
+        return False, route
+
+
+def _fallback_google_route(provider: str, model: str, base_url: str) -> bool:
+    """Whether one configured auxiliary fallback targets a disabled Google inference route.
+
+    This receives only already-resolved config facts, so it is safe to run before
+    fallback-key resolution, SDK construction, or a provider health/network probe.
+    """
+    normalized_provider = (provider or "").strip().lower()
+    if normalized_provider in {
+        "gemini", "google", "google-gemini", "google-ai-studio", "vertex", "vertexai",
+        "google-vertex", "vertex-ai", "gcp-vertex",
+    }:
+        return True
+    normalized_model = (model or "").strip().lower()
+    if any(segment == "gemini" or segment.startswith(("gemini-", "gemini_"))
+           for segment in re.split(r"[/:]", normalized_model)):
+        return True
+    try:
+        host = (urlparse(base_url).hostname or "").lower().rstrip(".")
+    except ValueError:
+        host = ""
+    return (
+        host in {"generativelanguage.googleapis.com", "aiplatform.googleapis.com", "vertexai.googleapis.com"}
+        or host.endswith(".aiplatform.googleapis.com")
+        or host.endswith("-aiplatform.googleapis.com")
+    )
+
+
 def _try_main_fallback_chain(
     task: Optional[str], failed_provider: str = "", reason: str = "error", *,
     failed_model: Optional[str] = None, failed_base_url: str = "", failure_scope: Any = None,
@@ -4407,7 +4499,23 @@ def _try_main_fallback_chain(
             continue
         fb_norm = fb_provider.lower()
         label = f"fallback_providers[{i}]({fb_provider})"
-        fb_base_url = _custom_health_base_url(fb_provider, entry.get("base_url"))
+        route_admitted, fb_route_base_url = _fallback_named_custom_route(
+            fb_provider, entry.get("base_url"),
+        )
+        if not route_admitted:
+            tried.append(f"{label} (custom route unresolved)")
+            continue
+        if _main_fallback_ambiguous_custom_route(fb_provider, fb_route_base_url):
+            tried.append(f"{label} (custom route unresolved)")
+            continue
+        # Preserve the configured URL as route evidence: a dynamically named provider may
+        # not have a custom-health mapping, but its explicit Google endpoint is still denied.
+        if _fallback_google_route(
+            fb_provider, fb_model, fb_route_base_url or str(entry.get("base_url") or ""),
+        ):
+            tried.append(f"{label} (Google outbound disabled)")
+            continue
+        fb_base_url = _custom_health_base_url(fb_provider, fb_route_base_url or entry.get("base_url"))
         if fb_norm == "auto" or skip(fb_provider, fb_model, fb_base_url):
             tried.append(f"{label} (skipped)")
             continue
