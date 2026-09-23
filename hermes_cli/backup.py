@@ -1299,6 +1299,7 @@ _QUICK_STATE_FILES = (
     "auth.json",
     "cron/jobs.json",
     "cron/executions.db",
+    "cron/notepad.db",
     "gateway_state.json",
     "channel_directory.json",
     "channel_aliases.json",
