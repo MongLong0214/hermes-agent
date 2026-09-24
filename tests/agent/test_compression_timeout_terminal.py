@@ -112,6 +112,9 @@ def test_overflow_recovery_timeout_ends_turn_without_provider_reentry():
     assert result["failed"] is True
     assert result["completed"] is False
     assert result["compression_exhausted"] is True
+    from agent.conversation_loop import _COMPRESSION_TIMEOUT_FINAL_RESPONSE
+
+    assert result["final_response"] == result["error"] == _COMPRESSION_TIMEOUT_FINAL_RESPONSE
 
 
 def test_pre_api_compression_timeout_is_typed_terminal():

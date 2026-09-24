@@ -28,6 +28,8 @@ class CLIChatTurnMixin:
     # response string, so one-shot callers that must map an outcome onto a
     # process exit code (see cli._run_single_query_mode) read this instead.
     _last_turn_result = None
+    # This turn exhausted context compression (the /goal and /loop hooks must not act on the stale reply).
+    _last_turn_compression_exhausted = False
 
     def _sync_fallback_chain_with_config(self, agent) -> None:
         """Adopt ``fallback_providers`` edits made while this chat is open (#95066) — the same
@@ -62,6 +64,7 @@ class CLIChatTurnMixin:
         set_secret_capture_callback(self._secret_capture_callback)
         # Reset per turn; only a real interrupt flips it, so early returns leave it False.
         self._last_turn_interrupted = False
+        self._last_turn_compression_exhausted = False
 
         if not self._ensure_runtime_credentials():
             return None
@@ -476,6 +479,8 @@ class CLIChatTurnMixin:
             self._prompt_start_time = None
         self._last_turn_finished_at = time.time()  # status bar idle time
         self._last_turn_result = turn.result
+        self._last_turn_compression_exhausted = bool(
+            turn.result and turn.result.get("compression_exhausted") and not turn.result.get("compression_deferred"))
         # AsyncOpenAI clients bound to the worker's now-closed loop would crash
         # prompt_toolkit's loop from __del__ on GC.
         try:

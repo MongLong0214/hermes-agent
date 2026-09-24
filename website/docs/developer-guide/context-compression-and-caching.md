@@ -187,10 +187,11 @@ attempt anyway:
 - Manual `/compress` (`force=True`) — clears the cooldown and retries.
 - The same-turn `fallback_chain` retry after a stalled primary route — the
   cancelled primary's own stall cooldown must not suppress it (`bypass_cooldown`).
-  If that pinned route's summary call fails, compress() still commits its
-  deterministic fallback summary (default `abort_on_summary_failure: false`);
-  the log then says "committed a deterministic fallback summary", not
-  "recovered".
+  If that pinned route's summary call fails, compress() commits its
+  deterministic fallback summary only under the opt-in
+  `abort_on_summary_failure: false` (the default `true` aborts and keeps every
+  message); the log then says "committed a deterministic fallback summary",
+  not "recovered".
 - **Repeated stall → deterministic fallback.** A first stall keeps the
   transcript, arms the cooldown and lets the LLM route retry after it lapses.
   When the route stalls *again* while a stall-class failure is still on the
@@ -199,8 +200,12 @@ attempt anyway:
   (`DETERMINISTIC_SUMMARY_ROUTE` pin) and commits the static fallback summary
   through the ordinary lease/fence/watermark pipeline — the same degrade a
   failed summary call gets — instead of "continuing without compression" and
-  re-entering the same silent stream every turn (#112420).
-  `abort_on_summary_failure: true` still aborts (nothing dropped). A committed
+  re-entering the same silent stream every turn (#112420). This rung is part
+  of the opt-in `abort_on_summary_failure: false`; the default `true` aborts
+  (nothing dropped). The cooldown paces the next try only while the request
+  still fits the window: an over-window session bypasses it
+  (`bypass_cooldown=True`), so each message costs one rejected main call plus
+  one summary call until `/compress` or `/new`. A committed
   compaction rebinds the compressor and resets the ladder count, so each
   compaction cycle grants the LLM route one stall before escalating; the
   persisted cooldown row still paces attempts across turns and restarts.
@@ -523,7 +528,7 @@ to find the parent assistant message, keeping groups intact.
 ### Phase 3: Generate Structured Summary
 
 :::warning Summary model context length
-The summary model must have a context window **at least as large** as the main agent model's. The entire middle section is sent to the summary model in a single `call_llm(task="compression")` call. If the summary model's context is smaller, the API returns a context-length error — `_generate_summary()` catches it, logs a warning, and returns `None`. The compressor then drops the middle turns **without a summary**, silently losing conversation context. This is the most common cause of degraded compaction quality.
+The summary model must have a context window **at least as large** as the main agent model's. The entire middle section is sent to the summary model in a single `call_llm(task="compression")` call. If the summary model's context is smaller, the API returns a context-length error — `_generate_summary()` catches it, logs a warning, and returns `None`. By default compress() then aborts and returns the transcript unchanged, with a warning, so the session stays over its threshold; with `abort_on_summary_failure: false` it replaces the middle turns with the static fallback summary and their detail is lost. This is the most common cause of degraded compaction quality.
 :::
 
 The middle turns are summarized using the auxiliary LLM with a structured

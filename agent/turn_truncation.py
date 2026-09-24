@@ -103,7 +103,7 @@ def partial_result(
 ) -> Dict[str, Any]:
     """Typed incomplete-turn result (``partial`` unless ``failed``); ``error`` defaults to
     ``final_response``. ``compression_exhausted`` carries the #98722 typed bit the gateway
-    consumes to reset/move future input to a clean session (see run_turn.py)."""
+    consumes to add the /compress-or-/new notice and, on a failed turn, skip the transcript write (see run_turn.py)."""
     result = {
         "final_response": final_response,
         "messages": messages,
@@ -165,8 +165,8 @@ class _Trunc(TruncationVerdict):
     ) -> TruncationVerdict:
         """Persist and end the turn as partial (or ``failed``).
 
-        ``compression_exhausted`` forwards the #98722 typed bit so the gateway can
-        move future input off a bloated session (run_turn.py consumes it). ``failure`` is
+        ``compression_exhausted`` forwards the #98722 typed bit so the gateway tells the user and,
+        on a failed turn, keeps the bloated session from growing (run_turn.py consumes it). ``failure`` is
         the ``(failure_reason, retryable)`` verdict for the UI descriptor.
         """
         agent = self.agent
@@ -404,9 +404,9 @@ def recover_from_truncation(
         # Prior tool batches can leave a tool-result tail; this path never reaches
         # finalize_turn (same as the truncated-tool-call terminal above).
         close_interrupted_tool_sequence(st.messages, _CONTEXT_OVERFLOW_PARTIAL_FINAL)
-        # Carry the #98722 typed exhaustion bit so the gateway resets/moves future
-        # input to a clean session instead of leaving this bloated one authoritative
-        # for the next turn.
+        # Carry the #98722 typed exhaustion bit so the gateway keeps this turn out of
+        # the transcript (the session does not grow) and tells the user to /compress
+        # or /new; the session itself is kept.
         return st.end_turn(
             _CONTEXT_OVERFLOW_PARTIAL_FINAL,
             error=_CONTEXT_OVERFLOW_PARTIAL_FINAL,

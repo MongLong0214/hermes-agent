@@ -265,8 +265,10 @@ class TestCompressTagsCarriedTail:
         from agent.context_compressor import _COMPACTION_TAIL_MARKER, ContextCompressor
 
         with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+            # A failing summary is the cheap way into the assembly path; that needs the opt-in fallback.
             compressor = ContextCompressor(
                 model="test/model", protect_first_n=2, protect_last_n=2, quiet_mode=True,
+                abort_on_summary_failure=False,
             )
             _ = compressor.context_length
 

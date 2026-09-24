@@ -86,7 +86,8 @@ summary with the `auxiliary` compression model. In-place compaction keeps a sing
 id; native Responses/Codex compaction paths are provider-specific. A stalled summary stream retries
 once on `auxiliary.compression.fallback_chain`, and a repeated stall (a stall-class failure already on
 the cooldown ladder) ends with the deterministic fallback summary through the same pipeline — never a
-prune committed outside the lease/fence. Compression is the sanctioned
+prune committed outside the lease/fence. That fallback is opt-in (`compression.abort_on_summary_failure:
+false`); by default a failed summary aborts and keeps every message. Compression is the sanctioned
 cache break — keep it the only one. Full detail:
 `website/docs/developer-guide/context-compression-and-caching.md`.
 

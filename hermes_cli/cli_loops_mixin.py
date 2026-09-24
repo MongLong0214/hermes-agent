@@ -622,7 +622,8 @@ class CLILoopsMixin:
 
         No-op unless the turn was a loop wakeup (``awaiting_response`` set by
         ``fire_tick``). Detects the LOOP_COMPLETE marker, judges --until, applies caps,
-        and schedules the next tick. Mirrors _maybe_continue_goal_after_turn's shape.
+        and schedules the next tick. Mirrors _maybe_continue_goal_after_turn's shape. A
+        compression-exhausted tick is never judged: it retries once, then the loop pauses.
         """
         from cli import _DIM, _RST, _cprint
         mgr = self._get_loop_manager()
@@ -643,7 +644,12 @@ class CLILoopsMixin:
                 f"  {_DIM}⏸ Loop paused — wakeup turn was interrupted. "
                 f"Use /loop resume to continue, or /loop stop to end it.{_RST}")
             return
-        decision = mgr.complete_tick(self._last_assistant_response_text())
+        if getattr(self, "_last_turn_compression_exhausted", False):
+            decision, self._loop_compression_recovery = mgr.complete_exhausted_tick(
+                getattr(self, "_loop_compression_recovery", None))
+        else:
+            self._loop_compression_recovery = None
+            decision = mgr.complete_tick(self._last_assistant_response_text())
         if (not _print_decision_message(decision) and decision.get("status") == "active"
                 and mgr.state is not None):
             _cprint(f"  {_DIM}↻ Loop: {mgr.state.remaining_label()}.{_RST}")
@@ -653,7 +659,8 @@ class CLILoopsMixin:
         message already queued preempts judging (re-judged after their turn). Ctrl+C
         AUTO-PAUSES instead of judging — the judge on partial output nearly always says
         "continue" and would re-queue exactly what was cancelled; pausing is recoverable
-        via ``/goal resume``. Empty-response skip mirrors ``gateway/run.py``."""
+        via ``/goal resume``. Empty-response skip mirrors ``gateway/run.py``, and so does the
+        compression-exhaustion bound (never judged; one retry, then the goal pauses)."""
         from cli import _DIM, _RST, _cprint, _looks_like_slash_command
         mgr = self._get_goal_manager()
         if mgr is None or not mgr.is_active():
@@ -686,12 +693,26 @@ class CLILoopsMixin:
                 f"  {_DIM}⏸ Goal paused — turn was interrupted. "
                 f"Use /goal resume to continue, or /goal clear to stop.{_RST}")
             return
+        # A compression-exhausted turn added no reply (the last one is stale), so it is never judged;
+        # the session is kept, so each retry re-sends the oversized request: one retry, then pause.
+        if getattr(self, "_last_turn_compression_exhausted", False):
+            from hermes_cli.goals import plan_compression_exhaustion_recovery
+            prompt, notice, self._goal_compression_recovery = plan_compression_exhaustion_recovery(
+                mgr, getattr(self, "_goal_compression_recovery", None))
+            _cprint(f"  {_DIM}{notice}{_RST}")
+            if prompt:
+                try:
+                    self._pending_input.put(prompt)
+                except Exception as exc:
+                    logging.debug("goal continuation enqueue failed: %s", exc)
+            return
 
         # Empty/whitespace responses are almost always transient failures (API error,
         # empty stream): judging would say "continue" and trip the parse-failure backstop.
         last_response = self._last_assistant_response_text()
         if not last_response.strip():
             return
+        self._goal_compression_recovery = None
         _active_deleg = 0
         try:
             from hermes_cli.goals import count_active_delegations, gather_background_processes as _gather_bg
