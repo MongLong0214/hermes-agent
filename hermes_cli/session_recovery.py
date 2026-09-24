@@ -17,8 +17,11 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
 from hermes_state import SessionDB
-from hermes_state_fence import register_turn_fence_generation
-from hermes_state_common import FTS_STORAGE_VERSION, SCHEMA_VERSION
+from hermes_state_fence import (
+    STORED_SCHEMA_VERSION, fences_exact, register_turn_fence_generation, validate_state_connection,
+)
+from hermes_state_common import FTS_STORAGE_VERSION
+from hermes_state_errors import IncompatibleSchemaError
 from hermes_state_repair import _db_opens_cleanly
 
 
@@ -370,8 +373,30 @@ def _fresh_destination(output: Path, *, topic_tables: bool = False) -> sqlite3.C
         if topic_tables:
             destination_db.apply_telegram_topic_migration()
     conn = _connect(output)
+    try:
+        _require_destination_fenced(conn)
+    except BaseException:
+        conn.close()
+        raise
     conn.execute("PRAGMA foreign_keys=OFF")
     return conn
+
+
+def _destination_fences_exact(conn: sqlite3.Connection) -> bool:
+    try:
+        return fences_exact(conn.cursor())
+    except IncompatibleSchemaError:
+        return False
+
+
+def _require_destination_fenced(conn: sqlite3.Connection) -> None:
+    """Refuse before any row is copied: an unfenced destination would publish a store any build can write."""
+    try:
+        stored = validate_state_connection(conn).stored
+    except IncompatibleSchemaError:
+        stored = None
+    if stored != STORED_SCHEMA_VERSION or not _destination_fences_exact(conn):
+        raise SessionRecoverySafetyError("Recovery destination turn-fence setup is unavailable or incompatible.")
 
 
 def _copy_table(
@@ -805,8 +830,11 @@ def _verify_structure(conn: sqlite3.Connection, verification: dict[str, Any]) ->
     verification["journal_mode"] = _journal_mode(conn)
     schema_row = conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
     verification["schema_version"] = int(schema_row[0]) if schema_row else None
-    if verification["schema_version"] != SCHEMA_VERSION:
-        errors.append(f"schema version is {verification['schema_version']}, expected {SCHEMA_VERSION}")
+    if verification["schema_version"] != STORED_SCHEMA_VERSION:
+        errors.append(f"schema version is {verification['schema_version']}, expected {STORED_SCHEMA_VERSION}")
+    verification["turn_fences_exact"] = _destination_fences_exact(conn)
+    if not verification["turn_fences_exact"]:
+        errors.append("turn-fence triggers are not exactly this build's declarations")
     meta = dict(conn.execute("SELECT key, value FROM state_meta WHERE key LIKE 'fts_%'").fetchall())
     meta = {str(key): value for key, value in meta.items()}
     verification["fts_meta"] = meta

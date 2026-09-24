@@ -37,6 +37,7 @@ def test_failure_owner_follows_only_live_lineage_markers(tmp_path):
     from gateway.platforms.event import MessageEvent
     from gateway.run import GatewayRunner
     from gateway.session import SessionSource, SessionStore
+    from hermes_state_fence import register_turn_fence_generation
 
     async def check():
         store = SessionStore(tmp_path / "sessions", GatewayConfig())
@@ -84,6 +85,7 @@ def test_failure_owner_follows_only_live_lineage_markers(tmp_path):
             db.end_session(middle, "compression")
             if location in ("ancestor", "middle-ancestor", "undone"):
                 with sqlite3.connect(db.db_path) as conn:
+                    register_turn_fence_generation(conn)  # the store is fenced: plain writes land only as this build's generation
                     conn.execute(
                         "UPDATE messages SET active=0, compacted=? WHERE id=?",
                         (int(location != "undone"), current_id),

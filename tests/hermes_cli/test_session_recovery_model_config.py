@@ -14,6 +14,7 @@ import sqlite3
 from pathlib import Path
 
 from hermes_state import SessionDB
+from hermes_state_fence import register_turn_fence_generation
 from hermes_cli.session_recovery import recover_session_database
 
 _TRUNCATED_JSON = '{"model": "sonnet", "cw'
@@ -30,6 +31,7 @@ def _damaged_source(path: Path) -> None:
     finally:
         db.close()
     raw = sqlite3.connect(str(path))
+    register_turn_fence_generation(raw)  # the store is fenced: plain writes land only as this build's generation
     try:
         raw.execute("UPDATE sessions SET model_config = ? WHERE id = 'child'", (_TRUNCATED_JSON,))
         raw.commit()

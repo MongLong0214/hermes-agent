@@ -20,6 +20,7 @@ import pytest
 
 import hermes_state
 import hermes_state_wal
+from hermes_state_fence import register_turn_fence_generation
 from hermes_state import SessionDB
 
 
@@ -67,6 +68,7 @@ def write_second_generation(db_path: Path, n_rows: int) -> int:
     Returns the message count on the path afterwards. MUST run in a different process from the writer that
     holds the deleted generation — two live handles on one db in one process collide on the -shm."""
     conn = sqlite3.connect(str(db_path), timeout=5.0, isolation_level=None)
+    register_turn_fence_generation(conn)  # the store is fenced: plain writes land only as this build's generation
     try:
         conn.execute("PRAGMA journal_mode")  # header says WAL -> a fresh -wal/-shm generation on the path
         sessions = [r[0] for r in conn.execute("SELECT id FROM sessions ORDER BY id").fetchall()]

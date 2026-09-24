@@ -16,6 +16,7 @@ SCHEMA_VERSION`` so neither older line can misread it as its own.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +27,8 @@ from hermes_state_errors import (
     SCHEMA_CAUSE_BUILD_TOO_OLD, SCHEMA_CAUSE_VERSION_UNREADABLE, IncompatibleSchemaError,
 )
 from hermes_state_fence_classifier import owned_turn_fence_literals
+
+logger = logging.getLogger("hermes_state")
 
 FENCE_LINEAGE_BASE = 1000
 STORED_SCHEMA_VERSION = FENCE_LINEAGE_BASE + SCHEMA_VERSION
@@ -67,8 +70,10 @@ def turn_fence_trigger_name(table: str, operation: str) -> str:
     return f"turn_fence_{table}_{operation.lower()}"
 
 
-def turn_fence_trigger_sql(table: str, operation: str, *, generation: int = TURN_FENCE_GENERATION) -> str:
+def turn_fence_trigger_sql(table: str, operation: str, *, generation: Optional[int] = None) -> str:
     # Byte-compatible with the fork builder for its generations: ownership is proven by token equality.
+    # The default resolves at call time, so every builder reads the one module binding of the generation.
+    generation = TURN_FENCE_GENERATION if generation is None else generation
     return (
         f"CREATE TRIGGER {turn_fence_trigger_name(table, operation)} BEFORE {operation} ON {table} "
         "BEGIN "
@@ -81,7 +86,7 @@ def turn_fence_trigger_sql(table: str, operation: str, *, generation: int = TURN
     )
 
 
-def turn_fence_trigger_definitions(governed, *, generation: int = TURN_FENCE_GENERATION) -> dict:
+def turn_fence_trigger_definitions(governed, *, generation: Optional[int] = None) -> dict:
     return {
         turn_fence_trigger_name(table, op): turn_fence_trigger_sql(table, op, generation=generation)
         for table in governed for op in FENCE_OPERATIONS
@@ -250,10 +255,13 @@ def open_fenced_state_connection(
     """Open a raw (non-SessionDB) connection to a state.db: probe, register, validate, then initialize.
 
     The probe runs before ``connect`` so a refused store gets no journal-mode change or DDL
-    from the caller's opener. ``bootstrap`` lets the SessionDB facade create a fresh store's
-    schema first, so the raw opener never becomes the store's first schema writer."""
+    from the caller's opener. ``bootstrap`` (an opener of its own profile's store) lets the
+    SessionDB facade go first: it creates a fresh store's schema, so the raw opener never becomes
+    the store's first schema writer, and it migrates a store whose fences carry another
+    generation, which would otherwise abort every governed write the raw opener makes. That is
+    the one migration, under SessionDB's lock and in its single transaction."""
     lineage = probe_store_lineage(path)
-    if bootstrap and lineage.lineage == LINEAGE_FRESH:
+    if bootstrap and (lineage.lineage == LINEAGE_FRESH or not lineage.writable_by_this_build):
         from hermes_state import SessionDB
 
         SessionDB(db_path=Path(path)).close()
@@ -267,3 +275,152 @@ def open_fenced_state_connection(
         conn.close()
         raise
     return conn
+
+
+# ── In-place migration: fence swap + lineage stamp ─────────────────────────────
+
+
+def _expected_definitions(cursor) -> dict:
+    return turn_fence_trigger_definitions(governed_tables(cursor))
+
+
+def _is_exact(owned: dict, expected: dict) -> bool:
+    return set(owned) == set(expected) and all(literal == TURN_FENCE_GENERATION for literal in owned.values())
+
+
+def fences_exact(cursor) -> bool:
+    """True when the owned fences are exactly this build's declarations for the governed tables present."""
+    return _is_exact(owned_turn_fence_literals(cursor), _expected_definitions(cursor))
+
+
+def _in_write_transaction(cursor, body):
+    # R's writer is autocommit, so each fence step brings its own transaction; a caller that
+    # already holds one (optimize-storage's settle) keeps the atomicity it asked for.
+    if cursor.connection.in_transaction:
+        return body()
+    cursor.execute("BEGIN IMMEDIATE")
+    try:
+        result = body()
+    except BaseException:
+        cursor.execute("ROLLBACK")
+        raise
+    cursor.execute("COMMIT")
+    return result
+
+
+def _write_lineage_stamp(cursor, lineage: StoreLineage, stamp: int) -> None:
+    if lineage.stored is None:
+        cursor.execute("INSERT INTO schema_version (version) VALUES (?)", (stamp,))
+    else:
+        cursor.execute("UPDATE schema_version SET version = ? WHERE version < ?", (stamp, stamp))
+
+
+def _create_missing(cursor, owned: dict, expected: dict) -> list:
+    missing = [name for name in expected if name not in owned]
+    for name in missing:
+        cursor.execute(expected[name])
+    return missing
+
+
+def _warn_restored(names: list) -> None:
+    if names:
+        logger.warning("restored %d missing turn-fence trigger(s) on state.db (a non-fence build's DDL "
+                       "removed them): %s", len(names), ", ".join(names))
+
+
+def _swap_fences(cursor, owned: dict, expected: dict) -> None:
+    for name in owned:
+        cursor.execute('DROP TRIGGER "{}"'.format(name.replace('"', '""')))
+    for sql in expected.values():
+        cursor.execute(sql)
+    if not fences_exact(cursor):
+        raise RuntimeError("turn-fence trigger verification failed after the swap")
+
+
+def apply_fence_delta(cursor) -> StoreLineage:
+    """Make this build's fences exact and stamp ``FENCE_LINEAGE_BASE + gate``, atomically.
+
+    Runs after ``SCHEMA_SQL`` + column reconcile (DDL, never fenced) and before any governed
+    DML. Returns the lineage decoded under the write lock; its ``gate`` drives the data
+    migrations. A settled store (fenced lineage, exact fences) takes no lock and runs no DDL.
+    From the commit on, the fork refuses the store at open and its UDF cannot write it."""
+    lineage = decode_store_lineage(cursor)
+    if lineage.lineage == LINEAGE_FENCED and fences_exact(cursor):
+        return lineage
+
+    def migrate() -> StoreLineage:
+        current = decode_store_lineage(cursor)  # another opener may have migrated since the read
+        owned, expected = owned_turn_fence_literals(cursor), _expected_definitions(cursor)
+        if not _is_exact(owned, expected):
+            if current.lineage == LINEAGE_FENCED and all(v == TURN_FENCE_GENERATION for v in owned.values()):
+                _warn_restored(_create_missing(cursor, owned, expected))
+            else:
+                _swap_fences(cursor, owned, expected)
+        stamp = STORED_SCHEMA_VERSION if current.lineage == LINEAGE_FRESH else FENCE_LINEAGE_BASE + current.gate
+        _write_lineage_stamp(cursor, current, stamp)
+        return current
+
+    return _in_write_transaction(cursor, migrate)
+
+
+def schema_cookie(cursor) -> int:
+    return cursor.execute("PRAGMA schema_version").fetchone()[0]
+
+
+def restore_missing_fences(cursor, *, unchanged_since: Optional[int] = None) -> list:
+    """Backstop after the heals and migrations: re-create any missing owned fence at this build's
+    generation. Never drops anything; an unowned or colliding declaration still refuses.
+
+    ``unchanged_since`` is the schema cookie read before the fence delta checked the fences:
+    only DDL removes a trigger, and any committed or own DDL moves the cookie, so an equal
+    cookie proves the fences are still the ones the delta found exact."""
+    if unchanged_since is not None and schema_cookie(cursor) == unchanged_since:
+        return []
+    if fences_exact(cursor):
+        return []
+
+    def restore() -> list:
+        owned, expected = owned_turn_fence_literals(cursor), _expected_definitions(cursor)
+        if any(v != TURN_FENCE_GENERATION for v in owned.values()):
+            raise RuntimeError("turn-fence triggers carry another generation after the fence delta")
+        missing = _create_missing(cursor, owned, expected)
+        _warn_restored(missing)
+        return missing
+
+    return _in_write_transaction(cursor, restore)
+
+
+def table_fence_literals(cursor, table: str) -> dict:
+    """Owned fence declarations on *table*, read before a rebuild RENAMEs it (after the RENAME
+    SQLite rewrites their bodies onto the legacy name and they are no longer owned)."""
+    names = set(turn_fence_trigger_definitions((table,)))
+    return {name: literal for name, literal in owned_turn_fence_literals(cursor).items() if name in names}
+
+
+def recreate_table_fences(cursor, table: str, literals: dict) -> None:
+    """Re-declare *table*'s fences inside the rebuild's own transaction: the DROP of the legacy
+    copy took them, and a commit without them would leave the table writable by any build."""
+    for name, literal in literals.items():
+        operation = name.rsplit("_", 1)[1].upper()
+        cursor.execute(turn_fence_trigger_sql(table, operation, generation=literal))
+
+
+def advance_lineage_stamp(cursor) -> bool:
+    """Raise a fenced store's stamp to ``STORED_SCHEMA_VERSION``, forward only, while its fences
+    are exact. Read-first, so a settled store takes no write lock; joins a caller's transaction."""
+    if cursor.execute(
+            "SELECT COUNT(*) = 1 AND SUM(typeof(version) = 'integer' AND version = ?) = 1 FROM schema_version",
+            (STORED_SCHEMA_VERSION,)).fetchone()[0]:
+        return False  # settled: skip the trigger parse the full decode needs
+    lineage = decode_store_lineage(cursor)
+    if lineage.lineage != LINEAGE_FENCED or lineage.stored >= STORED_SCHEMA_VERSION:
+        return False
+
+    def stamp() -> bool:
+        current = decode_store_lineage(cursor)
+        if current.lineage != LINEAGE_FENCED or current.stored >= STORED_SCHEMA_VERSION or not fences_exact(cursor):
+            return False
+        _write_lineage_stamp(cursor, current, STORED_SCHEMA_VERSION)
+        return True
+
+    return _in_write_transaction(cursor, stamp)

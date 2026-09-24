@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from hermes_state import SessionDB
+from hermes_state_fence import register_turn_fence_generation
 from hermes_cli import session_recovery
 from hermes_cli import session_schema_history
 from hermes_cli.session_lost_and_found import (
@@ -535,6 +536,7 @@ def test_mapper_rebuilds_sessiondb_from_synthetic_lost_and_found(
 
     lf_conn = sqlite3.connect(str(lf_path), isolation_level=None)
     dest = sqlite3.connect(str(output), isolation_level=None)
+    register_turn_fence_generation(dest)  # the store is fenced: plain writes land only as this build's generation
     try:
         dest.execute("PRAGMA foreign_keys=OFF")
         mapping = map_lost_and_found_rows(lf_conn, dest)
@@ -730,13 +732,16 @@ def _map_salvage_rows(
     SessionDB(db_path=output).close()
     lf_conn = sqlite3.connect(str(lf_path), isolation_level=None)
     dest = sqlite3.connect(str(output), isolation_level=None)
+    register_turn_fence_generation(dest)  # the store is fenced: plain writes land only as this build's generation
     try:
         dest.execute("PRAGMA foreign_keys=OFF")
         map_lost_and_found_rows(lf_conn, dest)
     finally:
         lf_conn.close()
         dest.close()
-    return sqlite3.connect(str(output), isolation_level=None)
+    mapped = sqlite3.connect(str(output), isolation_level=None)
+    register_turn_fence_generation(mapped)  # callers damage rows in the fenced store through it
+    return mapped
 
 
 def test_plausibility_gate_flags_positional_mis_mapping(
@@ -1039,6 +1044,7 @@ def test_upgraded_physical_layout_maps_cells_by_name(tmp_path: Path) -> None:
 
     lf_conn = sqlite3.connect(str(lf_path), isolation_level=None)
     dest = sqlite3.connect(str(output), isolation_level=None)
+    register_turn_fence_generation(dest)  # the store is fenced: plain writes land only as this build's generation
     try:
         dest.execute("PRAGMA foreign_keys=OFF")
         report = map_lost_and_found_rows(lf_conn, dest)
@@ -1104,6 +1110,7 @@ def test_plausibility_gate_ignores_stub_only_sessions(tmp_path: Path) -> None:
     output = tmp_path / "stubs.db"
     SessionDB(db_path=output).close()
     conn = sqlite3.connect(str(output))
+    register_turn_fence_generation(conn)  # the store is fenced: plain writes land only as this build's generation
     try:
         now = 1_750_000_000.0
         conn.execute(

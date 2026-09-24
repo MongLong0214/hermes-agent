@@ -18,7 +18,8 @@ import hermes_state_wal
 import hermes_state_common
 from agent.session_activity import ActivityProvenance, build_activity_snapshot
 from hermes_state import SessionDB
-from hermes_state_common import FTS_SQL, FTS_STORAGE_VERSION, SCHEMA_SQL, SCHEMA_VERSION
+from hermes_state_common import FTS_SQL, FTS_STORAGE_VERSION, SCHEMA_SQL
+from hermes_state_fence import STORED_SCHEMA_VERSION, register_turn_fence_generation
 
 
 def _activity_snapshot(db, session_id):
@@ -1774,6 +1775,7 @@ class TestSessionTitleIndexRepair:
         session_db.close()
 
         with sqlite3.connect(db_path) as conn:
+            register_turn_fence_generation(conn)  # the store is fenced: plain writes land only as this build's generation
             conn.execute("DROP INDEX idx_sessions_title_unique")
             if duplicate_titles:
                 conn.execute(
@@ -4085,12 +4087,11 @@ class TestFTS5ToolCallMigration:
             assert len(session_db.search_messages("LEGACYARG")) == 1, \
                 "v23 optimize must index tool_calls JSON into FTS"
             # schema_version bumped once the FTS layer is v23
-            from hermes_state_common import SCHEMA_VERSION
             row = session_db._conn.execute(
                 "SELECT version FROM schema_version LIMIT 1"
             ).fetchone()
             version = row["version"] if hasattr(row, "keys") else row[0]
-            assert version == SCHEMA_VERSION
+            assert version == STORED_SCHEMA_VERSION
         finally:
             session_db.close()
 
@@ -4169,7 +4170,7 @@ class TestFTSExternalContentMigration:
             version = db._conn.execute(
                 "SELECT version FROM schema_version"
             ).fetchone()[0]
-            assert version == SCHEMA_VERSION, "main schema version must advance"
+            assert version == STORED_SCHEMA_VERSION, "main schema version must advance"
             # But the FTS storage layout is NOT stamped current — it's legacy.
             assert db.get_meta("fts_storage_version") is None
             assert db.fts_optimize_available() is True

@@ -20,6 +20,15 @@ import sqlite3
 import pytest
 
 from hermes_state import SessionDB
+from hermes_state_fence import register_turn_fence_generation
+
+
+def _fenced_raw(db_path):
+    """A plain connection to the fenced store, writing as this build's generation."""
+    conn = sqlite3.connect(db_path)
+    register_turn_fence_generation(conn)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def _make_legacy_db(tmp_path, n_rows=5):
@@ -28,8 +37,7 @@ def _make_legacy_db(tmp_path, n_rows=5):
     db = SessionDB(db_path=db_path)
     db.close()
 
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
+    conn = _fenced_raw(db_path)
     cur = conn.cursor()
     for i in range(n_rows):
         cur.execute(
@@ -74,8 +82,7 @@ def test_mid_loop_lock_error_returns_instead_of_raising(tmp_path):
     db_path = _make_legacy_db(tmp_path)
     db = SessionDB(db_path=db_path)
     try:
-        conn = sqlite3.connect(db_path)
-        conn.row_factory = sqlite3.Row
+        conn = _fenced_raw(db_path)
         raw = conn.cursor()
         proxy = _FailAfterN(raw, fail_after=2)
         # Must NOT raise even though the third UPDATE hits "database is locked".
@@ -102,8 +109,7 @@ def test_later_run_completes_the_remainder(tmp_path):
     db_path = _make_legacy_db(tmp_path)
     db = SessionDB(db_path=db_path)
     try:
-        conn = sqlite3.connect(db_path)
-        conn.row_factory = sqlite3.Row
+        conn = _fenced_raw(db_path)
         raw = conn.cursor()
         db._dedupe_legacy_system_prompts(_FailAfterN(raw, fail_after=2))
         conn.commit()

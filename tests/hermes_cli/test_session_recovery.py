@@ -14,6 +14,7 @@ import pytest
 import hermes_state
 from hermes_state import SessionDB
 from hermes_state_common import FTS_STORAGE_VERSION, SCHEMA_VERSION
+from hermes_state_fence import register_turn_fence_generation
 from hermes_cli import session_recovery
 from hermes_cli.session_recovery import (
     SessionRecoverySafetyError,
@@ -427,6 +428,7 @@ def test_partial_recovery_keeps_messages_when_sessions_are_unsalvageable(
 
     # sessions unrecoverable, messages intact — the reported shape.
     conn = sqlite3.connect(str(source), isolation_level=None)
+    register_turn_fence_generation(conn)  # the store is fenced: plain writes land only as this build's generation
     try:
         conn.execute("DELETE FROM sessions")
     finally:
@@ -878,6 +880,7 @@ def test_partial_recovery_skips_phantom_row_rejected_by_destination_schema(
         conn.execute(f"PRAGMA schema_version={version + 1}")
         conn.execute("PRAGMA writable_schema=OFF")
     with sqlite3.connect(str(source), isolation_level=None) as conn:
+        register_turn_fence_generation(conn)  # the store is fenced: plain writes land only as this build's generation
         conn.execute(
             "INSERT INTO sessions (id, source, started_at, title) VALUES ('phantom', 'cli', NULL, 'Phantom')"
         )

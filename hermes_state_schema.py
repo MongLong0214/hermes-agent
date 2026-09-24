@@ -24,7 +24,11 @@ from hermes_state_common import (
     DEFERRED_INDEX_SQL, FTS_CJK_STALE_KEY, FTS_REBUILD_DEFERRAL_KEY, FTS_STALE_KEY, FTS_SQL,
     FTS_STORAGE_VERSION, FTS_TOOL_CONTENT_PREFIX_CHARS, FTS_TRIGRAM_SQL, LEGACY_FTS_SQL,
     LEGACY_FTS_TRIGRAM_SQL, SCHEMA_SQL,
-    SCHEMA_VERSION, _FTS_CJK_TRIGGERS, _FTS_TRIGGERS, _ephemeral_child_sql, _sql_json_extract, fts_rebuild_admission,
+    _FTS_CJK_TRIGGERS, _FTS_TRIGGERS, _ephemeral_child_sql, _sql_json_extract, fts_rebuild_admission,
+)
+from hermes_state_fence import (
+    LINEAGE_FRESH, advance_lineage_stamp, apply_fence_delta, recreate_table_fences, restore_missing_fences,
+    schema_cookie, table_fence_literals,
 )
 from hermes_state_fts import _drop_orphan_fts_shadow_tables
 from hermes_state_holders import _read_proc_argv
@@ -815,12 +819,15 @@ class SessionSchemaMixin:
 
     @staticmethod
     def _rebuild_table_statements(cursor, table, legacy_name, ddl, copy_sql, indexes) -> None:
+        # Read under the rebuild's lock, before the RENAME moves the fences onto the legacy copy.
+        fences = table_fence_literals(cursor, table)
         cursor.execute(f"ALTER TABLE {table} RENAME TO {legacy_name}")
         cursor.execute(ddl)
         cursor.execute(copy_sql)
         cursor.execute(f"DROP TABLE {legacy_name}")
         for sql in indexes:
             cursor.execute(sql)
+        recreate_table_fences(cursor, table, fences)
 
     def _heal_gateway_routing_pk(self, cursor: sqlite3.Cursor) -> None:
         """Rebuild ``gateway_routing`` when its PRIMARY KEY predates scoping (``session_key TEXT
@@ -931,6 +938,10 @@ class SessionSchemaMixin:
 
         # Column reconciliation, then the two table-shape repairs ADD COLUMN cannot express.
         self._reconcile_columns(cursor)
+        # Fences and lineage stamp before any heal or governed DML: an old literal would abort
+        # those writes, and the stamp is what makes the fork refuse the store from here on.
+        fence_cookie = schema_cookie(cursor)
+        lineage = apply_fence_delta(cursor)
         self._heal_gateway_routing_pk(cursor)
         # Rebuild session_model_usage if its PRIMARY KEY lacks the ``task`` column (5-column PK on installs
         # already at v22+ when the column landed — the version-gated rebuild is unreachable there, #73823).
@@ -977,27 +988,34 @@ class SessionSchemaMixin:
             # targets. Drop only the triggers; a future FTS5 runtime recreates them.
             self._drop_fts_triggers(cursor)
 
-        row = cursor.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
-        if row is None:
-            cursor.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
-            # Store provenance so fresh vs wiped stores are distinguishable.
-            # See #97568.
+        if lineage.lineage == LINEAGE_FRESH:
+            # The fence transaction inserted the stamp. Store provenance so fresh vs wiped
+            # stores are distinguishable. See #97568.
             now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
             cursor.executemany(
                 "INSERT OR IGNORE INTO state_meta (key, value) VALUES (?, ?)",
                 [("store_instance_id", str(uuid.uuid4())), ("store_created_at_utc", now_iso)],
             )
+            fts_migrations_complete = True
         else:
-            self._run_data_migrations(cursor, row[0], fts5_available)
+            fts_migrations_complete = self._run_data_migrations(cursor, lineage.gate, fts5_available)
 
         self._ensure_unique_title_index(cursor)
         if fts5_available:
             self._init_fts(cursor)
+        # A heal or migration that rebuilt a governed table by hand-written DDL must not leave it unfenced.
+        restore_missing_fences(cursor, unchanged_since=fence_cookie)
+        # Advance schema_version — deliberately NOT gated on the FTS opt-in (that would block
+        # every future migration for a user who never optimizes). FTS5 unavailable is the
+        # one skip: claiming current would lie.
+        if fts_migrations_complete and fts5_available:
+            advance_lineage_stamp(cursor)
         self._conn.commit()
 
-    def _run_data_migrations(self, cursor: sqlite3.Cursor, current_version: int, fts5_available: bool) -> None:
+    def _run_data_migrations(self, cursor: sqlite3.Cursor, current_version: int, fts5_available: bool) -> bool:
         """Version-gated chain for DATA migrations only (row backfills); column additions never
-        belong here. Advances schema_version at the end unless FTS5 is unavailable."""
+        belong here. *current_version* is the lineage's upstream gate. Returns whether the FTS
+        migrations completed, which gates the lineage stamp advance."""
         # Renew the lease: the chain can rewrite whole tables on large DBs.
         report_startup_progress(600.0, phase="state_db_data_migrations")
         # (v10 trigram backfill and v11 inline FTS re-index were superseded by v23 and removed.)
@@ -1093,12 +1111,7 @@ class SessionSchemaMixin:
                 (str(FTS_STORAGE_VERSION),),
             ).fetchone() is None:
                 self.set_meta("fts_storage_version", str(FTS_STORAGE_VERSION), cursor=cursor)
-
-        # Advance schema_version — deliberately NOT gated on the FTS opt-in (that would block
-        # every future migration for a user who never optimizes). FTS5 unavailable is the
-        # one skip: claiming current would lie.
-        if current_version < SCHEMA_VERSION and fts_migrations_complete and fts5_available:
-            cursor.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
+        return fts_migrations_complete
 
     def _migrate_v22_session_model_usage(self, cursor: sqlite3.Cursor) -> None:
         """v22: ``task`` joins the session_model_usage PRIMARY KEY ('' = main loop; aux calls

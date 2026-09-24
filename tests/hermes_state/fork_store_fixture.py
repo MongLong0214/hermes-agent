@@ -136,6 +136,8 @@ def _build_fork29(path: Path) -> None:
 
 
 def _build_r_store(path: Path) -> None:
+    """The store plain R (upstream) leaves. A fenced build's SessionDB writes it, so its fences and
+    lineage stamp come off again: R declares neither (a no-op on a build without fences)."""
     from hermes_state import SessionDB
 
     db = SessionDB(db_path=path)
@@ -144,6 +146,16 @@ def _build_r_store(path: Path) -> None:
         db.append_message("r-alpha", "user", "hello upstream")
     finally:
         db.close()
+    conn = _connect_as(path, None)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        for (name,) in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'turn_fence_%'").fetchall():
+            conn.execute(f'DROP TRIGGER "{name}"')
+        conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
 
 
 def _raw(path: Path, *statements, generation=None) -> None:

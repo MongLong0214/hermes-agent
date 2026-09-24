@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from hermes_state import SessionDB
+from hermes_state_fence import register_turn_fence_generation
 
 
 def _write_invalid_utf8_row(db_path: Path) -> None:
@@ -17,6 +18,7 @@ def _write_invalid_utf8_row(db_path: Path) -> None:
     """
     # CAST(x'61625F816364' AS TEXT) → 'ab_�cd' with 0x81 at position 3
     conn = sqlite3.connect(str(db_path))
+    register_turn_fence_generation(conn)  # the store is fenced: plain writes land only as this build's generation
     try:
         conn.execute("PRAGMA foreign_keys = OFF")
         # Force the bytes through by overwriting an existing row id.
