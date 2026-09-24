@@ -53,17 +53,22 @@ def test_profile_home_resolution_stamps_default_rows(tmp_path, monkeypatch):
         def create_session(self, _key, **kwargs):
             self.profile_name = kwargs["profile_name"]
 
-        def append_messages_batch(self, _key, _messages, *, chunk_rows):
+        def create_session_strict(self, _key, **kwargs):
+            self.profile_name = kwargs["profile_name"]
+            self.title_source = kwargs["title_source"]
+            return True
+
+        def try_acquire_session_turn_lease(self, _key, _holder, *, ttl_seconds):
+            return True
+
+        def release_session_turn_lease(self, _key, _holder):
+            return True
+
+        def append_messages_batch(self, _key, _messages, *, chunk_rows, turn_lease_holder):
             assert chunk_rows == 500
 
         def get_session_title(self, _key):
             return "branch"
-
-        def set_session_title(self, _key, _title):
-            return None
-
-        def set_auto_title(self, _key, _title, *, source):
-            self.title_source = source
 
     captured = CaptureDB()
 

@@ -300,8 +300,9 @@ class SessionSessionsMixin:
         chat_id: str = None, chat_type: str = None, thread_id: str = None,
         parent_session_id: str = None, cwd: str = None, profile_name: Optional[str] = None,
         git_repo_root: str = None, origin_json: str = None, display_name: str = None,
-        transport_profile: Optional[str] = None,
-    ) -> None:
+        transport_profile: Optional[str] = None, strict: bool = False,
+        title: Optional[str] = None, title_source: Optional[str] = None,
+    ) -> bool:
         """Upsert a session row, never overwriting what an earlier writer set (the gateway creates a
         bare row before create_session carries the real model/prompt) — the one exception is the
         token-accounting guard's placeholder ``source='unknown'``, which a later writer's real surface
@@ -330,10 +331,19 @@ class SessionSessionsMixin:
         deep links, the fail-closed owner ladder) treat NULL as unowned: the session vanishes from the
         sidebar even though its transcript is intact (#99222). Stores outside the profile tree (explicit
         ``db_path`` in tests, ad-hoc copies) derive nothing and keep NULL — never guess.
+
+        ``strict`` refuses a taken id (returns False) before ANY write — the prompt blob, the
+        COALESCE-fill of the upsert and the parent inheritance would all land on the other row.
+        ``title`` (``title_source``, default ``user``) is written in the same transaction, so a
+        refused title (ValueError: invalid, or in use) leaves no row behind.
         """
         if not (profile_name or "").strip():
             profile_name = self._own_profile_name()
+        title = self.sanitize_title(title)
         def _do(conn):
+            # Same BEGIN IMMEDIATE as the INSERT below, so no writer can take the id in between.
+            if strict and conn.execute("SELECT 1 FROM sessions WHERE id = ?", (session_id,)).fetchone():
+                return False
             system_prompt_hash = self._store_system_prompt(conn, system_prompt)
             conn.execute(
                 """INSERT INTO sessions (
@@ -391,13 +401,23 @@ class SessionSessionsMixin:
                 self._delete_unreferenced_system_prompts(conn)
             if parent_session_id:
                 self._inherit_parent_session_metadata(conn, session_id)
+            if title:
+                self._write_session_title(conn, session_id, title, title_source or self.TITLE_SOURCE_USER)
+            return True
         # Transcript-critical: a failed row creation aborts the turn.
-        self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+        return bool(self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S))
 
     def create_session(self, session_id: str, source: str, **kwargs) -> str:
         """Create (upsert) a session record. Returns the session_id."""
         self._insert_session_row(session_id, source, **kwargs)
         return session_id
+
+    def create_session_strict(self, session_id: str, source: str, **kwargs) -> bool:
+        """Create a NEW session row: True when created, False when ``session_id`` is already taken
+        (nothing written). Every other failure raises — an ``IntegrityError`` here is a trigger, FK or
+        other constraint, never a collision, so it is not classified; a ``title`` kwarg the row
+        cannot take raises ValueError with nothing written."""
+        return self._insert_session_row(session_id, source, strict=True, **kwargs)
 
     def ensure_session(self, session_id: str, source: str = "unknown", model: str = None, **kwargs) -> str:
         """Ensure a session row exists (upsert). Accepts optional kwargs."""

@@ -157,6 +157,7 @@ from gateway.browser_control_broker import (
 from gateway.platforms._shared import coerce_port as _coerce_port
 from gateway.platforms._shared import get_scoped_secret as _get_scoped_secret
 from gateway.platforms.tcp_site import start_tcp_site
+from hermes_state_branch import create_branch_session
 
 
 logger = logging.getLogger(__name__)
@@ -3138,23 +3139,29 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         # ``_branched_from`` is the durable branch marker (same as CLI /branch): with the child created
         # first, the timestamp fallback in _BRANCH_CHILD_SQL (child.started_at >= parent.ended_at) no
         # longer holds, and an unmarked child would vanish from default session listings.
-        await asyncio.to_thread(
-            db.create_session, fork_id, "api_server", model=source.get("model"),
-            system_prompt=source.get("system_prompt"), parent_session_id=source_id,
-            model_config={"_branched_from": source_id})
-        await asyncio.to_thread(db.end_session, source_id, "branched")
-        messages = await asyncio.to_thread(db.get_messages, source_id)
-        await asyncio.to_thread(db.replace_messages, fork_id, messages)
+        # The create is strict and titled in one transaction, like POST /api/sessions: a racing fork to
+        # the same id gets 409 and a refused explicit title 400, each with nothing written and the source
+        # still open. A derived title the row cannot take leaves the fork untitled instead.
+        row = dict(model=source.get("model"), system_prompt=source.get("system_prompt"),
+                   parent_session_id=source_id, model_config={"_branched_from": source_id})
         title = body.get("title")
         if title is None:
             base = source.get("title") or "fork"
             title = f"{base} fork"
             with suppress(Exception):
                 title = await asyncio.to_thread(db.get_next_title_in_lineage, base)
-        try:
-            await asyncio.to_thread(db.set_session_title, fork_id, str(title))
-        except ValueError as exc:
-            return _error_response(str(exc), 400, code="invalid_title")
+            created, _ = await asyncio.to_thread(create_branch_session, db, fork_id, "api_server", title=title, **row)
+        else:
+            try:
+                created = await asyncio.to_thread(db.create_session_strict, fork_id, "api_server",
+                                                  title=str(title), **row)
+            except ValueError as exc:
+                return _error_response(str(exc), 400, code="invalid_title")
+        if not created:
+            return _error_response(f"Session already exists: {fork_id}", 409, code="session_exists")
+        await asyncio.to_thread(db.end_session, source_id, "branched")
+        messages = await asyncio.to_thread(db.get_messages, source_id)
+        await asyncio.to_thread(db.replace_messages, fork_id, messages)
         fork = await asyncio.to_thread(db.get_session, fork_id) or {"id": fork_id, "parent_session_id": source_id}
         return web.json_response({"object": "hermes.session", "session": self._session_response(fork)}, status=201)
 
