@@ -315,27 +315,10 @@ def compress_after_tool_results(
             # #69870 lock-skip / #97488 transient-block: this pass no-oped for a TEMPORARY reason (another
             # path holds the compression lock, or a timed cooldown/backoff guard is active). That is a
             # temporary DEFER, not evidence about compressibility — refund the attempt (it must not burn the
-            # shared overflow-recovery budget toward compression_exhausted → gateway auto-reset,
-            # #9893/#35809) and leave the insufficient-progress blocker unarmed. Proceed with the current
-            # request: if it truly does not fit, the provider's 413/overflow handler returns the soft
+            # shared overflow-recovery budget toward compression_exhausted, which ends the turn with a
+            # /compress-or-/new notice) and leave the insufficient-progress blocker unarmed. Proceed with the
+            # current request: if it truly does not fit, the provider's 413/overflow handler returns the soft
             # compression_deferred result with that stronger signal.
-            # #69870 lock-skip: the provider proved the request does not fit, but this compression pass
-            # no-oped only because another path holds the session's compression lock. Temporary defer, not
-            # exhaustion — refund the attempt and end the turn softly so the gateway does NOT auto-reset the
-            # session (#9893/#35809).
-            # #97488 transient-block: compression no-oped because a timed guard (host-timeout cooldown /
-            # structural backoff) is active — a temporary defer, not evidence of incompressibility. Never
-            # classify it as compression_exhausted (gateway auto-reset).
-            # bypass_cooldown=True,  # #100661 provider-proven overflow
-            # #97488: timed transient guard — defer, never exhaustion (gateway auto-reset).
-            # #69870 lock-skip: the provider proved the request does not fit, but this compression pass
-            # no-oped only because another path holds the session's compression lock. Temporary defer, not
-            # exhaustion — refund the attempt and end the turn softly so the gateway does NOT auto-reset the
-            # session (#9893/#35809).
-            # #97488 transient-block: a timed guard (host-timeout cooldown / structural backoff) no-oped
-            # this pass — defer softly, never compression_exhausted (which would auto-reset the session).
-            # #69870 lock-skip: this pass no-oped because another path holds the session's compression lock
-            # — a temporary defer, not evidence about compressibility.
             compression_attempts -= 1
         else:
             conversation_history = conversation_history_after_compression(

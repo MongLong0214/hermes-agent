@@ -268,19 +268,45 @@ class GatewayGoalsMixin:
         await self._warm_goals_session_db(label)
         return factory(sid)
 
+    def _post_turn_conversation(self, session_entry: Any, source: Any):
+        """The turn's ``ConversationState`` (conversation boundaries clear it), or None."""
+        key = None
+        if source is not None:
+            with suppress(Exception):
+                key = self._session_key_for_source(source)
+        key = key or getattr(session_entry, "session_key", None)
+        return self._session_state(key).conversation if key else None
+
     async def _post_turn_goal_continuation(
-        self, *, session_entry: Any, source: Any, final_response: str,
+        self, *, session_entry: Any, source: Any, final_response: str, compression_exhausted: bool = False,
     ) -> None:
         """Run the goal judge after a gateway turn (AFTER delivery) and, if still active, enqueue a
-        continuation through the adapter FIFO so a simultaneous real user message takes priority."""
+        continuation through the adapter FIFO so a simultaneous real user message takes priority.
+        A compression-exhausted turn is never judged: it gets the bounded retry shared with the TUI."""
         def _load():
             from hermes_cli.goals import GoalManager
             max_turns = self._goal_max_turns_from_config()
             return lambda sid: GoalManager(session_id=sid, default_max_turns=max_turns)
 
         mgr = await self._post_turn_manager(session_entry, "goal continuation", "goals", _load)
+        conversation = self._post_turn_conversation(session_entry, source)
         if mgr is None or not mgr.is_active():
+            if conversation is not None:
+                conversation.goal_compression_recovery = None
             return
+        if compression_exhausted:
+            from hermes_cli.goals import plan_compression_exhaustion_recovery
+            prompt, msg, next_state = plan_compression_exhaustion_recovery(
+                mgr, conversation.goal_compression_recovery if conversation is not None else None,
+            )
+            if conversation is not None:
+                conversation.goal_compression_recovery = next_state
+            if source is not None:
+                await self._defer_goal_status_notice_after_delivery(source, msg)
+            self._enqueue_goal_continuation(source, prompt)
+            return
+        if conversation is not None:
+            conversation.goal_compression_recovery = None
 
         _bg_procs, _active_deleg = None, 0
         with suppress(Exception):
@@ -303,10 +329,13 @@ class GatewayGoalsMixin:
         # Deferred until the visible final response is delivered, else "✓ Goal achieved" precedes it.
         if msg and source is not None:
             await self._defer_goal_status_notice_after_delivery(source, msg)
-        prompt = decision.get("continuation_prompt") or ""
-        if not decision.get("should_continue") or not prompt or source is None:
+        if decision.get("should_continue"):
+            self._enqueue_goal_continuation(source, decision.get("continuation_prompt"))
+
+    def _enqueue_goal_continuation(self, source: Any, prompt: Optional[str]) -> None:
+        """Enqueue via the adapter's FIFO so a user message already in flight preempts naturally."""
+        if not prompt or source is None:
             return
-        # Enqueue via the adapter's FIFO so a user message already in flight preempts naturally.
         try:
             adapter = self._delivery_adapter_for(source)
             _quick_key = self._session_key_for_source(source)
@@ -320,6 +349,7 @@ class GatewayGoalsMixin:
     ) -> None:
         """Run goal and loop bookkeeping after an agent turn returns."""
         final_text = self._final_text_for_post_turn_hooks(agent_result, event)
+        exhausted = self._post_turn_compression_exhausted(agent_result, event)
         try:
             session_entry = await self.async_session_store.get_or_create_session(
                 source, touch_activity=not is_internal,
@@ -330,13 +360,24 @@ class GatewayGoalsMixin:
         # Empty interrupted/errored responses must not drive /goal, but an in-flight /loop tick
         # still needs to be released and rescheduled.
         hooks = [("loop completion", self._post_turn_loop_completion)]
-        if final_text.strip():
+        if final_text.strip() or exhausted:
             hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation))
         for label, hook in hooks:
             try:
-                await hook(session_entry=session_entry, source=source, final_response=final_text)
+                await hook(
+                    session_entry=session_entry, source=source, final_response=final_text,
+                    compression_exhausted=exhausted,
+                )
             except Exception as exc:
                 logger.debug("%s hook failed: %s", label, exc)
+
+    @staticmethod
+    def _post_turn_compression_exhausted(agent_result, event=None) -> bool:
+        """Whether the turn ended on compression exhaustion (a lock-contended defer is not one).
+        ``_handle_message_with_agent`` returns the reply text, so it marks the event instead."""
+        if isinstance(agent_result, dict):
+            return bool(agent_result.get("compression_exhausted") and not agent_result.get("compression_deferred"))
+        return getattr(event, "_compression_exhausted", False) is True
 
     @staticmethod
     def _final_text_for_post_turn_hooks(agent_result, event=None) -> str:
@@ -353,11 +394,12 @@ class GatewayGoalsMixin:
         return streamed if isinstance(streamed, str) and streamed.strip() else text
 
     async def _post_turn_loop_completion(
-        self, *, session_entry: Any, source: Any, final_response: str,
+        self, *, session_entry: Any, source: Any, final_response: str, compression_exhausted: bool = False,
     ) -> None:
         """Complete a /loop wakeup tick after a gateway turn. No-op unless a tick is in flight
         (``awaiting_response``, set when the wakeup was injected); applies the LOOP_COMPLETE marker
-        / --until judge / caps and schedules the next tick for the idle wakeup watcher."""
+        / --until judge / caps and schedules the next tick for the idle wakeup watcher. An exhausted
+        tick is never judged; the same bound as /goal applies — one retry, then the loop pauses."""
         def _load():
             from hermes_cli.loops import LoopManager
             return lambda sid: LoopManager(session_id=sid)
@@ -366,10 +408,20 @@ class GatewayGoalsMixin:
         state = mgr.state if mgr is not None else None
         if state is None or not state.awaiting_response:
             return
-        # The --until judge is a sync aux-LLM call — keep it off the event loop, but carry the
-        # contextvars: a bare executor hop drops the profile HERMES_HOME override and secret scope,
-        # so a served secondary's tick would be written into the DEFAULT profile's state.db.
-        decision = await self._run_in_executor_with_context(mgr.complete_tick, final_response or "")
+        conversation = self._post_turn_conversation(session_entry, source)
+        # Every SessionDB write and the --until judge (a sync aux-LLM call) stay off the event loop, but
+        # carry the contextvars: a bare executor hop drops the profile HERMES_HOME override and secret
+        # scope, so a served secondary's tick would be written into the DEFAULT profile's state.db.
+        next_state = None
+        if compression_exhausted:
+            decision, next_state = await self._run_in_executor_with_context(
+                mgr.complete_exhausted_tick,
+                conversation.loop_compression_recovery if conversation is not None else None,
+            )
+        else:
+            decision = await self._run_in_executor_with_context(mgr.complete_tick, final_response or "")
+        if conversation is not None:
+            conversation.loop_compression_recovery = next_state
         msg = decision.get("message") or ""
         if msg and source is not None:
             await self._defer_goal_status_notice_after_delivery(source, msg)

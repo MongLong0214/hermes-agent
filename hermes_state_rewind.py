@@ -45,6 +45,7 @@ class SessionRewindMixin:
     def rewind_user_turn(
         self, session_id: str, user_ordinal: int, *, warm_history: Optional[List[Dict[str, Any]]] = None,
         require_retryable: bool = False, require_composite: bool = False, adopt_row_ids: bool = False,
+        turn_lease_holder: Optional[str] = None,
     ) -> RewindOutcome:
         """Rewind the active transcript to just before user turn ``user_ordinal`` (0 = oldest; negative counts
         back from the newest and clamps to the oldest, so ``-n`` is ``/undo n``). ``warm_history`` (CLI/TUI):
@@ -53,8 +54,9 @@ class SessionRewindMixin:
         ``require_retryable``: the live payload must be losslessly replayable as text (``ValueError`` from
         :func:`retryable_user_text` before any write). ``require_composite``: the target must be a compaction
         carrier. ``adopt_row_ids`` (TUI): copy durable ``_row_id`` identities onto the installed warm prefix so
-        clients can address follow-ups by row; the CLI leaves its history shape alone. Out-of-range /
-        wrong-shape targets raise :class:`RewindTargetUnavailableError`."""
+        clients can address follow-ups by row; the CLI leaves its history shape alone. ``turn_lease_holder``: the
+        running turn's own lease, so a turn can retract its own row. Out-of-range / wrong-shape targets raise
+        :class:`RewindTargetUnavailableError`."""
         from agent.context_compressor import (
             _DB_PERSISTED_MARKER, history_before_user_originated_turn, retryable_user_text,
             split_user_originated_turn, user_originated_turn_view)
@@ -104,7 +106,8 @@ class SessionRewindMixin:
         try:
             result = self.rewind_to_message(
                 session_id, target_row_id, preserve_compaction_handoff=scaffold is not None,
-                expected_active_ids=expected_active_ids, expected_target_content=stored_view.get("content"))
+                expected_active_ids=expected_active_ids, expected_target_content=stored_view.get("content"),
+                turn_lease_holder=turn_lease_holder)
         except ValueError as exc:  # target vanished / changed role under us: same class of failure as out-of-range
             raise RewindTargetUnavailableError(str(exc)) from exc
         if scaffold is not None:

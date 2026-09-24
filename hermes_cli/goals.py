@@ -1554,6 +1554,47 @@ class GoalManager:
             "(no completion contract — set one with /goal draft <objective> or inline field: value lines)")
 
 
+# ── Compression-exhaustion recovery (TUI + gateway) ───────────────────
+
+COMPRESSION_RECOVERY_LIMIT = 1
+
+
+def plan_compression_exhaustion_recovery(
+    goal_mgr: GoalManager, recovery_state: Any,
+) -> Tuple[Optional[str], str, Optional[Dict[str, Any]]]:
+    """Bounded retry of an ACTIVE goal after a compression-exhausted turn: ``(continuation, notice,
+    next_state)``. The host stores ``next_state`` per session (None clears it) and clears it after a
+    successful turn. Exhaustion is a failed turn — never judge input, never a spent goal turn — and the
+    session is kept as is, so an unbounded continuation would re-send the same oversized request every
+    turn: one fresh continuation per goal, then the goal pauses."""
+    state = goal_mgr.state
+    created_at = float(getattr(state, "created_at", 0.0) or 0.0)
+    goal_text = getattr(state, "goal", "")
+    attempts = 0
+    if (
+        isinstance(recovery_state, dict)
+        and recovery_state.get("goal_created_at") == created_at
+        and recovery_state.get("goal") == goal_text
+    ):
+        try:
+            attempts = int(recovery_state.get("attempts", 0) or 0)
+        except (TypeError, ValueError):
+            attempts = 0
+    continuation = goal_mgr.next_continuation_prompt()
+    if attempts < COMPRESSION_RECOVERY_LIMIT and continuation:
+        return (
+            continuation,
+            "Context compression was exhausted. Retrying the active goal once.",
+            {"goal_created_at": created_at, "goal": goal_text, "attempts": attempts + 1},
+        )
+    goal_mgr.pause(reason="context compression exhausted twice consecutively")
+    # A later explicit /goal resume gets a fresh bounded recovery cycle.
+    return None, (
+        "Goal paused after context compression was exhausted twice. "
+        "Run /compress, then /goal resume to continue."
+    ), None
+
+
 # ── Kanban worker goal loop ───────────────────────────────────────────
 
 # Fed to a kanban goal-mode worker that hasn't completed/blocked its task yet: short, and points it

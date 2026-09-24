@@ -174,3 +174,28 @@ async def test_goal_verdict_budget_exhausted_sends_pause(hermes_home):
     assert not adapter._pending_messages
 
 
+
+
+@pytest.mark.asyncio
+async def test_compression_exhaustion_is_never_judged_and_pauses_the_goal_on_the_second(hermes_home):
+    """The session is kept on exhaustion, so a judged/continued goal would re-send the same oversized
+    request up to ``goals.max_turns``: one fresh continuation, then the goal pauses (the TUI bound)."""
+    runner, adapter, session_entry, src = _make_runner_with_adapter()
+    enqueued = []
+    runner._enqueue_fifo = lambda _key, event, _adapter: enqueued.append(event.text)
+
+    from hermes_cli.goals import GoalManager
+
+    GoalManager(session_entry.session_id).set("polish the docs")
+    exhausted = {"final_response": "This conversation has grown too long.", "failed": True,
+                 "compression_exhausted": True}
+    judge = MagicMock(return_value=("continue", "keep going", False, None, False))
+    with patch("hermes_cli.goals.judge_goal", judge):
+        for turn in (1, 2):
+            await runner._run_post_turn_hooks(agent_result=exhausted, source=src, is_internal=False)
+            await _drain_until(lambda: len(adapter.sends) >= turn)
+
+    judge.assert_not_called()
+    assert len(enqueued) == 1 and "polish the docs" in enqueued[0], "exactly one retry"
+    assert GoalManager(session_entry.session_id).state.status == "paused"
+    assert "paused" in adapter.sends[-1]["content"].lower() and "/compress" in adapter.sends[-1]["content"]

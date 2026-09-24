@@ -222,6 +222,31 @@ async def test_empty_agent_result_releases_inflight_loop_tick(loop_env):
 
 
 @pytest.mark.asyncio
+async def test_exhausted_ticks_are_never_judged_and_pause_the_loop_on_the_second(loop_env, monkeypatch):
+    """The session is kept on exhaustion, so every tick would re-send the oversized request up to
+    ``loops.max_ticks``: the reply is not judged, one tick retries, the second pauses the loop."""
+    runner = _make_runner()
+    await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI --until CI is green"))
+    judge = Mock(return_value=("done", "looks green", False, None, False))
+    monkeypatch.setattr(goals, "judge_goal", judge)
+    runner._post_turn_goal_continuation = AsyncMock()
+    exhausted = {"final_response": "This conversation has grown too long.", "failed": True,
+                 "compression_exhausted": True}
+
+    for tick in (1, 2):
+        mgr = loops.LoopManager(session_id="sid-gateway-loop")
+        mgr.state.next_due_at = time.time() - 1
+        assert mgr.fire_tick() is not None, f"tick {tick} must still be due"
+        await GatewayRunner._run_post_turn_hooks(
+            runner, agent_result=exhausted, source=_make_event("wakeup").source, is_internal=True,
+        )
+
+    judge.assert_not_called()
+    reloaded = loops.load_loop("sid-gateway-loop")
+    assert reloaded.status == "paused" and reloaded.awaiting_response is False
+
+
+@pytest.mark.asyncio
 async def test_goal_hook_failure_does_not_block_loop_completion(loop_env, caplog):
     runner = _make_runner()
     await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))

@@ -1971,8 +1971,8 @@ class TurnRunner:
         compacted_in_place, effective_session_id, history_offset = self._sync_session_after_run(agent_history)
         # failure_reason must survive the empty-response path too (TUI billing, transient-failure
         # persistence). compression_deferred (soft lock-contention defer) is distinct from
-        # compression_exhausted so the gateway never auto-resets a session a concurrent compressor is
-        # about to shrink.
+        # compression_exhausted so a session a concurrent compressor is about to shrink never gets the
+        # exhaustion notice.
         common = {
             "messages": result.get("messages", []), "api_calls": result.get("api_calls", 0),
             "failed": result.get("failed", False), "failure_reason": result.get("failure_reason"),

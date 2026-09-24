@@ -1,90 +1,82 @@
 """Gateway must treat ``compression_deferred`` as a soft result (#49874).
 
-A lock-contended compression defer means a CONCURRENT compressor is actively
-shrinking the session — the opposite of ``compression_exhausted`` (session
-permanently too large). The gateway's auto-reset (#9893/#35809) must never
-fire for a deferred turn: the session stays intact and the next message
-retries normally.
-
-AST invariants on ``gateway/run.py`` (mirrors
-``test_35809_auto_reset_clean_context.py``'s load-bearing pin style):
-
-* the ``compression_deferred`` branch guards the auto-reset block — a
-  deferred result can never reach ``reset_session``;
-* the deferred branch itself performs NO session mutation (no
-  ``reset_session``, no ``_evict_cached_agent``, no
-  ``_clear_conversation_scope``).
+A lock-contended compression defer means a CONCURRENT compressor is actively shrinking the session. The
+turn is not exhausted: the session stays intact, the reply carries no exhaustion notice, the /goal and /loop
+hooks are not told it exhausted, and the next message retries normally — even when a stale
+``compression_exhausted`` bit rides along (#69870). Driven through a whole gateway turn.
 """
 
 from __future__ import annotations
 
-import ast
-import inspect
+import sys
+import types
+from datetime import datetime
+from unittest.mock import AsyncMock, MagicMock
 
-from gateway import run as gateway_run
-from gateway import run_turn as gateway_run_turn
-from gateway import run_turn as gateway_run_turn
+import pytest
+
+import gateway.run as gateway_run
+from gateway.config import GatewayConfig, Platform
+from gateway.platforms.event import MessageEvent
+from gateway.session import SessionEntry, SessionSource
+
+SESSION_KEY = "agent:main:telegram:dm:123"
 
 
-def _calls(node: ast.AST) -> set[str]:
-    return {
-        n.func.attr
-        for n in ast.walk(node)
-        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-    }
+def _source():
+    return SessionSource(platform=Platform.TELEGRAM, chat_id="123", chat_type="dm", user_id="u1")
 
 
-def _find_deferred_guarded_reset_chain() -> ast.If:
-    """Return the ``if agent_result.get('compression_deferred') ... elif
-    agent_result.get('compression_exhausted') ... reset_session`` chain."""
-    tree = ast.parse(inspect.getsource(gateway_run_turn))
-
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.If):
-            continue
-        test_consts = [
-            n.value
-            for n in ast.walk(node.test)
-            if isinstance(n, ast.Constant) and isinstance(n.value, str)
-        ]
-        if "compression_deferred" not in test_consts:
-            continue
-        # The reset must live in the orelse (elif compression_exhausted ...),
-        # never in the deferred body.
-        orelse_calls = set()
-        for sub in node.orelse:
-            orelse_calls |= _calls(sub)
-        if "reset_session" in orelse_calls:
-            return node
-    raise AssertionError(
-        "Could not locate the compression_deferred guard in front of the "
-        "compression-exhausted auto-reset block in gateway/run.py. The "
-        "soft-defer contract (#49874: lock-contended defer must never "
-        "auto-reset the session) is no longer structurally guaranteed."
+def _turn_runner(monkeypatch, tmp_path, agent_result):
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
+    monkeypatch.setattr("agent.model_metadata.get_model_context_length", lambda *_a, **_k: 100_000)
+    runner = gateway_run.GatewayRunner(GatewayConfig())
+    runner.adapters = {}
+    runner._is_user_authorized = lambda _source: True
+    runner._set_session_env = lambda _context: None
+    runner._handle_active_session_busy_message = AsyncMock(return_value=False)
+    runner._session_db = MagicMock()
+    runner._recover_telegram_topic_thread_id = lambda _source: None
+    runner._cache_session_source = lambda _key, _source: None
+    runner._is_session_run_current = lambda _key, _gen: True
+    runner._begin_session_run_generation = lambda _key: 1
+    runner._reply_anchor_for_event = lambda _event: None
+    runner._get_guild_id = lambda _event: None
+    runner._should_send_voice_reply = lambda *_a, **_kw: False
+    runner.hooks = MagicMock()
+    runner.hooks.emit = AsyncMock()
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = SessionEntry(
+        session_key=SESSION_KEY, session_id="sess-deferred", created_at=datetime.now(),
+        updated_at=datetime.now(), platform=Platform.TELEGRAM, chat_type="dm",
     )
+    runner.session_store.load_transcript.return_value = []
+    runner.session_store.has_platform_message_id.return_value = False
+    runner.session_store.transcript_tail_role.return_value = "user"
+    runner._evict_cached_agent = MagicMock()
+    runner._run_agent = AsyncMock(return_value=agent_result)
+    runner._post_turn_goal_continuation = AsyncMock()
+    runner._post_turn_loop_completion = AsyncMock()
+    return runner
 
 
-class TestCompressionDeferredIsSoft:
-    def test_deferred_branch_guards_the_auto_reset(self):
-        """The auto-reset (``reset_session``) must be unreachable when
-        ``compression_deferred`` is set: the deferred check comes FIRST and
-        the reset lives only in its elif chain."""
-        node = _find_deferred_guarded_reset_chain()
-        # The exhaustion reset is in the orelse — verified by the finder.
-        # The deferred body must not mutate the session in any way.
-        body_calls = set()
-        for sub in node.body:
-            body_calls |= _calls(sub)
-        forbidden = {
-            "reset_session",
-            "_evict_cached_agent",
-            "_clear_conversation_scope",
-        }
-        assert not (body_calls & forbidden), (
-            f"The compression_deferred branch in gateway/run.py performs "
-            f"session mutation ({body_calls & forbidden}). A lock-contended "
-            f"defer is transient — the session must stay intact so the next "
-            f"message retries against the freshly compressed context "
-            f"(#49874, #69870)."
-        )
+@pytest.mark.asyncio
+async def test_deferred_result_leaves_session_reply_and_hooks_untouched(monkeypatch, tmp_path):
+    reply = "Context compression is already running for this session. Please retry in a moment."
+    runner = _turn_runner(monkeypatch, tmp_path, {
+        "final_response": reply, "error": reply, "messages": [], "history_offset": 0, "failed": True,
+        "compression_deferred": True, "compression_exhausted": True, "last_prompt_tokens": 0,
+    })
+    event = MessageEvent(text="hello", source=_source(), message_id="m-1")
 
+    response = await runner._handle_message_with_agent(event, _source(), SESSION_KEY, 1)
+
+    runner.session_store.reset_session.assert_not_called()
+    runner._evict_cached_agent.assert_not_called()
+    assert response == reply
+    await runner._run_post_turn_hooks(agent_result=response, source=_source(), is_internal=False, event=event)
+    assert runner._post_turn_loop_completion.await_args.kwargs.get("compression_exhausted", False) is False

@@ -118,8 +118,8 @@ class _Recovery(OverflowVerdict):
         }, reason, retryable)
         if compression_exhausted:
             # Reuse the gateway's existing context-recovery contract (#98722, salvaged from #98741). The
-            # bloated transcript remains intact while future input can move to a clean session instead of
-            # replaying the summarize-timeout loop.
+            # earlier history is kept (the unanswered ask is rolled back) and the turn ends instead of
+            # replaying the summarize-timeout loop; the user chooses /compress or /new.
             result["compression_exhausted"] = True
         result.update(extra)
         return self.done("return", result)
@@ -150,7 +150,7 @@ class _Recovery(OverflowVerdict):
         provider proved the request doesn't fit). Returns ``None`` when history was
         compressed, or a soft-defer verdict when another path holds the compression
         lock or a timed guard no-oped the pass: the attempt is refunded and the turn
-        ends WITHOUT ``compression_exhausted`` so the gateway does not auto-reset. With
+        ends WITHOUT ``compression_exhausted`` so the gateway sends no exhaustion notice. With
         ``fail_on_timeout`` a host timeout (recovery spent its wait budget with no
         committed summary) ends the turn via the typed contract, since re-sending would
         hit the same overflow."""
@@ -400,7 +400,7 @@ def _recover_context_length(st: _Recovery, _retry: TurnRetryState, error_msg: st
     # Hermes knows for this model (after adopting any limit the server reported), so compressing
     # would destroy history for nothing. Single-slot local servers reject like this while ANOTHER
     # request — a background review from an earlier session — holds their context. Name that,
-    # keep the turn retryable and transient: no "conversation too long", no gateway auto-reset.
+    # keep the turn retryable and transient: no "conversation too long", no exhaustion notice.
     # Only when the server quoted NO measurement of its own: "prompt is too long: 233153 tokens
     # > 200000" is the server's count and beats the local estimate.
     window = agent.context_compressor.context_length

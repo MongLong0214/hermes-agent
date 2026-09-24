@@ -51,6 +51,9 @@ class ConversationState:
     sidecar_notes: List[str] = field(default_factory=list)  # one-shot must-deliver notes
     ephemeral_pin: Optional[Tuple[Any, ...]] = None  # pinned session-context (change_key, text)
     vc_last: Optional[str] = None  # last voice-channel context delivered
+    # Compression-exhaustion bounds (the session is kept, so each retry re-sends the oversized request):
+    goal_compression_recovery: Optional[Dict[str, Any]] = None  # hermes_cli.goals recovery state
+    loop_compression_recovery: Optional[Dict[str, Any]] = None  # LoopManager.complete_exhausted_tick state
 
     def clear(self) -> None:
         """Reset every field to its default, so new fields are cleared automatically."""

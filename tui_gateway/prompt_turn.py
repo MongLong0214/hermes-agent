@@ -69,8 +69,8 @@ def _active_goal_manager(session: dict):
 def _plan_goal_compression_recovery(
     session: dict, result: Any, *, status: str, raw: Any) -> tuple[str | None, str | None]:
     """Bounded active-goal retry after compression exhaustion: ``(continuation, notice)``.
-    Exhaustion is a failed turn (never judge input, never a spent goal turn); one fresh
-    continuation is allowed, a second exhaustion pauses the goal instead of spinning."""
+    The bound itself is ``hermes_cli.goals.plan_compression_exhaustion_recovery`` (shared with the
+    gateway); this keeps its state in the session dict."""
     if not (isinstance(result, dict) and result.get("compression_exhausted")):
         if _is_successful_goal_turn(result, status, raw):
             session.pop(_GOAL_COMPRESSION_RECOVERY_ATTEMPTS, None)
@@ -80,29 +80,14 @@ def _plan_goal_compression_recovery(
     if (goal_mgr := _active_goal_manager(session)) is None:
         session.pop(_GOAL_COMPRESSION_RECOVERY_ATTEMPTS, None)
         return None, None
-    goal_created_at = float(getattr(goal_mgr.state, "created_at", 0.0) or 0.0)
-    goal_text = getattr(goal_mgr.state, "goal", "")
-    recovery_state = session.get(_GOAL_COMPRESSION_RECOVERY_ATTEMPTS)
-    attempts = 0
-    if (
-        isinstance(recovery_state, dict)
-        and recovery_state.get("goal_created_at") == goal_created_at
-        and recovery_state.get("goal") == goal_text):
-        with contextlib.suppress(TypeError, ValueError):
-            attempts = int(recovery_state.get("attempts", 0) or 0)
-    continuation_prompt = goal_mgr.next_continuation_prompt()
-    if attempts < _GOAL_COMPRESSION_RECOVERY_LIMIT and continuation_prompt:
-        session[_GOAL_COMPRESSION_RECOVERY_ATTEMPTS] = {
-            "goal_created_at": goal_created_at, "goal": goal_text, "attempts": attempts + 1}
-        return (
-            continuation_prompt,
-            "Context compression was exhausted. Retrying the active goal once.")
-    goal_mgr.pause(reason="context compression exhausted twice consecutively")
-    # A later explicit /goal resume gets a fresh bounded recovery cycle.
-    session.pop(_GOAL_COMPRESSION_RECOVERY_ATTEMPTS, None)
-    return None, (
-        "Goal paused after context compression was exhausted twice. "
-        "Run /compress, then /goal resume to continue.")
+    from hermes_cli.goals import plan_compression_exhaustion_recovery
+    continuation, notice, next_state = plan_compression_exhaustion_recovery(
+        goal_mgr, session.get(_GOAL_COMPRESSION_RECOVERY_ATTEMPTS))
+    if next_state is None:
+        session.pop(_GOAL_COMPRESSION_RECOVERY_ATTEMPTS, None)
+    else:
+        session[_GOAL_COMPRESSION_RECOVERY_ATTEMPTS] = next_state
+    return continuation, notice
 
 
 def _admit_prompt_turn(
