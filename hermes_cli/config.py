@@ -1716,16 +1716,17 @@ def _preserve_env_ref_templates(current, raw, loaded_expanded=None):
     return current
 
 
-def _explicit_config_paths(config: Dict[str, Any]) -> Set[Tuple[str, ...]]:
+def _explicit_config_paths(config: Dict[str, Any], *, null_only: bool = False) -> Set[Tuple[str, ...]]:
     """Leaf paths explicitly present in a RAW (un-normalized) config, so values injected by
-    normalisation are never mistaken for user-set ones. Feeds ``_strip_default_values``."""
+    normalisation are never mistaken for user-set ones. Feeds ``_strip_default_values``.
+    ``null_only`` keeps just the leaves the user wrote as YAML ``null``."""
     paths: Set[Tuple[str, ...]] = set()
 
     def _walk(value: Any, path: Tuple[str, ...]) -> None:
         if isinstance(value, dict):
             for key, child in value.items():
                 _walk(child, path + (key,))
-        elif path:
+        elif path and (value is None or not null_only):
             paths.add(path)
 
     _walk(config, ())
@@ -1734,12 +1735,17 @@ def _explicit_config_paths(config: Dict[str, Any]) -> Set[Tuple[str, ...]]:
 
 def _strip_default_values(
     config: Dict[str, Any], defaults: Dict[str, Any] = DEFAULT_CONFIG,
-    preserve_keys: Optional[Set[Tuple[str, ...]]] = None) -> Dict[str, Any]:
+    preserve_keys: Optional[Set[Tuple[str, ...]]] = None,
+    null_keys: Optional[Set[Tuple[str, ...]]] = None) -> Dict[str, Any]:
     """Return *config* without keys whose values match *defaults*.
     Paths in *preserve_keys* (explicitly present in the user's raw config) are always kept even
     when equal to the default. Dicts whose every child is stripped are removed entirely so
-    default-only subtrees never bloat ``config.yaml``."""
+    default-only subtrees never bloat ``config.yaml``. ``None`` doubles as the "stripped"
+    marker below, so a path in *null_keys* (the user wrote ``null`` there) keeps its ``None``:
+    null and absent differ for a null that disables a non-null default and for closed schemas
+    that require the key (``canonical_surface_bindings``)."""
     preserve_keys = {("_config_version",)} | set(preserve_keys or ())
+    null_keys = preserve_keys & set(null_keys or ())  # a null never replaces a stripped default
 
     def _strip(value: Any, default: Any, path: Tuple[str, ...]) -> Any:
         if path in preserve_keys:
@@ -1747,7 +1753,7 @@ def _strip_default_values(
         if isinstance(value, dict) and value:
             default_dict = default if isinstance(default, dict) else {}
             stripped = {k: _strip(v, default_dict.get(k), path + (k,)) for k, v in value.items()}
-            return {k: v for k, v in stripped.items() if v is not None} or None
+            return {k: v for k, v in stripped.items() if v is not None or path + (k,) in null_keys} or None
         return None if value == default else copy.deepcopy(value)
 
     return _strip(config, defaults, ()) or {}
@@ -1789,19 +1795,18 @@ def _normalize_root_model_keys(config: Dict[str, Any]) -> Dict[str, Any]:
     """
     model_in = config.get("model")
     model_provider = model_in.get("provider") if isinstance(model_in, dict) else None
+    # Presence, not value, opens the gate: every key named here is retired below, and a save
+    # keeps an explicit null, so a null legacy key would otherwise outlive its migration.
     needs_model_work = (model_provider is not None and not isinstance(model_provider, str)) or (
         isinstance(model_in, dict) and (
-            model_in.get("api_base")
-            or model_in.get("model") or model_in.get("name")
+            any(k in model_in for k in ("api_base", "model", "name"))
             or any(isinstance(model_in.get(k), dict) for k in ("default", "model", "name"))))
-    has_root = any(config.get(k) for k in ("provider", "base_url", "context_length", "api_base"))
+    has_root = any(k in config for k in ("provider", "base_url", "context_length", "api_base"))
     if not has_root and not needs_model_work:
         return config
 
     config = dict(config)
-    model = config.get("model")
-    model = dict(model) if isinstance(model, dict) else {"default": model} if model else {}
-    config["model"] = model
+    model = dict(model_in) if isinstance(model_in, dict) else {"default": model_in} if model_in else {}
 
     # Flatten ``{provider: <p>, model: <m>}``. The nested provider wins over the merged default
     # ``"auto"`` (which runtime resolution treats as authoritative) but never over a configured one.
@@ -1845,6 +1850,8 @@ def _normalize_root_model_keys(config: Dict[str, Any]) -> Dict[str, Any]:
         model.pop("model", None)
         model.pop("name", None)
 
+    if model or model_in is not None:  # null-only legacy keys: never inject an empty ``model``
+        config["model"] = model
     return config
 
 
@@ -2405,7 +2412,9 @@ def save_config(
         if strip_defaults:
             # ``_strip_default_values`` always preserves ``_config_version`` itself.
             effective_preserve_keys = _explicit_config_paths(_raw_for_paths) | set(preserve_keys or ())
-            normalized = _strip_default_values(normalized, DEFAULT_CONFIG, preserve_keys=effective_preserve_keys)
+            normalized = _strip_default_values(
+                normalized, DEFAULT_CONFIG, preserve_keys=effective_preserve_keys,
+                null_keys=_explicit_config_paths(_raw_for_paths, null_only=True))
 
         atomic_yaml_write(config_path, normalized, extra_content=_commented_sections_for_save(normalized))
         _secure_file(config_path)
