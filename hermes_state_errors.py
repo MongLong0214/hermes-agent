@@ -245,18 +245,32 @@ class IncompatibleSchemaError(RuntimeError):
         super().__init__(_incompatible_schema_message(cause, expected_generation, actual_generation, detail))
 
 
+# One table writes each refusal's message and reads it back: init-error slots and RPC errors keep only
+# ``str(e)``, and a refusal read from there must still classify as schema_incompatible and keep its cause.
+# A fence mismatch fires in either direction (older or newer writer), so its text never says "newer".
+_INCOMPATIBLE_SCHEMA_HEADS = {
+    SCHEMA_CAUSE_BUILD_TOO_OLD: "Session state schema is newer than this Hermes build",
+    SCHEMA_CAUSE_FENCE_GENERATION_MISMATCH: "Session state turn-fence generation does not match this Hermes build",
+    SCHEMA_CAUSE_VERSION_UNREADABLE: "Session state does not record exactly one integer schema version",
+}
+_INCOMPATIBLE_SCHEMA_GENERATIONS = {
+    SCHEMA_CAUSE_BUILD_TOO_OLD: " (expected generation {expected}, actual generation {actual})",
+    SCHEMA_CAUSE_FENCE_GENERATION_MISMATCH: " (build generation {expected}, stored generation {actual})",
+}
+
+
 def _incompatible_schema_message(cause: str, expected, actual, detail: str) -> str:
     suffix = f" ({detail})" if detail else ""
-    # A fence mismatch fires in either direction (older or newer writer), so its text never says "newer".
-    if cause == SCHEMA_CAUSE_BUILD_TOO_OLD:
-        head = ("Session state schema is newer than this Hermes build "
-                f"(expected generation {expected}, actual generation {actual})")
-    elif cause == SCHEMA_CAUSE_FENCE_GENERATION_MISMATCH:
-        head = ("Session state turn-fence generation does not match this Hermes build "
-                f"(build generation {expected}, stored generation {actual})")
-    else:
-        head = "Session state does not record exactly one integer schema version"
-    return f"{head}{suffix}; refusing to open it, and nothing was changed."
+    generations = _INCOMPATIBLE_SCHEMA_GENERATIONS.get(cause, "").format(expected=expected, actual=actual)
+    return f"{_INCOMPATIBLE_SCHEMA_HEADS[cause]}{generations}{suffix}; refusing to open it, and nothing was changed."
+
+
+def incompatible_schema_cause(exc_or_str) -> str | None:
+    """The cause of an ``IncompatibleSchemaError`` or of its message text, else None."""
+    if isinstance(exc_or_str, IncompatibleSchemaError):
+        return exc_or_str.cause
+    text = str(exc_or_str or "")
+    return next((cause for cause, head in _INCOMPATIBLE_SCHEMA_HEADS.items() if head in text), None)
 
 
 _PERSISTENCE_CAUSE_BY_TYPE = (
@@ -272,7 +286,8 @@ _PERSISTENCE_CAUSE_BY_TYPE = (
 )
 _PERSISTENCE_CAUSE_BY_PHRASE = (
     # The fence trigger's RAISE text and the missing-UDF error: a generation refusal, never damage.
-    (("state db generation incompatible", "no such function: hermes_turn_fence_generation"),
+    (("state db generation incompatible", "no such function: hermes_turn_fence_generation",
+      *(head.lower() for head in _INCOMPATIBLE_SCHEMA_HEADS.values())),
      "schema_incompatible"),
     (("turn lease",), "turn_lease"),
     (("closed by compression",), "compression_closed"),

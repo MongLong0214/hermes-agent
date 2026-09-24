@@ -164,6 +164,11 @@ _PERSISTENCE_CAUSE_EXPLANATIONS: Dict[str, str] = {
         "your messages. The disk is probably full: free some space (or fix the permissions "
         "on {home}/state.db), then send your message again."
     ),
+    # The refusal copy is shared with every other surface (hermes_state_user_copy), filled at render.
+    "schema_incompatible": (
+        "the turn was stopped and this message was not saved: {refusal_gloss}. "
+        "{refusal_action} Then send your message again."
+    ),
 }
 _PERSISTENCE_DEFAULT_EXPLANATION = (
     "Hermes couldn't save this conversation, so it stopped rather than lose your messages. "
@@ -387,6 +392,14 @@ class TurnExplainersMixin:
                 .replace("{profile_arg}", profile_cli_selector())
                 .replace("{recovery_docs}", STORAGE_RECOVERY_DOCS_URL)
             )
+            if persistence_cause == "schema_incompatible":
+                from hermes_state_errors import SCHEMA_CAUSE_FENCE_GENERATION_MISMATCH
+                from hermes_state_user_copy import describe_schema_refusal
+
+                # Only the bucket reaches here, and a write refused mid-turn is a fence abort (another
+                # build re-fenced the store after this one opened it), so the mismatch copy is the one.
+                refusal = describe_schema_refusal(SCHEMA_CAUSE_FENCE_GENERATION_MISMATCH)
+                body = body.replace("{refusal_gloss}", refusal.gloss).replace("{refusal_action}", refusal.action)
             if persistence_cause in ("corrupt", "fts_index"):
                 from hermes_constants import get_default_hermes_root
                 from hermes_state import _default_db_path

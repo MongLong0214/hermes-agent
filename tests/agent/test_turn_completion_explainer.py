@@ -252,6 +252,25 @@ def test_explanation_persistence_unknown_cause_is_neutral():
         assert "again" in lower
 
 
+def test_a_fence_refused_write_is_not_explained_as_disk_or_a_busy_database(monkeypatch, tmp_path):
+    """A write the store's turn fence refused means another Hermes build owns the store: freeing disk
+    or closing other windows never helps, and a resend meets the same refusal until the owner acts."""
+    import sqlite3
+
+    from hermes_constants import profile_cli_selector
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes" / "profiles" / "research"))
+    selector = profile_cli_selector()
+    cause = hermes_state_errors.classify_persistence_error(sqlite3.IntegrityError("state DB generation incompatible"))
+    out = AIAgent._format_turn_completion_explanation("session_persistence_failed", cause)
+    default = AIAgent._format_turn_completion_explanation("session_persistence_failed", "unknown")
+    lower = out.lower()
+    assert out != default
+    assert "{" not in out and "disk" not in lower and "holding the database" not in lower
+    assert "`hermes update`" in out and f"`hermes {selector}doctor" in out
+    assert "`hermes doctor" not in out
+
+
 def test_explanation_persistence_one_arg_backward_compat():
     """Existing one-arg callers must keep working (optional second param)."""
     out = AIAgent._format_turn_completion_explanation("session_persistence_failed")

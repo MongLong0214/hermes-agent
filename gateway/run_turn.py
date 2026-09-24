@@ -1981,6 +1981,13 @@ class GatewayTurnMixin:
                 await self._hmwa_close_failed_turn(session_entry.session_id, PARTIAL_FAILED_TURN_NOTICE)
         except Exception:
             logger.debug("Failed to persist inbound user message after agent exception", exc_info=True)
+        # A store another build owns refuses every retry the same way, so /retry is not the remedy.
+        from hermes_state_user_copy import describe_schema_refusal, schema_incompatibility_cause
+        if (refusal_cause := schema_incompatibility_cause(e)) is not None:
+            refusal = describe_schema_refusal(refusal_cause)
+            return self._hmwa_add_failed_turn_notice(
+                f"⚠️ I couldn't finish this reply: {refusal.gloss}. {refusal.action}", PARTIAL_FAILED_TURN_NOTICE,
+            )
         # Never expose raw exception types/messages to end users (info-leakage risk).
         status_hint = self._STATUS_HINTS.get(status_code, "")
         if status_code == 401:
