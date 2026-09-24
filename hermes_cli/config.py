@@ -1766,19 +1766,18 @@ def _normalize_root_model_keys(config: Dict[str, Any]) -> Dict[str, Any]:
     """
     model_in = config.get("model")
     model_provider = model_in.get("provider") if isinstance(model_in, dict) else None
+    # Presence, not value, opens the gate: every key named here is retired below, and a save
+    # keeps an explicit null, so a null legacy key would otherwise outlive its migration.
     needs_model_work = (model_provider is not None and not isinstance(model_provider, str)) or (
         isinstance(model_in, dict) and (
-            model_in.get("api_base")
-            or model_in.get("model") or model_in.get("name")
+            any(k in model_in for k in ("api_base", "model", "name"))
             or any(isinstance(model_in.get(k), dict) for k in ("default", "model", "name"))))
-    has_root = any(config.get(k) for k in ("provider", "base_url", "context_length", "api_base"))
+    has_root = any(k in config for k in ("provider", "base_url", "context_length", "api_base"))
     if not has_root and not needs_model_work:
         return config
 
     config = dict(config)
-    model = config.get("model")
-    model = dict(model) if isinstance(model, dict) else {"default": model} if model else {}
-    config["model"] = model
+    model = dict(model_in) if isinstance(model_in, dict) else {"default": model_in} if model_in else {}
 
     # Flatten ``{provider: <p>, model: <m>}``. The nested provider wins over the merged default
     # ``"auto"`` (which runtime resolution treats as authoritative) but never over a configured one.
@@ -1822,6 +1821,8 @@ def _normalize_root_model_keys(config: Dict[str, Any]) -> Dict[str, Any]:
         model.pop("model", None)
         model.pop("name", None)
 
+    if model or model_in is not None:  # null-only legacy keys: never inject an empty ``model``
+        config["model"] = model
     return config
 
 
