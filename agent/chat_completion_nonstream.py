@@ -2,6 +2,7 @@
 
 from agent import chat_completion_helpers as h
 from agent import chat_completion_wait_notice as wn
+from agent.chat_completion_accepted_failure import _CodexStreamTerminalFailure, is_accepted_stream_failure
 
 
 class _NonStreamRequest:
@@ -65,6 +66,7 @@ class _NonStreamRequest:
         return self.clients.set_client(client, kind=kind)
 
     def _call(self):
+        result = self.result  # a kill that settles the outcome detaches this dict from a late worker
         watchdog_state_var = watchdog_context_token = None
         try:
             self._install_codex_request_token()
@@ -73,7 +75,7 @@ class _NonStreamRequest:
 
                 watchdog_state_var = _codex_watchdog_state_var
                 watchdog_context_token = watchdog_state_var.set(self.codex_watchdog_state)
-            self.result["response"] = h._dispatch_nonstreaming_api_request(
+            result["response"] = h._dispatch_nonstreaming_api_request(
                 self.agent, self.api_kwargs, make_client=self._make_client)
         except Exception as e:
             # Our own force-close caused this error: swallow it, the main
@@ -89,17 +91,17 @@ class _NonStreamRequest:
                 h.logger.debug("Non-streaming worker caught %s after request "
                     "cancellation — exiting without surfacing a network error.", type(e).__name__)
                 return
-            self.result["error"] = e
+            result["error"] = e
         finally:
             if watchdog_state_var is not None:
                 watchdog_state_var.reset(watchdog_context_token)
             # Retire first: close_once can raise, and a leaked token would let
             # a later worker mistake itself for the owning attempt.
             self._retire_codex_request_token()
-            # Reuse reason only on a clean response; error or cancel-swallow
-            # really closes so the next attempt builds a fresh pool.
+            # Reuse reason only on a clean response; error, cancel-swallow or a
+            # lost accepted stream really closes so the next attempt builds a fresh pool.
             self.clients.close_once(
-                "request_complete" if self.result["response"] is not None else "request_error_cleanup")
+                "request_complete" if self._completed() else "request_error_cleanup")
 
     def _abort_request(self, reason: str) -> None:
         """Watchdog/interrupt kill: abort the request client (kind-aware, #67142)
@@ -112,8 +114,18 @@ class _NonStreamRequest:
     def _await_worker_after_kill(self, timeout_message: str) -> None:
         # Wait briefly for the worker to notice the closed connection.
         self.thread.join(timeout=2.0)
-        if self.result["error"] is None and self.result["response"] is None:
+        if self.result["response"] is not None:  # completed, or the worker's own accepted failure
+            return
+        if self._codex_watchdog_snapshot()[0] is not None:
+            # An event was accepted, so the request is billed: whether the worker is still stuck or
+            # swallowed its retirement, end on the accepted failure, never a replayable timeout.
+            self.result = {"response": _CodexStreamTerminalFailure(TimeoutError(timeout_message)), "error": None}
+        elif self.result["error"] is None:
             self.result["error"] = TimeoutError(timeout_message)
+
+    def _completed(self) -> bool:
+        response = self.result["response"]
+        return response is not None and not is_accepted_stream_failure(response)
 
     def _model(self) -> str:
         return self.api_kwargs.get("model", "unknown")
@@ -285,6 +297,6 @@ class _NonStreamRequest:
         if self.result["error"] is not None:
             raise self.result["error"]
         # Success — the provider proved responsive: clear the breaker (#58962).
-        if self.result["response"] is not None:
+        if self._completed():
             h._reset_stale_streak(agent)
         return self.result["response"]

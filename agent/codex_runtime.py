@@ -14,6 +14,7 @@ from contextlib import suppress
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
 
+from agent.chat_completion_accepted_failure import _CodexStreamTerminalFailure
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 from agent.transports.hermes_tools_mcp_server import HERMES_TOOLS_MCP_SERVER_NAME
 from agent.sdk_transform_bypass import bypass_sdk_request_transform
@@ -1022,6 +1023,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     # claims the sink supersedes this token; that only silences OUR live callbacks — consumption continues,
     # because stopping here handed the gateway a "completed" response missing its tail (#69486).
     writer_token = {"value": None, "raw_stream": None, "superseded_logged": False}
+    attempt_state = {"accepted_event": False}
 
     def _request_is_current() -> bool:
         return request_token is None or getattr(agent, "_active_codex_stream_request_token", None) is request_token
@@ -1051,6 +1053,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             agent._fire_stream_delta(text)
 
     def _on_event(event: Any) -> None:  # TTFB/activity touch — once per SSE event.
+        # Every event the Responses decoder accepts, lifecycle frames included, bills this attempt: never replay it.
+        attempt_state["accepted_event"] = True
         now = time.time()
         # Lifecycle frames can precede text, so the first accepted parsed event is the Responses
         # equivalent of Chat Completions' first chunk. Preserve the per-attempt reset; the ``_fenced``
@@ -1171,6 +1175,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             with watchdog_state.lock:
                 watchdog_state.retry_started_ts = time.time()
         intercepted_events: list = []
+        attempt_state["accepted_event"] = False
         writer_token["value"] = writer_token["raw_stream"] = event_stream = None
         writer_token["superseded_logged"] = False
         try:
@@ -1179,7 +1184,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     dict(api_kwargs), _open_codex_stream,
                     session_id=str(getattr(agent, "session_id", "") or ""),
                     name=str(getattr(agent, "provider", "") or "codex"), model_name=str(model or ""),
-                    finalizer=lambda: _consume_codex_event_stream(list(intercepted_events), model=model),
+                    finalizer=lambda: _consume_codex_event_stream(list(intercepted_events), model=model, on_event=_fenced(_on_event)),
                     on_stream_created=_codex_stream_created, on_chunk=intercepted_events.append,
                     chunk_adapter=lambda chunk: chunk,
                     completed_response_predicate=lambda r: bool(hasattr(r, "output") and not hasattr(r, "__iter__")),
@@ -1194,6 +1199,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     on_event=_fenced(_on_event), interrupt_check=_interrupt_or_superseded,
                 )
             except transport_errors as exc:
+                if attempt_state["accepted_event"]:
+                    return _CodexStreamTerminalFailure(exc)
                 if attempt >= max_stream_retries:
                     _log_failure(exc)
                     raise
@@ -1215,6 +1222,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 # raw ``transport_errors`` branch above never sees a pre-stream failure. Before the stream
                 # opened nothing is billed, so one fresh physical request is safe (#103673); once the writer
                 # token is claimed the inference may already be billed, so mid-stream failures still raise.
+                if attempt_state["accepted_event"]:
+                    return _CodexStreamTerminalFailure(exc)
                 if (attempt < max_stream_retries and writer_token["value"] is None
                         and isinstance(exc.__cause__, _httpx.TransportError)):
                     logger.debug(

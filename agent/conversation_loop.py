@@ -37,7 +37,7 @@ from agent.turn_context import PreflightCompressionTimedOut, build_turn_context
 from agent.turn_retry_state import TurnRetryState
 # Phase helpers of the turn loop, bound at import so a source-tree swap cannot load a
 # skewed phase mid-turn.
-from agent.turn_api_call import handle_api_interrupt, nous_rate_limit_guard, perform_api_call
+from agent.turn_api_call import handle_accepted_stream_failure, handle_api_interrupt, nous_rate_limit_guard, perform_api_call
 from agent.turn_api_error import handle_api_error
 from agent.turn_api_request import build_api_request
 from agent.turn_failure_copy import failed_turn_notice, site_copy
@@ -1360,6 +1360,7 @@ class _LoopState:
     _retry: Any = None
     finish_reason: str = "stop"
     response: Any = None  # None when every retry failed
+    accepted_stream_failure_error: Any = None
     api_kwargs: Any = None  # None until built; read by the except handlers
     api_request_id: Any = None
     _original_api_kwargs: Any = None
@@ -1415,7 +1416,10 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[Dict[str, Any]]:
             return None
         try:
             _run_phase(build_api_request, agent, s)
-            if _run_phase(perform_api_call, agent, s).action == "break":
+            _pc = _run_phase(perform_api_call, agent, s)
+            if _pc.action == "accepted_failure":
+                _run_phase(handle_accepted_stream_failure, agent, s)
+            if _pc.action in ("break", "accepted_failure"):
                 return None
             _rc = _run_phase(check_api_response, agent, s)
             if _rc.action == "return":
@@ -1554,6 +1558,8 @@ def _run_conversation_turn(
         if early_result is not None:
             return early_result
 
+        if s.accepted_stream_failure_error is not None:
+            break
         _rs = _run_phase(apply_retry_restarts, agent, s)
         if _rs.action == "break":
             break
