@@ -309,8 +309,8 @@ class SessionSessionsMixin:
         parent_session_id: str = None, cwd: str = None, profile_name: Optional[str] = None,
         git_repo_root: str = None, origin_json: str = None, display_name: str = None,
         transport_profile: Optional[str] = None, title: Optional[str] = None,
-        return_title: bool = False,
-    ) -> Optional[str]:
+        return_title: bool = False, strict: bool = False,
+    ) -> Union[Optional[str], bool, Tuple[bool, Optional[str]]]:
         """Upsert a session row, never overwriting what an earlier writer set (the gateway creates a
         bare row before create_session carries the real model/prompt) — the one exception is the
         token-accounting guard's placeholder ``source='unknown'``, which a later writer's real surface
@@ -341,12 +341,16 @@ class SessionSessionsMixin:
         ``db_path`` in tests, ad-hoc copies) derive nothing and keep NULL — never guess.
 
         ``title`` (``user`` provenance) is written in the same transaction, so a refused title
-        (ValueError: invalid, or in use) leaves no row behind.
+        (ValueError: invalid, or in use) leaves no row behind. ``strict`` refuses a taken id (returns
+        False) before any write: the upsert would otherwise fill in and repoint another session's row.
         """
         if not (profile_name or "").strip():
             profile_name = self._own_profile_name()
         title = self.sanitize_title(title)
         def _do(conn):
+            # Same BEGIN IMMEDIATE as the INSERT below, so no writer can take the id in between.
+            if strict and conn.execute("SELECT 1 FROM sessions WHERE id = ?", (session_id,)).fetchone():
+                return (False, None) if return_title else False
             system_prompt_hash = self._store_system_prompt(conn, system_prompt)
             conn.execute(
                 """INSERT INTO sessions (
@@ -410,7 +414,9 @@ class SessionSessionsMixin:
                 row = conn.execute("SELECT title FROM sessions WHERE id = ?", (session_id,)).fetchone()
                 if row is None:
                     raise RuntimeError(f"Created session {session_id} is missing")
-                return row["title"]
+                return (True, row["title"]) if strict else row["title"]
+            if strict:
+                return True
         # Transcript-critical: a failed row creation aborts the turn.
         return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
 
@@ -420,6 +426,13 @@ class SessionSessionsMixin:
         """Create (upsert) a session record. Returns the session_id, optionally with its stored title."""
         stored_title = self._insert_session_row(session_id, source, return_title=return_title, **kwargs)
         return (session_id, stored_title) if return_title else session_id
+
+    def create_session_strict(
+        self, session_id: str, source: str, *, return_title: bool = False, **kwargs,
+    ) -> Union[bool, Tuple[bool, Optional[str]]]:
+        """Create a NEW session row: True when created, False when ``session_id`` is already taken
+        (nothing written). A ``title`` kwarg the row cannot take raises ValueError with nothing written."""
+        return self._insert_session_row(session_id, source, strict=True, return_title=return_title, **kwargs)
 
     def create_session_with_title(
         self, session_id: str, source: str, title: Optional[str], *, return_title: bool = False, **kwargs,
