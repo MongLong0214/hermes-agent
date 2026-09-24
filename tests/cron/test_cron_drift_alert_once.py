@@ -303,7 +303,8 @@ class TestDriftAlertOnce:
                 sched.run_one_job(fresh)
 
         assert len(deliveries) == 1, "non-drift failure must still deliver"
-        assert "boom unrelated" in deliveries[0]
+        assert "failed:" in deliveries[0] and "drifted" not in deliveries[0], (
+            "the run's failure notice, not the drift alert")
 
 
 _ALERT_TEXT = "Nothing was charged"

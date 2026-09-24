@@ -247,7 +247,7 @@ def test_escaped_failure_delivery_carries_the_streak_nudge(monkeypatch):
 
     assert ok is False
     assert len(delivered) == 1
-    assert "cannot import name X" in delivered[0]
+    assert "failed:" in delivered[0] and "cannot import name X" not in delivered[0]
     assert "hermes cron pause scout" in delivered[0]
 
 
@@ -270,7 +270,8 @@ def test_escaped_failure_delivery_stays_quiet_below_the_threshold(monkeypatch):
 
     assert ok is False
     assert len(delivered) == 1
-    assert "provider failed" in delivered[0]
+    assert delivered[0].startswith("⚠️ Cron 'scout' failed: ")
+    assert "provider failed" not in delivered[0]
     assert "hermes cron pause scout" not in delivered[0]
 
 

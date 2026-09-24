@@ -182,7 +182,12 @@ def cron_list(show_all: bool = False):
 
     _print_banner("Scheduled Jobs")
 
+    from cron.jobs_public_status import closed_status_fields
+
     for job in jobs:
+        # Closed failure fields even for records written raw before the store closed them;
+        # the raw text is `hermes cron runs`' job.
+        job = {**job, **closed_status_fields(job)}
         # effective_job_state honours the scheduler flag — never [paused] when enabled=true.
         badge = _STATE_BADGES.get(effective_job_state(job)) or (
             ("[active]", Colors.GREEN) if job.get("enabled", True) else ("[disabled]", Colors.RED))
@@ -609,6 +614,9 @@ def _next_run_overdue_issue(next_run: str) -> Optional[str]:
 
 
 def _cron_doctor_issues_for_job(job: Dict[str, Any]) -> List[str]:
+    from cron.jobs_public_status import closed_status_fields
+
+    job = {**job, **closed_status_fields(job)}  # as in cron_list
     issues: List[str] = []
     last_status = str(job.get("last_status") or "").strip().lower()
     # "delivery_failed" = the agent run succeeded; the delivery issue below reports it.

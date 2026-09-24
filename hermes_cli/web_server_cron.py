@@ -9,6 +9,7 @@ import re
 from fastapi import HTTPException
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from cron.jobs_public_status import DASHBOARD_CRON_JOB_FIELDS, project_cron_job
 from hermes_cli.config import cfg_get
 from hermes_cli.web_models import CronJobCreate
 
@@ -126,8 +127,10 @@ def _cron_profile_home(profile: Optional[str]) -> Tuple[str, Path]:
 def _annotate_cron_job(
     job: Dict[str, Any], profile: str, home: Path, heartbeat_age: Optional[float] = None,
 ) -> Dict[str, Any]:
+    """Every job the dashboard serves: the closed projection (no claims, origin or raw failure
+    text) plus the profile it lives in."""
     return {
-        **job,
+        **project_cron_job(job, DASHBOARD_CRON_JOB_FIELDS),
         "profile": profile,
         "profile_name": profile,
         "hermes_home": str(home),

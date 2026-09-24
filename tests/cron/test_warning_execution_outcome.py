@@ -2,6 +2,7 @@
 import pytest
 
 from cron import executions, incidents, jobs, scheduler
+from cron.jobs_public_status import public_run_error
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 
 
@@ -52,7 +53,9 @@ def test_real_run_ledger_and_incident_match_actual_presentation(tmp_path, monkey
     saved = jobs.get_job(job["id"])
     assert saved["last_status"] == ("ok" if mode == "success" else "error")
     if mode != "success":
-        assert "isolated provider failure" in saved["last_error"]
+        # The record carries the closed label; the ledger row keeps the raw text.
+        assert saved["last_error"] == public_run_error("isolated provider failure")
+        assert "isolated provider failure" in row["error"]
         incident = next(i for i in incidents.list_incidents() if i["job_id"] == job["id"])
         assert incident["state"] == ("detected" if suppress else "alerted")
     if mode != "crash":

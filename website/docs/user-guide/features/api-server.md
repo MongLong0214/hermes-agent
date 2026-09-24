@@ -568,6 +568,8 @@ MCP trust-gate consent — a write-capable tool on a server configured `trust: u
 
 The server exposes a lightweight jobs CRUD surface for managing scheduled / background agent runs from a remote client. All endpoints are gated behind the same bearer auth.
 
+Every endpoint that returns a job serves a fixed set of fields: `id`, `name`, `prompt`, `skill`, `skills`, `schedule`, `schedule_display`, `repeat`, `deliver`, `enabled`, `state`, `paused_at`, `paused_reason`, `next_run_at`, `last_run_at`, `last_status`, `last_delivery_error` and `last_fire_error`. The creating chat's origin, scheduler claims, workdir, script, model routing and `last_error` are not served. `last_delivery_error` is the fixed `Delivery failed` label and `last_fire_error` keeps its timestamp with a fixed `detail`, as stored; the underlying reasons stay on the host (`hermes cron runs`, `hermes logs --level WARNING`).
+
 ### GET /api/jobs
 
 List all scheduled jobs.

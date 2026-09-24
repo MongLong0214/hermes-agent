@@ -28,6 +28,7 @@ def main():
         os.environ.update(HOME=home, HERMES_HOME=home)
         sys.path.insert(0, str(checkout))
         from cron import jobs, scheduler
+        from cron.jobs_public_status import public_run_error
         from hermes_cli.cli_commands_mixin import CLICommandsMixin
         from openai import OpenAI
         from tools.cronjob_job_args import _format_job
@@ -56,8 +57,8 @@ def main():
             checks = {
                 "persisted_traceback": "Traceback (most recent call last)" in saved,
                 "persisted_connection_cause": "Connection refused" in saved,
-                "listed_run_reason": formatted.get("last_error") == error,
-                "slash_list_reason": f"error: {error}" in console.getvalue(),
+                "listed_run_reason": formatted.get("last_error") == public_run_error(error),
+                "slash_list_reason": f"error: {formatted.get('last_error')}" in console.getvalue(),
                 "concise_return": not success and not response and error == "RuntimeError: Connection error.",
                 "separate_failure_fields": formatted["last_delivery_error"] is None and formatted["last_fire_error"] is None,
                 "private_output": os.name == "nt" or path.stat().st_mode & 0o077 == 0,
@@ -72,9 +73,8 @@ def main():
             jobs.mark_job_run(job["id"], False, error=secret_error)
             secret_listing = _format_job(jobs.get_job(job["id"]))
             visible = secret_listing.get("last_error") or ""
-            checks["listed_credentials_redacted"] = (
-                "localhost" in visible and "password" not in visible and "secret-token" not in visible
-            )
+            checks["listed_reason_closed"] = visible == public_run_error(secret_error) and not any(
+                private in visible for private in ("localhost", "password", "secret-token"))
             jobs.mark_job_run(job["id"], True)
             checks["success_clears_error"] = jobs.get_job(job["id"])["last_error"] is None
             print(json.dumps({"checkout": str(checkout), "checks": checks}, indent=2))

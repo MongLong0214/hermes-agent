@@ -155,6 +155,7 @@ def test_standalone_guidance_matches_profile_membership(served_root, monkeypatch
 @pytest.mark.parametrize("detail", ["unreachable " * 30 + "\nsecret second line", ""])
 def test_doctor_bounds_persisted_fire_errors(served_root, capsys, detail):
     from cron import jobs
+    from cron.jobs_public_status import public_fire_error
     from hermes_cli.cron import cron_doctor
 
     jobs.create_job(prompt="probe", schedule="every 1h")
@@ -164,7 +165,9 @@ def test_doctor_bounds_persisted_fire_errors(served_root, capsys, detail):
     assert cron_doctor() == bool(detail)
     output = capsys.readouterr().out
     if detail:
-        assert "missed scheduled fire at test-time: unreachable" in output
+        # A stamp written raw (before the store closed it) is reported by its closed text.
+        closed = public_fire_error(records[0]["last_fire_error"])["detail"]
+        assert f"missed scheduled fire at test-time: {closed}" in output
         line = next(line for line in output.splitlines() if "missed scheduled fire at" in line)
         assert len(line.split(". The messaging gateway")[0]) < 200
         assert f"hermes cron run {records[0]['id']}" in line
@@ -193,8 +196,11 @@ def test_doctor_reports_persisted_dispatch_health(served_root, capsys, dispatch)
         assert persisted["last_dispatch"]["kind"] == dispatch
     assert cron_doctor() == 1
     output = capsys.readouterr().out
-    expected = {"catch_up": "catch-up", "late": "last fire was late", "forward_error": "loopback unavailable"}
+    expected = {"catch_up": "catch-up", "late": "last fire was late",
+                "forward_error": "missed scheduled fire at"}
     assert expected[dispatch] in output
+    # The forwarder's reason is logged, not stored or printed (cron/jobs_public_status.py).
+    assert "loopback unavailable" not in output
     assert "Review the findings above, then run `hermes cron doctor` again." in output
     jobs.mark_job_run(job["id"], success=True)
     if dispatch == "forward_error":
