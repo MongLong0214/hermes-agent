@@ -160,6 +160,7 @@ def _is_settled_store(path: Path) -> bool:
     from hermes_state_dbfile import has_invalid_sqlite_header_preopen
     from hermes_state_fence import LINEAGE_FENCED, STORED_SCHEMA_VERSION, decode_store_lineage, fences_exact
     from hermes_state_holders import read_only_db_uri
+    from hermes_state_schema import fts_realign_pending
 
     if not path.is_file() or has_invalid_sqlite_header_preopen(path):
         return False
@@ -176,6 +177,9 @@ def _is_settled_store(path: Path) -> bool:
         # open's migrations have completed.
         lineage = decode_store_lineage(cursor)
         if lineage.lineage != LINEAGE_FENCED or lineage.stored != STORED_SCHEMA_VERSION or not fences_exact(cursor):
+            return False
+        # The base realign rebuilds the whole index on stores the stamp and marker below call settled.
+        if fts_realign_pending(cursor):
             return False
         meta = dict(
             cursor.execute(

@@ -437,12 +437,30 @@ def _seeded_store_with_meta(key: str, value: str):
     return make
 
 
+def _stamped_store_whose_index_lost_its_rows(path: Path) -> None:
+    """What an FTS realign cut off in its 'rebuild' left before it ran in one transaction: every stamp
+    and marker current, over an index missing the rows written before it."""
+    _seed(path.parent, ("root", "mid-1", "mid-2", "tip"), ("other",))
+    db = SessionDB(path)
+    try:
+        db.append_message("tip", "user", "indexed before the realign was cut off")
+    finally:
+        db.close()
+    conn = sqlite3.connect(path, isolation_level=None)
+    try:
+        conn.execute("INSERT INTO messages_fts(messages_fts) VALUES('delete-all')")
+    finally:
+        conn.close()
+    assert _state_meta(path.parent)["fts_storage_version"] == str(FTS_STORAGE_VERSION)
+
+
 # Stores the writer open would migrate, past any bound bind can keep: the fork's generation (fence swap
 # and lineage stamp, then the data migrations), and a store this build stamped whose FTS it would rebuild.
 _UNSETTLED_STORES = {
     "fork generation 29": lambda path: build_store(path, "fork29"),
     "stale fts index": _seeded_store_with_meta(FTS_STALE_KEY, "1"),
     "older fts storage": _seeded_store_with_meta("fts_storage_version", str(FTS_STORAGE_VERSION - 1)),
+    "stamped index missing its rows": _stamped_store_whose_index_lost_its_rows,
 }
 
 
