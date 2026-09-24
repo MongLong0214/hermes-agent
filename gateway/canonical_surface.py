@@ -8,6 +8,7 @@ import hashlib
 import json
 import secrets
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol
@@ -334,6 +335,20 @@ class ExistingCanonicalBindingResolver:
         return entry, proof
 
 
+@contextmanager
+def _unconfirmed_once_claimed():
+    """Report a refusal raised once the event's receipt row exists as an unconfirmed receipt.
+
+    Refusal codes tell a caller the turn did not run and nothing was stored for it. Past
+    ``claim_meta_once`` neither is provable (the actor may already have run), so a caller that
+    resent under a new event id would run the turn twice; the receipt, not the refusal, answers.
+    """
+    try:
+        yield
+    except ValueError as exc:
+        raise ValueError("canonical_receipt_terminal_unconfirmed") from exc
+
+
 @dataclass(frozen=True)
 class CanonicalReceiptResult:
     """The durable state visible to an internal canonical caller."""
@@ -431,6 +446,41 @@ class CanonicalReceiptCoordinator:
             raise ValueError("canonical_binding_stale")
         return bound
 
+    def _recorded_or_refuse(
+        self, binding: CanonicalSurfaceBinding, key: str, fingerprint: str, code: str,
+        proof: CanonicalBindingProof | None = None,
+    ) -> CanonicalReceiptResult:
+        """Answer an event an earlier request recorded; refuse with ``code`` only when none was.
+
+        A refusal reads as "not run", so a caller resends under a new event id: were the event
+        recorded, that runs it twice. Without the cached actor there is no writable handle, and
+        without a resolved head (a restarted gateway loads its routing index only after its
+        listeners are up) there is no proof, so the receipt is read on a read-only handle to the
+        state.db the resolver proves for this binding's own session key and profile scope.
+        """
+        from hermes_state import SessionDB
+
+        if proof is not None:
+            db_path, db_identity = proof.db_path, proof.db_identity
+        else:
+            db_path = ExistingCanonicalBindingResolver(self._runner.session_store)._existing_db_path(
+                binding.session_key
+            )
+            db_identity = _path_identity(db_path)
+        if db_path is None or db_identity is None:
+            raise ValueError(code)
+        reader = SessionDB(db_path, read_only=True)
+        try:
+            if getattr(reader, "_db_file_identity", None) != db_identity:
+                # The proven file was replaced: whether it held a receipt cannot be known now.
+                raise ValueError("canonical_receipt_unreadable")
+            recorded = reader.get_meta(key)
+        finally:
+            reader.close()
+        if recorded is None:
+            raise ValueError(code)
+        return self._decode(recorded, fingerprint)
+
     def _require_current_claim_target(
         self, proof: CanonicalBindingProof, actor: Any, db: Any,
         run_generation: int | None = None,
@@ -452,28 +502,41 @@ class CanonicalReceiptCoordinator:
         """Claim, run once, and durably terminalize an already-authenticated canonical event."""
         if event.binding != binding.name:
             raise ValueError("canonical_binding_stale")
-        entry, proof = ExistingCanonicalBindingResolver(self._runner.session_store).resolve_with_proof(
-            binding, event
-        )
-        actor, db = self._borrow_actor_db(self._runner, proof)
         fingerprint = self._fingerprint(binding, event)
         key = self._key(binding, event)
+        # Principal admission is never answered from a receipt; every later refusal before this
+        # request's own claim is, when the event was already recorded.
+        try:
+            entry, proof = ExistingCanonicalBindingResolver(self._runner.session_store).resolve_with_proof(
+                binding, event
+            )
+        except ValueError as refusal:
+            if str(refusal) == "canonical_principal_rejected":
+                raise
+            return self._recorded_or_refuse(binding, key, fingerprint, str(refusal))
+        try:
+            actor, db = self._borrow_actor_db(self._runner, proof)
+            if self._runner._is_session_running(proof.session_key):
+                raise ValueError("canonical_turn_busy")
+        except ValueError as refusal:
+            return self._recorded_or_refuse(binding, key, fingerprint, str(refusal), proof)
         owner = secrets.token_hex(16)
         pending = self._encode({"v": 1, "state": "pending", "owner": owner, "fingerprint": fingerprint})
-        if self._runner._is_session_running(proof.session_key):
-            raise ValueError("canonical_turn_busy")
         try:
             lease = await self._runner._turn_leases.acquire(
                 proof.session_id, owner_key=f"canonical:{id(event)}", generation=0,
             )
         except Exception:
-            raise ValueError("canonical_turn_busy") from None
+            return self._recorded_or_refuse(binding, key, fingerprint, "canonical_turn_busy", proof)
         run_generation: int | None = None
         try:
             # Waiting for the turn lease may have exposed a new head, actor, or DB generation.
-            self._require_current_claim_target(proof, actor, db)
-            if self._runner._is_session_running(proof.session_key):
-                raise ValueError("canonical_turn_busy")
+            try:
+                self._require_current_claim_target(proof, actor, db)
+                if self._runner._is_session_running(proof.session_key):
+                    raise ValueError("canonical_turn_busy")
+            except ValueError as refusal:
+                return self._recorded_or_refuse(binding, key, fingerprint, str(refusal), proof)
             run_generation = self._runner._begin_session_run_generation(proof.session_key)
             turn = self._runner._session_state(proof.session_key).turn
             turn.agent = actor
@@ -485,9 +548,10 @@ class CanonicalReceiptCoordinator:
             if not db.claim_meta_once(
                 key, pending, proven_db_path=db.db_path, proven_db_identity=proof.db_identity
             ):
-                receipt = db.get_meta(key)
-                # get_meta has no generation fence, so its result is usable only after this recheck.
-                self._require_current_claim_target(proof, actor, db, run_generation)
+                with _unconfirmed_once_claimed():
+                    receipt = db.get_meta(key)
+                    # get_meta has no generation fence, so its result is usable only after this recheck.
+                    self._require_current_claim_target(proof, actor, db, run_generation)
                 return self._decode(receipt, fingerprint)
 
             from gateway.canonical_surface import request_local_reply_sink
@@ -495,25 +559,27 @@ class CanonicalReceiptCoordinator:
             async def discard(_result: CanonicalTurnResult) -> None:
                 return None
 
-            result = await self._runner.run_bound_existing_turn(
-                binding, event, entry, reply_sink=request_local_reply_sink(discard),
-                expected_actor=actor, expected_session_db=db,
-                expected_db_path=proof.db_path, expected_db_identity=proof.db_identity,
-                expected_run_generation=run_generation,
-                held_lease=lease,
-            )
-            if not isinstance(result, CanonicalTurnResult) or len(result.terminal_text) > _MAX_TEXT_CHARS:
-                raise ValueError("canonical_receipt_invalid")
-            terminal = self._encode({
-                "v": 1, "state": "terminal", "fingerprint": fingerprint,
-                "response": {"binding_name": result.binding_name, "terminal_text": result.terminal_text},
-            })
-            self._require_current_claim_target(proof, actor, db, run_generation)
-            if not db.compare_and_set_meta(
-                key, pending, terminal, proven_db_path=db.db_path, proven_db_identity=proof.db_identity
-            ):
-                raise ValueError("canonical_receipt_terminal_unconfirmed")
-            self._require_current_claim_target(proof, actor, db, run_generation)
+            with _unconfirmed_once_claimed():
+                result = await self._runner.run_bound_existing_turn(
+                    binding, event, entry, reply_sink=request_local_reply_sink(discard),
+                    expected_actor=actor, expected_session_db=db,
+                    expected_db_path=proof.db_path, expected_db_identity=proof.db_identity,
+                    expected_run_generation=run_generation,
+                    held_lease=lease,
+                )
+                if not isinstance(result, CanonicalTurnResult) or len(result.terminal_text) > _MAX_TEXT_CHARS:
+                    raise ValueError("canonical_receipt_invalid")
+                terminal = self._encode({
+                    "v": 1, "state": "terminal", "fingerprint": fingerprint,
+                    "response": {"binding_name": result.binding_name, "terminal_text": result.terminal_text},
+                })
+                self._require_current_claim_target(proof, actor, db, run_generation)
+                if not db.compare_and_set_meta(
+                    key, pending, terminal, proven_db_path=db.db_path, proven_db_identity=proof.db_identity
+                ):
+                    raise ValueError("canonical_receipt_terminal_unconfirmed")
+            # The terminal is durable and a replay answers it, so this answer is the same; a head
+            # that moves after the compare-and-set cannot change what was recorded.
             return CanonicalReceiptResult("terminal", result.terminal_text)
         finally:
             if run_generation is not None:
