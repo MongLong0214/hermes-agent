@@ -8,7 +8,6 @@ with ``RedactingFormatter`` so secrets never reach disk.
 
 import atexit
 import copy
-import errno
 import io
 import logging
 import os
@@ -82,17 +81,20 @@ def _is_windows_concurrent_log_lock_timeout(exc: BaseException | None) -> bool:
     )
 
 
-def _is_unavailable_log_stream(exc: BaseException | None, base_filename: str) -> bool:
-    """True when a file handler lost its backing stream or its own log directory."""
-    return (
-        (isinstance(exc, OSError) and exc.errno == 5)
-        or (
-            isinstance(exc, FileNotFoundError)
-            and exc.errno == errno.ENOENT
-            and exc.filename == base_filename
-        )
-        or (isinstance(exc, ValueError) and "closed file" in str(exc).lower())
-    )
+def _is_unavailable_log_stream(exc: BaseException | None) -> bool:
+    """True when a file handler's own I/O (open, seek, write, flush, rollover) failed.
+
+    Callers pass only exceptions NOT raised while formatting — that is foreign code (formatter,
+    record args) failing on paths of its own. The split is where the error was raised, not the
+    path it names: a write-time ENOSPC carries no filename and a rollover error names a backup.
+    """
+    return isinstance(exc, OSError) or (isinstance(exc, ValueError) and "closed file" in str(exc).lower())
+
+
+def _report_unavailable_log(path: str | Path, exc: BaseException) -> None:
+    _quietly(lambda: print(
+        f"hermes_logging: {path} unavailable ({exc}); file logging paused until it recovers",
+        file=_safe_stderr()))
 
 
 # Third-party loggers that are noisy at DEBUG/INFO level.
@@ -312,6 +314,7 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
         from hermes_cli.config import is_managed
         self._managed = is_managed()
         self._unavailable_reported = False
+        self._format_error: Optional[BaseException] = None
         super().__init__(*args, **kwargs)
         self._record_stream_stat()
 
@@ -383,22 +386,31 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
         captures into chat output).
         """
         exc = sys.exc_info()[1]
+        # Cleared on every path so a handled exception (and its frames) is not kept alive.
+        raised_by_format, self._format_error = exc is self._format_error, None
         if _is_windows_concurrent_log_lock_timeout(exc):
             return
-        if _is_unavailable_log_stream(exc, self.baseFilename):
+        if not raised_by_format and _is_unavailable_log_stream(exc):
             # The QueueListener must not turn a failing log destination into a traceback for
             # every queued record. Name the path once, drop the stale stream; the next emit
             # reopens it if the destination has recovered.
             if not self._unavailable_reported:
                 self._unavailable_reported = True
-                _quietly(lambda: print(
-                    f"hermes_logging: {self.baseFilename} unavailable ({exc}); "
-                    "file logging paused until it recovers", file=_safe_stderr()))
+                _report_unavailable_log(self.baseFilename, exc)
             if self.stream is not None:
                 _quietly(self.stream.close)
             self.stream = None  # type: ignore[assignment]
             return
         super().handleError(record)
+
+    def format(self, record: logging.LogRecord) -> str:
+        try:
+            return super().format(record)
+        except Exception as exc:
+            # Formatting is the only foreign code in emit; mark its failure so handleError keeps
+            # the traceback and the stream instead of pausing a destination that is fine.
+            self._format_error = exc
+            raise
 
     def _open(self):
         stream = super()._open()
@@ -445,6 +457,8 @@ class _ProfileRoutingFileHandler(logging.Handler):
         self._max_bytes = getattr(existing, "maxBytes", 0)
         self._backup_count = getattr(existing, "backupCount", 0)
         self._profile_handlers: dict[Path, _ManagedRotatingFileHandler] = {}
+        # Homes whose log file cannot be created right now; each is named once per outage.
+        self._unavailable_homes: set[Path] = set()
         self._profile_handlers_lock = threading.RLock()
         self.setFormatter(existing.formatter)
         for log_filter in existing.filters:
@@ -458,18 +472,31 @@ class _ProfileRoutingFileHandler(logging.Handler):
             candidate = self._default_home
         return candidate if candidate in self._profile_homes else self._default_home
 
-    def _handler_for_home(self, home: Path) -> _ManagedRotatingFileHandler:
+    def _handler_for_home(self, home: Path) -> Optional[_ManagedRotatingFileHandler]:
+        """The home's file handler, or None while its log file cannot be created."""
         with self._profile_handlers_lock:
             if home not in self._profile_handlers:
-                self._profile_handlers[home] = _new_file_handler(
-                    home / "logs" / self._filename, level=self.level, max_bytes=self._max_bytes,
-                    backup_count=self._backup_count, formatter=self.formatter,
-                )
+                path = home / "logs" / self._filename
+                try:
+                    self._profile_handlers[home] = _new_file_handler(
+                        path, level=self.level, max_bytes=self._max_bytes,
+                        backup_count=self._backup_count, formatter=self.formatter,
+                    )
+                except OSError as exc:
+                    # Every routed record retries, and a removed named profile home is refused on
+                    # purpose (never recreated): name it once, not a traceback per record.
+                    if home not in self._unavailable_homes:
+                        self._unavailable_homes.add(home)
+                        _report_unavailable_log(path, exc)
+                    return None
+                self._unavailable_homes.discard(home)
             return self._profile_handlers[home]
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
-            self._handler_for_home(self._home_for_record(record)).handle(record)
+            handler = self._handler_for_home(self._home_for_record(record))
+            if handler is not None:
+                handler.handle(record)
         except Exception:
             self.handleError(record)
 
@@ -486,6 +513,7 @@ class _ProfileRoutingFileHandler(logging.Handler):
         with self._profile_handlers_lock:
             handler = self._profile_handlers.pop(home, None)
             self._profile_homes.discard(home)
+            self._unavailable_homes.discard(home)
         if handler is None:
             return False
         _quietly(handler.close)
