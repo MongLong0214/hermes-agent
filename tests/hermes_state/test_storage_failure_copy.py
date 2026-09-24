@@ -30,6 +30,27 @@ def test_each_cause_has_a_stable_code_and_an_action(exc, code, command):
     assert "sqlite" not in failure.gloss.lower() and "OperationalError" not in failure.gloss
 
 
+def test_a_refused_store_gets_its_cause_remedy_even_after_crossing_a_string(tmp_path):
+    """A store this build refuses is not "could not be opened, run doctor --fix": each refusal cause
+    has its own copy, and it survives ``str(e)`` (the gateway, TUI and CLI keep init errors as text)."""
+    from hermes_state import SessionDB
+    from tests.hermes_state.fork_store_fixture import REFUSED_KINDS, build_store
+
+    unknown = describe_storage_failure(None)
+    glosses = {}
+    for kind, cause in REFUSED_KINDS.items():
+        with pytest.raises(Exception) as caught:
+            SessionDB(db_path=build_store(tmp_path / kind / "state.db", kind)).close()
+        failure = describe_storage_failure(caught.value)
+        assert failure == describe_storage_failure(str(caught.value)), kind
+        assert failure.cause == "schema_incompatible" and failure.code != unknown.code, (kind, failure)
+        assert failure.gloss[0].islower() and "doctor --fix" not in failure.action, (kind, failure)
+        glosses.setdefault(cause, set()).add(failure.gloss)
+    # Kinds that share a cause share its copy; different causes never do.
+    assert all(len(g) == 1 for g in glosses.values()), glosses
+    assert len({next(iter(g)) for g in glosses.values()}) == len(glosses), glosses
+
+
 def test_details_line_is_flattened_and_bounded():
     details = storage_failure_details("line one\n   line two " + "x" * 400, limit=60)
     assert "\n" not in details and len(details) == 60 and details.endswith("...")

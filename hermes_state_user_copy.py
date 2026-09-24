@@ -8,8 +8,12 @@ and a machine-readable ``code`` a GUI can attach a "Run doctor" button to.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
-from hermes_state_errors import STORAGE_RECOVERY_DOCS_URL, classify_persistence_error, is_disk_full_error
+from hermes_state_errors import (
+    SCHEMA_CAUSE_BUILD_TOO_OLD, SCHEMA_CAUSE_FENCE_GENERATION_MISMATCH, SCHEMA_CAUSE_VERSION_UNREADABLE,
+    STORAGE_RECOVERY_DOCS_URL, classify_persistence_error, incompatible_schema_cause, is_disk_full_error,
+)
 
 
 @dataclass(frozen=True)
@@ -86,13 +90,48 @@ _STORAGE_FAILURES: dict[str, tuple[str, str, str]] = {
         "the session database could not be opened",
         _DOCTOR,
     ),
+    # "schema_incompatible" is split by the refusal's own cause at lookup time. The store is healthy for
+    # the build that wrote it, so no remedy is `doctor --fix` or `sessions repair`: the first only warns on
+    # such a store and the second reports it clean, which sends the owner in a circle (72e525838f).
+    SCHEMA_CAUSE_BUILD_TOO_OLD: (
+        "storage_schema_incompatible",
+        "this profile's session history was saved by a newer version of Hermes, so this version "
+        "will not open it and has changed nothing",
+        "Update Hermes (`hermes update`) or switch back to the newer version.",
+    ),
+    SCHEMA_CAUSE_FENCE_GENERATION_MISMATCH: (
+        "storage_schema_incompatible",
+        "this profile's session history belongs to a different Hermes version, so this version "
+        "will not write to it and has changed nothing",
+        "Use the Hermes version that last ran on this profile, or update this one (`hermes update`). "
+        "`hermes {profile_arg}doctor` shows the details; repair commands will not change this.",
+    ),
+    SCHEMA_CAUSE_VERSION_UNREADABLE: (
+        "storage_schema_incompatible",
+        "this profile's session history does not record a readable format version, so no version "
+        "of Hermes will open it; nothing in it was changed",
+        "Check it with `hermes {profile_arg}sessions recover --source <state.db> --inspect-only`, then "
+        "rebuild it into a new database with `--output <new-file>`. "
+        "`hermes {profile_arg}sessions repair` does not fix this.",
+    ),
 }
 
 
-def describe_storage_failure(exc_or_str) -> StorageFailure:
-    """Plain-language description of a persistence failure (never raises)."""
-    cause = classify_persistence_error(exc_or_str)
-    key = "disk_full" if cause == "disk" and is_disk_full_error(exc_or_str) else cause
+def schema_incompatibility_cause(exc_or_str) -> Optional[str]:
+    """The refusal cause when *exc_or_str* is this build refusing a store another build owns, else None.
+
+    A write the store's fence aborted, or one made without the fence function, is a generation
+    mismatch: the store's fences name a build other than this one."""
+    cause = incompatible_schema_cause(exc_or_str)
+    if cause is None:
+        from hermes_state_fence import fence_refusal_verdict
+
+        if exc_or_str is not None and fence_refusal_verdict(exc_or_str) is not None:
+            cause = SCHEMA_CAUSE_FENCE_GENERATION_MISMATCH
+    return cause
+
+
+def _storage_failure(cause: str, key: str) -> StorageFailure:
     code, gloss, action = _STORAGE_FAILURES.get(key, _STORAGE_FAILURES["unknown"])
     # Pin the copy-pasteable command to the failing profile — see profile_cli_selector.
     from hermes_constants import profile_cli_selector
@@ -100,6 +139,22 @@ def describe_storage_failure(exc_or_str) -> StorageFailure:
     return StorageFailure(
         cause=cause, code=code, gloss=gloss, action=action.replace("{profile_arg}", profile_cli_selector())
     )
+
+
+def describe_schema_refusal(refusal_cause: str) -> StorageFailure:
+    """The copy for one ``IncompatibleSchemaError`` cause. A retry repeats the refusal, so a surface
+    that knows it has one shows this instead of its own retry text."""
+    return _storage_failure("schema_incompatible", refusal_cause)
+
+
+def describe_storage_failure(exc_or_str) -> StorageFailure:
+    """Plain-language description of a persistence failure (never raises)."""
+    cause = classify_persistence_error(exc_or_str)
+    if cause == "schema_incompatible":
+        return describe_schema_refusal(
+            schema_incompatibility_cause(exc_or_str) or SCHEMA_CAUSE_FENCE_GENERATION_MISMATCH)
+    key = "disk_full" if cause == "disk" and is_disk_full_error(exc_or_str) else cause
+    return _storage_failure(cause, key)
 
 
 def storage_failure_details(exc_or_str, limit: int = 200) -> str:
