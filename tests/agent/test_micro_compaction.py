@@ -707,8 +707,12 @@ class TestMicroCompaction:
         assert cc._micro_compact_rolling_summary
         assert cc._micro_compact_cursor > 0
 
-        cc.compress(msgs, force=True)
+        # Stand in for the batch summarizer too: with no summary the default
+        # (abort_on_summary_failure) keeps the history and there is no batch marker.
+        with patch.object(cc, "_generate_summary", return_value="BATCH SUMMARY"):
+            compressed = cc.compress(msgs, force=True)
 
+        assert any("BATCH SUMMARY" in str(m.get("content")) for m in _summary_markers(compressed))
         assert cc._micro_compact_rolling_summary == ""
         assert cc._micro_compact_cursor == 0
 

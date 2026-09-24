@@ -115,12 +115,16 @@ def test_format_turn_completion_disk_still_advises_space():
 
 
 def test_format_turn_completion_locked_still_advises_retry():
-    """The 'locked' cause still advises retrying (unchanged)."""
+    """The 'locked' cause names the busy store and still advises retrying.
+
+    The bucket also covers a store another build's running gateway holds, so the copy
+    adds a stop-that-gateway remedy after the retry; the retry advice must survive it.
+    """
     from run_agent import AIAgent
 
     explanation = AIAgent._format_turn_completion_explanation(
         "session_persistence_failed", "locked"
-    )
+    ).lower()
     assert "busy" in explanation
     assert "send it again" in explanation
 

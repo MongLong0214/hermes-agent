@@ -139,13 +139,13 @@ def test_oversized_active_turn_uses_a_mid_turn_tool_boundary(
     _assert_tool_pairs_are_complete(messages[cut:])
 
 
-def test_full_compaction_preserves_active_request_and_tool_pairs(
-    compressor: ContextCompressor,
-) -> None:
+def test_full_compaction_preserves_active_request_and_tool_pairs() -> None:
+    # Exercise the deterministic handoff too: even when the summary model is
+    # unavailable, splitting the turn must not lose the opening request. That
+    # handoff is opt-in; the default aborts and keeps every message.
+    compressor = _make_compressor(abort_on_summary_failure=False)
     messages = _oversized_active_turn()
 
-    # Exercise the deterministic handoff too: even when the summary model is
-    # unavailable, splitting the turn must not lose the opening request.
     with patch.object(compressor, "_generate_summary", return_value=None):
         compressed = compressor.compress(messages, current_tokens=90_000)
 
