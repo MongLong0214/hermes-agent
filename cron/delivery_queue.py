@@ -117,7 +117,9 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
              owner_started_at INTEGER,
              created_at TEXT NOT NULL,
              finished_at TEXT,
-             error TEXT
+             error TEXT,
+             accepted INTEGER NOT NULL DEFAULT 0,
+             parked TEXT
            )"""
     )
     conn.execute(
@@ -132,6 +134,15 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         conn, "deliveries", "for_failure",
         "for_failure INTEGER NOT NULL DEFAULT 0",
     )
+    # 1 when at least one target took the message. ``error`` joins every target's failure, so it
+    # alone cannot tell a partial send from no send (the drift alert-once commit needs that).
+    add_column_if_missing(
+        conn, "deliveries", "accepted",
+        "accepted INTEGER NOT NULL DEFAULT 0",
+    )
+    # JSON list of handoffs no target has finished yet (open Bot Chat receipts): not accepted, not
+    # failed either, so the drift alert-once state waits on them.
+    add_column_if_missing(conn, "deliveries", "parked", "parked TEXT")
 
 
 def _connect() -> sqlite3.Connection:
@@ -251,7 +262,10 @@ def claim_next() -> Optional[dict]:
     return result
 
 
-def _finish(execution_id: str, *, error: Optional[str], suppressed: bool = False) -> bool:
+def _finish(
+    execution_id: str, *, error: Optional[str], suppressed: bool = False, accepted: bool = False,
+    parked: Optional[list] = None,
+) -> bool:
     status = "failed" if error else "suppressed" if suppressed else "delivered"
     safe_error = (
         redact_sensitive_text(str(error), force=True, redact_url_credentials=True)
@@ -260,13 +274,15 @@ def _finish(execution_id: str, *, error: Optional[str], suppressed: bool = False
     )
     with _transaction() as conn:
         cur = conn.execute(
-            """UPDATE deliveries SET status=?, finished_at=?, error=?
+            """UPDATE deliveries SET status=?, finished_at=?, error=?, accepted=?, parked=?
                WHERE execution_id=? AND status='delivering'
                  AND owner_process_id=? AND owner_pid=?""",
             (
                 status,
                 _hermes_now().isoformat(),
                 safe_error,
+                int(bool(accepted)),
+                json.dumps(parked) if parked else None,
                 execution_id,
                 _PROCESS_ID,
                 os.getpid(),
@@ -332,7 +348,9 @@ def drain(
             except BaseException as exc:
                 error = f"{type(exc).__name__}: {exc}"
             _finish(row["execution_id"], error=error,
-                    suppressed=bool(row["job"].get("_notification_all_targets_suppressed")))
+                    suppressed=bool(row["job"].get("_notification_all_targets_suppressed")),
+                    accepted=bool(row["job"].get("_delivery_accepted")),
+                    parked=row["job"].get("_delivery_parked"))
         finally:
             with _lock:
                 _ACTIVE_DELIVERIES.discard(row["execution_id"])
