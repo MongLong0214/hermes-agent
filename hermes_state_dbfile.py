@@ -28,6 +28,8 @@ from hermes_state_holders import canonical_sqlite_path, read_only_db_uri
 from hermes_state_common import (
     FTS_REBUILD_DEFERRAL_KEY, stat_db_file_identity as _stat_db_file_identity
 )
+from hermes_state_fence import register_turn_fence_generation
+from hermes_state_serialized_conn import serialized_connection_factory
 
 # Log-record parity with the origin module (caplog tests pin "hermes_state").
 logger = logging.getLogger("hermes_state")
@@ -576,15 +578,27 @@ def _connect_tracked_db(path, tracking_path=None, **kwargs):
     refused (an ``open()``/``close()`` would cancel every POSIX lock, even a running VACUUM's
     EXCLUSIVE).  The ONLY tolerated fallback is the helper being absent (scaffold/embed installs
     without hermes_cli); a real connection failure must propagate — a silent untracked retry
-    would disable the guard for that connection."""
+    would disable the guard for that connection.
+
+    Every connection also carries the turn-fence UDF (a fenced store aborts governed writes
+    from a connection without it) and per-connection serialization (the UDF callback is what
+    turns unserialized sharing into a GIL/connection-mutex deadlock)."""
+    kwargs["factory"] = serialized_connection_factory(kwargs.get("factory", sqlite3.Connection))
     try:
         from hermes_cli.sqlite_safe_read import connect_tracked
     except ImportError:
         logger.debug("hermes_cli.sqlite_safe_read unavailable; opening %s untracked "
                      "(byte-probe guard inactive in this install)", path)
-        return sqlite3.connect(str(path), **kwargs)
-    # Open through THIS module's sqlite3.connect so tests patching hermes_state.sqlite3.connect keep control.
-    return connect_tracked(path, tracking_path=tracking_path, connect_fn=sqlite3.connect, **kwargs)
+        conn = sqlite3.connect(str(path), **kwargs)
+    else:
+        # Open through THIS module's sqlite3.connect so tests patching hermes_state.sqlite3.connect keep control.
+        conn = connect_tracked(path, tracking_path=tracking_path, connect_fn=sqlite3.connect, **kwargs)
+    try:
+        register_turn_fence_generation(conn)
+    except BaseException:
+        conn.close()
+        raise
+    return conn
 
 
 def _preopen_header(path: Path, probe_bytes: int, force: bool) -> Optional[bytes]:
