@@ -3,6 +3,7 @@ import errno
 import io
 import logging
 import os
+import shutil
 import stat
 import sys
 import threading
@@ -902,6 +903,89 @@ def test_own_destination_oserror_names_path_once_then_recovers(tmp_path, capsys,
         assert handler.stream is live and not live.closed
     finally:
         handler.close()
+
+
+def test_log_dir_replaced_by_a_file_under_an_open_stream_is_named_once(hermes_home, capsys):
+    """The log dir removed and replaced by a regular file while the stream is open: the stream
+    would keep writing to the unlinked inode, so the path is named once and records land at the
+    path again once the directory is back."""
+    log_dir = hermes_home / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    path = log_dir / "agent.log"
+    handler = hermes_logging._ManagedRotatingFileHandler(
+        str(path), maxBytes=1024 * 1024, backupCount=1, encoding="utf-8",
+    )
+    handler.setFormatter(logging.Formatter("%(message)s"))
+
+    def _record(msg):
+        return logging.LogRecord("t", logging.INFO, __file__, 0, msg, (), None)
+
+    try:
+        handler.handle(_record("before"))
+        shutil.rmtree(log_dir)
+        log_dir.write_text("not a directory\n", encoding="utf-8")
+        for i in range(20):
+            handler.handle(_record(f"lost {i}"))
+        err = capsys.readouterr().err
+        assert "--- Logging error ---" not in err
+        assert err.count(f"{path} unavailable") == 1
+
+        log_dir.unlink()
+        log_dir.mkdir()
+        handler.handle(_record("recovered"))
+        assert "recovered" in path.read_text(encoding="utf-8")
+    finally:
+        handler.close()
+
+
+@pytest.mark.parametrize(
+    "drops_stream_after_write", [False, True], ids=["keeps-stream", "drops-stream-after-write"],
+)
+def test_pause_notice_re_arms_only_after_a_record_reaches_the_file(
+    tmp_path, capsys, drops_stream_after_write,
+):
+    """outage -> written record -> outage names the path twice; outage -> unformattable record ->
+    outage names it once. A live stream is not the signal: a format error keeps one without
+    writing, and Windows' concurrent handler drops its stream after every successful write."""
+    disk = {"full": False}
+
+    class _Disk(io.StringIO):
+        def write(self, text):
+            if disk["full"]:
+                raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+            return super().write(text)
+
+    class _Handler(hermes_logging._ManagedRotatingFileHandler):
+        def _open(self):
+            return _Disk()
+
+        def flush(self):
+            super().flush()
+            if drops_stream_after_write and self.stream is not None:
+                self.stream.close()
+                self.stream = None
+
+    class _Unformattable:
+        def __str__(self):
+            raise ValueError("bad record arg")
+
+    def _notices_and_tracebacks(name, steps):
+        path = tmp_path / f"{name}.log"
+        path.touch()
+        handler = _Handler(str(path), maxBytes=1024 * 1024, backupCount=1, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        try:
+            for step in steps:
+                disk["full"] = step != "write"
+                args = (_Unformattable(),) if step == "bad-arg" else ()
+                handler.handle(logging.LogRecord("t", logging.INFO, __file__, 0, "%s", args or (step,), None))
+        finally:
+            handler.close()
+        err = capsys.readouterr().err
+        return err.count(f"{path} unavailable"), err.count("--- Logging error ---")
+
+    assert _notices_and_tracebacks("rearmed", ["full", "full", "write", "full", "full"]) == (2, 0)
+    assert _notices_and_tracebacks("format-error", ["full", "full", "bad-arg", "full", "full"]) == (1, 1)
 
 
 def test_removed_routed_profile_home_is_named_once_and_not_recreated(tmp_path, capsys):
