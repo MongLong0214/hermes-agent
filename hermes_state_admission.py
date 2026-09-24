@@ -1,10 +1,12 @@
-"""Forward-migration admission for SessionDB's writable open.
+"""Forward-migration admission for SessionDB's writable open, and for every raw state.db writer.
 
 Migrating a store another build owns (fence swap, lineage stamp, data migrations) locks that build
 out of every governed table, and a gateway of that build may still be running on the profile.
 Every gateway holds its home's ``gateway.lock`` (an OS lock the kernel drops with the process) for
 as long as it runs, whatever its build, so such a migration runs only under a lease on that lock
 (``gateway.status_migration_lease``), and a held lock refuses the open before any byte is written.
+A raw opener (``hermes_state_fence.open_fenced_state_connection``: the delivery ledger, async
+delegation, A2A) runs DDL and writes on the same file, so it takes the same lease the same way.
 
 The home is the store's own directory: a gateway's lock and its ``state.db`` sit side by side, so
 no profile scope has to be bound to find it. A database with another name has no gateway.
@@ -18,6 +20,7 @@ holds it.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -120,3 +123,24 @@ def release_forward_migration_lease(db) -> None:
         from gateway.status_migration_lease import release_gateway_runtime_migration_lease
 
         release_gateway_runtime_migration_lease(lease)
+
+
+class _RawOpen:
+    """The lease slot SessionDB keeps for its open, kept for one raw opener's open."""
+
+    def __init__(self, db_path):
+        self.db_path, self._forward_migration_lease = Path(db_path), None
+
+
+@contextmanager
+def raw_open_admission(db_path, lineage: StoreLineage):
+    """SessionDB's admission for a raw state.db opener: taken before its connect when *lineage* is
+    another build's, held to the end of its initialize. Yields ``readmit(cursor)`` for right before
+    the first DDL. Raises ForwardSchemaMigrationAdmissionError while another process holds the lock.
+    The raw open itself never migrates (only its SessionDB bootstrap does); its DDL is additive."""
+    opener = _RawOpen(db_path)
+    admit_forward_migration(opener, lineage)
+    try:
+        yield lambda cursor: readmit_forward_migration(opener, cursor)
+    finally:
+        release_forward_migration_lease(opener)

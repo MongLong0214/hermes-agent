@@ -136,6 +136,30 @@ def test_a_store_another_build_owns_is_left_untouched_while_its_gateway_holds_th
     assert fence_triggers(db_path) == expected_fences(db_path, STORED_SCHEMA_VERSION)
 
 
+@pytest.mark.parametrize("kind", ["fork29", "upstream29"])
+def test_no_raw_opener_writes_a_store_another_build_owns_while_its_gateway_holds_the_runtime_lock(
+        tmp_path, monkeypatch, kind):
+    """The raw openers of the same file (the delivery ledger, which never bootstraps, and async
+    delegation, which bootstraps through SessionDB) are held to SessionDB's admission."""
+    from gateway import delivery_ledger
+    from tools import async_delegation
+
+    hermes_home = isolate_home(tmp_path, monkeypatch)
+    db_path = _foreign_store(hermes_home / "state.db", kind)
+    before = file_fingerprint(db_path)
+    openers = (delivery_ledger._connect, async_delegation._connect)
+
+    with _gateway_holding_runtime_lock(hermes_home):
+        for opener in openers:
+            with pytest.raises(RuntimeError) as refused:
+                opener()
+            assert getattr(refused.value, "code", None) == "STATE_DB_FORWARD_MIGRATION_ADMISSION_BLOCKED"
+            assert file_fingerprint(db_path) == before
+
+    for opener in openers:
+        opener().close()
+
+
 @pytest.mark.parametrize("stamp", ["gate", "settled"])
 def test_a_store_this_build_already_fenced_opens_while_a_gateway_holds_the_runtime_lock(
         tmp_path, monkeypatch, stamp):
