@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
+from agent.gemini_outbound_policy import deny_gemini_outbound
 from tools.tts_tool_delivery import _origin, _section, _wrap_pcm_as_wav, _write_wav_bytes_as
 from tools.xai_http import hermes_xai_user_agent
 
@@ -559,6 +560,7 @@ def _gemini_error_detail(response: Any) -> str:
 def _generate_gemini_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
     """Generate audio via Gemini ``generateContent`` (``responseModalities=["AUDIO"]``). The reply is
     base64 24kHz mono 16-bit PCM, wrapped as WAV and ffmpeg-converted to the requested container."""
+    deny_gemini_outbound(canonical_provider="gemini")
     origin = _origin()
     api_key = origin._resolve_provider_key("GEMINI_API_KEY", "gemini") or origin._resolve_provider_key(
         "GOOGLE_API_KEY", "gemini")

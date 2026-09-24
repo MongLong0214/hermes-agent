@@ -17,6 +17,7 @@ from hermes_cli.providers import (
     LLAMACPP_ALIASES, ProviderDef, custom_provider_aliases, determine_api_mode, get_label,
     host_mandated_api_mode, is_aggregator, resolve_provider_full)
 from hermes_cli.model_normalize import normalize_model_for_provider
+from agent.gemini_outbound_policy import GeminiOutboundDenied, is_gemini_outbound
 from agent.models_dev import (
     ModelCapabilities, ModelInfo, get_model_capabilities, get_model_info, list_provider_models)
 from utils import base_url_host_matches, base_url_hostname, base_url_origin, file_signature
@@ -1405,6 +1406,8 @@ def _creds_for_switched_provider(st: _Switch) -> Optional[ModelSwitchResult]:
         user_pdef = (resolve_user_provider(explicit_norm, st.user_providers)
                      or resolve_user_provider(st.target_provider, st.user_providers))
     if user_pdef is not None and user_pdef.base_url:
+        if is_gemini_outbound(base_url=user_pdef.base_url):  # before the block's key is read
+            return st.fail_on_target(GeminiOutboundDenied.public_message)
         ucfg = st.user_providers.get(explicit_norm) or st.user_providers.get(st.target_provider) or {}
         # Key reads go through the per-profile secret scope (multiplexed gateway).
         ukey = _entry_configured_key(ucfg, _scoped_key_env)
@@ -1541,6 +1544,21 @@ def _openrouter_mirror_base_url() -> str:
         return (get_secret_str("OPENROUTER_BASE_URL", "") or "").strip().rstrip("/")
     except Exception:
         return ""
+
+
+def _refuse_denied_route(st: _Switch) -> Optional[ModelSwitchResult]:
+    """Refuse a Google-bound target before its credentials are read, and again on the endpoint
+    they resolved to. A refusal returns before any agent, config or session state changes.
+
+    Classified like the startup resolver (no endpoint authority): a switch persists its route,
+    and a Gemini model on an aggregator that passed here would be refused at the next start."""
+    alias = DIRECT_ALIASES.get(st.resolved_alias) if st.resolved_alias else None
+    if is_gemini_outbound(
+            canonical_provider=st.target_provider, model=st.new_model,
+            base_url=st.base_url or (alias.base_url if alias is not None else ""), api_mode=st.api_mode,
+            routing_hint=st.explicit_provider or st.target_provider):
+        return st.fail_on_target(GeminiOutboundDenied.public_message)
+    return None
 
 
 def _resolve_switch_credentials(st: _Switch) -> Optional[ModelSwitchResult]:
@@ -1720,7 +1738,7 @@ def switch_model(
         explicit_provider=explicit_provider, user_providers=user_providers, custom_providers=custom_providers,
         new_model=raw_input.strip(), target_provider=current_provider)
     route = _route_explicit_provider if explicit_provider else _route_from_model_input
-    for step in (route, _resolve_switch_credentials, _validate_switch):
+    for step in (route, _refuse_denied_route, _resolve_switch_credentials, _refuse_denied_route, _validate_switch):
         fail = step(st)
         if fail is not None:
             return fail

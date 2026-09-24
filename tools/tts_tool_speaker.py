@@ -22,6 +22,7 @@ import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Callable, Iterable, Iterator, List, Optional
 
+from agent.gemini_outbound_policy import GeminiOutboundDenied
 from tools.tts_text_normalize import _strip_markdown_for_tts
 from tools.tts_tool_delivery import _origin, _remove_quietly as _unlink_quietly
 
@@ -103,9 +104,12 @@ class _SyncSentencePipeline:
     One single-thread synthesis executor (FIFO; providers never see concurrent calls) feeds one
     playback worker through a small bounded queue, so sentence n+1 synthesizes while n plays;
     the bound keeps lookahead/temp files small and gives the caller backpressure.
-    ``text_to_speech_tool`` / ``play_audio_file`` are resolved late so test patches apply."""
+    ``text_to_speech_tool`` / ``play_audio_file`` are resolved late so test patches apply.
+    A Google outbound denial is recorded in ``denied`` (the caller re-raises it) and stops further
+    synthesis; the drain keeps running so a ``speak`` blocked on the bounded queue cannot deadlock."""
 
     def __init__(self, stop_event: threading.Event, *, lookahead: int = 2):
+        self.denied: Optional[GeminiOutboundDenied] = None
         self._stop = stop_event
         self._queue: "queue.Queue[Optional[tuple[str, Future]]]" = queue.Queue(maxsize=max(1, lookahead))
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tts-sync-synth")
@@ -114,7 +118,7 @@ class _SyncSentencePipeline:
 
     def speak(self, cleaned: str) -> None:
         """Queue one sentence. Blocks only when the lookahead bound is full."""
-        if not self._stop.is_set():
+        if not self._stop.is_set() and self.denied is None:
             self._queue.put((cleaned, self._executor.submit(self._synthesize_to_tmp, cleaned)))
 
     def close(self) -> None:
@@ -124,7 +128,7 @@ class _SyncSentencePipeline:
         self._executor.shutdown(wait=True)
 
     def _synthesize_to_tmp(self, cleaned: str) -> Optional[str]:
-        if self._stop.is_set():
+        if self._stop.is_set() or self.denied is not None:
             return None
         tmp_path = None
         try:
@@ -135,6 +139,9 @@ class _SyncSentencePipeline:
             if os.path.abspath(written) != os.path.abspath(tmp_path):
                 _unlink_quietly(tmp_path)  # provider wrote elsewhere: the placeholder is empty
             return written
+        except GeminiOutboundDenied:
+            _unlink_quietly(tmp_path)
+            raise
         except Exception as exc:
             logger.warning("Sync per-sentence TTS synthesis failed: %s", exc)
             _unlink_quietly(tmp_path)
@@ -148,6 +155,8 @@ class _SyncSentencePipeline:
                 if tmp_path and not self._stop.is_set() and os.path.isfile(tmp_path) and os.path.getsize(tmp_path) > 0:
                     from tools.voice_mode import play_audio_file
                     play_audio_file(tmp_path)
+            except GeminiOutboundDenied as exc:
+                self.denied = self.denied or exc
             except Exception as exc:
                 logger.warning("Sync per-sentence TTS failed: %s", exc)
             finally:
@@ -167,6 +176,7 @@ class _StreamerPlayback:
 
     def __init__(self, streamer, stop_event: threading.Event):
         self.streamer, self.stop_event = streamer, stop_event
+        self.denied: Optional[GeminiOutboundDenied] = None  # a prefetch-thread denial, re-raised by the caller
         # The device is opened lazily, once the first sentence's first chunk has arrived: an
         # OpenAI-compatible endpoint reports its real PCM rate in the response headers, so
         # ``streamer.sample_rate`` is only trustworthy after the request answered (#76466).
@@ -224,8 +234,12 @@ class _StreamerPlayback:
 
     def speak(self, text: str) -> None:
         """Start ``streamer.stream(text)`` and prefetch its chunks immediately."""
+        if self.denied is not None:
+            return
         try:
             audio_iter = self.streamer.stream(text)
+        except GeminiOutboundDenied:
+            raise
         except Exception as exc:
             logger.warning("Streaming TTS synthesis failed: %s", exc)
             return
@@ -243,6 +257,8 @@ class _StreamerPlayback:
                     logger.info("TTS CUT: prefetch cancelled (stop_event set mid-sentence) — partial audio only")
                     break
                 chunk_queue.put(chunk, timeout=30.0)
+        except GeminiOutboundDenied as exc:
+            self.denied = self.denied or exc
         except Exception as exc:
             logger.warning("TTS CUT: streaming TTS prefetch failed mid-sentence (partial audio only): %s", exc)
         finally:
@@ -343,6 +359,10 @@ def stream_tts_to_speaker(
     playback: Optional[_StreamerPlayback] = None
     try:
         tts_config = origin._load_tts_config()
+        # Refused before any streamer probe reads a key; the sync path speaks the configured provider.
+        configured = origin._get_provider(tts_config)
+        for route_provider in (provider or configured, configured):
+            origin._preflight_tts_outbound_route(route_provider, tts_config)
         # Prefer a chunked streamer for low time-to-first-audio; otherwise per-sentence sync
         # synthesis (universal — edge + every non-streamer).
         from tools.tts_streaming import SentenceChunker, resolve_streaming_provider
@@ -391,6 +411,8 @@ def stream_tts_to_speaker(
         with contextlib.suppress(queue.Empty):
             while True:
                 text_queue.get_nowait()
+    except GeminiOutboundDenied:
+        raise
     except Exception as exc:
         logger.warning("Streaming TTS pipeline error: %s", exc)
     finally:
@@ -404,3 +426,6 @@ def stream_tts_to_speaker(
         if playback is not None:
             playback.finish()
         tts_done_event.set()
+    denied = next((p.denied for p in (sync_pipeline, playback) if p is not None and p.denied is not None), None)
+    if denied is not None:
+        raise denied

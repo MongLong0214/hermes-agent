@@ -13,6 +13,7 @@ from typing import Any, Callable, Dict, Optional, Tuple
 from urllib.parse import urlparse
 
 from hermes_cli.providers import custom_provider_aliases, custom_provider_slug
+from agent.gemini_outbound_policy import deny_gemini_outbound
 from agent.secret_scope import get_secret_str
 from utils import base_url_hostname
 
@@ -581,6 +582,9 @@ def _resolve_named_custom_runtime(*, requested_provider: str, explicit_api_key: 
     # silently fall through to OpenRouter.
     requested_norm = (requested_provider or "").strip().lower()
     custom_provider = None
+    # Route facts only: a Google-hosted entry is refused before its key_env / key_cmd is touched.
+    if not explicit_base_url and (route := peek_named_custom_provider_route(requested_provider)) is not None:
+        deny_gemini_outbound(base_url=route.get("base_url"))
     if requested_norm in _LLAMACPP_ALIASES and not explicit_base_url:
         custom_provider = rp._get_named_custom_provider(requested_provider)
         if not custom_provider:

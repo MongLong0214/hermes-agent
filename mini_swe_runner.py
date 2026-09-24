@@ -22,6 +22,7 @@ from typing import List, Dict, Any, Optional
 
 import fire
 from dotenv import load_dotenv
+from agent.gemini_outbound_policy import deny_gemini_outbound
 from agent.tool_dispatch_helpers import make_tool_result_message
 from trajectory_compressor import _effective_temperature_for_model
 
@@ -133,6 +134,7 @@ class MiniSWERunner:
     def __init__(self, model: str = "anthropic/claude-sonnet-4.6", base_url: str = None, api_key: str = None,
                  env_type: str = "local", image: str = "python:3.11-slim", cwd: str | None = None,
                  max_iterations: int = 15, command_timeout: int = 60, verbose: bool = False):
+        deny_gemini_outbound(model=model, base_url=base_url)
         self.model, self.max_iterations, self.command_timeout, self.verbose = model, max_iterations, command_timeout, verbose
         self.env_type, self.image, self.cwd = env_type, image, cwd
         self.logger = logging.getLogger(__name__)

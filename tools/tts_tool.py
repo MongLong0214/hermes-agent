@@ -22,6 +22,7 @@ from typing import Callable, Dict, Any, List, Optional
 
 import copy
 
+from agent.gemini_outbound_policy import GeminiOutboundDenied, deny_gemini_outbound
 from hermes_constants import display_hermes_home
 
 logger = logging.getLogger(__name__)
@@ -47,7 +48,8 @@ from tools.tts_tool_local import _generate_kittentts, _generate_neutts, _generat
 from tools.tts_tool_plugins import (
     _dispatch_to_plugin_provider, _plugin_provider_is_available,
     _plugin_provider_is_voice_compatible)
-from tools.tts_tool_openai import _generate_deepinfra_tts, _generate_openai_tts, _has_openai_audio_backend
+from tools.tts_tool_openai import (
+    _deepinfra_tts_route, _generate_deepinfra_tts, _generate_openai_tts, _has_openai_audio_backend, _openai_tts_route)
 
 
 # --- Lazy SDK importers -- providers import only when used (headless boxes lack PortAudio etc.) ---
@@ -188,6 +190,21 @@ _BUILTIN_DISPATCH: Dict[str, tuple] = {
               "Piper provider selected but 'piper-tts' package not installed. "
               "Run 'hermes tools' and select Piper under TTS, or install manually: "
               "pip install piper-tts")}
+
+
+# Built-in provider -> its configured route facts for the Google outbound policy (others have none).
+_TTS_OUTBOUND_ROUTES: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
+    "gemini": lambda _config: {"canonical_provider": "gemini"},
+    "openai": _openai_tts_route,
+    "deepinfra": _deepinfra_tts_route,
+}
+
+
+def _preflight_tts_outbound_route(provider: str, tts_config: Dict[str, Any]) -> None:
+    """Refuse a Google-bound speech route before dispatch touches the output dir, a key or a client."""
+    route = _TTS_OUTBOUND_ROUTES.get(provider)
+    if route is not None:
+        deny_gemini_outbound(**route(tts_config))
 
 
 def _error_json(message: str) -> str:
@@ -342,6 +359,7 @@ def _text_to_speech_single(
     Command providers resolve BEFORE built-in dispatch, but built-in names short-circuit so
     ``tts.providers.openai.command`` can't shadow OpenAI. Plugins fire only for names that are
     neither; a None return falls through to built-in dispatch (unknown -> Edge default)."""
+    _preflight_tts_outbound_route(provider, tts_config)
     try:
         if command_provider_config is not None:
             logger.info("Generating speech with command TTS provider '%s'...", provider)
@@ -374,6 +392,8 @@ def _text_to_speech_single(
             "success": True, "file_path": file_str, "media_tag": _media_tag([file_str], voice_compatible),
             "provider": provider, "voice_compatible": voice_compatible,
         }, ensure_ascii=False)
+    except GeminiOutboundDenied:
+        raise
     except ValueError as e:
         return _tool_failure("TTS configuration error", provider, e)
     except FileNotFoundError as e:
@@ -434,6 +454,7 @@ def text_to_speech_tool(
     if not text:
         return tool_error("Text is empty after TTS cleanup", success=False)
     tts_config, provider = _apply_call_overrides(_load_tts_config(), speed, provider)
+    _preflight_tts_outbound_route(provider, tts_config)
     command_provider_config = _resolve_command_provider_config(provider, tts_config)
     max_len = _resolve_max_text_length(provider, tts_config)
     chunks = _split_text_for_tts(text, max_len)
@@ -471,6 +492,8 @@ def text_to_speech_tool(
                 "platform": delivery_profile.platform, "max_file_bytes": delivery_profile.max_file_bytes,
                 "target_file_bytes": delivery_profile.target_file_bytes},
         }, ensure_ascii=False)
+    except GeminiOutboundDenied:
+        raise
     except _ChunkFailed as exc:
         return tool_error(str(exc), success=False)
     except ValueError as exc:
@@ -513,7 +536,7 @@ _BUILTIN_REQUIREMENTS: Dict[str, Callable[[], bool]] = {
     "deepinfra": lambda: _package_installed("openai") and bool(_resolve_provider_key("DEEPINFRA_API_KEY", "deepinfra")),
     "minimax": _minimax_requirements,
     "xai": _xai_requirements,
-    "gemini": lambda: bool(_resolve_provider_key("GEMINI_API_KEY", "gemini") or _resolve_provider_key("GOOGLE_API_KEY", "gemini")),
+    "gemini": lambda: False,  # Google outbound is denied; no key lookup
     "mistral": lambda: _importable(_import_mistral_client) and bool(_resolve_provider_key("MISTRAL_API_KEY", "mistral")),
     "neutts": lambda: _check_neutts_available(),
     "kittentts": lambda: _check_kittentts_available(),

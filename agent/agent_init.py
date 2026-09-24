@@ -24,6 +24,7 @@ from urllib.parse import parse_qs, urlparse, urlunparse
 
 from agent.context_compressor import ContextCompressor
 from agent.agent_runtime_helpers import _ra
+from agent.gemini_outbound_policy import deny_gemini_outbound
 from agent.iteration_budget import IterationBudget, normalize_budget_warning_ratio
 from agent.memory_manager import StreamingContextScrubber
 from agent.session_activity import ActivityProvenance
@@ -2405,6 +2406,8 @@ def init_agent(
     agent._credential_pool = credential_pool
     agent.acp_command = acp_command or command
     agent.acp_args = list(acp_args or args or [])
+    deny_gemini_outbound(canonical_provider=agent.provider, model=agent.model, base_url=agent.base_url,
+                         api_mode=api_mode, routing_hint=agent.requested_provider, endpoint_authority=True)
     _resolve_api_mode(agent, api_mode, provider_name, base_url)
     _finalize_routing(agent, api_mode, credential_pool)
 

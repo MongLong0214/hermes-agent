@@ -49,7 +49,6 @@ def test_copilot_runtime_api_mode_still_uses_default_without_target(monkeypatch)
     ("configured_model", "target_model", "expected_mode"),
     [
         ("gpt-5.5", "claude-opus-4.8", "chat_completions"),
-        ("gpt-5.5", "gemini-3-pro-preview", "chat_completions"),
         ("claude-opus-4.8", "gpt-5.5", "codex_responses"),
     ],
 )

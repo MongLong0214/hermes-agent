@@ -35,6 +35,7 @@ from agent.transports.chat_completions import is_router_timeout_shim, router_tim
 from agent.fast_mode import effective_request_overrides
 from agent.turn_context import substitute_api_content
 from agent.gemini_native_adapter import is_native_gemini_base_url
+from agent.gemini_outbound_policy import is_gemini_outbound
 # Remote endpoints must never be fingerprinted: the probe waterfall is only valid for local/LM-Studio/Ollama
 # boxes. Non-Ollama remotes (sglang, vLLM, OpenAI-compat) expose Ollama-compat endpoints that can
 # misidentify and, without an api_key, return 401 on every leg (issue #89863).
@@ -1726,12 +1727,6 @@ def _fallback_entry_unavailable_without_network(agent, fb: dict) -> Optional[str
     return None if has_token else "nous_token_missing"
 
 
-_GOOGLE_FALLBACK_PROVIDER_ALIASES = frozenset({
-    "gemini", "google", "google-gemini", "google-ai-studio",
-    "vertex", "vertexai", "google-vertex", "vertex-ai", "gcp-vertex",
-})
-
-
 def _bare_custom_fallback_route_fact() -> str:
     """Return bare-custom's configured endpoint without resolving a credential or client."""
     # ``model.base_url`` is a non-secret persisted route.  It has priority when the
@@ -1768,11 +1763,7 @@ def _main_fallback_google_route(fb_provider: str, fb_model: str, fb: dict) -> bo
     # ``auto`` has no non-secret route fact.  Resolving it can choose a disabled
     # Gemini/Vertex endpoint, but that resolver reads credentials and constructs
     # a client, so it must not run while scanning the main fallback chain.
-    if fb_provider == "auto" or fb_provider in _GOOGLE_FALLBACK_PROVIDER_ALIASES:
-        return True
-    normalized_model = (fb_model or "").strip().lower()
-    if any(segment == "gemini" or segment.startswith(("gemini-", "gemini_"))
-           for segment in re.split(r"[/:]", normalized_model)):
+    if fb_provider == "auto" or is_gemini_outbound(canonical_provider=fb_provider, model=fb_model):
         return True
 
     base_url = str(fb.get("base_url") or "").strip()
@@ -1798,12 +1789,7 @@ def _main_fallback_google_route(fb_provider: str, fb_model: str, fb: dict) -> bo
         from hermes_cli.runtime_provider_custom import is_usable_custom_provider_url
         if not is_usable_custom_provider_url(base_url):
             return True
-    host = base_url_hostname(base_url).lower().rstrip(".")
-    return (
-        host in {"generativelanguage.googleapis.com", "aiplatform.googleapis.com", "vertexai.googleapis.com"}
-        or host.endswith(".aiplatform.googleapis.com")
-        or host.endswith("-aiplatform.googleapis.com")
-    )
+    return is_gemini_outbound(base_url=base_url)
 
 
 _FALLBACK_REASON_LABELS = {
