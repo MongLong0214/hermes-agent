@@ -12,7 +12,7 @@ import dataclasses
 import logging
 import os
 import shlex
-import uuid
+import time
 from typing import Optional, Union
 
 from agent.i18n import t
@@ -26,6 +26,7 @@ from gateway.slash_commands_branch_thread import (
     BRANCH_THREAD_PLATFORMS, branch_dest_source, branch_thread_parent, format_thread_ref, parse_branch_args,
 )
 from gateway.slash_commands_status import HISTORY_UNREADABLE
+from hermes_state_branch import BRANCH_LEASE_TTL_S, branch_lease_holder, create_branch_session, seed_branch_session
 from hermes_state_errors import SessionTurnLeaseLostError
 
 logger = logging.getLogger("gateway.run")  # log-record parity with gateway/run.py
@@ -36,9 +37,10 @@ _RESET_CLEANUP_TIMEOUT_S = 30.0
 # chat_type values whose session key is per-user (DM-like), incl. the unknown/blank case.
 _DM_CHAT_TYPES = {"dm", "direct", "private", ""}
 
-# /branch leases: the parent read waits this long for an in-flight parent turn, then refuses.
-_BRANCH_LEASE_TTL_S = 30.0
+# /branch: the parent read waits this long for an in-flight parent turn, then refuses; it retries
+# every _BRANCH_POLL_S on the event loop, holding no executor thread in between.
 _BRANCH_PARENT_WAIT_S = 30.0
+_BRANCH_POLL_S = 1.0
 # (thread branch, one message, title on the row) -> reply; an untitled reply never names the title.
 _BRANCH_REPLY_KEYS = {
     (False, True, True): "gateway.branch.branched_one",
@@ -120,36 +122,30 @@ def _branch_row(msg: dict) -> dict:
     return row
 
 
-def _branch_lease_holder(stage: str, session_id: str) -> str:
-    """A holder no other call can mint: a re-acquire by the SAME holder is a re-entrant success,
-    so two /branch calls sharing one would let the first release free the second's lease."""
-    return f"pid={os.getpid()}:turn=branch-{stage}-{uuid.uuid4().hex}:session={session_id}"
-
-
-def _read_parent_transcript_fenced(sync_db, store, session_id: str):
-    """The parent transcript read under the parent's durable turn lease, so an in-flight turn
-    (another process, another routing key) lands wholly before the branch point; None when the
-    lease is still held after ``_BRANCH_PARENT_WAIT_S``."""
-    holder = _branch_lease_holder("read", session_id)
-    if not sync_db.acquire_session_turn_lease(session_id, holder, ttl_seconds=_BRANCH_LEASE_TTL_S,
-                                              wait_seconds=_BRANCH_PARENT_WAIT_S):
-        return None
+def _try_read_parent_transcript(sync_db, store, session_id: str) -> tuple[bool, Optional[list]]:
+    """One attempt at the parent's durable turn lease; ``(True, transcript)`` read under it, so an
+    in-flight turn (another process, another routing key) lands wholly before the branch point.
+    Acquire, read and release share one worker call, so a cancelled /branch never strands the lease."""
+    holder = branch_lease_holder("read", session_id)
+    if not sync_db.acquire_session_turn_lease(session_id, holder, ttl_seconds=BRANCH_LEASE_TTL_S, wait_seconds=0):
+        return False, None
     try:
-        return store.load_transcript(session_id)
+        return True, store.load_transcript(session_id)
     finally:
         sync_db.release_session_turn_lease(session_id, holder)
 
 
-def _seed_branch_fenced(sync_db, session_id: str, rows: list[dict]) -> None:
-    """Copy the history into the new child under the child's own lease (an explicit fork is its
-    own lease root), fencing the seed against a writer that learns the id before the switch."""
-    holder = _branch_lease_holder("seed", session_id)
-    if not sync_db.try_acquire_session_turn_lease(session_id, holder, ttl_seconds=_BRANCH_LEASE_TTL_S):
-        raise SessionTurnLeaseLostError(f"branch seed lease for {session_id!r} is held")
-    try:
-        sync_db.append_messages_batch(session_id, rows, turn_lease_holder=holder, chunk_rows=500)
-    finally:
-        sync_db.release_session_turn_lease(session_id, holder)
+async def _read_parent_transcript_fenced(sync_db, store, session_id: str) -> Optional[list]:
+    """The parent transcript under its lease; None when the lease is still held after
+    ``_BRANCH_PARENT_WAIT_S``. The wait sleeps on the loop: a blocking wait held a default-executor
+    thread per waiting /branch, and 16 of them delayed every other chat's DB call by seconds."""
+    deadline = time.monotonic() + _BRANCH_PARENT_WAIT_S
+    while True:
+        read, transcript = await asyncio.to_thread(_try_read_parent_transcript, sync_db, store, session_id)
+        remaining = deadline - time.monotonic()
+        if read or remaining <= 0:
+            return transcript
+        await asyncio.sleep(min(_BRANCH_POLL_S, remaining))
 
 
 def _strip_resume_name(parts: list[str]) -> str:
@@ -1056,8 +1052,7 @@ class GatewaySessionCommandsMixin:
         current_entry = await self.async_session_store.get_or_create_session(source)
         sync_db = getattr(self._session_db, "_db", self._session_db)
         try:
-            history = await asyncio.to_thread(
-                _read_parent_transcript_fenced, sync_db, self.session_store, current_entry.session_id)
+            history = await _read_parent_transcript_fenced(sync_db, self.session_store, current_entry.session_id)
         except TranscriptReadError:
             return HISTORY_UNREADABLE
         if history is None:
@@ -1070,6 +1065,10 @@ class GatewaySessionCommandsMixin:
             current_title = await self._session_db.get_session_title(current_entry.session_id)
             branch_title = await self._session_db.get_next_title_in_lineage(current_title or "branch")
         parent_session_id = current_entry.session_id
+        # A taken id is refused before a thread opens for it; the strict create stays the authority.
+        if await self._session_db.get_session(new_session_id):
+            logger.error("Generated branch session id %s is taken; refused before opening a thread", new_session_id)
+            return t("gateway.branch.create_failed", error="generated session ID collision")
         # The thread is created BEFORE the clone so a failed create never orphans a branch row;
         # ``None`` = branch in place (--here, no threads here, or the adapter could not open one).
         dest_source = None if stay_here else await self._branch_open_thread(source, branch_title)
@@ -1088,9 +1087,9 @@ class GatewaySessionCommandsMixin:
         # reopened and re-ended. ALL routing columns go in at CREATE time: a crash before
         # switch_session() records the peer would otherwise leave the branch unroutable.
         try:
-            created = await self._session_db.create_session_strict(
-                session_id=new_session_id,
-                source=source.platform.value if source.platform else "gateway",
+            created, title_error = await asyncio.to_thread(
+                create_branch_session, sync_db, new_session_id,
+                source.platform.value if source.platform else "gateway", title=branch_title,
                 model=(self.config.get("model", {}) or {}).get("default") if isinstance(self.config, dict) else None,
                 model_config={"_branched_from": parent_session_id},
                 parent_session_id=parent_session_id, user_id=dest_source.user_id,
@@ -1105,11 +1104,14 @@ class GatewaySessionCommandsMixin:
             logger.error("Generated branch session id %s is taken; refused without writing", new_session_id)
             return t("gateway.branch.create_failed", error="generated session ID collision")
 
-        # Best-effort — a failed copy still yields a usable (partial) branch. Bounded-chunk
-        # transactions (see #23254): one txn per row was the removed write-amplification pattern.
+        # Best-effort — a failed copy still yields a usable (partial) branch — unless another holder
+        # owns the new id's lease: switching the chat onto a row someone else is writing is refused.
         try:
             await asyncio.to_thread(
-                _seed_branch_fenced, sync_db, new_session_id, [_branch_row(msg) for msg in history])
+                seed_branch_session, sync_db, new_session_id, [_branch_row(msg) for msg in history])
+        except SessionTurnLeaseLostError as e:
+            logger.error("Branch %s refused before the copy: %s", new_session_id, e)
+            return t("gateway.branch.create_failed", error="the new session is in use by another process")
         except Exception as e:
             logger.error("Branch history copy into %s failed: %s", new_session_id, e)
         # Chunks commit independently, so only the durable child can say what was copied.
@@ -1119,15 +1121,8 @@ class GatewaySessionCommandsMixin:
         except Exception as e:
             logger.error("Failed to recount branch history of %s: %s", new_session_id, e)
             return t("gateway.branch.switch_failed")
-        title_note = ""
-        try:
-            titled = bool(await self._session_db.set_session_title(new_session_id, branch_title))
-        except ValueError as e:
-            titled = False
-            title_note = "\n" + t("gateway.shared.warn_passthrough", error=e)
-        except Exception as e:
-            titled = False
-            logger.error("Branch title for %s failed: %s", new_session_id, e)
+        titled = title_error is None
+        title_note = "" if titled else "\n" + t("gateway.shared.warn_passthrough", error=title_error)
         if not in_place:
             # Materialize the thread's own entry, then point IT at the clone; ``session_key`` (this
             # chat) is never touched, so the original conversation stays live here.
