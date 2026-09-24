@@ -15634,10 +15634,18 @@ def test_session_branch_writes_to_parent_profile_db(monkeypatch, tmp_path):
         def get_next_title_in_lineage(self, current):
             return f"{current} (branch)"
 
-        def create_session(self, new_key, **kwargs):
+        def create_session_strict(self, new_key, **kwargs):
             seen["created"] = new_key
             seen["parent"] = kwargs.get("parent_session_id")
             seen["profile_name"] = kwargs.get("profile_name")
+            seen["title"] = (new_key, kwargs.get("title"))
+            return True
+
+        def try_acquire_session_turn_lease(self, *a, **k):
+            return True
+
+        def release_session_turn_lease(self, *a, **k):
+            return True
 
         def append_message(self, **kwargs):
             seen["msgs"].append(kwargs)
@@ -15646,10 +15654,6 @@ def test_session_branch_writes_to_parent_profile_db(monkeypatch, tmp_path):
             for m in messages:
                 seen["msgs"].append(dict(m, session_id=session_id))
             return list(range(1, len(messages) + 1))
-
-        def set_session_title(self, key, title):
-            seen["title"] = (key, title)
-            return True
 
         def get_session(self, key):
             return {"id": key, "cwd": str(tmp_path)}
@@ -15751,18 +15755,22 @@ def test_session_create_persists_seeded_branch_child(monkeypatch):
         def get_next_title_in_lineage(self, current):
             return f"{current} #2"
 
-        def create_session(self, key, **kwargs):
+        def create_session_strict(self, key, **kwargs):
             seen["created"] = key
             seen["parent"] = kwargs.get("parent_session_id")
             seen["branched_from"] = (kwargs.get("model_config") or {}).get("_branched_from")
+            seen["title"] = kwargs.get("title")
+            seen["title_source"] = kwargs.get("title_source")
+            return True
+
+        def try_acquire_session_turn_lease(self, *a, **k):
+            return True
+
+        def release_session_turn_lease(self, *a, **k):
+            return True
 
         def append_messages_batch(self, session_id, messages, **kwargs):
             seen["messages"] = list(messages)
-
-        def set_auto_title(self, key, title, *, source):
-            seen["title"] = title
-            seen["title_source"] = source
-            return True
 
     monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
     monkeypatch.setattr(server, "_make_agent", lambda sid, key, session_db=None, **_kw: _FakeAgent())
@@ -15936,8 +15944,15 @@ def test_session_create_seed_failure_after_row_compensates(monkeypatch):
         def get_next_title_in_lineage(self, current):
             return f"{current} #2"
 
-        def create_session(self, key, **kwargs):
+        def create_session_strict(self, key, **kwargs):
             seen["created"] = key
+            return True
+
+        def try_acquire_session_turn_lease(self, *a, **k):
+            return True
+
+        def release_session_turn_lease(self, *a, **k):
+            return True
 
         def append_messages_batch(self, session_id, messages, **kwargs):
             raise RuntimeError("transcript write failed")
@@ -16121,8 +16136,15 @@ def test_session_branch_installs_parent_profile_secret_scope(monkeypatch, tmp_pa
         def get_next_title_in_lineage(self, current):
             return f"{current} (branch)"
 
-        def create_session(self, new_key, **kwargs):
+        def create_session_strict(self, new_key, **kwargs):
             seen["created"] = new_key
+            return True
+
+        def try_acquire_session_turn_lease(self, *a, **k):
+            return True
+
+        def release_session_turn_lease(self, *a, **k):
+            return True
 
         def append_message(self, **kwargs):
             seen["msgs"].append(kwargs)
@@ -16131,9 +16153,6 @@ def test_session_branch_installs_parent_profile_secret_scope(monkeypatch, tmp_pa
             for m in messages:
                 seen["msgs"].append(dict(m, session_id=session_id))
             return list(range(1, len(messages) + 1))
-
-        def set_session_title(self, key, title):
-            return True
 
         def get_session(self, key):
             return {"id": key, "cwd": str(tmp_path)}
@@ -16234,8 +16253,15 @@ def test_session_branch_uses_persisted_display_history_after_compaction(monkeypa
                 display_history,
             )
 
-        def create_session(self, _new_key, **_kwargs):
-            return None
+        def create_session_strict(self, _new_key, **kwargs):
+            seen["title_source"] = kwargs.get("title_source")
+            return True
+
+        def try_acquire_session_turn_lease(self, *args, **kwargs):
+            return True
+
+        def release_session_turn_lease(self, *args, **kwargs):
+            return True
 
         def append_message(self, **kwargs):
             seen["msgs"].append(kwargs)
@@ -16244,13 +16270,6 @@ def test_session_branch_uses_persisted_display_history_after_compaction(monkeypa
             for message in messages:
                 seen["msgs"].append(dict(message, session_id=session_id))
             return list(range(1, len(messages) + 1))
-
-        def set_session_title(self, _key, _title):
-            return True
-
-        def set_auto_title(self, _key, _title, *, source="llm"):
-            seen["title_source"] = source
-            return True
 
         def get_session(self, key):
             return {"id": key, "cwd": str(tmp_path)}

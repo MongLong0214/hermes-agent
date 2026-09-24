@@ -126,10 +126,46 @@ async def test_forked_session_stays_listable_and_parent_survives_failed_fork(ada
         assert {"parent", "child"} <= ids, ids
 
         session_db.create_session("solo", "api_server")
-        with patch.object(session_db, "create_session", side_effect=RuntimeError("boom")):
+        with patch.object(session_db, "create_session_strict", side_effect=RuntimeError("boom")):
             resp = await cli.post("/api/sessions/solo/fork", json={"id": "never"})
         assert resp.status >= 500
+
+        session_db.create_session("holder", "api_server")
+        session_db.set_session_title("holder", "Taken")
+        resp = await cli.post("/api/sessions/solo/fork", json={"id": "never", "title": "Taken"})
+        assert resp.status == 400 and (await resp.json())["error"]["code"] == "invalid_title"
+    assert session_db.get_session("never") is None
     assert session_db.get_session("solo")["end_reason"] is None
+
+
+@pytest.mark.asyncio
+async def test_forks_racing_to_one_id_commit_one_and_leave_the_loser_open(adapter, session_db, monkeypatch):
+    """Two forks to one id that both pass the existence pre-check: exactly one commits. The row holds
+    the winner's parent and transcript; the loser gets 409 and its source is left open."""
+    for sid in ("s1", "s2"):
+        session_db.create_session(sid, "api_server")
+        session_db.append_message(sid, "user", f"from {sid}")
+    both_checked = threading.Barrier(2, timeout=10)
+    get_session = session_db.get_session
+
+    def get_session_once_both_checked(session_id):
+        row = get_session(session_id)
+        if session_id == "same" and row is None:
+            both_checked.wait()
+        return row
+
+    monkeypatch.setattr(session_db, "get_session", get_session_once_both_checked)
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        responses = await asyncio.gather(
+            *(cli.post(f"/api/sessions/{sid}/fork", json={"id": "same"}) for sid in ("s1", "s2")))
+
+    assert sorted(resp.status for resp in responses) == [201, 409]
+    winner = get_session("same")["parent_session_id"]
+    loser = ({"s1", "s2"} - {winner}).pop()
+    assert [m["content"] for m in session_db.get_messages("same")] == [f"from {winner}"]
+    assert get_session(winner)["end_reason"] == "branched"
+    assert get_session(loser)["end_reason"] is None
 
 
 @pytest.mark.asyncio
