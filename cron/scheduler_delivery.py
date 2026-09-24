@@ -749,8 +749,8 @@ def _format_failure_streams(result) -> str:
     stderr is empty and stdout holds only the banner, the recorded error
     carried zero diagnostics (#104056). The banner lines are dropped from the
     stdout tail so what remains is the reason; the exit code is always named.
-    The text lands in ``last_delivery_error`` on disk, so it is scrubbed like
-    ``cron.incidents`` / ``cron.delivery_queue`` scrub their persisted errors.
+    The text is logged when the outcome is recorded (``last_delivery_error`` keeps a closed
+    label), so it is scrubbed like ``cron.incidents`` / ``cron.delivery_queue`` scrub theirs.
     """
     from agent.redact import redact_sensitive_text
 

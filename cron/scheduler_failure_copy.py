@@ -15,8 +15,10 @@ from hermes_constants import display_hermes_home
 
 
 def cron_output_dir_display(job_id: str) -> str:
-    """User-facing path of a job's saved run output (profile-aware)."""
-    return f"{display_hermes_home()}/cron/output/{job_id}/"
+    """User-facing path of a job's saved run output (profile-aware). A chat recipient need not be
+    the operator, so a home outside the user's reads ``$HERMES_HOME`` instead of its host path."""
+    home = display_hermes_home()
+    return f"{home if home.startswith('~/') else '$HERMES_HOME'}/cron/output/{job_id}/"
 
 
 _HTTP_STATUS_IN_TEXT = re.compile(r"(?:\bHTTP\b|\bError code\b|\bstatus(?: code)?\b)\W{0,3}(\b[45]\d\d\b)", re.I)
@@ -105,10 +107,11 @@ def provider_failure_notice(
     )
 
 
-def generic_failure_notice(job_name: str, job_id: str, cleaned_error: str) -> str:
-    """Unclassified failure: the cleaned error text plus where to look and what to do."""
+def generic_failure_notice(job_name: str, job_id: str, cause: str) -> str:
+    """Non-provider failure: *cause* (a closed clause from ``cron.jobs_public_status``, or the
+    agent's own ``[CRON_FAILURE]`` evidence) plus where to look and what to do."""
     return (
-        f"⚠️ Cron '{job_name}' failed: {cleaned_error}. "
+        f"⚠️ Cron '{job_name}' failed: {cause}. "
         f"See the full run with `hermes cron runs {job_id}` (output saved under "
         f"{cron_output_dir_display(job_id)}); run it again with `hermes cron run {job_id}`, "
         f"edit it with `hermes cron edit {job_id}`, or pause it with `hermes cron pause {job_id}`."
@@ -132,13 +135,14 @@ def inactivity_notice(job_name: str, job_id: str) -> str:
     )
 
 
-def blocked_config_notice(job_name: str, reason: str) -> str:
-    """One-time notice when the pre-run configuration check refused to start the job."""
-    reason = reason.rstrip()
-    if reason and reason[-1] not in ".!?":
-        reason += "."
+def blocked_config_notice(job_name: str, cause: str) -> str:
+    """One-time notice when the pre-run configuration check refused to start the job; *cause* is
+    the check's closed clause (``cron.jobs_public_status``), never its raw verdict."""
+    cause = cause.rstrip()
+    if cause and cause[-1] not in ".!?":
+        cause += "."
     return (
-        f"⛔ Cron '{job_name}' did not run: {reason} Nothing was charged. Hermes will try again at "
-        "the next scheduled time and will not repeat this alert; check with "
-        "`hermes cron doctor`."
+        f"⛔ Cron '{job_name}' did not run: {cause} Nothing was charged. Hermes will try again at "
+        "the next scheduled time and will not repeat this alert; see why with "
+        "`hermes cron runs` and check with `hermes cron doctor`."
     )

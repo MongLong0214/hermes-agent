@@ -260,59 +260,44 @@ def _log_tick_yield_once(reason: str) -> None:
 
 
 def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
-    """One-line failure notice for chat delivery (full details stay in the run output).
-
-    Deterministic scheduler/script shapes are matched first (their text can contain "timed out"
-    and would otherwise be blamed on the model service); everything else goes through the shared
-    ``classify_api_error`` verdict and the copy table in ``scheduler_failure_copy``."""
+    """One-line failure notice for chat delivery. Closed copy: the cause comes from the fixed kind
+    table in ``cron.jobs_public_status`` (never the raw error, which carries provider bodies, paths
+    and stderr tails); the full text stays in the run output and ``hermes cron runs``. Provider
+    kinds come from the shared ``classify_api_error`` verdict and get their remediation from the
+    copy table in ``scheduler_failure_copy``."""
+    from cron.jobs_public_status import failure_cause, failure_kind, provider_reason
     from cron.scheduler_failure_copy import (
-        classify_cron_failure_reason, generic_failure_notice, inactivity_notice,
-        provider_failure_notice, script_timeout_notice)
+        generic_failure_notice, inactivity_notice, provider_failure_notice, script_timeout_notice)
 
     job_name = job.get("name") or job.get("id") or "cron job"
     job_id = job.get("id") or job_name
-    text = (error or "unknown error").strip()
-    lower = text.lower()
+    # no_agent jobs never reach a model, so the kind table never blames a provider for them.
+    kind = failure_kind((error or "unknown error").strip(), no_agent=bool(job.get("no_agent")))
 
-    # Script runner contract ("Script timed out after {n}s: {path}") — also for agent jobs with a
-    # context script. Must precede provider classification so it never claims a model failure.
-    # See #78503, #82460.
-    if lower.startswith("script timed out"):
-        return script_timeout_notice(job_name, job_id)
+    # Script runner contract ("Script timed out after {n}s: {path}", #78503, #82460) and the
+    # inactivity watchdog ("idle for {n}s (limit {m}s)"): the job's own work went quiet, no model
+    # service involved — a stuck `terminal` call was once blamed on the provider.
+    fixed_notice = {"script_timeout": script_timeout_notice, "inactivity": inactivity_notice}.get(kind)
+    if fixed_notice is not None:
+        return fixed_notice(job_name, job_id)
 
-    # Scheduler inactivity watchdog ("idle for {n}s (limit {m}s)"): the job's OWN tool call went
-    # quiet, no model service involved. Its text may still contain "timed out", so it must be
-    # recognised before the classifier (field-reported: a stuck `terminal` call was blamed on the
-    # provider and the operator debugged the wrong system).
-    if re.search(r"idle for \d+s\s*\(limit \d+s\)", lower):
-        return inactivity_notice(job_name, job_id)
-
-    # no_agent jobs never reach a model, so provider errors are structurally impossible for them:
-    # gate on job MODE before classifying, or a script's own wording ("429", "timed out") would
-    # blame the wrong subsystem.
-    if not job.get("no_agent"):
+    reason = provider_reason(kind)
+    if reason is not None:
         notice = provider_failure_notice(
-            job_name, job_id, classify_cron_failure_reason(text),
+            job_name, job_id, reason,
             backup_provider_phrase=_fallback_chain_phrase(), provider=job.get("provider"))
         if notice is not None:
             return notice
 
-    # Strip exception wrappers; bound input first so a multi-KB blob can't slow the regexes.
-    cleaned = re.sub(r"^(RuntimeError|Exception|ValueError|HTTPStatusError):\s*", "", text[:2000])
-    cleaned = re.sub(r"\s+", " ", cleaned).strip().rstrip(".")
-    if len(cleaned) > 180:
-        cleaned = cleaned[:177].rstrip() + "..."
-    message = generic_failure_notice(job_name, job_id, cleaned)
+    message = generic_failure_notice(job_name, job_id, failure_cause(kind))
 
     # Import-class failures (#95294 part 3): a long-lived gateway whose checkout was updated
     # underneath it (interrupted `hermes update`, manual git pull) serves MIXED modules and every
     # agent cron job dies with `cannot import name X`. The error reads like a code bug, so APPEND
-    # cause + fix — never replace the raw error, which carries the failing symbol. Fail-safe: skew
-    # is None on non-git/no-fingerprint; no_agent jobs excluded (a fresh subprocess resolves
-    # imports against disk, so its ImportError is the script's own problem).
-    if not job.get("no_agent") and re.search(
-        r"cannot import name|modulenotfounderror|importerror", lower
-    ):
+    # cause + fix (the failing symbol itself is in the run output). Fail-safe: skew
+    # is None on non-git/no-fingerprint; no_agent jobs never get this kind (a fresh subprocess
+    # resolves imports against disk, so its ImportError is the script's own problem).
+    if kind == "import_error":
         try:
             skew = _detect_gateway_code_skew()
         except Exception:
@@ -2810,9 +2795,12 @@ def _compose_run_delivery(
         deliver_content, blocked_config_silent = drift_alert, not drift_alert
     elif blocked_config and not success:
         # Bypass the generic failure summarizer (its auth/timeout heuristics would mislabel this).
-        _pf_text = re.sub(r"\[blocked_config[^\]]*\]\s*", "", err).strip()
+        # The verdict itself names the credential store's absolute HERMES_HOME and the auth error,
+        # so chat gets its closed kind; the verdict stays in the run output and the log.
+        from cron.jobs_public_status import failure_cause, failure_kind
         from cron.scheduler_failure_copy import blocked_config_notice
-        deliver_content = blocked_config_notice(job.get("name") or job["id"], _pf_text)
+        deliver_content = blocked_config_notice(
+            job.get("name") or job["id"], failure_cause(failure_kind(err)))
     elif success:
         deliver_content = final_response
         _resolve_incidents_for_recovered_job(job)
@@ -3015,7 +3003,9 @@ def _finish_interrupted_run(job: dict, execution_id: str, delivery_error: Option
             # mark_job_run also advances next_run_at and the repeat counter, and running that a second time
             # for one run would skip a fire or auto-delete the job early.
             from cron.jobs import update_job
-            update_job(job["id"], {"last_delivery_error": delivery_error})
+            from cron.jobs_public_status import public_delivery_error
+            logger.warning("Job '%s': result not delivered: %s", job["id"], delivery_error)
+            update_job(job["id"], {"last_delivery_error": public_delivery_error(delivery_error)})
         except Exception as _rec_err:
             logger.debug(
                 "Failed recording delivery_error for interrupted job %s: %s", job["id"], _rec_err)
@@ -3046,9 +3036,12 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
         mark_kwargs["expected_fire_owner"] = fire_owner
     if d.blocked_config:
         mark_kwargs["status"] = "blocked_config"
+    # The agent's [CRON_FAILURE] prose went to chat as its report; the record gets only its kind.
+    from cron.jobs_public_status import public_run_error
+    recorded_error = public_run_error(d.error, agent_declared=True) if d.agent_declared else d.error
     # A run that removed its own record has nothing left to mark; the delivery above is its result.
     marked = self_removal_delivery_allowed(job["id"]) or mark_job_run(
-        job["id"], d.success, d.error, **mark_kwargs)
+        job["id"], d.success, recorded_error, **mark_kwargs)
     if fire_owner is not None and not marked:
         finish_execution(
             execution_id, success=False,

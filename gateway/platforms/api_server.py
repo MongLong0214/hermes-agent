@@ -1056,13 +1056,14 @@ try:
         list_jobs as _cron_list, get_job as _cron_get, update_job as _cron_update,
         remove_job as _cron_remove, pause_job as _cron_pause, resume_job as _cron_resume,
         trigger_job as _cron_trigger)
+    from cron.jobs_public_status import project_cron_job as _project_cron_job
     from cron.scheduler import (
         CronSchedulerRegistrationError as _CronSchedulerRegistrationError,
         create_job_with_scheduler_registration as _cron_create)
     _CRON_AVAILABLE = True
 except ImportError:
     _cron_list = _cron_get = _cron_create = _cron_update = None
-    _cron_remove = _cron_pause = _cron_resume = _cron_trigger = None
+    _cron_remove = _cron_pause = _cron_resume = _cron_trigger = _project_cron_job = None
 
     class _CronSchedulerRegistrationError(RuntimeError):
         pass
@@ -3579,7 +3580,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 return web.json_response({"error": "Job not found"}, status=404)
             if notify:
                 _notify_cron_provider_jobs_changed()
-            return web.json_response({"job": job})
+            return web.json_response({"job": _project_cron_job(job)})
         except Exception as e:
             return self._cron_error_response(e)
 
@@ -3594,7 +3595,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return err
         try:
             include_disabled = request.query.get("include_disabled", "").lower() in {"true", "1"}
-            return web.json_response({"jobs": _cron_list(include_disabled=include_disabled)})
+            return web.json_response({"jobs": [
+                _project_cron_job(job) for job in _cron_list(include_disabled=include_disabled)]})
         except Exception as e:
             return self._cron_error_response(e)
 
@@ -3632,7 +3634,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 kwargs["skills"] = skills
             if repeat is not None:
                 kwargs["repeat"] = repeat
-            return web.json_response({"job": _cron_create(**kwargs)})
+            return web.json_response({"job": _project_cron_job(_cron_create(**kwargs))})
         except _CronSchedulerRegistrationError as e:
             return web.json_response(e.to_dict(), status=424)
         except ValueError as e:

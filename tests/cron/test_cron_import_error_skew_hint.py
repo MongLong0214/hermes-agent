@@ -6,10 +6,12 @@ left the gateway on stale code for two days; every agent cron job failed with
 had no way to know the fix was one `hermes gateway restart`. The failure
 summarizer runs inside the gateway process, which knows its own boot
 fingerprint — when boot SHA != disk HEAD, the delivered error must say so and
-name the command.
+name the command. The notice carries the closed import cause, never the raw
+error (its symbol and module path stay in the run output).
 """
 
 import cron.scheduler as scheduler
+from cron.jobs_public_status import failure_cause, failure_kind
 from cron.scheduler import _summarize_cron_failure_for_delivery
 
 IMPORT_ERROR = (
@@ -26,9 +28,9 @@ def test_import_error_with_skew_names_shas_and_the_restart_command(monkeypatch):
     )
     job = {"name": "morning-brief", "id": "aaa111"}
     msg = _summarize_cron_failure_for_delivery(job, IMPORT_ERROR)
-    # The raw error text (with the failing symbol) must survive — the hint
-    # is APPENDED, never a replacement.
-    assert "cannot import name 'user_originated_turn_view'" in msg
+    # The hint is APPENDED to the closed import cause; the raw error stays private.
+    assert failure_cause(failure_kind(IMPORT_ERROR)) in msg
+    assert "user_originated_turn_view" not in msg
     assert "stale code" in msg
     assert "booted on 7e67f64fce" in msg
     assert "disk is at ec5e369fe6" in msg
@@ -36,11 +38,11 @@ def test_import_error_with_skew_names_shas_and_the_restart_command(monkeypatch):
 
 
 def test_import_error_without_skew_stays_a_plain_import_message(monkeypatch):
-    """No skew (or non-git install): message is byte-identical to today's."""
+    """No skew (or non-git install): the plain closed import notice, no restart hint."""
     monkeypatch.setattr(scheduler, "_detect_gateway_code_skew", lambda: None)
     job = {"name": "morning-brief", "id": "aaa111"}
     msg = _summarize_cron_failure_for_delivery(job, IMPORT_ERROR)
-    assert "cannot import name 'user_originated_turn_view'" in msg
+    assert failure_cause(failure_kind(IMPORT_ERROR)) in msg
     assert "stale code" not in msg
     assert "hermes gateway restart" not in msg
 
@@ -60,7 +62,7 @@ def test_modulenotfound_matches_the_import_class(monkeypatch):
 
 def test_no_agent_script_import_error_never_blames_gateway_skew(monkeypatch):
     """A no_agent script runs in a fresh subprocess — its ImportError is the
-    script's own problem and must reach the generic cleaner untouched."""
+    script's own problem, never Hermes code skew."""
     monkeypatch.setattr(
         scheduler,
         "_detect_gateway_code_skew",
@@ -88,7 +90,7 @@ def test_skew_probe_failure_degrades_to_the_plain_message(monkeypatch):
         raise AssertionError(
             "summarizer must not propagate a skew-probe failure"
         ) from None
-    assert "cannot import name" in msg
+    assert failure_cause(failure_kind(IMPORT_ERROR)) in msg
 
 
 def test_wrapper_seam_swallows_detector_import_failure(monkeypatch):

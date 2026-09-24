@@ -43,6 +43,7 @@ from cron.jobs import (
     resolve_job_ref,
     resume_job,
     update_job)
+from cron.jobs_public_status import public_run_error
 from tools.cronjob_prompt_scan import _scan_cron_prompt
 from tools.cronjob_job_args import (
     _apply_continuity,
@@ -201,7 +202,9 @@ def _claim_for_manual_run(job_id: str, log_label: str):
         logger.error("Failed to claim cron job %s for %s: %s", job_id, log_label, e)
         with contextlib.suppress(Exception):
             mark_job_run(job_id, False, str(e))
-        return None, {"claimed": True, "success": False, "error": str(e)}
+        # The claim is Hermes's own store operation, never the job's script (no_agent=False).
+        return None, {"claimed": True, "success": False,
+                      "error": public_run_error(str(e) or type(e).__name__)}
 
 
 def _execute_job_now(job: Dict[str, Any], extra_prompt: Optional[str] = None) -> Dict[str, Any]:
@@ -324,7 +327,11 @@ def _run_claimed_job(job: Dict[str, Any], extra_prompt: Optional[str] = None) ->
         ok = last_status in {"ok", "delivery_queued"}
         if execution is not None and execution.get("status") != "completed":
             ok = False
-            run_error = execution.get("error") or f"execution ended in {execution.get('status') or 'unknown'} state"
+            # The executions row holds the raw text (the operator's `hermes cron runs`); the calling
+            # agent relays this result to chat, so it gets the closed label of the same failure.
+            run_error = (
+                public_run_error(execution.get("error"), no_agent=bool(job.get("no_agent")))
+                or f"execution ended in {execution.get('status') or 'unknown'} state")
         return {"claimed": True, "success": bool(processed and ok), "error": run_error}
     except Exception as e:
         logger.error("Failed to execute cron job %s immediately: %s", job_id, e)
@@ -336,7 +343,8 @@ def _run_claimed_job(job: Dict[str, Any], extra_prompt: Optional[str] = None) ->
                 release_running_job(job_id)
         with contextlib.suppress(Exception):
             mark_job_run(job_id, False, str(e), expected_fire_owner=fire_owner)
-        return {"claimed": True, "success": False, "error": str(e)}
+        return {"claimed": True, "success": False,
+                "error": public_run_error(str(e) or type(e).__name__, no_agent=bool(job.get("no_agent")))}
 
 
 def execute_job_for_event(
@@ -376,12 +384,14 @@ def _latest_job_output_excerpt(job_id: str, max_chars: int = 2000) -> Optional[s
     block (parent sees what the job produced). Never raises."""
     try:
         from cron.jobs import get_cron_output_dir
+        from cron.scheduler_failure_copy import cron_output_dir_display
         files = sorted((get_cron_output_dir() / job_id).glob("*.md"))
         text = files[-1].read_text(encoding="utf-8", errors="replace").strip() if files else ""
         if not text:
             return None
         if len(text) > max_chars:
-            text = text[:max_chars] + f"\n… (truncated; full output: {files[-1]})"
+            text = (text[:max_chars]
+                    + f"\n… (truncated; full output: {cron_output_dir_display(job_id)}{files[-1].name})")
         return text
     except Exception:
         return None
@@ -435,7 +445,10 @@ def _manual_run_completion(
     ]
     if refreshed.get("next_run_at"):
         lines.append(f"Next scheduled run: {refreshed['next_run_at']}")
-    excerpt = _latest_job_output_excerpt(job_id)
+    # A failed run's output file holds its raw error (the operator's copy) and the parent relays
+    # this block to chat, so only a run that itself succeeded (last_error cleared) is excerpted.
+    ran_ok = refreshed.get("last_error") is None if refreshed else bool(res.get("success"))
+    excerpt = _latest_job_output_excerpt(job_id) if ran_ok else None
     if excerpt:
         lines += ["--- JOB OUTPUT ---", excerpt]
     return {

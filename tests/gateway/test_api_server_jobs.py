@@ -324,7 +324,7 @@ class TestRunJob:
     async def test_run_job(self, adapter):
         """POST /api/jobs/{id}/run returns triggered job."""
         app = _create_app(adapter)
-        triggered_job = {**SAMPLE_JOB, "last_run": "2025-01-01T00:00:00Z"}
+        triggered_job = {**SAMPLE_JOB, "last_run_at": "2025-01-01T00:00:00Z"}
         mock_trigger = MagicMock(return_value=triggered_job)
         async with TestClient(TestServer(app)) as cli:
             with patch(

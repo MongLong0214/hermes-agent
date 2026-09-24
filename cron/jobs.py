@@ -30,6 +30,8 @@ from pathlib import Path
 from hermes_constants import get_hermes_home
 from cron.constants import CLAIM_TTL_INACTIVITY_HEADROOM, FIRE_CLAIM_SKEW_SECONDS, FIRE_CLAIM_TTL_SECONDS
 from cron.env_settings import cron_env_setting
+from cron.jobs_public_status import (
+    FIRE_FORWARD_FAILED, NEXT_RUN_UNCOMPUTABLE, public_delivery_error, public_run_error)
 from typing import Optional, Dict, List, Any, Callable, Set, Tuple, Union, Collection
 
 logger = logging.getLogger(__name__)
@@ -2284,10 +2286,10 @@ def note_fire_forward_failure(job_id: str, detail: str) -> bool:
     """Durably record (as ``last_fire_error``) that a scheduled fire could not be handed to the
     runner — written by the dashboard fire webhook when the loopback forward fails. Without it
     the miss is invisible (no execution row, last_status only covers started runs); mark_job_run
-    clears it."""
+    clears it. The stamp keeps the fixed detail (cron/jobs_public_status.py); *detail* is logged."""
     def apply(jobs, _i, job):
-        job["last_fire_error"] = {
-            "at": _hermes_now().isoformat(), "detail": str(detail or "")[:500]}
+        logger.warning("Job '%s': scheduled fire not handed to the runner: %s", job_id, detail)
+        job["last_fire_error"] = {"at": _hermes_now().isoformat(), "detail": FIRE_FORWARD_FAILED}
         save_jobs(jobs)
         return True
 
@@ -2298,7 +2300,10 @@ def _record_run_outcome(
     job: Dict[str, Any], success: bool, error: Optional[str], delivery_error: Optional[str],
     status: Optional[str], now: str,
 ) -> None:
-    """Stamp one completed run onto *job*: status fields, failure streak, alert markers, claims."""
+    """Stamp one completed run onto *job*: status fields, failure streak, alert markers, claims.
+
+    Both error fields are closed labels (cron/jobs_public_status.py): this record reaches chat
+    tools, the dashboard and /api/jobs, while the raw text stays in the run's executions row."""
     job["last_run_at"] = now
     job.pop("manual_run_at", None)
     # The transient manual-run context is single-fire: the run that just completed consumed it.
@@ -2306,7 +2311,10 @@ def _record_run_outcome(
     delivery_failed = isinstance(delivery_error, str) and bool(delivery_error.strip())
     job["last_status"] = status or (
         "error" if not success else ("delivery_failed" if delivery_failed else "ok"))
-    job["last_error"] = None if success else error
+    job["last_error"] = None if success else public_run_error(error, no_agent=bool(job.get("no_agent")))
+    if delivery_failed and public_delivery_error(delivery_error) != delivery_error:
+        # The executions row keeps only the outcome, so the adapter's reason survives here alone.
+        logger.warning("Job '%s': result not delivered: %s", job.get("id"), delivery_error)
     if success:
         # Healthy run: drop the alert-once dedup markers so a FUTURE break re-alerts, and clear
         # the forward-failure stamp so it only describes CURRENT auto-fire health.
@@ -2319,7 +2327,7 @@ def _record_run_outcome(
         # Consecutive agent-failure streak; delivery failures do NOT count
         # (scheduler._failure_streak_nudge).
         job["failure_streak"] = int(job.get("failure_streak") or 0) + 1
-    job["last_delivery_error"] = delivery_error
+    job["last_delivery_error"] = public_delivery_error(delivery_error)
     # Clear both claims: the run is over, so the job is claimable again.
     job["fire_claim"] = None
     job.pop("pending_slot", None)
@@ -2363,9 +2371,7 @@ def _advance_after_run(job: Dict[str, Any], now: str) -> None:
         # dep into "job completed" and silently drop the schedule.
         job["state"] = "error"
         if not job.get("last_error"):
-            job["last_error"] = (
-                "Failed to compute next run for recurring schedule (is the 'croniter' package "
-                "installed in the gateway's Python env?)")
+            job["last_error"] = NEXT_RUN_UNCOMPUTABLE
         logger.error(
             "Job '%s' (%s) could not compute next_run_at; "
             "leaving enabled and marking state=error so the job is not silently disabled.",

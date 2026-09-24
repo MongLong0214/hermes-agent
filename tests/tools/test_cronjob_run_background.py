@@ -238,6 +238,7 @@ class TestInFlightDedupe:
         assert "job-bg-09" not in sched.get_running_job_ids()   # released after
 
     def test_run_claimed_job_reports_exact_unknown_execution_not_stale_success(self):
+        from cron.jobs_public_status import public_run_error
         from tools.cronjob_tools import _run_claimed_job
 
         def probe_run(job, **_kwargs):
@@ -257,7 +258,7 @@ class TestInFlightDedupe:
             res = _run_claimed_job(_job("job-bg-unknown"))
 
         assert res["success"] is False
-        assert res["error"] == "worker owner exited"
+        assert res["error"] == public_run_error("worker owner exited")
 
     def test_background_dispatch_reports_running_job_immediately(self):
         """The dispatch path pre-checks the running set so a mid-run job
