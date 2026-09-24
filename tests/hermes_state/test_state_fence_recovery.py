@@ -4,6 +4,7 @@ row is copied unless it carries this build's stamp and exactly this build's fenc
 from __future__ import annotations
 
 import contextlib
+import os
 import sqlite3
 
 import pytest
@@ -47,9 +48,17 @@ def test_recovery_refuses_a_destination_without_its_fences(tmp_path, monkeypatch
         finally:
             conn.close()
 
+    copied_tables: list[str] = []
+    real_copy_table = session_recovery._copy_table
+
+    def recording_copy_table(src, dst, table, **kwargs):
+        copied_tables.append(table)
+        return real_copy_table(src, dst, table, **kwargs)
+
     monkeypatch.setattr(session_recovery, "SessionDB", fence_stripping_session_db)
+    monkeypatch.setattr(session_recovery, "_copy_table", recording_copy_table)
     with pytest.raises(session_recovery.SessionRecoveryError, match="turn-fence"):
         session_recovery.recover_session_database(source, output, work_dir=tmp_path)
 
-    assert read_ro(output, "SELECT COUNT(*) FROM sessions")[0][0] == 0
-    assert read_ro(output, "SELECT COUNT(*) FROM messages")[0][0] == 0
+    assert copied_tables == []
+    assert not any(os.path.lexists(f"{output}{suffix}") for suffix in ("", "-wal", "-shm", "-journal"))
