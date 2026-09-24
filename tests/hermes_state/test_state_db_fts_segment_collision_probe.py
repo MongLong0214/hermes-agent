@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from hermes_state import SessionDB
+from hermes_state_fence import register_turn_fence_generation
 from hermes_state_repair import _db_opens_cleanly, repair_state_db_schema
 
 
@@ -39,6 +40,7 @@ def _plant_stale_trigram_segment(db_path: Path) -> None:
 
 def _real_append_fails(db_path: Path, sid: str) -> bool:
     conn = sqlite3.connect(str(db_path), isolation_level=None)
+    register_turn_fence_generation(conn)  # the store is fenced: plain writes land only as this build's generation
     try:
         conn.execute("INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
                      (sid, "user", "zebra yak xylophone wombat", time.time()))

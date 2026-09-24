@@ -15,9 +15,10 @@ from agent.skill_commands import describe_skill_invocation
 from hermes_state_common import (
     FTS_CJK_STALE_KEY, FTS_SQL, FTS_STALE_KEY, FTS_STORAGE_VERSION, FTS_TOOL_CONTENT_PREFIX_CHARS,
     FTS_TRIGRAM_EXCLUDED_SOURCES, FTS_TRIGRAM_SQL,
-    MAX_FTS5_QUERY_CHARS, SCHEMA_VERSION, _FTS_CJK_TRIGGERS,
+    MAX_FTS5_QUERY_CHARS, _FTS_CJK_TRIGGERS,
     escape_like as _escape_like, fts_rebuild_admission, fts_trigram_session_sql, routed_sessions_setting,
 )
+from hermes_state_fence import advance_lineage_stamp
 
 # Pre-split logger identity so log filtering/capture is unchanged.
 logger = logging.getLogger("hermes_state")
@@ -620,7 +621,7 @@ class SessionSearchMixin:
             return "backfill_incomplete"
         self.set_meta("fts_storage_version", str(FTS_STORAGE_VERSION), cursor=conn)
         _delete_meta(conn, "fts_optimize_available")
-        conn.execute("UPDATE schema_version SET version = ? WHERE version < ?", (SCHEMA_VERSION, SCHEMA_VERSION))
+        advance_lineage_stamp(conn.cursor())
         return None
 
     def optimize_fts_storage(

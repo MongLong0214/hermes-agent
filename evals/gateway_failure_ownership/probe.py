@@ -124,6 +124,7 @@ server = ThreadingHTTPServer(("127.0.0.1", 0), Peer)
 threading.Thread(target=server.serve_forever, daemon=True).start()
 from run_agent import AIAgent
 from hermes_state import SessionDB
+from hermes_state_fence import register_turn_fence_generation
 from gateway.session import SessionStore, AsyncSessionStore, SessionSource
 from gateway.config import GatewayConfig, Platform
 from gateway.platforms.event import MessageEvent
@@ -273,6 +274,7 @@ async def main():
         if fault == "archive-memory":
             # Large archived payloads must stay in SQLite, not become a Python baseline.
             with sqlite3.connect(HOME / "state.db") as conn:
+                register_turn_fence_generation(conn)  # the store is fenced: plain writes land only as this build's generation
                 conn.executemany(
                     "INSERT INTO messages (session_id, role, content, timestamp, active, compacted) "
                     "VALUES (?, 'user', ?, 1, 0, 1)",

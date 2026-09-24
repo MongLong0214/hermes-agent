@@ -9,7 +9,7 @@ import time
 import pytest
 
 from hermes_state import SessionDB
-from hermes_state_common import SCHEMA_VERSION
+from hermes_state_fence import STORED_SCHEMA_VERSION, register_turn_fence_generation
 
 
 @pytest.fixture()
@@ -210,6 +210,7 @@ def test_recovery_cleanup_keeps_tool_pins_and_drops_dangling_pin_refs(tmp_path):
         db._conn.execute("UPDATE sessions SET tool_names = ? WHERE id = 'legacy'", ('["read_file"]',))
         db._conn.commit()
     conn = sqlite3.connect(str(tmp_path / "state.db"), isolation_level=None)
+    register_turn_fence_generation(conn)  # the store is fenced: plain writes land only as this build's generation
     conn.row_factory = sqlite3.Row
     _cleanup_partial_orphans(conn)
     conn.close()
@@ -274,7 +275,7 @@ def test_v24_inline_prompts_migrate_once_to_content_addressed_storage(tmp_path):
         assert len({row["system_prompt_hash"] for row in raw_sessions}) == 1
         assert migrated._conn.execute(
             "SELECT version FROM schema_version LIMIT 1"
-        ).fetchone()[0] == SCHEMA_VERSION
+        ).fetchone()[0] == STORED_SCHEMA_VERSION
     finally:
         migrated.close()
 

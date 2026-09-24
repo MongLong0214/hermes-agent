@@ -607,6 +607,7 @@ class TestSweepOrphanedSessions:
         import sqlite3
 
         from hermes_cli.session_recovery import _reconstruct_missing_sessions
+        from hermes_state_fence import register_turn_fence_generation
 
         stale = time.time() - 200 * 86400
         for sid in ("lost-old", "lost-fresh"):
@@ -614,6 +615,7 @@ class TestSweepOrphanedSessions:
             db.append_message(sid, role="user", content="salvaged")
         db.close()
         raw = sqlite3.connect(tmp_path / "state.db")
+        register_turn_fence_generation(raw)  # the store is fenced: plain writes land only as this build's generation
         raw.execute("PRAGMA foreign_keys=OFF")
         raw.execute("DELETE FROM sessions WHERE id IN ('lost-old', 'lost-fresh')")
         assert _reconstruct_missing_sessions(raw)["sessions_reconstructed"] == 2

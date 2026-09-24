@@ -77,8 +77,8 @@ def owned_turn_fence_literals(cursor) -> dict:
     FENCE_GENERATION_MISMATCH otherwise (unknown body, name collision, or a
     generation this build never wrote)."""
     from hermes_state_fence import (
-        FORK_LEGACY_GENERATIONS, SESSION_PROCESS_GOVERNED_TABLES, STORED_SCHEMA_VERSION, TURN_FENCE_FUNCTION,
-        TURN_FENCE_GENERATION, schema_text,
+        FENCE_LINEAGE_BASE, FORK_BASE_UPSTREAM_GATE, FORK_LEGACY_GENERATIONS, SESSION_PROCESS_GOVERNED_TABLES,
+        STORED_SCHEMA_VERSION, TURN_FENCE_FUNCTION, TURN_FENCE_GENERATION, schema_text,
     )
 
     templates = _templates()
@@ -111,7 +111,9 @@ def owned_turn_fence_literals(cursor) -> dict:
             )
         # The fork first governed the authority tables at generation 28.
         legacy_ok = literal in FORK_LEGACY_GENERATIONS and not (literal == 27 and lowered in authority_names)
-        if literal != STORED_SCHEMA_VERSION and not legacy_ok:
+        # An earlier fenced build of this line (before an upstream SCHEMA_VERSION bump): migrated forward.
+        older_fenced = FENCE_LINEAGE_BASE + FORK_BASE_UPSTREAM_GATE < literal < STORED_SCHEMA_VERSION
+        if literal != STORED_SCHEMA_VERSION and not (legacy_ok or older_fenced):
             raise IncompatibleSchemaError(
                 cause=SCHEMA_CAUSE_FENCE_GENERATION_MISMATCH, expected_generation=TURN_FENCE_GENERATION,
                 actual_generation=literal, detail=f"trigger {name}",

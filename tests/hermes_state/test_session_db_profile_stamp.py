@@ -14,6 +14,7 @@ import pytest
 
 import hermes_state
 from hermes_state import SessionDB
+from hermes_state_fence import register_turn_fence_generation
 
 
 @pytest.fixture
@@ -85,6 +86,7 @@ def test_compression_child_of_null_parent_is_stamped(hermes_root):
         db.create_session("s_parent", source="cli")
         # Simulate a legacy pre-ownership parent row.
         conn = sqlite3.connect(db_path)
+        register_turn_fence_generation(conn)  # the store is fenced: plain writes land only as this build's generation
         conn.execute(
             "UPDATE sessions SET profile_name = NULL WHERE id = ?", ("s_parent",)
         )
@@ -127,6 +129,7 @@ def test_legacy_backfill_still_targets_only_null(hermes_root):
     try:
         db.create_session("s_new", source="cli")
         conn = sqlite3.connect(db_path)
+        register_turn_fence_generation(conn)  # the store is fenced: plain writes land only as this build's generation
         conn.execute("UPDATE sessions SET profile_name = NULL WHERE id = 's_new'")
         conn.commit()
         conn.close()
