@@ -4,7 +4,10 @@ This module deliberately does not receive ingress, create sessions, or deliver r
 """
 
 import asyncio
+import hashlib
 import json
+import secrets
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol
@@ -16,6 +19,8 @@ from gateway.session_persistence import _DB_UNPINNED
 _EVENT_FIELDS = frozenset({"binding", "event_id", "author_id", "channel_id", "text"})
 _MAX_ID_CHARS = 256
 _MAX_TEXT_CHARS = 16_384
+_MAX_RECEIPT_CHARS = 32_768
+_RECEIPT_NAMESPACE = "canonical-receipt:v2"
 
 
 def _required_text(value: Any, *, limit: int) -> str:
@@ -284,3 +289,209 @@ class ExistingCanonicalBindingResolver:
                 except Exception:
                     pass
         return entry, proof
+
+
+@dataclass(frozen=True)
+class CanonicalReceiptResult:
+    """The durable state visible to an internal canonical caller."""
+
+    status: str
+    terminal_text: str | None = None
+
+
+class CanonicalReceiptCoordinator:
+    """Claim one canonical event on the already-open DB owned by its cached actor.
+
+    This is deliberately an internal coordinator: it neither receives HTTP nor publishes a
+    reply.  A pending receipt is deliberately sticky; recovery is outside this narrow path.
+    """
+
+    def __init__(self, runner: Any) -> None:
+        self._runner = runner
+
+    @staticmethod
+    def _fingerprint(binding: CanonicalSurfaceBinding, event: CanonicalIngressEvent) -> str:
+        payload = json.dumps(
+            {"binding": binding.name, "session_key": binding.session_key,
+             "telegram_origin": (binding.telegram_chat_id, binding.telegram_chat_type,
+                                 binding.telegram_user_id, binding.telegram_thread_id),
+             "event_id": event.event_id, "author_id": event.author_id,
+             "channel_id": event.channel_id, "text": event.text},
+            ensure_ascii=False, separators=(",", ":"), sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    @staticmethod
+    def _key(binding: CanonicalSurfaceBinding, event: CanonicalIngressEvent) -> str:
+        # Digest a length-framed namespace so distinct literal identifiers cannot concatenate.
+        fields = (
+            binding.name,
+            binding.session_key,
+            binding.telegram_chat_id,
+            binding.telegram_chat_type,
+            json.dumps(
+                (binding.telegram_user_id, binding.telegram_thread_id),
+                ensure_ascii=False, separators=(",", ":"),
+            ),
+            event.event_id,
+            event.author_id,
+            event.channel_id,
+        )
+        framed = b"".join(
+            len(value.encode("utf-8")).to_bytes(4, "big") + value.encode("utf-8")
+            for value in fields
+        )
+        return f"{_RECEIPT_NAMESPACE}:{hashlib.sha256(framed).hexdigest()}"
+
+    @staticmethod
+    def _encode(value: dict[str, Any]) -> str:
+        encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        if len(encoded) > _MAX_RECEIPT_CHARS:
+            raise ValueError("canonical_receipt_invalid")
+        return encoded
+
+    @staticmethod
+    def _decode(value: Any, fingerprint: str) -> CanonicalReceiptResult:
+        try:
+            parsed = json.loads(value)
+            if not isinstance(parsed, dict) or parsed.get("v") != 1:
+                raise ValueError("invalid")
+            if parsed.get("fingerprint") != fingerprint:
+                raise ValueError("canonical_receipt_conflict")
+            if parsed.get("state") == "pending" and isinstance(parsed.get("owner"), str):
+                return CanonicalReceiptResult("pending")
+            response = parsed.get("response")
+            if (parsed.get("state") == "terminal" and isinstance(response, dict)
+                    and isinstance(response.get("terminal_text"), str)):
+                return CanonicalReceiptResult("terminal", response["terminal_text"])
+        except ValueError as exc:
+            if str(exc) == "canonical_receipt_conflict":
+                raise
+        except Exception:
+            pass
+        raise ValueError("canonical_receipt_conflict")
+
+    @staticmethod
+    def _borrow_actor_db(runner: Any, proof: CanonicalBindingProof) -> tuple[Any, Any]:
+        """Return only the cached actor and its existing writable DB matching resolver proof."""
+        with runner._agent_cache_lock:
+            cached = runner._agent_cache.get(proof.session_key)
+            actor = cached[0] if isinstance(cached, tuple) else cached
+            cached_session_id = (
+                cached[3]
+                if isinstance(cached, tuple) and len(cached) > 3
+                else getattr(actor, "session_id", None)
+            )
+        db = getattr(actor, "_session_db", None)
+        if (
+            actor is None
+            or cached_session_id != proof.session_id
+            or getattr(actor, "session_id", None) != proof.session_id
+            or db is None
+            or getattr(db, "read_only", True)
+            or getattr(db, "db_path", None) != proof.db_path
+            or getattr(db, "_db_file_identity", None) != proof.db_identity
+            or CanonicalReceiptCoordinator._path_identity(proof.db_path) != proof.db_identity
+            or not callable(getattr(db, "claim_meta_once", None))
+            or not callable(getattr(db, "compare_and_set_meta", None))
+            or not callable(getattr(db, "get_meta", None))
+        ):
+            raise ValueError("canonical_binding_stale")
+        return actor, db
+
+    @staticmethod
+    def _path_identity(path: Path) -> tuple[int, int] | None:
+        try:
+            stat = path.stat()
+            return stat.st_dev, stat.st_ino
+        except OSError:
+            return None
+
+    def _require_current_claim_target(
+        self, proof: CanonicalBindingProof, actor: Any, db: Any,
+        run_generation: int | None = None,
+    ) -> None:
+        """Recheck the exact head, cached actor, and DB generation before receipt I/O."""
+        if run_generation is not None and not self._runner._is_session_run_current(
+            proof.session_key, run_generation
+        ):
+            raise ValueError("canonical_turn_interrupted")
+        if self._runner.session_store.lookup_by_session_key_existing(proof.session_key) is not proof.entry:
+            raise ValueError("canonical_binding_stale")
+        current_actor, current_db = self._borrow_actor_db(self._runner, proof)
+        if current_actor is not actor or current_db is not db:
+            raise ValueError("canonical_agent_replaced")
+
+    async def submit(
+        self, binding: CanonicalSurfaceBinding, event: CanonicalIngressEvent
+    ) -> CanonicalReceiptResult:
+        """Claim, run once, and durably terminalize an already-authenticated canonical event."""
+        if event.binding != binding.name:
+            raise ValueError("canonical_binding_stale")
+        entry, proof = ExistingCanonicalBindingResolver(self._runner.session_store).resolve_with_proof(
+            binding, event
+        )
+        actor, db = self._borrow_actor_db(self._runner, proof)
+        fingerprint = self._fingerprint(binding, event)
+        key = self._key(binding, event)
+        owner = secrets.token_hex(16)
+        pending = self._encode({"v": 1, "state": "pending", "owner": owner, "fingerprint": fingerprint})
+        if self._runner._is_session_running(proof.session_key):
+            raise ValueError("canonical_turn_busy")
+        try:
+            lease = await self._runner._turn_leases.acquire(
+                proof.session_id, owner_key=f"canonical:{id(event)}", generation=0,
+            )
+        except Exception:
+            raise ValueError("canonical_turn_busy") from None
+        run_generation: int | None = None
+        try:
+            # Waiting for the turn lease may have exposed a new head, actor, or DB generation.
+            self._require_current_claim_target(proof, actor, db)
+            if self._runner._is_session_running(proof.session_key):
+                raise ValueError("canonical_turn_busy")
+            run_generation = self._runner._begin_session_run_generation(proof.session_key)
+            turn = self._runner._session_state(proof.session_key).turn
+            turn.agent = actor
+            turn.event = None
+            turn.ctx = None
+            turn.started_ts = time.time()
+            if not db.claim_meta_once(
+                key, pending, proven_db_path=proof.db_path, proven_db_identity=proof.db_identity
+            ):
+                receipt = db.get_meta(key)
+                # get_meta has no generation fence, so its result is usable only after this recheck.
+                self._require_current_claim_target(proof, actor, db, run_generation)
+                return self._decode(receipt, fingerprint)
+
+            from gateway.canonical_surface import request_local_reply_sink
+
+            async def discard(_result: CanonicalTurnResult) -> None:
+                return None
+
+            result = await self._runner.run_bound_existing_turn(
+                binding, event, entry, reply_sink=request_local_reply_sink(discard),
+                expected_actor=actor, expected_session_db=db,
+                expected_db_path=proof.db_path, expected_db_identity=proof.db_identity,
+                expected_run_generation=run_generation,
+                held_lease=lease,
+            )
+            if not isinstance(result, CanonicalTurnResult) or len(result.terminal_text) > _MAX_TEXT_CHARS:
+                raise ValueError("canonical_receipt_invalid")
+            terminal = self._encode({
+                "v": 1, "state": "terminal", "fingerprint": fingerprint,
+                "response": {"binding_name": result.binding_name, "terminal_text": result.terminal_text},
+            })
+            self._require_current_claim_target(proof, actor, db, run_generation)
+            if not db.compare_and_set_meta(
+                key, pending, terminal, proven_db_path=proof.db_path, proven_db_identity=proof.db_identity
+            ):
+                raise ValueError("canonical_receipt_terminal_unconfirmed")
+            self._require_current_claim_target(proof, actor, db, run_generation)
+            return CanonicalReceiptResult("terminal", result.terminal_text)
+        finally:
+            if run_generation is not None:
+                self._runner._release_running_agent_state(
+                    proof.session_key, run_generation=run_generation
+                )
+            self._runner._turn_leases.release(lease)
