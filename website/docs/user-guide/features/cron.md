@@ -131,6 +131,27 @@ hermes config set cron.model <model>                              # every unpinn
 
 `hermes cron list` and the `cronjob_manage` tool report `pinned` per job.
 
+### Older jobs with a creation-time snapshot (`cron.model_drift_guard`)
+
+Jobs created by older Hermes versions may still carry a `provider_snapshot` / `model_snapshot`
+recorded when they were created. Jobs created now never do, so this setting does not affect them.
+
+```yaml
+cron:
+  model_drift_guard: true   # default
+```
+
+While it is `true`, a snapshot-carrying job whose provider or model no longer matches its snapshot
+is **skipped with no LLM call**. This only applies to a provider or model the job does not pin
+itself and that `cron.model` / `cron.model_provider` does not set. Hermes sends ONE alert naming
+the change and the `hermes cron edit … --provider … --model …` command to pin the job. The alert
+is not repeated every tick. The next drift sends a new alert only after a successful run or after
+the config matches the snapshot again. A run that falls back to another provider because the
+primary failed does not count as drift.
+
+Set it to `false` (`hermes config set cron.model_drift_guard false`) to let those jobs follow the
+main model like every other unpinned job.
+
 ## Skill-backed cron jobs
 
 A cron job can load one or more skills before it runs the prompt. Each skill loads exactly as it does from `/skill-name` in a chat session, including the `[Skill config ...]` block with its resolved `metadata.hermes.config` values from `config.yaml`.

@@ -1755,6 +1755,7 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
                 runtime["_fallback_notice"] = pre_agent_fallback_notice(
                     requested or (jc.model_cfg.get("provider") if isinstance(jc.model_cfg, dict) else ""),
                     model, runtime.get("provider"), fb_model)
+                runtime["_primary_provider"] = _drift._primary_provider(resolve_exc, requested, jc)
                 return runtime, fb_model
             except Exception as fb_exc:
                 logger.debug("Job '%s': fallback %s failed: %s", job_id, fb_provider, fb_exc)
@@ -2341,7 +2342,7 @@ class _CronAgentSetup:
 
 def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _CronAgentSetup:
     """Resolve model/runtime/reasoning/pool for the run, in the original gate order: exfil guard ->
-    preflight (may block) -> runtime (+ fallback chain) -> credential pool -> MCP."""
+    preflight (may block) -> runtime (+ fallbacks) -> legacy drift (may block) -> pool -> MCP."""
     _cfg = jc.cfg
     setup = _CronAgentSetup(model=jc.model)
     setup.prefill_messages = _load_prefill_messages(_cfg, job_id)
@@ -2363,6 +2364,9 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
 
     setup.runtime, setup.model = _resolve_job_runtime(job, job_id, jc)
     setup.fallback_notice = setup.runtime.pop("_fallback_notice", None)
+    setup.blocked = _drift._legacy_drift_block(job, job_id, job_name, jc, setup.runtime)
+    if setup.blocked is not None:
+        return setup
     setup.reasoning_config = _resolve_job_reasoning_config(
         job, _cfg if isinstance(_cfg, dict) else {}, str(setup.model)
     )
@@ -2802,7 +2806,9 @@ def _compose_run_delivery(
     blocked_config = blocked_config_silent or BLOCKED_CONFIG_MARKER in err
     incident_acked = False
     failure_incident_id = None
-    if blocked_config and not success:
+    if not success and (drift_alert := _drift._pending_drift_alert(job)) is not None:
+        deliver_content, blocked_config_silent = drift_alert, not drift_alert
+    elif blocked_config and not success:
         # Bypass the generic failure summarizer (its auth/timeout heuristics would mislabel this).
         _pf_text = re.sub(r"\[blocked_config[^\]]*\]\s*", "", err).strip()
         from cron.scheduler_failure_copy import blocked_config_notice
@@ -2990,6 +2996,7 @@ def _save_compose_deliver(
                 # on the failure path) honor the job's failure_deliver override (NS-788).
                 for_failure=not d.success,
             )
+            _drift._commit_drift_alert(job, fence.owner)
     except Exception as de:
         if isinstance(de, _FireClaimLostDuringSideEffect):
             raise
@@ -4137,6 +4144,7 @@ from cron.scheduler_preflight import (  # noqa: E402
     BLOCKED_CONFIG_MARKER, BLOCKED_CONFIG_SILENT_MARKER, _cron_preflight_enabled,
     _empty_requested_mcp_toolsets, _is_transient_provider_resolve_error, _preflight_job_config,
 )
+from cron import scheduler_drift as _drift  # noqa: E402
 
 
 # `python -m cron.scheduler` entry: MUST stay below the split-module imports so the worker /

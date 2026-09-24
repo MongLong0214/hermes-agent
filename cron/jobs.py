@@ -2250,6 +2250,36 @@ def clear_preflight_alerted(job_id: str) -> None:
     _set_alert_flag(job_id, "preflight_alerted", False)
 
 
+def set_drift_alert(
+    job_id: str, alerted: bool, *, parked: Optional[list] = None,
+    expected_fire_owner: Optional[str] = None,
+) -> bool:
+    """Persist the legacy drift alert-once state; False when the owner fence refused the write.
+
+    ``drift_alerted`` means this drift episode's alert is out. ``parked`` lists the handoffs of an
+    alert no target has finished yet (durable-queue send, open Bot Chat receipt): the next drifted
+    tick settles them through their own lanes, so an alert that is only admitted never counts as
+    sent. ``expected_fire_owner`` makes the write a no-op unless that worker still holds the
+    persisted fire claim, so a stale worker cannot flip a successor's bit.
+    """
+    def apply(jobs, _i, job):
+        if expected_fire_owner is not None:
+            claim = job.get("fire_claim")
+            if not isinstance(claim, dict) or claim.get("by") != expected_fire_owner:
+                return False
+        job.pop("drift_alert_parked", None)
+        if alerted:
+            job["drift_alerted"] = True
+            if parked:
+                job["drift_alert_parked"] = list(parked)
+        else:
+            job.pop("drift_alerted", None)
+        save_jobs(jobs)
+        return True
+
+    return _with_job(job_id, apply, False)
+
+
 def note_fire_forward_failure(job_id: str, detail: str) -> bool:
     """Durably record (as ``last_fire_error``) that a scheduled fire could not be handed to the
     runner — written by the dashboard fire webhook when the loopback forward fails. Without it
@@ -2281,6 +2311,8 @@ def _record_run_outcome(
         # Healthy run: drop the alert-once dedup markers so a FUTURE break re-alerts, and clear
         # the forward-failure stamp so it only describes CURRENT auto-fire health.
         job.pop("preflight_alerted", None)
+        job.pop("drift_alerted", None)
+        job.pop("drift_alert_parked", None)
         job.pop("last_fire_error", None)
         job["failure_streak"] = 0
     else:

@@ -558,6 +558,17 @@ def _migrate_to_41(results: Dict[str, Any], quiet: bool) -> None:
                   f"({', '.join(cleaned)}) — Bot Chat sessions now get the live roster instead.")
 
 
+def _migrate_to_42(results: Dict[str, Any], quiet: bool) -> None:
+    # 41 → 42: this step used to delete cron.model_drift_guard. The key gates legacy snapshot jobs
+    # again, so an explicit value (notably an opt-out) is kept as written; only its narrower scope
+    # is announced.
+    cron = read_raw_config().get("cron")
+    if isinstance(cron, dict) and cron.get("model_drift_guard") is not None and not quiet:
+        print("  ✓ Kept cron.model_drift_guard — unpinned cron jobs follow the main model; it only "
+              "guards older jobs that still carry a creation-time model snapshot "
+              "(false lets those follow the main model too).")
+
+
 def _migrate_to_45(results: Dict[str, Any], quiet: bool) -> None:
     # 44 → 45: append `connections` to every saved `platform_toolsets` list that predates it
     # (an explicit list treats absence as unchecked). Skipped when `known_builtin_toolsets`
@@ -690,16 +701,8 @@ MIGRATIONS: Tuple[Tuple[int, Callable[[Dict[str, Any], bool], None]], ...] = (
         message="  ✓ Model catalog now refreshes every 20 minutes (model_catalog.ttl_minutes)",
         extra_guard=lambda raw: "ttl_minutes" not in raw)),
     (41, _migrate_to_41),
-    # 41 → 42: cron.model_drift_guard is gone. Unpinned jobs now run on their creation snapshot
-    # instead of failing closed when the global model changes, so the toggle has nothing to gate.
-    (42, functools.partial(
-        _rewrite_key, section="cron", key="model_drift_guard", new=None,
-        match=lambda cur: cur is not None,
-        added="removed cron.model_drift_guard",
-        message=(
-            "  ✓ Removed cron.model_drift_guard — unpinned cron jobs now keep running on the "
-            "model/provider they were created under when the global default changes, instead "
-            "of being skipped. Pin a job or set cron.model to move it."))),
+    # 41 → 42: cron.model_drift_guard is kept (see _migrate_to_42).
+    (42, _migrate_to_42),
     # 42 → 43: gateway.multiplex_profile_allowlist is gone. A multiplexing default gateway serves
     # every live profile under profiles/; a profile that must not be served is archived or deleted.
     (43, functools.partial(

@@ -1768,6 +1768,12 @@ DEFAULT_CONFIG = {
         # Inference provider paired with cron.model (NOT the scheduler provider below). "" = resolve
         # from global config.
         "model_provider": "",
+        # Spend guard for LEGACY job records that still carry provider_snapshot/model_snapshot
+        # (created before unpinned jobs followed the main model). While on, such a job whose
+        # unpinned, non-fleet-default provider or model drifted from its snapshot is skipped with
+        # no model call and ONE alert, instead of silently running on the new model. False = these
+        # records follow the main model like new jobs. Jobs without snapshots are never affected.
+        "model_drift_guard": True,
         # Cron SCHEDULER provider (WHEN a due job fires). "" = built-in in-process 60s ticker. Name
         # an installed provider (plugins/cron_providers/<name>/ or $HERMES_HOME/plugins/ <name>/),
         # e.g. "chronos" (NAS-mediated managed cron for scale-to-zero). An unknown or unavailable

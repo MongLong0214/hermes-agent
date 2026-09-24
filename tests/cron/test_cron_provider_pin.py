@@ -1,9 +1,14 @@
-"""Unpinned cron jobs run on the main agent model at fire time; ``pinned`` locks it.
+"""Unpinned cron jobs run on the main agent model at fire time; ``pinned`` locks it; legacy
+snapshot records fail closed while ``cron.model_drift_guard`` is on.
 
 Contract:
   - run_job() resolves per-job pin > cron.model / cron.model_provider > the main agent model
-    (config ``model:``). There is no creation-time snapshot axis any more: a record that still
-    carries legacy ``provider_snapshot`` / ``model_snapshot`` keys follows the main model.
+    (config ``model:``). New jobs carry no creation-time snapshot.
+  - A legacy record that still carries ``provider_snapshot`` / ``model_snapshot`` is skipped
+    before any agent is built (no model spend) when an axis that is unpinned and not supplied by
+    the cron fleet default drifted from its snapshot. The provider axis compares the PRIMARY
+    route, never a fallback reached because the primary failed. With
+    ``cron.model_drift_guard: false`` such records follow the main model like new jobs.
   - create_job(pinned=True) / update_job({"pinned": True}) lock the CURRENT main provider+model
     onto the job as an ordinary per-job pin; ``pinned=False`` releases both.
 
@@ -35,11 +40,11 @@ def _base_job(**overrides):
 
 
 def _run(job, tmp_path, *, current_provider="openrouter", current_model=None, cron_model=None,
-         cron_model_provider=None):
+         cron_model_provider=None, drift_guard=None, extra_yaml="", resolver=None):
     """Drive run_job against a temp config.yaml whose ``model.default`` / ``model.provider`` are
     the CURRENT global defaults. Returns ``(success, error, agent_kwargs, resolve_kwargs)`` where
     the last two are the kwargs AIAgent / resolve_runtime_provider were called with (None when
-    never called)."""
+    never called). ``resolver`` replaces the default resolve_runtime_provider stand-in."""
     config_yaml = ""
     if current_model or current_provider:
         config_yaml += "model:\n"
@@ -52,14 +57,18 @@ def _run(job, tmp_path, *, current_provider="openrouter", current_model=None, cr
         cron_lines.append(f"  model: {cron_model}")
     if cron_model_provider is not None:
         cron_lines.append(f"  model_provider: {cron_model_provider}")
+    if drift_guard is not None:
+        cron_lines.append(f"  model_drift_guard: {str(drift_guard).lower()}")
     if cron_lines:
         config_yaml += "cron:\n" + "\n".join(cron_lines) + "\n"
-    (tmp_path / "config.yaml").write_text(config_yaml)
+    (tmp_path / "config.yaml").write_text(config_yaml + extra_yaml)
 
     resolve_kwargs = {}
 
     def _resolve(**kwargs):
         resolve_kwargs.update(kwargs)
+        if resolver is not None:
+            return resolver(**kwargs)
         return {
             "api_key": "test-key",
             "base_url": "https://example.invalid/v1",
@@ -84,19 +93,74 @@ def _run(job, tmp_path, *, current_provider="openrouter", current_model=None, cr
     return success, error, agent_kwargs, (resolve_kwargs or None)
 
 
-class TestUnpinnedJobsFollowTheMainModel:
-    def test_legacy_snapshot_record_follows_the_main_model(self, tmp_path):
-        """A record created under the old snapshot design keeps running, on the CURRENT main
-        provider/model, never on what it was created under."""
+class TestLegacySnapshotDriftGuard:
+    def test_legacy_snapshot_fails_closed_while_guard_on_and_follows_main_when_off(self, tmp_path):
+        """A snapshot-era record never silently moves to a changed main model while the guard
+        is on (the default); switching the guard off gives it the upstream follow-main
+        semantics."""
         job = _base_job(provider_snapshot="old-provider", model_snapshot="old-model")
-        success, error, agent_kwargs, resolve_kwargs = _run(
+        success, error, agent_kwargs, _ = _run(
             job, tmp_path, current_provider="new-provider", current_model="new-model")
+        assert success is False
+        assert agent_kwargs is None
+        assert "no inference call" in (error or "").lower()
 
+        success, error, agent_kwargs, resolve_kwargs = _run(
+            _base_job(provider_snapshot="old-provider", model_snapshot="old-model"), tmp_path,
+            current_provider="new-provider", current_model="new-model", drift_guard=False)
         assert success is True, error
         assert agent_kwargs["model"] == "new-model"
         assert resolve_kwargs["requested"] is None
-        assert resolve_kwargs["target_model"] == "new-model"
 
+    def test_legacy_model_snapshot_axis_fails_closed(self, tmp_path):
+        """The model axis is guarded on its own: same provider, different main model."""
+        job = _base_job(provider_snapshot="openrouter", model_snapshot="old-model")
+        success, _error, agent_kwargs, _ = _run(
+            job, tmp_path, current_provider="openrouter", current_model="new-model")
+        assert success is False
+        assert agent_kwargs is None
+
+    def test_fleet_default_axes_are_exempt_from_the_legacy_drift_guard(self, tmp_path):
+        """cron.model_provider / cron.model are the operator's explicit cron routing, not drift."""
+        job = _base_job(provider_snapshot="openrouter", model_snapshot="old-model")
+        success, error, agent_kwargs, resolve_kwargs = _run(
+            job, tmp_path, current_provider="openrouter", current_model="main-model",
+            cron_model="fleet-model", cron_model_provider="nous")
+        assert success is True, error
+        assert (agent_kwargs["model"], resolve_kwargs["requested"]) == ("fleet-model", "nous")
+
+    def test_legacy_drift_compares_the_primary_route_not_the_fallback(self, tmp_path):
+        """A primary that matches the snapshot but fails auth may fall back; that is not drift."""
+        from hermes_cli.auth import AuthError
+
+        def resolver(**kwargs):
+            if kwargs.get("requested") is None:
+                raise AuthError("openrouter token expired", provider="openrouter")
+            return {"api_key": "fb-key", "base_url": "https://example.invalid/v1",
+                    "provider": kwargs["requested"], "api_mode": "chat_completions"}
+
+        job = _base_job(provider_snapshot="openrouter", model_snapshot="main-model")
+        success, error, agent_kwargs, _ = _run(
+            job, tmp_path, current_provider="openrouter", current_model="main-model",
+            resolver=resolver,
+            extra_yaml="fallback_providers:\n  - provider: nous\n    model: fb-model\n")
+        assert success is True, error
+        assert (agent_kwargs["provider"], agent_kwargs["model"]) == ("nous", "fb-model")
+
+    def test_heal_clear_failure_does_not_fail_a_healthy_run(self, tmp_path, monkeypatch):
+        """Re-arming the alert is bookkeeping; a store error there must not cost the run."""
+        def broken_store(*_a, **_k):
+            raise OSError("jobs.json is read-only")
+
+        monkeypatch.setattr("cron.jobs.set_drift_alert", broken_store)
+        job = _base_job(provider_snapshot="openrouter", drift_alerted=True)
+        success, error, agent_kwargs, _ = _run(
+            job, tmp_path, current_provider="openrouter", current_model="main-model")
+        assert success is True, error
+        assert agent_kwargs is not None
+
+
+class TestUnpinnedJobsFollowTheMainModel:
     def test_explicit_pin_then_fleet_default_beat_the_main_model(self, tmp_path):
         pinned = _base_job(provider="pinned-provider", model="pinned-model")
         success, error, agent_kwargs, resolve_kwargs = _run(
