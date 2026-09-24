@@ -1005,6 +1005,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     import httpx as _httpx
     from openai import APIConnectionError as _APIConnectionError
     from agent import relay_llm
+    from agent.native_compaction_grace import withhold_native_capture_reconnect
     transport_errors = (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ReadError, _httpx.ConnectError, ConnectionError)
     active_client = client or agent._ensure_primary_openai_client(reason="codex_stream_direct")
     max_stream_retries, model = 1, api_kwargs.get("model")
@@ -1105,6 +1106,12 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 agent, exc, attempts=attempt + 1,
                 base_url=getattr(active_client, "base_url", None) or getattr(agent, "base_url", ""))
 
+    def _log_native_grace_failure(exc: BaseException) -> None:
+        # Not ``_log_failure``: its buffered connect-exhausted notice would outlive the rebuild.
+        logger.warning("Codex Responses native compaction capture failed before any stream event (%s); "
+                       "not reconnecting, the turn rebuilds it through local preflight. %s",
+                       type(exc).__name__, agent._client_log_context())
+
     def _codex_stream_created(_raw_stream: Any) -> None:
         # Claim the delta sink for THIS attempt; a newer attempt supersedes this token.
         writer_token["value"] = claim_stream_writer(agent)
@@ -1201,6 +1208,9 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             except transport_errors as exc:
                 if attempt_state["accepted_event"]:
                     return _CodexStreamTerminalFailure(exc)
+                if withhold_native_capture_reconnect(agent):
+                    _log_native_grace_failure(exc)
+                    raise
                 if attempt >= max_stream_retries:
                     _log_failure(exc)
                     raise
@@ -1224,6 +1234,9 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 # token is claimed the inference may already be billed, so mid-stream failures still raise.
                 if attempt_state["accepted_event"]:
                     return _CodexStreamTerminalFailure(exc)
+                if withhold_native_capture_reconnect(agent):
+                    _log_native_grace_failure(exc)
+                    raise
                 if (attempt < max_stream_retries and writer_token["value"] is None
                         and isinstance(exc.__cause__, _httpx.TransportError)):
                     logger.debug(
