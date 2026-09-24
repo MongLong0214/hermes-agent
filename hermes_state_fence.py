@@ -266,21 +266,30 @@ def open_fenced_state_connection(
     SessionDB facade go first: it creates a fresh store's schema, so the raw opener never becomes
     the store's first schema writer, and it migrates a store whose fences carry another
     generation, which would otherwise abort every governed write the raw opener makes. That is
-    the one migration, under SessionDB's lock and in its single transaction."""
+    the one migration, under SessionDB's lock and in its single transaction.
+
+    A store another build still owns is written only under SessionDB's admission lease
+    (``hermes_state_admission``), bootstrap or not: while a gateway holds the profile's runtime
+    lock, the open raises ForwardSchemaMigrationAdmissionError before ``connect``."""
+    from hermes_state_admission import raw_open_admission
+
     lineage = probe_store_lineage(path)
     if bootstrap and (lineage.lineage == LINEAGE_FRESH or not lineage.writable_by_this_build):
         from hermes_state import SessionDB
 
         SessionDB(db_path=Path(path)).close()
-    conn = connect()
-    try:
-        register_turn_fence_generation(conn)
-        validate_state_connection(conn)
-        if initialize is not None:
-            initialize(conn)
-    except BaseException:
-        conn.close()
-        raise
+        lineage = probe_store_lineage(path)
+    with raw_open_admission(path, lineage) as readmit:
+        conn = connect()
+        try:
+            register_turn_fence_generation(conn)
+            validate_state_connection(conn)
+            readmit(conn.cursor())
+            if initialize is not None:
+                initialize(conn)
+        except BaseException:
+            conn.close()
+            raise
     return conn
 
 
