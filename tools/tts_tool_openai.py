@@ -13,6 +13,7 @@ import uuid
 from typing import Any, Dict, Optional
 from urllib.parse import urljoin
 
+from agent.gemini_outbound_policy import deny_gemini_outbound
 from tools.managed_tool_gateway import resolve_managed_tool_gateway
 from tools.tool_backend_helpers import (
     NOUS_MANAGED_PROVIDER, managed_nous_tools_enabled, nous_tool_gateway_unavailable_message,
@@ -29,6 +30,19 @@ DEFAULT_OPENAI_VOICE = "alloy"
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 # DeepInfra base URL is resolved via hermes_cli.models.deepinfra_base_url (shared).
 DEFAULT_DEEPINFRA_TTS_VOICE = "default"
+
+
+def _openai_tts_route(tts_config: Dict[str, Any]) -> Dict[str, Any]:
+    """Non-secret route facts of the configured OpenAI TTS endpoint (outbound-policy preflight)."""
+    oai = _section(tts_config, "openai")
+    return {"model": oai.get("model", DEFAULT_OPENAI_MODEL), "base_url": oai.get("base_url") or DEFAULT_OPENAI_BASE_URL}
+
+
+def _deepinfra_tts_route(tts_config: Dict[str, Any]) -> Dict[str, Any]:
+    """Pinned DeepInfra TTS route facts; a catalog-picked model is checked where it is picked."""
+    from hermes_cli.models import deepinfra_base_url
+    di = _section(tts_config, "deepinfra")
+    return {"model": di.get("model") or "", "base_url": deepinfra_base_url(di)}
 
 
 def _managed_openai_audio_route() -> Optional[tuple]:
@@ -104,14 +118,16 @@ def _generate_openai_tts(
     fallback_base: Optional[str] = None
     is_managed = False
     explicit_base_url = base_url is not None
-    if api_key is None:
-        api_key, fallback_base, is_managed = _resolve_openai_audio_client_config()
     oai_config = _section(tts_config, "openai")
     if model is None:
         model = oai_config.get("model", DEFAULT_OPENAI_MODEL)
+    config_base_url = oai_config.get("base_url")
+    # Route facts are checked before the auth chain reads a key, and again on the final endpoint.
+    deny_gemini_outbound(model=model, base_url=base_url or config_base_url or DEFAULT_OPENAI_BASE_URL)
+    if api_key is None:
+        api_key, fallback_base, is_managed = _resolve_openai_audio_client_config()
     if voice is None:
         voice = oai_config.get("voice", DEFAULT_OPENAI_VOICE)
-    config_base_url = oai_config.get("base_url")
     if base_url is None:  # config override beats the auth-chain fallback; explicit arg wins
         base_url = config_base_url or fallback_base or DEFAULT_OPENAI_BASE_URL
     if speed is None:
@@ -136,6 +152,7 @@ def _generate_openai_tts(
         create_kwargs["instructions"] = instructions
     if extra_body := _openai_extra_body(oai_config):
         create_kwargs["extra_body"] = extra_body
+    deny_gemini_outbound(model=model, base_url=base_url)
     client = _origin()._import_openai_client()(api_key=api_key, base_url=base_url)
     try:
         client.audio.speech.create(**create_kwargs).stream_to_file(output_path)
@@ -149,12 +166,11 @@ def _generate_openai_tts(
 def _generate_deepinfra_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
     """Resolve DeepInfra credentials/model (live ``hermes_cli.models`` catalog, no hardcoded ids), then
     delegate to the OpenAI-compatible handler."""
-    api_key = _origin()._resolve_provider_key("DEEPINFRA_API_KEY", "deepinfra")
-    if not api_key:
-        raise ValueError("DEEPINFRA_API_KEY not set. Run `hermes setup` to configure, or set the env var directly.")
     di_config = _section(tts_config, "deepinfra")
     from hermes_cli.models import deepinfra_base_url, deepinfra_model_ids
+    base_url = deepinfra_base_url(di_config)
     model = di_config.get("model")
+    deny_gemini_outbound(model=model, base_url=base_url)  # pinned route, before catalog or key
     if not isinstance(model, str) or not model.strip():
         candidates = deepinfra_model_ids("tts")
         if not candidates:
@@ -163,7 +179,11 @@ def _generate_deepinfra_tts(text: str, output_path: str, tts_config: Dict[str, A
                 "under tts.deepinfra.model, or check connectivity to "
                 "api.deepinfra.com so the live catalog can be fetched.")
         model = candidates[0]
+        deny_gemini_outbound(model=model, base_url=base_url)
+    api_key = _origin()._resolve_provider_key("DEEPINFRA_API_KEY", "deepinfra")
+    if not api_key:
+        raise ValueError("DEEPINFRA_API_KEY not set. Run `hermes setup` to configure, or set the env var directly.")
     return _origin()._generate_openai_tts(
-        text, output_path, tts_config, api_key=api_key, base_url=deepinfra_base_url(di_config),
+        text, output_path, tts_config, api_key=api_key, base_url=base_url,
         model=model, voice=di_config.get("voice", DEFAULT_DEEPINFRA_TTS_VOICE),
         speed=float(di_config.get("speed", tts_config.get("speed", 1.0))))

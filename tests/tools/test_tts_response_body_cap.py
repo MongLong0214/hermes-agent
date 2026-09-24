@@ -45,15 +45,3 @@ def test_xai_tts_rejects_oversized_audio_response(tmp_path, monkeypatch):
     assert post.call_args.kwargs["stream"] is True
     assert response.closed is True
     assert not output_path.exists()
-
-
-def test_gemini_tts_rejects_oversized_json_response(tmp_path, monkeypatch):
-    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
-    response = StreamingResponse([b'{"candidates":', b"[{}]}"], headers={"Content-Type": "application/json"})
-
-    with patch("requests.post", return_value=response) as post:
-        with pytest.raises(RuntimeError, match="Gemini TTS response exceeds 8 bytes"):
-            tts_tool._generate_gemini_tts("hello", str(tmp_path / "out.wav"), {})
-
-    assert post.call_args.kwargs["stream"] is True
-    assert response.closed is True

@@ -2,6 +2,7 @@
 resolved through the module object so test patches on ``hermes_cli.setup.<name>`` take effect."""
 
 import logging
+from agent.gemini_outbound_policy import is_gemini_outbound
 from tools import tool_backend_helpers
 from hermes_cli import nous_subscription
 
@@ -13,7 +14,6 @@ _TTS_SUMMARY_ROWS = {
     "elevenlabs": ("ElevenLabs", ("ELEVENLABS_API_KEY",)),
     "openai": ("OpenAI", ("VOICE_TOOLS_OPENAI_KEY", "OPENAI_API_KEY")),
     "minimax": ("MiniMax", ("MINIMAX_API_KEY",)), "mistral": ("Mistral Voxtral", ("MISTRAL_API_KEY",)),
-    "gemini": ("Google Gemini", ("GEMINI_API_KEY", "GOOGLE_API_KEY")),
     "neutts": ("NeuTTS", "neutts", "run 'hermes setup tts'"),
     "kittentts": ("KittenTTS", "kittentts", "run 'hermes setup tts'")}
 _TTS_SUMMARY_DEFAULT = ("Edge TTS", ())
@@ -144,6 +144,8 @@ def _tts_row(config, feats):
     if feats.tts.managed_by_nous:
         return ("Text-to-Speech (OpenAI via Nous subscription)", True, None)
     provider = _setup.cfg_get(config, "tts", "provider", default="edge")
+    if is_gemini_outbound(canonical_provider=provider):
+        return ("Text-to-Speech (Unavailable provider)", False, "run 'hermes setup tts'")
     return _voice_provider_status("Text-to-Speech", provider, _TTS_SUMMARY_ROWS, _TTS_SUMMARY_DEFAULT)
 
 

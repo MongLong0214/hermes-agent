@@ -13,6 +13,7 @@ import os
 import time
 from typing import Any, Optional, Tuple
 
+from agent.gemini_outbound_policy import deny_gemini_outbound
 from agent.secret_scope import get_secret as _get_secret, is_multiplex_active
 
 # The [vertex] extra is not in [all]; install google-auth on demand, else fall through to the ImportError below.
@@ -129,6 +130,7 @@ def _needs_refresh(creds) -> bool:
 
 def get_vertex_credentials(credentials_path: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
     """Return (fresh access_token, project_id) or (None, None); Credentials cached per file content."""
+    deny_gemini_outbound(canonical_provider="vertex")
     if google is None:
         logger.warning("google-auth package not installed. Cannot use Vertex AI.")
         return None, None

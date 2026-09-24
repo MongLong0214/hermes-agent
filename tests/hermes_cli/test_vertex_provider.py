@@ -1,23 +1,13 @@
 """Tests for Vertex AI runtime-provider resolution and profile registration.
 
 Covers: provider-profile registration + aliases, alias canonicalization,
-resolve_runtime_provider(vertex) minting an OAuth token, and the friendly
-AuthError when credentials can't be resolved. No network calls.
+and credential-identity preservation. No network calls.
 """
 
 from __future__ import annotations
 
-import pytest
 
 
-def test_resolve_runtime_provider_raises_autherror_when_unresolved(monkeypatch):
-    import agent.vertex_adapter as va
-    from hermes_cli import runtime_provider as rp
-    from hermes_cli.auth import AuthError
-
-    monkeypatch.setattr(va, "get_vertex_config", lambda: (None, None))
-    with pytest.raises(AuthError):
-        rp.resolve_runtime_provider(requested="vertex")
 
 
 def test_vertex_registered_in_provider_registry():

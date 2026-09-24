@@ -9,6 +9,7 @@ import time
 from contextlib import suppress
 from typing import Any, Optional
 
+from agent.gemini_outbound_policy import GeminiOutboundDenied
 from agent.lazy_forward import forward as _forward, forward_static as _forward_static, lazy_attr as _lazy_attr
 from hermes_cli.timeouts import get_provider_request_timeout
 from utils import base_url_host_matches, env_float
@@ -290,6 +291,8 @@ class ClientLifecycleMixin:
                     new_client = build_moa_facade(self, self.model)
                 else:
                     new_client = self._create_openai_client(self._client_kwargs, reason=reason, shared=True)
+            except GeminiOutboundDenied:
+                raise
             except Exception as exc:
                 logger.warning(
                     "Failed to rebuild shared primary client (%s) %s error=%s", reason, self._client_log_context(), exc,
@@ -312,6 +315,8 @@ class ClientLifecycleMixin:
                 return client
             try:
                 new_client = self._create_openai_client(self._client_kwargs, reason=reason, shared=True)
+            except GeminiOutboundDenied:
+                raise
             except Exception as exc:
                 logger.warning(
                     "Failed to recreate closed OpenAI client (%s) %s error=%s", reason, self._client_log_context(), exc,
@@ -787,6 +792,8 @@ class ClientLifecycleMixin:
         try:
             from agent.vertex_adapter import get_vertex_config
             token, base_url = get_vertex_config()
+        except GeminiOutboundDenied:
+            raise
         except Exception as exc:
             logger.debug("Vertex credential refresh failed: %s", exc)
             return False

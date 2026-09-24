@@ -6,6 +6,7 @@ import logging
 import shutil
 import subprocess
 import sys
+from agent.gemini_outbound_policy import is_gemini_outbound
 from tools import tool_backend_helpers
 from hermes_cli import nous_subscription
 
@@ -113,7 +114,6 @@ _TTS_PROVIDER_CHOICES = [
     ("xai", "xAI TTS (Grok voices — OAuth login or API key)"),
     ("minimax", "MiniMax TTS (high quality with voice cloning, needs API key)"),
     ("mistral", "Mistral Voxtral TTS (multilingual, native Opus, needs API key)"),
-    ("gemini", "Google Gemini TTS (30 prebuilt voices, prompt-controllable, needs API key)"),
     ("neutts", "NeuTTS (local on-device, free, ~300MB model download)"),
     ("kittentts", "KittenTTS (local on-device, free, lightweight ~25-80MB ONNX)")]
 # Short label = menu label minus its parenthetical ("Edge TTS", "Mistral Voxtral TTS", ...).
@@ -128,8 +128,6 @@ _TTS_API_KEY_PROVIDERS = {
                 "MiniMax TTS API key saved", ""),
     "mistral": (("MISTRAL_API_KEY",), "MISTRAL_API_KEY", "Mistral API key for TTS",
                 "Mistral TTS API key saved", ""),
-    "gemini": (("GEMINI_API_KEY", "GOOGLE_API_KEY"), "GEMINI_API_KEY", "Gemini API key for TTS",
-               "Gemini TTS API key saved", "Get a free API key at https://aistudio.google.com/app/apikey"),
 }
 # provider -> (module, display name, requirement lines, install question, installer)
 _TTS_LOCAL_PROVIDERS = {
@@ -228,7 +226,9 @@ def _tts_xai_step(config: dict) -> str:
 def _setup_tts_provider(config: dict):
     """Interactive TTS provider selection with install flow for local engines."""
     current_provider = config.get("tts", {}).get("provider", "edge")
-    current_label = _TTS_PROVIDER_LABELS.get(current_provider, current_provider)
+    current_label = _TTS_PROVIDER_LABELS.get(current_provider) or (
+        "Unavailable provider (choose another)" if is_gemini_outbound(canonical_provider=current_provider)
+        else current_provider)
     print()
     _setup.print_header("Text-to-Speech Provider (optional)")
     _setup._info(f"Current: {current_label}", None)

@@ -254,22 +254,6 @@ class TestBuildApiKwargsOpenRouter:
             "google": {"thought_signature": "signed-call"}
         }
 
-    def test_gemini_native_passes_base_url_for_top_level_thinking_config(self, monkeypatch):
-        agent = _make_agent(
-            monkeypatch,
-            "gemini",
-            base_url="https://generativelanguage.googleapis.com/v1beta",
-            model="gemini-3-flash-preview",
-        )
-        agent.reasoning_config = {"enabled": True, "effort": "high"}
-        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
-        assert kwargs["extra_body"]["thinking_config"] == {
-            "includeThoughts": True,
-            "thinkingLevel": "high",
-        }
-        assert "extra_body" not in kwargs["extra_body"]
-
-
 
 
 
