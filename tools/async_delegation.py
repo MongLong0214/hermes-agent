@@ -88,13 +88,20 @@ def _connect() -> sqlite3.Connection:
     # hardening so this writer doesn't create/leave the file (and its WAL
     # sidecars) at the process umask. See hermes_state._secure_state_db_files.
     from hermes_state import _secure_state_db_files
+    from hermes_state_fence import open_fenced_state_connection
 
     path = _db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    _secure_state_db_files(path, create_main=True)
-    # wal=False: SessionDB owns state.db's journal mode (_initialize_schema applies the barriers).
-    conn = open_db(path, db_label="state.db (async_delegation)", busy_timeout_ms=10_000,
-                   wal=False, row_factory=None, initialize=_initialize_schema)
+
+    def _open() -> sqlite3.Connection:
+        _secure_state_db_files(path, create_main=True)
+        # wal=False: SessionDB owns state.db's journal mode (_initialize_schema applies the barriers).
+        return open_db(path, db_label="state.db (async_delegation)", busy_timeout_ms=10_000,
+                       wal=False, row_factory=None)
+
+    # Lineage probe first: reconcile_state_schema's DDL must never reach a store this build refuses,
+    # and a fresh store gets its schema from SessionDB rather than from this raw writer.
+    conn = open_fenced_state_connection(path, bootstrap=True, connect=_open, initialize=_initialize_schema)
     _secure_state_db_files(path)
     return conn
 

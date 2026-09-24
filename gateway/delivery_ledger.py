@@ -174,11 +174,17 @@ def _db_path():
 
 def _connect() -> sqlite3.Connection:
     from hermes_cli.sqlite_util import open_db
+    from hermes_state_fence import open_fenced_state_connection
 
+    path = _db_path()
     # Shared state.db: SessionDB owns the durable PRAGMA set; this opener keeps the plain-tuple rows
-    # and the 10 s busy timeout it always had.
-    return open_db(_db_path(), db_label="state.db (delivery_ledger)", busy_timeout_ms=10_000,
-                   row_factory=None, initialize=_initialize_schema)
+    # and the 10 s busy timeout it always had. The lineage probe runs before open_db so a refused
+    # store gets neither the WAL switch nor the DDL below.
+    return open_fenced_state_connection(
+        path, bootstrap=False, initialize=_initialize_schema,
+        connect=lambda: open_db(path, db_label="state.db (delivery_ledger)", busy_timeout_ms=10_000,
+                                row_factory=None),
+    )
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:

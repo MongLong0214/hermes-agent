@@ -297,6 +297,12 @@ def _state_db_health(f: Finding, should_fix: bool, state_db_path: Path, _DHH: st
     except Exception as e:
         return _classify_unreadable_state_db(f, should_fix, state_db_path, _DHH, e)
     if _write_reason is not None:
+        from hermes_state_fence import is_schema_incompatible_verdict
+        if is_schema_incompatible_verdict(_write_reason):
+            # Healthy for the build that wrote it: --fix must not rebuild FTS, VACUUM or strip its fences.
+            check_warn(f"{_DHH}/state.db belongs to a Hermes build this one cannot write; left untouched",
+                       f"({_write_reason})")
+            return f.manual_issues.append(f"state.db is incompatible with this Hermes build: {_write_reason}")
         if _report_structural_damage(f, should_fix, state_db_path, _DHH, _write_reason):
             return
         check_warn(f"{_DHH}/state.db fails a write-health probe (FTS index may be corrupt)", f"({_write_reason})")

@@ -76,7 +76,7 @@ def is_disk_full_error(exc: BaseException | str | None) -> bool:
 # Every classify_persistence_error bucket; consumers enumerate this tuple.
 PERSISTENCE_ERROR_CAUSES = (
     "locked", "compression", "compression_closed", "turn_lease", "corrupt", "fts_index",
-    "replaced", "deleted_wal", "disk", "unknown",
+    "replaced", "deleted_wal", "schema_incompatible", "disk", "unknown",
 )
 
 
@@ -219,7 +219,48 @@ _STATE_DB_CORRUPT_MSG = (
 )
 
 
+SCHEMA_CAUSE_BUILD_TOO_OLD = "BUILD_TOO_OLD"
+SCHEMA_CAUSE_FENCE_GENERATION_MISMATCH = "FENCE_GENERATION_MISMATCH"
+SCHEMA_CAUSE_VERSION_UNREADABLE = "SCHEMA_VERSION_UNREADABLE"
+SCHEMA_INCOMPATIBLE_CAUSES = (
+    SCHEMA_CAUSE_BUILD_TOO_OLD, SCHEMA_CAUSE_FENCE_GENERATION_MISMATCH, SCHEMA_CAUSE_VERSION_UNREADABLE,
+)
+
+
+class IncompatibleSchemaError(RuntimeError):
+    """This build must not open the store at all: its stored lineage or turn-fence generation is one
+    the build does not own. Deliberately NOT an ``sqlite3.DatabaseError``: every DatabaseError path
+    in the open/repair stack treats the file as damaged and may quarantine, rebuild FTS or VACUUM it,
+    which would destroy a store that is healthy for the build that wrote it."""
+
+    code = "STATE_DB_SCHEMA_INCOMPATIBLE"
+
+    def __init__(self, *, cause: str, expected_generation, actual_generation, detail: str = ""):
+        if cause not in SCHEMA_INCOMPATIBLE_CAUSES:
+            raise ValueError(f"unknown schema incompatibility cause: {cause!r}")
+        self.cause = cause
+        self.expected_generation = expected_generation
+        self.actual_generation = actual_generation
+        self.detail = detail
+        super().__init__(_incompatible_schema_message(cause, expected_generation, actual_generation, detail))
+
+
+def _incompatible_schema_message(cause: str, expected, actual, detail: str) -> str:
+    suffix = f" ({detail})" if detail else ""
+    # A fence mismatch fires in either direction (older or newer writer), so its text never says "newer".
+    if cause == SCHEMA_CAUSE_BUILD_TOO_OLD:
+        head = ("Session state schema is newer than this Hermes build "
+                f"(expected generation {expected}, actual generation {actual})")
+    elif cause == SCHEMA_CAUSE_FENCE_GENERATION_MISMATCH:
+        head = ("Session state turn-fence generation does not match this Hermes build "
+                f"(build generation {expected}, stored generation {actual})")
+    else:
+        head = "Session state does not record exactly one integer schema version"
+    return f"{head}{suffix}; refusing to open it, and nothing was changed."
+
+
 _PERSISTENCE_CAUSE_BY_TYPE = (
+    (IncompatibleSchemaError, "schema_incompatible"),
     (SessionTurnLeaseLostError, "turn_lease"),
     (CompressionSessionClosedError, "compression_closed"),
     (CompressionSessionBusyError, "compression"),
@@ -230,6 +271,9 @@ _PERSISTENCE_CAUSE_BY_TYPE = (
     (StateDbCorruptError, "corrupt"),
 )
 _PERSISTENCE_CAUSE_BY_PHRASE = (
+    # The fence trigger's RAISE text and the missing-UDF error: a generation refusal, never damage.
+    (("state db generation incompatible", "no such function: hermes_turn_fence_generation"),
+     "schema_incompatible"),
     (("turn lease",), "turn_lease"),
     (("closed by compression",), "compression_closed"),
     (("being compressed", "compression lease"), "compression"),

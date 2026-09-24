@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
 from hermes_state import SessionDB
+from hermes_state_fence import register_turn_fence_generation
 from hermes_state_common import FTS_STORAGE_VERSION, SCHEMA_VERSION
 from hermes_state_repair import _db_opens_cleanly
 
@@ -214,9 +215,12 @@ def _count_rows(conn: sqlite3.Connection, table: str) -> int:
     return int(conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0])
 
 
-def _connect(path: Path) -> sqlite3.Connection:
-    """Autocommit connection with a short busy timeout (source snapshot or fresh output)."""
-    return sqlite3.connect(str(path), isolation_level=None, timeout=1.0)
+def _connect(path: Path, *, timeout: float = 1.0) -> sqlite3.Connection:
+    """Autocommit connection with a short busy timeout (source snapshot or fresh output). Carries the
+    turn-fence UDF: a fenced store aborts every governed write from a connection without it."""
+    conn = sqlite3.connect(str(path), isolation_level=None, timeout=timeout)
+    register_turn_fence_generation(conn)
+    return conn
 
 
 @contextmanager
@@ -891,7 +895,7 @@ def _verify_recovered_database(
     verification["opens_cleanly"] = open_error is None
     if open_error is not None:
         verification["errors"].append(f"database health probe: {open_error}")
-    conn = sqlite3.connect(str(output), isolation_level=None)
+    conn = _connect(output, timeout=5.0)
     try:
         _verify_structure(conn, verification)
         _verify_row_counts(
@@ -1076,7 +1080,7 @@ def _recover_via_lost_and_found(
     # Structural checks cannot see a positional mis-mapping: every row still inserts, so integrity/FK/FTS
     # stay green. A systematic timestamp violation is the semantic tell — never report such a salvage as verified.
     # See #101409.
-    plausibility_conn = sqlite3.connect(str(output), isolation_level=None)
+    plausibility_conn = _connect(output, timeout=5.0)
     try:
         plausibility_errors = _lost_and_found_plausibility_errors(plausibility_conn)
     finally:

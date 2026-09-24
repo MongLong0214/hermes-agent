@@ -27,6 +27,11 @@ from hermes_state_common import (
     _acquire_db_flock, _clear_lock_holder_record, _describe_lock_holder, _read_lock_holder_record,
     is_advisory_lock_contention,
 )
+from hermes_state_fence import (
+    fence_refusal_verdict, is_schema_incompatible_verdict, register_turn_fence_generation,
+    schema_incompatibility_verdict,
+)
+from hermes_state_serialized_conn import serialized_connection_factory
 
 # Log-record parity with the origin module (caplog tests pin "hermes_state").
 logger = logging.getLogger("hermes_state")
@@ -589,7 +594,13 @@ def _connect_repair_durable(db_path: Path, *, timeout: float = 5.0) -> sqlite3.C
     """
     from hermes_cli.sqlite_safe_read import connect_tracked
 
-    conn = connect_tracked(db_path, tracking_path=db_path, timeout=timeout, isolation_level=None)
+    conn = connect_tracked(db_path, tracking_path=db_path, timeout=timeout, isolation_level=None,
+                           factory=serialized_connection_factory())
+    try:
+        register_turn_fence_generation(conn)
+    except BaseException:
+        conn.close()
+        raise
     _reapply_durability_barriers(conn)
     return conn
 
@@ -739,6 +750,7 @@ def state_db_has_structural_damage(db_path: Path) -> bool:
         conn = sqlite3.connect(read_only_db_uri(db_path), uri=True, timeout=1.0)
     except sqlite3.Error:
         return False
+    register_turn_fence_generation(conn)
     try:
         master_rows = [tuple(r) for r in conn.execute(
             "SELECT rootpage, type, name FROM sqlite_master WHERE rootpage > 0").fetchall()]
@@ -764,6 +776,10 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
     See #50502.
     """
     from hermes_state import SessionDB, load_fts5_cjk_extension
+    # A store this build does not own is healthy for its writer; every repair strategy would strip its
+    # fences or VACUUM it, so the verdict is non-repairable and checked before any write probe.
+    if (incompatible := schema_incompatibility_verdict(db_path)) is not None:
+        return incompatible
     # ── Strategy 0.5: rebuild stale B-tree indexes (#63386) ── PRAGMA integrity_check can report "wrong #
     # of entries in index" when a B-tree index (e.g. idx_sessions_handoff_state) falls out of sync with its
     # base table. REINDEX rewrites the index b-tree from the canonical table rows using the existing index
@@ -823,13 +839,13 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
                 # SessionDB drops the triggers itself.
                 if _schema_not_built(exc) or "no such tokenizer: cjk_unicode61" in str(exc).lower():
                     return None
-                return f"fts5 write probe failed: {exc}"
+                return fence_refusal_verdict(exc) or f"fts5 write probe failed: {exc}"
             finally:
                 with contextlib.suppress(sqlite3.Error):
                     conn.execute("ROLLBACK")
             return None
     except sqlite3.DatabaseError as exc:
-        return str(exc)
+        return fence_refusal_verdict(exc) or str(exc)
 
 
 def _live_writer_holds_db(db_path: Path) -> bool:
@@ -875,6 +891,10 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
     if not db_path.exists():
         report["error"] = f"{db_path} does not exist"
         return report
+    # A store this build does not own is refused before the forensic backup, the attempt ledger and
+    # every strategy (FTS drop, VACUUM): reporting it is the whole remedy.
+    if (incompatible := schema_incompatibility_verdict(db_path)) is not None:
+        return _repair_skip(report, "refused", incompatible)
     # Cross-restart cap: the in-memory claim bounds one process, but unhealable b-tree damage used to re-run
     # surgery + a fresh backup on EVERY restart.
     # Cross-restart attempt cap (#86747): the in-memory claim bounds one process, but a corruption class the
@@ -992,9 +1012,12 @@ def _repair_state_db_schema_locked(
         return _repair_skip(report, "aborted", f"could not remove a stale repair snapshot before probing state.db: {cleanup_error}")
     # Re-probe under the lock: a process we queued behind may have just repaired the file; redoing surgery
     # would undo it (the repair/re-corrupt cascade).
-    if _db_opens_cleanly(db_path) is None:
+    reason = _db_opens_cleanly(db_path)
+    if reason is None:
         report["repaired"], report["strategy"] = True, "already_healthy"
         return report
+    if is_schema_incompatible_verdict(reason):
+        return _repair_skip(report, "refused", reason)
     if backup:
         bpath, backup_error = _backup_db_file(db_path)
         report["backup_path"] = str(bpath) if bpath else None

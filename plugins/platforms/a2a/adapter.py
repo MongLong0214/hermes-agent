@@ -140,7 +140,12 @@ def _state_db(profile: str, sql: str, params: tuple, log_msg: str, *, commit: bo
     if not db or not os.path.exists(db):
         return ""
     try:
-        with contextlib.closing(sqlite3.connect(db, timeout=5)) as con:
+        from hermes_state_fence import open_fenced_state_connection
+
+        # No bootstrap: the store exists (checked above) and belongs to the target profile, whose own
+        # SessionDB owns its schema; this forwarder only needs to be a registered, validated writer.
+        con = open_fenced_state_connection(db, bootstrap=False, connect=lambda: sqlite3.connect(db, timeout=5))
+        with contextlib.closing(con):
             cur = con.execute(sql, params)
             row = None if commit else cur.fetchone()
             if commit:

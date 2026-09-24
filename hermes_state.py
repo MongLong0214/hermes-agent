@@ -66,6 +66,7 @@ from hermes_state_wal import (
     _WAL_INCOMPAT_MARKERS, _on_disk_journal_mode, apply_database_pragmas, apply_wal_with_fallback,
 )
 from hermes_state_repair import _claim_repair_attempt, preflight_db_writability, repair_state_db_schema
+from hermes_state_fence import probe_store_lineage
 from hermes_state_titles import SessionTitlesMixin
 from hermes_state_usage import SessionUsageMixin
 from hermes_state_maintenance import SessionMaintenanceMixin
@@ -684,6 +685,7 @@ class SessionDB(
         leaked tracked connection cannot block the forensic backup the writable heal takes next."""
         for attempt in range(_READ_ONLY_IOERR_RETRY_ATTEMPTS + 1):
             try:
+                probe_store_lineage(self.db_path)  # a reader must not serve a lineage it does not own
                 self._conn = conn = self._connect_read_only(timeout=1.0)
                 try:
                     apply_database_pragmas(conn, db_label="state.db")
@@ -770,6 +772,8 @@ class SessionDB(
         # Refuse before sqlite3.connect (under the startup lock) so we cannot mint
         # a replacement WAL while a live writer still holds a deleted sidecar inode.
         refuse_deleted_wal_generation(self.db_path)
+        # SELECT-only lineage decode before any byte is written: a refused store stays untouched.
+        probe_store_lineage(self.db_path)
         # Create/tighten the main database before sqlite3.connect() so a
         # permissive process umask can never expose a fresh profile store.
         _secure_state_db_files(self.db_path, create_main=True)
