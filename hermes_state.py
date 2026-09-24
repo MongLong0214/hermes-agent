@@ -67,6 +67,7 @@ from hermes_state_wal import (
 )
 from hermes_state_repair import _claim_repair_attempt, preflight_db_writability, repair_state_db_schema
 from hermes_state_fence import probe_store_lineage
+from hermes_state_admission import admit_forward_migration, release_forward_migration_lease
 from hermes_state_titles import SessionTitlesMixin
 from hermes_state_usage import SessionUsageMixin
 from hermes_state_maintenance import SessionMaintenanceMixin
@@ -594,6 +595,7 @@ class SessionDB(
         # is queryable AND not marked stale.
         self._fts_cjk_loaded = self._fts_cjk_available = self._fts_unavailable_warned = False
         self._conn = None
+        self._forward_migration_lease = None  # held from admission to the end of this open only
         # Async token accounting; distinct from self._lock so enqueue/flush never contends with writes.
         self._token_queue: deque = deque()
         self._token_queue_cond = threading.Condition(threading.Lock())
@@ -632,6 +634,7 @@ class SessionDB(
                 # Test-isolation runs only (gated inside the helper): register
                 # for the suite-level leak sweep in tests/conftest.py.
                 _register_test_instance(self)
+            release_forward_migration_lease(self)
 
     def _open_writer(self) -> None:
         """Writable open: preflight, zero-byte quarantine, connect + schema (one in-place repair of a
@@ -773,8 +776,9 @@ class SessionDB(
         # Refuse before sqlite3.connect (under the startup lock) so we cannot mint
         # a replacement WAL while a live writer still holds a deleted sidecar inode.
         refuse_deleted_wal_generation(self.db_path)
-        # SELECT-only lineage decode before any byte is written: a refused store stays untouched.
-        probe_store_lineage(self.db_path)
+        # SELECT-only lineage decode before any byte is written: a refused store stays untouched,
+        # and so does one another build's still-running gateway owns (hermes_state_admission).
+        admit_forward_migration(self, probe_store_lineage(self.db_path))
         # Create/tighten the main database before sqlite3.connect() so a
         # permissive process umask can never expose a fresh profile store.
         _secure_state_db_files(self.db_path, create_main=True)

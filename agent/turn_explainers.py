@@ -107,11 +107,14 @@ _PERSISTENCE_CAUSE_EXPLANATIONS: Dict[str, str] = {
         "for the other process to finish, then send your message "
         "again."
     ),
+    # Also the bucket of a store another build's running gateway owns (hermes_state_admission),
+    # which no retry opens until that gateway stops.
     "locked": (
         "the turn was stopped because session storage was busy "
-        "(another Hermes process was writing to the state "
-        "database). Your message should already be saved — "
-        "please send it again in a moment."
+        "(another Hermes process held the state database), so your "
+        "message may not have been saved. Send it again in a moment; "
+        "if it persists, stop the other Hermes process "
+        "(`hermes {profile_arg}gateway stop`) first."
     ),
     # The forensic runbook for both (WAL generations, manifest.json, sidecars) lives in the
     # logger.error at hermes_state.py::_raise_if_db_replaced — never in the chat reply.

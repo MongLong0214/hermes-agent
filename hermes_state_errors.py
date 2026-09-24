@@ -296,6 +296,8 @@ _PERSISTENCE_CAUSE_BY_PHRASE = (
     (("deleted state.db-wal", "deleted state.db-shm"), "deleted_wal"),
     (("was replaced underneath",), "replaced"),
     (_DB_CORRUPTION_MARKERS, "corrupt"),
+    # hermes_state_admission's refusal: another build's gateway holds the store; stop it, as for a lock.
+    (("running hermes gateway owns",), "locked"),
     (("locked", "busy"), "locked"),
 )
 

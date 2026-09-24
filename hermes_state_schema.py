@@ -26,6 +26,7 @@ from hermes_state_common import (
     LEGACY_FTS_TRIGRAM_SQL, SCHEMA_SQL,
     _FTS_CJK_TRIGGERS, _FTS_TRIGGERS, _ephemeral_child_sql, _sql_json_extract, fts_rebuild_admission,
 )
+from hermes_state_admission import admit_forward_migration, readmit_forward_migration
 from hermes_state_errors import classify_persistence_error
 from hermes_state_fence import (
     LINEAGE_FRESH, advance_lineage_stamp, apply_fence_delta, recreate_table_fences, restore_missing_fences,
@@ -969,6 +970,7 @@ class SessionSchemaMixin:
         # loops for a rare failure mode.
         report_startup_progress(600.0, phase="state_db_init_schema")
         cursor = self._conn.cursor()
+        readmit_forward_migration(self, cursor)  # before the first DDL; see hermes_state_admission
         cursor.executescript(SCHEMA_SQL)
 
         # Column reconciliation, then the two table-shape repairs ADD COLUMN cannot express.
@@ -976,7 +978,11 @@ class SessionSchemaMixin:
         # Fences and lineage stamp before any heal or governed DML: an old literal would abort
         # those writes, and the stamp is what makes the fork refuse the store from here on.
         fence_cookie = schema_cookie(cursor)
-        lineage = apply_fence_delta(cursor)
+        # Re-admitted on the decode made under the write lock, before the first fence DDL: a store
+        # created or replaced since the probe is gated, and a lease that lost its lock file refuses
+        # (rolled back) unless it can be re-taken.
+        lineage = apply_fence_delta(
+            cursor, admit=lambda current: admit_forward_migration(self, current, reprobe=False))
         self._heal_gateway_routing_pk(cursor)
         # Rebuild session_model_usage if its PRIMARY KEY lacks the ``task`` column (5-column PK on installs
         # already at v22+ when the column landed — the version-gated rebuild is unreachable there, #73823).
