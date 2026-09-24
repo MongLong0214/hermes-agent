@@ -289,42 +289,63 @@ def mark_attempting(obligation_id: str) -> None:
     _update_state(obligation_id, "attempting")
 
 
-def mark_delivered(obligation_id: str) -> None:
-    _update_state(obligation_id, "delivered")
+def mark_delivered(obligation_id: str, *, attempt: Optional[int] = None) -> bool:
+    return _update_state(obligation_id, "delivered", attempt=attempt)
 
 
-def mark_failed(obligation_id: str, error: str = "") -> None:
-    _update_state(obligation_id, "failed", error=error)
+def mark_failed(obligation_id: str, error: str = "", *, attempt: Optional[int] = None) -> bool:
+    return _update_state(obligation_id, "failed", error=error, attempt=attempt)
 
 
-def release_runtime_claim(obligation_id: str, error: str = "") -> bool:
-    """Return an unsent runtime claim to ``failed`` without spending an attempt.
+def release_runtime_claim(obligation_id: str, error: str = "", *, attempt: Optional[int] = None,
+                          pending: bool = False) -> bool:
+    """Return an unsent claim (runtime or boot) to ``failed`` without spending an attempt.
 
     Runtime recovery claims before clearing ``resume_pending`` so two reconnect paths cannot send the
     same row; if the flag cannot be cleared no send was attempted and the claim must not consume the
-    redelivery budget. Fail-closed to the exact current process instance and ``attempting`` state."""
+    redelivery budget. Fail-closed to the exact current process instance and ``attempting`` state;
+    ``attempt`` (the claimed row's ``attempts``) narrows it to that one claim, as for settlement.
+    ``pending`` returns a boot claim taken from ``pending`` as it was, so the next boot sends it without
+    the duplicate marker; only for a process that is exiting, as no sweep of a live one claims ``pending``."""
     pid, started = _owner_stamp()
     if started is None:
         return False
     with _DB_LOCK, _transaction() as conn:
         cursor = conn.execute(
             """UPDATE delivery_obligations
-               SET state='failed', attempts=CASE
+               SET state=?, attempts=CASE
                        WHEN attempts > 0 THEN attempts - 1 ELSE 0 END,
                    updated_at=?, last_error=?
                WHERE obligation_id=? AND state='attempting'
-                 AND owner_pid IS ? AND owner_started_at IS ?""",
-            (time.time(), error[:500] if error else None, obligation_id, pid, started))
+                 AND owner_pid IS ? AND owner_started_at IS ? AND (? IS NULL OR attempts=?)""",
+            ("pending" if pending else "failed", time.time(), error[:500] if error and not pending else None,
+             obligation_id, pid, started, attempt, attempt))
     return bool(cursor.rowcount)
 
 
-def _update_state(obligation_id: str, state: str, error: str = "") -> None:
+def _update_state(obligation_id: str, state: str, error: str = "", *, attempt: Optional[int] = None) -> bool:
+    """Write a checkpoint; False when nothing matched. With ``attempt`` it settles ONE claim: the row must
+    still be ``attempting`` under this pid with that ``attempts`` count (every claim bumps it and re-stamps
+    the owner). A claimant whose row was claimed since, by another process or by a later claim here,
+    matches nothing, so its stale outcome cannot overwrite the newer claim's (a delivered row turned back
+    to failed is sent again). The pid alone is enough: the settler is the live claimant, and its claim
+    re-stamped the row with its own pid and that count, so a start-time compare would add nothing."""
+    pid = _owner_stamp()[0] if attempt is not None else None
     with _DB_LOCK, _transaction() as conn:
-        conn.execute(
+        cursor = conn.execute(
             """UPDATE delivery_obligations
                SET state=?, updated_at=?, last_error=?
-               WHERE obligation_id=?""",
-            (state, time.time(), error[:500] if error else None, obligation_id))
+               WHERE obligation_id=?
+                 AND (? IS NULL OR (state='attempting' AND owner_pid IS ? AND attempts=?))""",
+            (state, time.time(), error[:500] if error else None, obligation_id, attempt, pid, attempt))
+    return bool(cursor.rowcount)
+
+
+def _log_abandoned(oid, platform, chat_id, state, attempts, created_at, now) -> None:
+    """A reply given up on is logged at ERROR: nothing sends it again and nobody else is told."""
+    logger.error("delivery obligation %s to %s:%s abandoned in state %s after %d attempt(s), %.1f h after it "
+                 "was recorded: the reply was never confirmed delivered and is not sent again",
+                 oid, platform, chat_id, state, attempts, (now - created_at) / 3600)
 
 
 def _claimed_row(oid, session_key, platform, chat_id, thread_id, content, attempts, profile, *,
@@ -333,8 +354,9 @@ def _claimed_row(oid, session_key, platform, chat_id, thread_id, content, attemp
     """Claimed-row dict handed back for redelivery. A marked row names its own cause: ``flood`` (a reply
     the rate limit refused, possibly after accepting part of it) gets FLOOD_MARKER at boot or at runtime, a
     ``runtime`` reconnect replay gets RECONNECTED_MARKER, and a boot-recovered crash keeps the runner's
-    restart marker default. ``last_error`` is the row's pre-claim error, carried so a runtime claim that is
-    released unsent goes back to ``failed`` with the same error and keeps its retry eligibility."""
+    restart marker default. ``last_error`` is the row's pre-claim error, carried so a claim that is
+    released unsent goes back to ``failed`` with the same error and keeps its retry eligibility.
+    ``attempts`` is the post-claim count: with the owner pid it names this claim when it is settled."""
     marker = FLOOD_MARKER if flood else (RECONNECTED_MARKER if runtime else None)
     return {"obligation_id": oid, "session_key": session_key, "platform": platform, "chat_id": chat_id,
             "thread_id": thread_id, "content": content, "needs_marker": needs_marker,
@@ -380,6 +402,7 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
                 conn.execute(
                     """UPDATE delivery_obligations
                        SET state='abandoned', updated_at=? WHERE obligation_id=?""", (now, oid))
+                _log_abandoned(oid, platform, chat_id, state, attempts, created_at, now)
                 continue
             if ((deliverable_platforms is not None and platform not in deliverable_platforms)
                     or (deliverable_targets is not None and (platform, adapter_profile) not in deliverable_targets)):
@@ -401,23 +424,23 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
                         "profile": adapter_profile or "default", "attempts": attempts,
                         "adopted": True, "not_before": flood_not_before(updated_at, last_error)})
                 continue
-            # A claimed flood row is resent as a fresh attempt: clear the stale refusal so an interrupted
-            # resend is seen as 'attempting' with no error by the next boot and gets the marker.
+            # Every claim is a fresh attempt held by this process: 'attempting' with no error, so the
+            # runtime sweep (which claims this process's 'failed' rows) cannot claim it a second time
+            # while the boot send is in flight, and an interrupted resend gets the marker next boot.
             cursor = conn.execute(
                 """UPDATE delivery_obligations
                    SET owner_pid=?, owner_started_at=?, attempts=attempts+1, updated_at=?,
                        adapter_profile=COALESCE(adapter_profile, 'default'),
-                       state=CASE WHEN ? THEN 'attempting' ELSE state END,
-                       last_error=CASE WHEN ? THEN NULL ELSE last_error END
+                       state='attempting', last_error=NULL
                    WHERE obligation_id=? AND (owner_pid IS ? OR owner_pid=?)""",
-                (pid, started, now, 1 if flood_row else 0, 1 if flood_row else 0, oid, owner_pid, owner_pid))
+                (pid, started, now, oid, owner_pid, owner_pid))
             if cursor.rowcount:
                 # pending = never started, redeliver plainly; anything else (crashed mid-await, other
                 # rejection, a flood refusal whose earlier chunks the platform may have accepted) carries
-                # the marker.
+                # the marker. The pre-claim error rides along for a claim released unsent.
                 claimed.append(_claimed_row(oid, session_key, platform, chat_id, thread_id, content, attempts,
                                             adapter_profile or "default", needs_marker=state != "pending",
-                                            flood=flood_row))
+                                            flood=flood_row, last_error=last_error))
     return claimed
 
 
@@ -455,11 +478,12 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
                 continue
             owner_guard = (now, oid, owner_pid, owner_started_at)
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:  # exhausted -> abandoned
-                conn.execute(
-                    """UPDATE delivery_obligations
-                       SET state='abandoned', updated_at=?
-                       WHERE obligation_id=? AND state='failed'
-                         AND owner_pid IS ? AND owner_started_at IS ?""", owner_guard)
+                if conn.execute(
+                        """UPDATE delivery_obligations
+                           SET state='abandoned', updated_at=?
+                           WHERE obligation_id=? AND state='failed'
+                             AND owner_pid IS ? AND owner_started_at IS ?""", owner_guard).rowcount:
+                    _log_abandoned(oid, row_platform, chat_id, "failed", attempts, created_at, now)
                 continue
             if now < due:
                 continue  # the platform's wait or the backoff has not passed; the timer comes back for it

@@ -565,6 +565,119 @@ class TestGatewayRedeliverySweep:
         assert _row("ob-1")["attempts"] == 0
         assert _row("ob-1")["last_error"] == "send_path_degraded"
 
+    @pytest.mark.asyncio
+    async def test_only_the_current_claimant_settles_a_claimed_row(self, monkeypatch):
+        """A settlement names one claim: the claimant's pid AND that claim's ``attempts``, on a row still
+        ``attempting``. While a boot redelivery's send is in flight the reconnect sweep must not claim the
+        row again; once another gateway has taken it over, neither another owner's claim at the same
+        count, nor an older count, nor a second outcome for a settled claim lands, so the stale boot
+        send's failure cannot turn that delivery back into a retryable failure (a second send)."""
+        _record()
+        dl.mark_failed("ob-1", "send_path_degraded")
+        _orphan("ob-1")
+        seen = {}
+
+        def other_gateway_stamp():
+            return os.getpid() + 1, 202
+
+        async def send_while_taken_over(**_kwargs):
+            seen["reconnect_claim"] = dl.sweep_failed_for_runtime("slack")
+            with monkeypatch.context() as other_gateway:  # this process reads as dead to it
+                other_gateway.setattr(dl, "_owner_stamp", other_gateway_stamp)
+                other_gateway.setattr(dl, "_owner_alive", lambda pid, started: False)
+                (newer,) = dl.sweep_recoverable()
+            claim = newer["attempts"]
+            seen["same_count_other_owner"] = dl.mark_delivered("ob-1", attempt=claim)
+            with monkeypatch.context() as other_gateway:
+                other_gateway.setattr(dl, "_owner_stamp", other_gateway_stamp)
+                seen["same_owner_older_count"] = dl.mark_failed("ob-1", "stale", attempt=claim - 1)
+                seen["current_claim"] = dl.mark_delivered("ob-1", attempt=claim)
+                seen["settled_claim_again"] = dl.mark_failed("ob-1", "late", attempt=claim)
+            return MagicMock(success=False, error="nope")
+
+        adapter = MagicMock()
+        adapter.send = send_while_taken_over
+
+        await self._runner(adapter)._redeliver_pending_obligations()
+
+        assert _row("ob-1")["state"] == "delivered"
+        assert seen == {"reconnect_claim": [], "same_count_other_owner": False,
+                        "same_owner_older_count": False, "current_claim": True, "settled_claim_again": False}
+
+    @pytest.mark.asyncio
+    async def test_unconfirmed_redelivery_is_resent_in_process_and_unsent_claims_go_back_unspent(self):
+        """A reconnect redelivery whose send raised, and one whose send a cancel (adapter teardown) cut
+        short, may each have reached the platform: both are settled ``failed`` with the attempt spent, and
+        this process sends them again with the marker once the backoff has passed, instead of leaving them
+        for a restart that may come after the stale cutoff. The claim never sent goes back unspent."""
+        import asyncio
+
+        from gateway.config import Platform
+
+        by_chat = {}
+        for n in (1, 2, 3):
+            by_chat[f"C{n}"] = f"ob-{n}"
+            _record(f"ob-{n}", session_key=f"agent:main:slack:channel:C{n}", chat_id=f"C{n}")
+            dl.mark_failed(f"ob-{n}", "send_path_degraded")
+        sent_to, second_send = [], asyncio.Event()
+
+        async def refused_then_hanging_send(chat_id, **_kwargs):
+            sent_to.append(chat_id)
+            if len(sent_to) == 1:
+                raise ConnectionRefusedError(61, "Connect call failed")
+            second_send.set()
+            await asyncio.Event().wait()
+
+        adapter = MagicMock()
+        adapter.send = refused_then_hanging_send
+        task = asyncio.create_task(
+            self._runner(adapter)._redeliver_failed_obligations_for_platform(Platform.SLACK))
+        await asyncio.wait_for(second_send.wait(), timeout=5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        raised, interrupted = (by_chat[chat] for chat in sent_to)
+        (unsent,) = set(by_chat.values()) - {raised, interrupted}
+        settled = {oid: (_row(oid)["state"], _row(oid)["attempts"], _row(oid)["last_error"])
+                   for oid in (raised, interrupted, unsent)}
+        assert settled == {raised: ("failed", 1, "send failed"), interrupted: ("failed", 1, "send failed"),
+                           unsent: ("failed", 0, "send_path_degraded")}
+        (due,) = dl.pending_retries()  # what this process's redelivery timer waits for
+        resent = dl.sweep_failed_for_runtime("slack", now=due["not_before"] + 1)
+        assert sorted(r["obligation_id"] for r in resent) == sorted(by_chat.values())
+        assert all(r["marker"] == dl.RECONNECTED_MARKER for r in resent)
+
+    @pytest.mark.asyncio
+    async def test_shutdown_hands_back_a_never_started_boot_claim_as_it_was(self):
+        """Shutdown begins while a boot redelivery batch is going out. The rows not yet sent go back
+        unspent, and one claimed from ``pending`` goes back to ``pending``: it provably never started, so
+        the next boot sends it plainly instead of as a possible duplicate."""
+        for n in (1, 2):
+            _record(f"ob-{n}", session_key=f"agent:main:slack:channel:C{n}", chat_id=f"C{n}")
+            _orphan(f"ob-{n}")
+        sent_to = []
+
+        async def send_then_shut_down(chat_id, **_kwargs):
+            sent_to.append(chat_id)
+            runner._running = False
+            return MagicMock(success=True, error="")
+
+        adapter = MagicMock()
+        adapter.send = send_then_shut_down
+        runner = self._runner(adapter)
+        runner._running = True
+
+        await runner._redeliver_pending_obligations()
+
+        assert len(sent_to) == 1  # nothing more goes out once shutdown has begun
+        (unsent,) = {"ob-1", "ob-2"} - {"ob-" + chat[1:] for chat in sent_to}
+        assert (_row(unsent)["state"], _row(unsent)["attempts"]) == ("pending", 0)
+        _orphan(unsent)
+        next_boot = self._adapter()
+        await self._runner(next_boot)._redeliver_pending_obligations()
+        assert next_boot.send.call_args.kwargs["content"] == "the final answer"
+
     @pytest.mark.parametrize(
         ("send_success", "ledger_method"),
         [(True, "mark_delivered"), (False, "mark_failed")],

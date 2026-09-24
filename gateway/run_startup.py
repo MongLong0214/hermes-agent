@@ -354,17 +354,63 @@ class GatewayStartupMixin:
         return claimed
 
     @staticmethod
-    async def _release_runtime_claim_quiet(obligation_id, log_fmt: str, error: str = "send_path_degraded") -> None:
-        """Release an unsent runtime delivery-ledger claim; log-only on failure. ``error`` is what the row
-        goes back to ``failed`` with: the claim's own pre-claim error when the caller knows it, so a
-        flood-refused row keeps its ``flood_control:<seconds>`` and stays on the flood timer's list (the
-        release re-stamps ``updated_at``, so it waits the platform's figure once more); else
-        ``send_path_degraded``."""
-        from gateway.delivery_ledger import release_runtime_claim
-        try:
-            await asyncio.to_thread(release_runtime_claim, obligation_id, error)
-        except Exception:
-            logger.debug(log_fmt, obligation_id, exc_info=True)
+    def _hand_back_claims(rows: list, *, reconnect_only: bool = False, shutting_down: bool = False,
+                          interrupted: Optional[dict] = None) -> None:
+        """Hand claims whose send never started back to ``failed`` with the attempt refunded, each fenced
+        to its own claim; log-only on failure. A row goes back with its pre-claim error, so a flood-refused
+        row keeps its ``flood_control:<seconds>`` and stays on the flood timer's list (the release
+        re-stamps ``updated_at``, so it waits the platform's figure once more); with no error, or with
+        ``reconnect_only`` (the adapter is gone) and any non-flood error, it becomes
+        ``send_path_degraded``, or the redelivery timer would claim and release it until the adapter is
+        back. ``shutting_down`` returns a boot claim taken from ``pending`` to ``pending``: it provably
+        never started, so the next boot sends it without the duplicate marker. ``interrupted`` is a claim
+        whose send a cancel cut short: it may have reached the platform, so it is settled ``failed`` with
+        its attempt spent and goes out again with the marker. Callers release each claim at most once:
+        after a release the same pid and ``attempts`` can name a newer claim."""
+        from gateway.delivery_ledger import is_flood_error, mark_failed, release_runtime_claim
+
+        if interrupted is not None:
+            try:
+                mark_failed(interrupted["obligation_id"], "send failed", attempt=interrupted.get("attempts"))
+            except Exception:
+                logger.debug("failed to settle interrupted delivery %s", interrupted["obligation_id"], exc_info=True)
+        for row in rows:
+            error = row.get("last_error") or ""
+            if not error or (reconnect_only and not is_flood_error(error)):
+                error = "send_path_degraded"
+            try:
+                release_runtime_claim(row["obligation_id"], error, attempt=row.get("attempts"),
+                                      pending=shutting_down and not row.get("needs_marker"))
+            except Exception:
+                logger.debug("failed to release unsent delivery claim %s", row["obligation_id"], exc_info=True)
+
+    async def _release_unsent_claims(self, rows: list, *, reconnect_only: bool = False,
+                                     shutting_down: bool = False, interrupted: Optional[dict] = None) -> None:
+        """``_hand_back_claims`` in one worker call for the batch, so a second cancel cannot leave half of it
+        claimed. An interrupted send is re-sent in this process once its backoff passes: the timers are armed
+        from the worker's completion, which a second cancel of this await cannot skip either."""
+        if not rows and interrupted is None:
+            return
+        work = asyncio.ensure_future(asyncio.to_thread(
+            self._hand_back_claims, rows, reconnect_only=reconnect_only, shutting_down=shutting_down,
+            interrupted=interrupted))
+        if interrupted is not None:
+            work.add_done_callback(self._rearm_after_interrupted_send)
+        await asyncio.shield(work)
+
+    def _rearm_after_interrupted_send(self, _work: asyncio.Future) -> None:
+        if getattr(self, "_running", False):
+            task = self._retain_background_task(asyncio.ensure_future(self._arm_flood_timers_for_waiting_rows()))
+            task.add_done_callback(self._late_failure_callback(
+                "arming redelivery timers after an interrupted send failed", level=logging.DEBUG))
+
+    def _release_abandoned_sweep(self, sweep: asyncio.Future) -> None:
+        """Done-callback for a runtime claim whose caller was cancelled: the claim thread commits regardless,
+        so its rows are handed back from the thread's completion, which no further cancel can stop."""
+        if sweep.cancelled() or sweep.exception() is not None or not sweep.result():
+            return
+        asyncio.get_running_loop().run_in_executor(
+            None, copy_context().run, lambda: self._hand_back_claims(sweep.result()))
 
     def _schedule_flood_redelivery(self, platform, *, profile: Optional[str] = None) -> None:
         """Wake one deadline-driven ledger worker per bot identity, never sleep in a send."""
@@ -426,45 +472,74 @@ class GatewayStartupMixin:
         # No early return on an empty claim: the boot sweep may have ADOPTED flood-refused rows that are
         # not due yet, and those still need their timer armed below.
         try:
-            from gateway.delivery_ledger import RECOVERED_MARKER, mark_delivered, mark_failed
+            from gateway.delivery_ledger import RECOVERED_MARKER
         except Exception:
             logger.debug("delivery ledger import failed", exc_info=True)
             return 0
         redelivered = 0
-        for row in claimed:
-            if row.get("adopted"):
-                # Adopted at boot inside its flood wait: its resume flag is cleared with the others, and
-                # the timer armed below sends it once the platform's deadline has passed.
-                continue
-            adapter = await self._obligation_adapter(row)
-            if adapter is None:
-                continue
-            content = row["content"]
-            if row.get("needs_marker"):
-                content = row.get("marker", RECOVERED_MARKER) + content
-            metadata = {"thread_id": row["thread_id"]} if row.get("thread_id") else None
+        # Adopted at boot inside its flood wait: its resume flag is cleared with the others, and the timer
+        # armed below sends it once the platform's deadline has passed.
+        rows = [row for row in claimed if not row.get("adopted")]
+        for index, row in enumerate(rows):
+            if not getattr(self, "_running", True):
+                # Shutdown began after the claim: nothing more goes out on adapters being torn down, and
+                # the claims not yet sent go back unspent for the next boot's sweep.
+                await self._release_unsent_claims(rows[index:], shutting_down=True)
+                break
             try:
-                result = await adapter.send(chat_id=row["chat_id"], content=content, metadata=metadata)
-            except Exception as send_err:
-                logger.warning("obligation %s: redelivery send raised: %s", row["obligation_id"], send_err)
-                result = None
-            with _log_suppressed(logging.DEBUG, "delivery ledger update failed", exc_info=True):
-                if result is not None and getattr(result, "success", False):
-                    await asyncio.to_thread(mark_delivered, row["obligation_id"])
+                if await self._redeliver_claimed_row(row, RECOVERED_MARKER):
                     redelivered += 1
-                    logger.info(
-                        "Redelivered recovered final response to %s:%s (obligation %s, attempt %d)",
-                        row["platform"], row["chat_id"], row["obligation_id"], row["attempts"],
-                    )
-                else:
-                    await asyncio.to_thread(
-                        mark_failed, row["obligation_id"], str(getattr(result, "error", "") or "send failed")
-                    )
+            except BaseException:
+                # Cancelled (adapter teardown, shutdown). A send it cut short is settled spent and goes out
+                # again with the marker; otherwise this row's own release or settlement is already in a
+                # worker. The rows after it never started and go back unspent.
+                await self._release_unsent_claims(
+                    rows[index + 1:], shutting_down=not getattr(self, "_running", True),
+                    interrupted=row if row.get("send_interrupted") else None)
+                raise
         # Whatever is still waiting on a flood penalty or a retry backoff (adopted at boot, skipped as not
         # yet due, refused again just now) gets a timer, so no rejected reply waits for the next restart.
         with _log_suppressed(logging.DEBUG, "arming flood redelivery timers failed", exc_info=True):
             await self._arm_flood_timers_for_waiting_rows()
         return redelivered
+
+    async def _redeliver_claimed_row(self, row: dict, default_marker: str) -> bool:
+        """Send one claimed row and settle it under that claim (``attempt`` = the claim's ``attempts``, so a
+        claimant whose row was taken over since cannot overwrite the newer claim). True when delivered.
+        A send that raised is settled like a rejected one, ``failed`` with its attempt spent, and the
+        backoff timer sends it again with the marker. No exception type is taken as proof that nothing
+        reached the platform: an adapter may deliver the first chunks of a long reply, or retry a request
+        internally, before the call that raises. A send cut short by a cancel is flagged for the caller,
+        which settles it the same way."""
+        from gateway.delivery_ledger import mark_delivered, mark_failed
+
+        adapter = await self._obligation_adapter(row)
+        if adapter is None:
+            return False
+        content = row["content"]
+        if row.get("needs_marker"):
+            content = row.get("marker", default_marker) + content
+        metadata = {"thread_id": row["thread_id"]} if row.get("thread_id") else None
+        try:
+            result = await adapter.send(chat_id=row["chat_id"], content=content, metadata=metadata)
+        except Exception as send_err:
+            logger.warning("obligation %s: redelivery send raised, retried with the marker after its backoff: %s",
+                           row["obligation_id"], send_err)
+            result = None
+        except BaseException:
+            row["send_interrupted"] = True
+            raise
+        with _log_suppressed(logging.DEBUG, "delivery ledger update failed", exc_info=True):
+            if result is not None and getattr(result, "success", False):
+                await asyncio.to_thread(mark_delivered, row["obligation_id"], attempt=row.get("attempts"))
+                logger.info(
+                    "Redelivered recovered final response to %s:%s (obligation %s, attempt %d)",
+                    row["platform"], row["chat_id"], row["obligation_id"], row["attempts"],
+                )
+                return True
+            await asyncio.to_thread(mark_failed, row["obligation_id"],
+                                    str(getattr(result, "error", "") or "send failed"), attempt=row.get("attempts"))
+        return False
 
     async def _obligation_adapter(self, row: dict):
         """Resolve the adapter for a claimed ledger row, or None when it cannot be delivered now."""
@@ -478,19 +553,11 @@ class GatewayStartupMixin:
         else:
             # Startup rows preserve the historical default-adapter route.
             adapter = self.adapters.get(platform)
-        # A runtime claim whose reconnect vanished before dispatch is released without spending an
-        # attempt; startup claims keep their state (attempts cap + stale cutoff bound retries).
-        # Only a flood row keeps its error (the platform's wait must be honoured); any other row
-        # becomes reconnect-only, or the redelivery timer would claim and release it until the
-        # adapter is back.
-        if adapter is None and row.get("runtime_recovery"):
-            from gateway.delivery_ledger import is_flood_error
-
-            last_error = row.get("last_error")
-            await self._release_runtime_claim_quiet(
-                row["obligation_id"], "failed to release undispatched runtime obligation %s",
-                error=last_error if is_flood_error(last_error) else "send_path_degraded",
-            )
+        # A claim whose adapter vanished before dispatch is released without spending an attempt (a boot
+        # claim too: it is 'attempting' now, which no sweep of this process claims again). Only a flood
+        # row keeps its error; any other row becomes reconnect-only.
+        if adapter is None:
+            await self._release_unsent_claims([row], reconnect_only=True)
         return adapter
 
     async def _redeliver_pending_obligations(self) -> int:
@@ -504,11 +571,20 @@ class GatewayStartupMixin:
         """Replay one adapter identity's transient failures after reconnect: the startup sweep cannot
         claim live-owner rows, so ``send_path_degraded`` responses would otherwise stay failed until
         the next restart. Best-effort; reuses the startup redelivery contract."""
+        sweep = None
         try:
             from gateway.delivery_ledger import ledger_enabled, sweep_failed_for_runtime
             if not await asyncio.to_thread(ledger_enabled):
                 return 0
-            claimed = await asyncio.to_thread(sweep_failed_for_runtime, platform.value, profile=profile)
+            # The claim commits in its worker thread whether or not this await survives a cancel
+            # (adapter teardown, shutdown): shield it, so a cancelled caller still learns what it claimed.
+            sweep = asyncio.ensure_future(
+                asyncio.to_thread(sweep_failed_for_runtime, platform.value, profile=profile))
+            claimed = await asyncio.shield(sweep)
+        except asyncio.CancelledError:
+            if sweep is not None:
+                sweep.add_done_callback(self._release_abandoned_sweep)
+            raise
         except Exception:
             logger.debug(
                 "runtime delivery ledger sweep failed after %s reconnect", platform.value, exc_info=True,
@@ -517,14 +593,17 @@ class GatewayStartupMixin:
         if not claimed:
             return 0
         # Clear before any send so the reconnect path cannot both redeliver AND resume the same turn.
-        sendable = await self._clear_resume_pending_for_claimed_obligations(claimed, require_success=True)
+        try:
+            sendable = await self._clear_resume_pending_for_claimed_obligations(claimed, require_success=True)
+        except BaseException:
+            await self._release_unsent_claims(claimed)
+            raise
         sendable_ids = {row["obligation_id"] for row in sendable}
-        for row in claimed:
-            if row["obligation_id"] not in sendable_ids:
-                await self._release_runtime_claim_quiet(
-                    row["obligation_id"], "failed to release runtime delivery claim %s",
-                    error=row.get("last_error") or "send_path_degraded",
-                )
+        try:
+            await self._release_unsent_claims([row for row in claimed if row["obligation_id"] not in sendable_ids])
+        except BaseException:
+            await self._release_unsent_claims(sendable)
+            raise
         return await self._redeliver_claimed_obligations(sendable)
 
     def _resume_pending_candidates(self, platform=None) -> Optional[list]:
