@@ -315,6 +315,7 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
         self._managed = is_managed()
         self._unavailable_reported = False
         self._format_error: Optional[BaseException] = None
+        self._emit_failed = False
         super().__init__(*args, **kwargs)
         self._record_stream_stat()
 
@@ -351,12 +352,14 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
     def _reopen_if_externally_rotated(self) -> None:
         """Reopen when ``baseFilename`` was renamed, unlinked, or replaced by another inode.
 
-        Silent + best-effort: any error falls back to the existing (possibly stale)
-        stream so logging keeps working instead of dying on a stat failure.
+        A missing path or a parent that is no longer a directory (the log dir removed or
+        replaced by a file) means the open stream writes to an unlinked inode: reopen, and if
+        that fails the stream stays ``None`` so emit names the path once. Any other stat error
+        keeps the existing stream so logging survives a transient failure.
         """
         try:
             st = os.stat(self.baseFilename)
-        except FileNotFoundError:
+        except (FileNotFoundError, NotADirectoryError):
             self._reopen_stream()  # rotated/unlinked underneath us: recreate at the path
             return
         except OSError:
@@ -371,11 +374,13 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
         # The kernel caches inode metadata, so this stat is sub-microsecond on a hot file.
         if self.stream is not None or os.path.exists(self.baseFilename):
             self._reopen_if_externally_rotated()
+        self._emit_failed = False
         super().emit(record)
-        # A record actually reached the file: only now has the destination recovered. Resetting
-        # in _open() is wrong — open() succeeds on a device whose write/flush still raise EIO,
-        # which re-armed the report and printed the path once per record.
-        if self.stream is not None:
+        # Only a record that reached the file proves the destination recovered. Neither a
+        # successful open() (a device may still raise EIO on write) nor a live stream does: a
+        # format error keeps the stream without writing, and Windows' concurrent handler closes
+        # its stream after every successful write.
+        if not self._emit_failed:
             self._unavailable_reported = False
 
     def handleError(self, record: logging.LogRecord) -> None:
@@ -386,6 +391,7 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
         captures into chat output).
         """
         exc = sys.exc_info()[1]
+        self._emit_failed = True
         # Cleared on every path so a handled exception (and its frames) is not kept alive.
         raised_by_format, self._format_error = exc is self._format_error, None
         if _is_windows_concurrent_log_lock_timeout(exc):
