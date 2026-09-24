@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import os
 import threading
 
@@ -33,8 +34,8 @@ def _event(text="hello"):
     return CanonicalIngressEvent("receipt-binding", "evt-1", "author", "channel", text)
 
 
-def _runner(tmp_path, monkeypatch):
-    home = tmp_path / "home"
+def _runner(tmp_path, monkeypatch, home=None):
+    home = home or tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr("hermes_state.DEFAULT_DB_PATH", home / "state.db")
@@ -66,6 +67,53 @@ def _runner(tmp_path, monkeypatch):
     with runner._agent_cache_lock:
         runner._agent_cache[entry.session_key] = (agent, "exact", 0, entry.session_id)
     return runner, entry, source, db, agent
+
+
+class _SaturatedPool(concurrent.futures.ThreadPoolExecutor):
+    """Once ``holding`` is set, accepts work without handing it to a thread, like a full pool."""
+
+    def __init__(self):
+        super().__init__(max_workers=2)
+        self.holding = False
+        self.queued = []
+
+    def submit(self, fn, /, *args, **kwargs):
+        if not self.holding:
+            return super().submit(fn, *args, **kwargs)
+        future = concurrent.futures.Future()
+        self.queued.append((future, fn, args, kwargs))
+        return future
+
+    def drain(self):
+        """Hand every queued item to a thread the way ThreadPoolExecutor's work item does."""
+        for future, fn, args, kwargs in self.queued:
+            if future.set_running_or_notify_cancel():
+                future.set_result(fn(*args, **kwargs))
+
+
+def _mock_processes(monkeypatch, running, on_hold=None):
+    """A process table whose reap kills exactly the ids started after the baseline."""
+    reaped = threading.Event()
+
+    def snapshot(_task_id):
+        if on_hold is not None:
+            on_hold()
+        return frozenset(running)
+
+    def kill_started_since(_task_id, baseline_ids, *, source):
+        killed = running - set(baseline_ids)
+        running.difference_update(killed)
+        reaped.set()
+        return len(killed)
+
+    monkeypatch.setattr(process_registry, "snapshot_running_ids", snapshot)
+    monkeypatch.setattr(process_registry, "kill_started_since", kill_started_since)
+    return reaped
+
+
+def _join_new_threads(before):
+    for thread in set(threading.enumerate()) - before:
+        thread.join(timeout=5)
 
 
 def test_terminal_replay_runs_actor_once(tmp_path, monkeypatch):
@@ -252,6 +300,89 @@ def test_completed_canonical_turn_releases_process_ownership(tmp_path, monkeypat
     asyncio.run(exercise())
 
 
+def test_cancel_while_turn_is_queued_never_runs_it_and_leaves_no_process_ownership(tmp_path, monkeypatch):
+    async def exercise():
+        runner, entry, source, _db, agent = _runner(tmp_path, monkeypatch)
+        pool = _SaturatedPool()
+        # Hold whichever pool the turn is handed to; the baseline snapshot is taken just before.
+        asyncio.get_running_loop().set_default_executor(pool)
+        monkeypatch.setattr(runner, "_get_executor", lambda: pool)
+        running = {"proc-q"}
+        _mock_processes(monkeypatch, running, on_hold=lambda: setattr(pool, "holding", True))
+        try:
+            task = asyncio.create_task(
+                CanonicalReceiptCoordinator(runner).submit(_binding(entry, source), _event())
+            )
+            for _ in range(500):
+                if pool.queued:
+                    break
+                await asyncio.sleep(0.01)
+            assert pool.queued
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            pool.drain()
+            assert agent.calls == 0
+
+            # A same-task process no turn owns, then a /stop before the next turn republishes.
+            running.add("proc-u")
+            runner._session_state(entry.session_key).turn.agent = agent
+            before = set(threading.enumerate())
+            runner._interrupt_running_turn(entry.session_key, interrupt_reason="stop", invalidation_reason="stop")
+            _join_new_threads(before)
+            assert running == {"proc-q", "proc-u"}
+        finally:
+            runner.session_store.close_all_db_handles()
+    asyncio.run(exercise())
+
+
+def test_cancel_while_worker_runs_interrupts_it_and_holds_the_turn_until_it_exits(tmp_path, monkeypatch):
+    async def exercise():
+        runner, entry, source, _db, agent = _runner(tmp_path, monkeypatch)
+        running = {"proc-q"}
+        reaped = _mock_processes(monkeypatch, running)
+        entered, interrupted, may_exit = threading.Event(), threading.Event(), threading.Event()
+        try:
+            def blocked_run(text, *, conversation_history, task_id):
+                agent.calls += 1
+                running.add("proc-p")
+                entered.set()
+                interrupted.wait(5)
+                may_exit.wait(5)
+                return {"completed": False, "interrupted": True, "session_id": task_id,
+                        "final_response": "", "messages": conversation_history}
+
+            monkeypatch.setattr(agent, "interrupt", lambda _text=None: interrupted.set())
+            monkeypatch.setattr(agent, "run_conversation", blocked_run)
+            coordinator = CanonicalReceiptCoordinator(runner)
+            task = asyncio.create_task(coordinator.submit(_binding(entry, source), _event()))
+            assert await asyncio.to_thread(entered.wait, 5)
+            task.cancel()
+
+            assert await asyncio.to_thread(interrupted.wait, 2)
+            assert await asyncio.to_thread(reaped.wait, 2)
+            assert running == {"proc-q"}
+            # The worker is still inside the actor: the turn keeps its slot, so a second turn refuses.
+            with pytest.raises(ValueError, match="^canonical_turn_busy$"):
+                await coordinator.submit(_binding(entry, source), _event("second"))
+            assert not task.done()
+
+            may_exit.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert agent.calls == 1
+            assert not runner._is_session_running(entry.session_key)
+            lease = await runner._turn_leases.acquire(
+                entry.session_id, owner_key="probe", generation=0, timeout=0.5,
+            )
+            runner._turn_leases.release(lease)
+        finally:
+            interrupted.set()
+            may_exit.set()
+            runner.session_store.close_all_db_handles()
+    asyncio.run(exercise())
+
+
 def test_replaced_db_after_duplicate_read_refuses_terminal_replay(tmp_path, monkeypatch):
     async def exercise():
         runner, entry, source, db, agent = _runner(tmp_path, monkeypatch)
@@ -266,6 +397,35 @@ def test_replaced_db_after_duplicate_read_refuses_terminal_replay(tmp_path, monk
                 replacement = tmp_path / "replacement.db"
                 replacement.touch()
                 os.replace(replacement, db.db_path)
+                return value
+
+            monkeypatch.setattr(db, "get_meta", replace_after_read)
+            with pytest.raises(ValueError, match="^canonical_binding_stale$"):
+                await coordinator.submit(_binding(entry, source), _event())
+            assert agent.calls == 1
+        finally:
+            runner.session_store.close_all_db_handles()
+    asyncio.run(exercise())
+
+
+def test_home_behind_a_symlink_binds_by_file_and_still_refuses_a_replaced_db(tmp_path, monkeypatch):
+    (tmp_path / "real").mkdir()
+    (tmp_path / "link").symlink_to(tmp_path / "real", target_is_directory=True)
+    home = tmp_path / "link" / "home"
+
+    async def exercise():
+        runner, entry, source, db, agent = _runner(tmp_path, monkeypatch, home=home)
+        try:
+            coordinator = CanonicalReceiptCoordinator(runner)
+            first = await coordinator.submit(_binding(entry, source), _event())
+            assert (first.status, first.terminal_text, agent.calls) == ("terminal", "done:hello", 1)
+            original_get_meta = db.get_meta
+
+            def replace_after_read(*args, **kwargs):
+                value = original_get_meta(*args, **kwargs)
+                replacement = home / "replacement.db"
+                replacement.touch()
+                os.replace(replacement, home / "state.db")
                 return value
 
             monkeypatch.setattr(db, "get_meta", replace_after_read)

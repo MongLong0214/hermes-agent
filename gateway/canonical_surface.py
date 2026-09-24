@@ -31,6 +31,57 @@ def _required_text(value: Any, *, limit: int) -> str:
     return value
 
 
+def _path_identity(path: Path | None) -> tuple[int, int] | None:
+    """The (device, inode) the path names now, or None when it names nothing."""
+    if path is None:
+        return None
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return stat.st_dev, stat.st_ino
+
+
+def cached_actor(runner: Any, session_key: str) -> tuple[Any, Any]:
+    """The actor cached at ``session_key`` and the session id its cache entry was built for."""
+    with runner._agent_cache_lock:
+        cached = runner._agent_cache.get(session_key)
+    if not cached:
+        return None, None
+    if isinstance(cached, tuple):
+        actor = cached[0]
+        return actor, cached[3] if len(cached) > 3 else getattr(actor, "session_id", None)
+    return cached, getattr(cached, "session_id", None)
+
+
+def bound_actor_db(
+    runner: Any, session_key: str, session_id: str, db_path: Path | None,
+    db_identity: tuple[int, int] | None,
+) -> tuple[Any, Any] | None:
+    """The cached actor and its DB handle, only while both are bound to the proven DB file.
+
+    Bound: the cache entry at ``session_key`` serves ``session_id``, the actor's ``_session_db``
+    was opened on the file ``db_identity`` names, and ``db_path`` still names that file. Paths are
+    matched by file identity, never by spelling: the writer registry opens the resolved path while
+    the proof keeps the home's own spelling, so a symlinked home must not read as a different DB.
+    The claim, the pre-run and the post-run rechecks share this one answer; a missing piece is
+    unbound, never an exception.
+    """
+    actor, cached_session_id = cached_actor(runner, session_key)
+    db = getattr(actor, "_session_db", None)
+    if (
+        actor is None
+        or db is None
+        or db_identity is None
+        or cached_session_id != session_id
+        or getattr(actor, "session_id", None) != session_id
+        or getattr(db, "_db_file_identity", None) != db_identity
+        or _path_identity(db_path) != db_identity
+    ):
+        return None
+    return actor, db
+
+
 @dataclass(frozen=True)
 class CanonicalTurnResult:
     """The terminal selected from one canonical turn, before request readback."""
@@ -214,14 +265,6 @@ class ExistingCanonicalBindingResolver:
         assert proof is not None
         return entry, proof
 
-    @staticmethod
-    def _db_identity(path: Path) -> tuple[int, int] | None:
-        try:
-            stat = path.stat()
-        except OSError:
-            return None
-        return stat.st_dev, stat.st_ino
-
     def _resolve(
         self, binding: CanonicalSurfaceBinding, event: Any, *, require_proof: bool
     ) -> tuple[Any, CanonicalBindingProof | None]:
@@ -246,7 +289,7 @@ class ExistingCanonicalBindingResolver:
         db = None
         close_db = False
         db_path = self._existing_db_path(binding.session_key) if require_proof else None
-        db_identity = self._db_identity(db_path) if db_path is not None else None
+        db_identity = _path_identity(db_path)
         try:
             if self._session_store._should_reset(entry, origin) is not None:
                 raise ValueError("canonical_binding_stale")
@@ -266,7 +309,7 @@ class ExistingCanonicalBindingResolver:
                 if (
                     db_path is None
                     or db_identity is None
-                    or self._db_identity(db_path) != db_identity
+                    or _path_identity(db_path) != db_identity
                 ):
                     raise ValueError("canonical_binding_stale")
                 proof: CanonicalBindingProof | None = CanonicalBindingProof(
@@ -374,38 +417,19 @@ class CanonicalReceiptCoordinator:
     @staticmethod
     def _borrow_actor_db(runner: Any, proof: CanonicalBindingProof) -> tuple[Any, Any]:
         """Return only the cached actor and its existing writable DB matching resolver proof."""
-        with runner._agent_cache_lock:
-            cached = runner._agent_cache.get(proof.session_key)
-            actor = cached[0] if isinstance(cached, tuple) else cached
-            cached_session_id = (
-                cached[3]
-                if isinstance(cached, tuple) and len(cached) > 3
-                else getattr(actor, "session_id", None)
-            )
-        db = getattr(actor, "_session_db", None)
+        bound = bound_actor_db(
+            runner, proof.session_key, proof.session_id, proof.db_path, proof.db_identity
+        )
+        db = bound[1] if bound is not None else None
         if (
-            actor is None
-            or cached_session_id != proof.session_id
-            or getattr(actor, "session_id", None) != proof.session_id
-            or db is None
+            bound is None
             or getattr(db, "read_only", True)
-            or getattr(db, "db_path", None) != proof.db_path
-            or getattr(db, "_db_file_identity", None) != proof.db_identity
-            or CanonicalReceiptCoordinator._path_identity(proof.db_path) != proof.db_identity
             or not callable(getattr(db, "claim_meta_once", None))
             or not callable(getattr(db, "compare_and_set_meta", None))
             or not callable(getattr(db, "get_meta", None))
         ):
             raise ValueError("canonical_binding_stale")
-        return actor, db
-
-    @staticmethod
-    def _path_identity(path: Path) -> tuple[int, int] | None:
-        try:
-            stat = path.stat()
-            return stat.st_dev, stat.st_ino
-        except OSError:
-            return None
+        return bound
 
     def _require_current_claim_target(
         self, proof: CanonicalBindingProof, actor: Any, db: Any,
@@ -456,8 +480,10 @@ class CanonicalReceiptCoordinator:
             turn.event = None
             turn.ctx = None
             turn.started_ts = time.time()
+            # The handle is bound to the proof by file identity (bound_actor_db), so its own path
+            # spelling is the one SessionDB's literal path guard can match; the identity is the proof.
             if not db.claim_meta_once(
-                key, pending, proven_db_path=proof.db_path, proven_db_identity=proof.db_identity
+                key, pending, proven_db_path=db.db_path, proven_db_identity=proof.db_identity
             ):
                 receipt = db.get_meta(key)
                 # get_meta has no generation fence, so its result is usable only after this recheck.
@@ -484,7 +510,7 @@ class CanonicalReceiptCoordinator:
             })
             self._require_current_claim_target(proof, actor, db, run_generation)
             if not db.compare_and_set_meta(
-                key, pending, terminal, proven_db_path=proof.db_path, proven_db_identity=proof.db_identity
+                key, pending, terminal, proven_db_path=db.db_path, proven_db_identity=proof.db_identity
             ):
                 raise ValueError("canonical_receipt_terminal_unconfirmed")
             self._require_current_claim_target(proof, actor, db, run_generation)

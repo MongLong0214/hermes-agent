@@ -3561,8 +3561,12 @@ class GatewayRunner(
         held_lease: Any = None,
     ) -> Any:
         """Run one exact cached actor without creating, routing, or delivering anything."""
-        from gateway.canonical_surface import require_request_local_reply_sink
-        from tools.process_registry import process_registry
+        from gateway.canonical_surface import (
+            bound_actor_db,
+            cached_actor,
+            require_request_local_reply_sink,
+        )
+        from gateway.run_canonical_turn import run_owned_turn
 
         require_request_local_reply_sink(reply_sink)
         session_id = getattr(entry, "session_id", None)
@@ -3622,38 +3626,24 @@ class GatewayRunner(
                 ):
                     raise ValueError("canonical_binding_stale")
 
-            require_current_head()
-            with self._agent_cache_lock:
-                cached = self._agent_cache.get(entry.session_key)
-                if not cached:
-                    raise ValueError("canonical_agent_missing")
-                agent = cached[0] if isinstance(cached, tuple) else cached
-                if expected_actor is not None and agent is not expected_actor:
-                    raise ValueError("canonical_agent_replaced")
-                cached_session_id = (
-                    cached[3]
-                    if isinstance(cached, tuple) and len(cached) > 3
-                    else getattr(agent, "session_id", None)
+            def require_expected_actor() -> None:
+                if expected_actor is None:
+                    return
+                bound = bound_actor_db(
+                    self, entry.session_key, session_id, expected_db_path, expected_db_identity
                 )
-                if (
-                    cached_session_id != session_id
-                    or getattr(agent, "session_id", None) != session_id
-                ):
-                    raise ValueError("canonical_agent_missing")
-                if expected_actor is not None:
-                    db = getattr(agent, "_session_db", None)
-                    try:
-                        db_stat = expected_db_path.stat() if expected_db_path is not None else None
-                        db_identity = None if db_stat is None else (db_stat.st_dev, db_stat.st_ino)
-                    except OSError:
-                        db_identity = None
-                    if (
-                        db is not expected_session_db
-                        or getattr(db, "db_path", None) != expected_db_path
-                        or getattr(db, "_db_file_identity", None) != expected_db_identity
-                        or db_identity != expected_db_identity
-                    ):
-                        raise ValueError("canonical_agent_replaced")
+                if bound is None or bound[0] is not expected_actor or bound[1] is not expected_session_db:
+                    raise ValueError("canonical_agent_replaced")
+
+            require_current_head()
+            agent, cached_session_id = cached_actor(self, entry.session_key)
+            if agent is None:
+                raise ValueError("canonical_agent_missing")
+            if expected_actor is not None and agent is not expected_actor:
+                raise ValueError("canonical_agent_replaced")
+            if cached_session_id != session_id or getattr(agent, "session_id", None) != session_id:
+                raise ValueError("canonical_agent_missing")
+            require_expected_actor()
             if not bool(getattr(agent, "compression_in_place", True)):
                 raise ValueError("canonical_turn_refused")
             outward_callbacks = {
@@ -3668,50 +3658,16 @@ class GatewayRunner(
                 agent_history, _ = _build_gateway_agent_history(history)
                 require_current_head()
                 self._init_cached_agent_for_turn(agent, 0)
-                # Published on the loop so /stop, /new and eviction reap only processes this turn
-                # spawns, even when the interrupt lands before the worker thread starts.
-                baseline = process_registry.snapshot_running_ids(session_id)
-                agent._gateway_turn_process_task_id = session_id
-                agent._gateway_turn_process_baseline = baseline
-
-                def run_owned_turn() -> Any:
-                    try:
-                        return agent.run_conversation(
-                            event.text,
-                            conversation_history=agent_history,
-                            task_id=session_id,
-                        )
-                    finally:
-                        # Cleared when the worker exits, not when the awaiting coroutine unwinds; the
-                        # identity check keeps a later turn's publication on this actor intact.
-                        if agent._gateway_turn_process_baseline is baseline:
-                            agent._gateway_turn_process_task_id = ""
-                            agent._gateway_turn_process_baseline = frozenset()
-
-                result = await asyncio.to_thread(run_owned_turn)
+                result = await run_owned_turn(
+                    self, agent,
+                    lambda: agent.run_conversation(
+                        event.text, conversation_history=agent_history, task_id=session_id,
+                    ),
+                    session_key=binding.session_key, task_id=session_id,
+                    run_generation=expected_run_generation,
+                )
                 require_current_head()
-                if expected_actor is not None:
-                    with self._agent_cache_lock:
-                        current_cached = self._agent_cache.get(entry.session_key)
-                        current_agent = (
-                            current_cached[0]
-                            if isinstance(current_cached, tuple)
-                            else current_cached
-                        )
-                    current_db = getattr(current_agent, "_session_db", None)
-                    try:
-                        current_stat = expected_db_path.stat()
-                        current_identity = (current_stat.st_dev, current_stat.st_ino)
-                    except (AttributeError, OSError):
-                        current_identity = None
-                    if (
-                        current_agent is not expected_actor
-                        or current_db is not expected_session_db
-                        or getattr(current_db, "db_path", None) != expected_db_path
-                        or getattr(current_db, "_db_file_identity", None) != expected_db_identity
-                        or current_identity != expected_db_identity
-                    ):
-                        raise ValueError("canonical_agent_replaced")
+                require_expected_actor()
                 boundary = getattr(agent, "_persist_user_message_idx", None)
                 if isinstance(boundary, bool) or not isinstance(boundary, int):
                     raise ValueError("canonical_turn_refused")
