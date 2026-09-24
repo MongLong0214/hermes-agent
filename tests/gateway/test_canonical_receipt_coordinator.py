@@ -30,8 +30,8 @@ def _binding(entry, source):
     )
 
 
-def _event(text="hello"):
-    return CanonicalIngressEvent("receipt-binding", "evt-1", "author", "channel", text)
+def _event(text="hello", event_id="evt-1"):
+    return CanonicalIngressEvent("receipt-binding", event_id, "author", "channel", text)
 
 
 def _runner(tmp_path, monkeypatch, home=None):
@@ -217,8 +217,9 @@ def test_canonical_turn_uses_shared_running_slot_and_interrupt_generation(tmp_pa
             successor = object()
             runner._session_state(entry.session_key).turn.agent = successor
 
-            with pytest.raises(ValueError, match="^canonical_turn_interrupted$"):
+            with pytest.raises(ValueError, match="^canonical_receipt_terminal_unconfirmed$") as refused:
                 await task
+            assert str(refused.value.__cause__) == "canonical_turn_interrupted"
             assert runner._is_session_run_current(entry.session_key, successor_generation)
             assert runner._session_state(entry.session_key).turn.agent is successor
         finally:
@@ -267,8 +268,9 @@ def test_new_command_reaps_processes_spawned_by_canonical_turn_but_not_its_basel
             assert reaps == [(entry.session_id, frozenset({"proc-q"}), "gateway_turn_interrupt")]
             assert running == {"proc-q"}
             released.set()
-            with pytest.raises(ValueError, match="^canonical_turn_interrupted$"):
+            with pytest.raises(ValueError, match="^canonical_receipt_terminal_unconfirmed$") as refused:
                 await task
+            assert str(refused.value.__cause__) == "canonical_turn_interrupted"
         finally:
             released.set()
             runner.session_store.close_all_db_handles()
@@ -364,7 +366,7 @@ def test_cancel_while_worker_runs_interrupts_it_and_holds_the_turn_until_it_exit
             assert running == {"proc-q"}
             # The worker is still inside the actor: the turn keeps its slot, so a second turn refuses.
             with pytest.raises(ValueError, match="^canonical_turn_busy$"):
-                await coordinator.submit(_binding(entry, source), _event("second"))
+                await coordinator.submit(_binding(entry, source), _event("second", "evt-2"))
             assert not task.done()
 
             may_exit.set()
@@ -400,8 +402,9 @@ def test_replaced_db_after_duplicate_read_refuses_terminal_replay(tmp_path, monk
                 return value
 
             monkeypatch.setattr(db, "get_meta", replace_after_read)
-            with pytest.raises(ValueError, match="^canonical_binding_stale$"):
+            with pytest.raises(ValueError, match="^canonical_receipt_terminal_unconfirmed$") as refused:
                 await coordinator.submit(_binding(entry, source), _event())
+            assert str(refused.value.__cause__) == "canonical_binding_stale"
             assert agent.calls == 1
         finally:
             runner.session_store.close_all_db_handles()
@@ -429,8 +432,9 @@ def test_home_behind_a_symlink_binds_by_file_and_still_refuses_a_replaced_db(tmp
                 return value
 
             monkeypatch.setattr(db, "get_meta", replace_after_read)
-            with pytest.raises(ValueError, match="^canonical_binding_stale$"):
+            with pytest.raises(ValueError, match="^canonical_receipt_terminal_unconfirmed$") as refused:
                 await coordinator.submit(_binding(entry, source), _event())
+            assert str(refused.value.__cause__) == "canonical_binding_stale"
             assert agent.calls == 1
         finally:
             runner.session_store.close_all_db_handles()
@@ -502,8 +506,9 @@ def test_actor_replacement_under_lease_refuses_before_execution(tmp_path, monkey
                     runner._agent_cache[entry.session_key] = (object(), "exact", 0, entry.session_id)
                 return await original(*args, **kwargs)
             monkeypatch.setattr(runner, "run_bound_existing_turn", replace_then_run)
-            with pytest.raises(ValueError, match="^canonical_agent_replaced$"):
+            with pytest.raises(ValueError, match="^canonical_receipt_terminal_unconfirmed$") as refused:
                 await CanonicalReceiptCoordinator(runner).submit(_binding(entry, source), _event())
+            assert str(refused.value.__cause__) == "canonical_agent_replaced"
             assert agent.calls == 0
         finally:
             runner.session_store.close_all_db_handles()
@@ -567,8 +572,9 @@ def test_actor_swapped_during_run_leaves_receipt_pending_without_terminal_cas(tm
             monkeypatch.setattr(agent, "run_conversation", swap_during_run)
             monkeypatch.setattr(db, "compare_and_set_meta", count_terminal_cas)
             coordinator = CanonicalReceiptCoordinator(runner)
-            with pytest.raises(ValueError, match="^canonical_agent_replaced$"):
+            with pytest.raises(ValueError, match="^canonical_receipt_terminal_unconfirmed$") as refused:
                 await coordinator.submit(_binding(entry, source), _event())
+            assert str(refused.value.__cause__) == "canonical_agent_replaced"
             assert agent.calls == 1
             assert cas_calls == 0
             pending = await coordinator.submit(_binding(entry, source), _event())

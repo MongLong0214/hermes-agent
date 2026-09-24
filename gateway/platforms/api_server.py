@@ -118,6 +118,7 @@ except ImportError:
 
 from gateway.config import Platform, PlatformConfig
 from gateway.display_config import resolve_display_setting
+from gateway.platforms import api_server_canonical as _canonical_ingress
 from gateway.platforms import api_server_room_dispatch as _room_dispatch
 from gateway.platforms import api_server_room_grants as _room_grants
 from gateway.platforms import api_server_runs as _api_runs
@@ -1619,6 +1620,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job)]
         routes.extend(_room_grants._http_routes(self))
         routes.extend(_api_runs._http_routes(self))
+        # Existing-only canonical binding ingress, authenticated by API_SERVER_KEY.
+        routes.extend(_canonical_ingress._http_routes(self))
         if _CRON_AVAILABLE:
             # Chronos fire webhook (NAS -> agent): authenticated by a NAS-minted JWT.
             routes.append(("POST", "/api/cron/fire", self._handle_cron_fire))
