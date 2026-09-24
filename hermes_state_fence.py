@@ -121,6 +121,13 @@ class StoreLineage:
         """False when owned fences carry a generation other than this build's, so every governed write aborts."""
         return not (self.fence_literals - {TURN_FENCE_GENERATION})
 
+    @property
+    def owned_by_another_build(self) -> bool:
+        """True when a writable open migrates this store away from the build that wrote it: an
+        unfenced lineage gets this build's fences and stamp, and fences at another generation are
+        swapped. A fresh, damaged, or this-build-fenced store (a gate-parked stamp too) is not."""
+        return self.lineage in (LINEAGE_UPSTREAM, LINEAGE_FORK) or not self.writable_by_this_build
+
 
 _FRESH = StoreLineage(LINEAGE_FRESH, None, 0)
 _DAMAGED = StoreLineage(LINEAGE_DAMAGED, None, 0)
@@ -337,19 +344,22 @@ def _swap_fences(cursor, owned: dict, expected: dict) -> None:
         raise RuntimeError("turn-fence trigger verification failed after the swap")
 
 
-def apply_fence_delta(cursor) -> StoreLineage:
+def apply_fence_delta(cursor, *, admit: Optional[Callable[[StoreLineage], None]] = None) -> StoreLineage:
     """Make this build's fences exact and stamp ``FENCE_LINEAGE_BASE + gate``, atomically.
 
     Runs after ``SCHEMA_SQL`` + column reconcile (DDL, never fenced) and before any governed
     DML. Returns the lineage decoded under the write lock; its ``gate`` drives the data
     migrations. A settled store (fenced lineage, exact fences) takes no lock and runs no DDL.
-    From the commit on, the fork refuses the store at open and its UDF cannot write it."""
+    From the commit on, the fork refuses the store at open and its UDF cannot write it.
+    ``admit`` sees that locked decode before the first fence DDL and may raise to refuse it."""
     lineage = decode_store_lineage(cursor)
     if lineage.lineage == LINEAGE_FENCED and fences_exact(cursor):
         return lineage
 
     def migrate() -> StoreLineage:
         current = decode_store_lineage(cursor)  # another opener may have migrated since the read
+        if admit is not None:
+            admit(current)
         owned, expected = owned_turn_fence_literals(cursor), _expected_definitions(cursor)
         if not _is_exact(owned, expected):
             if current.lineage == LINEAGE_FENCED and all(v == TURN_FENCE_GENERATION for v in owned.values()):
