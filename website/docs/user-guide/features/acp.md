@@ -298,6 +298,7 @@ do not set them by hand in `.env` or `config.yaml`.
 | Variable | Value | Effect |
 |----------|-------|--------|
 | `HERMES_ACP_SKIP_CONFIGURED_MCP` | `1` | Skip starting the **globally configured** MCP servers from `config.yaml` before the ACP JSON-RPC loop begins. |
+| `HERMES_ACP_SKIP_ENV_LOAD` | `1` | Skip loading the profile `.env` during ACP **startup** only, before the first session loads the agent runtime. The first session still loads the profile `.env` (see below). |
 
 Hermes normally starts every MCP server configured in `config.yaml` before it
 enters the ACP JSON-RPC loop. A host that owns MCP itself — passing the
@@ -310,6 +311,18 @@ the ACP session through `session/new` are still registered**, so a host loses
 no capability it asked for. Any other value (unset, empty, `0`, `false`) keeps
 the default behavior, so an unrelated truthy-looking string cannot silently
 disable MCP.
+
+`HERMES_ACP_SKIP_ENV_LOAD` covers ACP startup only. With the exact value `1`
+(surrounding whitespace ignored), the adapter does not load the profile `.env`
+before it enters the ACP JSON-RPC loop. It does **not** keep the profile `.env`
+out of the process: the first session (new, load or fork) loads the agent
+runtime, which still loads the profile `.env` with override — `.env` values
+replace the ones the launcher passed, and a fixed set of profile-managed ACP
+keys that `.env` does not define are removed from the environment. Only the
+`hermes-acp` command and `python -m acp_adapter` honour the marker; `hermes acp`
+loads the profile `.env` before the adapter starts, so the marker has no effect
+there. Any other value (unset, empty, `0`, `true`) keeps the default startup
+load. The marker itself is not a secret.
 
 ## Session behavior
 
