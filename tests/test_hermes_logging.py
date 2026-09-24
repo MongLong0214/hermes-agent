@@ -1,4 +1,5 @@
 """Tests for hermes_logging — centralized logging setup."""
+import errno
 import io
 import logging
 import os
@@ -755,6 +756,66 @@ def test_eio_from_file_handler_names_the_path_once_then_recovers(tmp_path, capsy
         # Stream dropped, so the next emit reopens the real file and logging resumes.
         handler.handle(logging.LogRecord("t", logging.INFO, __file__, 0, "recovered", (), None))
         assert "recovered" in path.read_text(encoding="utf-8")
+    finally:
+        handler.close()
+
+
+def test_removed_log_directory_names_path_once_then_recovers(tmp_path, capsys):
+    """A removed profile log directory pauses its handler without per-record tracebacks."""
+    log_dir = tmp_path / "profile" / "logs"
+    log_dir.mkdir(parents=True)
+    path = log_dir / "agent.log"
+    handler = hermes_logging._ManagedRotatingFileHandler(
+        str(path), maxBytes=1024, backupCount=1, encoding="utf-8",
+    )
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    try:
+        assert handler.stream is not None
+        handler.stream.close()
+        os.unlink(path)
+        log_dir.rmdir()
+        for i in range(5):
+            handler.handle(logging.LogRecord("t", logging.INFO, __file__, 0, f"missing {i}", (), None))
+        err = capsys.readouterr().err
+        assert "--- Logging error ---" not in err
+        assert err.count("hermes_logging:") == 1
+        assert str(path) in err and "file logging paused" in err
+        assert handler.stream is None
+
+        log_dir.mkdir()
+        handler.handle(logging.LogRecord("t", logging.INFO, __file__, 0, "recovered", (), None))
+        assert "recovered" in path.read_text(encoding="utf-8")
+    finally:
+        handler.close()
+
+
+def test_formatter_enoent_for_unrelated_path_keeps_stream_and_traceback(tmp_path, capsys):
+    """A missing formatter resource is not mistaken for this handler's missing log file."""
+    missing_template = tmp_path / "missing-template.txt"
+
+    class _MissingTemplateFormatter(logging.Formatter):
+        def format(self, record):
+            raise FileNotFoundError(
+                errno.ENOENT, os.strerror(errno.ENOENT), str(missing_template),
+            )
+
+    path = tmp_path / "agent.log"
+    handler = hermes_logging._ManagedRotatingFileHandler(
+        str(path), maxBytes=1024, backupCount=1, encoding="utf-8",
+    )
+    handler.setFormatter(_MissingTemplateFormatter())
+    try:
+        stream = handler.stream
+        handler.handle(logging.LogRecord("t", logging.INFO, __file__, 0, "bad format", (), None))
+        err = capsys.readouterr().err
+        assert "--- Logging error ---" in err
+        assert str(missing_template) in err
+        assert "file logging paused" not in err
+        assert handler.stream is stream and stream is not None and not stream.closed
+
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        handler.handle(logging.LogRecord("t", logging.INFO, __file__, 0, "still live", (), None))
+        assert "still live" in path.read_text(encoding="utf-8")
     finally:
         handler.close()
 

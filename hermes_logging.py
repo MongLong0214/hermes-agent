@@ -8,6 +8,7 @@ with ``RedactingFormatter`` so secrets never reach disk.
 
 import atexit
 import copy
+import errno
 import io
 import logging
 import os
@@ -81,10 +82,15 @@ def _is_windows_concurrent_log_lock_timeout(exc: BaseException | None) -> bool:
     )
 
 
-def _is_unavailable_log_stream(exc: BaseException | None) -> bool:
-    """True when a file handler lost its backing stream during teardown or I/O."""
+def _is_unavailable_log_stream(exc: BaseException | None, base_filename: str) -> bool:
+    """True when a file handler lost its backing stream or its own log directory."""
     return (
         (isinstance(exc, OSError) and exc.errno == 5)
+        or (
+            isinstance(exc, FileNotFoundError)
+            and exc.errno == errno.ENOENT
+            and exc.filename == base_filename
+        )
         or (isinstance(exc, ValueError) and "closed file" in str(exc).lower())
     )
 
@@ -379,7 +385,7 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
         exc = sys.exc_info()[1]
         if _is_windows_concurrent_log_lock_timeout(exc):
             return
-        if _is_unavailable_log_stream(exc):
+        if _is_unavailable_log_stream(exc, self.baseFilename):
             # The QueueListener must not turn a failing log destination into a traceback for
             # every queued record. Name the path once, drop the stale stream; the next emit
             # reopens it if the destination has recovered.
