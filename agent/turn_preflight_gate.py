@@ -11,10 +11,24 @@ from contextlib import suppress
 from typing import Any
 
 from agent.message_metadata import append_message
+from agent.native_compaction_grace import (
+    consume_native_compaction_preflight_fallback, defer_local_preflight_for_native_compaction,
+)
 from agent.turn_context import _compression_warrants_another_preflight_pass
 from agent.turn_preflight import PreflightGateVerdict, run_preflight_compression
 
 logger = logging.getLogger("agent.conversation_loop")
+
+
+def _preflight_deferral(agent: Any, compressor: Any, request_pressure_tokens: Any, messages: Any):
+    """The ``defer_preflight`` predicate for this request. The one native compaction attempt
+    a threshold crossing gets defers; a spent attempt or an anchored figure (real usage +
+    delta) never does; only a whole-context rough estimate waits for the provider's count."""
+    if defer_local_preflight_for_native_compaction(agent, request_pressure_tokens, messages=messages):
+        return lambda _t: True
+    if consume_native_compaction_preflight_fallback(agent) or getattr(agent, "_request_pressure_anchored", False):
+        return lambda _t: False
+    return getattr(compressor, "should_defer_preflight_to_real_usage", lambda _t: False)
 
 
 def run_preflight_gate(
@@ -90,12 +104,7 @@ def run_preflight_gate(
     return run_preflight_compression(
         agent, v, compressor=_compressor, request_pressure_tokens=request_pressure_tokens,
         provider_overflow_preflight=_provider_overflow_preflight,
-        # An anchored figure is real usage + delta: never deferred. Only a whole-context rough
-        # estimate waits for the provider's count.
-        defer_preflight=(
-            (lambda _t: False) if getattr(agent, "_request_pressure_anchored", False)
-            else getattr(_compressor, "should_defer_preflight_to_real_usage", lambda _t: False)
-        ),
+        defer_preflight=_preflight_deferral(agent, _compressor, request_pressure_tokens, messages),
         moa_prepared_request=_moa_prepared_request, system_message=system_message,
         user_message=user_message, max_compression_attempts=max_compression_attempts,
         effective_task_id=effective_task_id,

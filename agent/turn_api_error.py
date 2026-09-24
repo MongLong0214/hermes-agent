@@ -16,6 +16,7 @@ import time
 from typing import Any, Dict, Optional
 
 from agent.error_classifier import RETRYABLE_CLIENT_REASONS, FailoverReason, classify_api_error
+from agent.native_compaction_grace import release_failed_native_preflight
 from agent.turn_overflow import recover_from_overflow
 from agent.turn_recovery import (
     _NONRETRYABLE_LABELS, abort_turn_on_interrupt, compute_error_backoff, interruptible_backoff_sleep,
@@ -76,6 +77,13 @@ def handle_api_error(
         thinking_spinner = None
     if agent.thinking_callback:
         agent.thinking_callback("")
+
+    if release_failed_native_preflight(agent, api_error):
+        # In place of the immediate in-stream reconnect base takes before this handler runs: a
+        # native capture that died before any event (or lost its native wire) is rebuilt through
+        # local preflight, not resent. Every other grace failure takes the handling below.
+        _retry.restart_with_rebuilt_messages = True
+        return _verdict("break")
 
     _recovered, active_system_prompt = recover_before_classification(
         agent, api_error, messages=messages, api_messages=api_messages, api_kwargs=api_kwargs,

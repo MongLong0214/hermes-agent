@@ -19,6 +19,7 @@ from agent.conversation_compression import (
     compression_skipped_due_to_lock, context_compression_timed_out,
     conversation_history_after_compression, ensure_compression_feasibility_checked,
 )
+from agent.native_compaction_grace import defer_local_preflight_for_native_compaction
 from agent.turn_context import _review_fork_first_request_pending
 from agent.turn_context_compaction import (
     _apply_grown_window, _blocked_compress_reason, _clear_overflow_warn, _refund_api_call,
@@ -290,7 +291,19 @@ def compress_after_tool_results(
 
     if agent.compression_enabled and compression_attempts < max_compression_attempts:
         ensure_compression_feasibility_checked(agent, _real_tokens)
-    if (
+    # Consult the native grace only over the trigger: an under-trigger figure (the 0 sentinel
+    # right after a compaction) would clear an armed attempt.
+    _native_deferred = (
+        agent.compression_enabled
+        and _real_tokens >= int(getattr(_compressor, "threshold_tokens", 0) or 0)
+        and defer_local_preflight_for_native_compaction(agent, _real_tokens, messages=messages)
+    )
+    if _native_deferred:
+        logger.info(
+            "Deferring post-tool compression: ~%s request tokens get one native compaction "
+            "attempt first", f"{_real_tokens:,}",
+        )
+    elif (
         agent.compression_enabled
         and compression_attempts < max_compression_attempts
         and not bool(
