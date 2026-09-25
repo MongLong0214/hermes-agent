@@ -286,7 +286,8 @@ def recover_abandoned_delegations() -> int:
 
 
 def restore_undelivered_completions(target_queue) -> int:
-    """Enqueue durable pending completions as fresh turns after process start.
+    """Enqueue durable pending completions as fresh turns at this process's first use of the ledger
+    (``ProcessRegistry.restore_durable_completions``).
     Restored events are stamped ``restored=True`` in memory only: they came from a PREVIOUS
     process, so drains without an ownership filter must leave them for a consumer that can
     prove ownership. Rows older than ``_MAX_COMPLETION_REPLAY_AGE_S`` are terminally dropped
@@ -571,6 +572,10 @@ def _dispatch_admitted(
     can't pile up unbounded background work. ``slot_key`` names the pool slot the unit occupies
     (default: its own id); the units of one delegate_task call share the first unit's id so
     splitting a call into per-group completions never consumes more capacity than the call did."""
+    from tools.process_registry import process_registry
+    # Settle the previous run's orphans and replay its completions before THIS run's first row
+    # exists: a replay after it would re-queue this process's own completion as ``restored``.
+    process_registry.restore_durable_completions()
     is_batch = goals is not None
     label = " batch" if is_batch else ""
     classify = _batch_status if is_batch else (lambda r: r.get("status") or "completed")

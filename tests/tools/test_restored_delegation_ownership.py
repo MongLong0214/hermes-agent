@@ -33,6 +33,7 @@ def _make_registry():
     reg.completion_queue = queue.Queue()
     reg._completion_consumed = set()
     reg._poll_observed = set()
+    reg._restored_ledger_homes = set()
     return reg
 
 

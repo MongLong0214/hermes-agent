@@ -1,4 +1,5 @@
-"""Running-process checkpoint persistence and PID-safe recovery."""
+"""Running-process checkpoint persistence and PID-safe recovery, and the restart replay of durable
+async-delegation completions."""
 
 import json
 import logging
@@ -116,3 +117,28 @@ class ProcessCheckpointMixin:
                 })
         self._write_checkpoint(extra_entries=unresolved_scope_entries)
         return recovered
+
+    # ----- Durable async-delegation completions (restart replay) -----
+
+    def restore_durable_completions(self) -> int:
+        """Settle orphaned delegations and re-queue the undelivered completions of the current
+        profile's ``state.db`` ledger onto ``completion_queue``, once per profile home per registry;
+        returns how many were queued.
+
+        Runs where the ledger is first really used: a drain, a dispatch, the TUI notification
+        poller, gateway boot. Never at construction: the module-level registry is built whenever
+        ``model_tools`` is imported, read-only commands (``hermes doctor``) included, and opening
+        the ledger creates a missing store and migrates one another build still owns."""
+        from hermes_constants import hermes_home_key
+
+        home = hermes_home_key()
+        with self._lock:
+            if home in self._restored_ledger_homes:
+                return 0
+            self._restored_ledger_homes.add(home)
+        try:
+            from tools.async_delegation import restore_undelivered_completions
+            return restore_undelivered_completions(self.completion_queue)
+        except Exception as exc:
+            logger.warning("Could not restore async delegation completions: %s", exc)
+            return 0
