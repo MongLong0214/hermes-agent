@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from hermes_constants import get_hermes_home, reset_hermes_home_override, set_hermes_home_override
+from hermes_state_fence import register_turn_fence_generation
 from tools import async_delegation as ad
 from tools.process_registry import process_registry
 
@@ -69,6 +70,7 @@ def _row(home: Path, delegation_id: str) -> dict:
 def _set(home: Path, delegation_id: str, **cols) -> None:
     conn = sqlite3.connect(home / "state.db")
     try:
+        register_turn_fence_generation(conn)  # the store is fenced: plain writes land only as this build's generation
         conn.execute(f"UPDATE async_delegations SET {', '.join(f'{k}=?' for k in cols)} WHERE delegation_id=?",
                      (*cols.values(), delegation_id))
         conn.commit()
