@@ -8,6 +8,7 @@ gateway was writing. The holder here is a separate process, as in production.
 
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 import yaml
@@ -60,3 +61,36 @@ def test_delete_mode_read_waits_for_other_process_commit(delete_mode_db, read_on
         assert holder.wait(timeout=30) == 0
     # Writes keep their short busy timeout: they retry at application level with jitter.
     assert delete_mode_db._conn.execute("PRAGMA busy_timeout").fetchone()[0] == 1000
+
+
+# A holder that has written a page leaves a -journal, so the open's lineage probe cannot read the
+# file immutably and takes a lock like any reader. A 1 s lock budget gives up at about 3 s of such
+# a hold; the read budget outlasts 10 s.
+_JOURNAL_HOLD_S = 5.0
+
+_WRITING_HOLDER = """
+import sqlite3, sys, time
+conn = sqlite3.connect(sys.argv[1], isolation_level=None)
+conn.execute("BEGIN EXCLUSIVE")
+conn.execute("INSERT OR REPLACE INTO state_meta(key, value) VALUES ('busy-holder', 'x')")
+print("held", flush=True)
+time.sleep(float(sys.argv[2]))
+conn.execute("COMMIT")
+"""
+
+
+def test_read_only_open_waits_out_a_commit_that_left_a_journal(delete_mode_db):
+    holder = subprocess.Popen(
+        [sys.executable, "-c", _WRITING_HOLDER, str(delete_mode_db.db_path), str(_JOURNAL_HOLD_S)],
+        stdout=subprocess.PIPE, text=True,
+    )
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        assert Path(f"{delete_mode_db.db_path}-journal").exists()
+        reader = SessionDB(db_path=delete_mode_db.db_path, read_only=True)
+        try:
+            assert [s["id"] for s in reader.list_sessions_rich(limit=10)] == ["s1"]
+        finally:
+            reader.close()
+    finally:
+        assert holder.wait(timeout=60) == 0

@@ -177,9 +177,12 @@ def _has_fork_markers(cursor, tables: set, literals: frozenset) -> bool:
 
 def _decode_at(uri: str, path: Path) -> StoreLineage:
     # Tracked, so a concurrent byte-level header probe cannot open()/close() the file under it.
+    from hermes_state import _READ_BUSY_TIMEOUT_S
     from hermes_state_dbfile import _connect_tracked_db
 
-    conn = _connect_tracked_db(uri, tracking_path=path, uri=True, timeout=1.0, isolation_level=None)
+    # A read: under DELETE journaling it waits out another process's commit on the budget every
+    # SessionDB read gets, or the probe refuses the open that budget exists to let through.
+    conn = _connect_tracked_db(uri, tracking_path=path, uri=True, timeout=_READ_BUSY_TIMEOUT_S, isolation_level=None)
     try:
         return decode_store_lineage(conn.cursor())
     except UnicodeDecodeError:
