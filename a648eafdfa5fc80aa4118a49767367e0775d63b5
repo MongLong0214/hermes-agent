@@ -1,0 +1,2 @@
+Warn: The lineage probe is shared: the writable open's admission check, the admission reprobe, schema_incompatibility_verdict and the dashboard ownership check can now each wait up to about 11 s behind a held DELETE-mode commit, where the limit used to be about 3 s.
+Provenance: reconstructed
