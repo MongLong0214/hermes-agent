@@ -1676,14 +1676,17 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
                     has_replayable_native_compaction_checkpoint,
                 )
 
-                note_checkpoint = getattr(
-                    agent.context_compressor, "note_native_compaction_checkpoint", None
-                )
-                if (
-                    callable(note_checkpoint)
-                    and has_replayable_native_compaction_checkpoint(agent, [msg])
-                ):
-                    note_checkpoint()
+                if has_replayable_native_compaction_checkpoint(agent, [msg]):
+                    note_checkpoint = getattr(
+                        agent.context_compressor, "note_native_compaction_checkpoint", None
+                    )
+                    if callable(note_checkpoint):
+                        note_checkpoint()
+                    # The next request starts at this carrier, so no skill_view body served so
+                    # far is on the wire any more: their repeat views reload, not stub (#32106).
+                    from tools.skills_tool_dedup import drop_lost_skill_views
+
+                    drop_lost_skill_views(getattr(agent, "_current_task_id", None), [msg])
 
     if assistant_tool_calls:
         msg["tool_calls"] = [_assistant_tool_call_dict(agent, tc, i) for i, tc in enumerate(assistant_tool_calls)]

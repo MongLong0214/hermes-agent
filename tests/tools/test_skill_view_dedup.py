@@ -7,10 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from tools.skills_tool import (
-    _skill_view_with_bump,
-    reset_skill_view_dedup,
-)
+from tools.skills_tool import _skill_view_with_bump
+from tools.skills_tool_dedup import reset_skill_view_dedup
 
 
 @pytest.fixture
@@ -131,8 +129,3 @@ class TestSkillViewDedup:
         repeat = _view("demo-dedup-skill")
         assert repeat.get("dedup") is True
         assert repeat.get("content_returned") is False
-
-    def test_compression_hook_importable(self):
-        # conversation_compression imports this lazily; keep the seam stable.
-        from tools.skills_tool import reset_skill_view_dedup as f
-        f(None)

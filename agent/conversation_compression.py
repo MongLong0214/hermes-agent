@@ -3367,11 +3367,14 @@ def _warn_summary_or_aux_fallback(agent: Any) -> None:
             )
 
 
-def _reset_read_dedup_caches(task_id: str, *, session_id: str = "", skills: bool = True) -> None:
-    """Advance the file-read (and skill_view) repeat-read dedup to a fresh generation after a boundary.
+def _reset_read_dedup_caches(task_id: str, *, session_id: str = "", transcript: Optional[list] = None) -> None:
+    """Advance the file-read repeat-read dedup to a fresh generation after a boundary.
     The mtime map is kept: the first read of each unchanged key returns full content compaction may have
     omitted; later reads return stubs, and stub-hit counters restart at the same boundary (#84857).
     The computer_use screenshot dedup is session-keyed and forgets its last frame for the same reason.
+    ``transcript`` is the rewritten message list: skill_view dedup keeps only the entries whose served body
+    still opens one of its tool rows verbatim. Without one nothing is proven, so every entry goes (the Codex
+    app-server path, whose skill_view runs in the hermes-tools MCP subprocess without a task_id).
     """
     with contextlib.suppress(Exception):
         from tools.file_tools_read_tracking import reset_file_dedup
@@ -3380,11 +3383,9 @@ def _reset_read_dedup_caches(task_id: str, *, session_id: str = "", skills: bool
         with contextlib.suppress(Exception):
             from tools.computer_use.tool import reset_screenshot_dedup
             reset_screenshot_dedup(session_id)
-    if not skills:
-        return
     with contextlib.suppress(Exception):
-        from tools.skills_tool import reset_skill_view_dedup
-        reset_skill_view_dedup(task_id)
+        from tools.skills_tool_dedup import drop_lost_skill_views
+        drop_lost_skill_views(task_id, transcript or ())
 
 
 def _finish_compaction_boundary(
@@ -3477,7 +3478,7 @@ def _finish_compaction_boundary(
             )
         else:
             compressor._verify_compaction_cleared_threshold = True
-    _reset_read_dedup_caches(task_id, session_id=agent.session_id or "")
+    _reset_read_dedup_caches(task_id, session_id=agent.session_id or "", transcript=compressed)
     return _compressed_est
 
 
@@ -4179,7 +4180,7 @@ def _compress_context_via_codex_app_server(
         # armed until a later turn; minimal test engines may lack update_from_response.
         if hasattr(agent.context_compressor, "update_from_response"):
             _record_codex_app_server_usage(agent, result, messages=messages)
-    _reset_read_dedup_caches(task_id, session_id=agent.session_id or "", skills=False)
+    _reset_read_dedup_caches(task_id, session_id=agent.session_id or "")
     logger.info(
         "codex app-server compaction done: session=%s thread=%s turn=%s", _sid,
         getattr(result, "thread_id", None) or "", getattr(result, "turn_id", None) or "",

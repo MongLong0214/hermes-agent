@@ -25,8 +25,7 @@ from tools.skills_tool_plugin import (  # noqa: F401
     MAX_DESCRIPTION_LENGTH, MAX_NAME_LENGTH, _INJECTION_PATTERNS, _fail, _json,
     _mark_background_review_read, _preprocess_skill, _read_skill_text, _safe_frontmatter,
     _serve_plugin_skill, _serve_skill_file, _truncate_description)
-from tools.skills_tool_dedup import (  # noqa: F401
-    _check_skill_view_dedup, _record_skill_view, reset_skill_view_dedup)
+from tools.skills_tool_dedup import _check_skill_view_dedup, _record_skill_view
 from tools.skill_provenance import is_background_review
 
 logger = logging.getLogger(__name__)
@@ -693,7 +692,7 @@ registry.register(
 def _skill_view_with_bump(args, **kw):
     """Invoke skill_view, then bump view_count/use on success (best-effort). Repeat-view dedup
     mirrors read_file's unchanged-stub: a SAME, unchanged skill file already loaded in this
-    session returns a short stub (cache cleared on context compression)."""
+    session returns a short stub until a transcript rewrite removes the served body."""
     name = args.get("name", "")
     task_id = kw.get("task_id")
     # The background-review fork shares the parent's task_id (prefix-cache parity). A stub there
@@ -707,7 +706,7 @@ def _skill_view_with_bump(args, **kw):
     with suppress(Exception):
         parsed = json.loads(result)
         if isinstance(parsed, dict) and parsed.get("success"):
-            _record_skill_view(dedup_task_id, name, args.get("file_path"), parsed)
+            _record_skill_view(dedup_task_id, name, args.get("file_path"), parsed, result)
             if resolved := parsed.get("name") or name:  # qualified forms return the canonical name
                 from tools.skill_usage import bump_use, bump_view
                 bump_view(str(resolved))
