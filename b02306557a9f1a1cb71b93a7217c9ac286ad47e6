@@ -1,0 +1,2 @@
+Limit: state.db is fenced on this line: every raw write to async_delegations must come from a connection that registered this build's turn-fence generation, so raw sqlite3 test fixtures must register it.
+Provenance: reconstructed
