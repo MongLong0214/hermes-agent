@@ -1835,13 +1835,11 @@ class GatewayNotificationsMixin:
         return delivered
 
     def _restore_secondary_completion_ledgers(self, profile_homes) -> None:
-        """Re-queue undelivered async completions from every SECONDARY profile's ledger. The process
-        registry restores only the launch profile's ``state.db`` at import; a secondary's rows would
-        otherwise never be replayed after a restart."""
-        from tools.async_delegation import restore_undelivered_completions
+        """Re-queue undelivered async completions from every SECONDARY profile's ledger. Gateway boot
+        restores only the launch profile's ``state.db``; a secondary's rows would otherwise never be
+        replayed after a restart."""
         from tools.process_registry import process_registry as _pr
-        self._each_secondary_ledger(profile_homes, lambda: restore_undelivered_completions(_pr.completion_queue),
-                                    "Restored")
+        self._each_secondary_ledger(profile_homes, _pr.restore_durable_completions, "Restored")
 
     def _sweep_orphaned_completion_ledgers(self) -> None:
         """Offer completions whose owner process died while this gateway runs (#97202): the launch

@@ -1186,6 +1186,11 @@ class GatewayStartupMixin:
             recovered += self._recover_secondary_process_checkpoints(process_registry)
             if recovered:
                 logger.info("Recovered %s background process(es) from previous run", recovered)
+        # Settle the launch profile's orphaned async delegations and re-queue their undelivered
+        # completions; each secondary's ledger follows once its adapters start.
+        restored = process_registry.restore_durable_completions()
+        if restored:
+            logger.info("Restored %d undelivered async completion(s) from the previous run", restored)
         # Recover the turns the last process left marked (in flight, or reply not yet ledgered).
         # SKIP after a clean exit — the previous process already drained.
         _clean_marker = _hermes_home / ".clean_shutdown"
