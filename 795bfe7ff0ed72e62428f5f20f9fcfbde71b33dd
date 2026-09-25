@@ -1,0 +1,2 @@
+Warn: Keep the gateway-stop advice in the locked persistence reply: for a store owned by another build's running gateway, no retry opens the store until that gateway stops.
+Provenance: reconstructed
