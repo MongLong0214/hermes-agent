@@ -568,7 +568,7 @@ class SessionSearchMixin:
             return hw
 
         hw = int(self._execute_write(_stage))
-        # Outside the write transaction (executescript commits); markers are durable.
+        # After the write transaction: its commit made the markers durable; this DDL autocommits per statement.
         self._ensure_v23_fts_tables("failed to create v23 messages_fts during optimize-storage demote")
         return hw
 

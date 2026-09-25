@@ -979,7 +979,7 @@ END;
 
 # Cross-process full-FTS-rebuild admission (single authority).  Several processes share one state.db and a
 # structural rebuild (FTS5 'rebuild' or `_recover_stale_fts`'s drop/recreate) must run in ONE at a time —
-# concurrent rebuilds corrupted state.db in production.  Gates `rebuild_fts()`, `_rebuild_fts_indexes()`,
+# concurrent rebuilds corrupted state.db in production.  Gates `rebuild_fts()`, `_repair_fts_indexes()`,
 # `_recover_stale_fts()`; the chunked backfill (`fts_rebuild_step`) is deliberately NOT routed through it (it
 # claims progress under SQLite transaction authority).  Mirrors `hermes_state_repair._cross_process_repair_lock`:
 # portable (msvcrt/flock), bounded wait, FAIL CLOSED; orphaned-fd holders (see `_acquire_db_flock`) are broken
@@ -993,7 +993,7 @@ END;
 # two concurrent rebuilds collide on write and have structurally corrupted state.db in production (PR
 # #93200; the 2026-08-15 / 2026-08-23 incidents and issues #89293 / #90950). This is the single admission
 # authority for every full structural rebuild entry point: `SessionSearchMixin.rebuild_fts()`,
-# `SessionSchemaMixin._rebuild_fts_indexes()` (via `_init_schema`), and
+# `SessionSchemaMixin._repair_fts_indexes()` (via `_init_schema`), and
 # `SessionSchemaMixin._recover_stale_fts()`. The chunked deferred backfill (`fts_rebuild_step`) is
 # deliberately NOT routed through it — it claims progress under `_execute_write`'s SQLite transaction
 # authority and is intentionally multi-process. Semantics mirror `hermes_state_repair._cross_process_repair_lock`
@@ -1194,9 +1194,10 @@ def _acquire_msvcrt_lock(lock_path, handle, timeout):
 def fts_rebuild_admission(db_path, *, timeout_seconds=None):
     """Serialize full structural FTS rebuilds on *db_path* across processes.  Yields True when this process
     holds the authority, False when the bounded acquire timed out or the lock file could not be opened: the
-    caller must NOT rebuild (fail closed; the stale breadcrumb guarantees a retry).  ``db_path`` None
-    (in-memory) yields True.  In-process retries pass ``timeout_seconds=0`` so a live holder never stalls a
-    long-lived writer; the orphan break still applies."""
+    caller must NOT rebuild (fail closed; the stale breadcrumb, or the triggers an open-time repair still
+    owes, guarantees a retry).  ``db_path`` None (in-memory) yields True.  In-process retries and the
+    open-time trigger repair pass ``timeout_seconds=0`` so a live holder never stalls a long-lived writer
+    or an open; the orphan break still applies."""
     if db_path is None:
         yield True
         return
@@ -1225,9 +1226,8 @@ def fts_rebuild_admission(db_path, *, timeout_seconds=None):
         elif not acquired:
             record = None if _IS_WINDOWS else _read_lock_holder_record(handle)
             if timeout <= 0:
-                # Non-blocking probe from an in-process retry: keep it quiet.
-                logger.info("FTS rebuild lock %s is busy — deferring this retry "
-                            "(the stale-FTS breadcrumb keeps it retryable). Recorded holder: %s.",
+                # Non-blocking probe (in-process retry, open-time trigger repair): keep it quiet.
+                logger.info("FTS rebuild lock %s is busy — not waiting for it. Recorded holder: %s.",
                             lock_path, _describe_lock_holder(record))
             else:
                 logger.warning("FTS rebuild lock %s held by another process for more than %.0fs — deferring "

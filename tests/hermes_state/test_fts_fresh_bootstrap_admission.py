@@ -7,6 +7,7 @@ from pathlib import Path
 
 import hermes_state_common
 from hermes_state import SessionDB
+from hermes_state_common import FTS_STALE_KEY
 
 
 _HOLD_ADMISSION_SCRIPT = """
@@ -50,7 +51,10 @@ def test_fresh_fts_bootstrap_does_not_publish_schema_without_admission(tmp_path,
 
         deferred = SessionDB(db_path=db_path)
         try:
-            assert deferred._fts_stale is True
+            # The holder owns the bootstrap: this open records no deferral (a write that would queue behind it).
+            assert deferred._conn.execute(
+                "SELECT 1 FROM state_meta WHERE key = ?", (FTS_STALE_KEY,)
+            ).fetchone() is None
             assert deferred._fts_enabled is False
             assert deferred._conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE name = 'messages_fts'"

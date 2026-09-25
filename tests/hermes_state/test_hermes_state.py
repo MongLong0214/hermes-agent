@@ -78,6 +78,11 @@ class _NoFtsExistingTableConnection(sqlite3.Connection):
 class _NoTrigramCursor(sqlite3.Cursor):
     """Simulate a SQLite build with FTS5 but without the trigram tokenizer."""
 
+    def execute(self, sql, parameters=()):
+        if "tokenize='trigram'" in sql:
+            raise sqlite3.OperationalError("no such tokenizer: trigram")
+        return super().execute(sql, parameters)
+
     def executescript(self, sql_script):
         if "tokenize='trigram'" in sql_script:
             raise sqlite3.OperationalError("no such tokenizer: trigram")
@@ -2466,7 +2471,7 @@ class TestFtsRebuildLoopWithoutTrigram:
     ):
         """An interrupted optimize-storage must keep its resume point.
 
-        ``_rebuild_fts_indexes`` clears both markers because a full rebuild
+        The open-time FTS repair clears both markers because a full rebuild
         genuinely does cover every row. Running it unconditionally on a
         trigram-less host therefore threw away the progress of a chunked,
         throttled backfill on the very next open.
