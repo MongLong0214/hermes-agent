@@ -1265,6 +1265,19 @@ def _last_assistant_index(messages: "List[Dict[str, Any]]") -> int:
     return _last_index_with_role(messages, "assistant")
 
 
+def _pending_tool_round(messages: "List[Dict[str, Any]]") -> range:
+    """Indices of the tool results the transcript ends with — a round the model has not answered yet; empty when
+    the transcript ends in any other row. One /steer row after the round does not answer it: the steer is
+    delivered after the newest tool result before the next API call, so preflight compaction sees it last."""
+    end = len(messages)
+    if end and messages[end - 1].get("display_kind") == STEER_DISPLAY_KIND:
+        end -= 1
+    start = end
+    while start > 0 and messages[start - 1].get("role") == "tool":
+        start -= 1
+    return range(start, end)
+
+
 def _part_text(item: Any) -> Optional[str]:
     """Text of a content part: the string itself, a dict's ``text``, else None."""
     return item if isinstance(item, str) else item.get("text") if isinstance(item, dict) else None
@@ -1779,12 +1792,26 @@ def _json_dict(text: Any) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _output_line_count(content: str) -> int:
+    """Lines of a tool's output. terminal and execute_code return JSON ``{"output": ...}`` whose newlines are
+    escaped, so counting the raw text said "1 lines" for any multi-line run. Only the leading JSON value is parsed:
+    subdirectory hints are appended after it (``agent/tool_executor.py``)."""
+    head = content.lstrip()
+    try:
+        parsed = json.JSONDecoder().raw_decode(head)[0] if head.startswith("{") else None
+    except (ValueError, RecursionError):  # RecursionError: pathologically nested JSON; count the raw text instead
+        parsed = None
+    output = parsed.get("output") if isinstance(parsed, dict) else None
+    text = output if isinstance(output, str) else content
+    return text.count("\n") + 1 if text.strip() else 0
+
+
 def _summarize_tool_result_unguarded(tool_name: str, tool_args: str, tool_content: str) -> str:
     """Build the summary line (unguarded; see ``_summarize_tool_result``)."""
     args = _json_dict(tool_args)
     content = tool_content or ""
     content_len = len(content)
-    line_count = content.count("\n") + 1 if content.strip() else 0
+    line_count = _output_line_count(content)
     summarizer = _TOOL_RESULT_SUMMARIZERS.get(tool_name)
     if summarizer is not None:
         return summarizer(tool_name, args, content, content_len, line_count)
@@ -2535,6 +2562,13 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         return threshold_percent
 
     @staticmethod
+    def _effective_input_window(context_length: int, max_tokens: int | None) -> int:
+        """Usable input budget: the window minus the output reservation, or the whole window when the reservation
+        is unset or leaves nothing."""
+        effective_window = context_length - (max_tokens or 0)
+        return effective_window if effective_window > 0 else context_length
+
+    @staticmethod
     def _compute_threshold_tokens(
         context_length: int, threshold_percent: float, max_tokens: int | None = None,
     ) -> int:
@@ -2555,9 +2589,7 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         the degenerate-window check below both operate on the effective input budget. ``max_tokens=None``
         (provider default) conservatively assumes no reservation (full window).
         """
-        effective_window = context_length - (max_tokens or 0)
-        if effective_window <= 0:
-            effective_window = context_length
+        effective_window = ContextCompressor._effective_input_window(context_length, max_tokens)
         pct_value = int(effective_window * threshold_percent)
         floored = max(pct_value, MINIMUM_CONTEXT_LENGTH)
         # The floor must not consume output headroom: cap at 85% when it is the binding term. Near-minimum windows
@@ -2994,11 +3026,12 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
 
     def _pressure_demote_tail(
         self, result: List[Dict[str, Any]], prune_boundary: int, protect_tail_tokens: int,
-        call_id_to_tool: Dict[str, tuple[str, str]], min_prune_chars: int,
+        call_id_to_tool: Dict[str, tuple[str, str]], min_prune_chars: int, spared: range,
     ) -> int:
         """Pass 4: demote inside the protected tail when it alone exceeds the soft budget (#61932).
-        Keeps a short recent floor verbatim; overrides the skill guard (else the dead-end recurs).
-        Returns the number of tool results demoted (arg truncations are logged but not counted)."""
+        Keeps a short recent floor and the ``spared`` pending tool round verbatim; overrides the skill guard
+        (else the dead-end recurs). Returns the number of tool results demoted (arg truncations are logged
+        but not counted)."""
         soft_ceiling = self._tail_soft_ceiling(protect_tail_tokens)
         demote_end = len(result) - min(_PRESSURE_KEEP_RECENT_MESSAGES, len(result))
         start = max(0, prune_boundary)
@@ -3011,6 +3044,8 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         def _shrink_at(i: int) -> None:
             # Each helper no-ops on the other role, so both may run unconditionally.
             nonlocal demoted, pressure_hits
+            if i in spared:
+                return
             if self._demote_tool_result_at(result, i, call_id_to_tool, min_prune_chars):
                 demoted += 1
                 pressure_hits += 1
@@ -3028,9 +3063,11 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
             last_tool_idx = next((i for i in range(len(result) - 1, -1, -1) if result[i].get("role") == "tool"), None)
             for i in (i for i in range(start, len(result)) if i != last_tool_idx):
                 _shrink_at(i)
-            # Last resort: the newest body alone may exceed the soft budget; summarize it.
+            # Last resort, unless it is the spared pending round: the newest body may exceed the soft budget
+            # alone (one 200KB read); summarize it.
             if (
-                last_tool_idx is not None and last_tool_idx >= prune_boundary and _protected_region_tokens() > soft_ceiling
+                last_tool_idx is not None and last_tool_idx not in spared and last_tool_idx >= prune_boundary
+                and _protected_region_tokens() > soft_ceiling
             ) and self._demote_tool_result_at(result, last_tool_idx, call_id_to_tool, min_prune_chars):
                 demoted += 1
                 pressure_hits += 1
@@ -3053,6 +3090,17 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         result = [m.copy() for m in messages]
         call_id_to_tool = _tool_calls_by_id(result)
         prune_boundary = self._prune_boundary(result, protect_tail_count, protect_tail_tokens)
+        # The pending tool round is output the model asked for and has not read yet: a stub makes it re-run the
+        # call (side effects included) or answer blind. Passes 2 and 4 spare it unless it alone exceeds the tail's
+        # hard share of the input budget the threshold is computed from (the output reservation is not room the
+        # round can keep) — the #61932 single-200KB-read case, which must still give way.
+        pending = _pending_tool_round(result)
+        input_window = self._effective_input_window(
+            getattr(self, "context_length", 0) or 0, getattr(self, "max_tokens", None))
+        hard_share = int(input_window * TAIL_MAX_CONTEXT_FRACTION)
+        fits = sum(_estimate_msg_budget_tokens(result[i]) for i in pending) <= hard_share
+        spared = pending if fits else range(0)
+        prune_boundary = min(prune_boundary, spared.start) if spared else prune_boundary
         pruned = self._dedupe_tool_results(result)
         # Just-loaded / tail-referenced skills keep full skill_view bodies through the ordinary passes.
         # Without this, a skill loaded moments before a compaction can be demoted to metadata while the
@@ -3072,7 +3120,7 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         pruned += _retire_stale_tool_result_images(result)
         if protect_tail_tokens is not None and protect_tail_tokens > 0 and result:
             pruned += self._pressure_demote_tail(
-                result, prune_boundary, protect_tail_tokens, call_id_to_tool, min_prune_chars,
+                result, prune_boundary, protect_tail_tokens, call_id_to_tool, min_prune_chars, spared,
             )
         return result, pruned
 
@@ -4616,7 +4664,10 @@ Write only the summary body. Do not include any preamble or prefix."""
             cut_idx, _ = self._walk_tail_budget(messages, head_end, token_budget, min_tail, cut_at_break=True)
 
         fallback_cut = n - min_tail
-        cut_idx = min(cut_idx, n - walk_floor)
+        # The newest row never leaves the tail. When it alone exceeds the ceiling the walk accepts nothing, and a cut
+        # at ``n`` summarised the pending tool round the model had not read (the split below then took the whole
+        # turn); aligning from ``n - 1`` keeps that group whole, as atomic groups may exceed the ceiling.
+        cut_idx = min(cut_idx, n - max(walk_floor, 1))
         # Small conversations: force a cut after the head so compression still removes something.
         if cut_idx <= head_end:
             cut_idx = max(fallback_cut, head_end + 1)
