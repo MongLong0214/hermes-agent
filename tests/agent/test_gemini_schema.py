@@ -215,26 +215,3 @@ class TestPrepareGeminiToolParameters:
             out = prepare_gemini_tool_parameters(params)
             assert out["properties"]["p"] == {"$ref": "#/$defs/Loop"}
             assert out["$defs"] == defs
-
-
-class TestAdapterWireShape:
-    _TOOLS = [{"type": "function", "function": {"name": "t", "parameters": {
-        "type": "object", "properties": {"g": {"anyOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]}}}}}]
-
-    def test_v1beta_sends_parameters_json_schema_other_versions_send_legacy_subset(self):
-        from agent.gemini_native_adapter import GeminiNativeClient
-
-        def decl(base_url):
-            client = GeminiNativeClient(api_key="k", base_url=base_url)
-            captured = {}
-            client._http = type("H", (), {"post": lambda self, url, json, headers, timeout: captured.update(json) or
-                                  type("R", (), {"status_code": 200, "json": lambda self: {"candidates": []}})()})()
-            client._create_chat_completion(model="gemini-2.5-flash", messages=[{"role": "user", "content": "hi"}], tools=self._TOOLS)
-            return captured["tools"][0]["functionDeclarations"][0]
-
-        beta = decl("https://generativelanguage.googleapis.com/v1beta")
-        assert "parameters" not in beta
-        assert beta["parametersJsonSchema"]["properties"]["g"]["anyOf"][1]["items"] == {"type": "string"}
-        v1 = decl("https://generativelanguage.googleapis.com/v1")
-        assert "parametersJsonSchema" not in v1
-        assert v1["parameters"]["properties"]["g"]["anyOf"]  # legacy translator still applied

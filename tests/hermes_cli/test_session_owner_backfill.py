@@ -13,6 +13,8 @@ import sqlite3
 
 import pytest
 
+from hermes_state_fence import register_turn_fence_generation
+
 
 @pytest.fixture
 def client(monkeypatch, _isolate_hermes_home):
@@ -131,6 +133,7 @@ def test_backfill_treats_empty_string_profile_as_legacy(client):
     _seed(db_path, [("legacy-empty", None)])
 
     conn = sqlite3.connect(str(db_path))
+    register_turn_fence_generation(conn)  # the store is fenced: plain writes land only as this build's generation
     conn.execute("UPDATE sessions SET profile_name = '  ' WHERE id = 'legacy-empty'")
     conn.commit()
     conn.close()

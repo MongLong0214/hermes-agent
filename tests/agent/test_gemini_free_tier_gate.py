@@ -27,34 +27,6 @@ def _run_probe(resp: MagicMock) -> str:
         return probe_gemini_tier("fake-key")
 
 
-class TestProbeGeminiTier:
-    """Verify the tier probe classifies keys correctly."""
-
-
-
-
-
-    def test_free_tier_via_429_body(self):
-        body = (
-            '{"error":{"code":429,"message":"Quota exceeded for metric: '
-            'generativelanguage.googleapis.com/generate_content_free_tier_requests, '
-            'limit: 20"}}'
-        )
-        resp = _mock_response(429, {}, body)
-        assert _run_probe(resp) == "free"
-
-
-    def test_successful_200_without_rpd_header_is_paid(self):
-        resp = _mock_response(200, {}, '{"candidates":[]}')
-        assert _run_probe(resp) == "paid"
-
-
-
-
-
-
-
-
 class TestIsFreeTierQuotaError:
     def test_detects_free_tier_marker(self):
         assert is_free_tier_quota_error(
@@ -94,5 +66,3 @@ class TestGeminiHttpErrorFreeTierGuidance:
         body = '{"error":{"code":429,"message":"Rate limited","status":"RESOURCE_EXHAUSTED"}}'
         err = gemini_http_error(self._FakeResp(429, body))
         assert "aistudio.google.com/apikey" not in str(err)
-
-

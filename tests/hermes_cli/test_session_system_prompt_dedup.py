@@ -9,7 +9,7 @@ import time
 import pytest
 
 from hermes_state import SessionDB
-from hermes_state_common import SCHEMA_VERSION
+from hermes_state_fence import STORED_SCHEMA_VERSION
 
 
 @pytest.fixture()
@@ -237,7 +237,7 @@ def test_v24_inline_prompts_migrate_once_to_content_addressed_storage(tmp_path):
         assert len({row["system_prompt_hash"] for row in raw_sessions}) == 1
         assert migrated._conn.execute(
             "SELECT version FROM schema_version LIMIT 1"
-        ).fetchone()[0] == SCHEMA_VERSION
+        ).fetchone()[0] == STORED_SCHEMA_VERSION
     finally:
         migrated.close()
 

@@ -634,10 +634,13 @@ DEFAULT_CONFIG = {
         # Non-system head messages always kept verbatim, in ADDITION to the (always protected)
         # system prompt. 0 = pin nothing but system prompt + summary + tail.
         "protect_first_n": 3,
-        # When True, auto-compression whose summary fails (aux error / non-JSON / timeout) aborts
-        # instead of dropping the middle with a "summary unavailable" placeholder; the session
-        # freezes at its size until /compress (bypasses the cooldown) or /new.
-        "abort_on_summary_failure": False,
+        # When True (default), auto-compression whose summary fails (aux error / non-JSON / timeout)
+        # aborts and keeps every message. A request that still fits is sent uncompressed and the
+        # failure cooldown paces retries; an over-window session bypasses the cooldown, so each
+        # message costs one rejected main call plus one summary call until /compress or /new. False
+        # opts into dropping the middle behind a deterministic "summary unavailable" handoff,
+        # including the repeated-stall rung (#112420).
+        "abort_on_summary_failure": True,
         # (Historical key name.) When True, gpt-5.4/5.5/5.6 and gpt-6 Astra (any slug containing
         # "astra" without "900k") on the ChatGPT Codex OAuth route raise their compaction trigger to
         # 85%: Codex hard-caps them at a 272K window, so the global 50% would compact at ~136K. False = global `threshold`. Only that route; the same models via
@@ -1768,6 +1771,12 @@ DEFAULT_CONFIG = {
         # Inference provider paired with cron.model (NOT the scheduler provider below). "" = resolve
         # from global config.
         "model_provider": "",
+        # Spend guard for LEGACY job records that still carry provider_snapshot/model_snapshot
+        # (created before unpinned jobs followed the main model). While on, such a job whose
+        # unpinned, non-fleet-default provider or model drifted from its snapshot is skipped with
+        # no model call and ONE alert, instead of silently running on the new model. False = these
+        # records follow the main model like new jobs. Jobs without snapshots are never affected.
+        "model_drift_guard": True,
         # Cron SCHEDULER provider (WHEN a due job fires). "" = built-in in-process 60s ticker. Name
         # an installed provider (plugins/cron_providers/<name>/ or $HERMES_HOME/plugins/ <name>/),
         # e.g. "chronos" (NAS-mediated managed cron for scale-to-zero). An unknown or unavailable

@@ -19,6 +19,7 @@ from agent.credential_pool import (  # custom_provider_pool_key_candidates is re
     CredentialPool, PooledCredential, credential_pool_matches_provider, custom_provider_pool_key_candidates,  # noqa: F401
     load_pool,
 )
+from agent.gemini_outbound_policy import deny_gemini_outbound, is_gemini_outbound
 from agent.secret_scope import get_secret_str
 from hermes_cli.auth import (  # resolve_external_process_provider_credentials is read via origin by runtime_provider_backends
     ACTUAL_LOCAL_NOAUTH_PLACEHOLDER, AuthError, DEFAULT_CODEX_BASE_URL, DEFAULT_QWEN_BASE_URL, DEFAULT_XAI_OAUTH_BASE_URL,
@@ -625,6 +626,7 @@ def _resolve_from_pool(provider: str, requested_provider: str, model_cfg: Dict[s
     entry = pool.select(model=target_model or None)
     if entry is None:
         return None
+    deny_gemini_outbound(base_url=_pool_entry_base_url(entry))
     pool_api_key = _pool_entry_api_key(entry)
     if provider == "nous":
         entry, pool_api_key = _refresh_nous_pool_entry(pool, entry, pool_api_key)
@@ -985,6 +987,14 @@ def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_ke
     requested_alias = requested_provider
     requested_provider, explicit_base_url = expand_direct_api_alias(requested_provider, explicit_base_url)
     _raise_if_local_alias_missing_endpoint(requested_provider, explicit_base_url)
+    # Google-bound routes are refused before any rung reads a credential; the result is re-checked below.
+    # ``model.*`` facts describe this request only for the configured provider (or auto): a stale
+    # Google endpoint there must not block switching away to another provider.
+    model_cfg = _get_model_config()
+    cfg_route = model_cfg if _cfg_provider(model_cfg) in {requested_alias, requested_provider} or requested_alias == "auto" else {}
+    deny_gemini_outbound(canonical_provider=requested_provider, model=target_model or cfg_route.get("default"),
+                         base_url=explicit_base_url or cfg_route.get("base_url"), api_mode=cfg_route.get("api_mode"),
+                         routing_hint=requested_alias)
     runtime = next(r for r in _ladder_rungs(requested_provider, explicit_api_key, explicit_base_url, target_model) if r)
     _raise_for_credentialless_bare_custom(requested_provider, runtime)
     # model.openai_runtime is applied ONCE, after the ladder: every rung (pool, OAuth store,
@@ -997,6 +1007,8 @@ def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_ke
         logger.info("model.openai_runtime=codex_app_server overrides the %s runtime (source=%s); its credential/endpoint "
                     "is not used — the app-server authenticates with its own login", runtime.get("provider"), runtime.get("source"))
     runtime["api_mode"] = api_mode
+    deny_gemini_outbound(canonical_provider=runtime.get("provider"), model=runtime.get("model"),
+                         base_url=runtime.get("base_url"), api_mode=api_mode, routing_hint=runtime.get("requested_provider"))
     return runtime
 
 
@@ -1032,6 +1044,7 @@ def _ladder_rungs(requested_provider, explicit_api_key, explicit_base_url, targe
     if not explicit_base_url and not explicit_api_key:
         yield _local_endpoint_bypass(requested_provider, explicit_api_key, explicit_base_url)
     provider = resolve_provider(requested_provider, explicit_api_key=explicit_api_key, explicit_base_url=explicit_base_url)
+    deny_gemini_outbound(canonical_provider=provider)  # "auto" may have picked a Google provider
     model_cfg = _get_model_config()
     yield _resolve_explicit_runtime(provider=provider, requested_provider=requested_provider, model_cfg=model_cfg,
                                     explicit_api_key=explicit_api_key, explicit_base_url=explicit_base_url,
@@ -1118,6 +1131,9 @@ def resolve_runtime_with_fallback(config: Optional[Dict[str, Any]], *, requested
             model = (entry.get("model") or "").strip()
             if not provider or not model:
                 continue
+            if is_gemini_outbound(canonical_provider=provider, model=model, base_url=entry.get("base_url")):
+                logger.warning("Fallback entry %s/%s skipped (Google outbound disabled)", provider, model)
+                continue  # before resolve_entry_api_key reads the entry's key
             kwargs: Dict[str, Any] = {"requested": provider, "target_model": model}
             if entry.get("base_url"):
                 kwargs["explicit_base_url"] = entry["base_url"]

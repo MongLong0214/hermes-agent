@@ -88,13 +88,20 @@ def _connect() -> sqlite3.Connection:
     # hardening so this writer doesn't create/leave the file (and its WAL
     # sidecars) at the process umask. See hermes_state._secure_state_db_files.
     from hermes_state import _secure_state_db_files
+    from hermes_state_fence import open_fenced_state_connection
 
     path = _db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    _secure_state_db_files(path, create_main=True)
-    # wal=False: SessionDB owns state.db's journal mode (_initialize_schema applies the barriers).
-    conn = open_db(path, db_label="state.db (async_delegation)", busy_timeout_ms=10_000,
-                   wal=False, row_factory=None, initialize=_initialize_schema)
+
+    def _open() -> sqlite3.Connection:
+        _secure_state_db_files(path, create_main=True)
+        # wal=False: SessionDB owns state.db's journal mode (_initialize_schema applies the barriers).
+        return open_db(path, db_label="state.db (async_delegation)", busy_timeout_ms=10_000,
+                       wal=False, row_factory=None)
+
+    # Lineage probe first: reconcile_state_schema's DDL must never reach a store this build refuses,
+    # and a fresh store gets its schema from SessionDB rather than from this raw writer.
+    conn = open_fenced_state_connection(path, bootstrap=True, connect=_open, initialize=_initialize_schema)
     _secure_state_db_files(path)
     return conn
 
@@ -279,7 +286,8 @@ def recover_abandoned_delegations() -> int:
 
 
 def restore_undelivered_completions(target_queue) -> int:
-    """Enqueue durable pending completions as fresh turns after process start.
+    """Enqueue durable pending completions as fresh turns at this process's first use of the ledger
+    (``ProcessRegistry.restore_durable_completions``).
     Restored events are stamped ``restored=True`` in memory only: they came from a PREVIOUS
     process, so drains without an ownership filter must leave them for a consumer that can
     prove ownership. Rows older than ``_MAX_COMPLETION_REPLAY_AGE_S`` are terminally dropped
@@ -564,6 +572,10 @@ def _dispatch_admitted(
     can't pile up unbounded background work. ``slot_key`` names the pool slot the unit occupies
     (default: its own id); the units of one delegate_task call share the first unit's id so
     splitting a call into per-group completions never consumes more capacity than the call did."""
+    from tools.process_registry import process_registry
+    # Settle the previous run's orphans and replay its completions before THIS run's first row
+    # exists: a replay after it would re-queue this process's own completion as ``restored``.
+    process_registry.restore_durable_completions()
     is_batch = goals is not None
     label = " batch" if is_batch else ""
     classify = _batch_status if is_batch else (lambda r: r.get("status") or "completed")

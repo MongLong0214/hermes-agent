@@ -546,6 +546,35 @@ class LoopManager:
         self._save()
         return {"status": status, "stopped": True, "reason": reason, "message": message}
 
+    def complete_exhausted_tick(self, recovery_state: Any) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+        """Settle a wakeup whose turn exhausted context compression: ``(decision, next_state)``.
+
+        The turn added no reply, so the last one is stale: it is never judged (no LOOP_COMPLETE marker,
+        no --until judge). The session is kept, so each tick re-sends the oversized request: the first
+        exhaustion only schedules the next tick (caps still apply), the second consecutive one pauses.
+        The host stores ``next_state`` per session (None clears it) and clears it after a tick that did
+        not exhaust. /goal's bound is ``hermes_cli.goals.plan_compression_exhaustion_recovery``."""
+        from hermes_cli.goals import COMPRESSION_RECOVERY_LIMIT
+
+        s = self._state
+        if s is None or not s.awaiting_response:
+            return self.complete_tick(""), None
+        ticks = 0
+        if isinstance(recovery_state, dict) and recovery_state.get("loop_created_at") == s.created_at:
+            try:
+                ticks = int(recovery_state.get("ticks", 0) or 0)
+            except (TypeError, ValueError):
+                ticks = 0
+        if ticks < COMPRESSION_RECOVERY_LIMIT:
+            decision = self.complete_tick("")
+            return decision, None if decision.get("stopped") else {"loop_created_at": s.created_at, "ticks": ticks + 1}
+        s.awaiting_response = False
+        return self._stop(
+            "paused", "context compression exhausted twice consecutively",
+            "⏸ Loop paused after context compression was exhausted twice. "
+            "Run /compress, then /loop resume to continue.",
+        ), None
+
     def complete_tick(self, last_response: str) -> Dict[str, Any]:
         """Evaluate the finished wakeup turn and schedule what's next.
 

@@ -3068,15 +3068,6 @@ class TestAuxiliaryAuthRefreshRetry:
             assert _refresh_provider_credentials("vertex") is False
 
 
-    def test_resolve_provider_client_vertex_none_when_no_credentials(self):
-        with patch("agent.vertex_adapter.has_vertex_credentials", return_value=False):
-            client, model = resolve_provider_client("vertex", "google/gemini-3-flash-preview")
-
-        assert client is None
-        assert model is None
-
-
-
 class TestAuxiliaryPoolRotationRetry:
     def test_call_llm_rotates_explicit_codex_pool_on_429(self):
         rate_err = Exception("usage limit reached")

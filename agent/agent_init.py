@@ -24,6 +24,7 @@ from urllib.parse import parse_qs, urlparse, urlunparse
 
 from agent.context_compressor import ContextCompressor
 from agent.agent_runtime_helpers import _ra
+from agent.gemini_outbound_policy import deny_gemini_outbound
 from agent.iteration_budget import IterationBudget, normalize_budget_warning_ratio
 from agent.memory_manager import StreamingContextScrubber
 from agent.session_activity import ActivityProvenance
@@ -844,6 +845,19 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[
     # #17929.
     _explicit = (agent.provider or "").strip().lower()
     for _fb in _fallback_entries(fallback_model):
+        _fb_provider = str(_fb.get("provider") or "").strip().lower()
+        _fb_model = str(_fb.get("model") or "").strip()
+        # Keep init-time recovery subject to the same fail-closed Google route
+        # policy as runtime failover.  This is deliberately before fallback-key
+        # resolution and client construction, so an unavailable primary cannot
+        # make Gemini/Vertex fallback entries touch credentials or transport
+        # state merely while scanning the chain.
+        from agent.chat_completion_helpers import _main_fallback_google_route
+        if _main_fallback_google_route(_fb_provider, _fb_model, _fb):
+            _skip_reason = ("automatic route cannot be verified before resolver effects"
+                            if _fb_provider == "auto" else "targets a disabled Google inference route")
+            logger.warning("Init-time fallback skip: %s/%s %s", _fb_provider, _fb_model, _skip_reason)
+            continue
         try:
             from hermes_cli.fallback_config import resolve_entry_api_key
             _fb_explicit_key = resolve_entry_api_key(_fb)
@@ -1508,7 +1522,11 @@ def _parse_compression_config(agent, _agent_cfg) -> CompressionSettings:
             0, _parse_config_int(cfg.get("proactive_prune_min_reclaim_tokens", 4096), 4096)
         ),
         protect_first=protect_first,
-        abort_on_summary_failure=_cfg_flag(cfg, "abort_on_summary_failure", False),
+        # An explicit null keeps the default, unlike the legacy flags: False opts into the fallback that
+        # drops history, which an empty value must not imply.
+        abort_on_summary_failure=(
+            cfg.get("abort_on_summary_failure") is None or _cfg_flag(cfg, "abort_on_summary_failure", True)
+        ),
         # Per-model threshold overrides: keys substring-matched against the model name
         # (longest match wins); {} = global threshold for all models.
         model_thresholds={
@@ -2388,6 +2406,8 @@ def init_agent(
     agent._credential_pool = credential_pool
     agent.acp_command = acp_command or command
     agent.acp_args = list(acp_args or args or [])
+    deny_gemini_outbound(canonical_provider=agent.provider, model=agent.model, base_url=agent.base_url,
+                         api_mode=api_mode, routing_hint=agent.requested_provider, endpoint_authority=True)
     _resolve_api_mode(agent, api_mode, provider_name, base_url)
     _finalize_routing(agent, api_mode, credential_pool)
 

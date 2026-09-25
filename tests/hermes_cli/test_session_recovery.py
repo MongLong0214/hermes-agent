@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
 import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,6 +16,7 @@ import pytest
 import hermes_state
 from hermes_state import SessionDB
 from hermes_state_common import FTS_STORAGE_VERSION, SCHEMA_VERSION
+from hermes_state_fence import register_turn_fence_generation
 from hermes_cli import session_recovery
 from hermes_cli.session_recovery import (
     SessionRecoverySafetyError,
@@ -427,6 +430,7 @@ def test_partial_recovery_keeps_messages_when_sessions_are_unsalvageable(
 
     # sessions unrecoverable, messages intact — the reported shape.
     conn = sqlite3.connect(str(source), isolation_level=None)
+    register_turn_fence_generation(conn)  # the store is fenced: plain writes land only as this build's generation
     try:
         conn.execute("DELETE FROM sessions")
     finally:
@@ -878,6 +882,7 @@ def test_partial_recovery_skips_phantom_row_rejected_by_destination_schema(
         conn.execute(f"PRAGMA schema_version={version + 1}")
         conn.execute("PRAGMA writable_schema=OFF")
     with sqlite3.connect(str(source), isolation_level=None) as conn:
+        register_turn_fence_generation(conn)  # the store is fenced: plain writes land only as this build's generation
         conn.execute(
             "INSERT INTO sessions (id, source, started_at, title) VALUES ('phantom', 'cli', NULL, 'Phantom')"
         )
@@ -935,3 +940,144 @@ def test_salvage_bounds_damaged_low_edge_from_the_aggregate_not_the_int64_domain
     assert result["range_queries"] < 200
     # Only the rows on the damaged leaf are lost; everything behind it is recovered.
     assert result["copied_rows"] >= 180 - 60
+
+
+_RECOVERY_CHILD = r"""
+import os, sys
+from pathlib import Path
+from hermes_cli.session_recovery import recover_session_database
+mode, source, output, ready = sys.argv[1], Path(sys.argv[2]), Path(sys.argv[3]), Path(sys.argv[4])
+def stop_mid_copy(progress):
+    if progress["copied_rows"] < 2:
+        return
+    if mode == "die":
+        os._exit(3)  # gone like a SIGKILL: no finally, no cleanup
+    ready.write_text("copying")
+    sys.stdin.read()  # alive mid-copy until the test closes stdin
+    os._exit(0)
+recover_session_database(source, output, chunk_size=1, progress_cb=stop_mid_copy)
+"""
+
+
+def _start_recovery_child(mode: str, source: Path, output: Path, ready: Path) -> subprocess.Popen:
+    return subprocess.Popen(
+        [sys.executable, "-c", _RECOVERY_CHILD, mode, str(source), str(output), str(ready)],
+        cwd=Path(__file__).resolve().parents[2], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+
+
+def test_interrupted_recovery_leaves_nothing_and_clears_only_dead_runs_leftovers(tmp_path: Path) -> None:
+    """The output is built in a private stage and only named once finished, so a run cut short mid-copy
+    leaves no partial database behind. The snapshot and stage copies of a run that died before its own
+    cleanup are removed by the next run; a live run's are never touched."""
+    source = tmp_path / "source" / "state.db"
+    output_dir = tmp_path / "output"
+    source.parent.mkdir()
+    output_dir.mkdir()
+    _make_source(source)
+    dead = _start_recovery_child("die", source, output_dir / "dead.db", tmp_path / "dead.ready")
+    assert dead.wait(timeout=60) == 3, dead.stderr.read()
+    dead_leftovers = {path.name for path in output_dir.iterdir()}
+    assert len(dead_leftovers) == 2  # its snapshot and its stage, each holding a database copy
+    live = _start_recovery_child("live", source, output_dir / "live.db", tmp_path / "live.ready")
+    try:
+        deadline = time.monotonic() + 60
+        while not (tmp_path / "live.ready").exists():
+            assert live.poll() is None and time.monotonic() < deadline, live.stderr.read()
+            time.sleep(0.05)
+        live_leftovers = {path.name for path in output_dir.iterdir()} - dead_leftovers
+        assert len(live_leftovers) == 2
+
+        def interrupt_mid_copy(progress: dict) -> None:
+            if progress["copied_rows"] >= 2:
+                raise KeyboardInterrupt  # Ctrl-C
+
+        with pytest.raises(KeyboardInterrupt):
+            recover_session_database(
+                source, output_dir / "recovered.db", chunk_size=1, progress_cb=interrupt_mid_copy,
+            )
+
+        assert {path.name for path in output_dir.iterdir()} == live_leftovers
+    finally:
+        live.communicate(timeout=60)
+
+
+@pytest.mark.parametrize("hard_links", [True, False], ids=["hard-links", "no-hard-links"])
+@pytest.mark.parametrize("taken", ["name", "journal", "journal-at-publish"])
+def test_recovery_never_publishes_over_or_beside_a_file_that_appeared_mid_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, taken: str, hard_links: bool,
+) -> None:
+    """The up-front existence check runs before the copy; publication takes the name atomically (a hard link,
+    or an exclusive placeholder where the filesystem has none, as on exFAT), so a database another process put
+    at the name, or a journal beside it, is refused and left byte-for-byte unchanged. Once it is gone the rerun
+    publishes, fsyncing the staged file before the name appears and the directory after."""
+    source = tmp_path / "source" / "state.db"
+    output = tmp_path / "output" / "recovered.db"
+    source.parent.mkdir()
+    output.parent.mkdir()
+    output = output.parent.resolve() / output.name  # the name recovery itself publishes under
+    _make_source(source)
+    intruder = output if taken == "name" else output.with_name(output.name + "-journal")
+    intruder_digest: list[str] = []
+
+    def intrude() -> None:
+        if taken == "name":
+            conn = sqlite3.connect(str(intruder))
+            conn.execute("CREATE TABLE competitor(owner TEXT)")
+            conn.commit()
+            conn.close()
+        else:
+            intruder.write_bytes(b"rollback journal of another database")
+        intruder_digest.append(_sha256(intruder))
+
+    real_snapshot, published_from = session_recovery._snapshot_and_inspect, []
+
+    def snapshot_then_intrude(*args, **kwargs):
+        result = real_snapshot(*args, **kwargs)
+        if taken != "journal-at-publish":
+            intrude()
+        return result
+
+    def recording(real):
+        def take_the_name(src, dst, *args, **kwargs):
+            if Path(dst) == output:
+                published_from.append(Path(src))
+                if taken == "journal-at-publish" and not intruder_digest:
+                    intrude()
+            return real(src, dst, *args, **kwargs)
+        return take_the_name
+
+    def unsupported_link(*_args, **_kwargs):
+        raise OSError(errno.ENOTSUP, "Operation not supported")
+
+    monkeypatch.setattr(session_recovery, "_snapshot_and_inspect", snapshot_then_intrude)
+    monkeypatch.setattr(os, "link", recording(os.link) if hard_links else unsupported_link)
+    monkeypatch.setattr(os, "replace", recording(os.replace))
+    with pytest.raises(SessionRecoverySafetyError, match="appeared during recovery"):
+        recover_session_database(source, output)
+
+    assert intruder_digest and _sha256(intruder) == intruder_digest[0]
+    assert sorted(path.name for path in output.parent.iterdir()) == [intruder.name]
+
+    intruder.unlink()
+    monkeypatch.setattr(session_recovery, "_snapshot_and_inspect", real_snapshot)
+    real_fsync, real_fsync_directory, fsyncs = os.fsync, session_recovery.fsync_directory, []
+
+    def recording_fsync(fd: int) -> None:
+        fsyncs.append(("file", os.fstat(fd).st_ino, output.exists()))
+        real_fsync(fd)
+
+    def recording_fsync_directory(path) -> None:
+        fsyncs.append(("directory", Path(path), output.exists()))
+        real_fsync_directory(path)
+
+    monkeypatch.setattr(os, "fsync", recording_fsync)
+    monkeypatch.setattr(session_recovery, "fsync_directory", recording_fsync_directory)
+    report = recover_session_database(source, output)
+
+    assert report["verified"] is True
+    assert sorted(path.name for path in output.parent.iterdir()) == [output.name]
+    assert published_from[-1].parent.parent == output.parent  # staged beside the output: one filesystem
+    assert ("file", os.stat(output).st_ino, False) in fsyncs
+    assert ("directory", output.parent, True) in fsyncs

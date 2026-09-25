@@ -164,6 +164,8 @@ class TestCronjobRunExecutesImmediately:
 
     def test_execute_job_now_marks_failure_on_exception(self):
         """An exception during fire is captured, marked failed, not propagated."""
+        from cron.jobs_public_status import public_run_error
+
         claimed = {**_JOB, "fire_claim": {"by": "manual-owner"}}
         with patch("tools.cronjob_tools.claim_job_for_fire", return_value=claimed), \
              patch("cron.scheduler.run_one_job", side_effect=RuntimeError("boom")), \
@@ -172,7 +174,8 @@ class TestCronjobRunExecutesImmediately:
             res = _execute_job_now(dict(_JOB))
         assert res["claimed"] is True
         assert res["success"] is False
-        assert "boom" in res["error"]
+        # The record store closes the raw text itself; the relayed tool result is already closed.
+        assert res["error"] == public_run_error("boom")
         m_mark.assert_called_once_with(
             "job-run-1",
             False,

@@ -83,6 +83,33 @@ def _shorten_implicit_idle_watchdog(monkeypatch, helpers, timeout=2.0):
     monkeypatch.setattr(helpers, "_resolve_nonstream_watchdogs", resolve)
 
 
+def _install_polled_clock(monkeypatch, agent):
+    """Swap wall time for a clock the stream advances; each step returns only after the
+    caller-thread watchdog has polled the new time (or a kill retired the request)."""
+    import threading
+
+    poll_thread = threading.current_thread()
+    clock = {"now": time.time(), "polls": 0}
+
+    def fake_time():
+        if threading.current_thread() is poll_thread:
+            clock["polls"] += 1
+        return clock["now"]
+
+    def advance(seconds):
+        seen = clock["polls"]
+        clock["now"] += seconds
+        # Three reads: at least two follow the step, so the first one's kill checks have run.
+        deadline = time.monotonic() + 10.0
+        while clock["polls"] < seen + 3 and time.monotonic() < deadline:
+            if getattr(agent, "_active_codex_stream_request_token", None) is None:
+                return
+            time.sleep(0.02)
+
+    monkeypatch.setattr(time, "time", fake_time)
+    return advance
+
+
 def _install_codex_event_stream(agent, monkeypatch, event_factory, closes):
     client = SimpleNamespace(
         responses=SimpleNamespace(create=lambda **_kwargs: event_factory())
@@ -353,6 +380,7 @@ def test_event_stale_phase_is_scoped_to_physical_stream_attempt(
 ):
     """Retry lifecycle resets phase without hiding a zero-event reconnect hang."""
     from agent import chat_completion_helpers as h
+    from agent.chat_completion_accepted_failure import is_accepted_stream_failure
 
     agent = _make_codex_agent(tmp_path, monkeypatch)
     _shorten_implicit_idle_watchdog(monkeypatch, h)
@@ -362,6 +390,7 @@ def test_event_stale_phase_is_scoped_to_physical_stream_attempt(
 
     closes: list = []
     attempts = {"count": 0}
+    advance = _install_polled_clock(monkeypatch, agent) if mode == "retry_gap" else None
 
     def stream_attempt():
         attempts["count"] += 1
@@ -381,9 +410,12 @@ def test_event_stale_phase_is_scoped_to_physical_stream_attempt(
                 time.sleep(0.02)
             raise RuntimeError("retired zero-event retry")
         if mode == "retry_gap" and attempts["count"] == 2:
+            # Each no-event phase fits the 2s TTFB but the two together do not, so only a
+            # per-reconnect TTFB restart survives; the lifecycle-only gap then outlasts idle.
+            advance(1.2)
             yield SimpleNamespace(type="response.created")
             yield SimpleNamespace(type="response.in_progress")
-            time.sleep(3.0)
+            advance(2.2)
             yield SimpleNamespace(type="response.reasoning_text.delta", delta="retry step")
             yield SimpleNamespace(type="response.output_text.delta", delta="done")
             yield SimpleNamespace(
@@ -392,11 +424,13 @@ def test_event_stale_phase_is_scoped_to_physical_stream_attempt(
             )
             return
 
-        yield SimpleNamespace(type="response.created")
-        if mode != "retry_no_event":
-            yield SimpleNamespace(type="response.reasoning_text.delta", delta="first step")
+        if mode == "retry_gap":
+            advance(1.2)
         if mode in {"retry_gap", "retry_no_event"}:
+            # Fail before the first event: accepted events are billed and never replayed.
             raise ConnectionError("retry physical stream")
+        yield SimpleNamespace(type="response.created")
+        yield SimpleNamespace(type="response.reasoning_text.delta", delta="first step")
         while getattr(agent, "_active_codex_stream_request_token", None) is not None:
             time.sleep(0.02)
         raise ConnectionError("retired stalled stream")
@@ -409,9 +443,15 @@ def test_event_stale_phase_is_scoped_to_physical_stream_attempt(
         )
         assert response.output_text == "done"
         assert attempts["count"] == (1 if mode == "initial_gap" else 2)
+    elif mode == "stall":
+        # The idle kill lands after an accepted event: the billed attempt ends as its accepted
+        # failure, never a watchdog TimeoutError that generic retry would replay.
+        outcome = h.interruptible_api_call(
+            agent, {"model": "gpt-5.6-sol", "input": "x" * 40_004}
+        )
+        assert is_accepted_stream_failure(outcome)
     else:
-        error_match = "no parsed stream event" if mode == "retry_no_event" else "no SSE events"
-        with pytest.raises(TimeoutError, match=error_match):
+        with pytest.raises(TimeoutError, match="no parsed stream event"):
             h.interruptible_api_call(
                 agent, {"model": "gpt-5.6-sol", "input": "x" * 40_004}
             )

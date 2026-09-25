@@ -79,18 +79,37 @@ class TestBranchCommandCLI:
         assert new_session is not None
 
     def test_failed_branch_creation_leaves_original_session_open(self, cli_instance, session_db):
-        """Branching is child-first: when create_session fails the user stays on the original
+        """Branching is child-first: when the strict create fails the user stays on the original
         session, so it must not be marked ended as "branched" (#11030)."""
         from unittest.mock import patch
         from cli import HermesCLI
 
         original = cli_instance.session_id
-        with patch.object(session_db, "create_session", side_effect=RuntimeError("boom")):
+        with patch.object(session_db, "create_session_strict", side_effect=RuntimeError("boom")):
             HermesCLI._handle_branch_command(cli_instance, "/branch")
 
         assert cli_instance.session_id == original
         row = session_db.get_session(original)
         assert row["end_reason"] is None and row["ended_at"] is None
+
+    def test_branch_reply_reports_only_what_the_child_row_holds(self, cli_instance, session_db, monkeypatch):
+        """A branch name another session already holds leaves the child untitled: the reply must not
+        claim the name, must say why, and its message count is the child's durable one."""
+        import hermes_cli.cli_commands_mixin as mixin
+        from cli import HermesCLI
+
+        session_db.create_session(session_id="holder", source="cli")
+        session_db.set_session_title("holder", "taken")
+        printed = []
+        monkeypatch.setattr(mixin, "_cp", lambda *lines: printed.extend(lines))
+        HermesCLI._handle_branch_command(cli_instance, "/branch taken")
+
+        child = session_db.get_session(cli_instance.session_id)
+        reply = "\n".join(printed)
+        assert child["parent_session_id"] == "20260403_120000_abc123" and child["title"] is None
+        assert '"taken"' not in reply and "already in use" in reply
+        durable = sum(m["role"] == "user" for m in session_db.get_messages(child["id"]))
+        assert f"({durable} user message" in reply
 
     def test_branch_copies_history(self, cli_instance, session_db):
         """Branching should copy all messages to the new session."""

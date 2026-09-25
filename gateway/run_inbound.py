@@ -1359,17 +1359,23 @@ class GatewayInboundMixin:
             # One-shot restore (/moa, /model --once) must run on EVERY exit path (success,
             # exception, interrupt); the generation guard makes a displaced turn's finalizer a no-op.
             self._restore_pending_one_turn_model_override(_quick_key, _run_generation)
-            # SIGKILL/OOM skips finally, leaving the durable marker for the next unclean startup's
-            # recovery pass.
-            await self._clear_durable_active_turn(event)
-            # Release only this turn's generation. Eviction may immediately admit a replacement
-            # through the cold path; an unconditional release here would then clear the replacement
-            # sentinel/agent and lease. Reset/stop release their stale slot before installing a
-            # successor, preserving reset-zombie cleanup without granting gen-N successor authority.
-            self._release_running_agent_state(_quick_key, run_generation=_run_generation)
-            # Turn lease is keyed by (routing key, run generation) so this unwind can only free
-            # the lease its own turn acquired, never a newer turn's.
-            self._release_turn_lease(_quick_key, _run_generation)
+            try:
+                # SIGKILL/OOM skips finally, leaving the durable marker for the next unclean
+                # startup's recovery pass.
+                await self._clear_durable_active_turn(event)
+            finally:
+                # A cancellation landing in the await above (/stop or shutdown while the marker CAS
+                # waits on state.db) must not skip these synchronous releases, or the slot stays busy
+                # and every routing key on this session_id times out on the still-held lease.
+                # Release only this turn's generation. Eviction may immediately admit a replacement
+                # through the cold path; an unconditional release here would then clear the
+                # replacement sentinel/agent and lease. Reset/stop release their stale slot before
+                # installing a successor, preserving reset-zombie cleanup without granting gen-N
+                # successor authority.
+                self._release_running_agent_state(_quick_key, run_generation=_run_generation)
+                # Turn lease is keyed by (routing key, run generation) so this unwind can only free
+                # the lease its own turn acquired, never a newer turn's.
+                self._release_turn_lease(_quick_key, _run_generation)
 
     def _restore_pending_one_turn_model_override(self, session_key: str, run_generation: int | None = None) -> None:
         """Restore the per-session model override captured by ``/model --once`` or ``/moa``.

@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from cron.jobs import create_job, get_job, list_jobs, load_jobs, pause_job, save_jobs
+from cron.jobs_public_status import public_delivery_error, public_run_error
 from hermes_cli import cron as cron_cli
 from hermes_cli.cron import cron_command
 from hermes_cli.subcommands.cron import build_cron_parser
@@ -184,8 +185,10 @@ class TestCronDoctor:
         assert rc == 1
         assert "Cron doctor found 3 issue(s)" in out
         assert job["id"] in out
-        assert "last run failed: Provider returned error" in out
-        assert "was not delivered (telegram timeout)" in out
+        # A record written raw by an older build is reported by its closed labels.
+        assert f"last run failed: {public_run_error('Provider returned error')}" in out
+        assert f"was not delivered ({public_delivery_error('telegram timeout')})" in out
+        assert "Provider returned error" not in out and "telegram timeout" not in out
         assert "hermes cron edit" in out
         assert "script not found" in out
 
@@ -219,7 +222,7 @@ class TestCronDoctor:
 
         out = capsys.readouterr().out
         assert rc == 1
-        assert "was not delivered (telegram timeout)" in out
+        assert f"was not delivered ({public_delivery_error('telegram timeout')})" in out
         assert "hermes cron edit" in out
         assert "last run failed" not in out
         assert "unknown error" not in out
@@ -289,9 +292,10 @@ class TestCronListStatusRendering:
         out = capsys.readouterr().out
         last_run_line = next(l for l in out.splitlines() if "Last run:" in l)
         assert "was not delivered" in last_run_line
-        assert "telegram timeout" in last_run_line, (
+        assert public_delivery_error("telegram timeout") in last_run_line, (
             "the delivery detail lives in last_delivery_error, not last_error"
         )
+        assert "telegram timeout" not in out
         assert cron_cli.Colors.GREEN not in last_run_line
 
     def test_ok_run_still_green(self, tmp_cron_dir, capsys, monkeypatch):
@@ -591,7 +595,10 @@ class TestSlashCronListLastStatus:
         save_jobs(jobs)
 
         out = self._run_list(tmp_cron_dir, capsys)
-        assert "Last run: 2026-09-01T07:00:00+00:00 (delivery_failed: telegram: 502 Bad Gateway)" in out
+        # The chat-facing list serves the closed label even for a record written raw by an older build.
+        closed = public_delivery_error("telegram: 502 Bad Gateway")
+        assert f"Last run: 2026-09-01T07:00:00+00:00 (delivery_failed: {closed})" in out
+        assert "502 Bad Gateway" not in out
 
     def test_ok_stays_plain(self, tmp_cron_dir, capsys):
         create_job(prompt="Nightly brief", schedule="every 1h")

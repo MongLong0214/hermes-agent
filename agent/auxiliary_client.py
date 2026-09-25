@@ -40,6 +40,7 @@ from agent.codex_headers import (
     is_official_codex_base_url as _is_official_codex_base_url,
 )
 from agent.codex_runtime import _codex_event_has_content
+from agent.gemini_outbound_policy import deny_gemini_outbound, is_gemini_outbound
 from agent.sdk_transform_bypass import bypass_chat_sdk_request_transform
 
 # `openai.OpenAI` is imported lazily (~240 ms cold); `OpenAI` below is a proxy
@@ -179,6 +180,7 @@ def _openai_http_client_kwargs(base_url: Optional[str], *, async_mode: bool = Fa
 
 
 def _create_openai_client(*, api_key: str, base_url: str, **kwargs: Any) -> Any:
+    deny_gemini_outbound(base_url=base_url)
     if _aux_probe_active():
         # Availability probe: resolved credentials/base_url are the answer.
         return _AuxProbeClientStub(api_key=api_key, base_url=base_url)
@@ -2140,6 +2142,8 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
     for provider_id, pconfig in PROVIDER_REGISTRY.items():
         if pconfig.auth_type != "api_key":
             continue
+        if is_gemini_outbound(canonical_provider=provider_id, base_url=pconfig.inference_base_url):
+            continue  # never an auto candidate: skipped before its key or pool is read
         if _is_provider_unhealthy(provider_id):
             logger.debug("Auxiliary api-key chain: %s is unhealthy, skipping", provider_id)
             continue
@@ -4315,15 +4319,26 @@ def _try_configured_fallback_chain(
         if not fb_provider:
             continue
         fb_model_raw = str(entry.get("model", "")).strip()
-        fb_base_url = _custom_health_base_url(fb_provider, entry.get("base_url"))
+        label = f"fallback_chain[{i}]({fb_provider})"
+        route_admitted, fb_route_base_url = _fallback_named_custom_route(
+            fb_provider, entry.get("base_url"),
+        )
+        if not route_admitted:
+            tried.append(f"{label} (custom route unresolved)")
+            continue
+        if _fallback_google_route(
+            fb_provider, fb_model_raw, fb_route_base_url or str(entry.get("base_url") or ""),
+        ):
+            tried.append(f"{label} (Google outbound disabled)")
+            continue
+        fb_base_url = _custom_health_base_url(fb_provider, fb_route_base_url or entry.get("base_url"))
         if skip(fb_provider, fb_model_raw, fb_base_url):
             continue
         if _is_provider_unhealthy(fb_provider, fb_base_url):
             _log_skip_unhealthy(fb_provider, task, base_url=fb_base_url)
-            tried.append(f"fallback_chain[{i}]({fb_provider}) (unhealthy)")
+            tried.append(f"{label} (unhealthy)")
             continue
         fb_model = fb_model_raw or None
-        label = f"fallback_chain[{i}]({fb_provider})"
         try:
             fb_client, resolved_model = _resolve_fallback_entry(entry)
         except Exception:
@@ -4378,6 +4393,69 @@ def _resolve_fallback_entry(entry: Dict[str, Any]) -> Tuple[Optional[Any], Optio
     return client, resolved_model
 
 
+def _main_fallback_ambiguous_custom_route(provider: str, explicit_base_url: Any) -> bool:
+    """Whether a custom fallback lacks a trustworthy explicit endpoint.
+
+    This uses only the fallback entry's route facts and deliberately runs before
+    custom health lookup, which may otherwise consult ambient custom-route state.
+    """
+    normalized_provider = (provider or "").strip().lower()
+    if normalized_provider != "custom" and not normalized_provider.startswith("custom:"):
+        return False
+    route = str(explicit_base_url or "").strip()
+    if not route:
+        return True
+    try:
+        parsed = urlparse(route)
+        _ = parsed.port  # Access validates malformed and out-of-range explicit ports.
+        return parsed.scheme not in {"http", "https"} or not parsed.hostname
+    except ValueError:
+        return True
+
+
+def _fallback_named_custom_route(provider: str, explicit_base_url: Any) -> Tuple[bool, str]:
+    """Return a named custom fallback's admitted non-secret endpoint fact.
+
+    Entries may name a configured provider without repeating its endpoint.  Peek
+    only at that endpoint before fallback resolution: this lets admission inspect
+    the same route as the resolver without reading a key or building a client.
+    A configured alias with no endpoint fails closed; unrelated providers retain
+    their existing routing behavior.
+    """
+    route = str(explicit_base_url or "").strip()
+    normalized_provider = (provider or "").strip().lower()
+    if not route:
+        if normalized_provider == "custom":
+            return False, route
+        if normalized_provider in {"", "auto", "moa"}:
+            return True, route
+        try:
+            from hermes_cli.runtime_provider_custom import peek_named_custom_provider_route
+            route_fact = peek_named_custom_provider_route(provider)
+        except Exception:
+            route_fact = None
+        if route_fact is None:
+            return not normalized_provider.startswith("custom:"), route
+        route = str(route_fact.get("base_url") or "").strip()
+        if not route:
+            return False, route
+    try:
+        parsed = urlparse(route)
+        _ = parsed.port  # Access validates malformed and out-of-range ports.
+        return parsed.scheme in {"http", "https"} and bool(parsed.hostname), route
+    except ValueError:
+        return False, route
+
+
+def _fallback_google_route(provider: str, model: str, base_url: str) -> bool:
+    """Whether one configured auxiliary fallback targets a disabled Google inference route.
+
+    This receives only already-resolved config facts, so it is safe to run before
+    fallback-key resolution, SDK construction, or a provider health/network probe.
+    """
+    return is_gemini_outbound(canonical_provider=provider, model=model, base_url=base_url)
+
+
 def _try_main_fallback_chain(
     task: Optional[str], failed_provider: str = "", reason: str = "error", *,
     failed_model: Optional[str] = None, failed_base_url: str = "", failure_scope: Any = None,
@@ -4407,7 +4485,23 @@ def _try_main_fallback_chain(
             continue
         fb_norm = fb_provider.lower()
         label = f"fallback_providers[{i}]({fb_provider})"
-        fb_base_url = _custom_health_base_url(fb_provider, entry.get("base_url"))
+        route_admitted, fb_route_base_url = _fallback_named_custom_route(
+            fb_provider, entry.get("base_url"),
+        )
+        if not route_admitted:
+            tried.append(f"{label} (custom route unresolved)")
+            continue
+        if _main_fallback_ambiguous_custom_route(fb_provider, fb_route_base_url):
+            tried.append(f"{label} (custom route unresolved)")
+            continue
+        # Preserve the configured URL as route evidence: a dynamically named provider may
+        # not have a custom-health mapping, but its explicit Google endpoint is still denied.
+        if _fallback_google_route(
+            fb_provider, fb_model, fb_route_base_url or str(entry.get("base_url") or ""),
+        ):
+            tried.append(f"{label} (Google outbound disabled)")
+            continue
+        fb_base_url = _custom_health_base_url(fb_provider, fb_route_base_url or entry.get("base_url"))
         if fb_norm == "auto" or skip(fb_provider, fb_model, fb_base_url):
             tried.append(f"{label} (skipped)")
             continue
@@ -5077,6 +5171,7 @@ def _resolve_named_custom_branch(req: _ResolveRequest) -> Optional[_ResolveResul
     # whatever the caller left blank, never replaces what the caller set (compression prompts carry
     # conversation history, so a silently swapped destination is a data-routing bug, not a nuisance).
     custom_base = (req.explicit_base_url or custom_entry.get("base_url") or "").strip()
+    deny_gemini_outbound(base_url=custom_base)  # before key_cmd / pool / client
     custom_key = _normalize_api_key(req.explicit_api_key) or _named_custom_api_key(custom_entry, provider, custom_base)
     if custom_key == "no-key-required":
         logger.warning("resolve_provider_client: named custom provider %r has no resolvable "
@@ -5325,6 +5420,20 @@ _EXPLICIT_PROVIDER_BRANCHES: Dict[str, Callable[[_ResolveRequest], _ResolveResul
 }
 
 
+def _deny_aux_route(provider: str, model: Any, base_url: Any, api_mode: Any, main_runtime: Any) -> None:
+    """Refuse a Google-bound auxiliary route before any credential, pool, cache or client work.
+
+    The main runtime is this call's route only on ``auto``; any other provider names its own."""
+    original = (provider or "").strip().lower()
+    normalized = _normalize_aux_provider(provider)
+    main_route = main_runtime if normalized == "auto" and isinstance(main_runtime, dict) else {}
+    deny_gemini_outbound(
+        canonical_provider=normalized, model=model or main_route.get("model", ""),
+        base_url=base_url or main_route.get("base_url", ""), api_mode=api_mode or main_route.get("api_mode", ""),
+        routing_hint=main_route.get("requested_provider") or main_route.get("provider") or original,
+        endpoint_authority=True)
+
+
 def resolve_provider_client(
     provider: str, model: str = None, async_mode: bool = False, raw_codex: bool = False,
     explicit_base_url: str = None, explicit_api_key: Optional[Union[str, Callable[[], str]]] = None,
@@ -5342,6 +5451,7 @@ def resolve_provider_client(
     # (e.g. "kimi" → "kimi-coding") is still reachable via the named-custom branch.
     original_provider = (provider or "").strip().lower()
     provider = _normalize_aux_provider(provider)
+    _deny_aux_route(original_provider, model, explicit_base_url, api_mode, main_runtime)
     api_mode = _canonical_api_mode(str(api_mode or "")).lower() or None
     # MoA chokepoint: "moa" is not an HTTP provider; resolve to the aggregator so direct callers don't
     # dead-end in unknown-provider. Unresolvable preset → leave untouched for the normal diagnostic.
@@ -5351,6 +5461,7 @@ def resolve_provider_client(
             original_provider = _agg_provider.strip().lower()
             provider = _normalize_aux_provider(_agg_provider)
             model = _agg_model
+            deny_gemini_outbound(canonical_provider=provider, routing_hint=original_provider, endpoint_authority=True)
             # The moa:// facade endpoint/key belong to the virtual runtime, not the aggregator.
             if explicit_base_url and str(explicit_base_url).lower().startswith("moa://"):
                 explicit_base_url = None
@@ -5904,6 +6015,7 @@ def _get_cached_client(
     previously occurred in long-running gateways where recycled worker threads created unbounded entries
     (#10200).
     """
+    _deny_aux_route(provider, model, base_url, api_mode, main_runtime)  # the cache key reads the pool
     current_loop = _current_event_loop() if async_mode else None
     runtime = _normalize_main_runtime(main_runtime)
     cache_key = _client_cache_key(

@@ -5,11 +5,15 @@ The classifier is `agent.error_classifier.classify_api_error`; these tests pin w
 does with its verdict, not the verdict itself.
 """
 
+import os
 import re
+from pathlib import Path
 
 import cron.scheduler as scheduler
+from cron.jobs import get_cron_output_dir
+from cron.jobs_public_status import failure_cause, failure_kind
 from cron.scheduler import _compose_run_delivery, _summarize_cron_failure_for_delivery
-from hermes_constants import display_hermes_home
+from cron.scheduler_failure_copy import cron_output_dir_display
 
 JOB = {"name": "Morning brief", "id": "ab12cd34"}
 _HTTP_LEAD = re.compile(r"failed: (HTTP|Error code:|provider )")
@@ -21,11 +25,16 @@ def _no_chain(monkeypatch):
 
 
 def test_generic_failure_names_runs_and_pause_commands_and_the_real_output_dir():
-    msg = _summarize_cron_failure_for_delivery(JOB, "[Errno 2] No such file or directory: '/x.py'")
-    assert "/x.py" in msg  # the raw detail survives as the cause
+    raw = "[Errno 2] No such file or directory: '/x.py'"
+    msg = _summarize_cron_failure_for_delivery(JOB, raw)
+    assert "/x.py" not in msg and failure_cause(failure_kind(raw)) in msg  # closed cause, raw stays private
     for cmd in ("hermes cron runs ab12cd34", "hermes cron run ab12cd34", "hermes cron pause ab12cd34"):
         assert f"`{cmd}`" in msg
-    assert f"{display_hermes_home()}/cron/output/ab12cd34/" in msg
+    named = cron_output_dir_display("ab12cd34")
+    assert named in msg
+    # It names the real output dir; a home outside the user's reads `$HERMES_HOME`, not its host path.
+    resolved = Path(os.path.expandvars(os.path.expanduser(named))).resolve()
+    assert resolved == (get_cron_output_dir() / "ab12cd34").resolve()
     assert "cron output" not in msg  # the unnamed internal location is gone
 
 
@@ -103,12 +112,12 @@ def test_transient_provider_failures_never_lead_with_jargon(monkeypatch):
 
 
 def test_blocked_config_notice_says_it_did_not_run_and_will_self_heal():
+    error = "[blocked_config] provider credential missing: no key"
     text, blocked, *_ = _compose_run_delivery(
-        JOB, success=False, error="[blocked_config] provider credential missing: no key",
-        final_response="", output_file=None)
+        JOB, success=False, error=error, final_response="", output_file=None)
     assert blocked is True
     assert "did not run" in text
-    assert "provider credential missing: no key" in text
+    assert failure_cause(failure_kind(error)) in text and "no key" not in text
     assert "Nothing was charged" in text
     # Some blocks (MCP server temporarily down) clear on their own, so the retry
     # line must not condition the retry on the user fixing something.

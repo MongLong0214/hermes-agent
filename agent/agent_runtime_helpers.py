@@ -28,6 +28,7 @@ from agent.credential_pool import (
     credential_pool_matches_provider, resolve_runtime_pool_key,
 )
 from agent.error_classifier import FailoverReason
+from agent.gemini_outbound_policy import GeminiOutboundDenied, deny_gemini_outbound
 from agent.retry_utils import parse_retry_after_seconds, reset_delay_from_message
 from agent.turn_context import drop_stale_api_content
 from utils import base_url_host_matches, base_url_hostname, env_var_enabled, atomic_json_write
@@ -1049,6 +1050,8 @@ def try_recover_primary_transport(
         )
         time.sleep(wait_time)
         return True
+    except GeminiOutboundDenied:
+        raise
     except Exception as e:
         logger.warning("Primary transport recovery failed: %s", e)
         return False
@@ -1243,6 +1246,11 @@ def restore_primary_runtime(agent) -> bool:
         # Stay on the fallback; the user sees the terminal entitlement error instead.
         return False
     primary_runtime_base_url = str((rt or {}).get("base_url") or "")
+    deny_gemini_outbound(  # before the primary's pool, credentials or client are touched
+        canonical_provider=primary_provider, model=primary_model,
+        base_url=primary_runtime_base_url or ((rt or {}).get("client_kwargs") or {}).get("base_url", ""),
+        api_mode=(rt or {}).get("api_mode", ""), routing_hint=(rt or {}).get("requested_provider") or primary_provider,
+        endpoint_authority=True)
 
     def _matches_primary(candidate) -> bool:
         return credential_pool_matches_provider(candidate, primary_provider, base_url=primary_runtime_base_url)
@@ -1803,6 +1811,10 @@ def _gemini_native_client(agent, client_kwargs: dict, httpx_verify, *, reason: s
 def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: bool) -> Any:
     from agent.auxiliary_client import _validate_base_url, _validate_proxy_env_urls
     from agent.ssl_verify import resolve_httpx_verify
+    deny_gemini_outbound(
+        canonical_provider=getattr(agent, "provider", ""), model=getattr(agent, "model", ""),
+        base_url=client_kwargs.get("base_url") or getattr(agent, "base_url", ""), api_mode=getattr(agent, "api_mode", ""),
+        routing_hint=getattr(agent, "requested_provider", "") or getattr(agent, "provider", ""), endpoint_authority=True)
     # Treat client_kwargs as read-only: callers pass agent._client_kwargs, and in-place mutation
     # leaks into later requests (a torn-down httpx transport got reused).
     # Callers pass agent._client_kwargs (or shallow copies of it) in; any in-place mutation leaks back into
@@ -2283,6 +2295,9 @@ def switch_model(
     compressor). Mirrors ``_try_activate_fallback()`` but also updates ``_primary_runtime`` so
     the change persists across turns. A failed swap/rebuild rolls back to the pre-switch
     snapshot and re-raises (callers catch)."""
+    # Refused before any agent state, pool or client changes: nothing to roll back.
+    deny_gemini_outbound(canonical_provider=new_provider, model=new_model, base_url=base_url, api_mode=api_mode,
+                         routing_hint=new_provider, endpoint_authority=True)
     old_model = agent.model
     old_provider = agent.provider
     # ── Reload credential pool for the new provider (issue #52727) ── Without this,

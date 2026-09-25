@@ -37,7 +37,7 @@ from agent.turn_context import PreflightCompressionTimedOut, build_turn_context
 from agent.turn_retry_state import TurnRetryState
 # Phase helpers of the turn loop, bound at import so a source-tree swap cannot load a
 # skewed phase mid-turn.
-from agent.turn_api_call import handle_api_interrupt, nous_rate_limit_guard, perform_api_call
+from agent.turn_api_call import handle_accepted_stream_failure, handle_api_interrupt, nous_rate_limit_guard, perform_api_call
 from agent.turn_api_error import handle_api_error
 from agent.turn_api_request import build_api_request
 from agent.turn_failure_copy import failed_turn_notice, site_copy
@@ -198,8 +198,9 @@ _HANDOFF_SKIP_FINAL_RESPONSE = (
 # while the request was still oversized (#98722, salvaged from #98741). Sending the unchanged request would
 # only bounce off the provider's overflow error and re-enter compression in the same turn.
 _COMPRESSION_TIMEOUT_FINAL_RESPONSE = (
-    "Context compression timed out without reducing this conversation. No messages were "
-    "dropped. Start a fresh session with /new, or check auxiliary.compression before retrying /compress."
+    "Context compression timed out without reducing this conversation. Earlier messages were kept, "
+    "but your last message was not answered: run /compress (check auxiliary.compression if it fails "
+    "again), then send it again — or start a fresh session with /new."
 )
 
 
@@ -998,8 +999,9 @@ def _partial_turn_result(
 
 def _compression_deferred_result(agent, messages: List[Dict], api_call_count: int, reason: str = "lock") -> Dict[str, Any]:
     """Soft turn result for a transiently-deferred compression. Both reasons must end as
-    ``compression_deferred``, never ``compression_exhausted`` — the gateway wipes the
-    session on exhaustion (#9893/#35809). ``failed`` stays False; the turn persists."""
+    ``compression_deferred``, never ``compression_exhausted`` — exhaustion tells the user to
+    /compress or /new, which is wrong for a session another path is about to shrink.
+    ``failed`` stays False; the turn persists."""
     session = agent.session_id or "none"
     if reason == "transient_block":
         block = getattr(agent, "_compression_blocked_transient", None)
@@ -1360,6 +1362,7 @@ class _LoopState:
     _retry: Any = None
     finish_reason: str = "stop"
     response: Any = None  # None when every retry failed
+    accepted_stream_failure_error: Any = None
     api_kwargs: Any = None  # None until built; read by the except handlers
     api_request_id: Any = None
     _original_api_kwargs: Any = None
@@ -1415,7 +1418,10 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[Dict[str, Any]]:
             return None
         try:
             _run_phase(build_api_request, agent, s)
-            if _run_phase(perform_api_call, agent, s).action == "break":
+            _pc = _run_phase(perform_api_call, agent, s)
+            if _pc.action == "accepted_failure":
+                _run_phase(handle_accepted_stream_failure, agent, s)
+            if _pc.action in ("break", "accepted_failure"):
                 return None
             _rc = _run_phase(check_api_response, agent, s)
             if _rc.action == "return":
@@ -1554,6 +1560,8 @@ def _run_conversation_turn(
         if early_result is not None:
             return early_result
 
+        if s.accepted_stream_failure_error is not None:
+            break
         _rs = _run_phase(apply_retry_restarts, agent, s)
         if _rs.action == "break":
             break
@@ -1585,8 +1593,8 @@ def _run_conversation_turn(
         for name in inspect.signature(finalize_turn).parameters if name != "agent"
     })
     if s._compression_timeout_exhausted:
-        # Reuse the gateway's context-recovery contract: transcript stays intact while
-        # future input can move to a clean session (#98722).
+        # Reuse the gateway's context-recovery contract: the session keeps its earlier history, the
+        # unanswered ask is rolled back (_retract_exhausted_turn), and the user chooses /compress or /new (#98722).
         result.update(error=_COMPRESSION_TIMEOUT_FINAL_RESPONSE, partial=True, compression_exhausted=True)
     return result
 
@@ -1652,16 +1660,17 @@ def _close_durable_failed_turn(agent, result: Any) -> None:
 
     Excluded: the context-pressure classes (``compression_exhausted``, ``compression_deferred``,
     ``failure_reason == "context_overflow"``) — appending to an already-oversized session is the
-    #1630 growth loop; their repair is rotation or a retry. Idempotence is keyed on the DURABLE
-    tail (``SessionDB.latest_conversation_role``), so a redelivery or a tail already closed by
-    another writer is a no-op, and the gateway's own closer then no-ops in turn.
+    #1630 growth loop. An exhausted turn instead retracts its own user row
+    (``_retract_exhausted_turn``); the others are left for a retry. Idempotence is keyed on the
+    DURABLE tail (``SessionDB.latest_conversation_role``), so a redelivery or a tail already
+    closed by another writer is a no-op, and the gateway's own closer then no-ops in turn.
     """
     try:
         if not isinstance(result, dict) or result.get("completed") is True:
             return
-        if (
-            result.get("compression_exhausted") or result.get("compression_deferred")
-            or result.get("failure_reason") == "context_overflow"
+        exhausted = bool(result.get("compression_exhausted")) and not result.get("compression_deferred")
+        if not exhausted and (
+            result.get("compression_deferred") or result.get("failure_reason") == "context_overflow"
         ):
             return
         messages = result.get("messages")
@@ -1669,6 +1678,9 @@ def _close_durable_failed_turn(agent, result: Any) -> None:
         if not isinstance(messages, list) or not messages or db is None or not session_id:
             return
         if getattr(agent, "_persist_disabled", False) or db.latest_conversation_role(session_id) != "user":
+            return
+        if exhausted:
+            _retract_exhausted_turn(agent, result, messages, db, session_id)
             return
         # Scope the "did a tool run" scan to this turn when its boundary is proven; otherwise
         # hedge over the whole list rather than under-report a possible side effect.
@@ -1678,6 +1690,26 @@ def _close_durable_failed_turn(agent, result: Any) -> None:
         agent._flush_messages_to_session_db(messages)
     except Exception:
         logger.debug("failed-turn boundary not written", exc_info=True)
+
+
+def _retract_exhausted_turn(agent, result: Dict[str, Any], messages: List[Dict[str, Any]], db, session_id) -> None:
+    """Soft-delete a compression-exhausted turn's own user row, the durable tail the turn-start flush wrote.
+
+    Exhaustion keeps the session, so an open row would be merged into the next ask (#107070) and
+    replayed on every later request, and closing it would replay it too while growing an oversized
+    session (#1630). Retracting matches the preflight-timeout exhaustion, which never persists the
+    row (#7100), so the boundary keys are dropped as there. Uses the /undo rewind (carrier-aware,
+    active-set pinned) under this turn's own lease; any mismatch leaves the row where it is.
+    """
+    if not isinstance(messages[-1], dict) or messages[-1].get("role") != "user":
+        return  # the turn ran tools first: its record stays
+    outcome = db.rewind_user_turn(
+        session_id, -1, warm_history=messages,
+        turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None),
+    )
+    messages[:] = outcome.prefix
+    result.pop("turn_id", None)
+    result.pop("current_turn_user_idx", None)
 
 
 __all__ = ["run_conversation"]

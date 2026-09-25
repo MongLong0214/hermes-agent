@@ -500,6 +500,8 @@ class TestCompress:
 
     def test_compress_strips_db_persisted_from_assembled_messages(self, compressor):
         """Regression for #57491: shallow copies must not carry flush markers."""
+        # A failing summary is the cheap way into the assembly path; that needs the opt-in fallback.
+        compressor.abort_on_summary_failure = False
         msgs = [
             {"role": "user" if i % 2 == 0 else "assistant", "content": f"m{i}", "_db_persisted": True}
             for i in range(10)
@@ -517,6 +519,7 @@ class TestCompress:
         plain leaking copy and assert the invariant still holds."""
         import agent.context_compressor as _cc
 
+        compressor.abort_on_summary_failure = False  # reach assembly through the opt-in fallback
         msgs = [
             {"role": "user" if i % 2 == 0 else "assistant", "content": f"m{i}", "_db_persisted": True}
             for i in range(10)
@@ -693,7 +696,10 @@ class TestGenerateSummaryNoneContent:
     def test_none_content_in_system_message_compress(self):
         """System message with content=None should not crash during compress."""
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
+            # The opt-in fallback assembles a compaction from a failed summary; the default would abort.
+            c = ContextCompressor(
+                model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2, abort_on_summary_failure=False,
+            )
 
         msgs = [{"role": "system", "content": None}] + [
             {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
@@ -1437,14 +1443,16 @@ class TestAuxModelFallbackSurfacedToCallers:
 
 
 class TestSummaryFailureTrackingForGatewayWarning:
-    """Default behavior (compression.abort_on_summary_failure=False):
+    """Opt-in behavior (compression.abort_on_summary_failure=False):
     summary-generation failure inserts a static fallback placeholder and
     records dropped count + fallback flag so gateway hygiene & /compress
     can surface a visible warning."""
 
     def test_compress_records_fallback_and_dropped_count_on_summary_failure(self):
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
+            c = ContextCompressor(
+                model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2, abort_on_summary_failure=False,
+            )
 
         msgs = [
             {"role": "system", "content": "sys"},
@@ -1463,7 +1471,7 @@ class TestSummaryFailureTrackingForGatewayWarning:
         assert c._last_summary_fallback_used is True
         assert c._last_summary_dropped_count > 0
         assert c._last_summary_error is not None
-        # Default mode: abort flag must NOT fire.
+        # Fallback mode: abort flag must NOT fire.
         assert c._last_compress_aborted is False
         assert any(
             isinstance(m.get("content"), str) and "Summary generation was unavailable" in m["content"]
@@ -1472,7 +1480,9 @@ class TestSummaryFailureTrackingForGatewayWarning:
 
     def test_summary_failure_fallback_preserves_tool_paths_and_redacts_secret_context(self):
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=1, protect_last_n=1)
+            c = ContextCompressor(
+                model="test", quiet_mode=True, protect_first_n=1, protect_last_n=1, abort_on_summary_failure=False,
+            )
 
         secret = "ghp_" + ("a" * 36)
         msgs = [
@@ -1513,7 +1523,7 @@ class TestSummaryFailureTrackingForGatewayWarning:
 
 
 class TestAbortOnSummaryFailure:
-    """Opt-in behavior (compression.abort_on_summary_failure=True):
+    """Default behavior (compression.abort_on_summary_failure=True):
     summary-generation failure ABORTS compression entirely — returns the
     original messages unchanged and sets _last_compress_aborted=True so
     gateway hygiene & /compress can surface a visible warning."""
@@ -1930,6 +1940,7 @@ class TestSummaryTargetRatio:
                 quiet_mode=True,
                 protect_first_n=0,
                 protect_last_n=2,
+                abort_on_summary_failure=False,  # the failed summary reaches assembly via the opt-in fallback
             )
         msgs = (
             [{"role": "system", "content": "System prompt"}]
@@ -3831,6 +3842,7 @@ class TestPreLlmFeasibilityCheck:
     def test_real_fallback_still_feeds_streak(self, compressor):
         """Negative control: a genuine summary-failure fallback boundary
         (no feasibility skip) must keep incrementing the streak breaker."""
+        compressor.abort_on_summary_failure = False  # a fallback boundary exists only in the opt-in mode
         compressor._ineffective_compression_count = 1
         msgs = self._make_messages(content="filler " * 3000)  # fat middle → no skip
 

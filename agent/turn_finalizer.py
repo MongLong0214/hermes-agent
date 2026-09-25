@@ -27,6 +27,9 @@ _VERIFICATION_CONTINUATION_FLAGS = ("_verification_stop_synthetic", "_pre_verify
 
 _SENTENCE_END = {".", "!", "?", "。", "！", "？", "`", ")"}
 
+# Fixed and metadata-free: transport detail stays in the logs, never in the reply.
+_ACCEPTED_STREAM_FAILURE_NOTICE = "⚠️ No reply: streaming stopped early. Send `continue` to resume."
+
 # ``result[key] = agent.session_<key>`` for the per-session usage/cost counters.
 _SESSION_TOKEN_KEYS = (
     "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
@@ -448,7 +451,7 @@ def finalize_turn(
     agent, *, final_response, api_call_count, interrupted, failed, messages, conversation_history,
     effective_task_id, turn_id, user_message, original_user_message, _should_review_memory,
     _turn_exit_reason, _pending_verification_response=None,
-    _pending_verification_response_previewed=False,
+    _pending_verification_response_previewed=False, accepted_stream_failure_error=None,
 ):
     """Run the post-loop finalization and return the turn ``result`` dict."""
     from agent.conversation_loop import logger
@@ -522,10 +525,14 @@ def finalize_turn(
 
     _log_turn_exit(agent, messages, final_response, api_call_count, _turn_exit_reason, interrupted, logger)
 
+    if accepted_stream_failure_error is not None:
+        # The streamed partial already reached the user and owns the transcript row, so the
+        # reply is only this fixed notice: echoing the partial would deliver it twice.
+        final_response = _ACCEPTED_STREAM_FAILURE_NOTICE
     # Response transforms apply only to real, uninterrupted responses.
     if final_response and not interrupted:
         final_response = _append_file_mutation_footer(agent, final_response, logger)
-    if not interrupted:
+    if not interrupted and accepted_stream_failure_error is None:
         final_response = _explain_abnormal_exit(
             agent, final_response, _turn_exit_reason, preserved_verification_fallback, logger,
         )

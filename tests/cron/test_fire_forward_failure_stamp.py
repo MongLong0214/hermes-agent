@@ -6,8 +6,11 @@ created — the miss used to be invisible outside gui.log. The dashboard fire
 webhook now stamps ``last_fire_error`` on the job record via
 ``note_fire_forward_failure`` so `cronjob list`, `hermes cron list`, and the
 dashboard surface it, and ``mark_job_run`` clears the stamp on the next
-successful run so it always describes CURRENT auto-fire health.
+successful run so it always describes CURRENT auto-fire health. The stamp's
+detail is the fixed closed text; the forwarder's own reason goes to the log.
 """
+
+import logging
 
 import pytest
 
@@ -17,6 +20,7 @@ from cron.jobs import (
     mark_job_run,
     note_fire_forward_failure,
 )
+from cron.jobs_public_status import public_fire_error
 
 
 @pytest.fixture()
@@ -35,8 +39,7 @@ class TestNoteFireForwardFailure:
 
         stamped = get_job(job["id"])
         err = stamped["last_fire_error"]
-        assert isinstance(err, dict)
-        assert err["detail"] == "gateway unreachable"
+        assert err == public_fire_error({"at": err["at"], "detail": "gateway unreachable"})
         # Timestamp parses as ISO.
         from datetime import datetime
         datetime.fromisoformat(err["at"])
@@ -47,15 +50,19 @@ class TestNoteFireForwardFailure:
     def test_repeated_failures_overwrite_latest_wins(self, tmp_cron_dir):
         job = create_job(prompt="Daily invoice triage", schedule="every 1h")
         note_fire_forward_failure(job["id"], "first miss")
+        first = get_job(job["id"])["last_fire_error"]
         note_fire_forward_failure(job["id"], "second miss")
         err = get_job(job["id"])["last_fire_error"]
-        assert err["detail"] == "second miss"
+        assert err["at"] >= first["at"]
+        assert err == public_fire_error(err)
 
-    def test_detail_truncated_to_500(self, tmp_cron_dir):
+    def test_forwarder_reason_is_logged_not_stored(self, tmp_cron_dir, caplog):
         job = create_job(prompt="Daily invoice triage", schedule="every 1h")
-        note_fire_forward_failure(job["id"], "x" * 2000)
-        err = get_job(job["id"])["last_fire_error"]
-        assert len(err["detail"]) == 500
+        reason = "POST http://127.0.0.1:8642/api/cron/fire refused: " + "x" * 2000
+        with caplog.at_level(logging.WARNING, logger="cron.jobs"):
+            note_fire_forward_failure(job["id"], reason)
+        assert reason not in str(get_job(job["id"])["last_fire_error"])
+        assert "refused" in caplog.text
 
     def test_successful_run_clears_stamp(self, tmp_cron_dir):
         """The stamp describes CURRENT auto-fire health — a run that made it
@@ -75,8 +82,7 @@ class TestNoteFireForwardFailure:
 
         assert mark_job_run(job["id"], success=False, error="boom") is True
         err = get_job(job["id"]).get("last_fire_error")
-        assert isinstance(err, dict)
-        assert err["detail"] == "gateway unreachable"
+        assert err is not None and err == public_fire_error(err)
 
 
 class TestFormatJobSurfacesFireError:
@@ -85,5 +91,7 @@ class TestFormatJobSurfacesFireError:
 
         job = create_job(prompt="Daily invoice triage", schedule="every 1h")
         note_fire_forward_failure(job["id"], "gateway unreachable")
-        formatted = _format_job(get_job(job["id"]))
-        assert formatted["last_fire_error"]["detail"] == "gateway unreachable"
+        stored = get_job(job["id"])
+        formatted = _format_job(stored)
+        assert formatted["last_fire_error"] == public_fire_error(stored["last_fire_error"])
+        assert formatted["last_fire_error"]["at"] == stored["last_fire_error"]["at"]

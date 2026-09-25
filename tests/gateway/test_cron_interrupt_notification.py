@@ -261,22 +261,25 @@ class TestShutdownDeliversNoticeBeforeDisconnect:
 
 
 class TestDeliveryErrorIsRecordedWhenTheNoticeCannotBeSent:
-    def test_interrupted_run_records_delivery_error_without_mark_job_run(self):
+    def test_interrupted_run_records_delivery_error_without_mark_job_run(self, tmp_path, monkeypatch):
         """``_consume_interrupted_flag`` short-circuits ``mark_job_run``,
         which used to discard ``delivery_error`` along with it. The recovery
-        path must use ``update_job`` so the repeat counter and next_run_at
-        bookkeeping that ``mark_job_run`` owns is not run twice for one run.
+        path records the (closed) delivery failure without running the repeat
+        counter and next_run_at bookkeeping ``mark_job_run`` owns a second time.
         """
-        import inspect
-
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         import cron.scheduler as sched
+        from cron.executions import create_execution
+        from cron.jobs import create_job, get_job
+        from cron.jobs_public_status import public_delivery_error
 
-        body_src = inspect.getsource(sched._run_one_job_body)
-        src = inspect.getsource(sched._finish_interrupted_run)
-        assert 'update_job(job["id"], {"last_delivery_error": delivery_error})' in src, (
-            "interrupted runs must still persist the delivery failure"
-        )
-        # The recovery branch hangs off the interrupted-flag short-circuit,
-        # not off a second mark_job_run call.
-        assert "_consume_interrupted_flag(" in body_src and "_finish_interrupted_run(" in body_src
-        assert "if delivery_error:" in src and "mark_job_run(" not in src
+        job = create_job(prompt="x", schedule="every 5m", name="interrupted")
+        before = get_job(job["id"])
+        execution = create_execution(job["id"], source="direct")
+
+        sched._finish_interrupted_run(before, execution["id"], "telegram: 502 Bad Gateway")
+
+        after = get_job(job["id"])
+        assert after["last_delivery_error"] == public_delivery_error("telegram: 502 Bad Gateway"), (
+            "interrupted runs must still persist the delivery failure")
+        assert after["repeat"] == before["repeat"] and after["next_run_at"] == before["next_run_at"]

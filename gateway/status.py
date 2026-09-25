@@ -36,6 +36,10 @@ _IS_WINDOWS = sys.platform == "win32"
 _UNSET = object()
 _GATEWAY_LOCK_FILENAME = "gateway.lock"
 _gateway_lock_handle = None
+# Serializes every read-and-set of _gateway_lock_handle (and the migration lease's borrow check):
+# the OS lock is per open file description, so a racing second claim in this process would fail
+# against our own handle and report another gateway.
+_gateway_lock_guard = threading.RLock()
 # Windows byte-range locks are mandatory for other readers: lock a byte well past
 # the JSON payload so status/PID readers can read while another process holds it.
 _WINDOWS_LOCK_OFFSET = 1024 * 1024
@@ -806,7 +810,8 @@ def _try_acquire_file_lock(handle) -> bool:
     try:
         if _IS_WINDOWS:
             handle.seek(0, os.SEEK_END)
-            if handle.tell() == 0:
+            # A read handle (a migration lease on another user's file) locks past EOF without it.
+            if handle.tell() == 0 and handle.writable():
                 handle.write("\n")
                 handle.flush()
             handle.seek(_WINDOWS_LOCK_OFFSET)
@@ -923,30 +928,31 @@ def _release_file_lock(handle) -> None:
 def acquire_gateway_runtime_lock() -> bool:
     """Claim the cross-process runtime lock; the OS releases it if the process dies."""
     global _gateway_lock_handle
-    if _gateway_lock_handle is not None:
-        return True
-    path = _get_gateway_lock_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        handle = open(path, "a+", encoding="utf-8")
-    except PermissionError:
-        # Stale root-owned lock (launchd session that ran as root): the directory owner can
-        # unlink it; retry once with a fresh file.
+    with _gateway_lock_guard:
+        if _gateway_lock_handle is not None:
+            return True
+        path = _get_gateway_lock_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            path.unlink()
             handle = open(path, "a+", encoding="utf-8")
-        except OSError:
+        except PermissionError:
+            # Stale root-owned lock (launchd session that ran as root): the directory owner can
+            # unlink it; retry once with a fresh file.
+            try:
+                path.unlink()
+                handle = open(path, "a+", encoding="utf-8")
+            except OSError:
+                return False
+        if not _try_acquire_file_lock(handle):
+            handle.close()
             return False
-    if not _try_acquire_file_lock(handle):
-        handle.close()
-        return False
-    handle.seek(0)
-    handle.truncate()
-    json.dump(_build_pid_record(), handle)
-    handle.flush()
-    with contextlib.suppress(OSError):
-        os.fsync(handle.fileno())
-    _gateway_lock_handle = handle
+        handle.seek(0)
+        handle.truncate()
+        json.dump(_build_pid_record(), handle)
+        handle.flush()
+        with contextlib.suppress(OSError):
+            os.fsync(handle.fileno())
+        _gateway_lock_handle = handle
     _clear_running_pid_cache()
     return True
 
@@ -954,19 +960,21 @@ def acquire_gateway_runtime_lock() -> bool:
 def release_gateway_runtime_lock() -> None:
     """Release the gateway runtime lock when owned by this process."""
     global _gateway_lock_handle
-    handle, _gateway_lock_handle = _gateway_lock_handle, None
-    if handle is None:
-        return
-    _release_file_lock(handle)
-    with contextlib.suppress(OSError):
-        handle.close()
+    with _gateway_lock_guard:
+        handle, _gateway_lock_handle = _gateway_lock_handle, None
+        if handle is None:
+            return
+        _release_file_lock(handle)
+        with contextlib.suppress(OSError):
+            handle.close()
     _clear_running_pid_cache()
 
 
 def owns_gateway_runtime_lock() -> bool:
     """True when THIS process holds the runtime lock. ``is_gateway_runtime_lock_active`` answers
     "does anyone?"; re-probing our own flock succeeds on POSIX, so only the handle discriminates."""
-    return _gateway_lock_handle is not None
+    with _gateway_lock_guard:
+        return _gateway_lock_handle is not None
 
 
 def _probe_lock_file(handle) -> bool:

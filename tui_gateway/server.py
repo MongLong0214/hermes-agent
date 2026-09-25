@@ -3134,7 +3134,6 @@ def _read_spawn_tree_index(session_dir) -> list[dict]:
 
 
 _GOAL_COMPRESSION_RECOVERY_ATTEMPTS = "_goal_compression_recovery_attempts"
-_GOAL_COMPRESSION_RECOVERY_LIMIT = 1
 
 # Captured at import time: tests monkeypatch threading.Thread with a synchronous stub, and the ticker only
 # exits once `stop` is set AFTER run_conversation returns — inline it would spin forever.

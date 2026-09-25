@@ -66,12 +66,15 @@ from hermes_state_wal import (
     _WAL_INCOMPAT_MARKERS, _on_disk_journal_mode, apply_database_pragmas, apply_wal_with_fallback,
 )
 from hermes_state_repair import _claim_repair_attempt, preflight_db_writability, repair_state_db_schema
+from hermes_state_fence import probe_store_lineage
+from hermes_state_admission import admit_forward_migration, release_forward_migration_lease
 from hermes_state_titles import SessionTitlesMixin
 from hermes_state_usage import SessionUsageMixin
 from hermes_state_maintenance import SessionMaintenanceMixin
 from hermes_state_gateway import SessionGatewayMixin
 from hermes_state_compression import SessionCompressionMixin
 from hermes_state_search import SessionSearchMixin
+from hermes_state_target_bind import SessionTargetBindMixin
 
 try:  # Hard dependency, but tolerate scaffold-phase imports before pip install.
     import psutil
@@ -444,7 +447,7 @@ class SessionDB(
     SessionSessionsMixin, SessionFtsSetupMixin, SessionSearchMixin, SessionSchemaMixin,
     SessionPortabilityMixin, SessionTelegramTopicsMixin, SessionCompressionMixin,
     SessionGatewayMixin, SessionMaintenanceMixin, SessionUsageMixin, SessionTitlesMixin,
-    SessionMessagesMixin, SessionRewindMixin, SessionProfileRepairMixin,
+    SessionMessagesMixin, SessionRewindMixin, SessionProfileRepairMixin, SessionTargetBindMixin,
 ):
     """SQLite-backed session storage with FTS5 search; many reader threads, one writer (WAL)."""
 
@@ -592,6 +595,7 @@ class SessionDB(
         # is queryable AND not marked stale.
         self._fts_cjk_loaded = self._fts_cjk_available = self._fts_unavailable_warned = False
         self._conn = None
+        self._forward_migration_lease = None  # held from admission to the end of this open only
         # Async token accounting; distinct from self._lock so enqueue/flush never contends with writes.
         self._token_queue: deque = deque()
         self._token_queue_cond = threading.Condition(threading.Lock())
@@ -630,6 +634,7 @@ class SessionDB(
                 # Test-isolation runs only (gated inside the helper): register
                 # for the suite-level leak sweep in tests/conftest.py.
                 _register_test_instance(self)
+            release_forward_migration_lease(self)
 
     def _open_writer(self) -> None:
         """Writable open: preflight, zero-byte quarantine, connect + schema (one in-place repair of a
@@ -684,6 +689,7 @@ class SessionDB(
         leaked tracked connection cannot block the forensic backup the writable heal takes next."""
         for attempt in range(_READ_ONLY_IOERR_RETRY_ATTEMPTS + 1):
             try:
+                probe_store_lineage(self.db_path)  # a reader must not serve a lineage it does not own
                 self._conn = conn = self._connect_read_only(timeout=1.0)
                 try:
                     apply_database_pragmas(conn, db_label="state.db")
@@ -770,6 +776,9 @@ class SessionDB(
         # Refuse before sqlite3.connect (under the startup lock) so we cannot mint
         # a replacement WAL while a live writer still holds a deleted sidecar inode.
         refuse_deleted_wal_generation(self.db_path)
+        # SELECT-only lineage decode before any byte is written: a refused store stays untouched,
+        # and so does one another build's still-running gateway owns (hermes_state_admission).
+        admit_forward_migration(self, probe_store_lineage(self.db_path))
         # Create/tighten the main database before sqlite3.connect() so a
         # permissive process umask can never expose a fresh profile store.
         _secure_state_db_files(self.db_path, create_main=True)
@@ -1572,6 +1581,90 @@ class SessionDB(
             cursor.execute(sql, (key, value))
         else:
             self._write_sql(sql, (key, value))
+
+    def _require_proven_meta_write_handle(
+        self,
+        *,
+        proven_db_path: Path,
+        proven_db_identity: Optional[Tuple[int, int]],
+    ) -> None:
+        """Refuse metadata writes unless the caller proves this live open generation."""
+        if (
+            proven_db_path != self.db_path
+            or proven_db_identity is None
+            or self._db_file_identity is None
+            or proven_db_identity != self._db_file_identity
+        ):
+            raise sqlite3.ProgrammingError(
+                "state metadata write requires a matching proven database path and identity"
+            )
+        if self.read_only:
+            raise sqlite3.OperationalError("cannot write state metadata on a read-only SessionDB")
+        if self._conn is None:
+            raise sqlite3.ProgrammingError("cannot write state metadata on a closed SessionDB")
+        self._raise_if_db_corrupt()
+        # The caller's proof identifies the handle we opened, not necessarily
+        # the file currently named by its path.  Refuse a stale descriptor
+        # before issuing DML if an out-of-band replacement occurred meanwhile.
+        self._raise_if_db_replaced()
+
+    def claim_meta_once(
+        self,
+        key: str,
+        receipt: str,
+        *,
+        proven_db_path: Path,
+        proven_db_identity: Optional[Tuple[int, int]],
+    ) -> bool:
+        """Insert ``state_meta[key]`` once on a caller-proven already-open writable handle.
+
+        Callers must bind their receipt to this exact path and the ``(st_dev,
+        st_ino)`` identity captured for this handle.  It makes no connection,
+        schema, recovery, or write-wrapper lifecycle call; after validating the
+        caller proof and that the pathname still names this generation, it uses
+        SQLite's one-statement compare-and-set without reading or overwriting an
+        existing receipt.
+        """
+        with self._lock:
+            self._require_proven_meta_write_handle(
+                proven_db_path=proven_db_path,
+                proven_db_identity=proven_db_identity,
+            )
+            assert self._conn is not None
+            cursor = self._conn.execute(
+                "INSERT OR IGNORE INTO state_meta (key, value) VALUES (?, ?)",
+                (key, receipt),
+            )
+            self._conn.commit()
+            return cursor.rowcount == 1
+
+    def compare_and_set_meta(
+        self,
+        key: str,
+        expected_value: str,
+        value: str,
+        *,
+        proven_db_path: Path,
+        proven_db_identity: Optional[Tuple[int, int]],
+    ) -> bool:
+        """Atomically replace matching metadata on this proven existing handle.
+
+        This is the companion to :meth:`claim_meta_once` for receipt transitions:
+        a terminal receipt replaces only the exact pending value it owns.  It
+        does not read, open, reopen, initialize, or recover the database.
+        """
+        with self._lock:
+            self._require_proven_meta_write_handle(
+                proven_db_path=proven_db_path,
+                proven_db_identity=proven_db_identity,
+            )
+            assert self._conn is not None
+            cursor = self._conn.execute(
+                "UPDATE state_meta SET value = ? WHERE key = ? AND value = ?",
+                (value, key, expected_value),
+            )
+            self._conn.commit()
+            return cursor.rowcount == 1
 
     def retag_kanban_worker_sessions(self, workspaces_root: str) -> int:
         """Retag legacy kanban worker rows from ``cli`` to ``kanban`` by cwd under the board's workspaces

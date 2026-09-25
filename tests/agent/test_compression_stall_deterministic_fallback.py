@@ -6,8 +6,11 @@ turn, so the stall retry ladder ends with a deterministic rung: the worker is re
 skipped and compress() commits its static fallback summary through the ordinary lease/fence pipeline.
 A first stall keeps today's behaviour (backoff, LLM retry after it lapses) unless the request is already
 above the model's context window — then nothing can be sent unchanged and the rung runs at once (#114594). A pinned fallback route whose
-summary call fails still commits under the default ``abort_on_summary_failure=false`` — that must not be
+summary call fails still commits under ``abort_on_summary_failure=false`` — that must not be
 logged as a recovery (#112387 review caveat).
+
+The deterministic rung commits a static summary, so it runs only when that opt-in is set; the default keeps
+every message on a failed summary. Every agent here opts in.
 """
 
 from __future__ import annotations
@@ -48,6 +51,7 @@ def _make_agent(tmp_path, tag):
     agent.compression_in_place = True
     agent._cached_system_prompt = "sys"
     agent.context_compressor.threshold_tokens = 1_000
+    agent.context_compressor.abort_on_summary_failure = False
     return agent
 
 

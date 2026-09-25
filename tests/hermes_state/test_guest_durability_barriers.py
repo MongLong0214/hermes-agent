@@ -40,16 +40,33 @@ def test_guest_barriers_apply_configured_synchronous(monkeypatch, tmp_path):
         conn.close()
 
 
-def test_guest_barriers_leave_synchronous_alone_when_unset(monkeypatch, tmp_path):
+def _synchronous_after_barriers_with_nothing_configured(monkeypatch, tmp_path):
     _config(monkeypatch, {})
     conn = sqlite3.connect(tmp_path / "state.db")
     try:
         conn.execute("PRAGMA journal_mode=DELETE")
         conn.execute("PRAGMA synchronous=1")
         apply_durability_barriers(conn)
-        assert conn.execute("PRAGMA synchronous").fetchone()[0] == 1
+        return conn.execute("PRAGMA synchronous").fetchone()[0]
     finally:
         conn.close()
+
+
+@pytest.mark.linux_only
+def test_guest_barriers_leave_synchronous_alone_when_unset(monkeypatch, tmp_path):
+    assert _synchronous_after_barriers_with_nothing_configured(monkeypatch, tmp_path) == 1
+
+
+@pytest.mark.windows_only
+def test_guest_barriers_leave_synchronous_alone_when_unset_on_windows(monkeypatch, tmp_path):
+    assert _synchronous_after_barriers_with_nothing_configured(monkeypatch, tmp_path) == 1
+
+
+@pytest.mark.macos_only
+def test_guest_barriers_force_full_on_macos_when_unset(monkeypatch, tmp_path):
+    # The macOS barrier enforces FULL regardless of config: NORMAL lets a checkpoint racing
+    # process termination leave half-written btree pages (_enforce_macos_synchronous_full).
+    assert _synchronous_after_barriers_with_nothing_configured(monkeypatch, tmp_path) == 2
 
 
 def test_guest_barriers_survive_config_failure(monkeypatch, tmp_path):

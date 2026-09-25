@@ -21,6 +21,9 @@ def main():
     parser.add_argument('--output', required=True)
     args = parser.parse_args()
     repo = Path(__file__).resolve().parents[1]
+    # The fence generation must be the measured checkout's, not whatever the venv resolves.
+    sys.path.insert(0, str(repo))
+    from hermes_state_fence import register_turn_fence_generation
     requests = []
 
     class Model(BaseHTTPRequestHandler):
@@ -128,6 +131,7 @@ def main():
         assert any(r[0] == result['fork_id'] and r[2] > 0 for r in result['after_fork'])
         legacy = rpc('session/new', {'cwd': str(home), 'mcpServers': []})['sessionId']
         with sqlite3.connect(hermes / 'state.db') as db:
+            register_turn_fence_generation(db)  # the store is fenced: plain writes land only as this build's generation
             db.execute("INSERT OR IGNORE INTO sessions (id, source, started_at) VALUES (?, 'acp', 1)",
                        (legacy,))
         moved = home / 'moved'

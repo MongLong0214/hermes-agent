@@ -131,6 +131,27 @@ hermes config set cron.model <model>                              # every unpinn
 
 `hermes cron list` and the `cronjob_manage` tool report `pinned` per job.
 
+### Older jobs with a creation-time snapshot (`cron.model_drift_guard`)
+
+Jobs created by older Hermes versions may still carry a `provider_snapshot` / `model_snapshot`
+recorded when they were created. Jobs created now never do, so this setting does not affect them.
+
+```yaml
+cron:
+  model_drift_guard: true   # default
+```
+
+While it is `true`, a snapshot-carrying job whose provider or model no longer matches its snapshot
+is **skipped with no LLM call**. This only applies to a provider or model the job does not pin
+itself and that `cron.model` / `cron.model_provider` does not set. Hermes sends ONE alert naming
+the change and the `hermes cron edit … --provider … --model …` command to pin the job. The alert
+is not repeated every tick. The next drift sends a new alert only after a successful run or after
+the config matches the snapshot again. A run that falls back to another provider because the
+primary failed does not count as drift.
+
+Set it to `false` (`hermes config set cron.model_drift_guard false`) to let those jobs follow the
+main model like every other unpinned job.
+
 ## Skill-backed cron jobs
 
 A cron job can load one or more skills before it runs the prompt. Each skill loads exactly as it does from `/skill-name` in a chat session, including the `[Skill config ...]` block with its resolved `metadata.hermes.config` values from `config.yaml`.
@@ -520,7 +541,7 @@ Checks per active job:
 - last run failed (`last_status` not ok, with the recorded error),
 - last delivery failed (the output was produced but never reached you),
 - last dispatch was late or caught up after a missed schedule (`last_dispatch`); this warning clears at the next on-time fire,
-- a scheduled fire could not reach the runner (`last_fire_error`), with the recorded timestamp and a shortened reason; this warning clears after a successful run,
+- a scheduled fire could not reach the runner (`last_fire_error`), with the recorded timestamp; this warning clears after a successful run,
 - `next_run_at` missing, or parked in the past beyond a 15-minute ticker
   grace window — the "job is silently not firing" signal (scheduler dead,
   gateway down, or a wedged fire-claim),
@@ -581,9 +602,10 @@ The run document under `cron/output/<job_id>/` keeps the agent's response as wri
 Execution and delivery are tracked separately. When the agent run succeeds but
 the output never reaches the target (platform 5xx, rate limit, stale session,
 adapter returned no positive evidence of a send), the job records
-`last_status: delivery_failed` — never a plain `ok` — with the reason in
-`last_delivery_error`. `hermes cron list` shows it in yellow as
-`delivery_failed: <reason>`, `hermes cron doctor` reports it as a delivery
+`last_status: delivery_failed` — never a plain `ok` — and `last_delivery_error`
+says so with a fixed label; the adapter's reason is written to the gateway log
+(`hermes logs --level WARNING`). `hermes cron list` shows it in yellow as
+`delivery_failed: <label>`, `hermes cron doctor` reports it as a delivery
 issue, and a manual `cronjob run` reports `success: false` with the delivery
 error. A delivery failure does not count toward the job's `failure_streak`
 (the agent did its job); the next fully successful run returns the status to
@@ -875,7 +897,7 @@ cron:
   standalone_send_timeout_seconds: 120
 ```
 
-A timed-out send is recorded in `last_delivery_error` as `standalone send to <target> timed out after Ns`; the message may still land if the adapter had already accepted it.
+A timed-out send marks `last_delivery_error` and logs `standalone send to <target> timed out after Ns` to the gateway log; the message may still land if the adapter had already accepted it.
 
 ## No-agent mode (script-only jobs)
 
@@ -1016,23 +1038,28 @@ This means cron jobs that run at high frequency or during peak hours are more re
 
 ## Run failures (`last_error`)
 
-A failed agent run records a concise `last_error`, visible in job listings and `/cron list`
-with credential patterns and URL credentials redacted (including previously stored errors).
+A failed run records `last_error` as one fixed label naming the kind of failure (for example
+"The AI model service rejected the sign-in. Details: `hermes cron runs`."), never the raw error
+text: the record is served to the cronjob tool, `/cron list`, the dashboard and `/api/jobs`,
+and raw failure text carries provider response bodies, paths, tokens and script stderr.
+Records written by an older build are listed with the same labels. The failure notice sent to
+the job's chat names the same kind. The raw error stays on this machine for the operator:
+`hermes cron runs <job>` shows it from the executions ledger, and the run document and the
+redacting logs keep it.
 This is separate from `last_fire_error` (scheduler handoff) and `last_delivery_error` (delivery).
 Those fields can correctly be empty when the agent itself failed.
 
 For a connection failure, inspect the run document under `cron/output/<job_id>/` in the active
 Hermes home. Its `## Error` section includes the chained traceback, with credential patterns
 and URL credentials redacted. The file uses the existing private output-file permissions;
-traceback locals are not captured. Delivery notices and `last_error` retain the concise error,
-not the full traceback. Review diagnostics before sharing: redaction is not a guarantee that
+traceback locals are not captured. Review diagnostics before sharing: redaction is not a guarantee that
 arbitrary application data is non-sensitive.
 
 ## Missed scheduled fires (`last_fire_error`)
 
 On hosted (managed-cron) deployments, a scheduled fire travels from the platform scheduler through the dashboard to the gateway's internal API server. If that final hand-off fails — the gateway process is down, or its API-server listener never started — the run never begins, so there is no execution record and no `last_status` to inspect. The tell-tale shape: the job works every time you trigger it manually, but never auto-fires.
 
-These misses are stamped on the job record as `last_fire_error` (timestamp + reason) and surfaced by:
+These misses are stamped on the job record as `last_fire_error` (timestamp + a fixed detail; the forwarder's own reason is logged: `hermes logs --level WARNING`) and surfaced by:
 
 - `cronjob_manage` tool → `action: "list"` — the `last_fire_error` field
 - `hermes cron list`: a red missed-fire warning under the job

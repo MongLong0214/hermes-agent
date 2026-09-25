@@ -489,7 +489,7 @@ class TestRestorePrimaryRuntime:
         fallback_pool.provider = "openrouter"
         agent = _make_agent(
             provider="custom:gemini-no-filter",
-            base_url="https://generativelanguage.googleapis.com/v1beta",
+            base_url="https://custom.example/v1",
         )
         agent._fallback_activated = True
         agent._credential_pool = fallback_pool
@@ -504,7 +504,7 @@ class TestRestorePrimaryRuntime:
             "providers": {
                 "gemini-no-filter": {
                     "name": "Gemini Display",
-                    "api": "https://generativelanguage.googleapis.com/v1beta",
+                    "api": "https://custom.example/v1",
                 }
             },
         }

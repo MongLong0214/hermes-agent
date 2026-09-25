@@ -1581,15 +1581,11 @@ def _automatic_compression_gate_blocks(agent: Any, bypass_cooldown: bool, *, inc
 def compression_blocked_transiently(agent: Any) -> bool:
     """Type-pinned read of the transient-block signal.
     Set when an automatic pass no-ops on a TRANSIENT guard (summary-failure cooldown or structural backoff).
-    Consumers must defer, not count it toward ``compression_exhausted``, or an overflow auto-reset wipes a
-    session that was merely cooling down. The permanent ``ineffective`` breaker never sets it.
-
-    See #97488.
     Consumers (the overflow-recovery loops in ``conversation_loop``) must treat such a no-op as a temporary
     defer, NOT as evidence the session is incompressible: counting it toward ``compression_exhausted`` lets
-    a real upstream ``context_length_exceeded`` auto-reset (wipe) a session whose compression was merely
-    cooling down (#97488). The permanent ``ineffective`` breaker intentionally does NOT set this signal — a
-    genuinely incompressible session must still be able to exhaust.
+    a real upstream ``context_length_exceeded`` end the turn as exhausted for a session whose compression was
+    merely cooling down (#97488). The permanent ``ineffective`` breaker intentionally does NOT set this
+    signal — a genuinely incompressible session must still be able to exhaust.
     """
     _sig = getattr(agent, "_compression_blocked_transient", None)
     return isinstance(_sig, str) and bool(_sig)

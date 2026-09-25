@@ -568,6 +568,8 @@ MCP trust-gate consent — a write-capable tool on a server configured `trust: u
 
 The server exposes a lightweight jobs CRUD surface for managing scheduled / background agent runs from a remote client. All endpoints are gated behind the same bearer auth.
 
+Every endpoint that returns a job serves a fixed set of fields: `id`, `name`, `prompt`, `skill`, `skills`, `schedule`, `schedule_display`, `repeat`, `deliver`, `enabled`, `state`, `paused_at`, `paused_reason`, `next_run_at`, `last_run_at`, `last_status`, `last_delivery_error` and `last_fire_error`. The creating chat's origin, scheduler claims, workdir, script, model routing and `last_error` are not served. `last_delivery_error` is the fixed `Delivery failed` label and `last_fire_error` keeps its timestamp with a fixed `detail`, as stored; the underlying reasons stay on the host (`hermes cron runs`, `hermes logs --level WARNING`).
+
 ### GET /api/jobs
 
 List all scheduled jobs.
@@ -615,6 +617,8 @@ External UIs can manage Hermes sessions over REST without standing up the dashbo
 | `POST` | `/api/sessions/{id}/fork` | Branch the session via `SessionDB` lineage (matches CLI `/branch` semantics) |
 | `POST` | `/api/sessions/{id}/chat` | Run one synchronous agent turn |
 | `POST` | `/api/sessions/{id}/chat/stream` | SSE wrapper over a single turn — emits `assistant.delta`, `assistant.commentary` (mid-turn commentary: `message_id`, `text`, `already_streamed`; never folded into `assistant.completed`), `tool.started`, `tool.completed`, then a terminal `run.completed` / `run.failed` / `run.cancelled` event that matches how the turn ended (see [Terminal run status](../../developer-guide/programmatic-integration.md#terminal-run-status)) |
+
+Creating a session (`POST /api/sessions`) and forking one refuse a taken `id` with 409 `session_exists` and a `title` already in use with 400 `invalid_title`. Either way nothing is written, and a fork's source session stays open. A fork sent without a `title` gets the next title in the source's lineage, or none if another session takes it first; the response's `session.title` is always the stored one.
 
 `/v1/capabilities` advertises the full surface via `session_*` feature flags and `endpoints.session_*` entries so external UIs can detect support and fall back safely. Inline images are supported in `chat` and `chat/stream` payloads (multimodal-aware path).
 

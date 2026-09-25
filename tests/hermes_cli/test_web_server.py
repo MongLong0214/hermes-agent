@@ -3604,10 +3604,10 @@ class TestDenormalizeProviderSwitch:
         })
 
         with _patch("hermes_cli.models_detect.provider_has_credentials", lambda p: p == "openrouter"):
-            result = _denormalize_config_from_web({"model": "google/gemini-2.5-flash"})
+            result = _denormalize_config_from_web({"model": "anthropic/claude-opus-4.6"})
         model = result["model"]
         assert model["provider"] == "openrouter"
-        assert model["default"] == "google/gemini-2.5-flash"
+        assert model["default"] == "anthropic/claude-opus-4.6"
         # The old ollama-local endpoint must not carry over to openrouter (the switch resolves
         # the aggregator's own endpoint instead of leaving the field blank or stale).
         assert model.get("base_url") != "http://localhost:11434/v1"
@@ -3624,7 +3624,7 @@ class TestDenormalizeProviderSwitch:
 
         with _patch("hermes_cli.models_detect.provider_has_credentials", lambda p: p == "openrouter"):
             result = _denormalize_config_from_web({
-                "model": "google/gemini-2.5-flash",
+                "model": "anthropic/claude-opus-4.6",
                 "model_context_length": 128000,
             })
         model = result["model"]

@@ -1,7 +1,9 @@
 """Tests for hermes_logging — centralized logging setup."""
+import errno
 import io
 import logging
 import os
+import shutil
 import stat
 import sys
 import threading
@@ -759,6 +761,66 @@ def test_eio_from_file_handler_names_the_path_once_then_recovers(tmp_path, capsy
         handler.close()
 
 
+def test_removed_log_directory_names_path_once_then_recovers(tmp_path, capsys):
+    """A removed profile log directory pauses its handler without per-record tracebacks."""
+    log_dir = tmp_path / "profile" / "logs"
+    log_dir.mkdir(parents=True)
+    path = log_dir / "agent.log"
+    handler = hermes_logging._ManagedRotatingFileHandler(
+        str(path), maxBytes=1024, backupCount=1, encoding="utf-8",
+    )
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    try:
+        assert handler.stream is not None
+        handler.stream.close()
+        os.unlink(path)
+        log_dir.rmdir()
+        for i in range(5):
+            handler.handle(logging.LogRecord("t", logging.INFO, __file__, 0, f"missing {i}", (), None))
+        err = capsys.readouterr().err
+        assert "--- Logging error ---" not in err
+        assert err.count("hermes_logging:") == 1
+        assert str(path) in err and "file logging paused" in err
+        assert handler.stream is None
+
+        log_dir.mkdir()
+        handler.handle(logging.LogRecord("t", logging.INFO, __file__, 0, "recovered", (), None))
+        assert "recovered" in path.read_text(encoding="utf-8")
+    finally:
+        handler.close()
+
+
+def test_formatter_enoent_for_unrelated_path_keeps_stream_and_traceback(tmp_path, capsys):
+    """A missing formatter resource is not mistaken for this handler's missing log file."""
+    missing_template = tmp_path / "missing-template.txt"
+
+    class _MissingTemplateFormatter(logging.Formatter):
+        def format(self, record):
+            raise FileNotFoundError(
+                errno.ENOENT, os.strerror(errno.ENOENT), str(missing_template),
+            )
+
+    path = tmp_path / "agent.log"
+    handler = hermes_logging._ManagedRotatingFileHandler(
+        str(path), maxBytes=1024, backupCount=1, encoding="utf-8",
+    )
+    handler.setFormatter(_MissingTemplateFormatter())
+    try:
+        stream = handler.stream
+        handler.handle(logging.LogRecord("t", logging.INFO, __file__, 0, "bad format", (), None))
+        err = capsys.readouterr().err
+        assert "--- Logging error ---" in err
+        assert str(missing_template) in err
+        assert "file logging paused" not in err
+        assert handler.stream is stream and stream is not None and not stream.closed
+
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        handler.handle(logging.LogRecord("t", logging.INFO, __file__, 0, "still live", (), None))
+        assert "still live" in path.read_text(encoding="utf-8")
+    finally:
+        handler.close()
+
+
 def test_eio_after_successful_reopen_still_names_the_path_once(tmp_path, capsys):
     """The reported case: open() succeeds but every write/seek/flush raises EIO. Reopening must
     not re-arm the notice, or a stuck device prints the path once per record."""
@@ -789,6 +851,176 @@ def test_eio_after_successful_reopen_still_names_the_path_once(tmp_path, capsys)
         assert err.count(str(path)) == 1
     finally:
         handler.close()
+
+
+@pytest.mark.parametrize("fault", [errno.ENOSPC, errno.EACCES])
+def test_own_destination_oserror_names_path_once_then_recovers(tmp_path, capsys, fault):
+    """Disk full on write (no filename) and permission denied on reopen pause the handler with
+    one notice instead of a traceback per record; the same errno raised while formatting a record
+    arg concerns another path, so it stays a logging error and the live stream is kept."""
+    path = tmp_path / "agent.log"
+
+    class _FullStream(io.StringIO):
+        def write(self, *_a):
+            raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+
+    def _failing_open(*_a, **_kw):
+        if fault == errno.ENOSPC:
+            return _FullStream()
+        raise OSError(fault, os.strerror(fault), str(path))
+
+    class _ArgTouchingAnotherFile:
+        def __str__(self):
+            raise OSError(fault, os.strerror(fault), str(tmp_path / "elsewhere.txt"))
+
+    def _record(msg, args=()):
+        return logging.LogRecord("t", logging.INFO, __file__, 0, msg, args, None)
+
+    handler = hermes_logging._ManagedRotatingFileHandler(
+        str(path), maxBytes=1024, backupCount=1, encoding="utf-8",
+    )
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    try:
+        real_open = handler._builtin_open
+        handler.stream.close()
+        handler.stream = None
+        handler._builtin_open = _failing_open
+        for i in range(20):
+            handler.handle(_record(f"lost {i}"))
+        err = capsys.readouterr().err
+        assert "--- Logging error ---" not in err
+        assert err.count("hermes_logging:") == 1 and str(path) in err
+
+        handler._builtin_open = real_open  # the fault clears
+        handler.handle(_record("recovered"))
+        assert "recovered" in path.read_text(encoding="utf-8")
+
+        live = handler.stream
+        handler.handle(_record("arg %s", (_ArgTouchingAnotherFile(),)))
+        err = capsys.readouterr().err
+        assert "--- Logging error ---" in err and "elsewhere.txt" in err
+        assert "file logging paused" not in err
+        assert handler.stream is live and not live.closed
+    finally:
+        handler.close()
+
+
+def test_log_dir_replaced_by_a_file_under_an_open_stream_is_named_once(hermes_home, capsys):
+    """The log dir removed and replaced by a regular file while the stream is open: the stream
+    would keep writing to the unlinked inode, so the path is named once and records land at the
+    path again once the directory is back."""
+    log_dir = hermes_home / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    path = log_dir / "agent.log"
+    handler = hermes_logging._ManagedRotatingFileHandler(
+        str(path), maxBytes=1024 * 1024, backupCount=1, encoding="utf-8",
+    )
+    handler.setFormatter(logging.Formatter("%(message)s"))
+
+    def _record(msg):
+        return logging.LogRecord("t", logging.INFO, __file__, 0, msg, (), None)
+
+    try:
+        handler.handle(_record("before"))
+        shutil.rmtree(log_dir)
+        log_dir.write_text("not a directory\n", encoding="utf-8")
+        for i in range(20):
+            handler.handle(_record(f"lost {i}"))
+        err = capsys.readouterr().err
+        assert "--- Logging error ---" not in err
+        assert err.count(f"{path} unavailable") == 1
+
+        log_dir.unlink()
+        log_dir.mkdir()
+        handler.handle(_record("recovered"))
+        assert "recovered" in path.read_text(encoding="utf-8")
+    finally:
+        handler.close()
+
+
+@pytest.mark.parametrize(
+    "drops_stream_after_write", [False, True], ids=["keeps-stream", "drops-stream-after-write"],
+)
+def test_pause_notice_re_arms_only_after_a_record_reaches_the_file(
+    tmp_path, capsys, drops_stream_after_write,
+):
+    """outage -> written record -> outage names the path twice; outage -> unformattable record ->
+    outage names it once. A live stream is not the signal: a format error keeps one without
+    writing, and Windows' concurrent handler drops its stream after every successful write."""
+    disk = {"full": False}
+
+    class _Disk(io.StringIO):
+        def write(self, text):
+            if disk["full"]:
+                raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+            return super().write(text)
+
+    class _Handler(hermes_logging._ManagedRotatingFileHandler):
+        def _open(self):
+            return _Disk()
+
+        def flush(self):
+            super().flush()
+            if drops_stream_after_write and self.stream is not None:
+                self.stream.close()
+                self.stream = None
+
+    class _Unformattable:
+        def __str__(self):
+            raise ValueError("bad record arg")
+
+    def _notices_and_tracebacks(name, steps):
+        path = tmp_path / f"{name}.log"
+        path.touch()
+        handler = _Handler(str(path), maxBytes=1024 * 1024, backupCount=1, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        try:
+            for step in steps:
+                disk["full"] = step != "write"
+                args = (_Unformattable(),) if step == "bad-arg" else ()
+                handler.handle(logging.LogRecord("t", logging.INFO, __file__, 0, "%s", args or (step,), None))
+        finally:
+            handler.close()
+        err = capsys.readouterr().err
+        return err.count(f"{path} unavailable"), err.count("--- Logging error ---")
+
+    assert _notices_and_tracebacks("rearmed", ["full", "full", "write", "full", "full"]) == (2, 0)
+    assert _notices_and_tracebacks("format-error", ["full", "full", "bad-arg", "full", "full"]) == (1, 1)
+
+
+def test_removed_routed_profile_home_is_named_once_and_not_recreated(tmp_path, capsys):
+    """A routed named profile whose home is removed before its log file exists: one notice, no
+    traceback per record, the home is not recreated, and another home's records all land."""
+    root = tmp_path / ".hermes"
+    gone, other = root / "profiles" / "gone", root / "profiles" / "other"
+    for directory in (root / "logs", gone, other):
+        directory.mkdir(parents=True)
+    existing = hermes_logging._ManagedRotatingFileHandler(
+        str(root / "logs" / "agent.log"), maxBytes=1024 * 1024, backupCount=1, encoding="utf-8",
+    )
+    existing.setFormatter(logging.Formatter("%(message)s"))
+    router = hermes_logging._ProfileRoutingFileHandler(existing, [root, gone, other])
+    existing.close()
+    gone.rmdir()
+
+    def _record(home, msg):
+        record = logging.LogRecord("agent.t", logging.INFO, __file__, 0, msg, (), None)
+        record.hermes_home = str(home)
+        return record
+
+    try:
+        for i in range(10):
+            router.handle(_record(gone, f"gone {i}"))
+            router.handle(_record(other, f"other {i}"))
+        err = capsys.readouterr().err
+        assert "--- Logging error ---" not in err
+        assert err.count("hermes_logging:") == 1
+        assert str(gone.resolve() / "logs" / "agent.log") in err
+        assert not gone.exists()
+        written = (other / "logs" / "agent.log").read_text(encoding="utf-8")
+        assert all(f"other {i}\n" in written for i in range(10))
+    finally:
+        router.close()
 
 
 class TestSafeStderr:

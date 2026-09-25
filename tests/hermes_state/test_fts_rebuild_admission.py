@@ -152,12 +152,14 @@ class TestRebuildFtsAdmission:
 
 
 class TestSchemaPathAdmission:
-    def test_startup_trigger_repair_defers_and_fails_closed(
+    def test_startup_trigger_repair_leaves_the_gap_to_the_holder(
         self, tmp_path, fast_timeout
     ):
         """The _init_schema trigger-repair rebuild is covered by the SAME
-        authority — deferral must leave FTS detached with the durable stale
-        breadcrumb, never triggers installed over an unrebuilt index gap."""
+        authority, taken without waiting: under a held lock the open installs no
+        trigger over the unrebuilt index gap, records no deferral (a write that
+        would queue behind the holder), and searches via LIKE. The missing
+        trigger is the claim: once the holder is gone, the next open repairs."""
         db_path = tmp_path / "state.db"
         d = SessionDB(db_path=db_path)
         if not d._fts_enabled:
@@ -169,8 +171,9 @@ class TestSchemaPathAdmission:
 
         # Drop one sync trigger out-of-band: next open takes the
         # triggers_need_repair branch in _init_schema.
+        dropped, installed = sorted(_FTS_TRIGGERS)[0], _base_fts_triggers(db_path)
         raw = sqlite3.connect(str(db_path))
-        raw.execute(f"DROP TRIGGER IF EXISTS {sorted(_FTS_TRIGGERS)[0]}")
+        raw.execute(f"DROP TRIGGER IF EXISTS {dropped}")
         raw.commit()
         raw.close()
 
@@ -181,9 +184,15 @@ class TestSchemaPathAdmission:
             finally:
                 d2.close()
 
-        # Durable state: stale breadcrumb set, no live sync triggers.
-        assert _meta_value(db_path, FTS_STALE_KEY) == "1"
-        assert _base_fts_triggers(db_path) == set()
+        assert _meta_value(db_path, FTS_STALE_KEY) is None
+        assert _base_fts_triggers(db_path) == installed - {dropped}
+        # The holder's kill dropped its lock with it.
+        d3 = SessionDB(db_path=db_path)
+        try:
+            assert d3._fts_enabled is True
+        finally:
+            d3.close()
+        assert _base_fts_triggers(db_path) == installed
 
     def test_stale_recovery_defers_then_succeeds_after_release(
         self, tmp_path, fast_timeout

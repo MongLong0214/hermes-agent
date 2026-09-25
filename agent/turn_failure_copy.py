@@ -229,8 +229,9 @@ def failure_cause_gloss(reason: Any, *, subject: str = "it", possessive: str = "
 _FAILURE_CODE_COPY: Dict[str, str] = {
     "context_overflow": (
         "This conversation has grown too long for {model} to read, and Hermes couldn't shrink "
-        "it enough automatically. Start a new session with /new (your history is kept), or try "
-        "/compress once more. Switching to a model with a bigger context window also works."
+        "it enough automatically, so your last message was not answered. Try /compress once more "
+        "and send it again, or start a new session with /new (your history is kept). Switching to "
+        "a model with a bigger context window also works."
     ),
     "truncated": (
         "The model's reply was cut off before it finished (it hit its output length limit), so "
@@ -266,7 +267,7 @@ _ONE_OFF_COPY: Dict[str, str] = {
     ),
     # Wording deliberately avoids the overflow phrases gateway/run_turn.py matches on
     # (``_CONTEXT_OVERFLOW_ERROR_PHRASES``): this failure is transient, so the user's
-    # message must stay in the transcript and the session must not be auto-reset.
+    # message must stay in the transcript.
     "server_context_rejection": (
         "The model server rejected this request as too large, but this conversation is only "
         "about {tokens:,} tokens — well under the {window:,}-token window Hermes knows for "

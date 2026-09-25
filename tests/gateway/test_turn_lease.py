@@ -494,3 +494,54 @@ def test_runner_release_turn_lease_is_token_scoped_and_bare_safe():
     _run(scenario())
 
 
+
+
+@pytest.mark.parametrize("turn_exit", ["cancelled", "failed"])
+def test_cancel_while_finalizer_awaits_marker_clear_still_releases_lease_and_slot(
+    monkeypatch, tmp_path, turn_exit
+):
+    """A cancellation landing while the dispatch finalizer awaits the durable-marker clear
+    (/stop or shutdown during a slow state.db CAS) must not skip the synchronous releases: the
+    lease ends free with its token released, and the routing key's slot is idle again."""
+    from tests.gateway.test_duplicate_user_message import _bootstrap, _event
+
+    class _TurnFailed(Exception):
+        pass
+
+    async def scenario():
+        runner = _bootstrap(monkeypatch, tmp_path)
+        registry = runner._turn_leases = SessionTurnLeaseRegistry()
+        session_id = runner.session_store.get_or_create_session.return_value.session_id
+        session_key = "agent:main:telegram:group:-1001:12345"
+        in_turn, in_cleanup, never = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        held = {}
+
+        async def mark(_event, _session_key):
+            held["token"] = registry._leases[session_id].holder
+            in_turn.set()
+            if turn_exit == "failed":
+                raise _TurnFailed()
+            await never.wait()
+
+        async def slow_clear(_event):
+            in_cleanup.set()
+            await never.wait()
+
+        runner._mark_durable_active_turn = mark
+        runner._clear_durable_active_turn = slow_clear
+        task = asyncio.create_task(runner._handle_message(_event()))
+        await asyncio.wait_for(in_turn.wait(), timeout=5)
+        if turn_exit == "cancelled":
+            task.cancel()
+        await asyncio.wait_for(in_cleanup.wait(), timeout=5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        token, lease = held["token"], registry._leases[session_id]
+        assert token is not None and token.released
+        assert lease.holder is None and not lease.lock.locked()
+        assert not runner._session_state(session_key).turn.lease_tokens
+        assert not runner._is_session_running(session_key)
+
+    _run(scenario())

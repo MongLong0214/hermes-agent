@@ -1742,16 +1742,19 @@ class GatewayTurnMixin:
             )
         return agent_failed_early, hidden_reasoning_incomplete, is_context_overflow_failure
 
-    async def _hmwa_compression_exhaustion_reset(
-        self, agent_result, response, session_entry, session_key, source,
-    ):
-        """Auto-reset a permanently oversized session so the next message starts fresh instead of
-        replaying the oversized context forever. Never on a lock-contended defer — that is the
-        OPPOSITE case (a concurrent path holds the lock and is shrinking it). Returns
-        ``(response, session_entry)``."""
-        # When compression is exhausted, the session is permanently too large to process. (#9893) Never wipe
-        # the session for that — retry-next-message semantics apply (#69870 lock-skip consumer; salvaged
-        # from #49874).
+    def _hmwa_compression_exhaustion_notice(self, agent_result, response, session_entry, event=None):
+        """Tell the user an exhausted compression kept their session. Returns the reply text.
+
+        Exhaustion ends only this turn: the session, its earlier history, the cached agent and the topic
+        binding stay put, and the user chooses ``/compress`` or ``/new``. The agent rolls back the
+        unanswered ask (unless tools already ran), so the notice asks for it again. An automatic reset
+        here used to discard the conversation's continuity (#9893/#35809). What that reset stopped is
+        bounded elsewhere: the #1630 transcript skip and the agent's failed-turn rollback keep the
+        session from growing, and /goal and /loop pause after a second consecutive exhaustion
+        (``_run_post_turn_hooks`` reads the event mark set here). Each message still costs one rejected
+        main call plus one summary call: an over-window session bypasses the summary-failure cooldown,
+        so nothing paces a user who keeps sending. A lock-contended defer is a soft result — a
+        concurrent path is shrinking the session — so it gets no notice (#69870; salvaged from #49874)."""
         if agent_result.get("compression_deferred"):
             logger.info(
                 "Compression deferred for session %s — the compression "
@@ -1759,32 +1762,18 @@ class GatewayTurnMixin:
                 "session intact; the next message retries normally.",
                 session_entry.session_id if session_entry else "?",
             )
-        elif agent_result.get("compression_exhausted") and session_entry and session_key:
-            logger.info("Auto-resetting session %s after compression exhaustion.", session_entry.session_id)
-            new_entry = await self.async_session_store.reset_session(session_key)
-            self._evict_cached_agent(session_key)
-            # Conversation boundary: the funnel clears every conversation-scoped per-session dict.
-            self._clear_conversation_scope(session_key, reason="compression_exhausted_reset")
-            if new_entry is not None:
-                # Re-point the Telegram topic binding at the fresh session, or the binding-heal walk
-                # switches the next message back onto the bloated child and re-triggers exhaustion
-                # forever. No-op on non-topic lanes.
-                # Compression rotated session_entry.session_id to the oversized compressed child earlier
-                # this turn (the agent-result sync above), and that _sync also rewrote the (chat_id,
-                # thread_id) -> bloated-child binding. reset_session swaps in a clean, parentless session,
-                # but without re-syncing the binding the next inbound message in this topic gets
-                # switch_session'd back onto the bloated child by the binding-heal walk, reloads the
-                # oversized transcript, and re-triggers compression exhaustion forever (#35809 — regression
-                # of the #9893/#10063 auto-reset).
-                session_entry = new_entry
-                await asyncio.to_thread(
-                    self._sync_telegram_topic_binding, source, session_entry, reason="compression-exhausted-reset",
-                )
-            response = (response or "") + (
-                "\n\n🔄 Session auto-reset — the conversation exceeded the maximum context size and "
-                "could not be compressed further. Your next message will start a fresh session."
+        elif agent_result.get("compression_exhausted") and session_entry:
+            with suppress(Exception):
+                event._compression_exhausted = True
+            logger.warning(
+                "Compression exhausted for session %s — keeping the session; the user can /compress or /new.",
+                session_entry.session_id,
             )
-        return response, session_entry
+            response = (response or "") + (
+                "\n\n⚠️ Nothing was reset, but your last message could not be answered. "
+                "Run /compress to shrink this chat, then send it again — or /new to start fresh."
+            )
+        return response
 
     @staticmethod
     def _hmwa_user_transcript_entry(event, prepared, ts):
@@ -1981,6 +1970,13 @@ class GatewayTurnMixin:
                 await self._hmwa_close_failed_turn(session_entry.session_id, PARTIAL_FAILED_TURN_NOTICE)
         except Exception:
             logger.debug("Failed to persist inbound user message after agent exception", exc_info=True)
+        # A store another build owns refuses every retry the same way, so /retry is not the remedy.
+        from hermes_state_user_copy import describe_schema_refusal, schema_incompatibility_cause
+        if (refusal_cause := schema_incompatibility_cause(e)) is not None:
+            refusal = describe_schema_refusal(refusal_cause)
+            return self._hmwa_add_failed_turn_notice(
+                f"⚠️ I couldn't finish this reply: {refusal.gloss}. {refusal.action}", PARTIAL_FAILED_TURN_NOTICE,
+            )
         # Never expose raw exception types/messages to end users (info-leakage risk).
         status_hint = self._STATUS_HINTS.get(status_code, "")
         if status_code == 401:
@@ -2222,9 +2218,7 @@ class GatewayTurnMixin:
             )
             if agent_failed_early and not is_context_overflow_failure:
                 response = self._hmwa_add_failed_turn_notice(response, self._hmwa_failed_turn_notice(agent_result))
-            response, session_entry = await self._hmwa_compression_exhaustion_reset(
-                agent_result, response, session_entry, session_key, source,
-            )
+            response = self._hmwa_compression_exhaustion_notice(agent_result, response, session_entry, event)
             await self._hmwa_persist_turn_transcript(
                 event=event, source=source, session_entry=session_entry, session_key=session_key,
                 agent_result=agent_result, agent_messages=agent_messages, prepared=prepared,

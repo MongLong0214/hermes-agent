@@ -194,6 +194,28 @@ class TestSyncFallbacks:
         assert res["success"] is True
         m_run.assert_called_once()   # ran inline on this thread
 
+    def test_pool_at_capacity_runs_under_the_claimed_fire_owner(self):
+        """The inline fallback runs the claimed snapshot: the pre-claim one carries no fire owner, so the
+        run's heartbeat and terminal writes went unfenced and could overwrite a newer claim."""
+        from cron.jobs import create_job, get_job
+
+        job = create_job(prompt="hi", schedule="0 9 * * *", name="inline owner")
+        owners = {}
+
+        def run_one_job(claimed, **_kw):
+            owners["run"] = (claimed.get("fire_claim") or {}).get("by")
+            owners["store"] = (get_job(claimed["id"]).get("fire_claim") or {}).get("by")
+            return True
+
+        with _bound_session_key(), \
+             patch("tools.async_delegation.dispatch_async_delegation",
+                   return_value={"status": "rejected", "error": "capacity"}), \
+             patch("cron.scheduler.run_one_job", side_effect=run_one_job):
+            res = _try_dispatch_background_run(get_job(job["id"]))
+
+        assert res["dispatched"] is False
+        assert owners["run"] and owners["run"] == owners["store"]
+
 
 class TestInFlightDedupe:
     """Manual runs must not double-fire a job that is already mid-run
@@ -238,6 +260,7 @@ class TestInFlightDedupe:
         assert "job-bg-09" not in sched.get_running_job_ids()   # released after
 
     def test_run_claimed_job_reports_exact_unknown_execution_not_stale_success(self):
+        from cron.jobs_public_status import public_run_error
         from tools.cronjob_tools import _run_claimed_job
 
         def probe_run(job, **_kwargs):
@@ -257,7 +280,7 @@ class TestInFlightDedupe:
             res = _run_claimed_job(_job("job-bg-unknown"))
 
         assert res["success"] is False
-        assert res["error"] == "worker owner exited"
+        assert res["error"] == public_run_error("worker owner exited")
 
     def test_background_dispatch_reports_running_job_immediately(self):
         """The dispatch path pre-checks the running set so a mid-run job

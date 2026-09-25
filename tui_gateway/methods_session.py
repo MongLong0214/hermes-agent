@@ -225,29 +225,28 @@ def _billing_pending_change(result: dict) -> dict:
 def _persist_branch(db, new_key: str, parent_key: str, title: str, history: list, *, source, cwd, profile_name,
                     copy_fields=(), compensate: bool = False, title_source: str = "user",
                     user_id: str | None = None) -> None:
-    """Branch child row + parent transcript (bounded-chunk transactions) + title. ``_branched_from`` keeps the
-    row visible in list_sessions_rich() (the live parent never matches the legacy end_reason='branched'
-    heuristic); NULL ``profile_name`` rows drop out of profile-keyed sidebar matching / deep links. ``compensate``
-    deletes a committed row whose transcript/title failed (a durable-but-empty row would defeat the INSERT OR
-    IGNORE first-prompt seed) — except on disk-full, where the delete cannot land. ``user_id`` is the creating
-    login: the child is a Desktop session too, and the row only records identity at insert."""
-    db.create_session(new_key, source=source, model=_resolve_model(), model_config={"_branched_from": parent_key},
-                      parent_session_id=parent_key, cwd=cwd, profile_name=profile_name, user_id=user_id)
+    """Branch child row + title (one strict transaction: a taken id or title writes nothing) + parent transcript
+    (bounded-chunk transactions, under the child's lease). ``_branched_from`` keeps the row visible in
+    list_sessions_rich() (the live parent never matches the legacy end_reason='branched' heuristic); NULL
+    ``profile_name`` rows drop out of profile-keyed sidebar matching / deep links. ``compensate`` deletes the
+    committed row whose transcript copy failed (a durable-but-partial row would defeat the INSERT OR IGNORE
+    first-prompt seed, and session.branch would report an error over it) — except on disk-full, where the delete
+    cannot land. ``user_id`` is the creating login: the child is a Desktop session too, and the row only records
+    identity at insert."""
+    from hermes_state_branch import seed_branch_session
+    if not db.create_session_strict(new_key, source=source, model=_resolve_model(),
+                                    model_config={"_branched_from": parent_key}, parent_session_id=parent_key,
+                                    cwd=cwd, profile_name=profile_name, user_id=user_id,
+                                    title=title, title_source=title_source):
+        raise ValueError(f"session id {new_key} is already taken")
     try:
-        # Compensation guard (#93959 review): if the transcript copy or title write fails AFTER the row
-        # committed, the durable-but-empty row would defeat the lazy first-prompt fallback
-        # (_ensure_session_db_row is INSERT OR IGNORE — the row exists, so the seed never lands and the
-        # renderer fail-latches on a "transcript-less" session again). Roll back just this child so the seed
-        # path can retry cleanly on first submit.
-        # Copy the whole parent history in bounded-chunk transactions — a branch seed can be hundreds of
-        # rows, and per-row transactions were the write-amplification pattern removed in #23254.
-        db.append_messages_batch(
-            new_key, [{"role": msg.get("role", "user"), "content": msg.get("content"),
-                       **{field: msg.get(field) for field in copy_fields}} for msg in history], chunk_rows=500)
-        if title_source == "user":
-            db.set_session_title(new_key, title)
-        else:
-            db.set_auto_title(new_key, title, source=title_source)
+        # Compensation guard (#93959 review): if the transcript copy fails AFTER the row committed, the
+        # durable-but-empty row would defeat the lazy first-prompt fallback (_ensure_session_db_row is INSERT OR
+        # IGNORE — the row exists, so the seed never lands and the renderer fail-latches on a "transcript-less"
+        # session again). Roll back just this child (ours: the strict create made it) so the seed path can
+        # retry cleanly on first submit.
+        seed_branch_session(db, new_key, [{"role": msg.get("role", "user"), "content": msg.get("content"),
+                                           **{field: msg.get(field) for field in copy_fields}} for msg in history])
     except Exception as exc:
         from hermes_state_errors import is_disk_full_error
         if compensate and not is_disk_full_error(exc):
@@ -2050,7 +2049,7 @@ def _(rid, params: dict, session: dict) -> dict:
             home = session.get("profile_home")
             _persist_branch(db, new_key, old_key, title, history, source=source, cwd=_session_cwd(session),
                             profile_name=profile_name_for_home(home) or _current_profile_name(),
-                            copy_fields=_BRANCH_COPY_FIELDS,
+                            copy_fields=_BRANCH_COPY_FIELDS, compensate=True,
                             title_source="user" if params.get("name") else "derived",
                             user_id=_session_auth_user_id(session))
         except Exception as e:

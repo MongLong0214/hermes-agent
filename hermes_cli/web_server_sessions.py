@@ -108,13 +108,31 @@ def _is_stale_schema_error(exc: BaseException) -> bool:
     return "no such table" in message or "no such column" in message
 
 
+def _owned_by_another_build(db_path: Path) -> bool:
+    """True when a writable open of *db_path* would migrate it away from the Hermes build that
+    wrote it (or this build must not open it at all). A store SQLite cannot read is damaged, not
+    owned: the one-writable-open heal stays its repair path."""
+    import sqlite3
+
+    from hermes_state_errors import IncompatibleSchemaError
+    from hermes_state_fence import probe_store_lineage
+
+    try:
+        return probe_store_lineage(db_path).owned_by_another_build
+    except IncompatibleSchemaError:
+        return True
+    except sqlite3.DatabaseError:
+        return False
+
+
 def _open_session_db_at_path(db_path: Path, *, read_only: bool):
     """Open a SessionDB at an explicit path with an explicit access mode.
 
     Read-only opens bootstrap a missing/zero-byte store once and heal a stale or
-    malformed schema through ONE writable open before reopening read-only; the
-    healthy read path never takes a write lock.  Tables outside SCHEMA_SQL
-    (telemetry ``tel_*``, FTS shadow tables) are outside both probe and heal.
+    malformed schema through ONE writable open before reopening read-only, except on a
+    store another Hermes build owns; the healthy read path never takes a write lock.
+    Tables outside SCHEMA_SQL (telemetry ``tel_*``, FTS shadow tables) are outside both
+    probe and heal.
     """
     import sqlite3
 
@@ -167,6 +185,15 @@ def _open_session_db_at_path(db_path: Path, *, read_only: bool):
             or is_malformed_schema_error(exc)
             or isinstance(exc, UnicodeDecodeError)):
             raise
+        if _owned_by_another_build(db_path):
+            # The heal's writable open would migrate a store another Hermes build still writes, and
+            # a read never does that: serve it unprobed until a deliberate open has migrated it.
+            if str(db_path) not in _session_db_heal_warned:
+                _session_db_heal_warned.add(str(db_path))
+                _log.warning(
+                    "state.db at %s belongs to another Hermes build; serving reads without the "
+                    "schema heal, so reads needing this build's schema may fail (%s)", db_path, exc)
+            return SessionDB(db_path=db_path, read_only=True)
         db = acquire(db_path)
         release_or_close(db)
         try:
@@ -253,6 +280,9 @@ def _maybe_auto_archive_for_profile(profile: Optional[str]) -> None:
         # multiplexer rung catches a served secondary, which owns no gateway.pid or lock
         # of its own and a bare lock-file probe would report stopped.
         if _check_gateway_running(profile_home):
+            return
+        # Housekeeping never migrates a store another Hermes build still writes; that build sweeps it.
+        if _owned_by_another_build(_session_db_path_for_profile(profile)):
             return
         db = _open_session_db_for_profile(profile, read_only=False)
         try:

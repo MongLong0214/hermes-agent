@@ -1,8 +1,9 @@
 """The provider call for the conversation turn's retry loop: ``nous_rate_limit_guard`` (skip
 the attempt while another session's Nous Portal rate limit is active), ``perform_api_call``
 (streaming decision, MoA prepared-request handshake, LLM execution middleware wrapper, the
-redirect ``_model_request_active`` bracket and the response-vs-redirect crossing check) and
-``handle_api_interrupt`` (``InterruptedError`` mid-call). Nothing here imports
+redirect ``_model_request_active`` bracket and the response-vs-redirect crossing check),
+``handle_api_interrupt`` (``InterruptedError`` mid-call) and ``handle_accepted_stream_failure``
+(an accepted Responses stream lost transport; no replay). Nothing here imports
 ``agent.conversation_loop`` at module level (cycle).
 """
 
@@ -16,7 +17,11 @@ from typing import Any, Dict, Optional
 
 from agent.error_classifier import FailoverReason
 from agent.agent_runtime_helpers import _INTERRUPTED_PLACEHOLDER
+from agent.chat_completion_accepted_failure import is_accepted_stream_failure
 from agent.message_metadata import append_message
+from agent.native_compaction_grace import (
+    NativeCompactionPreflightRefused, start_native_compaction_preflight_request,
+)
 from agent.repetition_guard import REPETITION_LOOP_INTERRUPTED, is_runaway_repetition
 from agent.turn_failure_copy import site_copy, stamp_failure
 
@@ -35,13 +40,16 @@ def stop_thinking_spinner(agent: Any, thinking_spinner: Any) -> None:
 
 @dataclass
 class ApiCallVerdict:
-    """``action``: ``"fallthrough"`` (``response`` is ready for verification) or ``"break"``
-    (a redirect crossed the response — rebuild armed on ``_retry`` or ``interrupted``)."""
+    """``action``: ``"fallthrough"`` (``response`` is ready for verification), ``"break"``
+    (a redirect crossed the response — rebuild armed on ``_retry`` or ``interrupted``) or
+    ``"accepted_failure"`` (this invocation's own accepted Responses stream lost transport;
+    ``accepted_stream_failure_error`` carries its error and nothing may replay it)."""
 
     action: str
     response: Any
     thinking_spinner: Any
     interrupted: Any
+    accepted_stream_failure_error: Any = None
 
 
 def _should_stream(agent: Any) -> bool:
@@ -73,11 +81,13 @@ def perform_api_call(
 ) -> ApiCallVerdict:
     """Issue the request (see ``_should_stream`` for the streaming decision)."""
     response = None
+    accepted_stream_failure_outcome = None
+    accepted_stream_failure_error = None
 
     def _verdict(action: str) -> ApiCallVerdict:
         return ApiCallVerdict(
             action=action, response=response, thinking_spinner=thinking_spinner,
-            interrupted=interrupted,
+            interrupted=interrupted, accepted_stream_failure_error=accepted_stream_failure_error,
         )
 
     def _stop_spinner():
@@ -86,21 +96,31 @@ def perform_api_call(
 
     _use_streaming = _should_stream(agent)
 
+    def _capture_outcome(result):
+        # Capture at the physical call, before execution middleware can replace the return
+        # value: the identity check after middleware trusts only this object, never a lookalike.
+        nonlocal accepted_stream_failure_outcome
+        if is_accepted_stream_failure(result):
+            accepted_stream_failure_outcome = result
+        return result
+
     def _perform_api_call(next_api_kwargs):
         if agent.api_mode == "codex_responses":
             next_api_kwargs = agent._get_transport().preflight_kwargs(
                 next_api_kwargs, allow_stream=False, is_github_responses=agent._is_copilot_url(),
                 sanitize_harmony_tokens=agent._is_codex_backend(),
             )
+        if not start_native_compaction_preflight_request(agent, next_api_kwargs):
+            raise NativeCompactionPreflightRefused("native compaction grace has no native wire")
         if _use_streaming:
-            return agent._interruptible_streaming_api_call(
+            return _capture_outcome(agent._interruptible_streaming_api_call(
                 next_api_kwargs, on_first_delta=_stop_spinner
-            )
+            ))
         from agent import relay_llm
 
-        return relay_llm.execute(
+        result = relay_llm.execute(
             next_api_kwargs,
-            agent._interruptible_api_call,
+            lambda request: _capture_outcome(agent._interruptible_api_call(request)),
             session_id=str(agent.session_id or ""),
             name=str(agent.provider or "provider"),
             model_name=str(agent.model or ""),
@@ -118,6 +138,8 @@ def perform_api_call(
             },
             defer_logical_completion=True,
         )
+        # Managed Relay execution may hand back a re-namespaced copy of the callback's value.
+        return accepted_stream_failure_outcome if accepted_stream_failure_outcome is not None else result
 
     from hermes_cli.middleware import run_llm_execution_middleware
 
@@ -147,13 +169,21 @@ def perform_api_call(
             )
     if _redirect_crossed_response:
         # Response and redirect can cross threads: discard the now-stale
-        # response and rebuild from the correction rather than lose it.
+        # response and rebuild from the correction rather than lose it. This
+        # also covers an accepted stream failure: the redirect rebuild owns the
+        # streamed partial, and failure finalization would clear the correction.
         thinking_spinner = stop_thinking_spinner(agent, thinking_spinner)
         if agent.clear_interrupt(preserve_redirect=True):
             _retry.restart_with_redirected_messages = True
         else:
             interrupted = True
         return _verdict("break")
+    if accepted_stream_failure_outcome is not None and response is accepted_stream_failure_outcome:
+        accepted_stream_failure_error, response = response.error, None
+        return _verdict("accepted_failure")
+    if is_accepted_stream_failure(response):
+        # A middleware lookalike has no accepted-event provenance: ordinary recovery.
+        raise response.error
     return _verdict("fallthrough")
 
 
@@ -206,6 +236,54 @@ def handle_api_interrupt(
         final_response = f"{INTERRUPT_WAITING_FOR_MODEL_PREFIX}{api_elapsed:.1f}s elapsed)."
     agent._persist_session(messages, conversation_history)
     return ApiInterruptVerdict("break", thinking_spinner, interrupted, final_response)
+
+
+@dataclass
+class AcceptedStreamFailureVerdict:
+    """Always ``action == "break"``: the turn ends failed, never retried or failed over."""
+
+    action: str
+    thinking_spinner: Any
+    final_response: Any
+    failed: Any
+    _turn_exit_reason: Any
+
+
+def handle_accepted_stream_failure(
+    agent: Any, *, thinking_spinner: Any, messages: Any, accepted_stream_failure_error: Any,
+) -> AcceptedStreamFailureVerdict:
+    """This invocation's accepted Responses stream lost transport: the request is billed, so
+    a replay would pay twice. Keep the delivered partial as the turn's transcript record; the
+    finalizer replaces the user-facing reply with the fixed notice."""
+    thinking_spinner = stop_thinking_spinner(agent, thinking_spinner)
+    # Nothing reconnects from here, so buffered retry chatter ("... Reconnecting.") is false and would
+    # surface on a later turn's flush; a provider switch stays visible, as on success.
+    agent._emit_pending_fallback_notice()
+    agent._clear_status_buffer()
+    # Type only: transport error text can carry request URLs.
+    logger.warning(
+        "%sAccepted Responses stream lost transport (%s); ending the turn without replay.",
+        agent.log_prefix, type(accepted_stream_failure_error).__name__,
+    )
+    _partial = agent._strip_think_blocks(
+        getattr(agent, "_current_streamed_assistant_text", "") or ""
+    ).strip()
+    final_response = None
+    if _partial and is_runaway_repetition(_partial):
+        # Same hidden shape as the interrupt path (#112764): looped bytes replayed next turn
+        # re-seed the loop. An assistant tail already closes the turn without it.
+        if not (messages and messages[-1].get("role") == "assistant"):
+            append_message(messages, {
+                "role": "assistant", "content": "", "display_kind": "hidden",
+                "api_content": _INTERRUPTED_PLACEHOLDER,
+            })
+    elif _partial:
+        # The finalizer's transcript-tail close appends it only when the tail is not already
+        # an assistant row (a Codex interim), keeping strict role alternation.
+        final_response = _partial
+    return AcceptedStreamFailureVerdict(
+        "break", thinking_spinner, final_response, True, "partial_stream_recovery",
+    )
 
 
 @dataclass

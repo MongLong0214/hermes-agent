@@ -30,10 +30,12 @@ from agent.error_classifier import (
 from agent.sdk_transform_bypass import bypass_chat_sdk_request_transform
 from agent.errors import EmptyStreamError
 from agent.chat_completion_stream_monitor import StreamingWaitMonitor
+from agent.chat_completion_accepted_failure import is_accepted_stream_failure, stream_end_fields
 from agent.transports.chat_completions import is_router_timeout_shim, router_timeout_shim_may_follow
 from agent.fast_mode import effective_request_overrides
 from agent.turn_context import substitute_api_content
 from agent.gemini_native_adapter import is_native_gemini_base_url
+from agent.gemini_outbound_policy import is_gemini_outbound
 # Remote endpoints must never be fingerprinted: the probe waterfall is only valid for local/LM-Studio/Ollama
 # boxes. Non-Ollama remotes (sglang, vLLM, OpenAI-compat) expose Ollama-compat endpoints that can
 # misidentify and, without an api_key, return 401 on every leg (issue #89863).
@@ -1000,8 +1002,9 @@ def direct_api_call(agent, api_kwargs: dict):
         # If a timer already won, the request still completed: return it (the
         # reset undoes the bump; the finally discards the poisoned client).
         request.mark_done()
-        _reset_stale_streak(agent)
-        succeeded = True
+        if not is_accepted_stream_failure(response):  # billed but never completed, even if a timer won
+            _reset_stale_streak(agent)
+            succeeded = True
         return response
     finally:
         request.stop_watchdogs()
@@ -1724,6 +1727,71 @@ def _fallback_entry_unavailable_without_network(agent, fb: dict) -> Optional[str
     return None if has_token else "nous_token_missing"
 
 
+def _bare_custom_fallback_route_fact() -> str:
+    """Return bare-custom's configured endpoint without resolving a credential or client."""
+    # ``model.base_url`` is a non-secret persisted route.  It has priority when the
+    # configured main provider is bare custom, matching runtime selection without
+    # entering its credential-bearing resolver.
+    try:
+        from hermes_cli.runtime_provider import _get_model_config
+        model_cfg = _get_model_config()
+        if str(model_cfg.get("provider") or "").strip().lower() == "custom":
+            configured = str(model_cfg.get("base_url") or "").strip()
+            if configured:
+                return configured
+    except Exception:
+        pass
+    # OPENAI_BASE_URL is route metadata despite living in the profile's scoped
+    # .env.  Read that one value directly; never invoke runtime/provider or key
+    # resolution just to decide whether this fallback may be considered.
+    try:
+        from agent.secret_scope import get_secret_str
+        return get_secret_str("OPENAI_BASE_URL", "").strip()
+    except Exception:
+        return ""
+
+
+def _main_fallback_google_route(fb_provider: str, fb_model: str, fb: dict) -> bool:
+    """Whether a main fallback must be skipped before route resolution effects.
+
+    This intentionally reads only configured route facts.  It runs before the
+    candidate's credential pool, key lookup, client construction, or transport
+    cache can be touched.  Named custom providers are resolved only far enough
+    to inspect their configured URL, so an innocuous-looking alias cannot
+    bypass the outbound Google-route restriction.
+    """
+    # ``auto`` has no non-secret route fact.  Resolving it can choose a disabled
+    # Gemini/Vertex endpoint, but that resolver reads credentials and constructs
+    # a client, so it must not run while scanning the main fallback chain.
+    if fb_provider == "auto" or is_gemini_outbound(canonical_provider=fb_provider, model=fb_model):
+        return True
+
+    base_url = str(fb.get("base_url") or "").strip()
+    if not base_url and fb_provider == "custom":
+        base_url = _bare_custom_fallback_route_fact()
+        # A bare custom fallback has no independently declared endpoint.  If a
+        # route fact cannot be obtained without entering credential resolution,
+        # fail closed rather than letting the later resolver discover a disabled
+        # Google/Vertex URL after it has touched secret or client state.
+        if not base_url:
+            return True
+    if not base_url and fb_provider not in {"", "auto", "custom", "moa"}:
+        try:
+            from hermes_cli.runtime_provider_custom import peek_named_custom_provider_route
+            route_fact = peek_named_custom_provider_route(fb_provider)
+        except Exception:
+            route_fact = None
+        if route_fact is not None:
+            base_url = str(route_fact.get("base_url") or "").strip()
+            if not base_url:
+                return True
+    if base_url:
+        from hermes_cli.runtime_provider_custom import is_usable_custom_provider_url
+        if not is_usable_custom_provider_url(base_url):
+            return True
+    return is_gemini_outbound(base_url=base_url)
+
+
 _FALLBACK_REASON_LABELS = {
     FailoverReason.auth: "authentication failed",
     FailoverReason.auth_permanent: "authentication permanently failed",
@@ -2010,12 +2078,20 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
             return _fallback_chain_exhausted(agent, reason)
         fb = agent._fallback_chain[agent._fallback_index]
         agent._fallback_index += 1
+        fb_provider = (fb.get("provider") or "").strip().lower()
+        fb_model = (fb.get("model") or "").strip()
+        # Do this before even allocating the unavailable-entry cache: Google
+        # inference routes are disabled and must not cause credential, client,
+        # cache, or network effects while the fallback chain is being scanned.
+        if _main_fallback_google_route(fb_provider, fb_model, fb):
+            skip_reason = ("automatic route cannot be verified before resolver effects"
+                           if fb_provider == "auto" else "targets a disabled Google inference route")
+            logger.warning("Fallback skip: %s/%s %s", fb_provider, fb_model, skip_reason)
+            continue
         fb_key = _fallback_entry_key(fb)
         if getattr(agent, "_unavailable_fallback_keys", None) is None:
             agent._unavailable_fallback_keys = set()
         unavailable = agent._unavailable_fallback_keys
-        fb_provider = (fb.get("provider") or "").strip().lower()
-        fb_model = (fb.get("model") or "").strip()
         if _should_skip_fallback_candidate(agent, fb, fb_key, fb_provider, fb_model, unavailable):
             continue
 
@@ -2445,7 +2521,7 @@ def _with_stream_emitters(agent, run):
         raise
     end = getattr(agent, "_emit_stream_end", None)
     if end is not None:
-        end(final_text=_stream_final_text(response), finished=True, error=None)
+        end(**stream_end_fields(response, _stream_final_text))
     return response
 
 

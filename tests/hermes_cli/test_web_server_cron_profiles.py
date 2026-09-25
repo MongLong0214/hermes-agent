@@ -732,8 +732,10 @@ async def test_trigger_cron_job_returns_refreshed_execution_failure(
         profile="worker_alpha",
     )
 
+    from cron.jobs_public_status import public_run_error
+
     assert triggered["last_status"] == "error"
-    assert triggered["last_error"] == "expected failure"
+    assert triggered["last_error"] == public_run_error("expected failure")
 
 
 @pytest.mark.asyncio

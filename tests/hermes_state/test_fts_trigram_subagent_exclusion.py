@@ -10,7 +10,7 @@ from __future__ import annotations
 import pytest
 
 from hermes_state import SessionDB
-from hermes_state_common import SCHEMA_VERSION
+from hermes_state_fence import STORED_SCHEMA_VERSION
 from hermes_state_common import FTS_TRIGRAM_EXCLUDED_SOURCES, fts_trigram_session_sql
 
 
@@ -147,7 +147,7 @@ def test_v29_install_purges_child_rows_on_upgrade(tmp_path):
         assert _trigram_rowids(migrated) == {ids["root"], ids["cont"]}
         assert migrated._conn.execute(
             "SELECT version FROM schema_version"
-        ).fetchone()[0] == SCHEMA_VERSION
+        ).fetchone()[0] == STORED_SCHEMA_VERSION
         migrated._conn.execute(
             "INSERT INTO messages_fts_trigram(messages_fts_trigram) VALUES('integrity-check')"
         )

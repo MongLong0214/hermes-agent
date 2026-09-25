@@ -8,6 +8,7 @@ the known-fragile core packages, using the pins from pyproject.toml).
 
 from __future__ import annotations
 
+import functools
 import importlib
 import os
 import shutil
@@ -96,7 +97,7 @@ _UPDATE_RETRY_RECOVERED = False
 
 
 def _should_skip_external_secret_sources() -> bool:
-    """True inside any ``hermes update`` process (and its import probes).
+    """True inside any ``hermes update`` process (and its import probes), and for ``target bind``.
 
     Every dotenv load in the process — ``hermes_cli.main``, ``run_agent``, ``cli`` — consults
     this, so the updater never resolves external secret sources: on Windows they map
@@ -105,8 +106,41 @@ def _should_skip_external_secret_sources() -> bool:
     120s critical-module import probe and be reported as an import-health timeout.
     Profile flags are stripped before ``hermes_cli.main`` loads dotenv, so ``argv[1]`` is
     the authoritative subcommand.
+
+    ``target bind`` is a local store preflight with a 5 s caller deadline and a stdout the caller
+    compares byte for byte; it needs no credential, and a helper's latency or output must not reach it.
     """
-    return _UPDATE_RETRY_RECOVERED or sys.argv[1:2] == ["update"]
+    return (
+        _UPDATE_RETRY_RECOVERED
+        or sys.argv[1:2] == ["update"]
+        or _target_bind_selected(tuple(sys.argv[1:]))
+    )
+
+
+@functools.lru_cache(maxsize=8)
+def _target_bind_selected(argv: tuple[str, ...]) -> bool:
+    """True when the REAL top-level parser routes ``argv`` to ``target bind``.
+
+    Parsing with the production grammar (not scanning argv) consumes every top-level option,
+    value-taking ones included, exactly as ``main()`` will. The imports stay inside the function so
+    this module remains stdlib-only at import time; any failure means "not selected". Cached per argv:
+    long-lived processes consult this on every dotenv reload.
+    """
+    import contextlib
+    import io
+
+    try:
+        from hermes_cli._parser import build_top_level_parser
+        from hermes_cli.subcommands.target import build_target_parser
+
+        # Help and usage errors print; this probe must stay silent on both streams.
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            parser, subparsers, _chat_parser = build_top_level_parser()
+            build_target_parser(subparsers)
+            args = parser.parse_args(list(argv))
+    except (Exception, SystemExit):
+        return False
+    return getattr(args, "command", None) == "target" and getattr(args, "target_command", None) == "bind"
 
 
 def _project_root() -> Path:

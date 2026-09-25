@@ -76,7 +76,7 @@ def is_disk_full_error(exc: BaseException | str | None) -> bool:
 # Every classify_persistence_error bucket; consumers enumerate this tuple.
 PERSISTENCE_ERROR_CAUSES = (
     "locked", "compression", "compression_closed", "turn_lease", "corrupt", "fts_index",
-    "replaced", "deleted_wal", "disk", "unknown",
+    "replaced", "deleted_wal", "schema_incompatible", "disk", "unknown",
 )
 
 
@@ -219,7 +219,62 @@ _STATE_DB_CORRUPT_MSG = (
 )
 
 
+SCHEMA_CAUSE_BUILD_TOO_OLD = "BUILD_TOO_OLD"
+SCHEMA_CAUSE_FENCE_GENERATION_MISMATCH = "FENCE_GENERATION_MISMATCH"
+SCHEMA_CAUSE_VERSION_UNREADABLE = "SCHEMA_VERSION_UNREADABLE"
+SCHEMA_INCOMPATIBLE_CAUSES = (
+    SCHEMA_CAUSE_BUILD_TOO_OLD, SCHEMA_CAUSE_FENCE_GENERATION_MISMATCH, SCHEMA_CAUSE_VERSION_UNREADABLE,
+)
+
+
+class IncompatibleSchemaError(RuntimeError):
+    """This build must not open the store at all: its stored lineage or turn-fence generation is one
+    the build does not own. Deliberately NOT an ``sqlite3.DatabaseError``: every DatabaseError path
+    in the open/repair stack treats the file as damaged and may quarantine, rebuild FTS or VACUUM it,
+    which would destroy a store that is healthy for the build that wrote it."""
+
+    code = "STATE_DB_SCHEMA_INCOMPATIBLE"
+
+    def __init__(self, *, cause: str, expected_generation, actual_generation, detail: str = ""):
+        if cause not in SCHEMA_INCOMPATIBLE_CAUSES:
+            raise ValueError(f"unknown schema incompatibility cause: {cause!r}")
+        self.cause = cause
+        self.expected_generation = expected_generation
+        self.actual_generation = actual_generation
+        self.detail = detail
+        super().__init__(_incompatible_schema_message(cause, expected_generation, actual_generation, detail))
+
+
+# One table writes each refusal's message and reads it back: init-error slots and RPC errors keep only
+# ``str(e)``, and a refusal read from there must still classify as schema_incompatible and keep its cause.
+# A fence mismatch fires in either direction (older or newer writer), so its text never says "newer".
+_INCOMPATIBLE_SCHEMA_HEADS = {
+    SCHEMA_CAUSE_BUILD_TOO_OLD: "Session state schema is newer than this Hermes build",
+    SCHEMA_CAUSE_FENCE_GENERATION_MISMATCH: "Session state turn-fence generation does not match this Hermes build",
+    SCHEMA_CAUSE_VERSION_UNREADABLE: "Session state does not record exactly one integer schema version",
+}
+_INCOMPATIBLE_SCHEMA_GENERATIONS = {
+    SCHEMA_CAUSE_BUILD_TOO_OLD: " (expected generation {expected}, actual generation {actual})",
+    SCHEMA_CAUSE_FENCE_GENERATION_MISMATCH: " (build generation {expected}, stored generation {actual})",
+}
+
+
+def _incompatible_schema_message(cause: str, expected, actual, detail: str) -> str:
+    suffix = f" ({detail})" if detail else ""
+    generations = _INCOMPATIBLE_SCHEMA_GENERATIONS.get(cause, "").format(expected=expected, actual=actual)
+    return f"{_INCOMPATIBLE_SCHEMA_HEADS[cause]}{generations}{suffix}; refusing to open it, and nothing was changed."
+
+
+def incompatible_schema_cause(exc_or_str) -> str | None:
+    """The cause of an ``IncompatibleSchemaError`` or of its message text, else None."""
+    if isinstance(exc_or_str, IncompatibleSchemaError):
+        return exc_or_str.cause
+    text = str(exc_or_str or "")
+    return next((cause for cause, head in _INCOMPATIBLE_SCHEMA_HEADS.items() if head in text), None)
+
+
 _PERSISTENCE_CAUSE_BY_TYPE = (
+    (IncompatibleSchemaError, "schema_incompatible"),
     (SessionTurnLeaseLostError, "turn_lease"),
     (CompressionSessionClosedError, "compression_closed"),
     (CompressionSessionBusyError, "compression"),
@@ -230,6 +285,10 @@ _PERSISTENCE_CAUSE_BY_TYPE = (
     (StateDbCorruptError, "corrupt"),
 )
 _PERSISTENCE_CAUSE_BY_PHRASE = (
+    # The fence trigger's RAISE text and the missing-UDF error: a generation refusal, never damage.
+    (("state db generation incompatible", "no such function: hermes_turn_fence_generation",
+      *(head.lower() for head in _INCOMPATIBLE_SCHEMA_HEADS.values())),
+     "schema_incompatible"),
     (("turn lease",), "turn_lease"),
     (("closed by compression",), "compression_closed"),
     (("being compressed", "compression lease"), "compression"),
@@ -237,6 +296,8 @@ _PERSISTENCE_CAUSE_BY_PHRASE = (
     (("deleted state.db-wal", "deleted state.db-shm"), "deleted_wal"),
     (("was replaced underneath",), "replaced"),
     (_DB_CORRUPTION_MARKERS, "corrupt"),
+    # hermes_state_admission's refusal: another build's gateway holds the store; stop it, as for a lock.
+    (("running hermes gateway owns",), "locked"),
     (("locked", "busy"), "locked"),
 )
 

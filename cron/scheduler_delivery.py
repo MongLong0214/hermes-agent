@@ -749,8 +749,8 @@ def _format_failure_streams(result) -> str:
     stderr is empty and stdout holds only the banner, the recorded error
     carried zero diagnostics (#104056). The banner lines are dropped from the
     stdout tail so what remains is the reason; the exit code is always named.
-    The text lands in ``last_delivery_error`` on disk, so it is scrubbed like
-    ``cron.incidents`` / ``cron.delivery_queue`` scrub their persisted errors.
+    The text is logged when the outcome is recorded (``last_delivery_error`` keeps a closed
+    label), so it is scrubbed like ``cron.incidents`` / ``cron.delivery_queue`` scrub theirs.
     """
     from agent.redact import redact_sensitive_text
 
@@ -1742,15 +1742,15 @@ def _standalone_send(
 
 def _deliver_standalone(
     t: _TargetDelivery, content: str, media_files: list, target_errors: list, delivery_errors: list,
-) -> None:
-    """Standalone fallback for a target the live lane did not deliver."""
+) -> bool:
+    """Standalone fallback for a target the live lane did not deliver; True once the target took it."""
     job = t.job
     if t.is_relay:
         # Relay owns the destination and credential; a native retry could duplicate — fail closed.
         if not target_errors:
             target_errors.append(f"relay delivery to {t.where} failed")
         delivery_errors.extend(target_errors)
-        return
+        return False
     result, err = _standalone_send(t, content, media_files)
     if err is None and result and result.get("error"):
         # Not inside an except block — the error comes from the result dict, no traceback.
@@ -1759,7 +1759,7 @@ def _deliver_standalone(
     if err is not None:
         target_errors.append(err)
         delivery_errors.extend(target_errors)
-        return
+        return False
     # Standalone senders report per-file attachment failures in ``warnings`` while returning
     # success; surface them so a vanished attachment doesn't mark the run ok.
     for _w in (result.get("warnings") if isinstance(result, dict) else None) or []:
@@ -1772,6 +1772,7 @@ def _deliver_standalone(
         job, t.platform_name, t.chat_id, t.mirror_text, thread_id=t.thread_id,
         user_id=t.origin_user_id,
         enabled=t.mirror_this_target)
+    return True
 
 
 def _prepare_target_delivery(
@@ -1909,7 +1910,15 @@ def _deliver_result(
     """Deliver job output to the configured target(s). With ``adapters``/``loop`` (gateway
     running) the live adapter is tried first (E2EE rooms can't use the standalone HTTP path), then
     standalone fallback. ``for_failure=True`` routes failure-category notices through the job's
-    ``failure_deliver`` override when present (NS-788). Returns None on success, else an error."""
+    ``failure_deliver`` override when present (NS-788). Returns None on success, else an error.
+
+    Sets ``job["_delivery_accepted"]`` when at least one target took the message, else
+    ``job["_delivery_parked"]``: the handoffs no target has finished yet (an unfinished durable-queue
+    send, an open Bot Chat receipt), which are neither accepted nor failed. Read only by the drift
+    alert-once commit: the joined error string cannot tell "one of two targets failed" from
+    "nothing was sent", and local/unresolved/suppressed/queued runs return None too."""
+    job.pop("_delivery_accepted", None)
+    job.pop("_delivery_parked", None)
     job.pop("_bot_chat_delivery_receipts", None)
     job.pop("_notification_all_targets_suppressed", None)
     targets = _resolve_delivery_targets(job, for_failure=for_failure)
@@ -1937,6 +1946,13 @@ def _deliver_result(
         from cron.jobs import get_job
         refreshed = get_job(job["id"]) or {}
         job["last_delivery_queued"] = refreshed.get("last_delivery_queued")
+        # The draining gateway records whether any target took the message (its joined error cannot
+        # say). A row no gateway has finished, or one that parked handoffs, is still open.
+        if delivery_status and delivery_status.get("accepted"):
+            job["_delivery_accepted"] = True
+        elif delivery_status and (
+                delivery_status["status"] in ("pending", "delivering") or delivery_status.get("parked")):
+            job["_delivery_parked"] = [{"queue": external_execution}]
         return error
 
     from gateway.config import load_gateway_config
@@ -2009,6 +2025,8 @@ def _deliver_result(
 
     delivery_errors = []
     suppressed_targets = 0  # local: `job` is snapshotted into durable deferred records mid-loop
+    accepted_targets = 0
+    parked = []
     for target in targets:
         # A failure notice for a platform that hides warning notifications is a suppressed
         # disposition, not a send; requested (non-failure) results are never gated.
@@ -2020,14 +2038,19 @@ def _deliver_result(
         # Bot Chat owns admission; never concurrently resume a live owner's transcript.
         if target["platform"] == BOT_CHAT_PLATFORM:
             bot_chat_error = _deliver_to_bot_chat(job, content, target["chat_id"], for_failure=for_failure)
-            suppressed_targets += job.pop("_notification_all_targets_suppressed", False)
+            suppressed = job.pop("_notification_all_targets_suppressed", False)
+            suppressed_targets += suppressed
             if bot_chat_error:
                 receipt_target = f"bot-chat:{target['chat_id'] or '(own)'}"
                 receipt = job.get("_bot_chat_delivery_receipts", {}).get(receipt_target)
                 if not receipt or receipt["status"] not in ("queued", "claimed"):
                     delivery_errors.append(bot_chat_error)
+                else:
+                    # Admission, not delivery: the receipt can still end failed or cancelled.
+                    parked.append({"bot_chat": receipt["delivery_id"], "profile": target["chat_id"]})
                 if receipt and receipt["status"] == "ambiguous":
                     unverified_targets.append(bot_chat_error)
+            accepted_targets += not suppressed and not bot_chat_error
             continue
 
         t = _prepare_target_delivery(
@@ -2043,8 +2066,9 @@ def _deliver_result(
             unverified_targets=unverified_targets,
         )
         if not delivered:
-            _deliver_standalone(
+            delivered = _deliver_standalone(
                 t, cleaned_delivery_content, media_files, target_errors, delivery_errors)
+        accepted_targets += bool(delivered)
 
     # Filter-time drops apply to every target; report them once. A run whose every target was
     # suppressed sent nothing, so there is no drop to report.
@@ -2053,6 +2077,10 @@ def _deliver_result(
     else:
         delivery_errors.extend(policy_drop_errors)
     _record_delivery_verification(job, unverified_targets)
+    if accepted_targets:
+        job["_delivery_accepted"] = True
+    elif parked:
+        job["_delivery_parked"] = parked
     return "; ".join(delivery_errors) if delivery_errors else None
 
 

@@ -289,6 +289,8 @@ class TestFlushAfterCompression:
             agent = self._make_agent(db)
             agent.session_id = parent_sid
             agent.compression_in_place = False
+            # The provider-less rotation below commits the static fallback, which is opt-in.
+            agent.context_compressor.abort_on_summary_failure = False
             agent._ensure_db_session()
 
             # Plain marked messages only: the exact-equality assertion below

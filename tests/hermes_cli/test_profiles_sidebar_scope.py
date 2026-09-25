@@ -72,6 +72,7 @@ def _seed_session(home, session_id, *, source, cwd=None, tokens=None, cost=None,
     import sqlite3
 
     from hermes_state import SessionDB
+    from hermes_state_fence import register_turn_fence_generation
 
     db = SessionDB(db_path=home / "state.db")
     try:
@@ -86,6 +87,7 @@ def _seed_session(home, session_id, *, source, cwd=None, tokens=None, cost=None,
         return
 
     conn = sqlite3.connect(home / "state.db")
+    register_turn_fence_generation(conn)  # the store is fenced: plain writes land only as this build's generation
     try:
         conn.execute(
             "UPDATE sessions SET input_tokens = ?, output_tokens = ?, estimated_cost_usd = ? WHERE id = ?",

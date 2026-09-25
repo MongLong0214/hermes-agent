@@ -1,7 +1,7 @@
 """Tests for Google AI Studio (Gemini) provider integration."""
 
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 from hermes_cli.auth import PROVIDER_REGISTRY, resolve_provider, resolve_api_key_provider_credentials
 from hermes_cli.models import _PROVIDER_MODELS, _PROVIDER_LABELS, _PROVIDER_ALIASES, normalize_provider
@@ -87,16 +87,6 @@ class TestGeminiCredentials:
         assert creds["api_key"] == "gemini-secret"
 
 
-    def test_runtime_gemini(self, monkeypatch):
-        monkeypatch.setenv("GOOGLE_API_KEY", "google-key")
-        from hermes_cli.runtime_provider import resolve_runtime_provider
-        result = resolve_runtime_provider(requested="gemini")
-        assert result["provider"] == "gemini"
-        assert result["api_mode"] == "chat_completions"
-        assert result["api_key"] == "google-key"
-        assert result["base_url"] == "https://generativelanguage.googleapis.com/v1beta"
-
-
 # ── Model Catalog ──
 
 class TestGeminiModelCatalog:
@@ -136,37 +126,6 @@ class TestGeminiContextLength:
 
 # ── Agent Init (no SyntaxError) ──
 
-class TestGeminiAgentInit:
-
-    def test_gemini_agent_uses_chat_completions(self, monkeypatch):
-        """Gemini still reports chat_completions even though the transport is native."""
-        monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
-        with patch("agent.gemini_native_adapter.GeminiNativeClient") as mock_client:
-            mock_client.return_value = MagicMock()
-            from run_agent import AIAgent
-            agent = AIAgent(
-                model="gemini-2.5-flash",
-                provider="gemini",
-                api_key="test-key",
-                base_url="https://generativelanguage.googleapis.com/v1beta",
-            )
-            assert agent.api_mode == "chat_completions"
-            assert agent.provider == "gemini"
-
-
-
-    def test_gemini_resolve_provider_client_uses_native_client(self, monkeypatch):
-        """resolve_provider_client('gemini') should build GeminiNativeClient."""
-        monkeypatch.setenv("GEMINI_API_KEY", "AIzaSy_TEST_KEY")
-        with patch("agent.gemini_native_adapter.GeminiNativeClient") as mock_client, \
-             patch("agent.auxiliary_client.OpenAI") as mock_openai:
-            mock_client.return_value = MagicMock()
-            from agent.auxiliary_client import resolve_provider_client
-            resolve_provider_client("gemini")
-        assert mock_client.called
-        mock_openai.assert_not_called()
-
-
 # ── models.dev Integration ──
 
 class TestGeminiModelsDev:
@@ -201,4 +160,3 @@ class TestGeminiModelsDev:
         assert "gemini-2.5-flash-preview-tts" not in result  # no tool_call
         assert "gemini-live-2.5-flash" not in result     # noise: live-
         assert "gemini-2.5-flash-preview-04-17" not in result  # noise: dated preview
-

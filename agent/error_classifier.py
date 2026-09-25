@@ -228,7 +228,7 @@ _MULTIMODAL_TOOL_CONTENT_PATTERNS = (
 # prefill memory PEAK, not a window limit, yet its remediation tail says
 # "reduce context length" — so without this list the request routes into
 # compression, which cannot lower a prefill peak: it burns the compression
-# budget, re-hits the wedged server each attempt and ends in a session reset.
+# budget, re-hits the wedged server each attempt and ends the turn as compression-exhausted.
 # Every token names memory/allocation in BYTES, never a token count, so the
 # list is disjoint from _CONTEXT_OVERFLOW_PATTERNS. Must be checked BEFORE
 # both overflow AND the usage-limit disambiguation ("memory limit exceeded"

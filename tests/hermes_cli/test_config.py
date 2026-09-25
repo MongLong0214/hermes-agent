@@ -1041,6 +1041,22 @@ class TestRetiredMultiplexAllowlist:
         assert "multiplex_profile_allowlist" not in DEFAULT_CONFIG["gateway"]
 
 
+class TestCronModelDriftGuardSurvivesMigration:
+    def test_explicit_drift_guard_opt_out_survives_the_full_ladder(self, tmp_path, monkeypatch):
+        """``cron.model_drift_guard`` still gates legacy snapshot jobs, so a pre-v42 opt-out must
+        reach the latest schema unchanged instead of silently turning the guard back on."""
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(yaml.safe_dump({
+            "_config_version": 38,
+            "cron": {"model_drift_guard": False},
+        }), encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        migrate_config(interactive=False, quiet=True)
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        assert raw["_config_version"] == DEFAULT_CONFIG["_config_version"]
+        assert raw["cron"]["model_drift_guard"] is False
+
+
 class TestCuratorFasterPrune:
     def test_v44_rewrites_old_curator_defaults_but_keeps_user_values(self, tmp_path, monkeypatch):
         """Old 30/90 defaults move to 14/30; an explicitly customized window is untouched."""

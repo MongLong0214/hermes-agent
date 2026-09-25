@@ -376,6 +376,26 @@ def bridge_core_env_settings(yaml_cfg: dict, platforms_data: dict) -> None:
             os.environ["SIGNAL_REQUIRE_MENTION"] = str(signal_cfg["require_mention"]).lower()
 
 
+def _managed_declares_canonical_bindings(managed_cfg: dict) -> bool:
+    """Whether a managed snapshot owns canonical bindings, including an explicit empty mapping."""
+    return "canonical_surface_bindings" in managed_cfg or (
+        isinstance(managed_cfg.get("gateway"), dict)
+        and "canonical_surface_bindings" in managed_cfg["gateway"]
+    )
+
+
+def _without_user_canonical_bindings(yaml_cfg: dict) -> dict:
+    """Remove both user spellings without disturbing noncanonical gateway siblings."""
+    yaml_cfg = dict(yaml_cfg)
+    yaml_cfg.pop("canonical_surface_bindings", None)
+    gateway_cfg = yaml_cfg.get("gateway")
+    if isinstance(gateway_cfg, dict) and "canonical_surface_bindings" in gateway_cfg:
+        gateway_cfg = dict(gateway_cfg)
+        gateway_cfg.pop("canonical_surface_bindings")
+        yaml_cfg["gateway"] = gateway_cfg
+    return yaml_cfg
+
+
 def read_yaml_layers(home: Path) -> dict:
     """User ``config.yaml`` with the managed overlay applied — the YAML the gateway loader sees.
 
@@ -396,14 +416,21 @@ def read_yaml_layers(home: Path) -> dict:
     # Managed scope: overlay administrator-pinned values (this loader bypasses
     # hermes_cli.config.load_config, so managed quick_commands / stt would otherwise be ignored).
     from hermes_cli import managed_scope
-    return managed_scope.apply_managed_overlay(yaml_cfg)
+    managed_cfg = managed_scope.load_managed_config()
+    if _managed_declares_canonical_bindings(managed_cfg):
+        yaml_cfg = _without_user_canonical_bindings(yaml_cfg)
+    return managed_scope.apply_managed_overlay(yaml_cfg, managed_config=managed_cfg)
 
 
-def load_yaml_layer(home: Path, gw_data: dict) -> None:
-    """Overlay ``read_yaml_layers`` onto *gw_data* in place. Raises on any failure (caller warns + falls back)."""
+def load_yaml_layer(home: Path, gw_data: dict) -> dict:
+    """Overlay ``read_yaml_layers`` onto *gw_data* and return that authoritative YAML mapping.
+
+    Raises on any failure so the caller can preserve normal legacy fallback while failing closed for
+    keys whose authority is deliberately YAML-only.
+    """
     yaml_cfg = read_yaml_layers(home)
     if not yaml_cfg:
-        return
+        return yaml_cfg
 
     gateway_section = yaml_cfg.get("gateway")
     bridge_toplevel_keys(yaml_cfg, gateway_section, gw_data)
@@ -422,3 +449,4 @@ def load_yaml_layer(home: Path, gw_data: dict) -> None:
     bridge_platform_shared_keys(yaml_cfg, gateway_platforms, gw_data, platforms_data, targets)
     apply_plugin_yaml_hooks(yaml_cfg, gateway_platforms, platforms_data, registry)
     bridge_core_env_settings(yaml_cfg, platforms_data)
+    return yaml_cfg

@@ -20,7 +20,8 @@ def test_run_error_persists_redacted_cause_but_returns_summary(tmp_path, monkeyp
         assert "password" not in saved and "secret-token" not in saved
 
 
-def test_list_exposes_run_error_and_clears_it_after_success(tmp_path, capsys):
+def test_list_shows_the_closed_run_error_and_clears_it_after_success(tmp_path, capsys):
+    from cron.jobs_public_status import public_run_error
     from hermes_cli.cli_commands_mixin import CLICommandsMixin
     from tools.cronjob_job_args import _format_job
 
@@ -29,12 +30,12 @@ def test_list_exposes_run_error_and_clears_it_after_success(tmp_path, capsys):
         reason = "RuntimeError: https://user:password@localhost/api?token=secret-token"
         jobs.mark_job_run(job["id"], False, error=reason)
         displayed = _format_job(jobs.get_job(job["id"]))
-        assert displayed["last_error"].startswith("RuntimeError:") and "localhost" in displayed["last_error"]
-        assert "password" not in displayed["last_error"] and "secret-token" not in displayed["last_error"]
+        assert displayed["last_error"] == public_run_error(reason)
         assert displayed["last_delivery_error"] is None and displayed["last_fire_error"] is None
         CLICommandsMixin._cron_list(object(), "list", {"all": False})
         console = capsys.readouterr().out
         assert f"error: {displayed['last_error']}" in console
-        assert "password" not in console and "secret-token" not in console
+        for private in ("localhost", "password", "secret-token"):
+            assert private not in displayed["last_error"] and private not in console
         jobs.mark_job_run(job["id"], True)
         assert _format_job(jobs.get_job(job["id"]))["last_error"] is None
