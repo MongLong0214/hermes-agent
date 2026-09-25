@@ -1493,11 +1493,16 @@ def _restart_manual_gateways(out: _GatewayRestartOutcome, _drain_budget) -> None
     import signal as _signal
     from hermes_cli.gateway import (
         find_gateway_pids, find_profile_gateway_processes, _prepare_profile_gateway_update_restart, _get_service_pids,
-        _wait_for_gateway_exit,
+        _service_owned_pids, _wait_for_gateway_exit,
     )
-    # Exclude just-restarted service PIDs so we don't kill what systemd/launchd spawned.
+    # Exclude every just-restarted service tree so we don't signal what systemd/launchd spawned: the
+    # launchd job PID is the stderr_timestamp wrapper, and the gateway it supervises is its child. The
+    # jobs and trees are read again AFTER the scan: a job restarted a moment ago can respawn, and start
+    # that child, while the scan runs.
     service_pids = _get_service_pids(all_profiles=True)
     manual_pids = find_gateway_pids(exclude_pids=service_pids, all_profiles=True)
+    service_pids = _service_owned_pids(service_pids | _get_service_pids(all_profiles=True))
+    manual_pids = [pid for pid in manual_pids if pid not in service_pids]
     profile_processes = {
         proc.pid: proc
         for proc in find_profile_gateway_processes(exclude_pids=service_pids)
@@ -1567,15 +1572,19 @@ def _force_kill_stuck_gateways(killed_pids) -> None:
     exit, so the watcher never respawns and ImportErrors persist. Give graceful paths a
     moment, then SIGKILL remaining pre-update PIDs."""
     with _best_effort('Post-restart survivor sweep failed: %s'):
-        from hermes_cli.gateway import find_gateway_pids, _get_service_pids
+        from hermes_cli.gateway import find_gateway_pids, _get_service_pids, _service_owned_pids
         # --- Post-restart survivor sweep ----------------------------- Issue #17648: some gateways ignore
         # SIGTERM (stuck drain, blocked I/O, PID dead but zombie). The detached profile watchers wait 120s
         # for the old PID to exit — if it never does, no respawn happens and the user keeps hitting
         # ImportError against a stale sys.modules.
         _time.sleep(3.0)
-        _surviving = find_gateway_pids(exclude_pids=_get_service_pids(all_profiles=True), all_profiles=True)
-        # Only PIDs we already tried to kill; newer ones are left alone.
-        _stuck = [pid for pid in _surviving if pid in killed_pids]
+        _service_pids = _get_service_pids(all_profiles=True)
+        _surviving = find_gateway_pids(exclude_pids=_service_pids, all_profiles=True)
+        # Only PIDs we already tried to kill; newer ones are left alone. killed_pids held no service-tree PID
+        # when written, but one may since be reused by a respawned job's gateway: never SIGKILL inside a tree
+        # (jobs and trees read after the scan, as in _restart_manual_gateways).
+        _owned = _service_owned_pids(_service_pids | _get_service_pids(all_profiles=True))
+        _stuck = [pid for pid in _surviving if pid in killed_pids and pid not in _owned]
         if _stuck:
             print()
             print(f"  ⚠ {len(_stuck)} gateway process(es) ignored SIGTERM — force-killing")
@@ -1708,6 +1717,7 @@ def _restart_gateway_fleet_after_update(_pre_update_plan, gateway_mode: bool):
             find_profile_gateway_processes,
             _prepare_profile_gateway_update_restart,
             _get_service_pids,
+            _service_owned_pids,
             _wait_for_gateway_exit,
         )
         # Drain budget covers ``restart_after_turn_timeout`` and stop()'s

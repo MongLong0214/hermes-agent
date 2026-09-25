@@ -37,8 +37,9 @@ def signal_stale_fleet_survivors(fleet: list, restart, drain_budget: float) -> l
     if not pids:
         return []
     try:
-        from hermes_cli.gateway import _get_service_pids
-        service_pids = set(_get_service_pids(all_profiles=True))
+        from hermes_cli.gateway import _get_service_pids, _service_owned_pids
+        # A fleet row names the gateway, which under launchd is the job's child, not the job PID.
+        service_pids = _service_owned_pids(set(_get_service_pids(all_profiles=True)))
     except Exception:
         service_pids = set()
     labels = {row.get("pid"): str(row.get("profile") or "gateway") for row in fleet if isinstance(row, dict)}

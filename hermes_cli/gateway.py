@@ -150,6 +150,10 @@ def _get_service_pids(all_profiles: bool = False) -> set:
     the orphan reaper passes all_profiles=True for the same friendly-fire reason. The systemd branch mirrors
     this: default scope filters to the current profile's exact unit name; ``all_profiles=True`` widens to
     the ``hermes-gateway*`` fleet glob.
+
+    Over-inclusion never makes a sweep kill anything, but it is no longer free: the kill sweeps spare each
+    PID's whole tree (``_service_owned_pids``), so a PID wrongly counted here also leaves every manual
+    gateway beneath it unrestarted.
     """
     pids: set = set()
 
@@ -160,9 +164,9 @@ def _get_service_pids(all_profiles: bool = False) -> set:
             try:
                 # Belt-and-suspenders for the EXCLUDE use case (#74075): a bare ``launchctl list`` prefix
                 # scan also catches ai.hermes.gateway* agents the label derivation can't map (renamed
-                # profiles, other installs sharing this user). Over-inclusion is safe here — these PIDs are
-                # only ever protected from the kill sweep, never targeted. Restart paths use the
-                # label-derived set only.
+                # profiles, other installs sharing this user). These PIDs are only ever protected from the
+                # kill sweep, never targeted (with their trees — see the docstring on over-inclusion).
+                # Restart paths use the label-derived set only.
                 result = subprocess.run(
                     scope_args
                     + ["list-units", pattern, "--plain", "--no-legend", "--no-pager"],
@@ -207,7 +211,7 @@ def _get_service_pids(all_profiles: bool = False) -> set:
                 pids.add(pid)
         if all_profiles:
             # Prefix scan also catches ai.hermes.gateway* agents the label derivation can't map
-            # (renamed profiles, other installs). Over-inclusion is safe: PIDs are only protected.
+            # (renamed profiles, other installs). PIDs (and their trees) are only protected, never targeted.
             try:
                 result = subprocess.run(["launchctl", "list"], timeout=5, **_CAPTURE_TEXT)
                 if result.returncode == 0:
@@ -224,6 +228,23 @@ def _get_service_pids(all_profiles: bool = False) -> set:
                 pass
 
     return pids
+
+
+def _service_owned_pids(service_pids: set[int]) -> set[int]:
+    """``service_pids`` plus every live descendant: the process trees service managers own.
+
+    A service PID can be a wrapper whose child is the gateway: the launchd job runs
+    ``hermes_cli.stderr_timestamp -- ... gateway run``, and both argvs match the gateway scan. A
+    sweep that spares only the job PID signals the supervised gateway itself, so every kill sweep
+    (update, orphan reaper) spares the whole tree; restarting it is the service path's job. A systemd
+    MainPID is the gateway itself, so there this adds only the gateway's own children.
+    """
+    from gateway.status import _snapshot_gateway_children
+    owned = set(service_pids)
+    # PID 1 (launchd/init) parents every orphan: its tree is the whole host, the caller included.
+    for service_pid in (pid for pid in service_pids if pid > 1):
+        owned.update(child.pid for child in _snapshot_gateway_children(service_pid))
+    return owned
 
 
 def _get_parent_pid(pid: int) -> int | None:
@@ -1806,15 +1827,8 @@ def _reaper_exclusion_pids(extra_exclude: set | None) -> set[int]:
         # profile's launchd gateway is misclassified as an unsupervised orphan and reaped. Same class as the
         # update-sweep fix in #74075.
         service_pids = _get_service_pids(all_profiles=True)
-    own |= service_pids
-    # A service PID can be a wrapper whose child is the gateway: the launchd job runs
-    # ``hermes_cli.stderr_timestamp -- ... gateway run``, and both argvs match the scan. Exempting the
-    # job PID alone left the supervised gateway itself as an orphan to SIGTERM, so every descendant of
-    # a service PID is exempt too (the recorded-PID walk below goes up; this one goes down).
-    for service_pid in service_pids:
-        with contextlib.suppress(Exception):  # no psutil, or the PID exited / is another user's
-            import psutil  # type: ignore
-            own.update(child.pid for child in psutil.Process(service_pid).children(recursive=True))
+    # The whole tree, not just the job PID (the recorded-PID walk below goes up; this one goes down).
+    own |= _service_owned_pids(service_pids)
     # Exempt the recorded gateway PID and its parent chain (on Windows the Scheduled-Task bootstrap's
     # ``gateway run`` argv matches the scan; killing it takes the gateway down). Use the RAW pidfile +
     # lock records, not only the validated probe: get_running_pid returns None on any validation
