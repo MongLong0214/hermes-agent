@@ -273,7 +273,8 @@ class TestCommittedPruneIsDedupBoundary:
         skill_md = tmp_path / "SKILL.md"
         skill_md.write_text("# s\n", encoding="utf-8")
         reset_skill_view_dedup(task_id)
-        _record_skill_view(task_id, "bigskill", None, {"name": "bigskill", "_source_path": str(skill_md)})
+        payload = {"name": "bigskill", "_source_path": str(skill_md)}
+        _record_skill_view(task_id, "bigskill", None, payload, json.dumps(payload))
         with _read_tracker_lock:
             _read_tracker.pop(task_id, None)
             td = _task_data(task_id)
