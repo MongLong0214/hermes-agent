@@ -108,6 +108,21 @@ def test_explanation_persistence_locked_cause_says_busy_not_disk():
     assert "permission" not in lower
 
 
+def test_locked_cause_advises_a_retry_and_names_the_stop_for_the_failing_profile(monkeypatch, tmp_path):
+    """A busy store usually frees itself, so the reply asks for the message again. The same bucket
+    covers a store another build's running gateway owns (hermes_state_admission), which no retry
+    opens until that gateway stops, so the reply also names the stop command for the profile whose
+    store failed."""
+    from hermes_constants import profile_cli_selector
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes" / "profiles" / "research"))
+    selector = profile_cli_selector()
+    assert selector.strip(), "fixture must resolve to a named profile"
+    out = AIAgent._format_turn_completion_explanation("session_persistence_failed", "locked")
+    assert "send it again" in out.lower()
+    assert f"`hermes {selector}gateway stop`" in out
+
+
 def test_explanation_persistence_compression_cause_is_specific():
     out = AIAgent._format_turn_completion_explanation(
         "session_persistence_failed", "compression"
