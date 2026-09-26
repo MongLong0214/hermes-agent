@@ -5,6 +5,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
+import os
+import sys
 from contextvars import ContextVar
 from pathlib import Path
 import uuid
@@ -20,6 +23,7 @@ canonical_method_entry_preflight: ContextVar[Callable[[Any, Any], None] | None] 
 )
 
 _EVENT_FIELDS = frozenset({"binding", "event_id", "author_id", "channel_id", "text"})
+_IDENTITY_FIELDS = frozenset({"session_id", "lineage_root_digest", "process_pid", "process_started_at"})
 _MAX_ID_CHARS = 256
 _MAX_TEXT_CHARS = 16_384
 
@@ -104,6 +108,7 @@ class CanonicalIngressEvent:
     author_id: str
     channel_id: str
     text: str
+    expected_identity: tuple[str, str, int, str] | None = None
 
     @classmethod
     def from_json_bytes(cls, raw: bytes) -> "CanonicalIngressEvent":
@@ -122,15 +127,47 @@ class CanonicalIngressEvent:
             payload = json.loads(raw.decode("utf-8"), object_pairs_hook=closed_object)
         except (UnicodeDecodeError, json.JSONDecodeError):
             raise ValueError("canonical_invalid_request") from None
-        if duplicate or not isinstance(payload, dict) or set(payload) != _EVENT_FIELDS:
+        if (duplicate or not isinstance(payload, dict)
+                or set(payload) not in (_EVENT_FIELDS, _EVENT_FIELDS | _IDENTITY_FIELDS)):
             raise ValueError("canonical_invalid_request")
+        expected_identity = None
+        if _IDENTITY_FIELDS <= payload.keys():
+            pid = payload["process_pid"]
+            if type(pid) is not int or pid <= 0:
+                raise ValueError("canonical_invalid_request")
+            expected_identity = (
+                _required_text(payload["session_id"], limit=_MAX_ID_CHARS),
+                _required_text(payload["lineage_root_digest"], limit=_MAX_ID_CHARS),
+                pid,
+                _required_text(payload["process_started_at"], limit=_MAX_ID_CHARS),
+            )
         return cls(
             binding=_required_text(payload["binding"], limit=_MAX_ID_CHARS),
             event_id=_required_text(payload["event_id"], limit=_MAX_ID_CHARS),
             author_id=_required_text(payload["author_id"], limit=_MAX_ID_CHARS),
             channel_id=_required_text(payload["channel_id"], limit=_MAX_ID_CHARS),
             text=_required_text(payload["text"], limit=_MAX_TEXT_CHARS),
+            expected_identity=expected_identity,
         )
+
+
+def canonical_process_identity() -> tuple[int, str]:
+    """Use the same local process token for identity proof and event admission."""
+    pid = os.getpid()
+    if sys.platform == "darwin":
+        import psutil
+
+        created = psutil.Process(pid).create_time()
+        if not math.isfinite(created) or created <= 0:
+            raise ValueError("invalid process start")
+        return pid, f"darwin-tv:{created:.6f}"
+    if sys.platform == "linux":
+        fields = Path(f"/proc/{pid}/stat").read_text(encoding="ascii").rsplit(")", 1)[1].split()
+        ticks = fields[19]
+        if not ticks.isascii() or not ticks.isdecimal() or int(ticks) <= 0:
+            raise ValueError("invalid process start")
+        return pid, f"linux-clk:{ticks}"
+    raise ValueError("unsupported process")
 
 
 class CanonicalEventReceipt:

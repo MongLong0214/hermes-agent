@@ -242,6 +242,80 @@ def test_concurrent_delivery_is_busy_then_replays_terminal(ingress, monkeypatch)
     asyncio.run(exercise())
 
 
+@pytest.mark.parametrize("field", ["session_id", "lineage_root_digest", "process_pid", "process_started_at"])
+def test_expected_identity_mismatch_never_claims_or_runs(ingress, field):
+    async def exercise():
+        request = SimpleNamespace(headers={"Authorization": f"Bearer {_API_KEY}"}, raw_path=_IDENTITY_ROUTE)
+        proof = await ingress.adapter._handle_canonical_surface_identity(request)
+        assert proof.status == 200
+        identity = json.loads(proof.text)
+        wrong = {**identity, field: (identity[field] + 1 if field == "process_pid" else "wrong")}
+        db = ingress.runner.session_store._db
+        before = list(db._conn.execute("SELECT key, value FROM state_meta WHERE key LIKE 'canonical_event:%'"))
+        status, body = await ingress.send(**wrong)
+        assert (status, body["error"]["code"]) == (409, "canonical_identity_mismatch")
+        assert list(db._conn.execute("SELECT key, value FROM state_meta WHERE key LIKE 'canonical_event:%'")) == before
+        assert ingress.agent.calls == []
+
+    asyncio.run(exercise())
+
+
+def test_expected_identity_rejects_split_resolver_head_before_claim(ingress, monkeypatch):
+    from gateway.canonical_surface import (
+        CanonicalEventReceipt,
+        ExistingCanonicalBindingResolver,
+        ExistingCanonicalIdentityResolver,
+    )
+
+    new_head = "new-head-after-route-change"
+    digest = "new-head-lineage-digest"
+    monkeypatch.setattr(ExistingCanonicalBindingResolver, "resolve", lambda self, binding, event: ingress.entry)
+    monkeypatch.setattr(ExistingCanonicalIdentityResolver, "resolve", lambda self, binding: (new_head, digest))
+    claims = []
+    monkeypatch.setattr(CanonicalEventReceipt, "claim", lambda self: claims.append(self.key))
+
+    async def exercise():
+        request = SimpleNamespace(headers={"Authorization": f"Bearer {_API_KEY}"}, raw_path=_IDENTITY_ROUTE)
+        proof = await ingress.adapter._handle_canonical_surface_identity(request)
+        assert proof.status == 200
+        expected = json.loads(proof.text)
+        assert expected["session_id"] == new_head
+        db = ingress.runner.session_store._db
+        before = list(db._conn.execute("SELECT key, value FROM state_meta WHERE key LIKE 'canonical_event:%'"))
+        status, body = await ingress.send(**expected)
+        assert (status, body["error"]["code"]) == (409, "canonical_identity_mismatch")
+        assert claims == []
+        assert list(db._conn.execute("SELECT key, value FROM state_meta WHERE key LIKE 'canonical_event:%'")) == before
+        assert ingress.agent.calls == []
+
+    asyncio.run(exercise())
+
+
+def test_expected_identity_runs_existing_cached_turn_and_replays(ingress):
+    async def exercise():
+        request = SimpleNamespace(headers={"Authorization": f"Bearer {_API_KEY}"}, raw_path=_IDENTITY_ROUTE)
+        proof = await ingress.adapter._handle_canonical_surface_identity(request)
+        assert proof.status == 200
+        identity = json.loads(proof.text)
+        result = await ingress.send(**identity)
+        assert result == (200, {"event_id": "event", "text": "request-owned terminal"})
+        assert await ingress.send(**identity) == result
+        assert ingress.agent.calls == [("hello", [], ingress.entry.session_id)]
+
+    asyncio.run(exercise())
+
+
+def test_partial_expected_identity_is_invalid_without_claim(ingress):
+    async def exercise():
+        status, body = await ingress.send(session_id=ingress.entry.session_id)
+        assert (status, body["error"]["code"]) == (400, "canonical_invalid_request")
+        assert ingress.agent.calls == []
+        db = ingress.runner.session_store._db
+        assert list(db._conn.execute("SELECT key FROM state_meta WHERE key LIKE 'canonical_event:%'")) == []
+
+    asyncio.run(exercise())
+
+
 def test_active_method_entry_reserves_route_and_cached_actor(ingress, monkeypatch):
     entered, release = threading.Event(), threading.Event()
     original = ingress.agent.run_conversation
