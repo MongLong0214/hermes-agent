@@ -1,20 +1,8 @@
-"""Regression tests for #29335 — gateway must persist ``session_entry.session_id``
-after the agent's compression path mutates it.
+"""Regression for #29335: compressed session repoints survive a gateway restart.
 
-When ``_compress_context()`` rolls the agent forward into a new session, the
-agent now returns the new ``session_id`` in its result dict. The gateway
-updates ``session_entry.session_id`` in memory AND must call
-``session_store._save()`` so the new mapping survives a gateway restart.
-Without ``_save()``, the next turn loads the OLD session's transcript and
-re-triggers compression forever.
-
-Three sites in ``gateway/run.py`` mutate ``session_entry.session_id`` after
-a compression-induced session split. All three MUST be followed by a
-``_save()`` call. This test pins that invariant.
-
-``TestCompressionSessionPropagation`` adds behavioral tests that exercise the
-actual propagation path inline, verifying that the mock session_entry update
-and _save() semantics are correct without requiring a live gateway.
+Runner repoints are guarded by SessionStore's CAS; a successful repoint must
+persist the new key→session mapping. Manual /compress uses the store's own
+advance operation, which must persist before reporting success.
 """
 
 from __future__ import annotations
@@ -22,163 +10,154 @@ from __future__ import annotations
 import ast
 import inspect
 import textwrap
-from unittest.mock import MagicMock, call
 
 from gateway import run as gateway_run
-from gateway.session_context import set_current_session_id, get_session_env
+from gateway import session as gateway_session
+from gateway import slash_commands
 
 
-def _session_id_assignments_followed_by_save(source: str) -> list[tuple[int, bool]]:
-    """For each ``session_entry.session_id = ...`` assignment in *source*,
-    return ``(lineno, saved_within_5_stmts)`` — True iff a
-    ``self.session_store._save()`` call appears in the same block within the
-    next 5 statements (covers normal control flow without false-flagging
-    cleanup that lives 200 lines away).
-    """
+def _call_on_store(node: ast.AST, method: str, store: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == method
+        and ast.dump(node.func.value) == ast.dump(store)
+    )
+
+
+def _saves(body: list[ast.stmt], store: ast.AST) -> bool:
+    """Only a direct save in this success block, not one in another branch."""
+    return any(
+        isinstance(stmt, (ast.Expr, ast.Assign))
+        and any(_call_on_store(node, "_save", store) for node in ast.walk(stmt))
+        for stmt in body
+    )
+
+
+def _repoint_persistence(source: str) -> list[tuple[int, bool]]:
+    """Find each runner CAS repoint and check its guarded success path."""
     tree = ast.parse(textwrap.dedent(source))
-    results: list[tuple[int, bool]] = []
-
-    class _Visitor(ast.NodeVisitor):
-        def _is_session_id_assign(self, node: ast.AST) -> bool:
-            if not isinstance(node, ast.Assign):
-                return False
-            for target in node.targets:
-                if (
-                    isinstance(target, ast.Attribute)
-                    and target.attr == "session_id"
-                    and isinstance(target.value, ast.Name)
-                    and target.value.id == "session_entry"
-                ):
-                    return True
-            return False
-
-        def _block_has_save_after(self, body: list[ast.stmt], idx: int) -> bool:
-            for stmt in body[idx : idx + 6]:
-                for sub in ast.walk(stmt):
-                    if (
-                        isinstance(sub, ast.Call)
-                        and isinstance(sub.func, ast.Attribute)
-                        and sub.func.attr == "_save"
-                    ):
-                        return True
-            return False
-
-        def _walk_body(self, body: list[ast.stmt]) -> None:
-            for i, stmt in enumerate(body):
-                if self._is_session_id_assign(stmt):
-                    results.append((stmt.lineno, self._block_has_save_after(body, i)))
-                # Recurse into the stmt itself when it is a control-flow node
-                # whose body/orelse/finalbody may carry assignments that are
-                # not also reachable as iter_child_nodes children of the stmt
-                # (e.g. an ``else`` block whose statements are all assigns).
-                if isinstance(stmt, (ast.If, ast.For, ast.While, ast.With,
-                                     ast.Try, ast.AsyncWith, ast.AsyncFor)):
-                    self._walk_node(stmt)
-                for child in ast.iter_child_nodes(stmt):
-                    if isinstance(child, (ast.If, ast.For, ast.While, ast.With,
-                                          ast.Try, ast.AsyncWith, ast.AsyncFor)):
-                        self._walk_node(child)
-
-        def _walk_node(self, node: ast.AST) -> None:
-            for attr in ("body", "orelse", "finalbody"):
-                inner = getattr(node, attr, None)
-                if isinstance(inner, list):
-                    self._walk_body(inner)
-            if hasattr(node, "handlers"):
-                for handler in node.handlers:
-                    self._walk_body(handler.body)
-
-        def visit(self, node: ast.AST) -> None:
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                self._walk_body(node.body)
-            for child in ast.iter_child_nodes(node):
-                self.visit(child)
-
-    _Visitor().visit(tree)
-    return results
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    sites: list[tuple[int, bool]] = []
+    for call in (node for node in ast.walk(tree) if isinstance(node, ast.Call)):
+        if not (isinstance(call.func, ast.Attribute)
+                and call.func.attr == "repoint_session_entry"):
+            continue
+        store = call.func.value
+        parent = parents[call]
+        while isinstance(parent, ast.Await):
+            parent = parents[parent]
+        if isinstance(parent, ast.If) and parent.test is call:
+            sites.append((call.lineno, _saves(parent.body, store)))
+            continue
+        if not (isinstance(parent, ast.Assign) and len(parent.targets) == 1
+                and isinstance(parent.targets[0], ast.Name)):
+            sites.append((call.lineno, False))
+            continue
+        result_name = parent.targets[0].id
+        current: ast.AST = parent
+        persisted = False
+        # The hygiene CAS is in an inner else block; its success guard lives
+        # immediately after that enclosing if. The agent-result CAS checks
+        # failure with a raising guard, then saves in the same success block.
+        while current in parents and not persisted:
+            owner = parents[current]
+            for field in ("body", "orelse", "finalbody"):
+                body = getattr(owner, field, None)
+                if not isinstance(body, list) or current not in body:
+                    continue
+                following = body[body.index(current) + 1:]
+                for index, stmt in enumerate(following):
+                    if not isinstance(stmt, ast.If):
+                        continue
+                    if isinstance(stmt.test, ast.Name) and stmt.test.id == result_name:
+                        persisted = _saves(stmt.body, store)
+                    elif (isinstance(stmt.test, ast.UnaryOp)
+                          and isinstance(stmt.test.op, ast.Not)
+                          and isinstance(stmt.test.operand, ast.Name)
+                          and stmt.test.operand.id == result_name
+                          and stmt.body
+                          and isinstance(stmt.body[-1], (ast.Raise, ast.Return))):
+                        persisted = _saves(following[index + 1:], store)
+                break
+            current = owner
+        sites.append((call.lineno, persisted))
+    return sites
 
 
-def test_every_post_compression_session_id_assignment_persists():
-    """Every ``session_entry.session_id = ...`` in gateway/run.py must be
-    followed by a ``session_store._save()`` call within the same block.
+def test_every_guarded_compression_repoint_persists():
+    sites = _repoint_persistence(inspect.getsource(gateway_run))
+    assert len(sites) == 3, f"Expected all three runner compression repoints, found {sites}"
+    assert all(saved for _, saved in sites), f"Compression repoints without a success-path _save: {sites}"
 
-    Regression for #29335 — the assignment at the end of
-    ``_handle_message_with_agent`` used to skip ``_save()`` while two sibling
-    sites (hygiene rewrite, manual /compress) already persisted. The agent
-    would compress correctly, the gateway would update its in-memory
-    session_id, then drop it on next gateway restart.
-    """
-    source = inspect.getsource(gateway_run)
-    assignments = _session_id_assignments_followed_by_save(source)
-    assert assignments, (
-        "No ``session_entry.session_id = ...`` assignments found in gateway/run.py — "
-        "either the structure changed or the AST walker is broken."
+
+def test_manual_compression_advance_persists():
+    """The /compress caller uses the store advance, not a direct assignment."""
+    command = ast.parse(textwrap.dedent(inspect.getsource(slash_commands.GatewaySlashCommandsMixin._execute_compress_command)))
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "advance_compression_session"
+        for node in ast.walk(command)
     )
-    missing = [lineno for lineno, saved in assignments if not saved]
-    assert not missing, (
-        f"{len(missing)} ``session_entry.session_id = ...`` site(s) in gateway/run.py "
-        f"are not followed by ``session_store._save()`` within the same block "
-        f"(lines: {missing}). Every post-compression session_id update must persist "
-        f"or the next turn loads the pre-compression transcript and triggers an "
-        f"infinite compression loop. See issue #29335."
+    advance = ast.parse(textwrap.dedent(inspect.getsource(gateway_session.SessionStore.advance_compression_session))).body[0]
+    assert isinstance(advance, ast.FunctionDef)
+    assert len(advance.body) >= 2
+    # The successful route falls through the guarded heal and saves before
+    # returning the entry; rejected CAS/lineage attempts return inside guards.
+    assert isinstance(advance.body[-1], ast.Return)
+    assert isinstance(advance.body[-1].value, ast.Name)
+    assert advance.body[-1].value.id == "entry"
+    assert isinstance(advance.body[-2], ast.Expr)
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_save"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "self"
+        for node in ast.walk(advance.body[-2])
+    )
+    assert any(
+        isinstance(node, ast.If)
+        and isinstance(node.test, ast.UnaryOp)
+        and isinstance(node.test.op, ast.Not)
+        and isinstance(node.test.operand, ast.Call)
+        and isinstance(node.test.operand.func, ast.Attribute)
+        and node.test.operand.func.attr == "_heal_compression_tip_locked"
+        and any(isinstance(stmt, ast.Return) and isinstance(stmt.value, ast.Constant)
+                and stmt.value.value is None for stmt in node.body)
+        for node in ast.walk(advance)
     )
 
 
-class TestCompressionSessionPropagation:
-    """Behavioral tests for post-compression session_id propagation.
-
-    The structural AST test above pins that every ``session_entry.session_id``
-    assignment in gateway/run.py is followed by ``_save()``.  These tests
-    exercise the *behavior* of that propagation path inline, using mocks that
-    mirror the objects gateway/run.py works with (``session_entry`` and
-    ``session_store``), verifying the semantics are correct without requiring a
-    live gateway instance.
-
-    Ordering contract (from the comments added to the source in this PR):
-    1. The agent thread updates the contextvar in ``conversation_compression.py``
-       via ``set_current_session_id(agent.session_id)``.
-    2. After ``run_in_executor`` returns, the gateway propagates the new id to
-       ``session_entry.session_id`` and calls ``session_store._save()``.
-    Both halves must agree for the next turn to route correctly.
-    """
-
-    def test_gateway_session_entry_follows_compression_rotation(self) -> None:
-        """The gateway handler must update session_entry and call _save() when
-        the agent result carries a rotated session_id.
-
-        Simulates the inline propagation block in gateway/run.py:
-
-            if agent_result.get("session_id") and \\
-                    agent_result["session_id"] != session_entry.session_id:
-                session_entry.session_id = agent_result["session_id"]
+def test_repoint_persistence_check_rejects_unsaved_success_path():
+    """A save in the failure branch or a nearby unrelated branch is insufficient."""
+    sites = _repoint_persistence('''
+        def handler(self, entry):
+            if self.session_store.repoint_session_entry(entry, "old", "new"):
+                pass
+            else:
                 self.session_store._save()
-
-        Verifies that session_entry.session_id is mutated and _save is called
-        exactly once — the minimal contract that prevents the restart-loop bug.
-        """
-        old_sid = "20260101_000000_aaaaaa"
-        new_sid = "20260101_000001_bbbbbb"
-
-        session_entry = MagicMock()
-        session_entry.session_id = old_sid
-
-        session_store = MagicMock()
-
-        agent_result = {"session_id": new_sid, "response": "hello"}
-
-        # Inline the propagation logic exactly as it appears in gateway/run.py
-        # (around line 9459). This is the behavior we are pinning.
-        if agent_result.get("session_id") and agent_result["session_id"] != session_entry.session_id:
-            session_entry.session_id = agent_result["session_id"]
-            session_store._save()
-
-        assert session_entry.session_id == new_sid, (
-            "session_entry.session_id was not updated to the compressed session id. "
-            "The next turn would load the old transcript and re-trigger compression."
-        )
-        session_store._save.assert_called_once_with(), (
-            "session_store._save() was not called after session_entry update. "
-            "The new session mapping would not survive a gateway restart."
-        )
-
-
+    ''')
+    assert len(sites) == 1
+    assert not sites[0][1]
+    sites = _repoint_persistence('''
+        def handler(self, entry):
+            repointed = self.session_store.repoint_session_entry(entry, "old", "new")
+            if not repointed:
+                pass
+            self.session_store._save()
+    ''')
+    assert len(sites) == 1
+    assert not sites[0][1]
+    sites = _repoint_persistence('''
+        def handler(self, entry):
+            if ready:
+                repointed = self.session_store.repoint_session_entry(entry, "old", "new")
+            if repointed:
+                pass
+            else:
+                self.session_store._save()
+    ''')
+    assert len(sites) == 1
+    assert not sites[0][1]

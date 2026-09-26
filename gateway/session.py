@@ -1257,6 +1257,10 @@ class SessionStore:
         self._entries: Dict[str, SessionEntry] = {}
         self._loaded = False
         self._lock = threading.Lock()
+        # Process-local admission fence; protected by _lock, not held during I/O.
+        self._canonical_reservations: Dict[str, tuple[SessionEntry, object]] = {}
+        self._command_claims: Dict[str, tuple[SessionEntry, str, object]] = {}
+        self._recovery_reopen_claims: Dict[str, object] = {}
         # Serialize whole-index persistence without holding ``_lock`` across
         # SQLite / fsync. Each writer snapshots the latest state only after
         # acquiring this lock, preventing stale delayed writes.
@@ -2633,6 +2637,8 @@ class SessionStore:
                     else:
                         adopt = source.chat_type == "dm"
                     if adopt and self._claim_legacy_slack_key(legacy_key):
+                        self._reject_canonical_repoint_locked(legacy_key)
+                        self._reject_canonical_repoint_locked(session_key)
                         migrated_legacy_entry = self._entries.pop(legacy_key)
                         migrated_legacy_entry.session_key = session_key
                         migrated_legacy_entry.origin = source
@@ -2729,6 +2735,10 @@ class SessionStore:
 
             if session_key in self._entries and not force_new:
                 entry = self._entries[session_key]
+                if (canonical_existing_session_id
+                        and canonical_existing_session_id != entry.session_id
+                        and entry.session_id == existing_session_id):
+                    self._reject_canonical_repoint_locked(session_key)
                 # A heal rewrites entry.session_id, so it must reach the
                 # sessions.json mirror too: force the full-rewrite save
                 # below (the fast path persists state.db only).
@@ -2737,6 +2747,7 @@ class SessionStore:
                 )
 
                 if _is_stale and entry.session_id == _stale_session_id:
+                    self._reject_canonical_repoint_locked(session_key)
                     # Stale routing self-heal (#54878): the in-memory entry
                     # points at a session that has ALREADY been ended in
                     # state.db.  Drop it and fall through to recovery/create.
@@ -2779,6 +2790,7 @@ class SessionStore:
                         reset_had_activity = entry.last_prompt_tokens > 0
                         db_end_session_id = entry.session_id
                         prev_session_id = entry.session_id
+                        self._reject_canonical_repoint_locked(session_key)
                         self._entries.pop(session_key, None)
                         entry = None
                         _needs_recover = True
@@ -2809,19 +2821,31 @@ class SessionStore:
                     db_end_session_id = recovered.session_id
                     prev_session_id = recovered.session_id
                 else:
-                    try:
-                        self._db.reopen_session(recovered.session_id)
-                    except Exception as exc:
-                        logger.debug(
-                            "Gateway session DB reopen failed for %s: %s",
-                            session_key,
-                            exc,
-                        )
                     with self._lock:
                         published = self._entries.get(session_key)
                         if published is None:
-                            self._entries[session_key] = recovered
-                            published = recovered
+                            self._reject_canonical_repoint_locked(session_key)
+                            # Fence the absent route before I/O: another writer
+                            # must not publish a different ID before reopen.
+                            reopen_claim = object()
+                            self._recovery_reopen_claims[session_key] = reopen_claim
+                    if published is None:
+                        try:
+                            try:
+                                self._db.reopen_session(recovered.session_id)
+                            except Exception as exc:
+                                logger.debug(
+                                    "Gateway session DB reopen failed for %s: %s",
+                                    session_key,
+                                    exc,
+                                )
+                            with self._lock:
+                                self._entries[session_key] = recovered
+                                published = recovered
+                        finally:
+                            with self._lock:
+                                if self._recovery_reopen_claims.get(session_key) is reopen_claim:
+                                    del self._recovery_reopen_claims[session_key]
                     entry = published
                     _needs_save = True
 
@@ -2849,6 +2873,7 @@ class SessionStore:
                     force_new and current is force_new_observed_entry
                 )
                 if may_publish:
+                    self._reject_canonical_repoint_locked(session_key)
                     self._entries[session_key] = candidate
                     published = candidate
                 else:
@@ -3286,6 +3311,8 @@ class SessionStore:
                 if self._has_active_processes_safe(entry.session_key, context="prune"):
                     continue
                 if entry.updated_at < cutoff:
+                    if key in self._canonical_reservations:
+                        continue
                     removed_keys.append(key)
             for key in removed_keys:
                 self._entries.pop(key, None)
@@ -3335,7 +3362,74 @@ class SessionStore:
                 self._save()
         return count
 
-    def reset_session(self, session_key: str, display_name: Optional[str] = None) -> Optional[SessionEntry]:
+    def reserve_canonical_entry(self, entry: SessionEntry) -> object:
+        """Atomically pin the exact admitted route until the turn completes."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            key = entry.session_key
+            if (self._entries.get(key) is not entry
+                    or key in self._canonical_reservations or key in self._command_claims):
+                raise ValueError("canonical_binding_stale")
+            token = object()
+            self._canonical_reservations[key] = (entry, token)
+            return token
+
+    def release_canonical_entry(self, entry: SessionEntry, token: object) -> None:
+        with self._lock:
+            if self._canonical_reservations.get(entry.session_key) == (entry, token):
+                del self._canonical_reservations[entry.session_key]
+
+    def claim_session_command(self, entry: SessionEntry, expected_session_id: str) -> object:
+        """CAS the existing route against canonical admission before command side effects."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            key = entry.session_key
+            if (self._entries.get(key) is not entry or entry.session_id != expected_session_id
+                    or key in self._canonical_reservations or key in self._command_claims):
+                raise ValueError("canonical_turn_busy")
+            token = object()
+            self._command_claims[key] = (entry, expected_session_id, token)
+            return token
+
+    def command_claim_owned(self, entry: SessionEntry, token: object) -> bool:
+        with self._lock:
+            return self._command_claims.get(entry.session_key) == (entry, entry.session_id, token)
+
+    def release_session_command(self, entry: SessionEntry, token: object) -> None:
+        with self._lock:
+            claim = self._command_claims.get(entry.session_key)
+            if claim is not None and claim[2] is token:
+                del self._command_claims[entry.session_key]
+
+    def _reject_canonical_repoint_locked(self, session_key: str, command_claim: object = None) -> None:
+        """Call under _lock at the actual route mutation, before side effects."""
+        claim = self._command_claims.get(session_key)
+        if (session_key in self._canonical_reservations
+                or session_key in self._recovery_reopen_claims
+                or (claim and claim[2] is not command_claim)):
+            raise ValueError("canonical_turn_busy")
+
+    def canonical_entry_reserved(self, session_key: str) -> bool:
+        """For cache writers holding their cache lock (cache → store order)."""
+        with self._lock:
+            return session_key in self._canonical_reservations
+
+    def repoint_session_entry(
+        self, entry: SessionEntry, expected_session_id: str, target_session_id: str,
+    ) -> bool:
+        """CAS a runner's existing entry without bypassing the route reservation."""
+        with self._lock:
+            if (self._entries.get(entry.session_key) is not entry
+                    or entry.session_id != expected_session_id):
+                return False
+            if expected_session_id == target_session_id:
+                return True
+            self._reject_canonical_repoint_locked(entry.session_key)
+            entry.session_id = target_session_id
+            return True
+
+    def reset_session(self, session_key: str, display_name: Optional[str] = None,
+                      *, command_claim: object = None) -> Optional[SessionEntry]:
         """Force reset a session, creating a new session ID."""
         db_end_session_id = None
         db_create_kwargs = None
@@ -3346,6 +3440,12 @@ class SessionStore:
 
             if session_key not in self._entries:
                 return None
+            self._reject_canonical_repoint_locked(session_key, command_claim)
+            if command_claim is not None:
+                claim = self._command_claims.get(session_key)
+                current = self._entries[session_key]
+                if claim is None or claim[0] is not current or claim[1] != current.session_id:
+                    raise ValueError("canonical_turn_busy")
 
             old_entry = self._entries[session_key]
             db_end_session_id = old_entry.session_id
@@ -3434,6 +3534,9 @@ class SessionStore:
         session_key: str,
         expected_session_id: str,
         target_session_id: str,
+        *,
+        command_claim: object = None,
+        expected_entry: Optional[SessionEntry] = None,
     ) -> Optional[SessionEntry]:
         """CAS-advance one route along an already-verified compression lineage.
 
@@ -3451,6 +3554,14 @@ class SessionStore:
             entry = self._entries.get(session_key)
             if entry is None:
                 return None
+            if expected_entry is not None and entry is not expected_entry:
+                return None
+            self._reject_canonical_repoint_locked(session_key, command_claim)
+            if command_claim is not None:
+                claim = self._command_claims.get(session_key)
+                if (claim is None or claim[0] is not entry
+                        or claim[1] != expected_session_id or claim[2] is not command_claim):
+                    raise ValueError("canonical_turn_busy")
             if entry.session_id == target_session_id:
                 return entry
             if entry.session_id != expected_session_id:
@@ -3465,13 +3576,15 @@ class SessionStore:
             # leave ``updated_at`` alone so a background compression on an
             # idle session cannot make it look fresh to reset policy or the
             # restart-resume freshness gate (#85709).
-            self._save()
-            return entry
+        self._save()
+        return entry
 
-    def switch_session(self, session_key: str, target_session_id: str) -> Optional[SessionEntry]:
+    def switch_session(self, session_key: str, target_session_id: str,
+                       *, command_claim: object = None) -> Optional[SessionEntry]:
         """Switch a session key to point at an existing session ID.
 
-        Used by ``/resume`` to restore a previously-named session.
+        Used by ``/resume`` to restore a previously-named session and by
+        ``/branch`` with its owning command claim to publish the child.
         Ends the current session in SQLite (like reset), but instead of
         generating a fresh session ID, re-uses ``target_session_id`` so the
         old transcript is loaded on the next message. If the target session was
@@ -3488,9 +3601,16 @@ class SessionStore:
 
             old_entry = self._entries[session_key]
 
+            if command_claim is not None:
+                claim = self._command_claims.get(session_key)
+                if (claim is None or claim[0] is not old_entry
+                        or claim[1] != old_entry.session_id or claim[2] is not command_claim):
+                    raise ValueError("canonical_turn_busy")
+
             # Don't switch if already on that session
             if old_entry.session_id == target_session_id:
                 return old_entry
+            self._reject_canonical_repoint_locked(session_key, command_claim)
 
             db_end_session_id = old_entry.session_id
 
@@ -3696,38 +3816,58 @@ class SessionStore:
                         if tip_row is not None and tip_row.get("ended_at") is None:
                             child_id = str(tip)
                     if child_id:
+                        # A canonical turn still owns the old route. Leave its
+                        # pending write untouched until that turn releases it.
+                        with self._lock:
+                            if any(
+                                entry.session_id == session_id
+                                and key in getattr(self, "_canonical_reservations", {})
+                                for key, entry in self._entries.items()
+                            ):
+                                return
                         try:
                             self._append_transcript_message(child_id, msg)
                         except Exception as reroute_exc:
                             exc = reroute_exc
                         else:
-                            with self._transcript_retry_lock:
-                                if pending and pending[0] is msg:
-                                    pending.pop(0)
-                                existing_child_pending = self._dirty_transcripts.get(
-                                    child_id, []
-                                )
-                                if pending:
-                                    # Older parent backlog must precede messages
-                                    # already queued directly on the child.
-                                    pending.extend(existing_child_pending)
-                                    self._dirty_transcripts[child_id] = pending
-                                elif existing_child_pending:
-                                    pending = existing_child_pending
-                                self._dirty_transcripts.pop(queue_session_id, None)
-                                previous_failures = self._transcript_append_failures.pop(
-                                    queue_session_id, 0
-                                )
-                                if previous_failures:
-                                    self._transcript_append_failures[child_id] = max(
-                                        previous_failures,
-                                        self._transcript_append_failures.get(child_id, 0),
-                                    )
-                                self._transcript_reroutes[session_id] = child_id
-                                queue_session_id = child_id
-                            # Publish routing only after the retry queue has moved,
-                            # so new child writes cannot bypass older parent backlog.
                             with self._lock:
+                                # Reservation can start during the DB append.
+                                # Account for that successful write exactly once,
+                                # but do not migrate or repoint its remaining queue.
+                                if any(
+                                    entry.session_id == session_id
+                                    and key in getattr(self, "_canonical_reservations", {})
+                                    for key, entry in self._entries.items()
+                                ):
+                                    with self._transcript_retry_lock:
+                                        if pending and pending[0] is msg:
+                                            pending.pop(0)
+                                        if not pending:
+                                            self._dirty_transcripts.pop(queue_session_id, None)
+                                    return
+                                with self._transcript_retry_lock:
+                                    if pending and pending[0] is msg:
+                                        pending.pop(0)
+                                    existing_child_pending = self._dirty_transcripts.get(child_id, [])
+                                    if pending:
+                                        # Parent backlog precedes direct child writes.
+                                        pending.extend(existing_child_pending)
+                                        self._dirty_transcripts[child_id] = pending
+                                    elif existing_child_pending:
+                                        pending = existing_child_pending
+                                    self._dirty_transcripts.pop(queue_session_id, None)
+                                    previous_failures = self._transcript_append_failures.pop(
+                                        queue_session_id, 0
+                                    )
+                                    if previous_failures:
+                                        self._transcript_append_failures[child_id] = max(
+                                            previous_failures,
+                                            self._transcript_append_failures.get(child_id, 0),
+                                        )
+                                    self._transcript_reroutes[session_id] = child_id
+                                    queue_session_id = child_id
+                                # Publish after the queue moves, in the same
+                                # reservation-locked critical section.
                                 for entry in self._entries.values():
                                     if entry.session_id == session_id:
                                         entry.session_id = child_id

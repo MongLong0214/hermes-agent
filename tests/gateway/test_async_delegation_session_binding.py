@@ -209,11 +209,58 @@ class TestGatewayPinningFailsClosed:
 
 
 class TestResetHandlerInterruptsDelegations:
-    def test_reset_command_calls_interrupt_for_session(self):
-        """The /new handler must sever the old conversation's delegations."""
-        import inspect
-        from gateway import slash_commands
+    @pytest.mark.asyncio
+    async def test_reset_interrupts_old_delegations_without_touching_other_sessions(self):
+        """A /new boundary severs only the old conversation's delegations."""
+        from datetime import datetime
+        from types import SimpleNamespace
 
-        src = inspect.getsource(slash_commands.GatewaySlashCommandsMixin._handle_reset_command)
-        assert "interrupt_for_session" in src
-        assert "session_reset" in src
+        from gateway.config import Platform
+        from gateway.platforms.base import MessageEvent
+        from gateway.run import GatewayRunner
+        from gateway.session import AsyncSessionStore, SessionEntry, SessionSource, build_session_key
+
+        source = SessionSource(
+            platform=Platform.TELEGRAM, user_id="1", chat_id="1", chat_type="dm"
+        )
+        key = build_session_key(source)
+        old = SessionEntry(
+            session_key=key, session_id="sess_old", created_at=datetime.now(),
+            updated_at=datetime.now(), platform=Platform.TELEGRAM, chat_type="dm",
+            origin=source,
+        )
+        new = SessionEntry(
+            session_key=key, session_id="sess_new", created_at=datetime.now(),
+            updated_at=datetime.now(), platform=Platform.TELEGRAM, chat_type="dm",
+            origin=source,
+        )
+        mine = _seed_record("mine", session_key=key, parent_session_id="sess_old")
+        other = _seed_record("other", session_key="another-route", parent_session_id="sess_other")
+
+        runner = object.__new__(GatewayRunner)
+        runner.session_store = MagicMock()
+        runner.session_store._entries = {key: old}
+        runner.session_store.reset_session.return_value = new
+        runner._async_session_store = AsyncSessionStore(runner.session_store)
+        runner._session_key_for_source = lambda _source: key
+        runner._invalidate_session_run_generation = MagicMock()
+        runner._release_running_agent_state = MagicMock()
+        runner._evict_cached_agent = MagicMock()
+        runner._clear_conversation_scope = MagicMock()
+        runner._reset_notice_session_info = MagicMock(return_value="")
+        runner._telegram_topic_new_header = MagicMock(return_value="")
+        runner._is_telegram_topic_lane = MagicMock(return_value=False)
+        runner._finalize_session_off_loop = AsyncMock()
+        runner._session_db = None
+        runner.hooks = SimpleNamespace(emit=AsyncMock())
+
+        await runner._handle_reset_command(MessageEvent(text="/new", source=source))
+
+        mine.assert_called_once()
+        other.assert_not_called()
+        runner.session_store.reset_session.assert_called_once_with(
+            key, command_claim=runner.session_store.claim_session_command.return_value
+        )
+        runner.session_store.release_session_command.assert_called_once_with(
+            old, runner.session_store.claim_session_command.return_value
+        )

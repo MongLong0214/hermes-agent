@@ -2675,7 +2675,7 @@ from gateway.session_state import (
 )
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
-from gateway.slash_commands import GatewaySlashCommandsMixin
+from gateway.slash_commands import GatewaySlashCommandsMixin, _run_claimed_command
 from gateway.turn_context import TurnContext
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -5609,6 +5609,11 @@ class TurnRunner:
         _xproc_evicted_agent = None
         if _cache_lock and _cache is not None:
             with _cache_lock:
+                # A canonical turn owns this key's existing actor until its
+                # executor finishes.  A regular turn must neither invalidate
+                # it nor run against it (even when its snapshot looks valid).
+                if ctx.session_key and self._runner._canonical_cache_key_reserved(ctx.session_key):
+                    raise ValueError("canonical_turn_busy")
                 cached = _cache.get(ctx.session_key)
                 if cached and cached[1] == _sig:
                     # cached[2] is the message_count at cache time;
@@ -5792,16 +5797,34 @@ class TurnRunner:
                 load_soul_identity=True,
             )
             if _cache_lock and _cache is not None:
+                _construction_lost_reservation = False
+                _constructed_is_reserved_actor = False
                 with _cache_lock:
-                    # Record the session_id the snapshot was taken for
-                    # alongside the message_count, so the cross-process
-                    # guard can skip the (meaningless) count comparison
-                    # when the active session_id later switches under
-                    # the same session_key (#54947).
-                    _cache[ctx.session_key] = (
-                        agent, _sig, _current_msg_count, ctx.session_id,
-                    )
-                    self._runner._enforce_agent_cache_cap()
+                    # Construction ran outside the lock.  A canonical turn
+                    # could have reserved this key after our cache lookup.
+                    if ctx.session_key and self._runner._canonical_cache_key_reserved(ctx.session_key):
+                        _construction_lost_reservation = True
+                        _existing = _cache.get(ctx.session_key)
+                        _constructed_is_reserved_actor = (
+                            _existing is agent or
+                            (isinstance(_existing, tuple) and _existing and _existing[0] is agent)
+                        )
+                    else:
+                        # Snapshot count belongs to this session_id (#54947).
+                        _cache[ctx.session_key] = (
+                            agent, _sig, _current_msg_count, ctx.session_id,
+                        )
+                        self._runner._enforce_agent_cache_cap()
+                if _construction_lost_reservation:
+                    # Only dispose of the newly built actor; never release
+                    # the canonical turn's cached actor.  Keep cleanup out
+                    # of both the cache lock and the gateway event loop.
+                    if not _constructed_is_reserved_actor:
+                        try:
+                            self._runner._release_evicted_agent_soft(agent)
+                        except Exception:
+                            logger.debug("Could not release unbound agent", exc_info=True)
+                    raise ValueError("canonical_turn_busy")
             logger.debug("Created new agent for session %s (sig=%s)", ctx.session_key, _sig)
 
         # Per-message state — callbacks and reasoning config change every
@@ -6504,7 +6527,7 @@ class TurnRunner:
         # same way a split would, even though the session_id is unchanged.
         _compacted_in_place = bool(getattr(agent, "_last_compaction_in_place", False)) if agent else False
         agent_session_id = getattr(agent, 'session_id', ctx.session_id) if agent else ctx.session_id
-        if agent and ctx.session_key and agent_session_id != ctx.session_id:
+        if agent and ctx.session_key and ctx.session_id and agent_session_id and agent_session_id != ctx.session_id:
             _session_was_split = True
             logger.info(
                 "Session split detected: %s → %s (compression)",
@@ -6533,14 +6556,16 @@ class TurnRunner:
                         entry_session_id,
                     )
                 else:
-                    entry.session_id = agent_session_id
-                    self._runner.session_store._save()
-                    self._runner.session_store._record_gateway_session_peer(
-                        agent_session_id,
-                        ctx.session_key,
-                        ctx.source,
-                    )
-                    _session_split_entry_persisted = True
+                    if self._runner.session_store.repoint_session_entry(
+                        entry, ctx.session_id, agent_session_id
+                    ):
+                        self._runner.session_store._save()
+                        self._runner.session_store._record_gateway_session_peer(
+                            agent_session_id,
+                            ctx.session_key,
+                            ctx.source,
+                        )
+                        _session_split_entry_persisted = True
 
             # If this is a Telegram DM and source.thread_id was lost during
             # the session split (synthetic / recovered event), restore it
@@ -15417,8 +15442,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _cache = getattr(self, "_agent_cache", None)
             if _cache_lock is not None and _cache is not None:
                 with _cache_lock:
-                    _idle_agents = list(_cache.values())
-                    _cache.clear()
+                    # Canonical to_thread workers can outlive the cancelled
+                    # request and the shutdown drain.  Keep their actors and
+                    # reservations intact until the worker itself exits.
+                    _idle_agents = []
+                    _store = getattr(self, "session_store", None)
+                    for _key in list(_cache):
+                        if _store is not None and _store.canonical_entry_reserved(_key):
+                            continue
+                        _idle_agents.append(_cache.pop(_key))
                 for _entry in _idle_agents:
                     _agent = (
                         _entry[0] if isinstance(_entry, tuple) else _entry
@@ -16852,6 +16884,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return EphemeralReply(t("gateway.stop.stopped"))
 
     async def _busy_new_command(self, event: MessageEvent, quick_key: str, source):
+        entry = self.session_store._entries.get(quick_key)
+        intended_session_id = entry.session_id if entry is not None else None
+        async def claimed_busy_new():
+            async def claim():
+                if entry is None:
+                    return None
+                return await self.async_session_store.claim_session_command(entry, intended_session_id)
+
+            return await _run_claimed_command(
+                claim,
+                lambda token: self._busy_new_command_claimed(event, quick_key, source, token),
+                lambda token: self.async_session_store.release_session_command(entry, token),
+                "⏳ Session is busy — wait for the current response before `/new`.",
+            )
+
+        # Interrupt and reset form one claimed operation; cancellation of the
+        # caller must not release the upstream claim before either completes.
+        worker = asyncio.create_task(claimed_busy_new())
+        return await asyncio.shield(worker)
+
+    async def _busy_new_command_claimed(self, event, quick_key, source, claim):
         # /reset and /new must bypass the running-agent guard so they
         # actually dispatch as commands instead of being queued as user
         # text (which would be fed back to the agent with the same
@@ -16868,7 +16921,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         # Clean up the running agent entry so the reset handler
         # doesn't think an agent is still active.
-        return await self._handle_reset_command(event)
+        if claim is None:
+            return await self._handle_reset_command(event)
+        return await self._handle_reset_command(event, _command_claim=claim)
 
     async def _busy_queue_command(self, event: MessageEvent, quick_key: str, source):
         # /queue <prompt> — queue without interrupting.
@@ -19430,7 +19485,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from gateway.canonical_surface import require_request_local_reply_sink
 
         require_request_local_reply_sink(reply_sink)
-        if entry.session_key != binding.session_key or entry.session_id != binding.session_id:
+        if entry.session_key != binding.session_key:
+            raise ValueError("canonical_binding_stale")
+        from gateway.canonical_surface import ExistingCanonicalBindingResolver
+        resolver = ExistingCanonicalBindingResolver(self.session_store)
+        current = resolver.resolve(binding, event)
+        if (current.session_key, current.session_id) != (entry.session_key, entry.session_id):
             raise ValueError("canonical_binding_stale")
         with self._agent_cache_lock:
             cached = self._agent_cache.get(entry.session_key)
@@ -19450,7 +19510,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except Exception:
             raise ValueError("canonical_turn_busy") from None
+        reservation = None
+        worker = None
+        outward_callbacks = {}
+
+        async def drain_store_task(task):
+            cancelled = False
+            while True:
+                try:
+                    return await asyncio.shield(task), cancelled
+                except asyncio.CancelledError:
+                    if task.done():
+                        return task.result(), True
+                    cancelled = True
+
         try:
+            # The session-ID lease serializes turns, while this key-scoped
+            # reservation fences route/cache writers through worker completion.
+            # The store operation is off-loop; if the caller is cancelled,
+            # await its worker so an acquired reservation cannot be orphaned.
+            async def reserve_entry():
+                return await self.async_session_store.reserve_canonical_entry(entry)
+
+            reservation_task = asyncio.create_task(reserve_entry())
+            reservation, cancelled = await drain_store_task(reservation_task)
+            if cancelled:
+                raise asyncio.CancelledError
+            with self._agent_cache_lock:
+                cached = self._agent_cache.get(entry.session_key)
+                cached_agent = cached[0] if isinstance(cached, tuple) and cached else cached
+                cached_session_id = (
+                    cached[3] if isinstance(cached, tuple) and len(cached) > 3
+                    else getattr(cached_agent, "session_id", None)
+                )
+                if cached_agent is not agent or cached_session_id != entry.session_id:
+                    raise ValueError("canonical_agent_missing")
+            current = resolver.resolve(binding, event)
+            if (current.session_key, current.session_id) != (entry.session_key, entry.session_id):
+                raise ValueError("canonical_binding_stale")
             if not bool(getattr(agent, "compression_in_place", True)):
                 raise ValueError("canonical_turn_refused")
             outward_callbacks = {
@@ -19464,12 +19561,55 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 history = await self.async_session_store.load_transcript(entry.session_id)
                 agent_history, _ = _build_gateway_agent_history(history)
                 self._init_cached_agent_for_turn(agent, 0)
-                result = await asyncio.to_thread(
-                    agent.run_conversation,
-                    event.text,
-                    conversation_history=agent_history,
-                    task_id=entry.session_id,
-                )
+
+                def require_current_cached_agent(method_agent):
+                    with self._agent_cache_lock:
+                        current_cached = self._agent_cache.get(entry.session_key)
+                        current_agent = (
+                            current_cached[0] if isinstance(current_cached, tuple) and current_cached else current_cached
+                        )
+                        current_session_id = (
+                            current_cached[3]
+                            if isinstance(current_cached, tuple) and len(current_cached) > 3
+                            else getattr(current_agent, "session_id", None)
+                        )
+                        if current_agent is not method_agent or current_session_id != entry.session_id:
+                            raise ValueError("canonical_binding_stale")
+
+                def run_if_still_bound():
+                    current = resolver.resolve(binding, event)
+                    if (current.session_key, current.session_id) != (entry.session_key, entry.session_id):
+                        raise ValueError("canonical_binding_stale")
+                    require_current_cached_agent(agent)
+                    return agent.run_conversation(
+                        event.text,
+                        conversation_history=agent_history,
+                        task_id=entry.session_id,
+                    )
+
+                def preflight(method_agent, task_id):
+                    store = self.session_store
+                    with store._lock:
+                        if (
+                            not store._loaded
+                            or store._entries.get(entry.session_key) is not entry
+                            or method_agent is not agent
+                            or task_id != entry.session_id
+                            or getattr(method_agent, "session_id", None) != entry.session_id
+                        ):
+                            raise ValueError("canonical_binding_stale")
+                    # Do not nest the store and cache locks: cache eviction may
+                    # proceed on another thread between these separate checks.
+                    require_current_cached_agent(method_agent)
+
+                from gateway.canonical_surface import canonical_method_entry_preflight
+
+                guard_token = canonical_method_entry_preflight.set(preflight)
+                try:
+                    worker = asyncio.create_task(asyncio.to_thread(run_if_still_bound))
+                    result = await asyncio.shield(worker)
+                finally:
+                    canonical_method_entry_preflight.reset(guard_token)
                 boundary = getattr(agent, "_persist_user_message_idx", None)
                 if isinstance(boundary, bool) or not isinstance(boundary, int):
                     raise ValueError("canonical_turn_refused")
@@ -19480,10 +19620,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     expected_session_id=entry.session_id,
                 )
             finally:
-                for name, value in outward_callbacks.items():
-                    setattr(agent, name, value)
+                if worker is None:
+                    for name, value in outward_callbacks.items():
+                        setattr(agent, name, value)
         finally:
-            self._turn_leases.release(lease)
+            if worker is not None and not worker.done():
+                # A cancelled HTTP coroutine cannot cancel its to_thread worker.
+                # Keep callbacks quarantined and both fences held until exit.
+                def finish_cancelled_turn(done):
+                    if not done.cancelled():
+                        done.exception()  # consume an otherwise unobserved failure
+                    try:
+                        for name, value in outward_callbacks.items():
+                            setattr(agent, name, value)
+                    finally:
+                        if reservation is not None:
+                            self.session_store.release_canonical_entry(entry, reservation)
+                        self._turn_leases.release(lease)
+
+                worker.add_done_callback(finish_cancelled_turn)
+            else:
+                try:
+                    if worker is not None:
+                        for name, value in outward_callbacks.items():
+                            setattr(agent, name, value)
+                    cancelled = False
+                    if reservation is not None:
+                        async def release_entry():
+                            await self.async_session_store.release_canonical_entry(entry, reservation)
+
+                        release_task = asyncio.create_task(release_entry())
+                        _, cancelled = await drain_store_task(release_task)
+                finally:
+                    self._turn_leases.release(lease)
+                if cancelled:
+                    raise asyncio.CancelledError
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
@@ -20464,7 +20635,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             _hyg_rotated = False
                                             _hyg_in_place = False
                                         else:
-                                            session_entry.session_id = _hyg_new_sid
+                                            _hyg_rotated = await self.async_session_store.repoint_session_entry(
+                                                session_entry, session_entry.session_id, _hyg_new_sid
+                                            )
+                                        if _hyg_rotated:
                                             # The held turn lease follows the
                                             # rotation so an alias key resolving
                                             # the fresh child still serializes
@@ -20989,7 +21163,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # session_entry so transcript writes below go to the right session.
             if agent_result.get("session_id") and agent_result["session_id"] != session_entry.session_id:
                 if session_entry.session_id == _run_start_session_id:
-                    session_entry.session_id = agent_result["session_id"]
+                    _repointed = await self.async_session_store.repoint_session_entry(
+                        session_entry, _run_start_session_id, agent_result["session_id"]
+                    )
+                    if not _repointed:
+                        raise ValueError("session_binding_moved")
                     # The held turn lease follows the rotation: the transcript
                     # persistence below writes to the NEW id, so the
                     # serialization boundary must move with it or an alias
@@ -27640,6 +27818,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if _live is None:
             return
         with _cache_lock:
+            if self._canonical_cache_key_reserved(session_key):
+                return
             cached = _cache.get(session_key)
             # Only re-baseline a live 3-tuple entry; skip pending sentinels,
             # legacy 2-tuples (they intentionally opt out of the guard), and
@@ -27817,6 +27997,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         return hashlib.sha256(repr(key_tuple).encode("utf-8")).hexdigest()
 
+    def _canonical_cache_key_reserved(self, session_key: str) -> bool:
+        """Check the key fence while holding the agent-cache lock (cache → store)."""
+        store = getattr(self, "session_store", None)
+        return bool(store is not None and store.canonical_entry_reserved(session_key))
+
     def _evict_cached_agent(self, session_key: str) -> None:
         """Remove a cached agent for a session (called on /new, /model, etc).
 
@@ -27841,23 +28026,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ``_agent_cache_lock`` on slow socket teardown — mirrors the
         cap-enforcer and idle-sweeper paths.
         """
-        # Prompt-stability state rides the agent-cache lifecycle: a fresh
-        # agent must re-render its session-context bytes (the pin) and re-see
-        # the current voice-channel state once.
-        _evict_state = self._peek_session_state(session_key)
-        if _evict_state is not None:
-            _evict_state.conversation.ephemeral_pin = None
-            _evict_state.conversation.vc_last = None
-
         _lock = getattr(self, "_agent_cache_lock", None)
         evicted = None
         if _lock:
             with _lock:
+                if self.session_store.canonical_entry_reserved(session_key):
+                    return
                 evicted = self._agent_cache.pop(session_key, None)
         else:
             _cache = getattr(self, "_agent_cache", None)
             if _cache is not None:
+                if self.session_store.canonical_entry_reserved(session_key):
+                    return
                 evicted = _cache.pop(session_key, None)
+
+        # Prompt-stability state rides the agent-cache lifecycle.
+        _evict_state = self._peek_session_state(session_key)
+        if _evict_state is not None:
+            _evict_state.conversation.ephemeral_pin = None
+            _evict_state.conversation.vc_last = None
 
         agent = evicted[0] if isinstance(evicted, tuple) and evicted else evicted
         if agent is None or agent is _AGENT_PENDING_SENTINEL:
@@ -28120,8 +28307,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 max_evictions=bounds.max_evictions_per_pass,
                 protect_recent=bounds.protect_recent,
             )
+            actual_plan = []
             for key, _ in plan:
-                _cache.pop(key, None)
+                if not self._canonical_cache_key_reserved(key):
+                    evicted = _cache.pop(key, None)
+                    if evicted is not None:
+                        evicted_agent = evicted[0] if isinstance(evicted, tuple) else evicted
+                        actual_plan.append((key, evicted_agent))
+            plan = actual_plan
 
         if not plan:
             _mid_turn = sum(1 for _, a in ordered if a is not None and id(a) in running_ids)
@@ -28249,6 +28442,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 agent = entry[0] if isinstance(entry, tuple) and entry else None
                 if agent is not None and id(agent) in running_ids:
                     continue  # active mid-turn; don't evict, don't substitute
+                if self._canonical_cache_key_reserved(key):
+                    continue
                 evict_plan.append((key, agent))
 
         for key, _ in evict_plan:
@@ -28355,8 +28550,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     ):
                         continue  # keep agent — finite session hasn't expired
                     to_evict.append((key, agent))
-            for key, _ in to_evict:
-                _cache.pop(key, None)
+            evicted = []
+            for key, agent in to_evict:
+                # Fence at the cache mutation, under cache → store lock order.
+                if not self._canonical_cache_key_reserved(key):
+                    _cache.pop(key, None)
+                    evicted.append((key, agent))
+            to_evict = evicted
         for key, agent in to_evict:
             logger.info(
                 "Agent cache idle-TTL evict: session=%s (idle=%.0fs)",

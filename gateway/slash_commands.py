@@ -56,6 +56,41 @@ logger = logging.getLogger("gateway.run")
 _RESET_CLEANUP_TIMEOUT_S = 30.0
 
 
+async def _drain_owned_command_stage(coro):
+    """Finish a claimed stage even if its owning worker is cancelled."""
+    task = asyncio.create_task(coro)
+    cancelled = False
+    while True:
+        try:
+            return await asyncio.shield(task), cancelled
+        except asyncio.CancelledError:
+            if task.done():
+                return task.result(), True
+            cancelled = True
+
+
+async def _run_claimed_command(claim, execute, release, busy_reply):
+    """Keep an off-loop claim owned through execution and release."""
+    token = None
+    result: Any = None
+    cancelled = False
+    try:
+        try:
+            token, cancelled = await _drain_owned_command_stage(claim())
+        except ValueError:
+            return busy_reply
+        if not cancelled:
+            result, interrupted = await _drain_owned_command_stage(execute(token))
+            cancelled |= interrupted
+    finally:
+        if token is not None and release is not None:
+            _, interrupted = await _drain_owned_command_stage(release(token))
+            cancelled |= interrupted
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
+
+
 def _clean_str(value: Any) -> str:
     """Strip and return a non-empty string value, or empty string."""
     return value.strip() if isinstance(value, str) and value.strip() else ""
@@ -141,12 +176,43 @@ class GatewaySlashCommandsMixin:
         adapter = self.adapters.get(platform) if getattr(self, "adapters", None) else None
         return getattr(adapter, "typed_command_prefix", "/") if adapter is not None else "/"
 
-    async def _handle_reset_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
-        """Handle /new or /reset command."""
+    async def _handle_reset_command(
+        self, event: MessageEvent, *, _command_claim: object = None,
+    ) -> Union[str, EphemeralReply]:
+        """Fence all pre-reset effects against canonical admission."""
         source = event.source
-        
-        # Get existing session key
         session_key = self._session_key_for_source(source)
+        entry = self.session_store._entries.get(session_key)
+        owned = _command_claim is None
+        intended_session_id = entry.session_id if entry is not None else None
+        async def claimed_reset():
+            async def claim():
+                if entry is None:
+                    return None
+                if owned:
+                    return await self.async_session_store.claim_session_command(entry, intended_session_id)
+                if not await self.async_session_store.command_claim_owned(entry, _command_claim):
+                    raise ValueError("command claim is no longer owned")
+                return _command_claim
+
+            return await _run_claimed_command(
+                claim,
+                lambda token: self._execute_reset_command(event, session_key, token),
+                (lambda token: self.async_session_store.release_session_command(entry, token))
+                if owned else None,
+                "⏳ Session is busy — wait for the current response before `/new`.",
+            )
+
+        # The cleanup executor can outlive a cancelled request. Its owner
+        # retains the claim through reset and all route-facing side effects.
+        worker = asyncio.create_task(claimed_reset())
+        return await asyncio.shield(worker)
+
+    async def _execute_reset_command(
+        self, event: MessageEvent, session_key: str, command_claim: object,
+    ) -> Union[str, EphemeralReply]:
+        """Handle /new or /reset after command admission."""
+        source = event.source
         self._invalidate_session_run_generation(session_key, reason="session_reset")
         # Evict the running-agent slot now that the generation is bumped. The
         # in-flight run's own guarded release (run_generation=old) will return
@@ -239,7 +305,12 @@ class GatewaySlashCommandsMixin:
             pass
 
         # Reset the session
-        new_entry = await self.async_session_store.reset_session(session_key)
+        if command_claim is None:
+            new_entry = await self.async_session_store.reset_session(session_key)
+        else:
+            new_entry = await self.async_session_store.reset_session(
+                session_key, command_claim=command_claim
+            )
 
         # (Conversation-scoped overrides + security state were already
         # cleared via _clear_conversation_scope above.)
@@ -4183,6 +4254,33 @@ class GatewaySlashCommandsMixin:
         """
         source = event.source
         session_entry = await self.async_session_store.get_or_create_session(source)
+        from hermes_cli.partial_compress import extract_compress_flags
+        raw_args = (event.get_command_args() or "").strip()
+        _, preview, _ = extract_compress_flags(raw_args)
+        if preview:
+            return await self._execute_compress_command(event, session_entry)
+
+        intended_session_id = session_entry.session_id
+        async def claimed_compression():
+            return await _run_claimed_command(
+                lambda: self.async_session_store.claim_session_command(
+                    session_entry, intended_session_id),
+                lambda token: self._execute_compress_command(
+                    event, session_entry, command_claim=token),
+                lambda token: self.async_session_store.release_session_command(session_entry, token),
+                "⏳ Session is busy — wait for the current response before `/compress`.",
+            )
+
+        # Cancelling the requesting coroutine cannot cancel an executor's
+        # SQLite/rotation work. Keep the claim owned by that worker through
+        # persistence and teardown, even when the requester disconnects.
+        worker = asyncio.create_task(claimed_compression())
+        return await asyncio.shield(worker)
+
+    async def _execute_compress_command(
+        self, event: MessageEvent, session_entry, *, command_claim: object = None,
+    ) -> str:
+        source = event.source
         history = await self.async_session_store.load_transcript(session_entry.session_id)
 
         if not history or len(history) < 4:
@@ -4434,8 +4532,13 @@ class GatewaySlashCommandsMixin:
                             f"failed to persist compressed transcript for "
                             f"session {new_session_id}"
                         )
-                    session_entry.session_id = new_session_id
-                    await self.async_session_store._save()
+                    advanced = await self.async_session_store.advance_compression_session(
+                        session_entry.session_key, session_entry.session_id,
+                        new_session_id, command_claim=command_claim,
+                        expected_entry=session_entry,
+                    )
+                    if advanced is not session_entry:
+                        raise RuntimeError("compression route changed before publication")
                     await asyncio.to_thread(
                         self._sync_telegram_topic_binding,
                         source, session_entry, reason="compress-command",
@@ -4889,16 +4992,39 @@ class GatewaySlashCommandsMixin:
             # persisted transcript.
             return t("gateway.resume.blocked_not_owner", name=name)
 
-        # Check if already on that session
-        current_entry = await self.async_session_store.get_or_create_session(source)
+        # Claim the existing route before any running-state or DB mutation.
+        # No existing entry means there is no canonical route to fence yet.
+        current_entry = self.session_store._entries.get(session_key)
+        if current_entry is None:
+            current_entry = await self.async_session_store.get_or_create_session(source)
         if current_entry.session_id == target_id:
             return t("gateway.resume.already_on", name=name)
+        intended_session_id = current_entry.session_id
+        async def claimed_switch():
+            return await _run_claimed_command(
+                lambda: self.async_session_store.claim_session_command(
+                    current_entry, intended_session_id),
+                lambda token: self._execute_resume_switch(
+                    source, session_key, name, target_id, allow_cross_room, token),
+                lambda token: self.async_session_store.release_session_command(current_entry, token),
+                "⏳ Session is busy — wait for the current response before `/resume`.",
+            )
 
-        # Clear any running agent for this session key
+        # The switch runs in a thread that can outlive a cancelled request.
+        # Keep its claim through DB writes and route cleanup in the worker.
+        worker = asyncio.create_task(claimed_switch())
+        return await asyncio.shield(worker)
+
+    async def _execute_resume_switch(
+        self, source: SessionSource, session_key: str, name: str, target_id: str,
+        allow_cross_room: bool, command_claim: object,
+    ) -> str:
+        """Perform the claimed switch and clear the outgoing conversation state."""
         self._release_running_agent_state(session_key)
 
-        # Switch the session entry to point at the old session
-        new_entry = await self.async_session_store.switch_session(session_key, target_id)
+        new_entry = await self.async_session_store.switch_session(
+            session_key, target_id, command_claim=command_claim
+        )
         if not new_entry:
             return t("gateway.resume.switch_failed")
 
@@ -5015,15 +5141,37 @@ class GatewaySlashCommandsMixin:
         a different approach without losing the original.
         Inspired by Claude Code's /branch command.
         """
-        import uuid as _uuid
-        from hermes_state import SessionTurnLeaseLostError
-
         if not self._session_db:
             from hermes_state import format_session_db_unavailable
             return format_session_db_unavailable(prefix=t("gateway.shared.session_db_unavailable_prefix"))
 
         source = event.source
         session_key = self._session_key_for_source(source)
+        entry = self.session_store._entries.get(session_key)
+        if entry is None:
+            entry = await self.async_session_store.get_or_create_session(source)
+        intended_session_id = entry.session_id
+        async def claimed_branch():
+            return await _run_claimed_command(
+                lambda: self.async_session_store.claim_session_command(entry, intended_session_id),
+                lambda token: self._execute_branch_command(event, session_key, entry, token),
+                lambda token: self.async_session_store.release_session_command(entry, token),
+                "⏳ Session is busy — wait for the current response before `/branch`.",
+            )
+
+        # The parent's read and child's seed run in threads that cannot be
+        # cancelled with the request. Keep their claim through publication.
+        worker = asyncio.create_task(claimed_branch())
+        return await asyncio.shield(worker)
+
+    async def _execute_branch_command(
+        self, event: MessageEvent, session_key: str, current_entry, command_claim: object,
+    ) -> str:
+        """Fork the claimed route, including all child writes and the final switch."""
+        import uuid as _uuid
+        from hermes_state import SessionTurnLeaseLostError
+
+        source = event.source
 
         # Load the current session and its transcript. The read is fenced by
         # the PARENT's own turn lease — not the child's, and not skipped —
@@ -5031,7 +5179,6 @@ class GatewaySlashCommandsMixin:
         # between this read and the copy below that the branch then silently
         # never sees. Off the event loop: acquisition can wait on the
         # parent's own running turn.
-        current_entry = await self.async_session_store.get_or_create_session(source)
         sync_db = getattr(self._session_db, "_db", self._session_db)
         # A per-call nonce, not just pid+parent id: two concurrent /branch
         # calls on the SAME parent (same pid, same session id) would
@@ -5264,7 +5411,9 @@ class GatewaySlashCommandsMixin:
             )
 
         # Switch the session store entry to the new session
-        new_entry = await self.async_session_store.switch_session(session_key, new_session_id)
+        new_entry = await self.async_session_store.switch_session(
+            session_key, new_session_id, command_claim=command_claim
+        )
         if not new_entry:
             return t("gateway.branch.switch_failed")
         self._clear_session_boundary_security_state(session_key)

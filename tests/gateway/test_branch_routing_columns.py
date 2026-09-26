@@ -99,12 +99,12 @@ class TestBranchRoutingColumns:
         runner = _make_branch_runner(store)
 
         captured_new_session_id = {}
-        real_switch_session = store.switch_session
-
-        def _crash_before_switch(session_key, target_session_id):
+        def _crash_before_switch(session_key, target_session_id, *, command_claim):
             # Simulate the process dying right here — before routing gets
             # backfilled — by capturing the id and raising instead of
             # forwarding to the real switch_session().
+            assert command_claim is not None
+            assert session_key == build_session_key(source)
             captured_new_session_id["id"] = target_session_id
             raise RuntimeError("simulated crash before switch_session")
 
@@ -150,6 +150,4 @@ class TestBranchRoutingColumns:
         origin = _json.loads(row["origin_json"])
         assert origin.get("chat_id") == "170829464"
         assert origin.get("thread_id") == "544520"
-
-        _ = real_switch_session  # silence unused
 

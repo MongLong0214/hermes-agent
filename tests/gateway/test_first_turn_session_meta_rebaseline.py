@@ -90,6 +90,7 @@ def _bootstrap(monkeypatch, tmp_path, db):
     runner._agent_cache_lock = threading.Lock()
 
     runner.session_store = MagicMock()
+    runner.session_store.canonical_entry_reserved.return_value = False
     runner.session_store.get_or_create_session.return_value = SessionEntry(
         session_key=SESSION_KEY,
         session_id=SESSION_ID,
