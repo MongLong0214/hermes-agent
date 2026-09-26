@@ -243,3 +243,84 @@ class ExistingCanonicalBindingResolver:
         except Exception:
             raise ValueError("canonical_binding_stale") from None
         return entry
+
+
+class ExistingCanonicalIdentityResolver:
+    """Prove a configured ancestor of the live head without changing event admission."""
+
+    def __init__(self, session_store: "SessionStore") -> None:
+        self._session_store = session_store
+
+    def resolve(self, binding: CanonicalSurfaceBinding) -> tuple[str, str]:
+        from pathlib import Path
+
+        from gateway.config import Platform
+        from hermes_state import SessionDB
+
+        store = self._session_store
+        entry = store.lookup_by_session_key_existing(binding.session_key)
+        if entry is None or entry.platform != Platform.TELEGRAM or entry.origin is None:
+            raise ValueError("canonical_binding_stale")
+        origin = entry.origin
+        if (
+            str(origin.chat_id) != binding.telegram_chat_id
+            or str(origin.chat_type) != binding.telegram_chat_type
+            or (str(origin.user_id) if origin.user_id is not None else None)
+            != binding.telegram_user_id
+            or (str(origin.thread_id) if origin.thread_id is not None else None)
+            != binding.telegram_thread_id
+        ):
+            raise ValueError("canonical_binding_stale")
+        try:
+            if store._should_reset(entry, origin) is not None:
+                raise ValueError("canonical_binding_stale")
+            path = getattr(store._db, "db_path", None)
+            if not isinstance(path, Path) or not path.is_file():
+                raise ValueError("canonical_binding_stale")
+            head = entry.session_id
+            with SessionDB(path, read_only=True) as reader:
+                conn = reader._conn
+                conn.execute("BEGIN")
+                try:
+                    row = conn.execute("SELECT ended_at FROM sessions WHERE id = ?", (head,)).fetchone()
+                    if row is None or row["ended_at"] is not None:
+                        raise ValueError("canonical_binding_stale")
+                    if reader.get_compression_tip(head) != head:
+                        raise ValueError("canonical_binding_stale")
+                    current = head
+                    seen: set[str] = set()
+                    found = False
+                    for _ in range(100):
+                        if not isinstance(current, str) or not current or current in seen:
+                            raise ValueError("canonical_binding_stale")
+                        seen.add(current)
+                        parent_row = conn.execute(
+                            "SELECT parent_session_id FROM sessions WHERE id = ?", (current,)
+                        ).fetchone()
+                        if parent_row is None:
+                            raise ValueError("canonical_binding_stale")
+                        found |= current == binding.session_id
+                        parent = parent_row["parent_session_id"]
+                        if parent is None:
+                            if not found:
+                                raise ValueError("canonical_binding_stale")
+                            root = current
+                            break
+                        current = parent
+                    else:
+                        raise ValueError("canonical_binding_stale")
+                    digest = SessionDB._target_bind_lineage_root_digest(root)
+                finally:
+                    conn.rollback()
+            with store._lock:
+                if (
+                    not store._loaded
+                    or store._entries.get(binding.session_key) is not entry
+                    or entry.session_id != head
+                ):
+                    raise ValueError("canonical_binding_stale")
+            return head, digest
+        except ValueError:
+            raise
+        except Exception:
+            raise ValueError("canonical_binding_stale") from None

@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -15,10 +18,12 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
+from hermes_state import SessionDB
 
 
 _API_KEY = "canonical-surface-test-key"
 _ROUTE = "/v1/canonical-surface/events"
+_IDENTITY_ROUTE = "/v1/canonical-surface/identity"
 
 
 class _ExistingCachedAgent:
@@ -204,6 +209,126 @@ def ingress(tmp_path, monkeypatch):
     yield SimpleNamespace(runner=runner, agent=agent, adapter=adapter, send=send, binding=binding, entry=entry)
     adapter._response_store.close()
     runner.session_store.close_all_db_handles()
+
+
+def test_identity_proves_ancestor_of_live_head_without_writer_access(ingress, monkeypatch):
+    db = ingress.runner.session_store._db
+    assert db is not None
+    db.create_session("lineage-root", source="telegram")
+    db._execute_write(lambda conn: conn.execute(
+        "UPDATE sessions SET parent_session_id = ? WHERE id = ?",
+        ("lineage-root", ingress.entry.session_id),
+    ))
+    ingress.binding.session_id = "lineage-root"
+    before = (
+        db._conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0],
+        db._conn.execute("SELECT COUNT(*) FROM state_meta").fetchone()[0],
+    )
+    opened = []
+    original_init = SessionDB.__init__
+
+    def track_open(self, *args, **kwargs):
+        opened.append(kwargs.get("read_only"))
+        return original_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(SessionDB, "__init__", track_open)
+    monkeypatch.setattr(db, "get_session", lambda *a: pytest.fail("writer read forbidden"))
+
+    async def exercise():
+        client = TestClient(TestServer(_app(ingress.adapter)))
+        await client.start_server()
+        try:
+            response = await client.get(_IDENTITY_ROUTE, headers={"Authorization": f"Bearer {_API_KEY}"})
+            assert response.status == 200
+            proof = await response.json()
+            if sys.platform == "darwin":
+                import psutil
+                started = f"darwin-tv:{psutil.Process(os.getpid()).create_time():.6f}"
+            else:
+                started = "linux-clk:" + Path(f"/proc/{os.getpid()}/stat").read_text(encoding="ascii").rsplit(")", 1)[1].split()[19]
+            assert proof == {
+                "session_id": ingress.entry.session_id,
+                "lineage_root_digest": SessionDB._target_bind_lineage_root_digest("lineage-root"),
+                "process_pid": os.getpid(), "process_started_at": started,
+            }
+        finally:
+            await client.close()
+
+    asyncio.run(exercise())
+    assert opened and all(opened)
+    assert before == (
+        db._conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0],
+        db._conn.execute("SELECT COUNT(*) FROM state_meta").fetchone()[0],
+    )
+    assert ingress.agent.calls == []
+
+
+def test_identity_rejects_in_place_live_head_drift_during_read_only_proof(ingress, monkeypatch):
+    store = ingress.runner.session_store
+    db = store._db
+    assert db is not None
+    original_head = ingress.entry.session_id
+    db.create_session("other-live-head", source="telegram")
+    original_tip = SessionDB.get_compression_tip
+    proof_reads = []
+
+    def drift_during_read(self, session_id):
+        if self is not db:
+            assert self.read_only
+            assert session_id == original_head
+            with store._lock:
+                assert store._entries[ingress.binding.session_key] is ingress.entry
+                ingress.entry.session_id = "other-live-head"
+            proof_reads.append(session_id)
+        return original_tip(self, session_id)
+
+    monkeypatch.setattr(SessionDB, "get_compression_tip", drift_during_read)
+
+    async def exercise():
+        client = TestClient(TestServer(_app(ingress.adapter)))
+        await client.start_server()
+        try:
+            response = await client.get(_IDENTITY_ROUTE, headers={"Authorization": f"Bearer {_API_KEY}"})
+            assert response.status == 409
+            assert await response.json() == {
+                "error": {"code": "canonical_binding_stale", "message": "Canonical request rejected."}
+            }
+        finally:
+            await client.close()
+
+    asyncio.run(exercise())
+    assert proof_reads == [original_head]
+    assert store.lookup_by_session_key_existing(ingress.binding.session_key) is ingress.entry
+    assert ingress.entry.session_id == "other-live-head"
+    assert ingress.agent.calls == []
+
+
+def test_identity_rejects_any_query_string_even_empty(ingress):
+    async def exercise():
+        server = TestServer(_app(ingress.adapter))
+        await server.start_server()
+        try:
+            for suffix in ("?", "?session_id=ignored"):
+                reader, writer = await asyncio.open_connection(server.host, server.port)
+                try:
+                    writer.write((
+                        f"GET {_IDENTITY_ROUTE}{suffix} HTTP/1.1\r\n"
+                        f"Host: {server.host}\r\n"
+                        f"Authorization: Bearer {_API_KEY}\r\n"
+                        "Connection: close\r\n\r\n"
+                    ).encode("ascii"))
+                    await writer.drain()
+                    response = await reader.read()
+                    status_line, _, body = response.partition(b"\r\n\r\n")
+                    assert status_line.split(b"\r\n", 1)[0] == b"HTTP/1.1 400 Bad Request"
+                    assert json.loads(body)["error"]["code"] == "canonical_invalid_request"
+                finally:
+                    writer.close()
+                    await writer.wait_closed()
+        finally:
+            await server.close()
+
+    asyncio.run(exercise())
 
 
 def test_concurrent_delivery_is_busy_then_replays_terminal(ingress, monkeypatch):

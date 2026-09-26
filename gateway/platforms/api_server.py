@@ -2252,6 +2252,70 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return profile_prefix_middleware
 
+    async def _handle_canonical_surface_identity(self, request: "web.Request"):
+        """Return a request-local proof of the existing head; never execute a turn."""
+        import math
+        import os
+        import sys
+        from pathlib import Path
+
+        from gateway.canonical_surface import ExistingCanonicalIdentityResolver
+
+        # Unlike legacy test adapters, the identity proof must fail closed without a key.
+        if not self._expected_api_key():
+            return web.json_response({"error": {"code": "gateway_auth_failed"}}, status=401)
+        auth_error = self._check_auth(request)
+        if auth_error:
+            return auth_error
+
+        def refuse(code, status):
+            return web.json_response(
+                {"error": {"code": code, "message": "Canonical request rejected."}}, status=status
+            )
+
+        if "?" in request.raw_path:
+            return refuse("canonical_invalid_request", 400)
+        if _api_request_profile.get() not in (None, "default"):
+            return refuse("canonical_binding_unknown", 404)
+        runner = self.gateway_runner
+        if runner is None:
+            return refuse("canonical_identity_unavailable", 503)
+        bindings = getattr(runner.config, "canonical_surface_bindings", None) or {}
+        if not bindings:
+            return refuse("canonical_binding_unknown", 404)
+        if len(bindings) != 1:
+            return refuse("canonical_binding_ambiguous", 409)
+        try:
+            session_id, digest = await asyncio.to_thread(
+                ExistingCanonicalIdentityResolver(runner.session_store).resolve,
+                next(iter(bindings.values())),
+            )
+        except Exception:
+            return refuse("canonical_binding_stale", 409)
+        pid = os.getpid()
+        try:
+            if sys.platform == "darwin":
+                import psutil
+
+                created = psutil.Process(pid).create_time()
+                if not math.isfinite(created) or created <= 0:
+                    raise ValueError("invalid process start")
+                started = f"darwin-tv:{created:.6f}"
+            elif sys.platform == "linux":
+                fields = Path(f"/proc/{pid}/stat").read_text(encoding="ascii").rsplit(")", 1)[1].split()
+                ticks = fields[19]
+                if not ticks.isascii() or not ticks.isdecimal() or int(ticks) <= 0:
+                    raise ValueError("invalid process start")
+                started = f"linux-clk:{ticks}"
+            else:
+                raise ValueError("unsupported process")
+        except Exception:
+            return refuse("canonical_identity_unavailable", 503)
+        return web.json_response({
+            "session_id": session_id, "lineage_root_digest": digest,
+            "process_pid": pid, "process_started_at": started,
+        })
+
     async def _handle_canonical_surface_event(self, request: "web.Request"):
         """Serve one authenticated, existing-only canonical event."""
         auth_error = self._check_auth(request)
@@ -2378,6 +2442,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/api/model/options", self._handle_model_options),
             ("GET", "/v1/capabilities", self._handle_capabilities),
             ("POST", "/v1/canonical-surface/events", self._handle_canonical_surface_event),
+            ("GET", "/v1/canonical-surface/identity", self._handle_canonical_surface_identity),
             # Authenticated browser-control surface: POST registration
             # mints a short-lived ticket; the controller then opens the WS with
             # that ticket. Both are gated on browser.extension_control.enabled
