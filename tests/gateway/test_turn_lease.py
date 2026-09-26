@@ -708,6 +708,15 @@ def test_agent_result_rotation_rebinds_event_token_after_slot_overwrite(
         entry.session_id = "sess-parent"
         async_store = runner.async_session_store
         async_store.get_or_create_session = AsyncMock(return_value=entry)
+
+        def repoint_entry(current, expected, target):
+            assert current is entry
+            assert (expected, target) == ("sess-parent", "sess-child")
+            assert current.session_id == expected
+            current.session_id = target
+            return True
+
+        runner.session_store.repoint_session_entry = MagicMock(side_effect=repoint_entry)
         event = _event()
         tokens = {}
 

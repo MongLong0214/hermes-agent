@@ -510,3 +510,233 @@ def test_cancelled_branch_keeps_claim_through_parent_read_and_child_seed(setup, 
         assert db.get_session(child.session_id)["parent_session_id"] == entry.session_id
 
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("command", ["new", "branch", "resume", "compress"])
+def test_cancelled_request_during_claim_acquisition_retains_worker_ownership(setup, monkeypatch, command):
+    async def exercise():
+        runner, entry, source = setup.runner, setup.entry, setup.source
+        entered, release = threading.Event(), threading.Event()
+        working, finish = asyncio.Event(), asyncio.Event()
+        original_claim = runner.session_store.claim_session_command
+
+        def paused_claim(*args):
+            entered.set()
+            assert release.wait(10)
+            return original_claim(*args)
+
+        async def paused_work(*args, **kwargs):
+            working.set()
+            await finish.wait()
+            return "done"
+
+        monkeypatch.setattr(runner.session_store, "claim_session_command", paused_claim)
+        handler = {
+            "new": ("_handle_reset_command", "_execute_reset_command", "/new"),
+            "branch": ("_handle_branch_command", "_execute_branch_command", "/branch test"),
+            "resume": ("_handle_resume_command", "_execute_resume_switch", "/resume prior"),
+            "compress": ("_handle_compress_command", "_execute_compress_command", "/compress"),
+        }[command]
+        monkeypatch.setattr(runner, handler[1], paused_work)
+        if command == "resume":
+            db = runner.session_store._db
+            db.create_session("prior", "telegram", session_key=entry.session_key,
+                              user_id="user", chat_id="chat")
+            db.set_session_title("prior", "Prior")
+        task = asyncio.create_task(getattr(runner, handler[0])(
+            MessageEvent(text=handler[2], source=source, message_id="claim-cancel")))
+        try:
+            assert await asyncio.to_thread(entered.wait, 10)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            release.set()
+            await asyncio.wait_for(working.wait(), 10)
+            with pytest.raises(ValueError, match="canonical_binding_stale"):
+                runner.session_store.reserve_canonical_entry(entry)
+        finally:
+            release.set()
+            finish.set()
+        for _ in range(200):
+            if not runner.session_store._command_claims.get(entry.session_key):
+                break
+            await asyncio.sleep(0.01)
+        assert not runner.session_store._command_claims.get(entry.session_key)
+        token = runner.session_store.reserve_canonical_entry(entry)
+        runner.session_store.release_canonical_entry(entry, token)
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("command", ["new", "busy_new", "branch", "resume", "compress"])
+def test_cancelled_claimed_worker_during_threaded_claim_releases_before_exit(setup, monkeypatch, command):
+    async def exercise():
+        runner, entry, source = setup.runner, setup.entry, setup.source
+        entered, release = threading.Event(), threading.Event()
+        original_claim = runner.session_store.claim_session_command
+        original_create_task = asyncio.create_task
+        worker = []
+        worker_names = {
+            "new": "claimed_reset", "busy_new": "claimed_busy_new",
+            "branch": "claimed_branch", "resume": "claimed_switch",
+            "compress": "claimed_compression",
+        }
+
+        def paused_claim(*args):
+            entered.set()
+            assert release.wait(10)
+            return original_claim(*args)
+
+        def capture_worker(coro, *args, **kwargs):
+            task = original_create_task(coro, *args, **kwargs)
+            if coro.cr_code.co_name == worker_names[command]:
+                worker.append(task)
+            return task
+
+        if command == "resume":
+            db = runner.session_store._db
+            db.create_session("prior", "telegram", session_key=entry.session_key,
+                              user_id="user", chat_id="chat")
+            db.set_session_title("prior", "Prior")
+        monkeypatch.setattr(runner.session_store, "claim_session_command", paused_claim)
+        monkeypatch.setattr(asyncio, "create_task", capture_worker)
+        handler = {
+            "new": (runner._handle_reset_command, "/new"),
+            "busy_new": (None, "/new"),
+            "branch": (runner._handle_branch_command, "/branch test"),
+            "resume": (runner._handle_resume_command, "/resume prior"),
+            "compress": (runner._handle_compress_command, "/compress"),
+        }[command]
+        event = MessageEvent(text=handler[1], source=source, message_id="worker-cancel")
+        requester = original_create_task(
+            runner._busy_new_command(event, entry.session_key, source)
+            if command == "busy_new" else handler[0](event)
+        )
+        try:
+            assert await asyncio.to_thread(entered.wait, 10)
+            assert len(worker) == 1
+            worker[0].cancel()
+            worker[0].cancel()
+            await asyncio.sleep(0)
+            assert not worker[0].done(), "claimed worker exited before its claim thread"
+        finally:
+            release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(requester, 10)
+        assert worker[0].done()
+        assert not runner.session_store._command_claims.get(entry.session_key)
+        token = runner.session_store.reserve_canonical_entry(entry)
+        runner.session_store.release_canonical_entry(entry, token)
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("stage", ["execution", "release"])
+def test_cancelled_branch_worker_drains_threaded_stage_before_releasing_claim(setup, monkeypatch, stage):
+    async def exercise():
+        runner, entry, source = setup.runner, setup.entry, setup.source
+        entered, finish = threading.Event(), threading.Event()
+        original_create_task = asyncio.create_task
+        original_release = runner.session_store.release_session_command
+        worker = []
+
+        def capture_worker(coro, *args, **kwargs):
+            task = original_create_task(coro, *args, **kwargs)
+            if coro.cr_code.co_name == "claimed_branch":
+                worker.append(task)
+            return task
+
+        def paused_thread():
+            entered.set()
+            assert finish.wait(10)
+
+        async def threaded_execution(*args):
+            await asyncio.to_thread(paused_thread)
+            return "done"
+
+        def threaded_release(*args):
+            paused_thread()
+            return original_release(*args)
+
+        monkeypatch.setattr(asyncio, "create_task", capture_worker)
+        monkeypatch.setattr(runner, "_execute_branch_command",
+                            threaded_execution if stage == "execution" else lambda *args: asyncio.sleep(0))
+        if stage == "release":
+            monkeypatch.setattr(runner.session_store, "release_session_command", threaded_release)
+        event = MessageEvent(text="/branch test", source=source, message_id="thread-stage")
+        requester = original_create_task(runner._handle_branch_command(event))
+        try:
+            assert await asyncio.to_thread(entered.wait, 10)
+            assert len(worker) == 1
+            worker[0].cancel()
+            await asyncio.sleep(0)
+            worker[0].cancel()
+            await asyncio.sleep(0)
+            assert not worker[0].done()
+            with pytest.raises(ValueError, match="canonical_binding_stale"):
+                runner.session_store.reserve_canonical_entry(entry)
+        finally:
+            finish.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(requester, 10)
+        assert not runner.session_store._command_claims.get(entry.session_key)
+        token = runner.session_store.reserve_canonical_entry(entry)
+        runner.session_store.release_canonical_entry(entry, token)
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("command", ["new", "busy_new", "branch", "resume", "compress"])
+def test_command_refuses_repointed_route_during_claim_acquisition(setup, monkeypatch, command):
+    async def exercise():
+        runner, entry, source = setup.runner, setup.entry, setup.source
+        store, db = runner.session_store, runner.session_store._db
+        original_id = entry.session_id
+        successor_id = "successor_for_claim_race"
+        db.create_session(successor_id, "telegram", session_key=entry.session_key,
+                          user_id="user", chat_id="chat")
+        if command == "resume":
+            db.create_session("prior", "telegram", session_key=entry.session_key,
+                              user_id="user", chat_id="chat")
+            db.set_session_title("prior", "Prior")
+        original_create_task = asyncio.create_task
+        scheduled = []
+        worker_names = {
+            "new": "claimed_reset", "busy_new": "claimed_busy_new",
+            "branch": "claimed_branch", "resume": "claimed_switch",
+            "compress": "claimed_compression",
+        }
+
+        def repoint_at_worker_scheduling(coro, *args, **kwargs):
+            if coro.cr_code.co_name == worker_names[command]:
+                assert not scheduled
+                scheduled.append(coro.cr_code.co_name)
+                assert store.repoint_session_entry(entry, original_id, successor_id)
+            return original_create_task(coro, *args, **kwargs)
+
+        async def forbidden_work(*args, **kwargs):
+            pytest.fail(f"/{command} executed against a repointed route")
+
+        monkeypatch.setattr(asyncio, "create_task", repoint_at_worker_scheduling)
+        handler = {
+            "new": (runner._handle_reset_command, "_execute_reset_command", "/new"),
+            "busy_new": (None, "_busy_new_command_claimed", "/new"),
+            "branch": (runner._handle_branch_command, "_execute_branch_command", "/branch test"),
+            "resume": (runner._handle_resume_command, "_execute_resume_switch", "/resume prior"),
+            "compress": (runner._handle_compress_command, "_execute_compress_command", "/compress"),
+        }[command]
+        monkeypatch.setattr(runner, handler[1], forbidden_work)
+        event = MessageEvent(text=handler[2], source=source, message_id="repoint-race")
+        task = asyncio.create_task(
+            runner._busy_new_command(event, entry.session_key, source)
+            if command == "busy_new" else handler[0](event)
+        )
+        result = await asyncio.wait_for(task, 10)
+        assert scheduled == [worker_names[command]]
+        assert "busy" in str(result).lower()
+        assert store._entries[entry.session_key] is entry
+        assert entry.session_id == successor_id
+        assert not store._command_claims.get(entry.session_key)
+        assert db.get_session(successor_id)["end_reason"] is None
+
+    asyncio.run(exercise())

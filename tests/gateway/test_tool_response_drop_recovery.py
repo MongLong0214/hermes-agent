@@ -21,6 +21,7 @@ Salvaged and de-scoped from the superseded Discord-only PR #33842.
 
 import asyncio
 import logging
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -286,6 +287,8 @@ class TestPostStopInterruptSwallow:
         runner._agent_cache_lock = threading.Lock()
         runner.adapters = {}
         runner._pending_messages = {}
+        runner.session_store = MagicMock()
+        runner.session_store.canonical_entry_reserved.return_value = False
 
         invalidated = []
         runner._invalidate_session_run_generation = (

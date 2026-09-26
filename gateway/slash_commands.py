@@ -56,6 +56,41 @@ logger = logging.getLogger("gateway.run")
 _RESET_CLEANUP_TIMEOUT_S = 30.0
 
 
+async def _drain_owned_command_stage(coro):
+    """Finish a claimed stage even if its owning worker is cancelled."""
+    task = asyncio.create_task(coro)
+    cancelled = False
+    while True:
+        try:
+            return await asyncio.shield(task), cancelled
+        except asyncio.CancelledError:
+            if task.done():
+                return task.result(), True
+            cancelled = True
+
+
+async def _run_claimed_command(claim, execute, release, busy_reply):
+    """Keep an off-loop claim owned through execution and release."""
+    token = None
+    result: Any = None
+    cancelled = False
+    try:
+        try:
+            token, cancelled = await _drain_owned_command_stage(claim())
+        except ValueError:
+            return busy_reply
+        if not cancelled:
+            result, interrupted = await _drain_owned_command_stage(execute(token))
+            cancelled |= interrupted
+    finally:
+        if token is not None and release is not None:
+            _, interrupted = await _drain_owned_command_stage(release(token))
+            cancelled |= interrupted
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
+
+
 def _clean_str(value: Any) -> str:
     """Strip and return a non-empty string value, or empty string."""
     return value.strip() if isinstance(value, str) and value.strip() else ""
@@ -149,20 +184,24 @@ class GatewaySlashCommandsMixin:
         session_key = self._session_key_for_source(source)
         entry = self.session_store._entries.get(session_key)
         owned = _command_claim is None
-        if entry is not None:
-            if owned:
-                try:
-                    _command_claim = self.session_store.claim_session_command(entry, entry.session_id)
-                except ValueError:
-                    return "⏳ Session is busy — wait for the current response before `/new`."
-            elif not self.session_store.command_claim_owned(entry, _command_claim):
-                return "⏳ Session is busy — wait for the current response before `/new`."
+        intended_session_id = entry.session_id if entry is not None else None
         async def claimed_reset():
-            try:
-                return await self._execute_reset_command(event, session_key, _command_claim)
-            finally:
-                if owned and entry is not None and _command_claim is not None:
-                    self.session_store.release_session_command(entry, _command_claim)
+            async def claim():
+                if entry is None:
+                    return None
+                if owned:
+                    return await self.async_session_store.claim_session_command(entry, intended_session_id)
+                if not await self.async_session_store.command_claim_owned(entry, _command_claim):
+                    raise ValueError("command claim is no longer owned")
+                return _command_claim
+
+            return await _run_claimed_command(
+                claim,
+                lambda token: self._execute_reset_command(event, session_key, token),
+                (lambda token: self.async_session_store.release_session_command(entry, token))
+                if owned else None,
+                "⏳ Session is busy — wait for the current response before `/new`.",
+            )
 
         # The cleanup executor can outlive a cancelled request. Its owner
         # retains the claim through reset and all route-facing side effects.
@@ -4221,20 +4260,16 @@ class GatewaySlashCommandsMixin:
         if preview:
             return await self._execute_compress_command(event, session_entry)
 
-        try:
-            command_claim = self.session_store.claim_session_command(
-                session_entry, session_entry.session_id
-            )
-        except ValueError:
-            return "⏳ Session is busy — wait for the current response before `/compress`."
-
+        intended_session_id = session_entry.session_id
         async def claimed_compression():
-            try:
-                return await self._execute_compress_command(
-                    event, session_entry, command_claim=command_claim
-                )
-            finally:
-                self.session_store.release_session_command(session_entry, command_claim)
+            return await _run_claimed_command(
+                lambda: self.async_session_store.claim_session_command(
+                    session_entry, intended_session_id),
+                lambda token: self._execute_compress_command(
+                    event, session_entry, command_claim=token),
+                lambda token: self.async_session_store.release_session_command(session_entry, token),
+                "⏳ Session is busy — wait for the current response before `/compress`.",
+            )
 
         # Cancelling the requesting coroutine cannot cancel an executor's
         # SQLite/rotation work. Keep the claim owned by that worker through
@@ -4964,19 +4999,16 @@ class GatewaySlashCommandsMixin:
             current_entry = await self.async_session_store.get_or_create_session(source)
         if current_entry.session_id == target_id:
             return t("gateway.resume.already_on", name=name)
-        try:
-            command_claim = self.session_store.claim_session_command(
-                current_entry, current_entry.session_id
-            )
-        except ValueError:
-            return "⏳ Session is busy — wait for the current response before `/resume`."
+        intended_session_id = current_entry.session_id
         async def claimed_switch():
-            try:
-                return await self._execute_resume_switch(
-                    source, session_key, name, target_id, allow_cross_room, command_claim
-                )
-            finally:
-                self.session_store.release_session_command(current_entry, command_claim)
+            return await _run_claimed_command(
+                lambda: self.async_session_store.claim_session_command(
+                    current_entry, intended_session_id),
+                lambda token: self._execute_resume_switch(
+                    source, session_key, name, target_id, allow_cross_room, token),
+                lambda token: self.async_session_store.release_session_command(current_entry, token),
+                "⏳ Session is busy — wait for the current response before `/resume`.",
+            )
 
         # The switch runs in a thread that can outlive a cancelled request.
         # Keep its claim through DB writes and route cleanup in the worker.
@@ -5118,15 +5150,14 @@ class GatewaySlashCommandsMixin:
         entry = self.session_store._entries.get(session_key)
         if entry is None:
             entry = await self.async_session_store.get_or_create_session(source)
-        try:
-            command_claim = self.session_store.claim_session_command(entry, entry.session_id)
-        except ValueError:
-            return "⏳ Session is busy — wait for the current response before `/branch`."
+        intended_session_id = entry.session_id
         async def claimed_branch():
-            try:
-                return await self._execute_branch_command(event, session_key, entry, command_claim)
-            finally:
-                self.session_store.release_session_command(entry, command_claim)
+            return await _run_claimed_command(
+                lambda: self.async_session_store.claim_session_command(entry, intended_session_id),
+                lambda token: self._execute_branch_command(event, session_key, entry, token),
+                lambda token: self.async_session_store.release_session_command(entry, token),
+                "⏳ Session is busy — wait for the current response before `/branch`.",
+            )
 
         # The parent's read and child's seed run in threads that cannot be
         # cancelled with the request. Keep their claim through publication.

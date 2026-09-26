@@ -349,6 +349,8 @@ class TestGatewayCleanupWiring:
 
         runner = object.__new__(GatewayRunner)
         runner._agent_cache_lock = threading.Lock()
+        runner.session_store = MagicMock()
+        runner.session_store.canonical_entry_reserved.return_value = False
 
         mock_agent = MagicMock()
         runner._agent_cache = {"session-key": (mock_agent, 12345)}

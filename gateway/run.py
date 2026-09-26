@@ -2675,7 +2675,7 @@ from gateway.session_state import (
 )
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
-from gateway.slash_commands import GatewaySlashCommandsMixin
+from gateway.slash_commands import GatewaySlashCommandsMixin, _run_claimed_command
 from gateway.turn_context import TurnContext
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -16885,19 +16885,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _busy_new_command(self, event: MessageEvent, quick_key: str, source):
         entry = self.session_store._entries.get(quick_key)
-        if entry is not None:
-            try:
-                claim = self.session_store.claim_session_command(entry, entry.session_id)
-            except ValueError:
-                return "⏳ Session is busy — wait for the current response before `/new`."
-        else:
-            claim = None
+        intended_session_id = entry.session_id if entry is not None else None
         async def claimed_busy_new():
-            try:
-                return await self._busy_new_command_claimed(event, quick_key, source, claim)
-            finally:
-                if entry is not None and claim is not None:
-                    self.session_store.release_session_command(entry, claim)
+            async def claim():
+                if entry is None:
+                    return None
+                return await self.async_session_store.claim_session_command(entry, intended_session_id)
+
+            return await _run_claimed_command(
+                claim,
+                lambda token: self._busy_new_command_claimed(event, quick_key, source, token),
+                lambda token: self.async_session_store.release_session_command(entry, token),
+                "⏳ Session is busy — wait for the current response before `/new`.",
+            )
 
         # Interrupt and reset form one claimed operation; cancellation of the
         # caller must not release the upstream claim before either completes.
@@ -19513,10 +19513,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         reservation = None
         worker = None
         outward_callbacks = {}
+
+        async def drain_store_task(task):
+            cancelled = False
+            while True:
+                try:
+                    return await asyncio.shield(task), cancelled
+                except asyncio.CancelledError:
+                    if task.done():
+                        return task.result(), True
+                    cancelled = True
+
         try:
             # The session-ID lease serializes turns, while this key-scoped
             # reservation fences route/cache writers through worker completion.
-            reservation = self.session_store.reserve_canonical_entry(entry)
+            # The store operation is off-loop; if the caller is cancelled,
+            # await its worker so an acquired reservation cannot be orphaned.
+            async def reserve_entry():
+                return await self.async_session_store.reserve_canonical_entry(entry)
+
+            reservation_task = asyncio.create_task(reserve_entry())
+            reservation, cancelled = await drain_store_task(reservation_task)
+            if cancelled:
+                raise asyncio.CancelledError
             with self._agent_cache_lock:
                 cached = self._agent_cache.get(entry.session_key)
                 cached_agent = cached[0] if isinstance(cached, tuple) and cached else cached
@@ -19625,10 +19644,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if worker is not None:
                         for name, value in outward_callbacks.items():
                             setattr(agent, name, value)
-                finally:
+                    cancelled = False
                     if reservation is not None:
-                        self.session_store.release_canonical_entry(entry, reservation)
+                        async def release_entry():
+                            await self.async_session_store.release_canonical_entry(entry, reservation)
+
+                        release_task = asyncio.create_task(release_entry())
+                        _, cancelled = await drain_store_task(release_task)
+                finally:
                     self._turn_leases.release(lease)
+                if cancelled:
+                    raise asyncio.CancelledError
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""

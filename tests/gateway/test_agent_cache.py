@@ -22,6 +22,8 @@ def _make_runner():
     runner = GatewayRunner.__new__(GatewayRunner)
     runner._agent_cache = {}
     runner._agent_cache_lock = threading.Lock()
+    runner.session_store = MagicMock()
+    runner.session_store.canonical_entry_reserved.return_value = False
     return runner
 
 
@@ -239,6 +241,8 @@ class TestAgentCacheBoundedGrowth:
         runner = GatewayRunner.__new__(GatewayRunner)
         runner._agent_cache = OrderedDict()
         runner._agent_cache_lock = threading.Lock()
+        runner.session_store = MagicMock()
+        runner.session_store.canonical_entry_reserved.return_value = False
         return runner
 
     def _fake_agent(self, last_activity: float | None = None):
@@ -272,6 +276,7 @@ class TestAgentCacheBoundedGrowth:
 
         # Finalizable (finite policy), not yet expired.
         runner.session_store = MagicMock()
+        runner.session_store.canonical_entry_reserved.return_value = False
         runner.session_store._entries = {"old": MagicMock(), "new": MagicMock()}
         runner.session_store.is_session_finalizable.return_value = True
         runner.session_store._is_session_expired.return_value = False
@@ -313,6 +318,7 @@ class TestAgentCacheBoundedGrowth:
         runner._release_evicted_agent_soft = lambda agent: release_calls.append(agent)
 
         runner.session_store = MagicMock()
+        runner.session_store.canonical_entry_reserved.return_value = False
         runner.session_store._entries = {"old": MagicMock(), "new": MagicMock()}
         runner.session_store.is_session_finalizable.return_value = False  # mode='none'
         runner.session_store._is_session_expired.return_value = False

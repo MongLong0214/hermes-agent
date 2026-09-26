@@ -69,9 +69,12 @@ def _make_runner():
     runner._session_model_overrides = {}
     runner.hooks = SimpleNamespace(loaded_hooks=False)
     runner.config = SimpleNamespace(streaming=None)
+    canonical_reservations = {}
     runner.session_store = SimpleNamespace(
         get_or_create_session=lambda source: SimpleNamespace(session_id="session-1"),
         load_transcript=lambda session_id: [],
+        _canonical_reservations=canonical_reservations,
+        canonical_entry_reserved=lambda session_key: session_key in canonical_reservations,
     )
     runner._get_or_create_gateway_honcho = lambda session_key: (None, None)
     runner._enrich_message_with_vision = AsyncMock(return_value="ENRICHED")
@@ -122,6 +125,22 @@ def test_turn_route_injects_priority_processing_without_changing_runtime():
     assert route["runtime"]["provider"] == "openrouter"
     assert route["runtime"]["api_mode"] == "chat_completions"
     assert route["request_overrides"] == {"service_tier": "priority"}
+
+
+def test_reserved_canonical_entry_prevents_fast_cache_eviction():
+    runner = _make_runner()
+    key = runner._session_key_for_source(_make_source())
+    cached = MagicMock()
+    runner._agent_cache[key] = cached
+
+    runner.session_store._canonical_reservations[key] = (MagicMock(), object())
+    runner._evict_cached_agent(key)
+    assert runner._agent_cache[key] is cached
+    cached.release_clients.assert_not_called()
+
+    runner.session_store._canonical_reservations.pop(key)
+    runner._evict_cached_agent(key)
+    assert key not in runner._agent_cache
 
 
 @pytest.mark.asyncio

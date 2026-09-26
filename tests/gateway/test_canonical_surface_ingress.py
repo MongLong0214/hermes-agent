@@ -748,6 +748,62 @@ def test_cancelled_turn_keeps_outward_callbacks_quarantined_until_worker_exits(i
     asyncio.run(exercise())
 
 
+@pytest.mark.parametrize("phase", ["acquire", "release"])
+def test_repeated_cancellation_keeps_canonical_fences_until_reservation_teardown(ingress, monkeypatch, phase):
+    store = ingress.runner.session_store
+    leases = ingress.runner._turn_leases
+    entered, continue_store = threading.Event(), threading.Event()
+    lease_releases = []
+    finished = asyncio.Event()
+    original_lease_release = leases.release
+    operation_name = "reserve_canonical_entry" if phase == "acquire" else "release_canonical_entry"
+    original_operation = getattr(store, operation_name)
+
+    def paused_operation(*args):
+        entered.set()
+        assert continue_store.wait(10)
+        return original_operation(*args)
+
+    def release_lease(lease):
+        # The session lease must never open while the key reservation exists.
+        lease_releases.append(store.canonical_entry_reserved(ingress.entry.session_key))
+        original_lease_release(lease)
+
+    monkeypatch.setattr(store, operation_name, paused_operation)
+    monkeypatch.setattr(leases, "release", release_lease)
+    outward = lambda *_args: None
+    ingress.agent.callback = outward
+
+    async def exercise():
+        finished = asyncio.Event()
+        first = asyncio.create_task(ingress.send())
+        try:
+            assert await asyncio.to_thread(entered.wait, 10)
+            first.cancel()
+            # Let the first cancellation enter the shielded drain / release.
+            await asyncio.sleep(0)
+            first.cancel()
+            await asyncio.sleep(0)
+            assert leases._leases[ingress.entry.session_id].lock.locked()
+            assert lease_releases == []
+            if phase == "release":
+                assert store.canonical_entry_reserved(ingress.entry.session_key)
+        finally:
+            continue_store.set()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        for _ in range(100):
+            if lease_releases:
+                break
+            await asyncio.sleep(0)
+        assert lease_releases == [False]
+        assert not store.canonical_entry_reserved(ingress.entry.session_key)
+        assert not leases._leases[ingress.entry.session_id].lock.locked()
+        assert ingress.agent.callback is outward
+
+    asyncio.run(exercise())
+
+
 def test_shutdown_cache_sweep_preserves_paused_canonical_worker_and_cleans_idle(ingress, monkeypatch):
     entered, release = threading.Event(), threading.Event()
     original_run = ingress.agent.run_conversation

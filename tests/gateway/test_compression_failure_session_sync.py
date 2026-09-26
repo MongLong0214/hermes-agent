@@ -5,6 +5,8 @@ import types
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 import gateway.run as gateway_run
 from gateway.config import Platform
 from gateway.session import SessionSource
@@ -20,8 +22,28 @@ class _SessionStore:
             session_id="session-before-compression",
         )
         self._entries = {SESSION_KEY: self.entry}
+        self._lock = threading.RLock()
+        self._canonical_reservations = set()
+        self._command_claims = set()
         self.save_calls = 0
         self.peer_records = []
+
+    def canonical_entry_reserved(self, session_key):
+        with self._lock:
+            return session_key in self._canonical_reservations
+
+    def repoint_session_entry(self, entry, expected_session_id, target_session_id):
+        with self._lock:
+            if (self._entries.get(entry.session_key) is not entry
+                    or entry.session_id != expected_session_id):
+                return False
+            if expected_session_id == target_session_id:
+                return True
+            if (entry.session_key in self._canonical_reservations
+                    or entry.session_key in self._command_claims):
+                raise ValueError("canonical_turn_busy")
+            entry.session_id = target_session_id
+            return True
 
     def _save(self):
         self.save_calls += 1
@@ -30,6 +52,34 @@ class _SessionStore:
         # #55300 records the child's gateway peer metadata after a compression
         # split; the fake tracks the call so tests can assert it fired.
         self.peer_records.append((session_id, session_key, source))
+
+
+def test_session_store_repoint_rejects_stale_and_claimed_bindings():
+    store = _SessionStore()
+    entry = store.entry
+    old_id = entry.session_id
+    new_id = "session-after-compression"
+
+    assert not store.repoint_session_entry(entry, "stale-id", new_id)
+    assert not store.repoint_session_entry(SimpleNamespace(
+        session_key=SESSION_KEY, session_id=old_id,
+    ), old_id, new_id)
+    assert entry.session_id == old_id
+
+    store._canonical_reservations.add(SESSION_KEY)
+    assert store.canonical_entry_reserved(SESSION_KEY)
+    with pytest.raises(ValueError, match="canonical_turn_busy"):
+        store.repoint_session_entry(entry, old_id, new_id)
+    store._canonical_reservations.remove(SESSION_KEY)
+
+    store._command_claims.add(SESSION_KEY)
+    with pytest.raises(ValueError, match="canonical_turn_busy"):
+        store.repoint_session_entry(entry, old_id, new_id)
+    store._command_claims.remove(SESSION_KEY)
+
+    assert store.repoint_session_entry(entry, old_id, new_id)
+    assert entry.session_id == new_id
+    assert not store.repoint_session_entry(entry, old_id, "unrelated-id")
 
 
 class _CompressionThenFailureAgent:

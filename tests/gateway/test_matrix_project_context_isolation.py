@@ -303,22 +303,20 @@ async def test_matrix_status_reports_current_matrix_room_scope():
 
 
 @pytest.mark.asyncio
-async def test_matrix_resume_quoted_title_same_room():
+async def test_matrix_resume_quoted_title_already_on_same_room():
     source_b = _make_matrix_source(PROJECT_B_ROOM_ID, PROJECT_B_NAME, PROJECT_B_TOPIC)
     entry_b = _entry(source_b, "session-b-old", "Project B Plan")
     runner = _make_runner(source_b, [entry_b])
-    runner.session_store.get_or_create_session.return_value = _entry(
-        source_b, "session-b-current", "Current Project B"
-    )
-    runner.session_store.switch_session.return_value = entry_b
     runner._session_db._db.resolve_session_by_title.return_value = "session-b-old"
 
     result = await runner._handle_resume_command(
         _event('/resume "Project B Plan"', source_b)
     )
 
-    assert "Resumed session" in result
+    assert "Already on session **Project B Plan**" in result
     runner._session_db._db.resolve_session_by_title.assert_called_once_with("Project B Plan")
+    runner.session_store.switch_session.assert_not_called()
+    runner.session_store.claim_session_command.assert_not_called()
 
 
 @pytest.mark.asyncio

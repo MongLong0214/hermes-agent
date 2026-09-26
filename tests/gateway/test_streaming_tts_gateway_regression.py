@@ -76,6 +76,7 @@ def _make_runner():
     runner.session_store = SimpleNamespace(
         get_or_create_session=lambda source: SimpleNamespace(session_id="session-1"),
         load_transcript=lambda session_id: [],
+        canonical_entry_reserved=lambda session_key: False,
     )
     runner._get_or_create_gateway_honcho = lambda session_key: (None, None)
     runner._enrich_message_with_vision = AsyncMock(return_value="ENRICHED")
