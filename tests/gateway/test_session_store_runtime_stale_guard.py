@@ -17,6 +17,8 @@ stale entry, falling through to `_recover_session_from_db` (which reopens
 transcript) or, failing recovery, to a fresh session.
 """
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
 
@@ -97,6 +99,54 @@ class TestIsSessionEndedInDb:
 # ---------------------------------------------------------------------------
 
 class TestRuntimeStaleGuard:
+
+    def test_recovery_reopen_fences_competing_route_publish(self, tmp_path):
+        """A force-new writer cannot publish while recovery is reopening its row."""
+        source = _source()
+        db = _db_returning({})
+        db.find_latest_gateway_session_for_peer.return_value = {
+            "id": "sid_recovered",
+            "started_at": datetime.now().timestamp(),
+        }
+        store = _make_store_with_db(tmp_path, db)
+        key = store._generate_session_key(source)
+        before_reopen = threading.Event()
+        release_reopen = threading.Event()
+        reopened_routes = []
+
+        def reopen(session_id):
+            before_reopen.set()
+            assert release_reopen.wait(timeout=10)
+            with store._lock:
+                published = store._entries.get(key)
+                reopened_routes.append((session_id, published.session_id if published else None))
+
+        db.reopen_session.side_effect = reopen
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            recovery = pool.submit(store.get_or_create_session, source)
+            try:
+                assert before_reopen.wait(timeout=10)
+                # Invoke the real transition underneath the single-flight
+                # wrapper: independent route writers can run during DB I/O.
+                contender = pool.submit(store._get_or_create_session_impl, source, True)
+                try:
+                    contender.result(timeout=10)
+                except ValueError as exc:
+                    contender_error = str(exc)
+                else:
+                    contender_error = None
+            finally:
+                release_reopen.set()
+            recovered = recovery.result(timeout=10)
+
+        assert contender_error == "canonical_turn_busy"
+        assert reopened_routes == [("sid_recovered", None)]
+        assert store.peek_session_id(key) == recovered.session_id == "sid_recovered"
+        db.create_session.assert_not_called()
+        # The fence is transient: normal route mutation works after recovery.
+        next_entry = store.get_or_create_session(source, force_new=True)
+        assert next_entry.session_id != recovered.session_id
+        assert store.peek_session_id(key) == next_entry.session_id
 
     def test_stale_ws_orphan_reap_entry_recovered_preserving_session_id(self, tmp_path):
         """Stale ``ws_orphan_reap`` entry → recovery reopens the SAME session_id (#63207)."""

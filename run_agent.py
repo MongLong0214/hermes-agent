@@ -8614,6 +8614,13 @@ class AIAgent:
         turn_receipt=None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
+        from gateway.canonical_surface import canonical_method_entry_preflight
+
+        preflight = canonical_method_entry_preflight.get()
+        if preflight is not None:
+            canonical_method_entry_preflight.set(None)
+            preflight(self, task_id)
+
         # A review deliberately shares this agent's session_id for prompt-cache
         # parity. Fence review startup or interrupt an admitted request, then
         # await that request's exit before opening any live-turn Relay or task

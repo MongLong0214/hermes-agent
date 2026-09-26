@@ -55,6 +55,9 @@ def _make_runner(session_db=None, current_session_id="current_session_001",
     mock_session_entry.session_id = current_session_id
     mock_session_entry.session_key = session_key
     mock_store = MagicMock()
+    # No pre-existing canonical entry or in-flight turn reservation.
+    mock_store._entries = {}
+    mock_store.canonical_entry_reserved.return_value = False
     mock_store.get_or_create_session.return_value = mock_session_entry
     mock_store.load_transcript.return_value = []
     mock_store.switch_session.return_value = mock_session_entry
@@ -229,8 +232,9 @@ class TestHandleResumeCommand:
         runner._agent_cache = {real_key: (MagicMock(), object())}
         runner._agent_cache_lock = threading.RLock()
 
-        await runner._handle_resume_command(event)
+        result = await runner._handle_resume_command(event)
 
+        assert "Resumed" in result
         assert real_key not in runner._agent_cache
         db.close()
 

@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from contextvars import ContextVar
+from pathlib import Path
 import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping, Protocol
@@ -12,6 +14,10 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping, Protocol
 if TYPE_CHECKING:
     from gateway.session import SessionEntry, SessionStore
 
+
+canonical_method_entry_preflight: ContextVar[Callable[[Any, Any], None] | None] = ContextVar(
+    "canonical_method_entry_preflight", default=None
+)
 
 _EVENT_FIELDS = frozenset({"binding", "event_id", "author_id", "channel_id", "text"})
 _MAX_ID_CHARS = 256
@@ -197,23 +203,57 @@ class CanonicalEventReceipt:
 
 
 class ExistingCanonicalBindingResolver:
-    """Read an exact configured binding without creating, healing, or rotating it."""
+    """Read a configured ancestor of the existing live head without healing it."""
 
     def __init__(self, session_store: "SessionStore") -> None:
         self._session_store = session_store
 
+    def _lineage_root(self, head: str, pin: str) -> str:
+        """Read one bounded, complete parent path from the already-open DB's file."""
+        from hermes_state import SessionDB
+
+        owned_db = self._session_store._db
+        path = getattr(owned_db, "db_path", None)
+        if not isinstance(path, Path) or not path.is_file():
+            raise ValueError("canonical_binding_stale")
+        with SessionDB(path, read_only=True) as reader:
+            seen: set[str] = set()
+            current = head
+            found = False
+            for _ in range(100):
+                if not isinstance(current, str) or not current or current in seen:
+                    break
+                seen.add(current)
+                with reader._read_ctx() as conn:
+                    row = conn.execute(
+                        "SELECT id, parent_session_id FROM sessions WHERE id = ?", (current,)
+                    ).fetchone()
+                if row is None:
+                    break
+                found |= current == pin
+                parent = row["parent_session_id"]
+                if parent is None:
+                    if not found:
+                        break
+                    return current
+                current = parent
+        raise ValueError("canonical_binding_stale")
+
     def resolve(
-        self, binding: CanonicalSurfaceBinding, event: CanonicalIngressEvent
+        self, binding: CanonicalSurfaceBinding, event: CanonicalIngressEvent | None,
+        *, read_only: bool = False,
     ) -> "SessionEntry":
         from gateway.config import Platform
 
         if (
-            event.author_id not in binding.allowed_author_ids
-            or event.channel_id not in binding.allowed_channel_ids
+            event is not None and (
+                event.author_id not in binding.allowed_author_ids
+                or event.channel_id not in binding.allowed_channel_ids
+            )
         ):
             raise ValueError("canonical_principal_rejected")
         entry = self._session_store.lookup_by_session_key_existing(binding.session_key)
-        if entry is None or entry.session_id != binding.session_id:
+        if entry is None:
             raise ValueError("canonical_binding_stale")
         if entry.platform != Platform.TELEGRAM or entry.origin is None:
             raise ValueError("canonical_binding_stale")
@@ -233,11 +273,28 @@ class ExistingCanonicalBindingResolver:
             db = self._session_store._db
             if db is None:
                 raise ValueError("canonical_binding_stale")
-            row: Mapping[str, Any] | None = db.get_session(binding.session_id)
-            if row is None or row.get("ended_at") is not None:
-                raise ValueError("canonical_binding_stale")
-            if db.get_compression_tip(binding.session_id) != binding.session_id:
-                raise ValueError("canonical_binding_stale")
+            if read_only:
+                from hermes_state import SessionDB
+
+                path = getattr(db, "db_path", None)
+                if not isinstance(path, Path) or not path.is_file():
+                    raise ValueError("canonical_binding_stale")
+                with SessionDB(path, read_only=True) as reader:
+                    with reader._read_ctx() as conn:
+                        row = conn.execute(
+                            "SELECT ended_at FROM sessions WHERE id = ?", (entry.session_id,)
+                        ).fetchone()
+                    if row is None or row["ended_at"] is not None:
+                        raise ValueError("canonical_binding_stale")
+                    if reader.get_compression_tip(entry.session_id) != entry.session_id:
+                        raise ValueError("canonical_binding_stale")
+            else:
+                row: Mapping[str, Any] | None = db.get_session(entry.session_id)
+                if row is None or row.get("ended_at") is not None:
+                    raise ValueError("canonical_binding_stale")
+                if db.get_compression_tip(entry.session_id) != entry.session_id:
+                    raise ValueError("canonical_binding_stale")
+            self._lineage_root(entry.session_id, binding.session_id)
         except ValueError:
             raise
         except Exception:
