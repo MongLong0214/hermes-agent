@@ -2254,12 +2254,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
     async def _handle_canonical_surface_identity(self, request: "web.Request"):
         """Return a request-local proof of the existing head; never execute a turn."""
-        import math
-        import os
-        import sys
-        from pathlib import Path
-
-        from gateway.canonical_surface import ExistingCanonicalIdentityResolver
+        from gateway.canonical_surface import ExistingCanonicalIdentityResolver, canonical_process_identity
 
         # Unlike legacy test adapters, the identity proof must fail closed without a key.
         if not self._expected_api_key():
@@ -2292,23 +2287,8 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         except Exception:
             return refuse("canonical_binding_stale", 409)
-        pid = os.getpid()
         try:
-            if sys.platform == "darwin":
-                import psutil
-
-                created = psutil.Process(pid).create_time()
-                if not math.isfinite(created) or created <= 0:
-                    raise ValueError("invalid process start")
-                started = f"darwin-tv:{created:.6f}"
-            elif sys.platform == "linux":
-                fields = Path(f"/proc/{pid}/stat").read_text(encoding="ascii").rsplit(")", 1)[1].split()
-                ticks = fields[19]
-                if not ticks.isascii() or not ticks.isdecimal() or int(ticks) <= 0:
-                    raise ValueError("invalid process start")
-                started = f"linux-clk:{ticks}"
-            else:
-                raise ValueError("unsupported process")
+            pid, started = canonical_process_identity()
         except Exception:
             return refuse("canonical_identity_unavailable", 503)
         return web.json_response({
@@ -2326,6 +2306,8 @@ class APIServerAdapter(BasePlatformAdapter):
             CanonicalIngressEvent,
             CanonicalTurnResult,
             ExistingCanonicalBindingResolver,
+            ExistingCanonicalIdentityResolver,
+            canonical_process_identity,
             request_local_reply_sink,
         )
 
@@ -2362,6 +2344,20 @@ class APIServerAdapter(BasePlatformAdapter):
                 binding,
                 event,
             )
+            if event.expected_identity is not None:
+                session_id, digest = await asyncio.to_thread(
+                    ExistingCanonicalIdentityResolver(runner.session_store).resolve, binding
+                )
+                try:
+                    pid, started = canonical_process_identity()
+                except Exception:
+                    raise ValueError("canonical_identity_unavailable") from None
+                if (
+                    event.expected_identity != (session_id, digest, pid, started)
+                    or entry.session_key != binding.session_key
+                    or entry.session_id != session_id
+                ):
+                    raise ValueError("canonical_identity_mismatch")
             receipt = CanonicalEventReceipt(runner.session_store._db, binding, event)
             # Volatile state only refines the error: SQLite alone authorizes a
             # turn. An absent local owner never permits reclaim after a crash.
@@ -2398,6 +2394,8 @@ class APIServerAdapter(BasePlatformAdapter):
             code = str(exc)
             if code == "canonical_principal_rejected":
                 status = 403
+            elif code == "canonical_identity_unavailable":
+                status = 503
             else:
                 status = 409
                 if code not in {
@@ -2410,6 +2408,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "canonical_reply_publish_failed",
                     "canonical_reply_already_published",
                     "canonical_reply_sink_missing",
+                    "canonical_identity_mismatch",
                 }:
                     code = "canonical_turn_refused"
             return web.json_response(
