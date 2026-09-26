@@ -28,6 +28,7 @@ import agent.conversation_compression as cc
 from agent.auxiliary_client import AuxiliaryExplicitCancellation
 from agent.context_compressor import SUMMARY_PREFIX, pin_summary_route
 from agent.conversation_compression import CompressionCommitFence, run_compress_context_with_progress_timeout
+from hermes_constants import OPENROUTER_MODELS_URL
 from hermes_state import SessionDB
 
 CHAIN_ENTRY = {
@@ -286,14 +287,22 @@ def test_over_window_request_commits_the_deterministic_fallback_on_the_first_sta
     """A request above the model's context window cannot be sent unchanged, so waiting for a SECOND stall
     (which on the messaging gateway never comes — the first one auto-reset the session) is a dead end:
     the deterministic rung runs on the first stall and the transcript is committed (#114594)."""
-    agent = _make_agent(tmp_path, "C")
-    compressor = agent.context_compressor
-    compressor.context_length = 64_000
-    calls = []
-    live = _transcript()
-    with patch("agent.context_compressor.call_llm", side_effect=_stalling_call_llm(compressor, calls)), \
-            patch("agent.auxiliary_client._get_auxiliary_task_config", return_value={"fallback_chain": []}):
-        out, _ = agent._compress_context(live, "sys", approx_tokens=70_000)
+    # Construction pre-warms the OpenRouter catalogue; context resolution uses separately imported bindings.
+    with patch("agent.model_metadata.requests.get", side_effect=OSError("network blocked")) as metadata_http, \
+            patch("agent.agent_init.fetch_model_metadata", return_value={}), \
+            patch("agent.model_metadata.get_model_context_length", return_value=256_000), \
+            patch("agent.context_compressor.get_model_context_length", return_value=256_000):
+        agent = _make_agent(tmp_path, "C")
+        compressor = agent.context_compressor
+        compressor.context_length = 64_000
+        calls = []
+        live = _transcript()
+        with patch("agent.context_compressor.call_llm", side_effect=_stalling_call_llm(compressor, calls)), \
+                patch("agent.auxiliary_client._get_auxiliary_task_config", return_value={"fallback_chain": []}):
+            out, _ = agent._compress_context(live, "sys", approx_tokens=70_000)
+        assert all(call.args[0] != OPENROUTER_MODELS_URL for call in metadata_http.call_args_list), (
+            "compression must not fetch OpenRouter model metadata"
+        )
 
     assert calls == ["primary"], "the deterministic rung makes no second summary LLM call"
     assert out is not live and len(out) < len(live)
