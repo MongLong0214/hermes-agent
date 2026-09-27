@@ -6,9 +6,9 @@ its own, so a process killed during the rebuild (minutes on a multi-GB store) le
 shape over an empty index: the shape probe that schedules the realign no longer fired, and
 search missed every older message from then on.
 
-Behaviour contracts on the index a reopen serves, not on how the migration is written: every
-row carrying the token is found by the index (MATCH count == LIKE count), and the layout marker
-is current.
+After an interrupted open, the old index must still serve its rows before another open can
+repair anything. A later open must find every row carrying the token (MATCH count == LIKE count)
+and leave the layout marker current.
 """
 
 import sqlite3
@@ -96,6 +96,18 @@ def test_a_realign_cut_off_in_its_rebuild_completes_on_the_next_open(tmp_path, m
         patch.setattr(sqlite3, "connect", _connect_cutting_off_the_realign_rebuild(sqlite3.connect))
         with pytest.raises(sqlite3.OperationalError, match="interrupted"):
             SessionDB(db_path=db_path)
+
+    raw = sqlite3.connect(db_path)
+    try:
+        ddl = raw.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts'"
+        ).fetchone()[0]
+        assert "content='messages'" in ddl
+        assert raw.execute(
+            "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH ?", (NEEDLE,)
+        ).fetchone()[0] == NEEDLE_ROWS
+    finally:
+        raw.close()
 
     db = SessionDB(db_path=db_path)
     try:
