@@ -10,6 +10,7 @@ from __future__ import annotations
 import errno
 import hashlib
 import json
+import logging
 import os
 import platform
 import re
@@ -22,6 +23,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
 from hermes_cli.timefmt import EPOCH_MAX, EPOCH_MIN
+from hermes_platform.host.facts import os_family
 from hermes_state import SessionDB
 from hermes_state_common import FTS_STORAGE_VERSION, SCHEMA_VERSION
 from hermes_state_repair import _db_opens_cleanly
@@ -29,6 +31,8 @@ from utils import fsync_directory
 
 
 ProgressCallback = Callable[[dict[str, Any]], None]
+NoticeCallback = Callable[[str], None]
+logger = logging.getLogger(__name__)
 _CANONICAL_TABLES = (
     "system_prompts", "sessions", "messages", "session_model_usage", "compression_locks", "gateway_routing",
     "async_delegations",
@@ -60,7 +64,8 @@ _GENERATED_META_KEYS = frozenset({
 _SIDECAR_SUFFIXES = ("", "-wal", "-shm", "-journal")
 _STAGE_PREFIX = ".hermes-session-recovery-stage-"
 # What os.link raises where the filesystem has no hard links: exFAT/FAT on macOS ENOTSUP, vfat on Linux EPERM.
-_NO_HARD_LINK_ERRNOS = frozenset({errno.ENOTSUP, errno.EOPNOTSUPP, errno.EPERM})
+_NO_HARD_LINK_ERRNOS = frozenset({errno.ENOTSUP, errno.EOPNOTSUPP, errno.EPERM, errno.ENOSYS})
+_NO_EXCLUSIVE_RENAME_ERRNOS = frozenset({errno.EINVAL, errno.ENOSYS, errno.ENOTSUP, errno.EOPNOTSUPP})
 _MINIMUM_SPACE_HEADROOM = 256 * 1024 * 1024
 _MAX_SALVAGE_RANGE_QUERIES = 10_000
 _MIN_SQLITE_ROWID = -(2**63)
@@ -110,7 +115,7 @@ def _validate_paths(
             if not suffix and stat.S_ISREG(existing.st_mode) and existing.st_size == 0:
                 raise SessionRecoverySafetyError(
                     f"Refusing to overwrite existing recovery output: {candidate} is an empty file, which is the "
-                    "placeholder a recovery interrupted while publishing leaves on a filesystem without hard links "
+                    "placeholder an earlier recovery interrupted while publishing left on a filesystem without hard links "
                     "(exFAT, FAT). If nothing else created it, delete it and re-run."
                 )
             raise SessionRecoverySafetyError(f"Refusing to overwrite existing recovery output: {candidate}")
@@ -1252,16 +1257,13 @@ def _host_tag() -> str:
 
 
 def _owner_prefix(prefix: str) -> str:
-    """``prefix`` + this process's owner tag (host, pid, start time in ms): a later run removes the directory
-    only once that exact process is provably gone."""
+    """``prefix`` + this process's owner tag (host, pid, start time in ms)."""
     from hermes_cli.process_identity import _process_create_time
     return f"{prefix}{_host_tag()}-{os.getpid()}-{int((_process_create_time() or 0) * 1000)}-"
 
 
-def _remove_dead_owner_dirs(directory: Path, prefix: str) -> None:
-    """Remove what a run killed before its own cleanup (SIGKILL, power loss) left in ``directory``: only real
-    directories named ``_owner_prefix(prefix)`` + a mkdtemp suffix whose owner process is provably gone. A live
-    or unprovable owner, another host's run, a symlink or any other name is never touched."""
+def _report_dead_owner_dirs(directory: Path, prefix: str, notice_cb: Optional[NoticeCallback] = None) -> None:
+    """Report a dead run's stage without deleting a name in the shared output directory."""
     from hermes_cli.process_identity import _pid_alive_matches
     pattern = re.compile(re.escape(prefix) + r"([0-9a-f]{8})-(\d+)-(\d+)-[a-z0-9_]{8}")
     try:
@@ -1273,13 +1275,20 @@ def _remove_dead_owner_dirs(directory: Path, prefix: str) -> None:
         if match is None or match[1] != _host_tag() or not entry.is_dir(follow_symlinks=False):
             continue
         if _pid_alive_matches(int(match[2]), int(match[3]) / 1000 or None) is False:
-            shutil.rmtree(entry.path, ignore_errors=True)
+            notice = (
+                f"Recovery left staging directory {entry.path} because its owner is no longer running. "
+                "Inspect it first; if it is no longer needed, it is safe to delete manually."
+            )
+            logger.warning("%s", notice)
+            if notice_cb is not None:
+                notice_cb(notice)
 
 
 @contextmanager
-def _staged_output(output: Path) -> Iterator[Path]:
+def _staged_output(output: Path, notice_cb: Optional[NoticeCallback] = None) -> Iterator[Path]:
     """A candidate path in a private directory beside ``output``: the same filesystem, so publishing it is a
-    link or rename, never a copy. The directory and whatever is still in it are removed on exit."""
+    link or rename, never a copy. ``mkdtemp`` creates this run's directory with mode 0700; its contents are
+    removed on exit when cleanup succeeds."""
     try:
         stage = Path(tempfile.mkdtemp(prefix=_owner_prefix(_STAGE_PREFIX), dir=output.parent))
     except OSError as exc:
@@ -1290,7 +1299,16 @@ def _staged_output(output: Path) -> Iterator[Path]:
     try:
         yield stage / output.name
     finally:
-        shutil.rmtree(stage, ignore_errors=True)
+        try:
+            shutil.rmtree(stage)
+        except OSError as exc:
+            notice = (
+                f"Recovery could not remove its private staging directory {stage}: {exc}. "
+                "It is safe to delete manually."
+            )
+            logger.warning("%s", notice)
+            if notice_cb is not None:
+                notice_cb(notice)
 
 
 def _refuse_journal_beside(output: Path, refusal: str) -> None:
@@ -1300,39 +1318,116 @@ def _refuse_journal_beside(output: Path, refusal: str) -> None:
             raise SessionRecoverySafetyError(refusal.format(sidecar))
 
 
-def _unlink_if_same_file(path: Path, expected: os.stat_result) -> None:
-    with suppress(OSError):  # cleanup on an error path: the original error is the one to report
-        if os.path.samestat(os.lstat(path), expected):
-            os.unlink(path)
-
-
-def _publish_over_own_placeholder(candidate: Path, output: Path, refusal: str) -> None:
-    """Publication where the filesystem has no hard links (exFAT, FAT, some network mounts): an exclusive create
-    takes the name, then the candidate replaces that placeholder while it is still ours. A kill between the two
-    leaves only the empty placeholder, which ``_validate_paths`` names as such on the next run."""
+def _report_shared_name_left(
+    path: Path, expected: os.stat_result | None, reason: str, *, placeholder: bool = False,
+) -> None:
     try:
+        matched = expected is not None and os.path.samestat(os.lstat(path), expected)
+    except OSError:
+        matched = False
+    ownership = (
+        "It matched the file recovery created when checked, but may have changed since."
+        if matched else "It could not be confirmed as the file recovery created."
+    )
+    guidance = (
+        " If it is an empty placeholder from this recovery and you did not create it, it is safe to delete."
+        if placeholder else ""
+    )
+    logger.warning("Recovery left %s for inspection because %s. %s%s", path, reason, ownership, guidance)
+
+
+def _publish_over_own_placeholder(
+    candidate: Path, output: Path, refusal: str, notice_cb: Optional[NoticeCallback] = None,
+) -> None:
+    """Publish through an exclusive placeholder where no no-clobber publish operation is available.
+
+    This degraded path can overwrite a file created after the final placeholder identity check.
+    """
+    try:
+        # The empty reservation is private; its 0600 mode is not inherited by the published candidate.
         descriptor = os.open(output, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     except FileExistsError:
         raise SessionRecoverySafetyError(refusal.format(output)) from None
+    placeholder = None
     try:
-        placeholder = os.fstat(descriptor)
-    finally:
-        os.close(descriptor)
-    try:
+        try:
+            placeholder = os.fstat(descriptor)
+        except BaseException:
+            # A transient failure may still let us describe our reservation in the report.
+            with suppress(OSError):
+                placeholder = os.fstat(descriptor)
+            raise
+        finally:
+            os.close(descriptor)
+        notice = (
+            "Recovery is using an empty placeholder because this volume lacks hard links and exclusive rename. "
+            "If another process removes the placeholder and creates a file after the ownership check, "
+            f"that file can be overwritten: {output}"
+        )
+        logger.warning("%s", notice)
+        if notice_cb is not None:
+            notice_cb(notice)
+        # With neither no-clobber publish operation available, another process can delete our
+        # reserved placeholder and create a file here after this check; os.replace overwrites it.
         if not os.path.samestat(os.lstat(output), placeholder):
             raise SessionRecoverySafetyError(refusal.format(output))
         os.replace(candidate, output)
-    except BaseException:
-        _unlink_if_same_file(output, placeholder)
+    except BaseException as exc:
+        _report_shared_name_left(output, placeholder, "placeholder publication failed", placeholder=True)
+        if isinstance(exc, OSError):
+            raise SessionRecoveryError(
+                f"Could not publish the recovered database as {output}: {exc.strerror or exc}. "
+                "The output name was left for inspection because another process may have claimed it. "
+                "If it is an empty placeholder from this recovery and you did not create it, it is safe to delete."
+            ) from exc
         raise
 
 
-def _publish_recovered_database(candidate: Path, output: Path) -> None:
-    """Give the finished candidate the output name, whole or not at all, and never over another file.
+def _rename_exclusive(candidate: Path, output: Path) -> None:
+    """Rename a finished candidate without replacing a name another process took.
 
-    ``_validate_paths`` checks the name before the copy starts; publication takes it atomically: ``os.link``
-    (``os.rename`` on Windows, which also refuses an existing name), or an exclusive placeholder that the
-    candidate replaces where hard links are unsupported."""
+    The destination check and rename are one filesystem operation where the volume supports it.
+    """
+    family = os_family()
+    if family == "win32":
+        os.rename(candidate, output)  # Windows rename already refuses an existing destination.
+        return
+
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    source, destination = os.fsencode(candidate), os.fsencode(output)
+    try:
+        if family == "darwin":
+            rename = libc.renamex_np
+            rename.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint)
+            rename.restype = ctypes.c_int
+            result = rename(source, destination, 0x4)  # RENAME_EXCL
+        elif family == "linux":
+            rename = libc.renameat2
+            rename.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+            rename.restype = ctypes.c_int
+            result = rename(-100, source, -100, destination, 0x1)  # AT_FDCWD, RENAME_NOREPLACE
+        else:
+            raise AttributeError("exclusive rename unavailable")
+    except AttributeError:
+        raise OSError(errno.ENOTSUP, os.strerror(errno.ENOTSUP), output) from None
+    if result == 0:
+        return
+    error = ctypes.get_errno()
+    if error == errno.EEXIST:
+        raise FileExistsError(error, os.strerror(error), output)
+    raise OSError(error, os.strerror(error), output)
+
+
+def _publish_recovered_database(
+    candidate: Path, output: Path, notice_cb: Optional[NoticeCallback] = None,
+) -> None:
+    """Give the finished candidate the output name without exposing a partial recovered database.
+
+    ``_validate_paths`` checks the name before the copy starts. A hard link or exclusive rename
+    takes it without clobbering another file; where neither is supported, a placeholder fallback
+    has a check-to-replace window. The published file retains the candidate's mode."""
     # Only the main file is published: rows still in a WAL or journal would be dropped with the stage.
     if stray := [p for p in (_sidecar_path(candidate, s) for s in _SIDECAR_SUFFIXES if s) if os.path.lexists(p)]:
         raise SessionRecoveryError(f"Recovered database still has an open journal and was not published: {stray[0]}")
@@ -1346,23 +1441,33 @@ def _publish_recovered_database(candidate: Path, output: Path) -> None:
             os.close(descriptor)
         _refuse_journal_beside(output, refusal)
         try:
-            (os.rename if os.name == "nt" else os.link)(candidate, output)
+            os.link(candidate, output)
         except FileExistsError:
             raise SessionRecoverySafetyError(refusal.format(output)) from None
         except OSError as exc:
             if exc.errno not in _NO_HARD_LINK_ERRNOS:
                 raise
-            _publish_over_own_placeholder(candidate, output, refusal)
-        try:  # a journal that appeared while the name was being taken: withdraw rather than ship beside it
+            try:
+                _rename_exclusive(candidate, output)
+            except FileExistsError:
+                raise SessionRecoverySafetyError(refusal.format(output)) from None
+            except OSError as rename_error:
+                if rename_error.errno not in _NO_EXCLUSIVE_RENAME_ERRNOS:
+                    raise
+                _publish_over_own_placeholder(candidate, output, refusal, notice_cb)
+        try:  # a journal that appeared while the name was being taken
             _refuse_journal_beside(output, refusal)
-        except SessionRecoverySafetyError:
-            _unlink_if_same_file(output, published)
-            raise
+        except SessionRecoverySafetyError as exc:
+            _report_shared_name_left(output, published, f"a journal sidecar appeared: {exc}")
+            raise SessionRecoverySafetyError(
+                f"{exc} Published output {output} was left for inspection because a journal sidecar appeared; "
+                "inspect both names before retrying."
+            ) from exc
         fsync_directory(output.parent)
     except OSError as exc:
         raise SessionRecoveryError(
             f"Could not publish the recovered database as {output}: {exc.strerror or exc}. The staged copy was "
-            "discarded and nothing was left at that name; re-run with --output on a writable local disk."
+            "discarded. Inspect the output name before retrying with --output on a writable local disk."
         ) from exc
 
 
@@ -1378,8 +1483,13 @@ def recover_session_database(
         raise SessionRecoverySafetyError("chunk_size must be greater than zero")
     source, output, work_root = _validate_paths(source_path, output_path=output_path, work_dir=work_dir)
     assert output is not None
-    # A killed run's stage copy can be as large as the source; drop it before the space check.
-    _remove_dead_owner_dirs(output.parent, _STAGE_PREFIX)
+    notices: list[str] = []
+
+    def report_notice(message: str) -> None:
+        notices.append(message)
+        print(f"\nWarning: {message}")
+
+    _report_dead_owner_dirs(output.parent, _STAGE_PREFIX, report_notice)
     disk_space = _disk_space_preflight(source, work_root, output.parent)
     temp_dir, snapshot_source, inspection = _snapshot_and_inspect(source, work_root)
     try:
@@ -1391,7 +1501,7 @@ def recover_session_database(
                 "into a new database (the source is never modified)."
             )
         missing_required = [t for t in ("sessions", "messages") if not inspection["tables"][t].get("available")]
-        with _staged_output(output) as candidate:
+        with _staged_output(output, report_notice) as candidate:
             if allow_partial and missing_required:  # no readable schema -> page-level lost_and_found salvage
                 report = _recover_via_lost_and_found(
                     source=source, snapshot_source=snapshot_source, snapshot_dir=Path(temp_dir.name),
@@ -1404,7 +1514,9 @@ def recover_session_database(
                     inspection=inspection, disk_space=disk_space, chunk_size=chunk_size, progress_cb=progress_cb,
                     allow_partial=allow_partial,
                 )
-            _publish_recovered_database(candidate, output)
+            _publish_recovered_database(candidate, output, report_notice)
+        if notices:
+            report["warnings"] = notices
         return report
     finally:
         temp_dir.cleanup()
