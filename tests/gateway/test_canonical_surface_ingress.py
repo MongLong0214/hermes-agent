@@ -10,13 +10,19 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
+import re
 import secrets
 import sqlite3
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import aiohttp
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.canonical_surface import CanonicalSurfaceBinding
 from gateway.config import GatewayConfig, Platform, PlatformConfig
@@ -26,6 +32,7 @@ from gateway.session import SessionSource
 
 
 _ROUTE = "/v1/canonical-surface/events"
+_IDENTITY_ROUTE = "/v1/canonical-surface/identity"
 _TERMINAL = "request-owned terminal"
 
 
@@ -130,6 +137,104 @@ def send(ingress):
 def _payload(**changes):
     return {"binding": "canonical", "event_id": "event", "author_id": "author",
             "channel_id": "channel", "text": "hello", **changes}
+
+
+def test_identity_get_is_authenticated_and_reports_live_head_without_writes(ingress, send, monkeypatch):
+    from hermes_state_target_bind import _lineage_root_digest
+
+    async def exercise():
+        [handler] = [h for method, path, h in send.adapter._http_route_table()
+                     if (method, path) == ("GET", _IDENTITY_ROUTE)]
+
+        async def get(key, profile=None, path=_IDENTITY_ROUTE):
+            token = _api_request_profile.set(profile)
+            try:
+                response = await handler(SimpleNamespace(
+                    headers={"Authorization": f"Bearer {key}"} if key else {},
+                    method="GET", path_qs=path, raw_path=path, transport=None))
+                return response.status, json.loads(response.text)
+            finally:
+                _api_request_profile.reset(token)
+
+        assert (await get(None))[0] == 401
+        assert (await get("wrong"))[0] == 401
+        assert (await get(ingress.key, profile="other"))[0] == 404
+        assert (await get(ingress.key, path=_IDENTITY_ROUTE + "?binding=canonical"))[0] == 400
+        assert (await get(ingress.key, path=_IDENTITY_ROUTE + "/extra"))[0] == 400
+        status, identity = await get(ingress.key)
+        assert status == 200
+        assert identity["session_id"] == ingress.entry.session_id
+        assert identity["lineage_root_digest"] == _lineage_root_digest(ingress.entry.session_id)
+        assert type(identity["process_pid"]) is int and identity["process_pid"] > 0
+        token_pattern = r"darwin-tv:\d+\.\d{6}" if sys.platform == "darwin" else r"linux-clk:\d+"
+        assert re.fullmatch(token_pattern, identity["process_started_at"])
+        assert set(identity) == {"session_id", "lineage_root_digest", "process_pid", "process_started_at"}
+        assert ingress.actor.calls == [] and ingress.receipts() == []
+        assert (await get(ingress.key))[1] == identity
+        monkeypatch.setattr("gateway.platforms.api_server_canonical._process_started_at", lambda pid: None)
+        assert _code(await get(ingress.key)) == (503, "canonical_unavailable")
+        assert ingress.actor.calls == [] and ingress.receipts() == []
+
+    asyncio.run(exercise())
+
+
+def test_identity_get_default_profile_http_mirror(ingress, send):
+    """The registered mirror accepts only the validated default profile and exact path."""
+    async def exercise():
+        adapter = send.adapter
+        app = web.Application(middlewares=[adapter._make_profile_prefix_middleware()])
+        for method, path, handler in adapter._http_route_table():
+            if (method, path) == ("GET", _IDENTITY_ROUTE):
+                app.router.add_route(method, path, handler)
+                app.router.add_route(method, f"/p/{{profile}}{path}", handler)
+        headers = {"Authorization": f"Bearer {ingress.key}"}
+        async with TestClient(TestServer(app)) as client:
+            bare = await client.get(_IDENTITY_ROUTE, headers=headers)
+            assert bare.status == 200
+            identity = await bare.json()
+            mirror = await client.get("/p/default" + _IDENTITY_ROUTE, headers=headers)
+            assert mirror.status == 200
+            assert await mirror.json() == identity
+            query = await client.get("/p/default" + _IDENTITY_ROUTE + "?binding=canonical", headers=headers)
+            assert (query.status, (await query.json())["error"]["code"]) == (400, "canonical_invalid_request")
+            denied = await client.get("/p/default" + _IDENTITY_ROUTE, headers={"Authorization": "Bearer wrong"})
+            assert denied.status == 401
+            foreign = await client.get("/p/other" + _IDENTITY_ROUTE, headers=headers)
+            assert foreign.status == 404
+        assert ingress.actor.calls == [] and ingress.receipts() == []
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.macos_only
+def test_identity_start_token_equals_acp_native_peercred_for_same_pid(ingress, send):
+    """ACP's readProcessStartToken uses its Node addon on the Python server PID."""
+    acp_module = os.getenv("ACP_PROCESS_ARGV_MODULE")
+    if acp_module is None:
+        pytest.skip("set ACP_PROCESS_ARGV_MODULE to ACP's src/core/process-argv.ts")
+
+    async def exercise():
+        assert acp_module is not None
+        [handler] = [h for method, path, h in send.adapter._http_route_table()
+                     if (method, path) == ("GET", _IDENTITY_ROUTE)]
+        response = await handler(SimpleNamespace(
+            headers={"Authorization": f"Bearer {ingress.key}"}, method="GET",
+            path_qs=_IDENTITY_ROUTE, raw_path=_IDENTITY_ROUTE, transport=None))
+        assert response.status == 200
+        identity = json.loads(response.text)
+        assert identity["process_pid"] == os.getpid()
+        native = subprocess.run([
+            "node", "--experimental-transform-types", "--input-type=module", "-e",
+            "import {pathToFileURL} from 'node:url';"
+            "const {readProcessStartToken}=await import(pathToFileURL(process.argv[1]).href);"
+            "const token=readProcessStartToken(Number(process.argv[2]));"
+            "if(token===null) process.exit(2); process.stdout.write(token)",
+            acp_module, str(identity["process_pid"]),
+        ], capture_output=True, text=True, check=True, timeout=10)
+        assert identity["process_started_at"] == native.stdout
+        assert ingress.actor.calls == [] and ingress.receipts() == []
+
+    asyncio.run(exercise())
 
 
 def _code(result):
@@ -330,6 +435,48 @@ def test_loopback_http_ingress_claims_once_and_replays_the_durable_terminal(ingr
                 assert (status, body["error"]["code"]) == (409, "canonical_event_conflict")
                 assert ingress.actor.calls == ["hello"]
                 assert ingress.receipts() == [receipt]
+        finally:
+            await adapter.disconnect()
+
+    asyncio.run(exercise())
+
+
+def test_loopback_http_identity_fences_flat_event_before_claim(ingress):
+    """GET's authenticated live identity fences POST over the actual listener."""
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={
+        "host": "127.0.0.1", "port": 0, "key": ingress.key}))
+    adapter.gateway_runner = ingress.runner
+
+    async def exercise():
+        assert await adapter.connect()
+        try:
+            port = adapter._site._server.sockets[0].getsockname()[1]
+            base = f"http://127.0.0.1:{port}"
+            auth = {"Authorization": f"Bearer {ingress.key}"}
+            async with aiohttp.ClientSession() as client:
+                async with client.get(base + _IDENTITY_ROUTE, headers=auth) as response:
+                    assert response.status == 200
+                    identity = await response.json()
+                assert set(identity) == {
+                    "session_id", "lineage_root_digest", "process_pid", "process_started_at"}
+                assert ingress.actor.calls == [] and ingress.receipts() == []
+
+                async def post(payload):
+                    async with client.post(base + _ROUTE, json=payload, headers=auth) as response:
+                        return response.status, await response.json()
+
+                partial = await post(_payload(session_id=identity["session_id"]))
+                assert _code(partial) == (400, "canonical_invalid_request")
+                mismatch = await post(_payload(**{**identity, "session_id": identity["session_id"] + "-old"}))
+                assert _code(mismatch) == (409, "canonical_binding_stale")
+                assert ingress.actor.calls == [] and ingress.receipts() == []
+
+                accepted = await post(_payload(**identity))
+                assert accepted == (200, {"event_id": "event", "text": _TERMINAL})
+                assert await post(_payload(**identity)) == accepted
+                assert ingress.actor.calls == ["hello"]
+                [receipt] = ingress.receipts()
+                assert receipt["state"] == "terminal"
         finally:
             await adapter.disconnect()
 
