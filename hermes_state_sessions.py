@@ -309,7 +309,8 @@ class SessionSessionsMixin:
         parent_session_id: str = None, cwd: str = None, profile_name: Optional[str] = None,
         git_repo_root: str = None, origin_json: str = None, display_name: str = None,
         transport_profile: Optional[str] = None, title: Optional[str] = None,
-    ) -> None:
+        return_title: bool = False,
+    ) -> Optional[str]:
         """Upsert a session row, never overwriting what an earlier writer set (the gateway creates a
         bare row before create_session carries the real model/prompt) — the one exception is the
         token-accounting guard's placeholder ``source='unknown'``, which a later writer's real surface
@@ -405,24 +406,33 @@ class SessionSessionsMixin:
                 self._inherit_parent_session_metadata(conn, session_id)
             if title:
                 self._write_session_title(conn, session_id, title, self.TITLE_SOURCE_USER)
+            if return_title:
+                row = conn.execute("SELECT title FROM sessions WHERE id = ?", (session_id,)).fetchone()
+                if row is None:
+                    raise RuntimeError(f"Created session {session_id} is missing")
+                return row["title"]
         # Transcript-critical: a failed row creation aborts the turn.
-        self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+        return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
 
-    def create_session(self, session_id: str, source: str, **kwargs) -> str:
-        """Create (upsert) a session record. Returns the session_id."""
-        self._insert_session_row(session_id, source, **kwargs)
-        return session_id
+    def create_session(
+        self, session_id: str, source: str, *, return_title: bool = False, **kwargs,
+    ) -> Union[str, Tuple[str, Optional[str]]]:
+        """Create (upsert) a session record. Returns the session_id, optionally with its stored title."""
+        stored_title = self._insert_session_row(session_id, source, return_title=return_title, **kwargs)
+        return (session_id, stored_title) if return_title else session_id
 
-    def create_session_with_title(self, session_id: str, source: str, title: Optional[str], **kwargs) -> Optional[str]:
+    def create_session_with_title(
+        self, session_id: str, source: str, title: Optional[str], *, return_title: bool = False, **kwargs,
+    ) -> Union[Optional[str], Tuple[Optional[str], Optional[str]]]:
         """Create (upsert) a session row with ``title`` in the same transaction. A title the row cannot
         take (invalid, or held by another session) leaves it untitled instead: the reason is returned,
-        None when nothing was refused. A caller reports only the title the row holds."""
+        None when nothing was refused. ``return_title`` also returns the title held at commit."""
         try:
-            self.create_session(session_id, source, title=title, **kwargs)
-            return None
+            created = self.create_session(session_id, source, title=title, return_title=return_title, **kwargs)
+            return (None, created[1]) if return_title else None
         except ValueError as exc:
-            self.create_session(session_id, source, **kwargs)
-            return str(exc)
+            created = self.create_session(session_id, source, return_title=return_title, **kwargs)
+            return (str(exc), created[1]) if return_title else str(exc)
 
     def ensure_session(self, session_id: str, source: str = "unknown", model: str = None, **kwargs) -> str:
         """Ensure a session row exists (upsert). Accepts optional kwargs."""

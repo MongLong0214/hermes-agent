@@ -100,6 +100,43 @@ class TestBranchCommandCLI:
         durable = sum(m["role"] == "user" for m in session_db.get_messages(child["id"]))
         assert f"({durable} user message" in reply
 
+    @pytest.mark.parametrize("command, title, reply_start", [
+        ("/branch A  B", "A B", '  ⑂ Branched session "A B"'),
+        ("/branch \u200b", None, "  ⑂ Branched session ("),
+    ])
+    def test_branch_reply_uses_committed_title(self, cli_instance, session_db, monkeypatch,
+                                               command, title, reply_start):
+        import hermes_cli.cli_commands_mixin as mixin
+        from cli import HermesCLI
+
+        printed = []
+        monkeypatch.setattr(mixin, "_cp", lambda *lines: printed.extend(lines))
+        HermesCLI._handle_branch_command(cli_instance, command)
+
+        child = session_db.get_session(cli_instance.session_id)
+        assert child["title"] == title
+        assert printed[0].startswith(reply_start)
+
+    def test_branch_reply_keeps_title_accepted_at_creation_after_rename(self, cli_instance,
+                                                                         session_db, monkeypatch):
+        import hermes_cli.cli_commands_mixin as mixin
+        from cli import HermesCLI
+
+        create = session_db.create_session_with_title
+
+        def rename_after_create(*args, **kwargs):
+            result = create(*args, **kwargs)
+            session_db.set_session_title(kwargs["session_id"], "renamed later")
+            return result
+
+        printed = []
+        monkeypatch.setattr(session_db, "create_session_with_title", rename_after_create)
+        monkeypatch.setattr(mixin, "_cp", lambda *lines: printed.extend(lines))
+        HermesCLI._handle_branch_command(cli_instance, "/branch original")
+
+        assert session_db.get_session_title(cli_instance.session_id) == "renamed later"
+        assert printed[0].startswith('  ⑂ Branched session "original"')
+
     def test_branch_copies_history(self, cli_instance, session_db):
         """Branching should copy all messages to the new session."""
         from cli import HermesCLI

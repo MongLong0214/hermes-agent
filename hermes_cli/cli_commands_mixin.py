@@ -1414,9 +1414,9 @@ class CLICommandsMixin:
                 parent_prompt = (self._session_db.get_session(parent_session_id) or {}).get("system_prompt")
         # The title goes in the same transaction; one the row cannot take leaves the branch untitled.
         try:
-            title_error = self._session_db.create_session_with_title(
+            title_error, committed_title = self._session_db.create_session_with_title(
                 session_id=new_session_id, source=os.environ.get("HERMES_SESSION_SOURCE", "cli"),
-                title=branch_title, model=self.model, parent_session_id=parent_session_id,
+                title=branch_title, return_title=True, model=self.model, parent_session_id=parent_session_id,
                 system_prompt=parent_prompt or None,
                 model_config={"max_iterations": self.max_turns, "reasoning_config": self.reasoning_config,
                               "_branched_from": parent_session_id})
@@ -1444,7 +1444,7 @@ class CLICommandsMixin:
         _sync_agent_to_session(self, new_session_id, parent_session_id=parent_session_id, reason="branch")
         # Chunks commit independently: only the durable child can say what was copied.
         msg_count = sum(m.get("role") == "user" for m in self._session_db.get_messages(new_session_id))
-        named = "" if title_error else f' "{branch_title}"'
+        named = f' "{committed_title}"' if committed_title else ""
         _cp(f"  ⑂ Branched session{named} ({_plural(msg_count, 'user message')})",
             f"  Original session: {parent_session_id}", f"  Branch session:   {new_session_id}",
             *(f"  ⚠ {note}" for note in (title_error, copy_error) if note))

@@ -1059,9 +1059,10 @@ class GatewaySessionCommandsMixin:
         # the branch untitled, and the reply says so.
         try:
             parent = await self._session_db.get_session(parent_session_id)
-            title_error = await self._session_db.create_session_with_title(
+            title_error, committed_title = await self._session_db.create_session_with_title(
                 session_id=new_session_id,
                 source=source.platform.value if source.platform else "gateway", title=branch_title,
+                return_title=True,
                 model=(self.config.get("model", {}) or {}).get("default") if isinstance(self.config, dict) else None,
                 model_config={"_branched_from": parent_session_id},
                 parent_session_id=parent_session_id, user_id=dest_source.user_id,
@@ -1071,7 +1072,6 @@ class GatewaySessionCommandsMixin:
         except Exception as e:
             logger.error("Failed to create branch session: %s", e)
             return t("gateway.branch.create_failed", error=e)
-
         # Chunked transactions; best-effort — a failed copy still yields a usable (partial) branch.
         try:
             # Copy conversation history to the new session in bounded-chunk transactions (see #23254): one
@@ -1088,8 +1088,8 @@ class GatewaySessionCommandsMixin:
             logger.error("Failed to recount branch history of %s: %s", new_session_id, e)
             return t("gateway.branch.switch_failed")
         msg_count = sum(row.get("role") == "user" for row in copied)
-        titled = title_error is None
-        title_note = "" if titled else "\n" + t("gateway.shared.warn_passthrough", error=title_error)
+        titled = bool(committed_title)
+        title_note = "\n" + t("gateway.shared.warn_passthrough", error=title_error) if title_error else ""
         if not in_place:
             # Materialize the thread's own entry, then point IT at the clone; ``session_key`` (this
             # chat) is never touched, so the original conversation stays live here.
@@ -1101,11 +1101,11 @@ class GatewaySessionCommandsMixin:
         self._evict_cached_agent(dest_key)
         key = _BRANCH_REPLY_KEYS[(not in_place, msg_count == 1, titled)]
         if in_place:
-            reply = t(key, title=branch_title, count=msg_count, parent=parent_session_id, new=new_session_id)
+            reply = t(key, title=committed_title, count=msg_count, parent=parent_session_id, new=new_session_id)
             if not stay_here and source.platform in BRANCH_THREAD_PLATFORMS:
                 reply += "\n" + t("gateway.branch.thread_fallback")
             return reply + title_note
-        return t(key, title=branch_title, count=msg_count, parent=parent_session_id, new=new_session_id,
+        return t(key, title=committed_title, count=msg_count, parent=parent_session_id, new=new_session_id,
                  thread=format_thread_ref(source.platform, dest_source.thread_id)) + title_note
 
     async def _branch_open_thread(self, source: SessionSource, title: str) -> Optional[SessionSource]:
