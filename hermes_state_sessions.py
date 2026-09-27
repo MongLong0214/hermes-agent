@@ -310,7 +310,7 @@ class SessionSessionsMixin:
         git_repo_root: str = None, origin_json: str = None, display_name: str = None,
         transport_profile: Optional[str] = None, title: Optional[str] = None,
         return_title: bool = False, strict: bool = False,
-    ) -> Union[Optional[str], bool, Tuple[bool, Optional[str]]]:
+    ) -> Union[Optional[str], bool]:
         """Upsert a session row, never overwriting what an earlier writer set (the gateway creates a
         bare row before create_session carries the real model/prompt) — the one exception is the
         token-accounting guard's placeholder ``source='unknown'``, which a later writer's real surface
@@ -350,7 +350,7 @@ class SessionSessionsMixin:
         def _do(conn):
             # Same BEGIN IMMEDIATE as the INSERT below, so no writer can take the id in between.
             if strict and conn.execute("SELECT 1 FROM sessions WHERE id = ?", (session_id,)).fetchone():
-                return (False, None) if return_title else False
+                return False
             system_prompt_hash = self._store_system_prompt(conn, system_prompt)
             conn.execute(
                 """INSERT INTO sessions (
@@ -414,7 +414,7 @@ class SessionSessionsMixin:
                 row = conn.execute("SELECT title FROM sessions WHERE id = ?", (session_id,)).fetchone()
                 if row is None:
                     raise RuntimeError(f"Created session {session_id} is missing")
-                return (True, row["title"]) if strict else row["title"]
+                return row["title"]
             if strict:
                 return True
         # Transcript-critical: a failed row creation aborts the turn.
@@ -427,12 +427,10 @@ class SessionSessionsMixin:
         stored_title = self._insert_session_row(session_id, source, return_title=return_title, **kwargs)
         return (session_id, stored_title) if return_title else session_id
 
-    def create_session_strict(
-        self, session_id: str, source: str, *, return_title: bool = False, **kwargs,
-    ) -> Union[bool, Tuple[bool, Optional[str]]]:
+    def create_session_strict(self, session_id: str, source: str, **kwargs) -> bool:
         """Create a NEW session row: True when created, False when ``session_id`` is already taken
         (nothing written). A ``title`` kwarg the row cannot take raises ValueError with nothing written."""
-        return self._insert_session_row(session_id, source, strict=True, return_title=return_title, **kwargs)
+        return self._insert_session_row(session_id, source, strict=True, **kwargs)
 
     def create_session_with_title(
         self, session_id: str, source: str, title: Optional[str], *, return_title: bool = False, **kwargs,

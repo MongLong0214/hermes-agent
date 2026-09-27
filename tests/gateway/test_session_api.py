@@ -119,14 +119,15 @@ async def test_forked_session_stays_listable_and_parent_survives_failed_fork(ada
     session_db.create_session("parent", "api_server")
     app = _create_session_app(adapter)
     async with TestClient(TestServer(app)) as cli:
-        resp = await cli.post("/api/sessions/parent/fork", json={"id": "child"})
+        resp = await cli.post("/api/sessions/parent/fork", json={"id": "child", "title": "  Child  \u200b Name \t"})
         assert resp.status == 201
+        assert (await resp.json())["session"]["title"] == session_db.get_session("child")["title"] == "Child Name"
         listed = await (await cli.get("/api/sessions")).json()
         ids = {row["id"] for row in listed["data"]}
         assert {"parent", "child"} <= ids, ids
 
         session_db.create_session("solo", "api_server")
-        with patch.object(session_db, "create_session_strict", side_effect=RuntimeError("boom")):
+        with patch.object(session_db, "_insert_session_row", side_effect=RuntimeError("boom")):
             resp = await cli.post("/api/sessions/solo/fork", json={"id": "never"})
         assert resp.status >= 500
     assert session_db.get_session("solo")["end_reason"] is None
