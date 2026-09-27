@@ -781,17 +781,35 @@ def _stream_raising(err, *ops):
     return type("_FailingStream", (io.StringIO,), {op: fail for op in ops})
 
 
+def _replace_handler_open(handler, replacement):
+    # The stdlib handler opens through _builtin_open; concurrent-log-handler uses do_open.
+    name = "do_open" if hasattr(handler, "do_open") else "_builtin_open"
+    original = getattr(handler, name)
+    calls = 0
+
+    def injected(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return replacement(*args, **kwargs)
+
+    setattr(handler, name, injected)
+
+    def restore():
+        setattr(handler, name, original)
+        assert calls > 0, f"{name} was never reached"
+
+    return restore
+
+
 def _stream_fault(err, *ops):
     def arrange(tmp_path):
         path = tmp_path / "agent.log"
         handler = _file_handler(path)
-        real_open, sick = handler._builtin_open, _stream_raising(err, *ops)
-        handler.stream.close()
+        sick = _stream_raising(err, *ops)
+        if handler.stream is not None:
+            handler.stream.close()
         handler.stream = sick()
-        handler._builtin_open = lambda *_a, **_kw: sick()  # the reopen hits the same fault
-
-        def restore():
-            handler._builtin_open = real_open
+        restore = _replace_handler_open(handler, lambda *_a, **_kw: sick())
 
         return (lambda msg: handler.handle(_record(msg))), path, restore, handler.close
 
@@ -801,17 +819,14 @@ def _stream_fault(err, *ops):
 def _reopen_refused(tmp_path):
     path = tmp_path / "agent.log"
     handler = _file_handler(path)
-    real_open = handler._builtin_open
 
     def refuse(*_a, **_kw):
         raise OSError(errno.EACCES, os.strerror(errno.EACCES), str(path))
 
-    handler.stream.close()
+    if handler.stream is not None:
+        handler.stream.close()
     handler.stream = None
-    handler._builtin_open = refuse
-
-    def restore():
-        handler._builtin_open = real_open
+    restore = _replace_handler_open(handler, refuse)
 
     return (lambda msg: handler.handle(_record(msg))), path, restore, handler.close
 
@@ -854,12 +869,12 @@ def _routed_profile_home_removed(tmp_path):
 @pytest.mark.parametrize("arrange", [
     _stream_fault(errno.ENOSPC, "flush"),
     _stream_fault(errno.EIO, "flush"),
-    _stream_fault(errno.ESTALE, "seek", "tell"),
+    _stream_fault(errno.ESTALE, "seek", "tell", "write"),
     _reopen_refused,
-    _log_dir_replaced_by_a_file,
+    pytest.param(_log_dir_replaced_by_a_file, marks=pytest.mark.platforms("posix")),
     _routed_profile_home_removed,
 ], ids=[
-    "enospc-on-flush", "eio-on-flush", "estale-on-rollover-check", "eacces-on-reopen",
+    "enospc-on-flush", "eio-on-flush", "estale-on-destination", "eacces-on-reopen",
     "log-dir-replaced-by-a-file", "routed-profile-home-removed",
 ])
 def test_a_failing_log_destination_is_named_once_and_resumes_when_it_recovers(
@@ -895,15 +910,20 @@ def test_a_paused_log_destination_re_arms_only_after_a_record_reaches_it(
     handler). A record arg that raises OSError about another file is foreign code: it keeps its
     traceback, does not pause the destination and, having written nothing, does not re-arm it."""
     disk = {"full": False}
+    attempted_writes = []
 
     class _Disk(io.StringIO):
         def write(self, text):
+            attempted_writes.append(disk["full"])
             if disk["full"]:
                 raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
             return super().write(text)
 
     class _Handler(hermes_logging._ManagedRotatingFileHandler):
         def _open(self):
+            return _Disk()
+
+        def do_open(self, mode=None):
             return _Disk()
 
         def flush(self):
@@ -926,6 +946,8 @@ def test_a_paused_log_destination_re_arms_only_after_a_record_reaches_it(
             handler.handle(_record("%s", args))
     finally:
         handler.close()
+    assert attempted_writes.count(True) == 4
+    assert attempted_writes.count(False) == (1 if middle == "write" else 0)
     err = capsys.readouterr().err
     assert (err.count(f"{path} unavailable"), err.count("--- Logging error ---")) == expected
 
