@@ -159,7 +159,8 @@ from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
 from plugins.platforms.telegram.telegram_network import (
     SEED_FALLBACK_IPS, TelegramFallbackTransport, discover_fallback_ips, parse_fallback_ip_env, tcp_keepalive_socket_options)
 from plugins.platforms.telegram.telegram_abandoned_init import (
-    await_abandoned_initialize_owners, retain_abandoned_initialize)
+    abandon_app_requests, abandonment_aware_request_class, close_abandoned_initialize_apps,
+    retain_abandoned_initialize)
 from utils import env_float, env_int
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -619,7 +620,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._bot_identity_refresh_task: Optional[asyncio.Task] = None
         self._post_connect_task: Optional[asyncio.Task] = None  # command menu + DM topics, off the connect path
         # Cleanup owners of cancelled initialize() calls; not _background_tasks, which teardown cancels.
-        self._abandoned_initialize_owners: Set[asyncio.Task] = set()
+        self._abandoned_initialize_owners: Dict[asyncio.Task, Any] = {}
         self._polling_conflict_count = self._polling_network_error_count = self._polling_generation = 0
         self._polling_conflict_recovery_generation: Optional[int] = None
         self._polling_progress_event = asyncio.Event()
@@ -3043,9 +3044,11 @@ class TelegramAdapter(BasePlatformAdapter):
             "TELEGRAM_PROXY", target_hosts=["api.telegram.org", *fallback_ips],
             configured=self.config.extra.get("proxy_url"))
 
+        request_class = abandonment_aware_request_class(HTTPXRequest)
+
         def _pair(general_httpx: dict, updates_httpx: dict, **extra) -> tuple:
-            return (HTTPXRequest(**request_kwargs, **extra, httpx_kwargs=general_httpx),
-                    HTTPXRequest(**request_kwargs, **extra, httpx_kwargs=updates_httpx))
+            return (request_class(**request_kwargs, **extra, httpx_kwargs=general_httpx),
+                    request_class(**request_kwargs, **extra, httpx_kwargs=updates_httpx))
 
         if fallback_ips and not proxy_url and not disable_fallback:
             logger.info("[%s] Telegram fallback IPs active: %s", self.name, ", ".join(fallback_ips))
@@ -3093,17 +3096,21 @@ class TelegramAdapter(BasePlatformAdapter):
                 logger.warning("[%s] Connecting to Telegram (attempt %d/%d)…", self.name, _attempt + 1, _max_connect)
                 # On timeout the (possibly shielded) initialize() task is abandoned; release the half-built
                 # app's httpx client so it isn't leaked across the ladder.
-                init_task = asyncio.ensure_future(self._app.initialize())
+                app = self._app
+                init_task = asyncio.ensure_future(app.initialize())
                 try:
                     await _await_with_thread_deadline(
-                        init_task, timeout=_init_timeout, on_abandon=lambda app=self._app: _shutdown_abandoned_app(app),
+                        init_task, timeout=_init_timeout, on_abandon=lambda app=app: _shutdown_abandoned_app(app),
                         label="telegram-init")
                 except asyncio.CancelledError:
                     # Our caller was cancelled: the deadline helper abandons the child with no cleanup.
-                    retain_abandoned_initialize(self, init_task, self._app)
+                    retain_abandoned_initialize(self, init_task, app)
+                    # Start its cleanup coroutine before asyncio.run can cancel pending tasks at exit.
+                    await asyncio.sleep(0)
                     raise
                 break
             except asyncio.TimeoutError:
+                abandon_app_requests(app)
                 rebuild_app = True
                 if _attempt >= _max_connect - 1:
                     raise OSError(
@@ -3131,9 +3138,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 raise
             finally:
                 # A failed attempt may leave the app half-initialized: rebuild a fresh Application from the
-                # same builder for the next attempt and discard the old one.
+                # same builder with its own requests for the next attempt and discard the old one.
                 if rebuild_app and _attempt < _max_connect - 1:
                     old_app = self._app
+                    request, get_updates_request = await self._build_ptb_requests()
+                    builder.request(request).get_updates_request(get_updates_request)
                     self._app = builder.build()
                     self._bot = self._app.bot
                     # Same order as connect(): plugin handlers first (the wired-set is keyed per app, so
@@ -3466,7 +3475,7 @@ class TelegramAdapter(BasePlatformAdapter):
         with contextlib.suppress(Exception):
             await self._await_disconnect_step(self._set_status_indicator(online=False), _DISCONNECT_STEP_TIMEOUT, "status-indicator update")
         await self._await_disconnect_step(self._cancel_pending_delivery_tasks(), _DISCONNECT_STEP_TIMEOUT, "pending-delivery cancel")
-        await await_abandoned_initialize_owners(self, _DISCONNECT_STEP_TIMEOUT)
+        await close_abandoned_initialize_apps(self, _DISCONNECT_STEP_TIMEOUT)
         if self._app:
             try:
                 # Bounded: a CLOSE-WAIT socket can wedge updater.stop() forever; fall through on timeout.
