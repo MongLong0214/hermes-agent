@@ -20,6 +20,10 @@ _TITLE_INVISIBLE_RE = re.compile(r'[\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufef
 _NUMBERED_TITLE_RE = re.compile(r'^(.*?) #(\d+)$')
 
 
+class SessionTitleError(ValueError):
+    """A requested session title cannot be stored."""
+
+
 class SessionTitlesMixin:
     """Sanitizing, ranking auto/user titles, lineage-aware lookups."""
 
@@ -42,7 +46,7 @@ class SessionTitlesMixin:
         if not cleaned:
             return None
         if len(cleaned) > SessionDB.MAX_TITLE_LENGTH:
-            raise ValueError(f"Title too long ({len(cleaned)} chars, max {SessionDB.MAX_TITLE_LENGTH})")
+            raise SessionTitleError(f"Title too long ({len(cleaned)} chars, max {SessionDB.MAX_TITLE_LENGTH})")
         return cleaned
 
     def _is_compression_ancestor(self, conn, *, ancestor_id: str, descendant_id: str) -> bool:
@@ -93,7 +97,7 @@ class SessionTitlesMixin:
         if ((current["title"] or "") == self.CANONICAL_BOT_CHAT_TITLE and bool(current["hidden"])
                 and title != self.CANONICAL_BOT_CHAT_TITLE):
             if is_user:
-                raise ValueError("This is the bot's canonical Bot Chat — its name is its "
+                raise SessionTitleError("This is the bot's canonical Bot Chat — its name is its "
                                  "identity, and renaming it would orphan the conversation. "
                                  "To start fresh, create a new bot instead.")
             return 0
@@ -120,7 +124,7 @@ class SessionTitlesMixin:
                         (conflict_id,),
                     )
                 else:
-                    raise ValueError(f"Title '{title}' is already in use by session {conflict_id}")
+                    raise SessionTitleError(f"Title '{title}' is already in use by session {conflict_id}")
         # CAS on the values just read (``IS`` is NULL-safe): a concurrent write between
         # the SELECT and here loses instead of being overwritten.
         return conn.execute(

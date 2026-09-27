@@ -179,6 +179,60 @@ async def test_forks_racing_to_one_id_commit_one_and_leave_the_loser_open(adapte
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ("read", "copy", "end"))
+async def test_failed_fork_leaves_source_and_child_unchanged(adapter, session_db, monkeypatch, failure):
+    session_db.create_session("source", "api_server")
+    session_db.append_message("source", "user", "original history")
+    source_before = session_db.get_session("source")
+    read_messages = session_db.get_messages
+    history_before = read_messages("source")
+
+    if failure == "read":
+        def fail_read(_session_id):
+            raise RuntimeError("read failed")
+
+        monkeypatch.setattr(session_db, "get_messages", fail_read)
+    elif failure == "copy":
+        insert = session_db._insert_message_rows
+
+        def fail_after_copy(*args, **kwargs):
+            insert(*args, **kwargs)
+            raise RuntimeError("copy failed")
+
+        monkeypatch.setattr(session_db, "_insert_message_rows", fail_after_copy)
+    else:
+        end = session_db._end_and_bump
+
+        def fail_after_end(*args, **kwargs):
+            end(*args, **kwargs)
+            raise RuntimeError("end failed")
+
+        monkeypatch.setattr(session_db, "_end_and_bump", fail_after_end)
+
+    async with TestClient(TestServer(_create_session_app(adapter))) as cli:
+        resp = await cli.post("/api/sessions/source/fork", json={"id": "child", "title": "Child"})
+
+    assert resp.status >= 500
+    assert session_db.get_session("child") is None
+    assert session_db.get_session("source") == source_before
+    assert read_messages("source") == history_before
+
+
+@pytest.mark.asyncio
+async def test_fork_storage_value_error_is_not_a_title_error(adapter, session_db):
+    session_db.create_session("source", "api_server")
+    source_before = session_db.get_session("source")
+
+    with patch.object(session_db, "_insert_session_row", side_effect=ValueError("storage failed")):
+        async with TestClient(TestServer(_create_session_app(adapter))) as cli:
+            resp = await cli.post("/api/sessions/source/fork", json={"id": "child", "title": "Child"})
+
+    assert resp.status >= 500
+    assert session_db.get_session("child") is None
+    assert session_db.get_session("source") == source_before
+
+
+@pytest.mark.asyncio
 async def test_list_sessions_resurrects_bot_chat_off_the_event_loop(adapter, session_db, monkeypatch):
     """Canonical Bot Chat recovery must not run SQLite work in the HTTP loop."""
     session_id = session_db.create_session("archived-bot-chat", "gateway_botmode")

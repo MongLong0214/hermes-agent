@@ -28,6 +28,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from hermes_state_titles import SessionTitleError
+
 # _resolve_request_profile result for a /p/<profile>/ prefix this gateway does not serve (-> 404);
 # distinct from None (no prefix / multiplexing off -> default profile).
 _PROFILE_REJECTED = object()
@@ -3285,8 +3287,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         # The create is strict and titled in one transaction: a racing fork to the same id gets 409 and a
         # refused explicit title 400, each with nothing written and the source still open. A derived
         # title the row cannot take leaves the fork untitled instead.
+        # Read history before any write; the store commits the titled child, copy, and end together.
         row = dict(model=source.get("model"), system_prompt=source.get("system_prompt"),
-                   parent_session_id=source_id, model_config={"_branched_from": source_id})
+                   model_config={"_branched_from": source_id})
         title = body.get("title")
         explicit_title = title is not None
         if not explicit_title:
@@ -3294,18 +3297,17 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             title = f"{base} fork"
             with suppress(Exception):
                 title = await asyncio.to_thread(db.get_next_title_in_lineage, base)
+        messages = await asyncio.to_thread(db.get_messages, source_id)
         try:
-            created = await asyncio.to_thread(db.create_session_strict, fork_id, "api_server", title=str(title), **row)
-        except ValueError as exc:
+            fork = await asyncio.to_thread(
+                db.fork_session_strict, source_id, fork_id, "api_server", messages, title=str(title), **row)
+        except SessionTitleError as exc:
             if explicit_title:
                 return _error_response(str(exc), 400, code="invalid_title")
-            created = await asyncio.to_thread(db.create_session_strict, fork_id, "api_server", **row)
-        if not created:
+            fork = await asyncio.to_thread(
+                db.fork_session_strict, source_id, fork_id, "api_server", messages, **row)
+        if fork is None:
             return _error_response(f"Session already exists: {fork_id}", 409, code="session_exists")
-        await asyncio.to_thread(db.end_session, source_id, "branched")
-        messages = await asyncio.to_thread(db.get_messages, source_id)
-        await asyncio.to_thread(db.replace_messages, fork_id, messages)
-        fork = await asyncio.to_thread(db.get_session, fork_id) or {"id": fork_id, "parent_session_id": source_id}
         return web.json_response({"object": "hermes.session", "session": self._session_response(fork)}, status=201)
 
     async def _prepare_session_chat(self, request: "web.Request") -> tuple:
