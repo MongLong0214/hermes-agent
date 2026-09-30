@@ -325,7 +325,8 @@ def test_default_abort_skips_the_deterministic_rung_and_names_the_opt_in(tmp_pat
 
     assert out is live, "the default keeps every message on a failed summary"
     assert attempted == [], "no pinned re-run of a worker the default is certain to abort"
-    assert "compression.abort_on_summary_failure" in caplog.text
+    warning = next(r.getMessage() for r in caplog.records if "compression.abort_on_summary_failure" in r.getMessage())
+    assert all(hint in warning for hint in ("/compress", "/new", "false")), "names the ways out, not only the setting"
 
 
 def test_default_abort_stays_silent_when_the_configured_fallback_recovers(tmp_path, fast_timeouts, caplog):
