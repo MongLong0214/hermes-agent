@@ -39,6 +39,13 @@ _UPDATE_FAILED_NOTICE = (
 # deferred line on every poll, in every process, forever. Stop waiting past this age.
 _UPDATE_NOTIFY_MAX_ADAPTER_WAIT_SECONDS = 3600.0
 
+# A session whose busy queue sits at cap refuses every internal wake until it drains, and the idle
+# watcher drains every 2s: re-offering refused watch events on each pass logged 16,611 refusals in
+# 53 minutes for one session (2026-09-29). The event stays queued rather than dropped; only its next offer
+# waits, doubling.
+_WATCH_RETRY_FIRST_DELAY_SECONDS = 5.0
+_WATCH_RETRY_MAX_DELAY_SECONDS = 60.0
+
 
 def _served_notice_target_key(profile: Optional[str], platform_value: str, chat_id, thread_id) -> tuple:
     """Notice-dedupe key for one SERVED profile's home channel.
@@ -1173,7 +1180,11 @@ class GatewayNotificationsMixin:
         """
         from gateway.run import _drain_gateway_watch_events, _format_gateway_process_notification
         watch_events = _drain_gateway_watch_events(completion_queue)
+        now = time.monotonic()
         for evt in watch_events:
+            if evt.get("_retry_at", 0.0) > now:
+                completion_queue.put(evt)
+                continue
             async with self._completion_event_scope(evt):
                 if self._load_background_notifications_mode() == "off":
                     continue
@@ -1186,6 +1197,10 @@ class GatewayNotificationsMixin:
                     logger.exception("Watch notification injection error")
                     delivered = False
             if delivered is False:
+                delay = (min(2 * evt["_retry_delay"], _WATCH_RETRY_MAX_DELAY_SECONDS)
+                         if "_retry_delay" in evt else _WATCH_RETRY_FIRST_DELAY_SECONDS)
+                evt["_retry_delay"] = delay
+                evt["_retry_at"] = time.monotonic() + delay
                 completion_queue.put(evt)
 
     def _adapter_by_platform_value(self, platform_name: str):
