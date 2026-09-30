@@ -964,14 +964,11 @@ def _retry_compression_on_fallback_chain(
     if callable(getattr(hard_cancel, "is_set", None)) and hard_cancel.is_set():
         return None
     compressor = getattr(telemetry_agent, "context_compressor", None)
-    if escalate_deterministic and getattr(compressor, "abort_on_summary_failure", None) is True:
-        # The default refuses the static summary this rung commits, so running it would only re-run the
-        # whole worker to abort, under a log line that claims a commit. An engine that does not expose the
-        # flag keeps the rung and decides inside compress().
-        logger.warning(
-            "Context compression stalled again; compression.abort_on_summary_failure=true keeps every message, so "
-            "the session stays uncompressed until /compress or /new (false commits a deterministic handoff instead)"
-        )
+    # The default refuses the static summary the deterministic rung commits, so running it would only re-run
+    # the whole worker to abort, under a log line that claims a commit. An engine that does not expose the
+    # flag keeps the rung and decides inside compress().
+    skipped_deterministic = escalate_deterministic and getattr(compressor, "abort_on_summary_failure", None) is True
+    if skipped_deterministic:
         escalate_deterministic = False
     for route in _stall_retry_routes(escalate_deterministic):
         recovered = _run_pinned_compression_retry(
@@ -982,6 +979,12 @@ def _retry_compression_on_fallback_chain(
         )
         if recovered is not None:
             return recovered
+    if skipped_deterministic:
+        # Only once every route has failed: a configured fallback that recovers leaves nothing to report.
+        logger.warning(
+            "Context compression stalled again; compression.abort_on_summary_failure=true keeps every message, so "
+            "the session stays uncompressed until /compress or /new (false commits a deterministic handoff instead)"
+        )
     return None
 
 
