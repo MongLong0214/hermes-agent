@@ -1182,11 +1182,13 @@ class GatewayNotificationsMixin:
         watch_events = _drain_gateway_watch_events(completion_queue)
         now = time.monotonic()
         for evt in watch_events:
-            if evt.get("_retry_at", 0.0) > now:
-                completion_queue.put(evt)
-                continue
             async with self._completion_event_scope(evt):
+                # The off gate comes before the retry wait: an event refused while its profile had
+                # notifications on is dropped once the profile turns them off rather than kept to its retry time.
                 if self._load_background_notifications_mode() == "off":
+                    continue
+                if evt.get("_retry_at", 0.0) > now:
+                    completion_queue.put(evt)
                     continue
                 synth_text = _format_gateway_process_notification(evt)
                 if not synth_text:
