@@ -1372,6 +1372,12 @@ DEFAULT_CONFIG = {
         # notifications to the PARENT; false suppresses them (the child's result is the
         # deliverable). Async-delegation results are NEVER suppressed.
         "surface_child_process_notifications": False,
+        # How a background delegation's result reaches a messaging chat (Telegram, Discord, ...).
+        # "wake" (default): the result starts a new agent turn as soon as it lands. "quiet": no turn;
+        # the result is recorded in the conversation, read with the user's next message, and the chat
+        # gets a one-line plain-text notice (no model call). API-server sessions always record quietly.
+        # Running delegations synchronously instead would also end these turns but keep the chat busy.
+        "completion_delivery": "wake",
     },
     # Ephemeral prefill messages file — JSON list of {role, content} dicts injected at the start of
     # every API call for few-shot priming. Never saved to sessions/logs/trajectories.

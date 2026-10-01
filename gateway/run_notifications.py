@@ -1593,7 +1593,11 @@ class GatewayNotificationsMixin:
                 if self._completion_identity_seen(identity, claim=True):
                     return None
                 identity_claimed = True
-            injection_result = await self._inject_watch_notification(synth_text, evt, raise_not_accepted=True)
+            if evt.get("type") == "async_delegation" and self._load_delegation_completion_delivery() == "quiet":
+                injection_result = await self._record_quiet_delegation_completion(
+                    synth_text, evt, batch_size=1 + len(sibling_claims))
+            else:
+                injection_result = await self._inject_watch_notification(synth_text, evt, raise_not_accepted=True)
             if injection_result is not True:
                 return injection_result
             accepted = True
@@ -1616,6 +1620,48 @@ class GatewayNotificationsMixin:
                     self._settle_durable_claim(operation, sibling["delegation_id"], claim_id)
             if accepted and sibling_claims:
                 self._record_coalesced_completion_siblings([event for event, _claim_id in sibling_claims])
+
+    async def _record_quiet_delegation_completion(self, synth_text: str, evt: dict, *, batch_size: int = 1) -> bool:
+        """``delegation.completion_delivery: quiet`` on a push chat: record the result in the session the
+        chat's next message reads (the wake path's resolver picks it) and send the chat a plain-text notice
+        instead of starting an agent turn. A session with a turn in flight refuses the row; that raises
+        WakeNotAccepted, which defers the claim without spending an attempt. An event that names no
+        spawning session, or a route that cannot push, keeps the wake path so no result is stranded."""
+        from gateway.wake import WakeNotAccepted, _delegation_display_metadata, adapter_supports_push
+        from hermes_state_errors import SessionTurnLeaseLostError
+        from tools.process_registry_notifications import async_delegation_display_text
+        parent_session_id = str(evt.get("parent_session_id") or "").strip()
+        source = await asyncio.to_thread(self._build_process_event_source, evt)
+        adapter = None
+        if source is not None:
+            platform = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
+            adapter = self._resolve_injection_adapter(platform, source)
+        session_db = self._session_db
+        if not parent_session_id or adapter is None or not adapter_supports_push(adapter) or session_db is None:
+            return await self._inject_watch_notification(synth_text, evt, raise_not_accepted=True)
+        session_entry = await self.async_session_store.get_or_create_session(source, touch_activity=False)
+        session_entry = await self._resolve_async_delegation_session(session_entry, parent_session_id)
+        if session_entry is None:
+            return False
+        try:
+            await session_db.append_delegation_delivery(
+                session_entry.session_id, synth_text, _delegation_display_metadata(evt))
+        except SessionTurnLeaseLostError as exc:
+            raise WakeNotAccepted(f"session {session_entry.session_id} has a turn in flight") from exc
+        except Exception:
+            logger.warning("Could not record quiet delegation completion %s in session %s",
+                           evt.get("delegation_id"), session_entry.session_id, exc_info=True)
+            return False
+        logger.info("Async delegation %s recorded in session %s without a wake turn (delegation.completion_delivery: quiet)",
+                    evt.get("delegation_id"), session_entry.session_id)
+        notice = async_delegation_display_text(evt)
+        if batch_size > 1:
+            notice += f" (+{batch_size - 1} more)"
+        try:
+            await self._deliver_platform_notice(source, f"{notice} — saved to this chat; read with your next message.")
+        except Exception:
+            logger.warning("Quiet delegation completion notice failed for session %s", session_entry.session_id, exc_info=True)
+        return True
 
     @staticmethod
     def _event_route_key(evt: dict, fields: tuple[str, ...]) -> tuple[str, ...]:
