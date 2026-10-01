@@ -943,7 +943,8 @@ def _retry_compression_on_fallback_chain(
 ) -> Optional[Tuple[list, str]]:
     """Re-run an aborted compression with the summary route pinned: once on the configured chain entry,
     then — when ``escalate_deterministic`` (a stall backoff already burned one idle window this session,
-    #112420) — once with the summary LLM skipped so compress() commits its deterministic fallback summary.
+    #112420) and ``abort_on_summary_failure`` is opted out — once with the summary LLM skipped so compress()
+    commits its deterministic fallback summary.
     Returns ``(messages, system_prompt)`` on real compression, else ``None`` and the caller degrades as
     before. The entry's ``timeout`` sets the idle window. Re-runs the whole worker, so pre-compression
     callbacks must be idempotent.
@@ -962,6 +963,13 @@ def _retry_compression_on_fallback_chain(
     hard_cancel = getattr(telemetry_agent, "_hard_interrupt_requested", None)
     if callable(getattr(hard_cancel, "is_set", None)) and hard_cancel.is_set():
         return None
+    compressor = getattr(telemetry_agent, "context_compressor", None)
+    # The default refuses the static summary the deterministic rung commits, so running it would only re-run
+    # the whole worker to abort, under a log line that claims a commit. An engine that does not expose the
+    # flag keeps the rung and decides inside compress().
+    skipped_deterministic = escalate_deterministic and getattr(compressor, "abort_on_summary_failure", None) is True
+    if skipped_deterministic:
+        escalate_deterministic = False
     for route in _stall_retry_routes(escalate_deterministic):
         recovered = _run_pinned_compression_retry(
             route, worker=worker, messages=messages, system_prompt_fallback=system_prompt_fallback,
@@ -971,6 +979,12 @@ def _retry_compression_on_fallback_chain(
         )
         if recovered is not None:
             return recovered
+    if skipped_deterministic:
+        # Only once every route has failed: a configured fallback that recovers leaves nothing to report.
+        logger.warning(
+            "Context compression stalled again; compression.abort_on_summary_failure=true keeps every message, so "
+            "the session stays uncompressed until /compress or /new (false commits a deterministic handoff instead)"
+        )
     return None
 
 

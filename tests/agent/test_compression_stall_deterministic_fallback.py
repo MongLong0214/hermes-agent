@@ -15,6 +15,7 @@ every message on a failed summary. Every agent here opts in.
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import time
@@ -298,3 +299,57 @@ def test_over_window_request_commits_the_deterministic_fallback_on_the_first_sta
     assert out is not live and len(out) < len(live)
     assert len(_summary_rows(out)) == 1, "the over-window request got a committed deterministic handoff"
     assert getattr(agent, "_last_compression_timed_out", None) is not True
+
+
+def test_default_abort_skips_the_deterministic_rung_and_names_the_opt_in(tmp_path, fast_timeouts, monkeypatch, caplog):
+    """Under the default the deterministic rung can only abort, so the ladder must not re-run the whole worker
+    for it (memory/plugin callbacks included) under a log line claiming a commit. The operator is told which
+    setting keeps the over-window session uncompressed instead."""
+    agent = _make_agent(tmp_path, "D")
+    compressor = agent.context_compressor
+    compressor.abort_on_summary_failure = True
+    compressor.context_length = 64_000
+    attempted = []
+    real_retry = cc._run_pinned_compression_retry
+
+    def _spy(route, **kwargs):
+        attempted.append(route["label"])
+        return real_retry(route, **kwargs)
+
+    monkeypatch.setattr(cc, "_run_pinned_compression_retry", _spy)
+    live = _transcript()
+    with caplog.at_level(logging.WARNING, logger="agent.conversation_compression"), \
+            patch("agent.context_compressor.call_llm", side_effect=_stalling_call_llm(compressor, [])), \
+            patch("agent.auxiliary_client._get_auxiliary_task_config", return_value={"fallback_chain": []}):
+        out, _ = agent._compress_context(live, "sys", approx_tokens=70_000)
+
+    assert out is live, "the default keeps every message on a failed summary"
+    assert attempted == [], "no pinned re-run of a worker the default is certain to abort"
+    warning = next(r.getMessage() for r in caplog.records if "compression.abort_on_summary_failure" in r.getMessage())
+    assert all(hint in warning for hint in ("/compress", "/new", "false")), "names the ways out, not only the setting"
+
+
+def test_default_abort_stays_silent_when_the_configured_fallback_recovers(tmp_path, fast_timeouts, caplog):
+    """The skipped rung is reported only after every route has failed. A configured fallback that commits a
+    summary must not leave a log line saying the session stays uncompressed."""
+    from types import SimpleNamespace
+
+    agent = _make_agent(tmp_path, "E")
+    compressor = agent.context_compressor
+    compressor.abort_on_summary_failure = True
+    compressor.context_length = 64_000
+    stall = _stalling_call_llm(compressor, [])
+
+    def _stall_primary_answer_fallback(**kwargs):
+        if "provider" not in kwargs:
+            return stall(**kwargs)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="FALLBACK SUMMARY BODY"))])
+
+    live = _transcript()
+    with caplog.at_level(logging.WARNING, logger="agent.conversation_compression"), \
+            patch("agent.context_compressor.call_llm", side_effect=_stall_primary_answer_fallback), \
+            patch("agent.auxiliary_client._get_auxiliary_task_config", return_value={"fallback_chain": [CHAIN_ENTRY]}):
+        out, _ = agent._compress_context(live, "sys", approx_tokens=70_000)
+
+    assert out is not live and len(_summary_rows(out)) == 1, "the configured fallback committed a summary"
+    assert "stays uncompressed" not in caplog.text
