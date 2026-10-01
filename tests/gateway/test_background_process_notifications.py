@@ -349,9 +349,16 @@ async def test_refused_watch_admission_waits_before_reinjecting(monkeypatch, tmp
     assert adapter.handle_message.await_count == 1, "re-offered on the very next pass"
     assert completion_queue.qsize() == 1 and completion_queue.queue[0] is evt, "a refused event is kept"
 
-    clock[0] += 60.0
-    await runner._drain_watch_notifications(completion_queue)
-    assert adapter.handle_message.await_count == 2, "offered again once its delay has passed"
+    # Each refusal doubles the wait from 5s up to the 60s cap: offers land at +5, +10, +20, +40, +60, +60.
+    offered_at = 1000.0
+    for offers, delay in enumerate((5.0, 10.0, 20.0, 40.0, 60.0, 60.0), start=2):
+        clock[0] = offered_at + delay - 0.5
+        await runner._drain_watch_notifications(completion_queue)
+        assert adapter.handle_message.await_count == offers - 1, f"held until {delay}s after the last offer"
+        clock[0] = offered_at = offered_at + delay
+        await runner._drain_watch_notifications(completion_queue)
+        assert adapter.handle_message.await_count == offers, f"offered again {delay}s after the last offer"
+    assert completion_queue.queue[0] is evt
 
 
 @pytest.mark.asyncio

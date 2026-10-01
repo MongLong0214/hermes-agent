@@ -1179,9 +1179,11 @@ class GatewayNotificationsMixin:
         See #9290.
         """
         from gateway.run import _drain_gateway_watch_events, _format_gateway_process_notification
+        from gateway.wake import WakeNotAccepted
         watch_events = _drain_gateway_watch_events(completion_queue)
         now = time.monotonic()
         for evt in watch_events:
+            refused = False
             async with self._completion_event_scope(evt):
                 # The off gate comes before the retry wait: an event refused while its profile had
                 # notifications on is dropped once the profile turns them off rather than kept to its retry time.
@@ -1194,15 +1196,20 @@ class GatewayNotificationsMixin:
                 if not synth_text:
                     continue
                 try:
-                    delivered = await self._inject_watch_notification(synth_text, evt)
+                    delivered = await self._inject_watch_notification(synth_text, evt, raise_not_accepted=True)
+                except WakeNotAccepted:
+                    delivered, refused = False, True
                 except Exception:
                     logger.exception("Watch notification injection error")
                     delivered = False
-            if delivered is False:
+            if refused:
+                # Only an admission refusal (a session busy at its queue cap) waits; a transport failure
+                # is offered again on the next pass rather than waiting, since the adapter may already be back.
                 delay = (min(2 * evt["_retry_delay"], _WATCH_RETRY_MAX_DELAY_SECONDS)
                          if "_retry_delay" in evt else _WATCH_RETRY_FIRST_DELAY_SECONDS)
                 evt["_retry_delay"] = delay
                 evt["_retry_at"] = time.monotonic() + delay
+            if delivered is False:
                 completion_queue.put(evt)
 
     def _adapter_by_platform_value(self, platform_name: str):
