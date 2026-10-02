@@ -55,7 +55,9 @@ LINEAGE_FENCED = "fenced"
 LINEAGE_DAMAGED = "damaged"
 
 SCHEMA_INCOMPATIBLE_VERDICT_PREFIX = "schema_incompatible: "
-_FENCE_REFUSAL_PHRASES = ("state db generation incompatible", f"no such function: {TURN_FENCE_FUNCTION}")
+_FENCE_ABORT_PHRASE = "state db generation incompatible"
+_MISSING_FENCE_FUNCTION_PHRASE = f"no such function: {TURN_FENCE_FUNCTION}"
+_FENCE_REFUSAL_PHRASES = (_FENCE_ABORT_PHRASE, _MISSING_FENCE_FUNCTION_PHRASE)
 
 
 def _turn_fence_generation() -> int:
@@ -243,11 +245,36 @@ def schema_incompatibility_verdict(path) -> Optional[str]:
     return None
 
 
-def fence_refusal_verdict(exc_or_text) -> Optional[str]:
-    """Map a fence abort or a missing-UDF error to a schema_incompatible verdict, else None."""
-    text = str(exc_or_text)
-    if any(phrase in text.lower() for phrase in _FENCE_REFUSAL_PHRASES):
-        return f"{SCHEMA_INCOMPATIBLE_VERDICT_PREFIX}{text}"
+def exception_chain(exc):
+    """*exc*, then the exceptions it was raised from or while handling, each once."""
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        yield exc
+        exc = exc.__cause__ or exc.__context__
+
+
+def fence_refusal_verdict(exc_or_text, *, db_path=None) -> Optional[str]:
+    """Map a fence refusal to a schema_incompatible verdict, else None.
+
+    An exception counts only through a typed SQLite error on its chain, never through prose that quotes
+    the phrases. The fence's RAISE(ABORT) is a refusal by itself. A missing fence function only says the
+    writing connection never registered it, so it is a refusal only when *db_path*'s lineage shows a
+    store this build may not write. Bare text (init-error slots, RPC errors) has no type left and is
+    matched by phrase."""
+    if not isinstance(exc_or_text, BaseException):
+        text = str(exc_or_text)
+        if any(phrase in text.lower() for phrase in _FENCE_REFUSAL_PHRASES):
+            return f"{SCHEMA_INCOMPATIBLE_VERDICT_PREFIX}{text}"
+        return None
+    for exc in exception_chain(exc_or_text):
+        if not isinstance(exc, sqlite3.DatabaseError):
+            continue
+        text = str(exc).lower()
+        if _FENCE_ABORT_PHRASE in text or (
+                _MISSING_FENCE_FUNCTION_PHRASE in text and db_path is not None
+                and schema_incompatibility_verdict(db_path) is not None):
+            return f"{SCHEMA_INCOMPATIBLE_VERDICT_PREFIX}{exc}"
     return None
 
 

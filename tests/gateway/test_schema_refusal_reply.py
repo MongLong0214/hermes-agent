@@ -74,17 +74,37 @@ def test_each_refusal_cause_gets_its_own_remedy_not_the_generic_reply(tmp_path):
     assert len(set(leads.values())) == len(leads), leads
 
 
+def _raw_write_error(db, generation):
+    conn = sqlite3.connect(str(db), isolation_level=None)
+    if generation is not None:
+        conn.create_function("hermes_turn_fence_generation", 0, lambda: generation)
+    try:
+        with pytest.raises(sqlite3.DatabaseError) as caught:
+            conn.execute("UPDATE sessions SET title = 'refused' WHERE id = 'fx-alpha'")
+    finally:
+        conn.close()
+    return caught.value
+
+
 def test_a_fence_refused_write_gets_the_generation_mismatch_reply(tmp_path):
     db = build_store(tmp_path / "fenced" / "state.db", "fenced1030")
     mismatch = _reply(_refusal_from_open(tmp_path, "FENCE_GENERATION_MISMATCH"))
     assert _lead(mismatch) != _lead(_reply(RuntimeError("unrelated failure")))
-    for generation in (None, 29):
-        conn = sqlite3.connect(str(db), isolation_level=None)
-        if generation is not None:
-            conn.create_function("hermes_turn_fence_generation", 0, lambda: generation)
-        try:
-            with pytest.raises(sqlite3.DatabaseError) as caught:
-                conn.execute("UPDATE sessions SET title = 'refused' WHERE id = 'fx-alpha'")
-        finally:
-            conn.close()
-        assert _reply(caught.value) == mismatch, (generation, caught.value)
+    assert _reply(_raw_write_error(db, 29)) == mismatch
+
+
+def test_a_write_without_the_fence_function_is_not_blamed_on_another_build(tmp_path):
+    """This build's own store: the error names an unregistered writer, not the store's lineage."""
+    db = build_store(tmp_path / "fenced" / "state.db", "fenced1030")
+    generic = _lead(_reply(RuntimeError("unrelated failure")))
+    assert _lead(_reply(_raw_write_error(db, None))) == generic
+
+
+@pytest.mark.parametrize("quoted", [
+    "no such function: hermes_turn_fence_generation",
+    "state DB generation incompatible",
+    "Session state turn-fence generation does not match this Hermes build",
+])
+def test_an_unrelated_error_quoting_fence_text_gets_the_generic_reply(quoted):
+    generic = _lead(_reply(RuntimeError("unrelated failure")))
+    assert _lead(_reply(RuntimeError(f"tool output contained: {quoted}"))) == generic

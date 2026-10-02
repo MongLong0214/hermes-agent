@@ -4954,12 +4954,19 @@ def _housekeeping_state_db_maintenance(launch: Optional[Tuple[Path, Path]] = Non
                 idle_days=float(_sess_cfg.get("auto_archive_days", 3)),
                 min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)))
         if _sess_cfg.get("auto_prune", False):
-            _adb.maybe_auto_prune_and_vacuum(
+            # Never VACUUM here: _adb is the shared SessionDB this gateway's turns write through (the
+            # holder gate excludes it), and a full rewrite holds its lock for the whole store, so every
+            # reply waits it out. Reclaiming space is `hermes sessions optimize` with the gateway stopped.
+            _result = _adb.maybe_auto_prune_and_vacuum(
                 retention_days=int(_sess_cfg.get("retention_days", 90)),
                 min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)),
                 min_vacuum_interval_days=int(_sess_cfg.get("min_vacuum_interval_days", 30)),
-                vacuum=bool(_sess_cfg.get("vacuum_after_prune", True)),
+                vacuum=False,
                 sessions_dir=_profile_sessions_dir(launch))
+            if _result.get("pruned") and _sess_cfg.get("vacuum_after_prune", True):
+                logger.info(
+                    "state.db auto-maintenance: VACUUM skipped while the gateway serves turns; run "
+                    "`hermes sessions optimize` with the gateway stopped to reclaim the pruned space")
     finally:
         release_or_close(_adb)
 

@@ -16,6 +16,11 @@ from hermes_startup_watchdog import report_startup_progress
 logger = logging.getLogger("hermes_state")
 
 _LAST_ACTIVE_SQL = _sql_session_last_active("s")
+# Automatic prune runs beside live turns on the same writer: each transaction deletes sessions until
+# about this many rows (sessions + their messages, each message firing the FTS triggers), then
+# releases the writer for a moment so a reply's transcript write is never queued behind the whole sweep.
+_AUTO_PRUNE_BATCH_ROWS = 2000
+_AUTO_PRUNE_BATCH_PAUSE_S = 0.01
 _TOKENS_SQL = "(COALESCE(s.input_tokens, 0) + COALESCE(s.output_tokens, 0))"
 _COST_SQL = "COALESCE(s.actual_cost_usd, s.estimated_cost_usd, 0)"
 
@@ -271,36 +276,67 @@ class SessionMaintenanceMixin:
 
     def prune_sessions(self, older_than_days: Optional[float] = 90, source: str = None,
                        sessions_dir: Optional[Path] = None, exclude_active_write_guards: bool = False,
-                       **filters) -> int:
+                       batch_rows: Optional[int] = None, **filters) -> int:
         """Delete ended sessions inactive for ``older_than_days`` (an explicit ``started_before`` /
         ``last_active_before`` overrides it; None = no implicit bound) matching the filters.
         Children outside the window are orphaned (parent NULLed), not cascade-deleted.  With
         *sessions_dir*, transcript files are removed outside the DB transaction.
         ``exclude_active_write_guards`` (automatic maintenance) skips rows under a live turn lease
-        or compression lock while expired/dead holders are reclaimed and fenced."""
+        or compression lock while expired/dead holders are reclaimed and fenced.
+        ``batch_rows`` (automatic maintenance) commits per batch of whole sessions holding about that
+        many rows instead of one transaction for the sweep; every batch re-applies the filters and
+        guards under its own write lock. None keeps an explicit prune all-or-nothing."""
         where, where_params = self._prune_where(older_than_days, source, filters)
-        removed_ids: list[str] = []
-        def _do(conn):
-            cursor = conn.execute(f"SELECT s.id FROM sessions s WHERE {where}", where_params)
-            session_ids = {row["id"] for row in cursor.fetchall()}
+        def _do(conn, only_ids=None):
+            sql, params = f"SELECT s.id FROM sessions s WHERE {where}", list(where_params)
+            if only_ids is not None:
+                sql += f" AND s.id IN ({_placeholders(only_ids)})"
+                params.extend(only_ids)
+            session_ids = {row["id"] for row in conn.execute(sql, params).fetchall()}
             if exclude_active_write_guards:
                 session_ids -= {sid for sid in session_ids
                                 if self._write_guards_reject(conn, sid, allow_closed_compression_parent=True)}
             if not session_ids:
-                return 0
+                return []
             # Batched: a cron-heavy store prunes tens of thousands of ids in one call.
             for chunk in _id_chunks(session_ids):
                 ph = _placeholders(chunk)
                 conn.execute(f"UPDATE sessions SET parent_session_id = NULL WHERE parent_session_id IN ({ph})", chunk)
                 conn.execute(f"DELETE FROM messages WHERE session_id IN ({ph})", chunk)
                 conn.execute(f"DELETE FROM sessions WHERE id IN ({ph})", chunk)
-                removed_ids.extend(chunk)
-            self._delete_unreferenced_system_prompts(conn)
-            return len(session_ids)
-        count = self._execute_write(_do)
-        for sid in removed_ids:
-            self._remove_session_files(sessions_dir, sid)
-        return count
+            if only_ids is None:
+                self._delete_unreferenced_system_prompts(conn)
+            return list(session_ids)
+        removed_ids: list[str] = []
+        try:
+            if batch_rows is None:
+                removed_ids = self._execute_write(_do)
+            else:
+                for batch in self._prune_batches(where, where_params, batch_rows):
+                    if removed_ids:
+                        time.sleep(_AUTO_PRUNE_BATCH_PAUSE_S)  # let a waiting reply-path write take the writer
+                    removed_ids.extend(self._execute_write(lambda conn, ids=batch: _do(conn, ids)))
+                if removed_ids:
+                    self._execute_write(self._delete_unreferenced_system_prompts)
+        finally:
+            # A failed later batch must not orphan the transcript files of batches already committed.
+            for sid in removed_ids:
+                self._remove_session_files(sessions_dir, sid)
+        return len(removed_ids)
+
+    def _prune_batches(self, where: str, where_params: list, batch_rows: int):
+        """Prune candidates as lists of whole sessions, each about *batch_rows* rows (itself + messages)."""
+        batch: List[str] = []
+        rows = 0
+        for row in self._read_all(
+                f"SELECT s.id, COALESCE(s.message_count, 0) FROM sessions s WHERE {where}", where_params):
+            batch.append(row[0])
+            rows += 1 + max(int(row[1] or 0), 0)
+            if rows >= batch_rows:
+                yield batch
+                batch, rows = [], 0
+        if batch:
+            yield batch
 
     def _page_pragmas(self, names: Tuple[str, ...], fail_msg: str) -> Optional[list]:
         """Integer PRAGMAs over the existing connection (never a byte probe); None + debug log on failure."""
@@ -419,7 +455,8 @@ class SessionMaintenanceMixin:
             # once at entry. No-op when the watchdog is not armed; never raises.
             report_startup_progress(900.0, phase="state_db_auto_prune")
             result["pruned"] = pruned = self.prune_sessions(
-                older_than_days=retention_days, sessions_dir=sessions_dir, exclude_active_write_guards=True)
+                older_than_days=retention_days, sessions_dir=sessions_dir, exclude_active_write_guards=True,
+                batch_rows=_AUTO_PRUNE_BATCH_ROWS)
             report_startup_progress(900.0, phase="state_db_auto_sweep")
             closed = self.sweep_orphaned_sessions(
                 max_idle_seconds=float(retention_days) * 86400.0,

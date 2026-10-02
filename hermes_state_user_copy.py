@@ -12,7 +12,8 @@ from typing import Optional
 
 from hermes_state_errors import (
     SCHEMA_CAUSE_BUILD_TOO_OLD, SCHEMA_CAUSE_FENCE_GENERATION_MISMATCH, SCHEMA_CAUSE_VERSION_UNREADABLE,
-    STORAGE_RECOVERY_DOCS_URL, classify_persistence_error, incompatible_schema_cause, is_disk_full_error,
+    STORAGE_RECOVERY_DOCS_URL, IncompatibleSchemaError, classify_persistence_error, incompatible_schema_cause,
+    is_disk_full_error,
 )
 
 
@@ -120,14 +121,19 @@ _STORAGE_FAILURES: dict[str, tuple[str, str, str]] = {
 def schema_incompatibility_cause(exc_or_str) -> Optional[str]:
     """The refusal cause when *exc_or_str* is this build refusing a store another build owns, else None.
 
-    A write the store's fence aborted, or one made without the fence function, is a generation
-    mismatch: the store's fences name a build other than this one."""
-    cause = incompatible_schema_cause(exc_or_str)
-    if cause is None:
-        from hermes_state_fence import fence_refusal_verdict
+    A write the store's fence aborted is a generation mismatch: the store's fences name a build other
+    than this one. An exception is read by type only (an ``IncompatibleSchemaError`` or the fence's
+    typed SQLite error on its chain), so one that merely quotes a refusal is not one; bare text
+    (init-error slots, RPC errors) is matched by its head."""
+    from hermes_state_fence import exception_chain, fence_refusal_verdict
 
-        if exc_or_str is not None and fence_refusal_verdict(exc_or_str) is not None:
-            cause = SCHEMA_CAUSE_FENCE_GENERATION_MISMATCH
+    if isinstance(exc_or_str, BaseException):
+        cause = next((exc.cause for exc in exception_chain(exc_or_str)
+                      if isinstance(exc, IncompatibleSchemaError)), None)
+    else:
+        cause = incompatible_schema_cause(exc_or_str)
+    if cause is None and exc_or_str is not None and fence_refusal_verdict(exc_or_str) is not None:
+        cause = SCHEMA_CAUSE_FENCE_GENERATION_MISMATCH
     return cause
 
 
