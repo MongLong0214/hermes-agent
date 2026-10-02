@@ -191,7 +191,12 @@ async def test_turn_error_preserves_diagnostic_bridge_and_failed_outcome(
             assert adapter.wire == []
         else:
             assert len(adapter.wire) == 1
-            assert ("same source failure" in adapter.wire[0][0]) is (setting is not True)
+            # R71-1 (PR #71): the chat-bound error notice never carries the raw exception text
+            # regardless of `setting` -- pattern redaction can only mask known credential SHAPES
+            # and cannot be made airtight against arbitrary private content an exception string
+            # can carry. The notice is logged with its traceback before this runs, so nothing is
+            # lost for diagnosis; "setting" only ever gated some OTHER, now-removed behavior here.
+            assert "same source failure" not in adapter.wire[0][0]
         assert not adapter._active_sessions
     finally:
         logger.removeHandler(bridge)

@@ -44,7 +44,7 @@ async def test_sigusr1_handler_installed_by_start_gateway_logs_graceful_restart(
     for target, value in (
         ("gateway.status.get_running_pid", lambda: None),
         ("gateway.status.acquire_gateway_runtime_lock", lambda: True),
-        ("gateway.status.write_pid_file", lambda: None),
+        ("gateway.status.write_pid_file", lambda **kwargs: None),
         ("gateway.status.remove_pid_file", lambda: None),
         ("gateway.status.release_gateway_runtime_lock", lambda: None),
         ("tools.skills_sync.sync_skills", lambda quiet=True: None),

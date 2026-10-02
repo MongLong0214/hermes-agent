@@ -130,8 +130,11 @@ _ORIGINAL_ROW_ID_KEY = "_source_row_id_before_reinsertion"
 def _capture_original_row_id(msg: Dict[str, Any]) -> None:
     """Stamp *msg*'s current ``_row_id`` as its immutable source identity, once. ``setdefault`` so a
     retried attempt (same Python object, already mutated by the failed attempt) never re-captures
-    the wrong value."""
-    msg.setdefault(_ORIGINAL_ROW_ID_KEY, msg.get("_row_id"))
+    the wrong value. A brand-new message (no ``_row_id`` at all -- not a reinsertion) is left alone:
+    stamping a None marker onto it would leak into every plain compaction/compression comparison
+    that is not a reinsertion at all."""
+    if "_row_id" in msg:
+        msg.setdefault(_ORIGINAL_ROW_ID_KEY, msg.get("_row_id"))
 
 
 def _tool_calls_len(raw: Any, scalar: int = 0) -> int:

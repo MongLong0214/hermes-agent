@@ -194,6 +194,11 @@ async def test_start_gateway_replace_aborts_when_force_killed_pid_still_alive(
     monkeypatch.setattr("gateway.run.os.getpid", lambda: 100)
     monkeypatch.setattr("gateway.run.os.kill", lambda pid, sig: None)
     monkeypatch.setattr("time.sleep", lambda _: None)
+    # The SIGTERM-wait loop polls via real `await asyncio.sleep(...)` (never blocking, so signal
+    # handlers stay responsive -- see _wait_for_pid_exit), not `time.sleep`: a legacy PID record's
+    # drain budget is a long conservative floor (R68-3, PR72), so this test must fast-forward every
+    # sleep or it would really wait out that whole budget in wall-clock time.
+    monkeypatch.setattr("gateway.run.asyncio.sleep", AsyncMock())
     monkeypatch.setattr("tools.skills_sync.sync_skills", lambda quiet=True: None)
     monkeypatch.setattr("hermes_logging.setup_logging", lambda hermes_home, mode: tmp_path)
     monkeypatch.setattr("hermes_logging._add_rotating_handler", lambda *args, **kwargs: None)

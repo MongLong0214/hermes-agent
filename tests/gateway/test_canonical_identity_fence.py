@@ -41,7 +41,7 @@ def target(tmp_path, monkeypatch):
         def __init__(self):
             self.calls = []
 
-        def run_conversation(self, text, *, conversation_history, task_id):
+        def run_conversation(self, text, *, conversation_history, task_id, **_kwargs):
             self.calls.append(text)
             self._persist_user_message_idx = len(conversation_history)
             return {"completed": True, "session_id": task_id, "final_response": "terminal",
@@ -145,6 +145,14 @@ def test_matching_identity_runs_one_real_cached_actor_turn(target):
     event = _event(**expected)
     result = asyncio.run(CanonicalReceiptCoordinator(runner).submit(binding, event))
     assert result == CanonicalReceiptResult("terminal", "terminal")
-    assert actor.calls == ["hello"] and len(receipts()) == 1
+
+    def _is_wrapped_peer_turn(call):
+        # The actor now receives the full peer-provenance envelope (render_peer_turn), not the
+        # bare event text -- the envelope's nonce is random per render, so an exact-string
+        # assertion is neither possible nor meaningful; check the structural contract instead.
+        return (call.startswith("[Canonical event principal=peer") and "<<<peer-body:" in call
+                and "\nhello\n" in call)
+
+    assert len(actor.calls) == 1 and _is_wrapped_peer_turn(actor.calls[0]) and len(receipts()) == 1
     assert asyncio.run(CanonicalReceiptCoordinator(runner).submit(binding, event)) == result
-    assert actor.calls == ["hello"]
+    assert len(actor.calls) == 1, "a replayed receipt must not run the actor a second time"
