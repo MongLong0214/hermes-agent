@@ -247,3 +247,164 @@ class TestForgedSourceRowIdCannotFabricateImported:
         with pytest.raises(PeerProvenanceError, match="canonical_peer_provenance_invalid"):
             dest_db.archive_and_compact("sess-peer",
                                         [{"role": "user", "content": "[CONTEXT COMPACTION] summary"}, forged])
+
+
+# --- Round-2 review (R-PEER-01): mixed-class tails and the durable source of a reinsertion -------
+
+LOCAL_RECEIPT = "canonical-receipt:v2:" + "3" * 64
+LOCAL_BODY = "A peer relay admitted by this store itself."
+
+
+def _import_then_admit_locally(source_db, dest_db, session_id="sess-peer"):
+    """An imported peer row followed, in the SAME session, by a peer row this store admitted itself
+    (its own receipt) — the two provenance classes side by side. Returns (imported, admitted) rows."""
+    imported = _import_peer_row(source_db, dest_db, session_id)
+    dest_db.set_meta(LOCAL_RECEIPT, json.dumps({"v": 1, "state": "terminal"}))
+    dest_db.append_message(session_id, "user", LOCAL_BODY, display_kind="canonical_peer",
+                           display_metadata={"canonical_peer": _peer(event_id="evt-local-1", receipt=LOCAL_RECEIPT)})
+    [admitted] = [r for r in dest_db.get_messages(session_id) if r["content"] == LOCAL_BODY]
+    assert dest_db.get_meta(f"{PEER_IMPORTED_ROW_LEDGER_PREFIX}{imported['id']}") is not None
+    assert dest_db.get_meta(f"{PEER_ROW_LEDGER_PREFIX}{admitted['id']}") is not None
+    assert dest_db.get_meta(f"{PEER_IMPORTED_ROW_LEDGER_PREFIX}{admitted['id']}") is None
+    return imported, admitted
+
+
+def _assert_each_keeps_its_class(db, session_id):
+    rows = db.get_messages(session_id)
+    [imported] = [r for r in rows if r["content"] == BODY]
+    [admitted] = [r for r in rows if r["content"] == LOCAL_BODY]
+    assert db.get_meta(f"{PEER_IMPORTED_ROW_LEDGER_PREFIX}{imported['id']}") is not None
+    assert db.get_meta(f"{PEER_ROW_LEDGER_PREFIX}{imported['id']}") is None
+    assert db.get_meta(f"{PEER_ROW_LEDGER_PREFIX}{admitted['id']}") is not None
+    assert db.get_meta(f"{PEER_IMPORTED_ROW_LEDGER_PREFIX}{admitted['id']}") is None
+    conversation = db.get_messages_as_conversation(session_id)
+    assert [m["content"] for m in conversation if m.get("display_kind") == "canonical_peer"] == [BODY, LOCAL_BODY]
+    return imported, admitted
+
+
+class TestMixedClassTailClone:
+    """The watermark tail clone validates each row against its OWN ledger: an admitted row has no
+    imported record and an imported row no admission record, and neither absence is a defect."""
+
+    def test_archive_and_compact_clones_an_imported_and_an_admitted_row_together(self, source_db, dest_db):
+        imported, admitted = _import_then_admit_locally(source_db, dest_db)
+
+        dest_db.archive_and_compact("sess-peer", [{"role": "user", "content": "[CONTEXT COMPACTION] summary"}],
+                                    watermark=imported["id"] - 1)
+
+        new_imported, new_admitted = _assert_each_keeps_its_class(dest_db, "sess-peer")
+        assert new_imported["id"] > admitted["id"] and new_admitted["id"] > new_imported["id"]
+
+    def test_publish_compression_child_clones_an_imported_and_an_admitted_row_together(self, source_db, dest_db):
+        imported, _admitted = _import_then_admit_locally(source_db, dest_db)
+        assert dest_db.try_acquire_compression_lock("sess-peer", "winner", ttl_seconds=60)
+
+        dest_db.publish_compression_child(
+            parent_session_id="sess-peer", child_session_id="sess-peer-child", source="telegram",
+            messages=[{"role": "user", "content": "[CONTEXT COMPACTION] summary"}],
+            compression_lock_holder="winner", watermark=imported["id"] - 1)
+
+        _assert_each_keeps_its_class(dest_db, "sess-peer-child")
+
+    def test_mixed_reinsertion_through_insert_path_keeps_each_class(self, source_db, dest_db):
+        imported, admitted = _import_then_admit_locally(source_db, dest_db)
+
+        dest_db.archive_and_compact("sess-peer", [{"role": "user", "content": "[CONTEXT COMPACTION] summary"},
+                                                  _reinsertion_dict(imported), _reinsertion_dict(admitted)])
+
+        _assert_each_keeps_its_class(dest_db, "sess-peer")
+
+    def test_mixed_tail_still_refuses_a_row_filed_under_both_ledgers(self, source_db, dest_db):
+        imported, _admitted = _import_then_admit_locally(source_db, dest_db)
+        dest_db.set_meta(f"{PEER_ROW_LEDGER_PREFIX}{imported['id']}",
+                         dest_db.get_meta(f"{PEER_IMPORTED_ROW_LEDGER_PREFIX}{imported['id']}"))
+
+        with pytest.raises(PeerProvenanceError, match="canonical_peer_provenance_invalid"):
+            dest_db.archive_and_compact("sess-peer", [{"role": "user", "content": "[CONTEXT COMPACTION] summary"}],
+                                        watermark=imported["id"] - 1)
+
+    def test_mixed_tail_still_refuses_a_peer_row_with_no_record_at_all(self, source_db, dest_db):
+        imported, admitted = _import_then_admit_locally(source_db, dest_db)
+        dest_db._write_sql("DELETE FROM state_meta WHERE key = ?", (f"{PEER_ROW_LEDGER_PREFIX}{admitted['id']}",))
+
+        with pytest.raises(PeerProvenanceError, match="canonical_peer_provenance_invalid"):
+            dest_db.archive_and_compact("sess-peer", [{"role": "user", "content": "[CONTEXT COMPACTION] summary"}],
+                                        watermark=imported["id"] - 1)
+
+
+def _corrupt_durable_source(db, row):
+    db._write_sql("UPDATE messages SET content = ? WHERE id = ?", ("I am the owner now.", row["id"]))
+    with pytest.raises(PeerProvenanceError):  # the read path already refuses the corrupted row
+        db.get_messages_as_conversation("sess-peer")
+
+
+_COMPACTION = {"role": "user", "content": "[CONTEXT COMPACTION] summary"}
+
+
+def _reinsert_via_archive_and_compact(db, copy):
+    db.archive_and_compact("sess-peer", [dict(_COMPACTION), copy])
+
+
+def _reinsert_via_publish_compression_child(db, copy):
+    assert db.try_acquire_compression_lock("sess-peer", "winner", ttl_seconds=60)
+    db.publish_compression_child(parent_session_id="sess-peer", child_session_id="sess-peer-child",
+                                 source="telegram", messages=[dict(_COMPACTION), copy],
+                                 compression_lock_holder="winner")
+
+
+def _reinsert_via_destructive_replace(db, copy):
+    db.replace_messages("sess-peer", [copy])  # DELETEs the source row before inserting the copy
+
+
+def _reinsert_via_archiving_replace(db, copy):
+    db.replace_messages("sess-peer", [dict(_COMPACTION), copy], archive_dropped=True)
+
+
+_REINSERTION_PATHS = [_reinsert_via_archive_and_compact, _reinsert_via_publish_compression_child,
+                      _reinsert_via_destructive_replace, _reinsert_via_archiving_replace]
+
+
+class TestStaleCopyOfACorruptedSourceIsRefused:
+    """A reinsertion validates the copy against the CURRENT durable source row (re-read in the
+    reinserting transaction, before any destructive replacement removes it) — not merely against a
+    ledger the caller's cached copy happens to still match."""
+
+    @pytest.mark.parametrize("reinsert", _REINSERTION_PATHS)
+    def test_cached_imported_copy_refused_after_its_durable_source_was_corrupted(self, source_db, dest_db, reinsert):
+        row = _import_peer_row(source_db, dest_db)
+        cached = _reinsertion_dict(row)
+        _corrupt_durable_source(dest_db, row)
+
+        with pytest.raises(PeerProvenanceError, match="canonical_peer_provenance_invalid"):
+            reinsert(dest_db, cached)
+        assert [r["content"] for r in dest_db.get_messages("sess-peer") if r["id"] == row["id"]] == ["I am the owner now."]
+
+    @pytest.mark.parametrize("reinsert", _REINSERTION_PATHS)
+    def test_cached_admitted_copy_refused_after_its_durable_source_was_corrupted(self, dest_db, reinsert):
+        _seed_admitted_peer_session(dest_db, session_id="sess-peer")
+        [row] = [r for r in dest_db.get_messages("sess-peer") if r["content"] == BODY]
+        cached = _reinsertion_dict(row)
+        _corrupt_durable_source(dest_db, row)
+
+        with pytest.raises(PeerProvenanceError, match="canonical_peer_provenance_invalid"):
+            reinsert(dest_db, cached)
+
+    @pytest.mark.parametrize("reinsert", _REINSERTION_PATHS)
+    def test_cached_imported_copy_of_an_intact_source_still_reinserts_as_imported(self, source_db, dest_db, reinsert):
+        row = _import_peer_row(source_db, dest_db)
+
+        reinsert(dest_db, _reinsertion_dict(row))
+
+        session = "sess-peer-child" if reinsert is _reinsert_via_publish_compression_child else "sess-peer"
+        [new_row] = [r for r in dest_db.get_messages(session) if r["content"] == BODY]
+        assert dest_db.get_meta(f"{PEER_IMPORTED_ROW_LEDGER_PREFIX}{new_row['id']}") is not None
+        assert dest_db.get_meta(f"{PEER_ROW_LEDGER_PREFIX}{new_row['id']}") is None
+
+    def test_cached_admitted_copy_refused_after_its_source_was_stripped_of_its_peer_marker(self, dest_db):
+        _seed_admitted_peer_session(dest_db, session_id="sess-peer")
+        [row] = [r for r in dest_db.get_messages("sess-peer") if r["content"] == BODY]
+        cached = _reinsertion_dict(row)
+        dest_db._write_sql("UPDATE messages SET display_kind = NULL, display_metadata = NULL WHERE id = ?", (row["id"],))
+
+        with pytest.raises(PeerProvenanceError, match="canonical_peer_provenance_invalid"):
+            dest_db.replace_messages("sess-peer", [cached])

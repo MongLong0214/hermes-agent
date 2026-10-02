@@ -2054,9 +2054,9 @@ _BRANCH_COPY_FIELDS = (
     # Branch copies are history, not new activity: keep the parent's timestamps.
     "timestamp",
     # The parent's durable row id, when the source history still carries one (resume's display
-    # projection does). _insert_message_rows reads it to tell a reinserted row's provenance class
-    # from its SOURCE row's own ledger entry (R-PEER-01) instead of defaulting a copied peer row to
-    # admitted; harmless for ordinary rows and for assistant rows (the lookup is scoped to the new
+    # projection does). _insert_message_rows re-reads that SOURCE row and its own ledger entry
+    # (R-PEER-01) to give a copied peer row its source's class instead of defaulting it to admitted,
+    # refusing a copy that no longer matches the source; harmless for ordinary rows and for assistant rows (the lookup is scoped to the new
     # child's session id, which never already holds the parent's row id).
     "_row_id")
 
