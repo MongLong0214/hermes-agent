@@ -131,3 +131,64 @@ def test_handoff_refuses_exited_foreign_or_non_child_callers(clean_queue):
     finally:
         process_registry.kill_all(source="test")
         _unregister_subagent(sid)
+
+
+def test_failed_child_run_names_unhanded_background_process(clean_queue):
+    """L3-6: ``account_background_processes`` ran only on the success path of ``_run_single_child``,
+    so a child that crashes/times out while running (``await_child``'s own failure handling, returned
+    through the ``failure_entry`` branch) never told the parent about a background process it started
+    and never handed off -- the parent learned only the error, then the process was killed unannounced
+    at teardown. The failure entry must name it exactly as the success entry would."""
+    from tools.delegate_tool import _run_single_child
+    from tests.tools.test_delegate_output_schema import _StubChild, _StubParent
+
+    child = _StubChild([])
+    spawned = {}
+
+    def fail(**kwargs):
+        spawned["session"] = process_registry.spawn_local(
+            "sleep 30", task_id=kwargs["task_id"], owner_task_id=kwargs["task_id"])
+        raise RuntimeError("CHILD_CRASH_WITH_LIVE_PROCESS")
+
+    child.run_conversation = fail
+    try:
+        entry = _run_single_child(0, "start a watcher then crash", child, _StubParent())
+        assert entry["status"] in ("error", "failed")
+        assert "CHILD_CRASH_WITH_LIVE_PROCESS" in str(entry)
+        orphaned = entry.get("orphaned_processes") or []
+        assert any(p["session_id"] == spawned["session"].id for p in orphaned), entry
+    finally:
+        process_registry.kill_all(source="test")
+
+
+def test_post_run_exception_names_unhanded_background_process(monkeypatch, clean_queue):
+    """L3-6 sibling site: ``_run_single_child``'s own bare ``except Exception`` tail (a crash in the
+    parent's post-processing AFTER a successful child run -- schema validation, late-steer merge --
+    distinct from ``await_child``'s failure handling) built a fabricated entry and returned it without
+    ever calling ``account_background_processes`` either."""
+    from tools.delegate_tool import _run_single_child
+    from tests.tools.test_delegate_output_schema import _StubChild, _StubParent
+
+    child = _StubChild(['{"ok": true}'])
+    real_run_conversation = child.run_conversation
+    spawned = {}
+
+    def run_and_spawn(**kwargs):
+        spawned["session"] = process_registry.spawn_local(
+            "sleep 30", task_id=kwargs["task_id"], owner_task_id=kwargs["task_id"])
+        return real_run_conversation(**kwargs)
+
+    child.run_conversation = run_and_spawn
+
+    def boom(*_a, **_kw):
+        raise RuntimeError("POST_RUN_CRASH")
+
+    monkeypatch.setattr("tools.delegate_tool._merge_late_steer", boom)
+    try:
+        entry = _run_single_child(0, "start a watcher then crash after finishing", child, _StubParent())
+        assert entry["status"] in ("error", "failed")
+        assert "POST_RUN_CRASH" in str(entry)
+        orphaned = entry.get("orphaned_processes") or []
+        assert any(p["session_id"] == spawned["session"].id for p in orphaned), entry
+    finally:
+        process_registry.kill_all(source="test")

@@ -1207,6 +1207,146 @@ def test_persist_failure_still_delivers_result_and_frees_slot(monkeypatch):
         assert ad._records[res["delegation_id"]]["status"] == "completed"
 
 
+def test_persist_dispatch_failure_frees_slot_and_reports_error(monkeypatch):
+    """L3-3: a PRE-submit durable write failure (locked/full state.db, raised from
+    ``_persist_dispatch`` before the worker is ever submitted) must not strand the in-memory
+    ``running`` record: it occupies a capacity slot forever with no worker ever running to
+    free it. The dispatch must undo its own record and return an explicit error, and the
+    slot must be usable again immediately."""
+    real_persist_dispatch = ad._persist_dispatch
+    calls = {"n": 0}
+
+    def boom_once(record):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("database is locked")
+        return real_persist_dispatch(record)
+
+    monkeypatch.setattr(ad, "_persist_dispatch", boom_once)
+
+    res = ad.dispatch_async_delegation(
+        goal="g", context=None, toolsets=None, role="leaf", model="m", session_key="",
+        runner=lambda: {"status": "completed", "summary": "done"}, max_async_children=1,
+    )
+    assert res["status"] == "rejected"
+    assert "database is locked" in res["error"]
+    assert ad.active_count() == 0
+    with ad._records_lock:
+        assert not ad._records
+
+    # The slot must be free: a second dispatch at the SAME capacity succeeds.
+    res2 = ad.dispatch_async_delegation(
+        goal="g2", context=None, toolsets=None, role="leaf", model="m", session_key="",
+        runner=lambda: {"status": "completed", "summary": "done2"}, max_async_children=1,
+    )
+    assert res2["status"] == "dispatched"
+    evt = _drain_for(res2["delegation_id"])
+    assert evt is not None and evt["status"] == "completed" and evt["summary"] == "done2"
+
+
+def test_recover_abandoned_delegations_releases_lock_during_git_probe(tmp_path, monkeypatch):
+    """L3-5: restart recovery's forensic git-state probe (up to three serial 5s-ceiling `git`
+    subprocess calls, async_delegation_recovery_hints.py) must not run while holding the
+    process-wide ``_DB_LOCK``/ledger transaction -- one abandoned unit stuck in that probe
+    must not freeze every other ledger writer (e.g. a live completion write) behind it."""
+    from gateway import status as gw_status
+    from tools import async_delegation_recovery_hints as hints
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(gw_status, "_pid_exists", lambda pid: False)  # every owner reads as dead
+
+    # One abandoned 'running' row whose dead owner triggers the git-state hint lookup.
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute(
+            "INSERT INTO async_delegations (delegation_id, origin_session, state, dispatched_at, "
+            "updated_at, delivery_state, delivery_attempts, owner_pid, owner_started_at, task_json) "
+            "VALUES ('d-abandoned', 's', 'running', 1.0, 1.0, 'pending', 0, 424242, 1, ?)",
+            (json.dumps({"goal": "g", "owner_cwd": str(tmp_path)}),),
+        )
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_git_state_hint(cwd):
+        entered.set()
+        release.wait(timeout=5)
+        return None
+
+    monkeypatch.setattr(hints, "git_state_hint", blocking_git_state_hint)
+
+    recover_thread = threading.Thread(target=ad.recover_abandoned_delegations)
+    recover_thread.start()
+    try:
+        assert entered.wait(timeout=5), "recovery never reached the git-state hint"
+
+        # The hint call is blocked right now. A concurrent ledger write must complete without
+        # waiting for it -- it must not be stuck behind _DB_LOCK/the recovery transaction.
+        write_done = threading.Event()
+
+        def do_write():
+            ad._persist_dispatch({
+                "delegation_id": "d-live", "session_key": "s", "origin_ui_session_id": "",
+                "parent_session_id": None, "dispatched_at": time.time(),
+            })
+            write_done.set()
+
+        writer = threading.Thread(target=do_write)
+        writer.start()
+        writer.join(timeout=2.0)
+        assert write_done.is_set(), "a concurrent ledger write waited on the blocked git-state hint"
+    finally:
+        release.set()
+        recover_thread.join(timeout=5)
+    assert not recover_thread.is_alive()
+
+
+def test_prune_durable_records_never_drops_undelivered_pending(tmp_path, monkeypatch):
+    """L3-1: the 50-row terminal-history cap must bound delivered/dropped history only.
+    Pending completions (never delivered to the parent) are bounded solely by the separate
+    1,000-row pending cap; the history cap must not treat them as eviction candidates just
+    because delivered rows ran out, or a refused-and-requeued result becomes unrecoverable."""
+    import queue
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    now = time.time()
+    delegation_ids = [f"deleg-pending-{i}" for i in range(ad._MAX_RETAINED_COMPLETED + 1)]
+    for i, delegation_id in enumerate(delegation_ids):
+        ad._persist_dispatch({
+            "delegation_id": delegation_id, "session_key": "s", "origin_ui_session_id": "",
+            "parent_session_id": "parent", "dispatched_at": now + i,
+        })
+        ad._persist_completion(
+            {"delegation_id": delegation_id, "status": "completed", "completed_at": now + i},
+            {"status": "completed", "summary": f"done-{i}"},
+        )
+
+    # A later dispatch's own prune call (every _persist_dispatch ends with one) is the
+    # trigger the finding describes: the 52nd dispatch must not reach back and delete any
+    # of the 51 still-pending completions above it.
+    ad._persist_dispatch({
+        "delegation_id": "deleg-next-dispatch", "session_key": "s", "origin_ui_session_id": "",
+        "parent_session_id": "parent", "dispatched_at": now + 1000,
+    })
+
+    conn = ad._connect()
+    try:
+        pending_ids = {row[0] for row in conn.execute(
+            "SELECT delegation_id FROM async_delegations WHERE delivery_state='pending' "
+            "AND delegation_id != 'deleg-next-dispatch'").fetchall()}
+    finally:
+        conn.close()
+    assert pending_ids == set(delegation_ids)
+
+    # And they must be restorable, not just present as rows: replay must offer every one.
+    restored_queue = queue.Queue()
+    restored = ad.restore_undelivered_completions(restored_queue)
+    assert restored == len(delegation_ids)
+    restored_ids = set()
+    while not restored_queue.empty():
+        restored_ids.add(restored_queue.get_nowait()["delegation_id"])
+    assert restored_ids == set(delegation_ids)
+
+
 def test_prune_never_evicts_live_records():
     """Retention pruning drops TERMINAL records only; ``stalling``/``finalizing`` are live work
     (#76605, #112030). A stalling record has no ``completed_at`` so it sorts oldest and was the
