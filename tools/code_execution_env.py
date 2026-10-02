@@ -114,7 +114,7 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
 
 
 def _build_child_env(*, rpc_endpoint: str, rpc_token: str, tmpdir: str,
-                     child_python: str) -> Dict[str, str]:
+                     child_python: str, lifecycle_guard_active: bool = False) -> Dict[str, str]:
     """Build the scrubbed child environment both execution paths share."""
     from hermes_constants import apply_scratch_tmp_env, apply_subprocess_home_env, get_hermes_home_override
     child_env = _scrub_child_env(os.environ)
@@ -175,7 +175,14 @@ def _build_child_env(*, rpc_endpoint: str, rpc_token: str, tmpdir: str,
     # ``subprocess.run([a+b, ...])``. This stays off PYTHONPATH so a foreign
     # ``code_execution.mode: project`` interpreter's own imports are unaffected; the bootstrap
     # fails open (no audit-hook coverage, source-text scan still applies) if loading errors.
-    child_env["HERMES_KERNEL_LIFECYCLE_GUARD_ROOT"] = _hermes_root
+    # Only wired in when the caller already confirmed this host process is the supervised
+    # gateway (``lifecycle_guard_active``, carrying the SAME ``_is_supervised_gateway_process()``
+    # verdict the source-text scan at tools/code_execution_tool.py gates on) -- a CLI, `hermes
+    # serve`, or unsupervised foreground session is not the process this guard protects, and the
+    # terminal tool's own lifecycle guard preserves lifecycle operations for exactly those
+    # contexts (R70-2).
+    if lifecycle_guard_active:
+        child_env["HERMES_KERNEL_LIFECYCLE_GUARD_ROOT"] = _hermes_root
     return child_env
 
 

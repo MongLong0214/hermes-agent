@@ -187,71 +187,19 @@ _real_stdout = sys.stdout
 # scan. sys.addaudithook() callbacks cannot be removed or replaced by code that runs after them
 # in this interpreter -- including the cell's own code -- so installing this before the first
 # cell runs makes it unconditional for the life of this kernel.
-_HERMES_GUARD_ROOT = os.environ.pop("HERMES_KERNEL_LIFECYCLE_GUARD_ROOT", "")
-_HERMES_LIFECYCLE_CHECK = None
-if _HERMES_GUARD_ROOT:
-    try:
-        # Loaded by file path, not ``import cron.lifecycle_guard``: the ``cron`` package's own
-        # __init__ pulls in the scheduler, which a foreign code_execution.mode: project
-        # interpreter may not have the dependencies for. This file's own top-level imports are
-        # stdlib-only.
-        _guard_path = os.path.join(_HERMES_GUARD_ROOT, "cron", "lifecycle_guard.py")
-        _guard_spec = importlib.util.spec_from_file_location("_hermes_kernel_lifecycle_guard", _guard_path)
-        _guard_mod = importlib.util.module_from_spec(_guard_spec)
-        _guard_spec.loader.exec_module(_guard_mod)
-        _HERMES_LIFECYCLE_CHECK = _guard_mod.contains_gateway_lifecycle_command
-    except Exception:
-        _HERMES_LIFECYCLE_CHECK = None  # fails open to the source-text scan already run on this cell
-
-
-def _hermes_cmdline_text(value):
-    """Flatten a Popen/exec/spawn argv (str, bytes, path-like, or a sequence of those) into one
-    text blob -- the shape ``contains_gateway_lifecycle_command`` expects from a shell command
-    line."""
-    if not value:
-        return ""
-    if isinstance(value, bytes):
-        return value.decode("utf-8", "replace")
-    if isinstance(value, str):
-        return value
-    parts = []
-    try:
-        for item in value:
-            if isinstance(item, bytes):
-                parts.append(item.decode("utf-8", "replace"))
-            else:
-                try:
-                    parts.append(os.fspath(item))
-                except TypeError:
-                    parts.append(str(item))
-    except TypeError:
-        return str(value)
-    try:
-        return shlex.join(parts)
-    except (TypeError, ValueError):
-        return " ".join(parts)
-
-
-def _hermes_classify_cmdline(cmdline):
-    """Run the real classifier with the Hermes root transiently on sys.path -- its own lazy
-    sub-imports (profile lookup, heredoc stripping) need it -- and never leave it there for the
-    cell's own imports. Any classifier error fails OPEN: an import hiccup under a foreign
-    interpreter must not block ordinary subprocess use; the source-text scan already run on this
-    cell's code still covers the literal-command case either way."""
-    if not cmdline or _HERMES_LIFECYCLE_CHECK is None:
-        return False
-    sys.path.append(_HERMES_GUARD_ROOT)
-    try:
-        return bool(_HERMES_LIFECYCLE_CHECK(cmdline))
-    except Exception:
-        return False
-    finally:
-        try:
-            sys.path.remove(_HERMES_GUARD_ROOT)
-        except ValueError:
-            pass
-
-
+#
+# Everything the hook needs (the classifier, the guard root) is a LOCAL variable closed over by
+# the inner functions below, never a module global: a cell shares this runner's ``__main__``
+# namespace (``import __main__`` resolves to this very module, not the per-cell exec dict), so a
+# module global the hook looked up by name each call was one ``__main__._name = ...`` away from a
+# cell disabling the whole guard for the rest of the kernel's life (R70-1c).
+#
+# Scope: a grandchild interpreter spawned from inside a cell (``python -c "..."``) does not
+# inherit this hook -- sys.addaudithook() is per-interpreter and there is no PYTHONSTARTUP
+# equivalent for ``-c`` (it only runs interactively). The Popen/os.system/exec/spawn call that
+# LAUNCHES that grandchild is still checked here, against its own argv; a grandchild that itself
+# shells out to launchctl without that ever appearing in the parent's argv is out of scope for
+# this kernel's own cells, same as the acknowledged ctypes gap below.
 _HERMES_LIFECYCLE_BLOCK_MESSAGE = (
     "Blocked: cannot restart or stop the gateway from inside the gateway process "
     "(execute_code audit-hook guard). The gateway would kill this script before it could "
@@ -259,27 +207,103 @@ _HERMES_LIFECYCLE_BLOCK_MESSAGE = (
 )
 
 
-def _hermes_lifecycle_audit_hook(event, args):
-    """``subprocess.Popen``, ``os.system``, the ``os.exec*`` family and the ``os.posix_spawn*``
-    family each raise one auditing event right before CPython creates the process; raising here
-    aborts that creation instead of merely logging it. ctypes calls straight into libc (a direct
-    ``execve``/``posix_spawn`` via ``ctypes.CDLL``) never go through these C implementations and
-    so never reach this hook -- out of reach of any Python-level audit hook, not just this one."""
-    if event == "os.system":
-        cmdline = args[0] if args else ""
-    elif event == "subprocess.Popen":
-        executable, popen_args, _cwd, _env = args
-        cmdline = (_hermes_cmdline_text(executable) + " " + _hermes_cmdline_text(popen_args)).strip()
-    elif event == "os.exec" or event == "os.posix_spawn":
-        path, exec_args, _env = args
-        cmdline = (_hermes_cmdline_text(path) + " " + _hermes_cmdline_text(exec_args)).strip()
-    else:
-        return
-    if _hermes_classify_cmdline(cmdline):
-        raise PermissionError(_HERMES_LIFECYCLE_BLOCK_MESSAGE)
+def _install_hermes_lifecycle_guard():
+    guard_root = os.environ.pop("HERMES_KERNEL_LIFECYCLE_GUARD_ROOT", "")
+    scan = None
+    if guard_root:
+        try:
+            # Loaded by file path, not ``import cron.lifecycle_guard``: the ``cron`` package's own
+            # __init__ pulls in the scheduler, which a foreign code_execution.mode: project
+            # interpreter may not have the dependencies for. This file's own top-level imports are
+            # stdlib-only.
+            guard_path = os.path.join(guard_root, "cron", "lifecycle_guard.py")
+            guard_spec = importlib.util.spec_from_file_location("_hermes_kernel_lifecycle_guard", guard_path)
+            guard_mod = importlib.util.module_from_spec(guard_spec)
+            guard_spec.loader.exec_module(guard_mod)
+            # The RECURSIVE scanner, not the flat ``contains_gateway_lifecycle_command``: the flat
+            # classifier re-tokenizes the reconstructed cmdline only once, so a quoted
+            # executable/verb inside an ``sh -c`` payload (``sh -c '"launchctl" "bootout" ...'``)
+            # still has literal ``"`` characters sitting between the words after that one pass and
+            # never matches (R70-1b). ``scan_gateway_lifecycle`` is the same recursive walk the
+            # terminal tool's guard uses (tools/terminal_tool_guards.py::gateway_lifecycle_block) --
+            # it re-parses an ``sh -c`` payload as its own fresh command line, which strips exactly
+            # those quotes, so both paths now treat the command the same way.
+            scan = guard_mod.scan_gateway_lifecycle
+        except Exception:
+            scan = None  # fails open to the source-text scan already run on this cell
+
+    def _cmdline_text(value):
+        """Flatten a Popen/exec/spawn argv (str, bytes, path-like, or a sequence of those) into one
+        text blob -- the shape the classifier expects from a shell command line."""
+        if not value:
+            return ""
+        if isinstance(value, bytes):
+            return value.decode("utf-8", "replace")
+        if isinstance(value, str):
+            return value
+        parts = []
+        try:
+            for item in value:
+                if isinstance(item, bytes):
+                    parts.append(item.decode("utf-8", "replace"))
+                else:
+                    try:
+                        parts.append(os.fspath(item))
+                    except TypeError:
+                        parts.append(str(item))
+        except TypeError:
+            return str(value)
+        try:
+            return shlex.join(parts)
+        except (TypeError, ValueError):
+            return " ".join(parts)
+
+    def _classify_cmdline(cmdline):
+        """Run the real classifier with the Hermes root transiently on sys.path -- its own lazy
+        sub-imports (profile lookup, heredoc stripping) need it -- and never leave it there for the
+        cell's own imports. Any classifier error fails OPEN: an import hiccup under a foreign
+        interpreter must not block ordinary subprocess use; the source-text scan already run on this
+        cell's code still covers the literal-command case either way."""
+        if not cmdline or scan is None:
+            return False
+        sys.path.append(guard_root)
+        try:
+            return bool(scan(cmdline)[0])
+        except Exception:
+            return False
+        finally:
+            try:
+                sys.path.remove(guard_root)
+            except ValueError:
+                pass
+
+    def _audit_hook(event, args):
+        """``subprocess.Popen``, ``os.system``, the ``os.exec*`` family and the ``os.posix_spawn*``
+        family each raise one auditing event right before CPython creates the process; raising here
+        aborts that creation instead of merely logging it. ctypes calls straight into libc (a direct
+        ``execve``/``posix_spawn`` via ``ctypes.CDLL``) never go through these C implementations and
+        so never reach this hook -- out of reach of any Python-level audit hook, not just this one."""
+        if event == "os.system":
+            # CPython on at least macOS raises this event with the command as BYTES even when
+            # os.system() was called with a str (verified: os.system("echo hi") audits b"echo
+            # hi") -- decode it like every other argv shape, or the classifier raises on bytes
+            # input and the except-Exception fail-open below lets it straight through (R70-1a).
+            cmdline = _cmdline_text(args[0] if args else "")
+        elif event == "subprocess.Popen":
+            executable, popen_args, _cwd, _env = args
+            cmdline = (_cmdline_text(executable) + " " + _cmdline_text(popen_args)).strip()
+        elif event == "os.exec" or event == "os.posix_spawn":
+            path, exec_args, _env = args
+            cmdline = (_cmdline_text(path) + " " + _cmdline_text(exec_args)).strip()
+        else:
+            return
+        if _classify_cmdline(cmdline):
+            raise PermissionError(_HERMES_LIFECYCLE_BLOCK_MESSAGE)
+
+    sys.addaudithook(_audit_hook)
 
 
-sys.addaudithook(_hermes_lifecycle_audit_hook)
+_install_hermes_lifecycle_guard()
 
 {cell_source}
 
@@ -711,7 +735,8 @@ def _parent_process_handle(child_env: Dict[str, str]):
 
 
 def _spawn(kernel: SessionKernel, *, child_python: str, child_cwd: str,
-           sandbox_tools: frozenset, max_tool_calls: int, task_id: str = "") -> None:
+           sandbox_tools: frozenset, max_tool_calls: int, task_id: str = "",
+           lifecycle_guard_active: bool = False) -> None:
     from tools.code_execution_env import _build_child_env
     from tools.code_execution_tool import generate_hermes_tools_module
     kernel.tmpdir = tempfile.mkdtemp(prefix="hermes_kernel_")
@@ -722,6 +747,7 @@ def _spawn(kernel: SessionKernel, *, child_python: str, child_cwd: str,
                       ("hermes_kernel_runner.py", KERNEL_RUNNER_SOURCE)):
         Path(kernel.tmpdir, name).write_text(src, encoding="utf-8")
     child_env = _build_child_env(rpc_endpoint=rpc_endpoint, rpc_token=kernel.rpc_token,
+                                 lifecycle_guard_active=lifecycle_guard_active,
                                  tmpdir=kernel.tmpdir, child_python=child_python)
     child_env["HERMES_KERNEL_SENTINEL"] = kernel.sentinel
     # Full clipped stdout spills to the kernel's tmpdir so the agent can read_file the middle.
@@ -948,9 +974,15 @@ def _cell_result(kernel: SessionKernel, key: Tuple, status: str, payload: Dict[s
 def execute_in_session_kernel(
     code: str, *, task_id: str, mode: str, child_python: str, child_cwd: str,
     sandbox_tools: frozenset, timeout: int, max_tool_calls: int, reset: bool, is_interrupted,
+    lifecycle_guard_active: bool = False,
 ) -> str:
     """Run one cell in the (owner, mode, python, cwd, tools) session kernel. The owner is the
-    session key (``_resolve_owner``), not the per-turn task id, so state survives across turns."""
+    session key (``_resolve_owner``), not the per-turn task id, so state survives across turns.
+
+    ``lifecycle_guard_active`` carries the caller's already-computed
+    ``_is_supervised_gateway_process()`` verdict: the kernel's subprocess-creation audit hook (see
+    tools/code_kernel.py's ``_install_hermes_lifecycle_guard``) is wired into the child env only for
+    the supervised gateway, matching the condition the SOURCE-TEXT scan already applies (R70-2)."""
     key = (_resolve_owner(task_id) or "", mode, child_python, child_cwd, tuple(sorted(sandbox_tools)))
     exec_start = time.monotonic()
     from agent.delegation_context import is_delegated_child_context
@@ -958,7 +990,8 @@ def execute_in_session_kernel(
     try:
         return _run_cell(kernel, key, code, task_id=task_id, child_python=child_python, child_cwd=child_cwd,
                          sandbox_tools=sandbox_tools, timeout=timeout, max_tool_calls=max_tool_calls,
-                         is_interrupted=is_interrupted, exec_start=exec_start, state_reset=state_reset)
+                         is_interrupted=is_interrupted, exec_start=exec_start, state_reset=state_reset,
+                         lifecycle_guard_active=lifecycle_guard_active)
     finally:
         with _REGISTRY.lock:
             kernel.attached -= 1
@@ -972,7 +1005,8 @@ def execute_in_session_kernel(
 
 def _run_cell(kernel: SessionKernel, key: Tuple, code: str, *, task_id: str, child_python: str,
               child_cwd: str, sandbox_tools: frozenset, timeout: int, max_tool_calls: int,
-              is_interrupted, exec_start: float, state_reset: bool) -> str:
+              is_interrupted, exec_start: float, state_reset: bool,
+              lifecycle_guard_active: bool = False) -> str:
     reused = kernel.proc is not None
     # Captured on the calling thread BEFORE the cell runs (the snapshot a per-call RPC thread
     # would get) and installed on the kernel so RPC dispatches under THIS cell's identity.
@@ -981,7 +1015,8 @@ def _run_cell(kernel: SessionKernel, key: Tuple, code: str, *, task_id: str, chi
         try:
             if kernel.proc is None:
                 _spawn(kernel, task_id=task_id, child_python=child_python, child_cwd=child_cwd,
-                       sandbox_tools=sandbox_tools, max_tool_calls=max_tool_calls)
+                       sandbox_tools=sandbox_tools, max_tool_calls=max_tool_calls,
+                       lifecycle_guard_active=lifecycle_guard_active)
             assert kernel.proc is not None and kernel.proc.stdin is not None
             # Per-cell tool budget: the RPC loop enforces counter < max; reset without restarting.
             kernel.tool_call_counter[0] = 0
