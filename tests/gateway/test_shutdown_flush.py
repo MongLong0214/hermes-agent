@@ -311,6 +311,101 @@ def test_flush_overflow_noop_on_empty():
     assert flush_overflow_to_file({"k": []}) == 0
 
 
+def test_recovery_preserves_head_and_overflow_arrival_order(tmp_path, monkeypatch):
+    """ROUND1-ESCAPE-1: recovery must not scramble FIFO order by sorting the random UUID
+    filenames. A session's head (flushed via ``flush_pending_to_file``) plus two overflow tail
+    events (flushed right after via ``flush_overflow_to_file``, mirroring
+    ``gateway/run_shutdown.py``'s shutdown sequence) must recover in "first, second, third"
+    order — the order they actually arrived in — never resorted by filename."""
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr("gateway.shutdown_flush._get_flush_dir", lambda: flush_dir)
+
+    session_key = "agent:main:telegram:dm:1"
+    pending_count = flush_pending_to_file({session_key: _overflow_event("first")}, reason="shutdown")
+    overflow_count = flush_overflow_to_file(
+        {session_key: [_overflow_event("second"), _overflow_event("third")]}, reason="shutdown")
+    assert pending_count == 1 and overflow_count == 2
+
+    # The on-disk filenames are random UUIDs that carry no ordering. Identify each file by its
+    # own payload text (independent of any ordering field) and rename to the EXACT reverse of
+    # arrival order, so a name-sort (the bug) would recover "third, second, first" while an
+    # order-aware recovery still gets "first, second, third".
+    arrival_rank = {"first": 0, "second": 1, "third": 2}
+    by_arrival = sorted(
+        flush_dir.glob("*.json"),
+        key=lambda p: arrival_rank[json.loads(p.read_text(encoding="utf-8"))["data"]["text"]],
+    )
+    for path, forced_name in zip(by_arrival, ["zzz-1.json", "mmm-2.json", "aaa-3.json"]):
+        path.rename(flush_dir / forced_name)
+
+    db = MagicMock()
+    recovered = recover_pending_to_db(session_db=db)
+
+    assert recovered == 3
+    contents = [call.kwargs["content"] for call in db.append_message.call_args_list]
+    assert contents == ["first", "second", "third"]
+
+
+def test_recovery_keeps_legacy_payloads_before_sequenced_ones(tmp_path, monkeypatch):
+    """ROUND1-ESCAPE-1, round 3: a legacy payload (written before the flush_order field existed)
+    predates every sequenced one and must recover first -- a mixed queue must recover "older,
+    newer", never "newer, older" (the previous key sorted sequenced-but-unmarked-as-legacy files
+    last, inverting exactly the upgrade-survival chronology this field exists to protect)."""
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr("gateway.shutdown_flush._get_flush_dir", lambda: flush_dir)
+
+    pending_count = flush_pending_to_file(
+        {"agent:main:telegram:dm:1": _overflow_event("newer")}, reason="shutdown")
+    assert pending_count == 1
+    newer_path = next(flush_dir.glob("*.json"))
+    payload = json.loads(newer_path.read_text(encoding="utf-8"))
+    assert "flush_order" in payload
+
+    legacy_payload = {**payload, "data": {**payload["data"], "text": "older"}}
+    del legacy_payload["flush_order"]
+    (flush_dir / "legacy-pre-upgrade.json").write_text(json.dumps(legacy_payload), encoding="utf-8")
+
+    db = MagicMock()
+    recovered = recover_pending_to_db(session_db=db)
+
+    assert recovered == 2
+    contents = [call.kwargs["content"] for call in db.append_message.call_args_list]
+    assert contents == ["older", "newer"]
+
+
+def test_recovery_order_survives_a_clock_step_backward_mid_batch(tmp_path, monkeypatch):
+    """ROUND1-ESCAPE-1, round 3: flush_order must not resample the wall clock per write -- a
+    clock step backward between two payloads of the SAME flush batch (NTP sync, VM pause) must
+    not reorder them. The sequence counter alone must still recover "first, second, third"."""
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr("gateway.shutdown_flush._get_flush_dir", lambda: flush_dir)
+
+    import gateway.shutdown_flush as shutdown_flush_module
+    real_time_ns = shutdown_flush_module.time.time_ns
+    clock = iter([5_000_000_000, 1_000_000_000, 9_000_000_000])  # steps backward then forward
+
+    def fake_time_ns():
+        try:
+            return next(clock)
+        except StopIteration:
+            return real_time_ns()
+
+    monkeypatch.setattr(shutdown_flush_module.time, "time_ns", fake_time_ns)
+
+    session_key = "agent:main:telegram:dm:1"
+    pending_count = flush_pending_to_file({session_key: _overflow_event("first")}, reason="shutdown")
+    overflow_count = flush_overflow_to_file(
+        {session_key: [_overflow_event("second"), _overflow_event("third")]}, reason="shutdown")
+    assert pending_count == 1 and overflow_count == 2
+
+    db = MagicMock()
+    recovered = recover_pending_to_db(session_db=db)
+
+    assert recovered == 3
+    contents = [call.kwargs["content"] for call in db.append_message.call_args_list]
+    assert contents == ["first", "second", "third"]
+
+
 def test_drain_transcript_spool_skips_parseable_non_dict_payload(tmp_path, monkeypatch):
     """A scalar/list JSON spool file must not abort the drain; the healthy payload still replays."""
     from gateway.shutdown_flush import drain_transcript_spool, spool_dropped_transcript_message

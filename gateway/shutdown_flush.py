@@ -29,6 +29,17 @@ logger = logging.getLogger(__name__)
 TRANSCRIPT_CAP_DROP_REASON = "transcript_cap_drop"
 # Monotonic tiebreaker so same-second spool files replay in drop order.
 _TRANSCRIPT_SPOOL_SEQ = itertools.count()
+# Monotonic tiebreaker shared by every pending/overflow payload written in one flush pass
+# (head and overflow write their payloads back-to-back from the same shutdown call); recovery
+# sorts on this instead of the random UUID filename so FIFO arrival order survives (ROUND1-ESCAPE-1).
+# The counter alone governs order WITHIN this process's lifetime -- it only ever increases, so a
+# clock step backward mid-flush (round-3 regression) cannot reorder two payloads this process
+# wrote. ``_FLUSH_EPOCH_NS`` is read ONCE, separating this process's generation of payloads from
+# an earlier process's leftover files (if recovery never got to run before another shutdown):
+# a later epoch's payloads still sort after an earlier epoch's, without resampling the clock on
+# every write (which is what let it drift mid-batch in the first place).
+_FLUSH_ORDER_SEQ = itertools.count()
+_FLUSH_EPOCH_NS = time.time_ns()
 
 
 def _get_flush_dir():
@@ -44,8 +55,13 @@ def _get_flush_dir():
 
 
 def _write_payload(flush_dir: Path, payload: Dict[str, Any]) -> Path:
-    """Atomically write one private, uniquely named recovery payload; return its path."""
+    """Atomically write one private, uniquely named recovery payload; return its path.
+
+    Stamps ``flush_order`` with this process's next flush-sequence value: the filename itself
+    (a random UUID) carries no ordering information, so recovery cannot rely on it (ROUND1-ESCAPE-1).
+    """
     from utils import atomic_json_write
+    payload = {**payload, "flush_order": [_FLUSH_EPOCH_NS, next(_FLUSH_ORDER_SEQ)]}
     final_path = flush_dir / f"pending-{uuid.uuid4().hex}.json"
     atomic_json_write(final_path, payload, mode=0o600, default=str)
     if os.name == "posix":
@@ -189,12 +205,30 @@ def _json_safe(value: Any) -> bool:
         return False
 
 
+def _event_recovery_text(event: Any) -> str:
+    """Text that stands for a queued ``MessageEvent`` once replayed as a user row.
+
+    A voice note transcribed while its turn was being drained keeps the transcript only in the STT
+    cache (``_gateway_pending_stt_text``, its ``text`` stays empty), and ``media_urls`` is not part
+    of ``text`` at all — so a media-only event serialised to empty text, which recovery rejects.
+    Prefer the cached transcript, and name every attachment by the placeholder the live drain uses.
+    """
+    stt_text = getattr(event, "_gateway_pending_stt_text", None)
+    text = stt_text if isinstance(stt_text, str) and stt_text else (getattr(event, "text", "") or "")
+    media_urls = getattr(event, "media_urls", None)
+    if not isinstance(media_urls, (list, tuple)) or not media_urls:
+        return text
+    from gateway.run import _build_media_placeholder
+    placeholder = _build_media_placeholder(event)
+    return f"{text}\n{placeholder}" if text else placeholder
+
+
 def _serialise_value(value: Any) -> Optional[dict]:
     """Convert a pending message value to a JSON-serialisable dict."""
     if hasattr(value, "text"):  # MessageEvent-like object
-        result: Dict[str, Any] = {"text": getattr(value, "text", "")}
+        result: Dict[str, Any] = {"text": _event_recovery_text(value)}
         for attr in ("session_id", "platform", "sender_id", "sender_name", "reply_to", "media",
-                     "raw_event"):
+                     "media_urls", "media_types", "raw_event"):
             val = getattr(value, attr, None)
             if val is not None:
                 result[attr] = val if _json_safe(val) else str(val)
@@ -216,20 +250,47 @@ def recover_pending_to_db(session_db=None, *, session_resolver=None) -> int:
     branch. A returned ``db`` routes the append to the profile store owning the key (multiplexed
     gateways); ``None`` falls back to ``session_db``. Returns the number of messages recovered.
     """
-    flush_files = sorted(_get_flush_dir().glob("*.json"))
-    if not flush_files:
+    raw_paths = list(_get_flush_dir().glob("*.json"))
+    if not raw_paths:
         return 0
+    # Pre-read every payload so files can be recovered in flush order (ROUND1-ESCAPE-1): the
+    # filename is a random UUID and carries no ordering, but each payload written by
+    # ``_write_payload`` since the ROUND1-ESCAPE-1 fix carries a monotonic ``flush_order``. A file
+    # that fails to parse here is kept (payload=None) and re-attempted — and re-logged — in the
+    # recovery loop below, unchanged from the previous one-file-isolation behaviour.
+    entries = []
+    for path in raw_paths:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            payload = None
+        entries.append((path, payload))
+    def _order_key(entry):
+        path, payload = entry
+        order = payload.get("flush_order") if isinstance(payload, dict) else None
+        # A legacy file (written before this flush_order field existed) predates every sequenced
+        # one -- it sorts FIRST (ROUND1-ESCAPE-1 round 3: the previous key sorted it last, an
+        # inverted chronology for exactly the case this sequencing exists to protect: state that
+        # outlived an upgrade). Among themselves, legacy files keep filename order (no other
+        # ordering signal exists for them); sequenced files sort by their flush order.
+        if isinstance(order, int):  # an earlier build of this fix wrote a bare counter
+            order = [0, order]
+        valid = (isinstance(order, list) and len(order) == 2
+                 and all(isinstance(v, int) and not isinstance(v, bool) for v in order))
+        return (1, tuple(order), path.name) if valid else (0, (0, 0), path.name)
+    flush_files = sorted(entries, key=_order_key)
     own_db = session_db is None
     if own_db:
         from hermes_state_registry import acquire
         session_db = acquire()
     recovered = 0
     try:
-        for path in flush_files:
+        for path, payload in flush_files:
             # One unparseable payload or rejected append must only skip THIS file: the file is
             # never unlinked, so aborting the pass would re-poison every later boot.
             try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
+                if payload is None:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
                 # Agent-history snapshots are for manual operator recovery, not automatic DB
                 # insertion.
                 if payload.get("reason") == "shutdown-with-unpersisted-agent-history":

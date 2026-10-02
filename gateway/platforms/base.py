@@ -3920,7 +3920,8 @@ class BasePlatformAdapter(ABC):
         """Tail of /stop, /new, /reset: release the command-scoped guard, then
         spawn a fresh processing task for any follow-up queued meanwhile."""
         await self._flush_text_debounce_now(session_key)
-        pending_event = self._pending_messages.pop(session_key, None)
+        pending_event = (None if self._keep_pending_for_shutdown(session_key)
+                         else self._pending_messages.pop(session_key, None))
         self._release_session_guard(session_key, guard=command_guard)
         if pending_event is not None:
             self._start_session_processing(pending_event, session_key)
@@ -4423,9 +4424,10 @@ class BasePlatformAdapter(ABC):
     def _finish_session_task(self, session_key: str, interrupt_event: asyncio.Event) -> None:
         """End-of-task guard/ownership reconciliation. A late ``_pending_messages`` arrival must not
         drop: re-queue it if another task already owns the session (drain handoff), else spawn the
-        drain task and leave it the guard. Nothing pending: release the guard only if we still own
-        it."""
-        late_pending = self._pending_messages.pop(session_key, None)
+        drain task and leave it the guard. Nothing pending (or kept for the shutdown flush while the
+        runner drains): release the guard only if we still own it."""
+        late_pending = (None if self._keep_pending_for_shutdown(session_key)
+                        else self._pending_messages.pop(session_key, None))
         current_task = asyncio.current_task()
         if late_pending is not None:
             existing_task = self._session_tasks.get(session_key)
@@ -4532,13 +4534,26 @@ class BasePlatformAdapter(ABC):
             # Force-flush an unfired debounce timer so this task hands off to a fresh drain task.
             # Clear the Event BEFORE the stop-typing await so concurrent inbound sees a live guard.
             await self._flush_text_debounce_now(session_key)
-            if session_key in self._pending_messages:
+            if session_key in self._pending_messages and not self._keep_pending_for_shutdown(session_key):
                 pending_event = self._pending_messages.pop(session_key)
                 logger.debug("[%s] Processing queued follow-up message", self.name)
                 self._clear_session_guard(session_key)
                 await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_thread_metadata)
-                self._spawn_drain_task(pending_event, session_key)
-                return  # Drain task owns the session now.
+                # A restart drain can start DURING the await above; a stale "not draining" check
+                # taken before it would start a task the now-draining runner only refuses (#round2
+                # PR72-R1 escape). Recheck ownership after the await: if draining began, hand the
+                # head back to the slot for the shutdown flush instead of dispatching it.
+                if (getattr(self.gateway_runner, "_draining", False) is True
+                        and session_key not in self._pending_messages):
+                    # Only restore into an EMPTY slot: a concurrent inbound message admitted
+                    # during the await above already claimed this session's single pending slot
+                    # (PR72-R1 round-3 escape) -- overwriting it would silently drop that newer,
+                    # already-accepted event. With the slot taken, pending_event is processed now
+                    # instead of fighting for the one slot the shutdown flush can save.
+                    self._pending_messages[session_key] = pending_event
+                else:
+                    self._spawn_drain_task(pending_event, session_key)
+                return  # Drain task owns the session now, or the head is left for the flush.
         except asyncio.CancelledError:
             expected = asyncio.current_task() in self._expected_cancelled_tasks
             await self._run_processing_hook(
@@ -4573,6 +4588,19 @@ class BasePlatformAdapter(ABC):
             # Flush any timer that missed the in-band drain, then reconcile ownership.
             await self._flush_text_debounce_now(session_key)
             self._finish_session_task(session_key, interrupt_event)
+
+    def _keep_pending_for_shutdown(self, session_key: str) -> bool:
+        """True when a queued follow-up must stay in ``_pending_messages`` instead of being handed
+        to a drain task: the runner is draining for shutdown/restart and refuses new work, so a
+        dispatched follow-up the user was told is queued would be lost. Left in the slot, it is
+        written out by ``cancel_background_tasks``' flush and recovered on the next boot."""
+        if session_key not in self._pending_messages:
+            return False
+        if getattr(self.gateway_runner, "_draining", False) is not True:
+            return False
+        logger.info("[%s] Gateway draining — keeping queued follow-up for %s for the shutdown flush",
+                    self.name, session_key)
+        return True
 
     def _spawn_drain_task(self, pending_event: MessageEvent, session_key: str) -> None:
         """Hand the session to a fresh task for a queued follow-up — never recurse (chained
