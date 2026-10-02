@@ -23,6 +23,8 @@ from hermes_cli.config import (
     migrate_config,
     read_raw_config,
     remove_env_value,
+    require_parseable_user_config,
+    require_readable_config_before_write,
     save_config,
     save_env_value,
     save_env_value_secure,
@@ -755,6 +757,21 @@ class TestConfigVersionDetection:
         ),
         pytest.param(b"- just_a_list\n", "must be a mapping", (0, _LATEST), id="list-root"),
         pytest.param(b"[]\n", "must be a mapping", (0, _LATEST), id="empty-list-root"),
+        # R-CONFIG-NULL siblings: an explicit null root parses to the same Python ``None`` as an
+        # empty/comment-only file via ``yaml.safe_load`` in every one of these spellings, but it
+        # means "config is null", not "no config written yet" — reject it like any other
+        # non-mapping root, not just the line-based forms the first fix covered.
+        pytest.param(b"null\n", "must be a mapping", (0, _LATEST), id="null-root"),
+        pytest.param(b"~\n", "must be a mapping", (0, _LATEST), id="tilde-root"),
+        pytest.param(b"\xef\xbb\xbfnull\n", "must be a mapping", (0, _LATEST), id="bom-null-root"),
+        pytest.param(
+            b"null\n# end\n", "must be a mapping", (0, _LATEST), id="null-with-trailing-comment"
+        ),
+        pytest.param(
+            b"%YAML 1.1\n---\nnull\n", "must be a mapping", (0, _LATEST), id="yaml-directive-null"
+        ),
+        pytest.param(b"&a null\n", "must be a mapping", (0, _LATEST), id="anchored-null"),
+        pytest.param(b"!!null foo\n", "must be a mapping", (0, _LATEST), id="tagged-null"),
     ]
 
     @pytest.mark.parametrize("config_bytes, match, tolerant", _INVALID_CONFIG_CASES)
@@ -786,6 +803,47 @@ class TestConfigVersionDetection:
 
         assert config_path.read_bytes() == config_bytes
         assert env_path.read_bytes() == env_bytes
+
+
+class TestExplicitNullRootSiblings:
+    """R-CONFIG-NULL sibling sweep: every gate that treats ``fast_safe_load`` returning ``None``
+    as "config is null" rather than "no config written yet" must reject an explicit null root
+    the same way it rejects any other non-mapping root — not just the shared ``_load_user_mapping``
+    readers the first fix covered."""
+
+    @pytest.mark.parametrize(
+        "config_bytes", [b"null\n", b"~\n", b"\xef\xbb\xbfnull\n", b"null\n# end\n"], ids=repr
+    )
+    def test_require_parseable_user_config_rejects_null_root(self, tmp_path, config_bytes):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_bytes(config_bytes)
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            with pytest.raises(InvalidUserConfigError, match="must be a mapping"):
+                require_parseable_user_config()
+
+    def test_require_parseable_user_config_accepts_empty_and_comment_only(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("# just a comment\n", encoding="utf-8")
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            require_parseable_user_config()  # must not raise
+
+    @pytest.mark.parametrize(
+        "config_bytes", [b"null\n", b"~\n", b"\xef\xbb\xbfnull\n", b"null\n# end\n"], ids=repr
+    )
+    def test_require_readable_config_before_write_rejects_null_root(self, tmp_path, config_bytes):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_bytes(config_bytes)
+
+        with pytest.raises(Exception, match="must start with settings names"):
+            require_readable_config_before_write(config_path)
+
+    def test_require_readable_config_before_write_accepts_empty_and_comment_only(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("# just a comment\n", encoding="utf-8")
+
+        assert require_readable_config_before_write(config_path) == {}
 
 
 class TestConfigSupportFloor:

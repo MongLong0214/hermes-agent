@@ -161,7 +161,14 @@ GATEWAY_RESTRICTED_YAML = RESTRICTED_YAML + """
 
 @pytest.mark.parametrize(
     "bad_root",
-    ["[]\n", "false\n", "0\n", "''\n", "- stray\n", "null\n", "~\n", "Null\n", "NULL\n", "---\nnull\n"],
+    [
+        "[]\n", "false\n", "0\n", "''\n", "- stray\n", "null\n", "~\n", "Null\n", "NULL\n", "---\nnull\n",
+        # YAML-valid null spellings the line-based classifier missed: BOM-prefixed, a null
+        # followed by a comment on an "end" line, a %YAML directive document, an anchored null
+        # and an explicitly tagged null. All compose to the same explicit-null root as the forms
+        # above under yaml.compose() with the production loader class.
+        "﻿null\n", "null\n# end\n", "%YAML 1.1\n---\nnull\n", "&a null\n", "!!null foo\n",
+    ],
 )
 def test_non_mapping_root_survives_shared_cache_readers(homes, bad_root):
     """L7-1 regression, with every cache kept live: the raw reader (``read_raw_config()`` behind
