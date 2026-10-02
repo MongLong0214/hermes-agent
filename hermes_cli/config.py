@@ -1896,13 +1896,45 @@ def cfg_get(cfg: Optional[Dict[str, Any]], *keys: str, default: Any = None) -> A
     return node
 
 
+_EXPLICIT_NULL_TOKENS = frozenset({"null", "~"})
+
+
+def _is_explicit_null_document(text: str) -> bool:
+    """True when *text*, once comments/blank lines/document markers are stripped, holds exactly
+    one token and it is a null scalar (``null``/``Null``/``NULL``/``~``) — as opposed to a
+    document that is empty or comment-only, which ``yaml.safe_load`` also returns as ``None`` but
+    which means "no config written here", not "config is null"."""
+    remaining = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped in ("", "---", "..."):
+            continue
+        if stripped.startswith("---"):
+            stripped = stripped[3:].strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        stripped = stripped.split(" #", 1)[0].split("\t#", 1)[0].strip()
+        if stripped:
+            remaining.append(stripped)
+    return len(remaining) == 1 and remaining[0].lower() in _EXPLICIT_NULL_TOKENS
+
+
 def _load_user_mapping(f) -> Dict[str, Any]:
     """Parse a user ``config.yaml`` stream for a cache / ``good``-backup publisher: ``{}`` for an
-    empty file, else the root mapping. Any other root raises ``TypeError``: ``fast_safe_load(f) or {}``
-    turns ``[]``/``false``/``0``/``''`` into ``{}``, which every shared reader then serves as a
-    successful parse — evicting the last-good config instead of falling back to it."""
+    empty or comment-only file, else the root mapping. Any other root raises ``TypeError``:
+    ``fast_safe_load(f) or {}`` turns ``[]``/``false``/``0``/``''`` into ``{}``, which every shared
+    reader then serves as a successful parse — evicting the last-good config instead of falling
+    back to it. An explicit ``null``/``~`` root parses to the same ``None`` as an empty file but
+    means "config is null", not "no config written yet" — reject it the same way as the other
+    non-mapping roots instead of conflating it with a legitimate first-run empty file."""
     data = fast_safe_load(f)
     if data is None:
+        # Re-read the raw text only in this (rare) branch — passing f through unchanged above
+        # keeps the stream object itself (not its text) the thing every caller/test fault-injects
+        # and caches on.
+        f.seek(0)
+        if _is_explicit_null_document(f.read()):
+            raise TypeError("top-level YAML must be a mapping, got NoneType (explicit null)")
         return {}
     if not isinstance(data, dict):
         raise TypeError(f"top-level YAML must be a mapping, got {type(data).__name__}")
