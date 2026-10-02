@@ -313,6 +313,10 @@ def _run_single_child(
 
     * ``"completed"``       — normal finish. See #97655.
     """
+    from tools.approval_context import bind_delegation_depth, get_delegation_depth
+    bind_delegation_depth(get_delegation_depth() + 1)  # MCP call provenance: every child run is one subagent hop,
+    # whether dispatched synchronously (this thread) or from the async worker thread (which already copied the
+    # parent's context via propagate_context_to_thread) -- a single bump here covers both paths.
     child_progress_cb = getattr(child, "tool_progress_callback", None)
     child_pool, leased_cred_id = _lease_child_credential(child)
     # Heartbeat keeps the parent's _last_activity_ts moving so the gateway inactivity timeout doesn't fire while the

@@ -54,6 +54,30 @@ def is_peer_turn() -> bool:
     return _turn_principal_ctx.get() == "peer"
 
 
+def get_turn_principal() -> str:
+    """The current turn's principal for provenance/observability: "owner" for an ordinary turn
+    (the ContextVar default, None, means nobody called set_turn_principal), or the bound value
+    (e.g. "peer")."""
+    return _turn_principal_ctx.get() or "owner"
+
+
+# How many async-delegation hops deep the current context is: 0 for an ordinary top-level turn,
+# N for the Nth-generation subagent. tools.thread_context.propagate_context_to_thread copies the
+# PARENT's contextvars into a delegated worker thread, so without an explicit bump here a subagent
+# tool call is indistinguishable from the top-level turn that dispatched it.
+_delegation_depth_ctx: contextvars.ContextVar[int] = contextvars.ContextVar("delegation_depth", default=0)
+
+
+def get_delegation_depth() -> int:
+    """0 for an ordinary turn; >0 while running inside an async-delegation subagent."""
+    return _delegation_depth_ctx.get()
+
+
+def bind_delegation_depth(depth: int) -> contextvars.Token:
+    """Bind the current context's delegation depth; pair with reset via the returned Token."""
+    return _delegation_depth_ctx.set(depth)
+
+
 def set_hermes_interactive_context(interactive: bool) -> contextvars.Token:
     """Bind interactive mode for the current context instead of mutating os.environ."""
     return _hermes_interactive_ctx.set("1" if interactive else "")
