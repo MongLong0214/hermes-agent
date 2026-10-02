@@ -18,6 +18,7 @@ tests patch ``_load_config`` directly, mirroring test_code_execution_modes.
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -580,7 +581,17 @@ class TestLifecycleGuardAuditHook(unittest.TestCase):
     never looks like a literal string to that scan and — with ``approvals.mode: off`` — the cell
     then runs unchecked. The kernel's bootstrap installs a ``sys.addaudithook`` that re-applies
     ``cron.lifecycle_guard.contains_gateway_lifecycle_command`` to the REAL argv right before
-    CPython would create the process, so terminal and Python enforce the same rule."""
+    CPython would create the process, so terminal and Python enforce the same rule.
+
+    R70-2 scoped the hook to the supervised gateway only (matching the SOURCE-TEXT scan's existing
+    condition), so every test here that exercises blocking behavior needs that precondition set up
+    explicitly -- this class is not itself the supervised gateway process."""
+
+    def setUp(self):
+        from tools import process_registry
+        patcher = patch.object(process_registry, "_is_supervised_gateway_process", lambda: True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     @staticmethod
     def _stub_launchctl(bin_dir: Path, record_path: Path) -> None:
@@ -595,15 +606,21 @@ class TestLifecycleGuardAuditHook(unittest.TestCase):
         stub.chmod(0o755)
 
     def _run_with_stub_launchctl(self, code: str):
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            bin_dir = tmp_path / "bin"
-            record_path = tmp_path / "launchctl_argv.jsonl"
-            self._stub_launchctl(bin_dir, record_path)
-            patched_path = str(bin_dir) + os.pathsep + os.environ.get("PATH", "")
-            with _kernel_config(), patch.dict(os.environ, {"PATH": patched_path}):
-                result = _run(code)
-            return result, record_path
+        # R70-3: a plain ``with tempfile.TemporaryDirectory() as tmp: ... return result, record_path``
+        # unwinds the ``with`` block (deleting the directory) as PART of executing that ``return`` --
+        # before the caller ever sees the value -- so every ``record_path.exists()`` check below was
+        # checking an already-removed path regardless of whether the stub had run. `addCleanup` defers
+        # removal until after the whole test method (including its assertions) has run.
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        tmp_path = Path(tmp)
+        bin_dir = tmp_path / "bin"
+        record_path = tmp_path / "launchctl_argv.jsonl"
+        self._stub_launchctl(bin_dir, record_path)
+        patched_path = str(bin_dir) + os.pathsep + os.environ.get("PATH", "")
+        with _kernel_config(), patch.dict(os.environ, {"PATH": patched_path}):
+            result = _run(code)
+        return result, record_path
 
     def test_dynamically_built_lifecycle_argv_never_reaches_launchctl(self):
         result, record_path = self._run_with_stub_launchctl(textwrap.dedent("""\
@@ -622,7 +639,12 @@ class TestLifecycleGuardAuditHook(unittest.TestCase):
             'import subprocess\n'
             'subprocess.run(["launchctl", "bootout", "gui/501/ai.hermes.gateway"], check=False)\n'
         )
-        self.assertEqual(result["status"], "error", result)
+        # A literal argv like this one is ALSO recognized by the pre-existing SOURCE-TEXT scan
+        # (tools/code_execution_tool.py), which returns a bare ``{"error": ...}`` with no "status"
+        # key -- a dict shared with the kernel's own error shape only through "blocked" semantics,
+        # not key-for-key. Either layer catching it is correct; this test asserts the command is
+        # still blocked, not which layer caught it.
+        self.assertEqual(result.get("status", "error"), "error", result)
         self.assertIn("Blocked: cannot restart or stop the gateway", result["error"])
         self.assertFalse(record_path.exists(),
                           "the stub launchctl must never have been invoked")
@@ -636,3 +658,128 @@ class TestLifecycleGuardAuditHook(unittest.TestCase):
         self.assertEqual(result["status"], "success", result)
         self.assertIn("ok", result["output"])
         self.assertFalse(record_path.exists())
+
+    def test_record_path_reflects_a_genuine_invocation(self):
+        """R70-3: ``_run_with_stub_launchctl`` returned ``record_path`` from inside the
+        ``TemporaryDirectory`` ``with`` block AFTER that block had already exited (``return``
+        unwinds the ``with`` before the caller gets the value), so the directory -- and
+        ``record_path`` -- no longer existed by the time any caller checked it. Every
+        ``assertFalse(record_path.exists(), ...)`` above held vacuously, regardless of whether the
+        stub had actually run. This command carries no hermes-gateway label, so the guard allows
+        it and the stub genuinely runs; ``record_path`` must still answer ``True`` for it."""
+        result, record_path = self._run_with_stub_launchctl(
+            'import subprocess\n'
+            'subprocess.run(["launchctl", "bootout", "unrelated-label"], check=False)\n'
+        )
+        self.assertEqual(result["status"], "success", result)
+        self.assertTrue(record_path.exists(),
+                         "the stub launchctl should have run for an unrelated label")
+
+    def test_os_system_bytes_argv_still_blocked(self):
+        """R70-1(a): on this interpreter ``os.system()`` raises its ``os.system`` audit event with
+        a BYTES argument even when called with a ``str`` (verified directly: ``os.system('echo
+        hi')`` audits ``args[0]`` as ``b'echo hi'``). The hook passed that straight to the
+        classifier, which raised ``TypeError`` on bytes input; the classifier's own fail-OPEN
+        ``except Exception`` swallowed it, so ``os.system(<a lifecycle command>)`` reached the real
+        ``launchctl`` unblocked. The command is built at runtime (as in
+        ``test_dynamically_built_lifecycle_argv_never_reaches_launchctl``) so the pre-existing
+        SOURCE-TEXT scan cannot catch it first -- this isolates the audit hook itself."""
+        result, record_path = self._run_with_stub_launchctl(textwrap.dedent("""\
+            import os
+            a = "launch"
+            b = "ctl"
+            os.system(a + b + " bootout gui/501/ai.hermes.gateway")
+            """))
+        self.assertEqual(result["status"], "error", result)
+        self.assertIn("Blocked: cannot restart or stop the gateway", result["error"])
+        self.assertFalse(record_path.exists(),
+                          "the stub launchctl must never have been invoked")
+
+    def test_quoted_sh_c_payload_still_blocked(self):
+        """R70-1(b): the hook reconstructs a Popen argv into one text blob with ``shlex.join`` and
+        classifies it with the single-pass ``contains_gateway_lifecycle_command``. A quoted
+        executable/verb INSIDE the ``sh -c`` payload (``sh -c '"launchctl" "bootout" ...'``) leaves
+        literal ``"`` characters sitting between ``launchctl`` and ``bootout`` even after that
+        reconstruction, so the single-pass regex/tokenizer never resolves them into one word and
+        the match fails -- while the terminal tool's guard (``scan_gateway_lifecycle``, which
+        re-parses an ``sh -c`` payload as its own fresh command line and so strips exactly those
+        quotes) recognizes the identical command. Confirmed directly against
+        ``cron.lifecycle_guard``: ``contains_gateway_lifecycle_command`` returns False on this
+        reconstructed text, ``scan_gateway_lifecycle`` returns True."""
+        result, record_path = self._run_with_stub_launchctl(
+            'import subprocess\n'
+            'subprocess.run(["sh", "-c", \'"launchctl" "bootout" gui/501/ai.hermes.gateway\'], check=False)\n'
+        )
+        self.assertEqual(result["status"], "error", result)
+        self.assertIn("Blocked: cannot restart or stop the gateway", result["error"])
+        self.assertFalse(record_path.exists(),
+                          "the stub launchctl must never have been invoked")
+
+    def test_global_classifier_override_does_not_disable_the_guard(self):
+        """R70-1(c): the hook's classifier was looked up off a module-level global
+        (``_HERMES_LIFECYCLE_CHECK``) in the runner's own ``__main__`` namespace, and a cell shares
+        that exact namespace with the runner's bootstrap -- ``exec(cell_code, GLOBALS)`` runs in a
+        separate dict, but ``import __main__`` resolves to the REAL running module
+        (``sys.modules["__main__"]``), not that dict. A cell that reassigns
+        ``__main__._HERMES_LIFECYCLE_CHECK = lambda _: False`` therefore disabled the check for
+        every later cell in the kernel's life. This cell disables it and THEN issues the blocked
+        command (built at runtime so the pre-existing SOURCE-TEXT scan cannot catch it first,
+        isolating the audit hook) in the same cell; the guard must still fire."""
+        result, record_path = self._run_with_stub_launchctl(textwrap.dedent("""\
+            import __main__
+            import subprocess
+            try:
+                __main__._HERMES_LIFECYCLE_CHECK = lambda _: False
+            except Exception:
+                pass
+            a = "launch"
+            b = "ctl"
+            subprocess.run([a + b, "bootout", "gui/501/ai.hermes.gateway"], check=False)
+            """))
+        self.assertEqual(result["status"], "error", result)
+        self.assertIn("Blocked: cannot restart or stop the gateway", result["error"])
+        self.assertFalse(record_path.exists(),
+                          "the stub launchctl must never have been invoked")
+
+
+class TestLifecycleGuardSupervisedGatewayOnly(unittest.TestCase):
+    """R70-2: ``tools/code_execution_env.py::_build_child_env`` wired the audit-hook guard into
+    EVERY local kernel unconditionally, discarding the existing supervised-gateway condition the
+    SOURCE-TEXT scan still honors (``tools/code_execution_tool.py``,
+    ``_is_supervised_gateway_process()``). The terminal sibling explicitly preserves lifecycle
+    operations from CLI, ``hermes serve``, and unsupervised foreground contexts -- the kernel's
+    audit hook must too."""
+
+    @staticmethod
+    def _stub_launchctl(bin_dir: Path, record_path: Path) -> None:
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        stub = bin_dir / "launchctl"
+        stub.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            "with open(" + repr(str(record_path)) + ", 'a') as f:\n"
+            "    f.write(json.dumps(sys.argv) + chr(10))\n"
+        )
+        stub.chmod(0o755)
+
+    def test_dynamically_built_lifecycle_argv_allowed_outside_supervised_gateway(self):
+        from tools import process_registry
+
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        tmp_path = Path(tmp)
+        bin_dir = tmp_path / "bin"
+        record_path = tmp_path / "launchctl_argv.jsonl"
+        self._stub_launchctl(bin_dir, record_path)
+        patched_path = str(bin_dir) + os.pathsep + os.environ.get("PATH", "")
+        with patch.object(process_registry, "_is_supervised_gateway_process", lambda: False):
+            with _kernel_config(), patch.dict(os.environ, {"PATH": patched_path}):
+                result = _run(textwrap.dedent("""\
+                    import subprocess
+                    a = "launch"
+                    b = "ctl"
+                    subprocess.run([a + b, "bootout", "gui/501/ai.hermes.gateway"], check=False)
+                    """))
+        self.assertEqual(result["status"], "success", result)
+        self.assertTrue(record_path.exists(),
+                         "outside a supervised gateway the audit hook must not block this cell")

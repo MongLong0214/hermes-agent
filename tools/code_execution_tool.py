@@ -755,6 +755,10 @@ def execute_code(
         timeout=_cfg.get("timeout", DEFAULT_TIMEOUT),
         max_tool_calls=_cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS),
         reset=bool(reset), is_interrupted=_is_interrupted,
+        # Reuse the supervised-gateway verdict already computed above (R70-2): the kernel's
+        # subprocess-creation audit hook must apply under the exact same condition as the
+        # SOURCE-TEXT scan right above it, not unconditionally for every local kernel.
+        lifecycle_guard_active=bool(_probe.value),
     )
 
 
