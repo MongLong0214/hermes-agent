@@ -3373,7 +3373,7 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
             is_peer = peer_metadata(msg) is not None
             if is_peer:
                 # A canonical peer's body reaches the summarizer only quoted under its principal.
-                content = peer_wire_text(msg, with_sidecar=False)
+                content = peer_wire_text(msg)
             if isinstance(content, list):
                 content = "\n".join(_summary_part_text(part) for part in content if isinstance(part, (dict, str)))
             content = _redact_compaction_text(content or "")
@@ -3424,7 +3424,7 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
             role = msg.get("role", "unknown")
             # A canonical peer turn is never an owner ask: quoted under its principal, labelled PEER.
             is_peer = peer_metadata(msg) is not None
-            text = _compact_fallback_turn(peer_wire_text(msg, with_sidecar=False) if is_peer else msg.get("content"))
+            text = _compact_fallback_turn(peer_wire_text(msg) if is_peer else msg.get("content"))
             _collect_path_mentions(text, relevant_files)
             synthetic_user = role == "user" and self._is_synthetic_compression_user_turn(msg)
             tool_names = [_extract_tool_call_name_and_args(tc)[0] for tc in (msg.get("tool_calls") or [])] if role == "assistant" else []

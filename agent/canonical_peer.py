@@ -115,13 +115,18 @@ def peer_metadata(msg: Any) -> Optional[dict[str, str]]:
     return validate_peer_metadata(meta[PEER_METADATA_KEY])
 
 
-def peer_wire_text(msg: Mapping[str, Any], *, with_sidecar: bool = True) -> str:
-    """The exact text a model receives for a peer-marked message.
+def peer_wire_text(msg: Mapping[str, Any]) -> str:
+    """The exact text a model receives for a peer-marked message: always a fresh rendering of the
+    metadata over the row's own authenticated ``content``, never any stored ``api_content``
+    sidecar.
 
     ``content`` is either the clean body (a row loaded from the store) or the rendering itself (the
-    live turn's own dict); the result is always the rendering of the metadata, optionally followed
-    by the per-turn context the live send appended after a blank line (kept from ``api_content`` so
-    replay stays byte-stable). Anything else is refused.
+    live turn's own dict); either way the result is recomputed from it every call. The admission
+    ledger (``hermes_state_messages.py``) authenticates the row's metadata and its ``content``
+    column via a digest; it never covers ``api_content``, so a sidecar is never trusted here even
+    when it starts with the correct rendering (R-PEER-SIDECAR) — a stored rendering that disagrees
+    with this one is not an error, it is simply never read. Anything that fails to validate as a
+    peer row at all is refused.
     """
     peer = peer_metadata(msg)
     if peer is None:
@@ -129,15 +134,7 @@ def peer_wire_text(msg: Mapping[str, Any], *, with_sidecar: bool = True) -> str:
     content = msg.get("content")
     if not isinstance(content, str):
         raise PeerProvenanceError()
-    rendered = content if _unrendered_body(peer, content) is not None else render_peer_turn(peer, content)
-    if not with_sidecar:
-        return rendered
-    sidecar = msg.get("api_content")
-    if isinstance(sidecar, str) and sidecar and sidecar != rendered:
-        if not sidecar.startswith(rendered + "\n\n"):
-            raise PeerProvenanceError()
-        return sidecar
-    return rendered
+    return content if _unrendered_body(peer, content) is not None else render_peer_turn(peer, content)
 
 
 def peer_body(msg: Mapping[str, Any]) -> str:
