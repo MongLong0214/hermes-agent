@@ -91,6 +91,7 @@ _sessions: dict[str, dict] = {}
 _methods: dict[str, callable] = {}
 _db = None
 _db_error: str | None = None
+_db_error_exc: BaseException | None = None  # the open failure behind _db_error, kept for _db_failure()
 _stdout_lock = threading.Lock()
 _cfg_lock = threading.Lock()
 # Shared profile UI metadata is updated concurrently by Desktop, mobile and pool RPCs; its
@@ -394,15 +395,16 @@ def _launch_state_db_path() -> Path:
 
 
 def _get_db():
-    global _db, _db_error
+    global _db, _db_error, _db_error_exc
     if _db is None:
         from hermes_state_registry import acquire
         try:
             # Launch home, never the context-local override (#102526); resolved at first
             # use, not import time (#112692). See _launch_state_db_path.
             _db, _db_error = acquire(_launch_state_db_path()), None
+            _db_error_exc = None
         except Exception as exc:
-            _db_error = str(exc)
+            _db_error, _db_error_exc = str(exc), exc
             logger.warning("TUI session store unavailable — continuing without state.db features: %s", exc)
             return None
     return _db
@@ -501,9 +503,18 @@ def _response_profile_name(profile: str | None = None) -> str:
         return _current_profile_name()
 
 
+def _db_failure():
+    """The store's open failure for the cause classifier: the exception itself while ``_db_error`` is
+    still its text — its type and ``__cause__`` chain tell a real refusal from an error that merely
+    quotes fence text, which ``str(exc)`` throws away — else the bare text."""
+    if _db_error_exc is not None and str(_db_error_exc) == _db_error:
+        return _db_error_exc
+    return _db_error
+
+
 def _db_unavailable_error(rid, *, code: int):
     from hermes_state_user_copy import describe_storage_failure, storage_failure_details
-    failure = describe_storage_failure(_db_error)
+    failure = describe_storage_failure(_db_failure())
     return _err(
         rid, code,
         f"Session storage is unavailable: {failure.gloss}. {failure.action}",

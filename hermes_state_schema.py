@@ -719,25 +719,25 @@ class SessionSchemaMixin:
                     return False
                 cursor = self._conn.cursor()
                 legacy = self._db_has_legacy_inline_fts(cursor)
-                if cursor.execute("SELECT 1 FROM state_meta WHERE key = ? LIMIT 1", (FTS_STALE_KEY,)).fetchone():
-                    row_count = cursor.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
-                    if row_count > _AUTO_FTS_REBUILD_MAX_ROWS:
-                        # The rebuild below is one drop/recreate/reindex transaction inside the
-                        # self._lock this method already holds — on a store this size it would run
-                        # long enough to stall a reply's own transcript write, which takes the SAME
-                        # lock with no timeout. Defer, same as the admission-held case above: the
-                        # breadcrumb survives for the next full-rebuild-guaranteed open to repair.
-                        logger.debug(
-                            "Deferred state.db FTS rebuild skipped automatically (%d stored messages "
-                            "> %d): restart the gateway (or open the store from the CLI) to retry it "
-                            "before any turns resume.", row_count, _AUTO_FTS_REBUILD_MAX_ROWS)
-                        recovered = False
-                    else:
-                        recovered = self._recover_stale_fts(cursor, legacy=legacy, timeout_seconds=0.0)
-                        if recovered:
-                            # CJK was detached alongside the base indexes; its own ensure path
-                            # decides when it comes back online.
-                            self._ensure_fts_cjk_schema(cursor)
+                row_count = cursor.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+                if row_count > _AUTO_FTS_REBUILD_MAX_ROWS:
+                    # Both repairs below reindex every stored message in one transaction inside the
+                    # self._lock this method already holds — on a store this size that runs long
+                    # enough to stall a reply's own transcript write, which takes the SAME lock with
+                    # no timeout. Defer, same as the admission-held case above: the breadcrumb (or,
+                    # without one, the still-missing triggers) survives for the next full-rebuild-
+                    # guaranteed open to repair.
+                    logger.debug(
+                        "Deferred state.db FTS rebuild skipped automatically (%d stored messages "
+                        "> %d): restart the gateway (or open the store from the CLI) to retry it "
+                        "before any turns resume.", row_count, _AUTO_FTS_REBUILD_MAX_ROWS)
+                    recovered = False
+                elif cursor.execute("SELECT 1 FROM state_meta WHERE key = ? LIMIT 1", (FTS_STALE_KEY,)).fetchone():
+                    recovered = self._recover_stale_fts(cursor, legacy=legacy, timeout_seconds=0.0)
+                    if recovered:
+                        # CJK was detached alongside the base indexes; its own ensure path
+                        # decides when it comes back online.
+                        self._ensure_fts_cjk_schema(cursor)
                 else:
                     # No breadcrumb: stale only in memory, because this open's trigger repair found another
                     # process holding the rebuild admission. Run that repair again, still without waiting.

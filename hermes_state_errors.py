@@ -365,8 +365,11 @@ def classify_persistence_error(exc_or_str) -> str:
         # db_path reaches this generic classifier, so that confirmation only ever comes from the
         # unambiguous RAISE text here). An exception that merely QUOTES these phrases in an
         # unrelated message (a tool result, a log line) must not be read as a refusal.
-        from hermes_state_fence import fence_refusal_verdict
-        if fence_refusal_verdict(exc_or_str) is not None:
+        # A refusal re-raised by the layer that hit it (``raise ... from err``) keeps its type on the
+        # chain — the same chain ``schema_incompatibility_cause`` reads for the sub-cause.
+        from hermes_state_fence import exception_chain, fence_refusal_verdict
+        if (any(isinstance(exc, IncompatibleSchemaError) for exc in exception_chain(exc_or_str))
+                or fence_refusal_verdict(exc_or_str) is not None):
             return "schema_incompatible"
     else:
         # No exception object survives an RPC/init-error slot, so there is no type left to check —

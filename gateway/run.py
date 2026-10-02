@@ -3733,6 +3733,7 @@ class GatewayRunner(
         # channel(s) after connecting so the user learns persistence is broken before /resume fails.
         # See #88235.
         self._session_db_init_error: Optional[str] = None
+        self._session_db_init_exc: Optional[BaseException] = None  # same failure, typed: _record_session_db_init_error
         # Non-default profiles' adapters by profile then Platform; self.adapters stays the default's map.
         self._profile_adapters: Dict[str, Dict[Platform, BasePlatformAdapter]] = {}
         # Each SERVED profile's gateway config, as loaded once by ``_load_secondary_profile_config``.
@@ -3944,7 +3945,7 @@ class GatewayRunner(
         except Exception as e:
             # WARNING (not DEBUG) so it lands in errors.log; else an NFS HERMES_HOME silently loses /resume etc.
             logger.warning("SQLite session store not available: %s", e)
-            self._session_db_init_error = str(e)  # surfaced on the home channel(s) once connected
+            self._record_session_db_init_error(e)  # surfaced on the home channel(s) once connected
 
         # Opportunistic state.db maintenance (prune + optional VACUUM), at most once per min_interval_hours.
         # A few blocking seconds per day is fine for a long-lived gateway; failures log, never raise.
@@ -4053,7 +4054,7 @@ class GatewayRunner(
                 raise
 
         def _recovered() -> None:
-            self._session_db_init_error = None
+            self._session_db_init_error = self._session_db_init_exc = None
             logger.info("SQLite session store recovered")
 
         return cache.get(path, _open, raise_on_error=raise_on_error, on_recovered=_recovered)

@@ -137,3 +137,49 @@ def test_prune_splits_one_oversized_session_across_sub_batches(tmp_path, monkeyp
         assert db.get_session("huge") is None
     finally:
         db.close()
+
+
+def test_an_oversized_session_after_a_small_one_never_shares_its_transaction(tmp_path, monkeypatch):
+    """Batching must look at a session's OWN stored rows before adding it to a batch in progress: a
+    small expired session followed by an oversized one used to land both in one batch, so the
+    oversized session's whole history went out in a single un-split transaction (one small + one
+    3,000-message session = one 3,001-message DELETE). No write transaction may delete more than the
+    budget's worth of messages, however the candidates are ordered."""
+    from hermes_state import SessionDB
+
+    budget = 15
+    monkeypatch.setattr(hermes_state_maintenance, "_AUTO_PRUNE_BATCH_ROWS", budget, raising=False)
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        old = time.time() - 400 * 86400
+        sizes = {"small-0": 1, "huge-0": 40, "small-1": 2, "huge-1": 40, "small-2": 1}
+        for sid, count in sizes.items():
+            db.create_session(sid, source="cli")
+            db.append_messages_batch(sid, [{"role": "user", "content": f"m{j}"} for j in range(count)])
+            _mark_old_and_ended(db, sid, old)
+
+        deleted: list = []
+        db._conn.create_function("_test_count_msg_delete", 0, lambda: deleted.append(1) or 0)
+        db._conn.execute(
+            "CREATE TEMP TRIGGER _test_count_msg_delete BEFORE DELETE ON main.messages "
+            "BEGIN SELECT _test_count_msg_delete(); END")
+        per_transaction: list = []
+        real_write = db._execute_write
+
+        def _write(fn, *args, **kwargs):
+            before = len(deleted)
+            try:
+                return real_write(fn, *args, **kwargs)
+            finally:
+                per_transaction.append(len(deleted) - before)
+
+        monkeypatch.setattr(db, "_execute_write", _write)
+        result = db.maybe_auto_prune_and_vacuum(retention_days=90, min_interval_hours=0, vacuum=False)
+
+        assert result.get("pruned") == len(sizes), result
+        assert len(deleted) == sum(sizes.values())
+        assert max(per_transaction) <= budget, (
+            f"one write transaction deleted {max(per_transaction)} messages (budget {budget}): "
+            f"an oversized session shared a batch with a smaller one — {per_transaction}")
+    finally:
+        db.close()
