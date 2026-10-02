@@ -2677,18 +2677,23 @@ class _CompressionLease:
     def release_holder_only(self) -> bool:
         """Stop this holder's refresher and release only its durable lock; False when the DELETE kept failing.
         Holder-qualified and idempotent: safe for the host after a timeout because a newer holder's lease can
-        never be deleted by this stale release."""
+        never be deleted by this stale release. ``_released`` is set only once the DELETE actually commits (or
+        there was nothing to delete), so a failed attempt leaves the holder pending: a later cleanup call
+        (callers release idempotently, e.g. an abort branch followed by the enclosing ``finally``) retries the
+        DELETE instead of reporting a release that never happened."""
         with self._release_guard:
             if self._released:
                 return True
-            self._released = True
             if getattr(self._agent, "_active_compression_lock_holder", None) == self.holder:
                 self._agent._active_compression_lock_holder = None
             if self._refresher is not None:
                 with _swallow('compression lock refresher stop failed: %s'):
                     self._refresher.stop()
+                self._refresher = None
             if self.db is not None and self.sid and self.holder:
-                return _release_lock_row(self.db, self.sid, self.holder)
+                if not _release_lock_row(self.db, self.sid, self.holder):
+                    return False
+            self._released = True
             return True
 
     def release(self) -> None:
@@ -2776,8 +2781,7 @@ def _try_acquire_durable_lock(lease: _CompressionLease, try_acquire: Any, commit
                     "so rows appended during the summary are not archived with the snapshot", lease.sid, _wm_err,
                 )
                 lease.watermark_unreadable = True
-                _release_lock_row(lease.db, lease.sid, lease.holder)
-                lease.holder = None
+                lease.release_holder_only()
                 return False
             # A captured watermark makes the commit safe against later rows on BOTH commit
             # paths; tell the fence so a host may keep this attempt's admission.
@@ -2786,8 +2790,7 @@ def _try_acquire_durable_lock(lease: _CompressionLease, try_acquire: Any, commit
                     commit_fence.mark_commit_watermark_fenced()
         return acquired
     except Exception as _lock_err:
-        _release_lock_row(lease.db, lease.sid, lease.holder)
-        lease.holder = None
+        lease.release_holder_only()
         logger.warning(
             "compression lock acquisition raised unexpectedly for session=%s (%s: %s) — skipping compression this cycle",
             lease.sid, type(_lock_err).__name__, _lock_err,
@@ -2884,6 +2887,12 @@ def _acquire_compression_lease(
             lease.finish_lock_setup()
             if lease.watermark_unreadable:
                 agent._last_compaction_in_place = False
+                # Fail closed on the DB (sit out, commit nothing — see _try_acquire_durable_lock), but tell
+                # callers this is a transient defer, not proof the session cannot compress: an unchanged
+                # transcript with no signal set reaches the insufficient-progress / exhaustion branches
+                # (turn_context_compaction preflight, turn_preflight post-tool, turn_overflow 413 recovery)
+                # the same way a session that genuinely cannot shrink further would.
+                agent._compression_blocked_transient = "watermark_unreadable"
                 return _abort_lease(agent, lifecycle, system_message, attempt_started_at, "watermark_unreadable")
             return _sit_out_lock_contention(
                 agent, lease, lifecycle, system_message, approx_tokens, attempt_started_at

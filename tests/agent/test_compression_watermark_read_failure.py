@@ -108,3 +108,42 @@ def test_rotation_does_not_drop_a_row_appended_after_a_failed_ceiling_read(tmp_p
 
     assert LATE_ROW in _live_contents(db, agent.session_id)
     assert db.get_compression_lock_holder(sid) is None
+
+
+def test_watermark_unreadable_abort_publishes_a_transient_defer_signal(tmp_path: Path):
+    """R1-3: the watermark-unreadable abort (fail-closed: sit out, commit nothing) must also publish the
+    existing transient-defer signal. Without it, an unchanged transcript with no signal set is
+    indistinguishable from a genuinely incompressible session to every caller that only checks the
+    lock-skip signal (turn-start preflight, post-tool) or request_exceeds_model_window (the over-window
+    guard) — each would treat a one-off, already-recovered read failure as proof compression is exhausted."""
+    from agent.conversation_compression import compression_blocked_transiently
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    sid = "WATERMARK_READ_FAILS_TRANSIENT_SIGNAL"
+    messages = _seed(db, sid)
+    agent = _build_agent(db, sid, in_place=True, append_during_summary=False)
+
+    with patch.object(db, "get_active_message_watermark", side_effect=_fail_watermark_read(db, on_call=1)):
+        out_messages, _out_prompt = agent._compress_context(messages, "sys", approx_tokens=120_000)
+
+    assert out_messages is messages  # aborted: sat out, transcript unchanged
+    assert compression_blocked_transiently(agent) is True
+
+
+def test_watermark_unreadable_abort_does_not_trip_the_incompressible_session_error(tmp_path: Path):
+    """R1-3 repro: a request over the model's context window, compressed on a session whose watermark read
+    failed (then recovered), must not raise "Start a new session with /new; this session is too large to
+    compress further" — the transient signal from the abort must reach this exact guard."""
+    from agent.turn_context import _fail_closed_on_insufficient_progress
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    sid = "WATERMARK_READ_FAILS_OVER_WINDOW"
+    messages = _seed(db, sid)
+    agent = _build_agent(db, sid, in_place=True, append_during_summary=False)
+    agent.context_compressor.context_length = 272_000
+
+    with patch.object(db, "get_active_message_watermark", side_effect=_fail_watermark_read(db, on_call=1)):
+        agent._compress_context(messages, "sys", approx_tokens=300_000)
+
+    # Must not raise: a transient defer, not proof a 300k-token request can never fit a 272k window.
+    _fail_closed_on_insufficient_progress(agent, 300_000)

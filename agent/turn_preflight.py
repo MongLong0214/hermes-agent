@@ -328,9 +328,11 @@ def compress_after_tool_results(
         messages, active_system_prompt = agent._compress_context(
             messages, system_message, approx_tokens=_real_tokens, task_id=effective_task_id
         )
-        if messages is _post_tool_input and compression_skipped_due_to_lock(agent):
-            # Lock-skip no-op is a temporary defer, not evidence about compressibility:
-            # refund so a lock-loser loop doesn't burn the budget toward exhausted.
+        if messages is _post_tool_input and (
+            compression_skipped_due_to_lock(agent) or compression_blocked_transiently(agent)
+        ):
+            # Lock-skip or transient-guard no-op is a temporary defer, not evidence about compressibility:
+            # refund so a lock-loser/cooldown loop doesn't burn the budget toward exhausted.
             # #69870 lock-skip / #97488 transient-block: this pass no-oped for a TEMPORARY reason (another
             # path holds the compression lock, or a timed cooldown/backoff guard is active). That is a
             # temporary DEFER, not evidence about compressibility — refund the attempt (it must not burn the

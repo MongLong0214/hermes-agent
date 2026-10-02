@@ -59,3 +59,38 @@ def test_complete_short_selection_keeps_the_verbatim_guarantee():
     assert "verbatim" in section.lower()
     assert "omitted" not in section and "truncated" not in section
     assert section.index("no new deps") < section.index("use tabs")  # newest first
+
+
+def test_an_echoed_previous_user_section_is_replaced_not_trusted():
+    """R1-2: an iterative round hands the model its own previous summary (already carrying this method's
+    '## User Messages' section) as the "PREVIOUS SUMMARY" to preserve, and the model can echo that heading
+    straight through with its old, short content underneath. Trusting the heading's mere presence would
+    then skip rebuilding the bounded-selection disclosure for the turns actually being compacted THIS
+    round, letting a stale "quoted verbatim" claim ride forward indefinitely."""
+    with patch("agent.context_compressor.get_model_context_length", return_value=272_000):
+        c = ContextCompressor(model="main-model", quiet_mode=True, tail_mode="lean")
+    c._session_id = SID
+
+    # Round 1: a short, genuinely-complete prior section.
+    prior_turns = [_user("use tabs"), {"role": "assistant", "content": "ok"}]
+    carried_forward = c._augment_summary_lean("summary body", prior_turns)
+    assert "verbatim" in carried_forward.lower()
+
+    # Round 2: the model echoed round 1's heading/content back verbatim (exactly what "PRESERVE all
+    # existing information that is still relevant" invites), but THIS round's turns are the
+    # bounded-selection case — the 24,000-char budget only holds the newest 8 of 12.
+    turns = []
+    for i in range(12):
+        turns.append(_user(f"constraint {i:02d}: " + "x" * 2_985))
+        turns.append({"role": "assistant", "content": "ok"})
+
+    rebuilt = c._augment_summary_lean(carried_forward, turns)
+    assert rebuilt.count("## User Messages") == 1  # replaced, not duplicated alongside the stale one
+    start = rebuilt.index("## User Messages")
+    end = rebuilt.find("\n## ", start + 1)
+    section = rebuilt[start:] if end == -1 else rebuilt[start:end]
+
+    assert "constraint 00" not in section  # the oldest really is left out...
+    assert "use tabs" not in section  # ...and round 1's stale content does not ride forward
+    assert "every real user message" not in section.lower()
+    assert "8 of 12" in section and "4 older" in section

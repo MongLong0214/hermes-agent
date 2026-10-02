@@ -12,7 +12,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from agent.image_eviction_policy import outbound_image_retire_count
 from agent.auxiliary_client import (
@@ -995,6 +995,24 @@ def _build_recovery_footer(session_id: str, region_len: int) -> str:
         f"session_search(query='<keywords>', session_id='{session_id}') — "
         "do not guess at lost specifics when you can look them up."
     )
+
+
+def _replace_lean_section(summary: str, heading: str, build: Callable[[], str]) -> str:
+    """Rebuild ``heading``'s section from the CURRENT turns, replacing any occurrence already in
+    ``summary`` instead of trusting that the heading's mere presence means its content is still accurate.
+    An iterative prompt hands the model its own previous summary — including the lean sections this same
+    method appended last round — as "PREVIOUS SUMMARY" to preserve, so the model can echo an old heading
+    straight through with shortened or stale content under it (the bounded-selection omission disclosure
+    then never gets regenerated for this round's turns)."""
+    idx = summary.find(heading)
+    if idx == -1:
+        return summary + build()
+    start = idx
+    while start > 0 and summary[start - 1] == "\n":
+        start -= 1
+    end = summary.find("\n## ", idx + len(heading))
+    tail = summary[end:] if end != -1 else ""
+    return summary[:start].rstrip("\n") + tail + build()
 
 
 # Detailed session log comes from the SAME single summary request (one aux LLM
@@ -3560,13 +3578,19 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         return result
 
     def _augment_summary_lean(self, summary: str, turns_to_summarize: List[Dict[str, Any]]) -> str:
-        """Append deterministic lean-mode sections to a summary; no-op in legacy mode."""
+        """Append deterministic lean-mode sections to a summary; no-op in legacy mode.
+        The user-messages section always replaces any carried-forward occurrence (see
+        ``_replace_lean_section``): an iterative round can echo that heading back from the previous
+        summary with its bounded-selection omission disclosure gone or stale, and the heading's mere
+        presence must not be trusted as proof this round's selection was already disclosed."""
         if getattr(self, "tail_mode", "lean") != "lean":
             return summary
+        summary = _replace_lean_section(
+            summary, _LEAN_USER_MESSAGES_HEADING, lambda: _redact_compaction_text(
+                _build_verbatim_user_section(turns_to_summarize, getattr(self, "_session_id", "") or "")),
+        )
         for heading, build in (
             (_LEAN_ANCHOR_HEADING, lambda: _redact_compaction_text(_build_anchor_index(turns_to_summarize))),
-            (_LEAN_USER_MESSAGES_HEADING, lambda: _redact_compaction_text(
-                _build_verbatim_user_section(turns_to_summarize, getattr(self, "_session_id", "") or ""))),
             (_LEAN_RECOVERY_HEADING, lambda: _build_recovery_footer(getattr(self, "_session_id", "") or "", len(turns_to_summarize))),
         ):
             if heading not in summary:
