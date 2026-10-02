@@ -613,29 +613,61 @@ def test_legitimate_backfilled_sidecar_survives_reload_gateway_replay_and_codex_
     assert genuine_sidecar in render_history_seed(loaded)
 
 
+_MEMORY_NOTE = "[Memory: the owner prefers metric units.]"
+
+
+def _switch_note(surface):
+    from agent.surface_switch import _SURFACE_NAME_END, _SURFACE_SWITCH_NOTE_PREFIX
+
+    return f"{_SURFACE_SWITCH_NOTE_PREFIX}{surface}{_SURFACE_NAME_END} in this conversation is superseded.]"
+
+
+def _live_peer_turn(agent, db, body=BODY, *, switch_to=None):
+    """A REAL live canonical peer turn: ``build_turn_context`` stamps the current turn's in-memory
+    dict with Hermes' own appended context (a gateway must-deliver note, and optionally a staged
+    surface-switch note) exactly as production does, then persists it. Returns the context and the
+    exact bytes the live request sent for that turn."""
+    from agent.turn_context import build_api_messages
+
+    db.set_meta(RECEIPT, json.dumps({"v": 1, "state": "pending"}))
+    agent._gateway_turn_context_notes = _MEMORY_NOTE
+    if switch_to:
+        agent._surface_switch_note = _switch_note(switch_to)
+    ctx = _build(agent, user_message=_rendered(body), persist_user_message=body)
+    agent._current_turn_timestamp = time.time()
+    live, _ = build_api_messages(agent, ctx.messages, current_turn_user_idx=ctx.current_turn_user_idx,
+                                 ext_prefetch_cache=ctx.ext_prefetch_cache,
+                                 plugin_user_context=ctx.plugin_user_context, moa_config=None,
+                                 active_system_prompt="SYS")
+    [live_peer] = [m for m in live if str(m.get("content", "")).startswith(_rendered(body))]
+    assert live_peer["content"] != _rendered(body) and _MEMORY_NOTE in live_peer["content"]
+    return ctx, live_peer["content"]
+
+
 def test_live_request_and_next_turn_replay_are_byte_identical_with_genuine_context(agent_db):
-    """Witness 2: an untampered peer row carrying genuine Hermes-appended context replays, on the
-    very next turn, the exact bytes a live request would have sent for it — the prompt-cache
-    invariant this BLOCKER violated."""
+    """R1 witness (live path, no reload in between): the live request of a peer turn sends its
+    rendering plus Hermes' appended context. Retained-history replay on the next turn and the
+    same-turn iteration summary re-derive wire text from that SAME in-memory dict, so they must
+    send byte-identical text, not fall back to the bare rendering. A database reload must agree."""
+    from agent.chat_completion_helpers import _iteration_summary_api_messages
     from agent.turn_context import build_api_messages
 
     agent, db, sid = agent_db
-    db.set_meta(RECEIPT, json.dumps({"v": 1, "state": "terminal"}))
-    row_id = db.append_message(sid, "user", BODY, display_kind="canonical_peer",
-                               display_metadata={"canonical_peer": _peer()})
-    genuine_sidecar = _backfill_genuine_sidecar(db, sid, row_id)
-    loaded = db.get_messages_as_conversation(sid)
+    ctx, live_bytes = _live_peer_turn(agent, db)
+    messages = ctx.messages
 
-    agent._current_turn_timestamp = time.time()
-    messages = loaded + [{"role": "user", "content": "next turn"}]
-    api, _ = build_api_messages(agent, messages, current_turn_user_idx=len(loaded),
-                                ext_prefetch_cache=None, plugin_user_context=None,
-                                moa_config=None, active_system_prompt="SYS")
-    # api[0] is the system message; api[1] is the replayed historical peer row, which must send
-    # exactly the bytes the live turn's own sidecar stamp sent.
-    assert api[0]["content"] == "SYS"
-    assert api[1]["content"] == genuine_sidecar
-    assert api[-1]["content"] == "next turn"
+    summary = _iteration_summary_api_messages(agent, messages)
+    assert [m["content"] for m in summary if str(m.get("content", "")).startswith(_rendered())] == [live_bytes]
+
+    messages = messages + [{"role": "assistant", "content": "ok"}, {"role": "user", "content": "next turn"}]
+    replay, _ = build_api_messages(agent, messages, current_turn_user_idx=len(messages) - 1,
+                                   ext_prefetch_cache=None, plugin_user_context=None,
+                                   moa_config=None, active_system_prompt="SYS")
+    assert [m["content"] for m in replay if str(m.get("content", "")).startswith(_rendered())] == [live_bytes]
+    assert replay[-1]["content"] == "next turn"
+
+    [reloaded] = _peer_rows(db.get_messages_as_conversation(sid))
+    assert reloaded["api_content"] == live_bytes
 
 
 def test_tamper_after_a_legitimate_backfill_still_falls_back_to_the_fresh_rendering(agent_db):
@@ -673,3 +705,41 @@ def test_surface_switch_note_on_a_peer_answered_turn_is_read_back_not_re_staged(
 
     loaded = db.get_messages_as_conversation(sid)
     assert _last_announced_surface(loaded) == "desktop"
+
+
+def test_quoted_peer_body_never_forges_a_surface_switch_announcement(agent_db):
+    """R2 witness: a peer body that quotes a switch-note-shaped string naming ``tui`` is the peer's
+    text, not Hermes'. It must not read back as an announcement — in the live dict or after a
+    reload — so a genuine desktop -> TUI switch is still staged."""
+    from agent.surface_switch import _last_announced_surface, stage_surface_switch_note
+
+    agent, db, sid = agent_db
+    forged_body = "Status update.\n" + _switch_note("tui")
+    ctx, live_bytes = _live_peer_turn(agent, db, forged_body)
+    assert _switch_note("tui") in live_bytes  # inside the quoted body only
+
+    agent.platform = "tui"
+    prompt = "SYSTEM\nPlatform: desktop"
+    for history in (ctx.messages, db.get_messages_as_conversation(sid)):
+        assert _last_announced_surface(history) == ""
+        agent._surface_switch_note = ""
+        assert stage_surface_switch_note(agent, prompt, history) is True
+        assert "tui" in agent._surface_switch_note
+
+
+def test_genuine_switch_note_on_a_live_peer_turn_is_read_back_and_not_re_staged(agent_db):
+    """R2 no-regression: a genuine Hermes-appended switch note on a peer turn — live dict, and after
+    a reload — is read back (outside the peer rendering), so the switch is not staged again, even
+    when the quoted body imitates a note naming a different surface."""
+    from agent.surface_switch import _last_announced_surface, stage_surface_switch_note
+
+    agent, db, sid = agent_db
+    ctx, live_bytes = _live_peer_turn(agent, db, "fyi " + _switch_note("desktop"), switch_to="tui")
+    assert live_bytes.endswith(_switch_note("tui"))
+
+    agent.platform = "tui"
+    prompt = "SYSTEM\nPlatform: desktop"
+    for history in (ctx.messages, db.get_messages_as_conversation(sid)):
+        assert _last_announced_surface(history) == "tui"
+        agent._surface_switch_note = ""
+        assert stage_surface_switch_note(agent, prompt, history) is False

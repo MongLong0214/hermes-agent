@@ -65,7 +65,7 @@ def _last_announced_surface(conversation_history: Any) -> str:
     Once a switch has been announced, that note — not the stored prompt's ``Platform:`` trailer —
     is the last thing the model was told it runs on.  Reading it back is also what keeps a fresh
     AIAgent per turn (the gateway shape) from stacking one copy of the note per turn."""
-    from agent.canonical_peer import peer_metadata
+    from agent.canonical_peer import peer_appended_context, peer_metadata
 
     for msg in reversed((conversation_history or [])[-_NOTE_SCAN_TAIL:]):
         # The note only ever lands on a user row: in its api_content sidecar, or as a text part
@@ -73,13 +73,10 @@ def _last_announced_surface(conversation_history: Any) -> str:
         if not isinstance(msg, dict) or msg.get("role") != "user":
             continue
         if peer_metadata(msg) is not None:
-            # A peer row's own body is never searched for a note (R-PEER-SIDECAR: it is the peer's
-            # text, not Hermes'). Its ``api_content`` is different: by the time it reaches here it
-            # is either the fresh rendering (no note — the common case) or an admission-ledger-
-            # authenticated sidecar that is Hermes' own appended context, a genuine switch note
-            # included, so it is searched the same way a non-peer sidecar is — the body is not.
-            sidecar = msg.get("api_content")
-            text = sidecar if isinstance(sidecar, str) else ""
+            # Only Hermes' own trusted context appended AFTER the peer rendering is searched — where
+            # a genuine switch note lands. The rendering quotes the peer's body, so searching it
+            # would let a peer forge an announcement and suppress a real switch correction.
+            text = peer_appended_context(msg)
             if _SURFACE_SWITCH_NOTE_PREFIX in text:
                 tail = text.rsplit(_SURFACE_SWITCH_NOTE_PREFIX, 1)[1]
                 return tail.split(_SURFACE_NAME_END, 1)[0].strip()

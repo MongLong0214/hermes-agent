@@ -30,9 +30,11 @@ PEER_ROW_LEDGER_PREFIX = "canonical-peer-row:v1:"
 PEER_PROVENANCE_INVALID = "canonical_peer_provenance_invalid"
 ENVELOPE_ESCAPE = "canonical_envelope_escape"
 # Set ONLY by a reader that has already authenticated ``api_content`` against the admission
-# ledger's sidecar digest (``hermes_state_messages.py::_require_admitted_peer``), or by code
-# re-deriving a message from one that was. Never set by a row's own stored columns, so a stored
-# sidecar can never self-authenticate merely by being present: see :func:`peer_wire_text`.
+# ledger's sidecar digest (``hermes_state_messages.py::_require_admitted_peer``), by the live
+# turn's own sidecar stamp (``agent/turn_context.py::_stamp_api_content_sidecar`` — Hermes
+# composing its own context onto the in-memory dict, never data read back from storage), or by
+# code re-deriving a message from one of those. Never set by a row's own stored columns, so a
+# stored sidecar can never self-authenticate merely by being present: see :func:`peer_wire_text`.
 PEER_SIDECAR_VERIFIED_KEY = "_peer_sidecar_verified"
 _RECEIPT_PREFIX = "canonical-receipt:"
 _NONCE_RE = re.compile(r"[0-9a-f]{32}")
@@ -133,12 +135,30 @@ def peer_wire_text(msg: Mapping[str, Any]) -> str:
     let through). Only the admission-ledger digest check in
     ``hermes_state_messages.py::_require_admitted_peer`` — which alone can tell a genuine
     Hermes-appended sidecar (memory/plugin/surface-switch context) from one a stored-row edit
-    tampered with — may set it, and only after that check passes; code that re-derives a message
+    tampered with — may set it, and only after that check passes; the live turn's own stamp sets
+    it on the in-memory dict it just composed (so same-turn and retained-history consumers of that
+    dict send the bytes the live request sent); code that re-derives a message
     from an already-verified one (e.g. gateway replay's history rebuild) may carry the flag
     forward, never originate it. Even then the sidecar must still be a well-formed extension of
     this exact rendering (the correct header, the correct nonce, no foreign nonce) or it is
     refused rather than trusted blindly.
     """
+    rendering, appended = _peer_wire_parts(msg)
+    return rendering + appended
+
+
+def peer_appended_context(msg: Mapping[str, Any]) -> str:
+    """Hermes' own context appended after a peer message's rendering in its trusted sidecar (memory,
+    plugin and surface-switch notes); "" when there is none or the sidecar is not trusted.
+
+    Never includes the rendering, so never the peer's quoted body: a reader looking for Hermes'
+    own notes (``agent/surface_switch.py``) must search only this, or a peer could forge one by
+    quoting its shape."""
+    return _peer_wire_parts(msg)[1]
+
+
+def _peer_wire_parts(msg: Mapping[str, Any]) -> tuple[str, str]:
+    """``(rendering, appended)`` of a peer-marked message; see :func:`peer_wire_text`."""
     peer = peer_metadata(msg)
     if peer is None:
         raise PeerProvenanceError()
@@ -149,8 +169,8 @@ def peer_wire_text(msg: Mapping[str, Any]) -> str:
     sidecar = msg.get("api_content")
     if (msg.get(PEER_SIDECAR_VERIFIED_KEY) and isinstance(sidecar, str) and sidecar.startswith(rendering)
             and peer["nonce"] not in sidecar[len(rendering):]):
-        return sidecar
-    return rendering
+        return rendering, sidecar[len(rendering):]
+    return rendering, ""
 
 
 def peer_body(msg: Mapping[str, Any]) -> str:
