@@ -38,3 +38,24 @@ def test_legacy_siblings_move_but_user_named_copies_stay(tmp_path: Path):
     assert (root / "config.yaml.corrupt.20260729-093706.bak").exists()
     assert (tmp_path / "config.yaml.bak-my-note").read_text() == "mine"
     assert not list(tmp_path.glob("config.yaml.bak.*")) and not list(tmp_path.glob("config.yaml.corrupt.*"))
+
+
+def test_same_stamp_backups_recover_in_creation_order_even_after_pruning(tmp_path: Path, monkeypatch):
+    """REMEDIATION-1: with the clock frozen (every call lands on the same second-level stamp) and
+    retention pruning the oldest copies as newer ones are made, list_config_backups' lexical sort
+    must still return the TRUE newest content first -- not a stale copy whose name happens to
+    collide, after pruning, with the single second this test freezes on."""
+    from hermes_cli.config_backups import backup_config, list_config_backups
+
+    cfg = tmp_path / "config.yaml"
+    frozen = "20261002-000000"
+    monkeypatch.setattr("hermes_cli.config_backups.time.strftime", lambda _fmt: frozen)
+
+    for i in range(10):
+        cfg.write_text(f"model: {i}\n")
+        assert backup_config(cfg, "good", keep=3) is not None
+
+    kept = list_config_backups(cfg, "good")
+    assert len(kept) == 3
+    assert kept[0].read_text() == "model: 9\n", "the newest backup must sort first, even reused names"
+    assert [p.read_text() for p in kept] == ["model: 9\n", "model: 8\n", "model: 7\n"]

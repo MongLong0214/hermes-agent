@@ -21,7 +21,6 @@ from typing import Any, Dict, Optional, Tuple
 from hermes_cli import config as _config
 from hermes_cli import managed_scope
 from hermes_cli.config_read_errors import _warn_config_parse_failure
-from utils import fast_safe_load
 
 # path -> raw user mapping from the last successful parse in this process; served (through the
 # normal pipeline) when the file is later found mid-edit as broken YAML.
@@ -75,17 +74,23 @@ def load_user_config_effective(config_path: Optional[Path] = None, *, fail_close
         raw_hit = _config._RAW_CONFIG_CACHE.get(path_key)
         if user_sig is not None and raw_hit is not None and raw_hit[:4] == user_sig:
             raw = copy.deepcopy(raw_hit[4])  # one parse per process, shared with read_raw_config()
-            _LAST_GOOD_USER_RAW.setdefault(path_key, copy.deepcopy(raw))
+            # Always advance, never setdefault: raw_hit is keyed on the CURRENT file signature, so a hit
+            # here means this is the latest successfully parsed content — an older last-good/backup from
+            # before this valid update must not be preserved (ROUND1-ESCAPE-1).
+            _LAST_GOOD_USER_RAW[path_key] = copy.deepcopy(raw)
+            if config_path == _config.get_config_path():
+                from hermes_cli.config_backups import backup_config
+                backup_config(config_path, "good")
         elif user_sig is not None:
             try:
                 with open(config_path, encoding="utf-8") as f:
-                    loaded = fast_safe_load(f)
+                    # Non-mapping root -> TypeError: handled exactly like broken YAML, never cached.
+                    raw = _config._load_user_mapping(f)
             except Exception as exc:
                 if fail_closed:
                     raise
                 raw, recovered = _recover_user_raw(config_path, path_key, exc), True
             else:
-                raw = loaded if isinstance(loaded, dict) else {}
                 _config._RAW_CONFIG_CACHE[path_key] = (*user_sig, copy.deepcopy(raw))
                 _LAST_GOOD_USER_RAW[path_key] = copy.deepcopy(raw)
                 # Same copy load_config keeps: a fresh process recovers from it (see _recover_user_raw).

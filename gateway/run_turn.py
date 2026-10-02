@@ -1216,13 +1216,16 @@ class GatewayTurnMixin:
                 )
         # Configured aux model failed, recovered on the main model: only the user can fix that config.
         elif _comp is not None and getattr(_comp, "_last_aux_model_failure_model", None):
+            # Egress scrub: provider exception text may carry credentials (opaque Bearer tokens too).
+            from gateway.run import _redact_gateway_user_facing_secrets
             _aux_model = getattr(_comp, "_last_aux_model_failure_model", "")
             _aux_err = getattr(_comp, "_last_aux_model_failure_error", None) or "unknown error"
             await self._hmwa_hygiene_notify(
-                source, attempt.meta, f"ℹ️ Configured compression model `{_aux_model}` "
-                f"failed ({_aux_err}). Recovered using your main "
-                "model — context is intact — but you may want to "
-                "check `auxiliary.compression.model` in config.yaml.",
+                source, attempt.meta, _redact_gateway_user_facing_secrets(
+                    f"ℹ️ Configured compression model `{_aux_model}` "
+                    f"failed ({_aux_err}). Recovered using your main "
+                    "model — context is intact — but you may want to "
+                    "check `auxiliary.compression.model` in config.yaml."),
                 "aux-model-fallback notice",
             )
 

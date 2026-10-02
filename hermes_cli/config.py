@@ -1896,6 +1896,19 @@ def cfg_get(cfg: Optional[Dict[str, Any]], *keys: str, default: Any = None) -> A
     return node
 
 
+def _load_user_mapping(f) -> Dict[str, Any]:
+    """Parse a user ``config.yaml`` stream for a cache / ``good``-backup publisher: ``{}`` for an
+    empty file, else the root mapping. Any other root raises ``TypeError``: ``fast_safe_load(f) or {}``
+    turns ``[]``/``false``/``0``/``''`` into ``{}``, which every shared reader then serves as a
+    successful parse — evicting the last-good config instead of falling back to it."""
+    data = fast_safe_load(f)
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise TypeError(f"top-level YAML must be a mapping, got {type(data).__name__}")
+    return data
+
+
 def _raw_config_cache_hit(path_key: str, cache_key: Tuple[Any, ...]) -> Optional[Dict[str, Any]]:
     """Pure lookup: the cached raw config for ``path_key`` if its signature equals ``cache_key``,
     else ``None``. Shared by the lock-free fast path and the locked re-check of
@@ -1937,13 +1950,11 @@ def _read_raw_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
 
         try:
             with open(config_path, encoding="utf-8") as f:
-                data = fast_safe_load(f) or {}
+                data = _load_user_mapping(f)
         except Exception as e:
             _warn_config_parse_failure(config_path, e)
             return FailedConfigRead(error=e)
 
-        if not isinstance(data, dict):
-            return FailedConfigRead(error=TypeError(f"top-level YAML must be a mapping, got {type(data).__name__}"))
         _CONFIG_PARSE_FAILURES.pop(path_key, None)  # the file reads now (a transient error left the record)
         # The cache stores its own deepcopy. The readonly path returns THAT object (identity
         # invariant: later cache hits return the same dict); the mutable path returns the parse.
@@ -2286,7 +2297,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         if user_sig is not None:
             try:
                 with open(config_path, encoding="utf-8") as f:
-                    user_config = fast_safe_load(f) or {}
+                    user_config = _load_user_mapping(f)
                 _CONFIG_PARSE_FAILURES.pop(path_key, None)  # the file reads now (a transient error left the record)
 
                 if "max_turns" in user_config:

@@ -71,3 +71,58 @@ async def test_aborted_hygiene_retains_cooldown_across_restart_and_final_result(
         runner.session_store.rewrite_transcript.assert_not_called()
     finally:
         db.close()
+
+
+@pytest.mark.asyncio
+async def test_aux_model_fallback_notice_scrubs_credential_shaped_error(tmp_path, monkeypatch):
+    """L1-3 regression: a provider exception recovered via aux-model fallback can carry a
+    credential (e.g. an auth error echoing the key it rejected). The abort branch just above this
+    one in _hmwa_hygiene_apply_result already force-redacts before calling _hmwa_hygiene_notify
+    (gateway/run_turn.py ~1206-1208); the aux-fallback branch must scrub its whole notice with the
+    gateway egress helper — vendor-prefixed keys AND opaque ``Bearer`` tokens — before the text
+    reaches the adapter's real send() (gateway/platforms/base.py emit_warning)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(tmp_path / "managed"))
+    sid = "hygiene-aux-fallback-secret"
+    secret = "sk-testFAKEKEY1234567890ABCDEFGHIJ"
+    # No vendor prefix: only the egress scrub's Bearer sweep catches this one.
+    opaque = "opaqueFixtureToken1234567890ABCDE"
+    raw_error = (f"litellm.AuthenticationError: Incorrect API key provided: {secret}; "
+                 f"upstream rejected Bearer {opaque}")
+
+    class CompressorAgent:
+        def __init__(self, **kwargs):
+            self.session_id = kwargs["session_id"]
+            self._session_db = kwargs.get("session_db")
+            self._last_compaction_in_place = False
+            self.context_compressor = SimpleNamespace(
+                bind_session_state=MagicMock(), _last_compress_aborted=False,
+                _last_aux_model_failure_model=None)
+            self.shutdown_memory_provider = MagicMock()
+            self.close = MagicMock()
+
+        def _compress_context(self, messages, *args, **kwargs):
+            compacted = [{"role": "user", "content": "retained summary"}]
+            self._session_db.archive_and_compact(self.session_id, compacted)
+            self._last_compaction_in_place = True
+            self.context_compressor._last_compress_aborted = False
+            self.context_compressor._last_aux_model_failure_model = "fixture-aux"
+            self.context_compressor._last_aux_model_failure_error = raw_error
+            return compacted, None
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session(sid, "telegram")
+        runner, adapter, event = _make_cooldown_runner(monkeypatch, tmp_path, CompressorAgent, db, sid)
+        cfg = {"compression": {"enabled": True, "hygiene_failure_cooldown_seconds": 300}}
+        (tmp_path / "config.yaml").write_text(json.dumps(cfg))
+
+        assert await runner._handle_message(event) == "ok"
+
+        warnings = [sent for sent in adapter.sent if "Configured compression model" in sent["content"]]
+        assert len(warnings) == 1
+        for credential in (secret, opaque):
+            assert credential not in warnings[0]["content"], (
+                f"raw credential reached the adapter's send(): {warnings[0]['content']!r}")
+    finally:
+        db.close()
