@@ -127,6 +127,17 @@ def _assert_user_call_has_skip_db(calls, expected_skip_db: bool):
         )
 
 
+def _batch_rows(runner, role: str | None = None):
+    """Rows the gateway recovery path (#R67-2) batched through ``append_transcript_batch``
+    (row-id-repair-aware write replacing the old per-row ``append_to_transcript(skip_db=...)``
+    fallback for every write that is NOT skipped outright)."""
+    rows = []
+    for call in runner.session_store.append_transcript_batch.call_args_list:
+        if len(call.args) >= 2 and isinstance(call.args[1], list):
+            rows.extend(r for r in call.args[1] if isinstance(r, dict))
+    return [r for r in rows if role is None or r.get("role") == role]
+
+
 # ── Test 1: agent_failed_early path uses skip_db=True ─────────────────
 
 
@@ -152,24 +163,35 @@ async def test_agent_failed_early_skip_db_when_agent_has_session_db(
         _event(), _source(), "agent:main:telegram:group:-1001:12345", 1
     )
 
-    _assert_user_call_has_skip_db(
-        runner.session_store.append_to_transcript.call_args_list, True
+    # agent_persisted=True (the agent has its own _session_db): the gateway's recovery write
+    # must be skipped outright — no call to either write path for the user row, not a
+    # ``skip_db=True`` no-op call (#R67-2 batches recovery writes through
+    # ``append_transcript_batch`` instead of a per-row ``append_to_transcript``).
+    assert _batch_rows(runner, role="user") == []
+    assert not any(
+        len(call.args) >= 2 and call.args[1].get("role") == "user"
+        for call in runner.session_store.append_to_transcript.call_args_list
     )
     assert FAILED_TURN_NOTICE in response
 
+    # The failed-turn boundary (closed via _hmwa_close_failed_turn, unchanged by #R67-2) is the
+    # only append_to_transcript call left.
     transcript_rows = [
         call.args[1]
         for call in runner.session_store.append_to_transcript.call_args_list
         if len(call.args) >= 2 and call.args[1].get("role") in {"user", "assistant"}
     ]
-    assert [row["role"] for row in transcript_rows] == ["user", "assistant"]
+    assert [row["role"] for row in transcript_rows] == ["assistant"]
     assert transcript_rows[-1]["content"] == FAILED_TURN_NOTICE
 
-    # The next unrelated input remains its own turn instead of alternation repair
-    # merging the failed mutating request into it.
+    # The next unrelated input remains its own turn instead of alternation repair merging the
+    # failed mutating request into it. The user row itself landed via the agent's own
+    # persistence (skip_db case), not through this mock, so it's reconstructed here to match
+    # what the durable transcript actually holds.
     from agent.agent_runtime_helpers import repair_message_sequence
 
-    replay = [*transcript_rows, {"role": "user", "content": "unrelated question"}]
+    replay = [{"role": "user", "content": "hello world"}, *transcript_rows,
+              {"role": "user", "content": "unrelated question"}]
     assert repair_message_sequence(None, replay) == 0
     assert replay[-1]["content"] == "unrelated question"
 
@@ -283,8 +305,12 @@ async def test_not_new_messages_skip_db_when_agent_has_session_db(
         _event(), _source(), "agent:main:telegram:group:-1001:12345", 1
     )
 
-    _assert_user_call_has_skip_db(
-        runner.session_store.append_to_transcript.call_args_list, True
+    # agent_persisted=True → the gateway recovery write is skipped outright, not called with
+    # skip_db=True (#R67-2 moved this write to append_transcript_batch).
+    assert _batch_rows(runner, role="user") == []
+    assert not any(
+        len(call.args) >= 2 and call.args[1].get("role") == "user"
+        for call in runner.session_store.append_to_transcript.call_args_list
     )
 
 
@@ -310,5 +336,90 @@ async def test_transcript_read_failure_stops_turn_before_agent_or_append(
 
 
 # ── Test 4: normal path (new_messages found) uses skip_db=True ────────
+
+
+# ── R67-2 (L4-2): agent_persisted=False must not re-insert already-committed rows ──────
+
+
+@pytest.mark.asyncio
+async def test_agent_persisted_false_only_writes_the_unpersisted_tail(monkeypatch, tmp_path):
+    """Turn-start persistence (and any mid-turn incremental flush) can already have committed
+    the user row and earlier tool exchanges before the FINAL flush fails and the turn reports
+    ``agent_persisted=False`` (#L4-2/R67-1 now makes this a real, reachable signal). The gateway's
+    new_messages loop used to apply one blanket ``skip_db=agent_persisted`` to the entire
+    current-turn suffix, so a partial failure re-inserted rows the agent already wrote — a
+    probe through the real append path produced ``old user, old assistant, new user, new user,
+    new assistant``. Only rows the agent never persisted (no ``_db_persisted`` marker — including
+    ones the finalizer's blank-row fill cleared the marker on for a rewrite) may reach the DB."""
+    runner = _bootstrap(monkeypatch, tmp_path)
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "final answer",
+            "messages": [
+                {"role": "user", "content": "hi", "_db_persisted": True},
+                {
+                    "role": "assistant", "content": "", "_db_persisted": True,
+                    "tool_calls": [{"id": "c1", "function": {"name": "f", "arguments": "{}"}}],
+                },
+                {"role": "tool", "tool_call_id": "c1", "content": "ok", "_db_persisted": True},
+                {"role": "assistant", "content": "final answer"},  # the flush that FAILED
+            ],
+            "tools": [],
+            "history_offset": 0,
+            "agent_persisted": False,
+            "last_prompt_tokens": 0,
+        }
+    )
+
+    await runner._handle_message_with_agent(
+        _event(), _source(), "agent:main:telegram:group:-1001:12345", 1
+    )
+
+    # #R67-2 batches the unpersisted suffix through append_transcript_batch (row-id-repair-aware)
+    # instead of looping per-row append_to_transcript(skip_db=...) calls; a row carrying
+    # ``_db_persisted`` is now excluded from the write entirely rather than passed with
+    # skip_db=True.
+    single_calls = runner.session_store.append_to_transcript.call_args_list
+    written_single = {
+        call.args[1]["content"]
+        for call in single_calls
+        if len(call.args) >= 2 and isinstance(call.args[1], dict)
+        and call.args[1].get("role") in {"user", "assistant", "tool"}
+    }
+    batched = _batch_rows(runner)
+    written_batched = {row["content"] for row in batched}
+    assert "hi" not in written_single and "hi" not in written_batched
+    assert "ok" not in written_single and "ok" not in written_batched
+    assert "final answer" in written_batched, (written_single, written_batched)
+    assert "final answer" not in written_single
+
+
+@pytest.mark.asyncio
+async def test_agent_persisted_false_still_writes_everything_without_markers(monkeypatch, tmp_path):
+    """Guardrail: a runtime that never flushed anything itself (every message lacks
+    ``_db_persisted``) must keep writing the whole new-message tail, same as before this fix."""
+    runner = _bootstrap(monkeypatch, tmp_path)
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "final answer",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "final answer"},
+            ],
+            "tools": [],
+            "history_offset": 0,
+            "agent_persisted": False,
+            "last_prompt_tokens": 0,
+        }
+    )
+
+    await runner._handle_message_with_agent(
+        _event(), _source(), "agent:main:telegram:group:-1001:12345", 1
+    )
+
+    # Neither row carries ``_db_persisted``, so both go through append_transcript_batch
+    # (#R67-2's row-id-repair-aware recovery write), not the old skip_db=False per-row call.
+    user_rows = _batch_rows(runner, role="user")
+    assert len(user_rows) == 1 and user_rows[0]["content"] == "hi"
 
 

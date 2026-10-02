@@ -569,8 +569,16 @@ def _persist_projected_messages(agent, turn, messages: List[Dict[str, Any]]) -> 
     rows are durable in the session DB (the codex thread binding may then be published).
 
     Bypasses conversation_loop's per-step _persist_session(); the flush dedups via _DB_PERSISTED_MARKER so
-    only the new codex rows are written. The agent stays the sole persister (agent_persisted=True): a
-    gateway re-write would re-INSERT the user turn."""
+    only the new codex rows are written. The agent is normally the sole persister: a gateway re-write
+    would re-INSERT the user turn. Also sets ``agent._last_persist_succeeded`` (same contract as
+    ``session_persistence.py``'s ``_persist_session``) so the caller's ``agent_persisted`` reflects
+    whether this flush actually landed instead of assuming the agent always wrote it (#L4-2/R67-1:
+    a failed flush was reported as persisted, so the gateway skipped the write that could have
+    recovered it). When there is nothing new to project, this function attempts no flush of its
+    own, so it must not touch ``_last_persist_succeeded`` at all — the turn-start flush
+    (``turn_context._persist_turn_start``, before the codex runtime ever ran) already recorded
+    the real outcome, and forcing it to ``True`` here silently erased a genuine turn-start
+    failure (ROUND1-ESCAPE sibling of #L4-2/R67-1)."""
     if not turn.projected_messages:
         return False
     from agent.message_metadata import append_message
@@ -585,6 +593,7 @@ def _persist_projected_messages(agent, turn, messages: List[Dict[str, Any]]) -> 
     for projected_message in projected_messages:
         append_message(messages, projected_message)
     if getattr(agent, "_session_db", None) is None:
+        agent._last_persist_succeeded = True  # no store configured — not a failure
         return False
     flush_ok = False
     try:
@@ -592,9 +601,11 @@ def _persist_projected_messages(agent, turn, messages: List[Dict[str, Any]]) -> 
     except Exception:
         logger.warning("codex app-server projected-message flush failed", exc_info=True)
     if flush_ok is False:
-        # Output already streamed and agent_persisted cannot flip to False: surface the gap loudly.
+        # Output already streamed: the reply already reached the user, but the gateway must still
+        # know the write didn't land so it can attempt its own recovery write.
         logger.warning("codex app-server turn was delivered but could NOT be persisted to the session DB "
                        "(session=%s) — this turn will be missing after restart/resume", getattr(agent, "session_id", None))
+    agent._last_persist_succeeded = flush_ok is True
     return flush_ok is True
 
 
@@ -666,8 +677,11 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
     )
     return _turn_result(
         interrupt, messages, api_calls=1, completed=not turn.interrupted and turn.error is None, error=turn.error,
-        # We flushed the projected rows ourselves (agent_persisted); the gateway must skip its own DB write.
-        final_response=turn.final_text, agent_persisted=True, codex_thread_id=turn.thread_id, codex_turn_id=turn.turn_id,
+        # Honest outcome from the flush above (#L4-2/R67-1): True when we actually flushed the
+        # projected rows (or there was nothing to flush), False only when an attempted flush failed
+        # — the gateway must then NOT skip its own DB write.
+        final_response=turn.final_text, agent_persisted=getattr(agent, "_last_persist_succeeded", True),
+        codex_thread_id=turn.thread_id, codex_turn_id=turn.turn_id,
         **usage_result,
     )
 

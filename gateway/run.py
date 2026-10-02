@@ -1335,12 +1335,21 @@ def _select_cached_agent_history(
     retention.
     """
     if isinstance(live_history, list) and len(live_history) > len(persisted_history):
-        from agent.session_persistence import _is_ephemeral_scaffolding
+        from agent.session_persistence import _RETAINED_UNFLUSHED_HISTORY_MARKER, _is_ephemeral_scaffolding
 
-        has_unpersisted_row = any(
-            isinstance(message, dict) and not message.get("_db_persisted")
-            and not _is_ephemeral_scaffolding(message) for message in live_history)
-        if has_unpersisted_row:
+        unpersisted_rows = [
+            message for message in live_history
+            if isinstance(message, dict) and not message.get("_db_persisted")
+            and not _is_ephemeral_scaffolding(message)
+        ]
+        if unpersisted_rows:
+            # These rows are about to ride conversation_history for the new turn without ever
+            # having reached state.db. _db_flush_collect's "already in conversation_history =>
+            # durable" shortcut would otherwise certify them durable by identity alone and skip
+            # writing them (#L4-2/R67-5) -- mark them so that turn's flush writes the backlog for
+            # real instead of waving it through.
+            for message in unpersisted_rows:
+                message[_RETAINED_UNFLUSHED_HISTORY_MARKER] = True
             return list(live_history)
     return persisted_history
 

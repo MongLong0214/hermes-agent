@@ -43,6 +43,13 @@ _IMAGE_PART_TYPES = {"image", "image_url", "input_image"}
 # Reasoning/codex fields are role-gated (assistant-only) inside _insert_message_rows.
 _ROW_REASONING_KEYS = ("reasoning", "reasoning_content", "reasoning_details", "codex_reasoning_items", "codex_message_items")
 _PERSIST_AFTER_ADMISSION_INTERRUPT = "_persist_after_admission_interrupt"
+# The FTS write-corruption guard (gateway/run.py::_select_cached_agent_history, #50502) can hand a
+# NEW turn the retained LIVE transcript (still carrying rows that never reached state.db) as its
+# conversation_history, instead of a genuine DB reload. Those rows are then both unflushed AND
+# present in conversation_history by identity — without this flag the "already in
+# conversation_history => durable" shortcut below falsely certifies them and skips writing them,
+# so the backlog is never recovered and eviction reads the session as caught up (#L4-2/R67-5).
+_RETAINED_UNFLUSHED_HISTORY_MARKER = "_retained_unflushed_history"
 
 
 def _is_ephemeral_scaffolding(msg: Any) -> bool:
@@ -242,7 +249,7 @@ def _db_flush_collect(agent, messages: List[Dict], conversation_history: Optiona
         # Already durable (history copy or caller-seeded): stamp so future flushes skip it.
         if (
             id(msg) in history_ids or id(msg) in seed_ids
-        ) and not msg.get(_PERSIST_AFTER_ADMISSION_INTERRUPT):
+        ) and not msg.get(_PERSIST_AFTER_ADMISSION_INTERRUPT) and not msg.get(_RETAINED_UNFLUSHED_HISTORY_MARKER):
             msg[_DB_PERSISTED_MARKER] = True
             continue
         if getattr(agent, "_mute_notification_reply", False):
@@ -350,12 +357,17 @@ class SessionPersistenceMixin:
         The persist user-message *override* is NOT applied here — it is resolved inside
         ``_flush_messages_to_session_db`` and written only to the DB row, never mutating the live message
         list used by the API call (#48677 is thus closed for every persist caller, not just this one).
+
+        ``_last_persist_succeeded`` records this flush's outcome (``False`` only on a write
+        exception, never on "nothing to flush" — no DB / persist-disabled) so the finalizer can
+        report an honest ``agent_persisted`` instead of assuming the write landed (#L4-2).
         """
         from agent.agent_runtime_helpers import note_turn_persisted
         with _persist_lock(self):
             self._drop_trailing_empty_response_scaffolding(messages)
             self._session_messages = messages
-            self._flush_messages_to_session_db(messages, conversation_history)
+            flush_result = self._flush_messages_to_session_db(messages, conversation_history)
+            self._last_persist_succeeded = flush_result is not False
             # Drain async token-accounting deltas at every persist point; cheap no-op when nothing queued.
             if self._session_db is not None:
                 self._session_db.flush_token_counts()

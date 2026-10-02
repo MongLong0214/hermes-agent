@@ -257,6 +257,8 @@ class TestGatewayCleanupWiring:
         runner._agent_cache_lock = threading.Lock()
 
         mock_agent = MagicMock()
+        mock_agent._session_messages = []
+        mock_agent._last_flushed_db_idx = 0  # fully flushed -- eviction must proceed
         runner._agent_cache = {"session-key": (mock_agent, 12345)}
 
         GatewayRunner._evict_cached_agent(runner, "session-key")

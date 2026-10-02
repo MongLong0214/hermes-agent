@@ -304,6 +304,32 @@ class TestAgentCacheLifecycle:
         with runner._agent_cache_lock:
             assert session_key not in runner._agent_cache
 
+    def test_evict_skips_an_agent_whose_transcript_has_not_reached_disk(self):
+        """L4-2: explicit eviction (/new, /model, ...) must not drop the only remaining copy of a
+        turn that never reached state.db -- the entry stays cached (and recoverable) instead of
+        being released into an unreachable, soon-to-be-garbage-collected agent object."""
+        runner = _make_runner()
+        session_key = "telegram:unflushed"
+
+        agent = MagicMock()
+        agent._session_messages = [
+            {"role": "user", "content": "x"}, {"role": "assistant", "content": "y"},
+        ]
+        agent._last_flushed_db_idx = 0  # the assistant reply never reached state.db
+
+        released: list = []
+        runner._release_evicted_agent_soft = lambda a: released.append(a)
+        with runner._agent_cache_lock:
+            runner._agent_cache[session_key] = (agent, "sig")
+
+        runner._evict_cached_agent(session_key)
+
+        with runner._agent_cache_lock:
+            assert session_key in runner._agent_cache, (
+                "an unflushed transcript's only remaining copy was dropped from the cache"
+            )
+        assert released == []
+
 
 class TestAgentCacheBoundedGrowth:
     """LRU cap and idle-TTL eviction prevent unbounded cache growth."""
@@ -345,7 +371,8 @@ class TestAgentCacheBoundedGrowth:
 
         old_agent = self._fake_agent()
         old_agent._memory_manager = MagicMock()  # has an external provider
-        old_agent._session_messages = [{"role": "user", "content": "hi"}]
+        old_agent._session_messages = [{"role": "user", "content": "hi", "_db_persisted": True}]
+        old_agent._last_flushed_db_idx = 1  # fully flushed -- eviction must proceed
         old_agent.commit_memory_session = lambda msgs=None: commit_calls.append(msgs)
         new_agent = self._fake_agent()
 
@@ -359,7 +386,7 @@ class TestAgentCacheBoundedGrowth:
         while _t.time() < deadline and not release_calls:
             _t.sleep(0.02)
         # Memory committed with the live transcript, THEN client released.
-        assert commit_calls == [[{"role": "user", "content": "hi"}]]
+        assert commit_calls == [[{"role": "user", "content": "hi", "_db_persisted": True}]]
         assert old_agent in release_calls
 
 
@@ -428,6 +455,41 @@ class TestAgentCacheActiveSafety:
         assert "session-idle-b" in runner._agent_cache
         assert runner._cleanup_agent_resources.call_count == 0
 
+    def test_cap_skips_an_lru_entry_whose_transcript_has_not_reached_disk(self, monkeypatch):
+        """L4-2: LRU-cap eviction must not discard the only remaining copy of an unflushed
+        turn -- mirrors the mid-turn protection above (``transcript_persistence_caught_up``)."""
+        from gateway import run as gw_run
+
+        monkeypatch.setattr(gw_run, "_AGENT_CACHE_MAX_SIZE", 2)
+        runner = self._runner()
+        runner._commit_then_release_soft = lambda agent, key: None
+
+        def _flushed_agent():
+            a = self._fake_agent()
+            a._session_messages = []
+            a._last_flushed_db_idx = 0
+            return a
+
+        unflushed = self._fake_agent()
+        unflushed._session_messages = [{"role": "user", "content": "x"}]
+        unflushed._last_flushed_db_idx = 0  # the only message never reached state.db
+
+        idle_a = _flushed_agent()
+        idle_b = _flushed_agent()
+
+        # Insertion order: unflushed (oldest), idle_a, idle_b. Cap=2 makes "unflushed" the sole
+        # eviction candidate.
+        runner._agent_cache["session-unflushed"] = (unflushed, "sig")
+        runner._agent_cache["session-idle-a"] = (idle_a, "sig")
+        runner._agent_cache["session-idle-b"] = (idle_b, "sig")
+
+        with runner._agent_cache_lock:
+            runner._enforce_agent_cache_cap()
+
+        assert "session-unflushed" in runner._agent_cache, (
+            "an unflushed transcript's only remaining copy was dropped from the cache"
+        )
+
 
     def test_idle_sweep_skips_active_agent(self, monkeypatch):
         """Idle-TTL sweep must not tear down an active agent even if 'stale'."""
@@ -446,6 +508,26 @@ class TestAgentCacheActiveSafety:
         assert evicted == 0
         assert "s1" in runner._agent_cache
         assert runner._cleanup_agent_resources.call_count == 0
+
+    def test_idle_sweep_skips_an_entry_whose_transcript_has_not_reached_disk(self, monkeypatch):
+        """L4-2: idle-TTL release must not discard the only remaining copy of an unflushed turn."""
+        from gateway import run as gw_run
+
+        monkeypatch.setattr(gw_run, "_AGENT_CACHE_IDLE_TTL_SECS", 0.01)
+        runner = self._runner()
+        runner._commit_then_release_soft = lambda agent, key: None
+
+        unflushed = self._fake_agent(idle_seconds=10.0)
+        unflushed._session_messages = [{"role": "user", "content": "x"}]
+        unflushed._last_flushed_db_idx = 0  # the only message never reached state.db
+        runner._agent_cache["s-unflushed"] = (unflushed, "sig")
+
+        evicted = runner._sweep_idle_cached_agents()
+
+        assert evicted == 0
+        assert "s-unflushed" in runner._agent_cache, (
+            "an unflushed transcript's only remaining copy was dropped from the cache"
+        )
 
 
 class TestAgentCacheSpilloverLive:

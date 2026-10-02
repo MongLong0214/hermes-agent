@@ -146,13 +146,22 @@ async def test_incomplete_codex_turn_closes_transcript_without_slack_delivery(mo
     assert adapter.sent == []
     assert runner.session_store.update_session.called
 
+    # agent_persisted=False (no _session_db) routes the fallback user row through
+    # append_transcript_batch (row-id-repair-aware recovery write, #R67-2) instead of a
+    # per-row append_to_transcript call; session_meta and the failed-turn boundary are
+    # unaffected (still direct append_to_transcript calls).
     transcript_roles = [
         call.args[1]["role"]
         for call in runner.session_store.append_to_transcript.call_args_list
     ]
-    assert transcript_roles == ["session_meta", "user", "assistant"]
-    assert runner.session_store.append_to_transcript.call_args_list[1].args[1]["content"] == "hello"
-    boundary = runner.session_store.append_to_transcript.call_args_list[2].args[1]["content"]
+    assert transcript_roles == ["session_meta", "assistant"]
+    batched_user_rows = [
+        row for call in runner.session_store.append_transcript_batch.call_args_list
+        if len(call.args) >= 2 and isinstance(call.args[1], list)
+        for row in call.args[1] if isinstance(row, dict) and row.get("role") == "user"
+    ]
+    assert len(batched_user_rows) == 1 and batched_user_rows[0]["content"] == "hello"
+    boundary = runner.session_store.append_to_transcript.call_args_list[1].args[1]["content"]
     assert boundary == FAILED_TURN_NOTICE
     assert adapter.processing_hooks == [
         ("start", "m-1"),

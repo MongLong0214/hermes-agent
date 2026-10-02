@@ -71,6 +71,9 @@ def _bootstrap(monkeypatch, tmp_path):
     runner.session_store.load_transcript.return_value = []
     runner.session_store.append_to_transcript = MagicMock()
     runner.session_store.has_platform_message_id.return_value = False
+    # Internal events carry no platform message_id, so the failed-turn dedupe falls to the
+    # ownership check (#R67-2); a bare MagicMock would read truthy and wrongly skip the write.
+    runner.session_store.has_input_owner.return_value = False
     runner.session_store.update_session = MagicMock()
 
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
@@ -102,14 +105,24 @@ def _event(*, internal: bool, text: str = "hello world"):
     )
 
 
-def _user_entries(calls):
-    return [
+def _user_entries(calls, batch_calls=()):
+    """User-role rows from per-row ``append_to_transcript`` calls AND from
+    ``append_transcript_batch`` calls (the row-id-repair-aware recovery write #R67-2 moved
+    un-skipped gateway fallback writes to)."""
+    entries = [
         call.args[1]
         for call in calls
         if len(call.args) >= 2
         and isinstance(call.args[1], dict)
         and call.args[1].get("role") == "user"
     ]
+    for call in batch_calls:
+        if len(call.args) >= 2 and isinstance(call.args[1], list):
+            entries.extend(
+                row for row in call.args[1]
+                if isinstance(row, dict) and row.get("role") == "user"
+            )
+    return entries
 
 
 # ── 1+2: the marker is threaded to the agent run for internal events only ──
@@ -174,6 +187,7 @@ async def test_failed_early_fallback_row_is_marked_for_internal_event(
             "messages": [],
             "history_offset": 0,
             "last_prompt_tokens": 0,
+            "agent_persisted": False,  # force the recovery write so the marked row is observable
         }
     )
 
@@ -182,7 +196,10 @@ async def test_failed_early_fallback_row_is_marked_for_internal_event(
         _source(), SESSION_KEY, 1,
     )
 
-    entries = _user_entries(runner.session_store.append_to_transcript.call_args_list)
+    entries = _user_entries(
+        runner.session_store.append_to_transcript.call_args_list,
+        runner.session_store.append_transcript_batch.call_args_list,
+    )
     assert entries, "expected a fallback user-row write"
     for entry in entries:
         assert entry["role"] == "user"  # alternation invariant: role unchanged
@@ -202,6 +219,7 @@ async def test_failed_early_fallback_row_is_unmarked_for_real_user(
             "messages": [],
             "history_offset": 0,
             "last_prompt_tokens": 0,
+            "agent_persisted": False,  # force the recovery write so the unmarked row is observable
         }
     )
 
@@ -209,7 +227,10 @@ async def test_failed_early_fallback_row_is_unmarked_for_real_user(
         _event(internal=False), _source(), SESSION_KEY, 1,
     )
 
-    entries = _user_entries(runner.session_store.append_to_transcript.call_args_list)
+    entries = _user_entries(
+        runner.session_store.append_to_transcript.call_args_list,
+        runner.session_store.append_transcript_batch.call_args_list,
+    )
     assert entries
     for entry in entries:
         assert "display_kind" not in entry
@@ -227,6 +248,7 @@ async def test_no_new_messages_fallback_row_is_marked_for_internal_event(
             "tools": [],
             "history_offset": 1,  # equals len(messages) → new_messages=[]
             "last_prompt_tokens": 0,
+            "agent_persisted": False,  # force the recovery write so the marked row is observable
         }
     )
 
@@ -235,7 +257,10 @@ async def test_no_new_messages_fallback_row_is_marked_for_internal_event(
         _source(), SESSION_KEY, 1,
     )
 
-    entries = _user_entries(runner.session_store.append_to_transcript.call_args_list)
+    entries = _user_entries(
+        runner.session_store.append_to_transcript.call_args_list,
+        runner.session_store.append_transcript_batch.call_args_list,
+    )
     assert entries
     for entry in entries:
         assert entry["role"] == "user"

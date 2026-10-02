@@ -130,6 +130,65 @@ def test_final_response_closes_tool_tail_before_persistence(monkeypatch):
     assert agent.persisted_messages[-1] == result["messages"][-1]
 
 
+def test_result_reports_agent_persisted_false_when_the_flush_failed(monkeypatch):
+    """L4-2: ``gateway/run_turn_runner.py`` defaults ``agent_persisted`` to whatever this result
+    dict says; if the turn's own flush failed (``agent/session_persistence.py::_persist_session``
+    now records that on ``_last_persist_succeeded``), the result must say so instead of letting the
+    gateway believe the turn is durable and skip its own transcript append."""
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = FakeAgent()
+
+    def _failing_persist_session(messages, conversation_history):
+        agent.persisted_messages = [dict(m) for m in messages]
+        agent._last_persist_succeeded = False  # what the real flush sets on a write exception
+
+    agent._persist_session = _failing_persist_session
+
+    result = finalize_turn(
+        agent,
+        final_response="Done.",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=[{"role": "user", "content": "hi"}, {"role": "assistant", "content": "Done."}],
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="hi",
+        original_user_message="hi",
+        _should_review_memory=False,
+        _turn_exit_reason="fallback_prior_turn_content",
+    )
+
+    assert result["agent_persisted"] is False
+
+
+def test_result_reports_agent_persisted_true_on_an_ordinary_successful_turn(monkeypatch):
+    """Guardrail: the new key must not regress the common case, where nothing ever sets
+    ``_last_persist_succeeded`` (the attribute simply doesn't exist, as on every other FakeAgent
+    in this file) — the default must stay True, matching the pre-L4-2 contract."""
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = FakeAgent()
+
+    result = finalize_turn(
+        agent,
+        final_response="Done.",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=[{"role": "user", "content": "hi"}, {"role": "assistant", "content": "Done."}],
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="hi",
+        original_user_message="hi",
+        _should_review_memory=False,
+        _turn_exit_reason="fallback_prior_turn_content",
+    )
+
+    assert result["agent_persisted"] is True
+
+
 def test_fallback_timestamp_survives_delayed_sqlite_persistence(
     monkeypatch, tmp_path
 ):

@@ -100,10 +100,16 @@ def normalize_response_for_agent(agent: Any, response: Any) -> Any:
 def partial_result(
     messages: List[Dict[str, Any]], api_call_count: int, final_response: str,
     error: Optional[str] = None, *, failed: bool = False, compression_exhausted: bool = False,
+    agent: Any = None,
 ) -> Dict[str, Any]:
     """Typed incomplete-turn result (``partial`` unless ``failed``); ``error`` defaults to
     ``final_response``. ``compression_exhausted`` carries the #98722 typed bit the gateway
-    consumes to add the /compress-or-/new notice and, on a failed turn, skip the transcript write (see run_turn.py)."""
+    consumes to add the /compress-or-/new notice and, on a failed turn, skip the transcript write (see run_turn.py).
+
+    This is an early-return path: it bypasses ``agent/turn_finalizer.py::finalize_turn``, which is
+    where ``agent_persisted`` normally comes from. Passing ``agent`` (every call site here persists
+    via ``agent._persist_session()`` immediately before calling this) carries the real flush outcome
+    through instead of letting the caller assume a session DB means the turn is durable (#L4-2/R67-1)."""
     result = {
         "final_response": final_response,
         "messages": messages,
@@ -114,6 +120,8 @@ def partial_result(
     }
     if compression_exhausted:
         result["compression_exhausted"] = True
+    if agent is not None:
+        result["agent_persisted"] = getattr(agent, "_last_persist_succeeded", True)
     return result
 
 
@@ -175,7 +183,7 @@ class _Trunc(TruncationVerdict):
         agent._persist_session(self.messages, self.conversation_history)
         return self.done("return", stamp_failure(partial_result(
             self.messages if result_messages is None else result_messages, self.api_call_count,
-            final_response, error, failed=failed, compression_exhausted=compression_exhausted,
+            final_response, error, failed=failed, compression_exhausted=compression_exhausted, agent=agent,
         ), *failure))
 
     @property
@@ -593,7 +601,8 @@ def continue_codex_incomplete(
     agent._codex_reasoning_only_streak = 0
     agent._persist_session(messages, conversation_history)
     return partial_result(
-        messages, api_call_count, "Codex response remained incomplete after 3 continuation attempts"
+        messages, api_call_count, "Codex response remained incomplete after 3 continuation attempts",
+        agent=agent,
     )
 
 

@@ -117,6 +117,25 @@ class SessionTranscriptMixin:
         with self._get_transcript_drain_lock():
             self._append_to_transcript_serialized(self._follow_reroutes(session_id), message)
 
+    def append_transcript_batch(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
+        """Durable one-transaction recovery append for gateway-side fallback writes (turns the agent
+        itself did not fully persist): unlike ``append_to_transcript``'s fire-and-forget single-row
+        insert, this (a) raises instead of silently queuing, so the caller gets a real
+        confirmed-write acknowledgement, and (b) runs messages through
+        ``resolve_and_repair_transcript_batch`` (via ``SessionDB.append_messages_batch``), so an
+        assistant message still carrying ``_row_id`` from an earlier blank placeholder fills that row
+        in place instead of duplicating it (R67-2). Mutates *messages* in place with the durable
+        ``_row_id``/``timestamp`` (same contract as ``append_messages_batch``); callers that need the
+        live message objects marked durable still need ``sync_flushed_message_markers``. Callers own
+        retry/spool on failure — this never queues."""
+        if not messages:
+            return
+        session_id = self._follow_reroutes(session_id)
+        _db = self._db_for_session_id(session_id)
+        if _db is None:
+            raise RuntimeError(f"no owning session store for {session_id}; cannot batch-append")
+        _db.append_messages_batch(session_id=session_id, messages=messages)
+
     def _follow_reroutes(self, session_id: str) -> str:
         """Follow the compression reroute chain (cycle-guarded)."""
         reroutes = self._lazy("_transcript_reroutes", dict)
@@ -485,12 +504,17 @@ class SessionTranscriptMixin:
         """Replace a session's transcript (/retry, /compress). DESTRUCTIVE by default:
         ``active_only=False`` DELETEs every row incl. soft-archived compaction history (pass
         ``active_only=True`` for sessions that may carry archived rows). True when the write lands
-        or there is no DB, False on failure — callers committing a destructive change on top
-        (/compress repointing) must check it. ``reject_active_turn_lease`` is for user-initiated
-        rewrites that do not own the cross-process turn lease."""
+        or the store is deliberately DB-less (JSONL-only); False on failure, INCLUDING when the
+        canonical store resolved to a real path but cannot currently be opened (RecoverableHandleCache
+        backoff) — callers committing a destructive change on top (/compress repointing) must check
+        it. ``reject_active_turn_lease`` is for user-initiated rewrites that do not own the
+        cross-process turn lease."""
         db = self._db_for_session_id(session_id)
         if not db:
-            return True
+            # Only a deliberately DB-less store (``store._db = None``) counts as "nothing to write";
+            # an unavailable canonical store is a failure, not permission to proceed as if the
+            # destructive replace had landed (#L4-1).
+            return self._pinned_db() is None
         with self._get_transcript_drain_lock():
             try:
                 # Even when the current agent doesn't "own" persistence, the session on disk may already
@@ -541,7 +565,15 @@ class SessionTranscriptMixin:
         same routing writes use — the in-memory reroute map, then the durable compression tip —
         otherwise the transcript "vanishes" while every message sits under the child."""
         if not self._db_for_session_id(session_id):
-            return []
+            if self._pinned_db() is None:
+                # Deliberately configured without SQLite backing (``store._db = None``,
+                # JSONL-only tests) — a genuinely empty, not a failed, read.
+                return []
+            # The canonical store resolved to a real path but its last open attempt is still
+            # failing/backing off (RecoverableHandleCache) — NOT the same as "no DB": an existing
+            # session's history may be sitting behind that unavailable store, so fail like any
+            # other unreadable history instead of inventing an empty one.
+            raise TranscriptReadError(session_id)
         session_id = self._follow_reroutes(session_id)
         with contextlib.suppress(Exception):
             # Durable successor survives restart; the reroute map doesn't.

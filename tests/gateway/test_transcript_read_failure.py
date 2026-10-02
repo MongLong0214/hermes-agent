@@ -76,6 +76,60 @@ class TestLoadTranscriptReadFailure:
 
 
 # --------------------------------------------------------------------------
+# C. L4-1: a reopen failure during RecoverableHandleCache backoff is NOT the
+#    same as "no SQLite backing" (``store._db = None``, the JSONL-only test
+#    idiom above). An existing routed session's history may be sitting
+#    behind that unavailable store, so it must fail the same way a
+#    corrupt-read does (A above) rather than invent an empty conversation.
+# --------------------------------------------------------------------------
+
+
+def _break_next_reopen(store, monkeypatch) -> None:
+    """Evict the cached handle and make the next open attempt raise — the
+    real RecoverableHandleCache backoff path, not a deliberately pinned
+    ``store._db = None``."""
+    import hermes_state_registry
+
+    path = next(iter(store._db_handle_cache.handles))
+    store._db_handle_cache.handles.pop(path)
+
+    def _boom(*_a, **_kw):
+        raise OSError("database is locked")
+
+    monkeypatch.setattr(hermes_state_registry, "acquire", _boom)
+
+
+class TestUnavailableStoreVsDeliberatelyAbsentStore:
+    def test_reopen_failure_on_existing_session_raises_not_empty(self, store, monkeypatch):
+        db = store._db
+        assert db is not None
+        db.create_session("s3", "telegram", session_key="telegram:3")
+        db.append_message("s3", "user", "the operator's only copy of this conversation")
+
+        _break_next_reopen(store, monkeypatch)
+
+        with pytest.raises(TranscriptReadError) as excinfo:
+            store.load_transcript("s3")
+        assert excinfo.value.session_id == "s3"
+
+    def test_reopen_failure_on_existing_session_fails_the_rewrite(self, store, monkeypatch):
+        db = store._db
+        assert db is not None
+        db.create_session("s4", "telegram", session_key="telegram:4")
+        db.append_message("s4", "user", "keep me")
+
+        _break_next_reopen(store, monkeypatch)
+
+        assert store.rewrite_transcript("s4", [{"role": "user", "content": "x"}]) is False
+
+    def test_pinned_none_keeps_its_empty_and_success_contract(self, store):
+        """Guardrail: distinguishing the two must not regress the deliberate no-DB path."""
+        store._db = None
+        assert store.load_transcript("nope") == []
+        assert store.rewrite_transcript("nope", []) is True
+
+
+# --------------------------------------------------------------------------
 # B. slash-command handlers surface the failure instead of dying silently.
 #    Before: the handler raised, base.py's dispatch wrapper logged
 #    "Command '/x' dispatch failed" and the user got NO reply at all.

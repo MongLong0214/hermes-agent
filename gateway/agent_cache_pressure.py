@@ -202,9 +202,26 @@ def transcript_persistence_caught_up(agent: Any) -> bool:
     ``_last_flushed_db_idx`` (advanced only on a fully successful write) has caught
     up.  Unknown shapes are *not* caught up: a skipped eviction costs memory, a
     wrong one costs the conversation.
+
+    The positional watermark alone cannot see a REWRITE of an already-flushed row:
+    ``turn_finalizer._close_transcript_tail`` can fill a previously persisted blank
+    assistant row with the real answer, and micro-compaction defrag can rewrite an
+    EARLIER summary row in place — both change that row's content and pop its
+    ``_DB_PERSISTED_MARKER`` (the per-message "this exact content is durable" contract,
+    see ``agent/session_persistence.py``) without changing ``len(messages)`` or rolling
+    back the watermark. Checking only the tail missed a dirtied non-tail row (#L4-2/R67-4,
+    ROUND1-ESCAPE): require EVERY row still carry the marker, not just the last one -- an
+    empty transcript has nothing to lose either way. This is the same per-row dirty
+    tracking ``_db_flush_collect`` already uses to decide what needs re-flushing, so it
+    answers the eviction question with no new state.
     """
+    from agent.context_compressor import _DB_PERSISTED_MARKER
     messages, flushed = getattr(agent, "_session_messages", None), getattr(agent, "_last_flushed_db_idx", None)
-    return isinstance(messages, list) and _is_int(flushed) and flushed >= len(messages)
+    if not (isinstance(messages, list) and _is_int(flushed) and flushed >= len(messages)):
+        return False
+    if not messages:
+        return True
+    return all(isinstance(m, dict) and bool(m.get(_DB_PERSISTED_MARKER)) for m in messages)
 
 
 def plan_pressure_evictions(

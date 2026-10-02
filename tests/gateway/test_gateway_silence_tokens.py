@@ -131,6 +131,7 @@ async def test_internal_silence_token_suppresses_delivery_but_preserves_transcri
         "last_prompt_tokens": 0,
         "api_calls": 1,
         "failed": False,
+        "agent_persisted": False,  # force the recovery write so the batched rows are observable
     })
 
     response = await runner._handle_message_with_agent(
@@ -138,7 +139,14 @@ async def test_internal_silence_token_suppresses_delivery_but_preserves_transcri
     )
 
     assert response == ""
-    appended = [call.args[1] for call in runner.session_store.append_to_transcript.call_args_list]
+    # The suffix loop batches both un-skipped rows through append_transcript_batch
+    # (row-id-repair-aware recovery write, #R67-2) instead of two per-row append_to_transcript
+    # calls.
+    appended = [
+        row for call in runner.session_store.append_transcript_batch.call_args_list
+        if len(call.args) >= 2 and isinstance(call.args[1], list)
+        for row in call.args[1] if isinstance(row, dict)
+    ]
     assert {"role": "assistant", "content": "[SILENT]"}.items() <= appended[-1].items()
     assert [msg["role"] for msg in appended if msg.get("role") in {"user", "assistant"}] == ["user", "assistant"]
 

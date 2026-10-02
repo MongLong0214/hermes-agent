@@ -184,6 +184,72 @@ class TestPersistenceGuard:
         assert transcript_persistence_caught_up(object()) is False
         assert transcript_persistence_caught_up(None) is False
 
+    def test_a_filled_row_whose_marker_was_popped_blocks_eviction_at_unchanged_length(self, tmp_path):
+        """#L4-2/R67-4: ``turn_finalizer._close_transcript_tail``'s blank-row fill rewrites an
+        already-flushed tail's content and pops its ``_DB_PERSISTED_MARKER`` in place, without
+        changing ``len(messages)`` or ``_last_flushed_db_idx``. The reviewer's probe found the
+        predicate still returned True in exactly this shape (watermark == length == 2) and
+        explicit/LRU/idle-TTL eviction then cleared the agent's unflushed messages to ``[]``."""
+        agent = self._agent(tmp_path, "filled-tail")
+        try:
+            messages = [
+                {"role": "user", "content": "do it"},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "t1", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+                ]},
+            ]
+            agent._session_messages = messages
+            assert agent._flush_messages_to_session_db(messages) is True
+            assert transcript_persistence_caught_up(agent) is True
+
+            # The fill: rewrite the persisted tail's content in place and pop its marker, exactly
+            # as agent/turn_finalizer.py::_close_transcript_tail does — length/watermark untouched.
+            from agent.context_compressor import _DB_PERSISTED_MARKER
+            tail = messages[-1]
+            tail["content"] = "Here is your answer."
+            tail.pop(_DB_PERSISTED_MARKER, None)
+
+            assert agent._last_flushed_db_idx == len(messages)  # watermark never moved
+            assert transcript_persistence_caught_up(agent) is False, (
+                "a rewritten, re-dirtied tail must not read as durable just because the "
+                "positional watermark never moved"
+            )
+        finally:
+            agent.close()
+
+    def test_a_dirtied_non_tail_row_blocks_eviction_too(self, tmp_path):
+        """ROUND1-ESCAPE sibling of R67-4: the reviewer's production reproduction was
+        micro-compaction defrag rewriting an EARLIER summary row (not the tail) in place,
+        clearing ITS marker without touching length or the tail's marker. The tail-only check
+        read this as caught up and LRU/TTL/pressure eviction cleared the transcript while SQLite
+        still held the stale (pre-defrag) summary -- the predicate must check every row."""
+        agent = self._agent(tmp_path, "dirtied-middle")
+        try:
+            messages = [
+                {"role": "assistant", "content": "summary of turns 1-50", "_compressed_summary": True},
+                {"role": "user", "content": "what's next"},
+                {"role": "assistant", "content": "next step"},
+            ]
+            agent._session_messages = messages
+            assert agent._flush_messages_to_session_db(messages) is True
+            assert transcript_persistence_caught_up(agent) is True
+
+            # Defrag rewrites the EARLIER summary row in place and pops ITS marker; the tail is
+            # untouched, length and watermark are untouched.
+            from agent.context_compressor import _DB_PERSISTED_MARKER
+            middle = messages[0]
+            middle["content"] = "re-summarized turns 1-50"
+            middle.pop(_DB_PERSISTED_MARKER, None)
+            assert messages[-1].get(_DB_PERSISTED_MARKER) is True  # tail still looks durable
+
+            assert agent._last_flushed_db_idx == len(messages)  # watermark never moved
+            assert transcript_persistence_caught_up(agent) is False, (
+                "a dirtied non-tail row must not read as durable just because the tail and "
+                "the positional watermark look caught up"
+            )
+        finally:
+            agent.close()
+
 
 class TestEvictionPlanner:
     def _entries(self, n):
@@ -256,7 +322,8 @@ class TestGatewayPressureSweep:
 
     def _cached_agent(self, *, persisted=True, messages=2):
         agent = MagicMock()
-        agent._session_messages = [{"role": "user", "content": "x"}] * messages
+        tail = {"role": "user", "content": "x", **({"_db_persisted": True} if persisted else {})}
+        agent._session_messages = [tail] * messages
         agent._last_flushed_db_idx = messages if persisted else 0
         return agent
 
@@ -379,6 +446,16 @@ class TestConfiguredBoundsReachTheCache:
         assert runner._agent_cache_cap() == gw_run._AGENT_CACHE_MAX_SIZE
         assert runner._agent_cache_idle_ttl() == gw_run._AGENT_CACHE_IDLE_TTL_SECS
 
+    @staticmethod
+    def _flushed_mock_agent() -> MagicMock:
+        """A MagicMock whose transcript_persistence_caught_up() reads as fully flushed -- a bare
+        MagicMock's auto-mocked ``_session_messages``/``_last_flushed_db_idx`` otherwise read as
+        unsafe-to-evict (#L4-2) and these tests are exercising cap/TTL eviction, not that guard."""
+        agent = MagicMock()
+        agent._session_messages = []
+        agent._last_flushed_db_idx = 0
+        return agent
+
     def test_configured_cap_bounds_the_real_enforcer(self):
         """A configured cap must actually shrink the cache, not just report."""
         runner = self._runner(AgentCacheBounds(max_size=2))
@@ -390,7 +467,7 @@ class TestConfiguredBoundsReachTheCache:
 
         with runner._agent_cache_lock:
             for i in range(5):
-                runner._agent_cache[f"s{i}"] = (MagicMock(), "sig")
+                runner._agent_cache[f"s{i}"] = (self._flushed_mock_agent(), "sig")
             runner._enforce_agent_cache_cap()
 
         assert len(runner._agent_cache) == 2
@@ -406,7 +483,7 @@ class TestConfiguredBoundsReachTheCache:
         runner._release_evicted_agent_soft = lambda agent: None
         runner.session_store = None
 
-        stale = MagicMock()
+        stale = self._flushed_mock_agent()
         stale._last_activity_ts = _t.time() - 5.0
         runner._agent_cache["s-stale"] = (stale, "sig")
 
