@@ -152,7 +152,7 @@ def _check_all_guards(command: str, env_type: str,
                                   has_host_access=has_host_access)
 
 
-from tools.environments.base import EnvironmentConnectionError
+from tools.environments.base import EnvironmentConnectionError, PostSpawnExecutionError
 
 
 # Tool description for LLM
@@ -1158,10 +1158,23 @@ def _run_foreground(
                                 task_id=task_id, session_key=session_key),
             )
             break
+        except PostSpawnExecutionError as e:
+            # The shell was already spawned before this failure (collecting output, updating
+            # state, ...); it may already have produced a side effect (git push, a sent mail).
+            # Retrying would risk repeating it, so report the ambiguous outcome instead of
+            # replaying the command. See tools/environments/base.py's _spawn_and_wait.
+            logger.error("Execution failed after spawn, outcome unknown (not retried) - Command: %s - Error: %s - Task: %s, Backend: %s",
+                         _safe_command_preview(command), e, eff, env_type)
+            return _error_json(
+                _redact_terminal_error_text(
+                    f"Command may have already started before this error; outcome unknown, not retried: {e}"),
+                status="ambiguous",
+            )
         except Exception as e:
             if "timeout" in str(e).lower():
                 return _error_json(f"Command timed out after {effective_timeout} seconds", exit_code=124)
-            # Retry on transient errors
+            # Retry on transient errors proven to precede process creation (anything that
+            # reaches here never spawned the shell — see PostSpawnExecutionError above).
             if retry_count < max_retries:
                 wait_time = 2 ** (retry_count + 1)
                 logger.warning("Execution error, retrying in %ds (attempt %d/%d) - Command: %s - Error: %s: %s - Task: %s, Backend: %s",

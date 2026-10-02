@@ -4,6 +4,7 @@
 (no I/O).
 """
 
+import contextlib
 import os
 import posixpath
 import re
@@ -22,6 +23,11 @@ from tools.file_operations_common import ExecuteResult, SearchMatch, SearchResul
 _MACOS_TCC_PROTECTED_HOME_DIRS = (
     "Desktop", "Documents", "Downloads", "Library", "Movies", "Music", "Pictures",
 )
+
+# Bound on the final drain-thread join in _run_rg_native: a descendant that survives the
+# process-group kill (ignored signal, uninterruptible sleep, or a snapshot miss) can keep
+# the native rg's stdout pipe open forever, and nothing else bounds that wait. See PR64-03.
+_RG_DRAIN_FINAL_JOIN_BOUND_S = 2.0
 
 
 def _macos_protected_search_exclusions(
@@ -343,6 +349,11 @@ class SearchMixin:
                 start_new_session=True)
         except OSError as exc:
             return ExecuteResult(stdout=f"rg: {exc}", exit_code=2)
+        with contextlib.suppress(ProcessLookupError):
+            # Mirrors tools/environments/local.py's _run_bash: cache the pgid now, while
+            # the leader is still alive, so _kill_process_group_posix can fall back to it
+            # later even if rg itself has already exited by then (PR64-03).
+            proc._hermes_pgid = os.getpgid(proc.pid)
 
         # Drain on a thread so a silent rg (huge tree, no hits yet) cannot pin the
         # caller past the deadline or past a /stop; the waiter below owns both.
@@ -370,11 +381,27 @@ class SearchMixin:
             if time.monotonic() > deadline:
                 exit_code = 124
                 break
-        if proc.poll() is None:
+        # Always attempt the group-level cleanup, even when proc.poll() reports the
+        # leader itself already exited: a cached pgid can still reach a live descendant
+        # (a backgrounded `sleep &`, PR64-R02) that outlived the leader, and
+        # os.killpg/_kill_process_group_posix is idempotent on a group that is already
+        # fully gone. rg can also exit (and get reaped by an unrelated Popen cleanup
+        # elsewhere in this process) between the poll() above and the group lookup
+        # inside _kill_process_group_posix; the cached _hermes_pgid above is what lets
+        # that lookup fall back instead of raising ESRCH with nothing to kill. A genuine
+        # already-gone-entirely case (no leader, no cached pgid either) still means
+        # there is nothing left to signal — don't let it discard the output already
+        # drained into `lines`.
+        with contextlib.suppress(ProcessLookupError):
             _kill_process_group_posix(proc)  # native lane is POSIX-only (gate above)
         proc.wait()
-        drainer.join()
-        proc.stdout.close()
+        # A descendant that survives the group kill (ignored signal, uninterruptible sleep,
+        # or a psutil snapshot miss) can keep rg's stdout pipe open forever even though rg
+        # itself is gone — bound the wait so it can never hang the search indefinitely
+        # (PR64-03). The drain thread is a daemon; abandoning it leaks nothing but itself.
+        drainer.join(_RG_DRAIN_FINAL_JOIN_BOUND_S)
+        if not drainer.is_alive():
+            proc.stdout.close()
         stdout = b"".join(lines).decode("utf-8", errors="replace")
         if exit_code == 124:
             return ExecuteResult(stdout=stdout + f"\n[Command timed out after {timeout}s]", exit_code=124)
