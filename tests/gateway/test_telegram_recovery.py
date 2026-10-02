@@ -365,3 +365,10 @@ async def test_recovery_edge_during_refund_commit_survives_cancellation(monkeypa
     await _drain(adapter)
 
     assert _state(oid) == "delivered", "cancelling the caller must not strand the shielded recovery spawn"
+    # Exactly one API send: the cancelled caller's own send_message call on its (unprotected) line
+    # never ran, and the shielded recovery spawn is the only thing that actually delivered.
+    adapter._bot.send_message.assert_awaited_once()
+    # A later sweep for the same obligation finds nothing left to do (already delivered, not retried).
+    swept = await runner._redeliver_failed_obligations_for_platform(Platform.TELEGRAM)
+    assert swept == 0
+    adapter._bot.send_message.assert_awaited_once()
