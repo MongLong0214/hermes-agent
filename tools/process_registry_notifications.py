@@ -249,7 +249,12 @@ def _process_accounting_lines(r: dict) -> list:
         lines.append(f"Handed off to you: {h.get('session_id')} ({h.get('command', '')[:120]}) — {h.get('note', '')}. "
                      "You own it now; its completion notice will arrive here.")
     orphans = r.get("orphaned_processes") or []
-    if orphans:
+    if orphans and r.get("orphaned_processes_close_deferred"):
+        lines.append(f"Child timed out leaving {len(orphans)} background process(es) still running: "
+                     + "; ".join(f"{o.get('session_id')} `{o.get('command', '')[:100]}` ({o.get('runtime_seconds')}s)" for o in orphans)
+                     + ". They are terminated when the child's abandoned worker exits (subagent process notices never "
+                     "reach you); re-launching one before then would run a duplicate beside the live original.")
+    elif orphans:
         lines.append(f"Child left {len(orphans)} background process(es) running that were TERMINATED with it "
                      "(subagent process notices never reach you): "
                      + "; ".join(f"{o.get('session_id')} `{o.get('command', '')[:100]}` ({o.get('runtime_seconds')}s)" for o in orphans)

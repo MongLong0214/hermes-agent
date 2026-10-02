@@ -334,7 +334,7 @@ def _run_single_child(
         run.seed_workspace()
         result, failure_entry, _child_close_deferred = run.await_child()
         if failure_entry is not None:
-            return failure_entry
+            return failure_entry  # await_child already accounted for its processes, before any deferred close
 
         schema = _validate_child_output_schema(child, result, task_index, run.child_task_id, run.relay_text)
         _merge_late_steer(result, _subagent_id, child)
@@ -354,10 +354,12 @@ def _run_single_child(
         _late_pending_steer = run.close_steering()
         logging.exception(f"[subagent-{task_index}] failed")
         # Entry status "error" (contract), progress event status "failed" (UI vocabulary).
-        return run.finish_failed(
+        entry = run.finish_failed(
             _fabricated_entry(task_index, "error", str(exc), child, run.elapsed()), _late_pending_steer,
             preview=str(exc), summary=str(exc), status="failed",
         )
+        run.account_background_processes(entry)
+        return entry
     finally:
         run.cleanup(heartbeat=heartbeat, child_pool=child_pool, leased_cred_id=leased_cred_id, close_deferred=_child_close_deferred)
 

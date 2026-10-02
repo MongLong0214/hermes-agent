@@ -184,28 +184,40 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
 
 
 def _prune_durable_records() -> None:
-    """Bound terminal history, preferring delivered records for deletion."""
+    """Bound terminal history, preferring delivered records for deletion.
+
+    The history cap below only ever considers delivered/dropped rows: a completion still
+    ``delivery_state='pending'`` has not reached the parent yet, so it is never an eviction
+    candidate here (#L3-1) -- it is bounded solely by its own cap just below, which reports
+    what it drops instead of deleting silently."""
     cutoff = time.time() - _DURABLE_RETENTION_SECONDS
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
             "DELETE FROM async_delegations WHERE delivery_state='delivered' AND updated_at < ?", (cutoff,))
-        terminal_count = conn.execute(
-            "SELECT COUNT(*) FROM async_delegations WHERE state NOT IN ('running','finalizing')").fetchone()[0]
+        terminal_count = conn.execute("""SELECT COUNT(*) FROM async_delegations
+               WHERE state NOT IN ('running','finalizing') AND delivery_state != 'pending'""").fetchone()[0]
         if terminal_count > _MAX_RETAINED_COMPLETED:
             conn.execute("""DELETE FROM async_delegations WHERE delegation_id IN (
                      SELECT delegation_id FROM async_delegations
-                     WHERE state NOT IN ('running','finalizing')
+                     WHERE state NOT IN ('running','finalizing') AND delivery_state != 'pending'
                      ORDER BY CASE delivery_state WHEN 'delivered' THEN 0 ELSE 1 END,
                               updated_at ASC LIMIT ?
                    )""", (terminal_count - _MAX_RETAINED_COMPLETED,))
         pending_count = conn.execute("""SELECT COUNT(*) FROM async_delegations
                WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'""").fetchone()[0]
         if pending_count > _MAX_DURABLE_PENDING:
+            over = pending_count - _MAX_DURABLE_PENDING
+            doomed_ids = [row[0] for row in conn.execute("""SELECT delegation_id FROM async_delegations
+                     WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'
+                     ORDER BY updated_at ASC LIMIT ?""", (over,)).fetchall()]
             conn.execute("""DELETE FROM async_delegations WHERE delegation_id IN (
                      SELECT delegation_id FROM async_delegations
                      WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'
                      ORDER BY updated_at ASC LIMIT ?
-                   )""", (pending_count - _MAX_DURABLE_PENDING,))
+                   )""", (over,))
+            logger.warning("Async delegation ledger: %d pending completion(s) exceeded the %d-row "
+                           "pending cap and were dropped before delivery: %s",
+                           over, _MAX_DURABLE_PENDING, ", ".join(doomed_ids))
 
 
 def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
@@ -264,7 +276,14 @@ def _owner_liveness() -> Optional[Callable[[Any, Any], bool]]:
 
 def recover_abandoned_delegations() -> int:
     """Classify records whose owning process disappeared as outcome unknown; children a multi-child unit had already
-    recorded (``record_unit_child``) are replayed with their real results."""
+    recorded (``record_unit_child``) are replayed with their real results.
+
+    Classification only needs a quick SELECT; forensic hint-gathering (transcript reads, up to
+    three serial 5s-ceiling ``git`` probes per row -- tools/async_delegation_recovery_hints.py)
+    runs OUTSIDE ``_DB_LOCK`` so one abandoned unit's slow/stuck probe can never hold the
+    process-wide ledger lock for the whole sweep (#L3-5). Each classification is then persisted
+    in its own short transaction, conditional on the row still being unclaimed, so a row the
+    owner actually finished in the meantime is never clobbered with 'unknown'."""
     alive = _owner_liveness()
     if alive is None:
         return 0
@@ -274,41 +293,44 @@ def recover_abandoned_delegations() -> int:
                       parent_session_id, dispatched_at, owner_pid,
                       owner_started_at, task_json, origin_session_id, result_json, state
                FROM async_delegations WHERE state IN ('running','finalizing')""").fetchall()
-        for row in rows:
-            delegation_id, session_key, origin_ui, parent_id, dispatched_at, pid, started, task_json, origin_sid, result_json, last_state = row
-            if alive(pid, started):
-                continue
-            task = json.loads(task_json or "{}")
-            error = "Delegation owner exited before recording a terminal result; outcome unknown."
-            recovered_results = _recovered_results(task, result_json, error)
-            if recovered_results:
-                done = sum(1 for r in recovered_results if r.get("status") != "unknown")
-                error = (f"Delegation owner exited before the unit finished; {done}/{len(recovered_results)} child "
-                         "results were recorded and are included below, the rest are unknown.")
-            diagnostics = {"last_known_status": last_state, "task_transcripts": task.get("task_transcripts") or {}}
-            # Verbatim transcript tails + a git snapshot of the owner's cwd, so the parent can
-            # continue or re-dispatch from the event alone instead of opening files (#116000).
-            from tools.async_delegation_recovery_hints import git_state_hint, transcript_tails
-            if tails := transcript_tails(diagnostics["task_transcripts"]):
-                diagnostics["transcript_tails"] = tails
-            if hint := git_state_hint(task.get("owner_cwd")):
-                diagnostics["git_state_hint"] = hint
-            event = {
-                "type": "async_delegation", "delegation_id": delegation_id, "session_key": session_key,
-                "origin_ui_session_id": origin_ui, "origin_session_id": origin_sid or "",
-                "parent_session_id": parent_id, "goal": task.get("goal", ""), "goals": task.get("goals"),
-                "context": task.get("context"), "toolsets": task.get("toolsets"), "role": task.get("role"),
-                "model": task.get("model"), "is_batch": bool(task.get("is_batch")),
-                "status": "unknown", "summary": None, "error": error, **diagnostics,
-                **({"results": recovered_results} if recovered_results else {}),
-                "dispatched_at": dispatched_at, "completed_at": now,
-                **{k: task[k] for k in _ROUTING_KEYS if task.get(k)}}
-            result = {"status": "unknown", "summary": None, "error": event["error"], **diagnostics,
-                      **({"results": recovered_results} if recovered_results else {})}
-            conn.execute("""UPDATE async_delegations SET state='unknown', completed_at=?,
+    for row in rows:
+        delegation_id, session_key, origin_ui, parent_id, dispatched_at, pid, started, task_json, origin_sid, result_json, last_state = row
+        if alive(pid, started):
+            continue
+        task = json.loads(task_json or "{}")
+        error = "Delegation owner exited before recording a terminal result; outcome unknown."
+        recovered_results = _recovered_results(task, result_json, error)
+        if recovered_results:
+            done = sum(1 for r in recovered_results if r.get("status") != "unknown")
+            error = (f"Delegation owner exited before the unit finished; {done}/{len(recovered_results)} child "
+                     "results were recorded and are included below, the rest are unknown.")
+        diagnostics = {"last_known_status": last_state, "task_transcripts": task.get("task_transcripts") or {}}
+        # Verbatim transcript tails + a git snapshot of the owner's cwd, so the parent can
+        # continue or re-dispatch from the event alone instead of opening files (#116000).
+        from tools.async_delegation_recovery_hints import git_state_hint, transcript_tails
+        if tails := transcript_tails(diagnostics["task_transcripts"]):
+            diagnostics["transcript_tails"] = tails
+        if hint := git_state_hint(task.get("owner_cwd")):
+            diagnostics["git_state_hint"] = hint
+        event = {
+            "type": "async_delegation", "delegation_id": delegation_id, "session_key": session_key,
+            "origin_ui_session_id": origin_ui, "origin_session_id": origin_sid or "",
+            "parent_session_id": parent_id, "goal": task.get("goal", ""), "goals": task.get("goals"),
+            "context": task.get("context"), "toolsets": task.get("toolsets"), "role": task.get("role"),
+            "model": task.get("model"), "is_batch": bool(task.get("is_batch")),
+            "status": "unknown", "summary": None, "error": error, **diagnostics,
+            **({"results": recovered_results} if recovered_results else {}),
+            "dispatched_at": dispatched_at, "completed_at": now,
+            **{k: task[k] for k in _ROUTING_KEYS if task.get(k)}}
+        result = {"status": "unknown", "summary": None, "error": event["error"], **diagnostics,
+                  **({"results": recovered_results} if recovered_results else {})}
+        with _DB_LOCK, _transaction() as conn:
+            cur = conn.execute("""UPDATE async_delegations SET state='unknown', completed_at=?,
                    updated_at=?, event_json=?, result_json=?, delivery_state='pending'
-                   WHERE delegation_id=?""", (now, now, json.dumps(event), json.dumps(result), delegation_id))
-            recovered += 1
+                   WHERE delegation_id=? AND state IN ('running','finalizing')""",
+                (now, now, json.dumps(event), json.dumps(result), delegation_id))
+            if cur.rowcount:
+                recovered += 1
     return recovered
 
 
@@ -568,6 +590,34 @@ def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
 
 
 # ── In-memory registry queries ──────────────────────────────────────────────
+def _discard_queued_work_item(executor, fn) -> Optional[bool]:
+    """Best-effort: drain *executor*'s internal work queue looking for an item wrapping *fn* (by
+    identity) and discard it without running it. True if found and discarded, False if the queue
+    was inspectable and did not contain it (something else already dequeued it), None if the
+    executor exposes no queue to inspect (a test double, or a future stdlib change) -- callers
+    must treat None the same as "assume nothing is ambiguous", the historical, simpler behavior."""
+    work_queue = getattr(executor, "_work_queue", None)
+    if work_queue is None:
+        return None
+    drained = []
+    found = False
+    try:
+        while True:
+            item = work_queue.get_nowait()
+            if not found and getattr(item, "fn", None) is fn:
+                found = True
+                continue  # drop it: never run
+            drained.append(item)
+    except Exception:  # queue.Empty, or any queue implementation quirk
+        pass
+    for item in drained:
+        try:
+            work_queue.put(item)
+        except Exception:
+            pass
+    return found if found else False
+
+
 def _get_executor(max_workers: int) -> ThreadPoolExecutor:
     """Lazily create (or grow in place, never shrink) the shared daemon executor. Raising
     ``_max_workers`` is enough: the next ``submit`` spawns threads up to the new cap."""
@@ -662,6 +712,19 @@ def _batch_status(combined: Dict[str, Any]) -> str:
     return "error" if child_results and all(r.get("status") not in ok for r in child_results) else "completed"
 
 
+def _forget_unsubmitted(delegation_id: str) -> None:
+    """Undo an admission whose worker was never submitted: free its slot, then best-effort delete its ledger row. The
+    database may be what just failed, so the delete never raises; a row it cannot remove is only logged (if its INSERT
+    had committed, restart recovery later reports it as outcome unknown)."""
+    with _records_lock:
+        _records.pop(delegation_id, None)
+    try:
+        with _DB_LOCK, _transaction() as conn:
+            conn.execute("DELETE FROM async_delegations WHERE delegation_id=?", (delegation_id,))
+    except Exception:  # noqa: BLE001 — cleanup of a failed dispatch must not turn it into a raise
+        logger.warning("Async delegation %s never started; could not remove its ledger row", delegation_id, exc_info=True)
+
+
 def _dispatch(**kwargs) -> Dict[str, Any]:
     from hermes_cli.backend_retirement import retirement
 
@@ -718,7 +781,12 @@ def _dispatch_admitted(
             return {"status": "rejected", "error": capacity_error}
         _records[delegation_id] = record
         live_units = sum(1 for r in _records.values() if r.get("status") in _LIVE_STATES)
-    _persist_dispatch(record)
+    try:
+        _persist_dispatch(record)
+    except Exception as exc:  # noqa: BLE001 — a locked/full state.db must not strand the slot
+        _forget_unsubmitted(delegation_id)
+        # ``reason`` tells callers this is not a full pool: running the work inline instead would hide the failure.
+        return {"status": "rejected", "reason": "persistence", "error": f"Failed to persist async delegation{label}: {exc}"}
     # Units of one call share a slot, so live units can exceed slots: size the pool by units or a
     # unit queues behind a full pool and the stale monitor kills it before its child ever starts.
     executor = _get_executor(max(max_async_children, live_units))
@@ -750,13 +818,30 @@ def _dispatch_admitted(
         future.add_done_callback(lambda _: retirement.release())
     except Exception as exc:  # pragma: no cover — pool submit failure is rare
         retirement.release()
-        with _records_lock:
-            _records.pop(delegation_id, None)
-        with _DB_LOCK, _transaction() as conn:
-            conn.execute("DELETE FROM async_delegations WHERE delegation_id=?", (delegation_id,))
+        _forget_unsubmitted(delegation_id)
+        # ThreadPoolExecutor.submit() enqueues the work item BEFORE it tries to start a new worker
+        # thread, so a failure in that later step (e.g. the OS refusing a new thread) does not mean
+        # the task never ran -- an existing or newly-spawned thread can still dequeue and execute it
+        # for real while we report "rejected". Drain the pool's own queue looking for our item: if
+        # it is still sitting there, discard it and report a clean rejection (nothing will ever run
+        # it, same as a submit() that failed before queuing anything -- a real ThreadPoolExecutor
+        # whose submit() raises for another reason, or a test double with no queue, behaves the
+        # same way). If it is NOT there, something already dequeued it, so the caller must not also
+        # run it inline (PR65-R5): tag the rejection "raised" the way an admission exception is.
+        ambiguous = _discard_queued_work_item(executor, _worker) is False
+        if ambiguous:
+            return {"status": "rejected", "reason": "raised",
+                    "error": f"Failed to schedule async delegation{label}: {exc}"}
         return {"status": "rejected", "error": f"Failed to schedule async delegation{label}: {exc}"}
     if progress_fn is not None:
-        _ensure_stale_monitor()
+        try:
+            _ensure_stale_monitor()
+        except Exception:  # noqa: BLE001 — the worker above is already submitted and running: a failure here must
+            # not be reported as a failed dispatch (a caller retrying on that would duplicate live work). The next
+            # dispatch with a progress_fn retries starting the monitor, which then sweeps every live record, this
+            # one included, so it is only unmonitored in between.
+            logger.warning(f"Async delegation{label} %s: failed to start the stale monitor; it stays unmonitored "
+                           "until the next dispatch retries", delegation_id, exc_info=True)
     return {"status": "dispatched", "delegation_id": delegation_id}
 
 
@@ -770,7 +855,8 @@ def dispatch_async_delegation(
     ``session_key``/``parent_session_id`` are captured on the parent thread (the worker carries
     no contextvars) and route the completion back to the spawning session.
     ``progress_fn() -> (token, in_tool)`` enables stale monitoring; omitted = unmonitored.
-    Returns ``{"status": "dispatched", "delegation_id"}`` or ``{"status": "rejected", "error"}``."""
+    Returns ``{"status": "dispatched", "delegation_id"}`` or ``{"status": "rejected", "error"}``; a rejection
+    carrying ``"reason": "persistence"`` means state.db could not record the dispatch (not a full pool)."""
     delegation_id = _new_delegation_id()
     handle = _dispatch(
         delegation_id=delegation_id, goal=goal, goals=None, context=context,

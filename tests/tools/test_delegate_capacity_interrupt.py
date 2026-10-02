@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import queue
+import sqlite3
 import threading
 import time
+import uuid
 from concurrent.futures import Future
 from types import SimpleNamespace
 
@@ -303,3 +305,230 @@ def test_accepted_background_child_keeps_registry_cancellation_ownership(registr
             child.hard_interrupt("test teardown")
         child.allow_finish.set()
         assert child.closed.wait(5)
+
+
+class _QuickChild(_ControlledChild):
+    """Finishes at once if it is ever run: a unit whose admission failed must never reach it."""
+
+    def __init__(self):
+        super().__init__()
+        self.run_count = 0
+
+    def run_conversation(self, **_kwargs):
+        self.run_count += 1
+        self.started.set()
+        self.finished.set()
+        return {"final_response": "ran", "completed": True, "api_calls": 0, "messages": []}
+
+
+@pytest.fixture
+def locked_ledger(monkeypatch):
+    """The ledger on a shared-cache in-memory SQLite DB. ``lock()`` opens a write transaction on a second connection,
+    so every ledger write -- the dispatch INSERT and the cleanup DELETE alike -- fails at once with the real
+    ``database table is locked`` (SQLITE_LOCKED is not retried by busy_timeout); ``unlock()`` ends it."""
+    uri = f"file:ledger-{uuid.uuid4().hex}?mode=memory&cache=shared"
+    holder = sqlite3.connect(uri, uri=True, check_same_thread=False, isolation_level=None)
+    async_delegation._initialize_schema(holder)
+    monkeypatch.setattr(async_delegation, "_connect", lambda: sqlite3.connect(uri, uri=True, check_same_thread=False))
+
+    def lock():
+        holder.execute("BEGIN IMMEDIATE")
+        holder.execute("INSERT INTO async_delegations (delegation_id, origin_session, state, dispatched_at, updated_at, "
+                       "delivery_state, delivery_attempts) VALUES ('lock-holder', 's', 'running', 0, 0, 'pending', 0)")
+
+    def unlock():
+        if holder.in_transaction:
+            holder.execute("ROLLBACK")
+
+    def rows():
+        return [r[0] for r in holder.execute("SELECT delegation_id FROM async_delegations").fetchall()]
+
+    yield SimpleNamespace(lock=lock, unlock=unlock, rows=rows)
+    unlock()
+    holder.close()
+
+
+@pytest.mark.parametrize("failure", ["persistent", "transient"])
+def test_unrecordable_background_dispatch_reports_the_db_failure_without_running(
+    registry_state, locked_ledger, monkeypatch, failure,
+):
+    """PR65-R1: state.db cannot take the dispatch row. Persistent: the cleanup DELETE fails too and must not escape
+    and strand the detached child. Transient: the cleanup succeeds, and the rejection must not be read as "pool at
+    capacity" -- that ran the child synchronously inside the user's turn and hid the DB failure. Either way the tool
+    reports the failure, the child never runs, it is disposed rather than left detached, and no slot is held."""
+    from tools.delegate_tool_dispatch import _run_batch
+
+    parent, child = _Parent(), _QuickChild()
+    batch = _batch(parent, child)
+    persist_errors = []
+    real_persist = async_delegation._persist_dispatch
+
+    def persist(record):
+        try:
+            return real_persist(record)
+        except Exception as exc:
+            persist_errors.append(exc)
+            raise
+        finally:
+            if failure == "transient":
+                locked_ledger.unlock()
+
+    monkeypatch.setattr(async_delegation, "_persist_dispatch", persist)
+    locked_ledger.lock()
+    try:
+        result = json.loads(_run_batch(batch, background=True))
+    finally:
+        locked_ledger.unlock()
+
+    assert persist_errors and "locked" in str(persist_errors[0])
+    assert result.get("status") == "error", result
+    assert "locked" in result["error"]
+    assert "capacity" not in json.dumps(result).lower()
+    assert not child.started.is_set(), "a unit the ledger could not record ran inline anyway"
+    assert async_delegation.active_count() == 0
+    assert child not in parent._active_children and child.close_count == 1
+    if failure == "transient":
+        assert locked_ledger.rows() == [], "the failed dispatch left a ledger row behind"
+
+
+def test_admission_that_raises_restores_parent_ownership(registry_state, monkeypatch):
+    """PR65-R1: an exception out of async admission must not leave the already-detached child outside the parent's
+    stop fan-out; the call reports the failure instead of raising past the restore or running the child."""
+    from tools.delegate_tool_dispatch import _run_batch
+
+    parent, child = _Parent(), _QuickChild()
+    batch = _batch(parent, child)
+
+    def raising_admission(**_kwargs):
+        raise sqlite3.OperationalError("database table is locked")
+
+    monkeypatch.setattr(async_delegation, "dispatch_async_delegation_batch", raising_admission)
+    result = json.loads(_run_batch(batch, background=True))
+
+    assert result["status"] == "error" and "locked" in result["error"], result
+    assert not child.started.is_set()
+    assert parent._active_children == [child], "admission raised and the detached child was never re-attached"
+
+
+def test_schedule_failure_cleanup_survives_an_unavailable_ledger(registry_state, locked_ledger, monkeypatch):
+    """PR65-R1 sibling site (the submit-failure cleanup): the executor refuses the unit and state.db is unavailable
+    for the cleanup DELETE as well. That cleanup must not raise out of admission: the unit's slot is freed and the
+    established scheduler-failure fallback still runs the child under the parent's ownership."""
+    from tools.delegate_tool_dispatch import _run_batch
+
+    parent, child = _Parent(), _QuickChild()
+
+    class LockingRejectingExecutor:
+        def submit(self, *_args, **_kwargs):
+            locked_ledger.lock()
+            raise RuntimeError("executor shut down")
+
+    monkeypatch.setattr(async_delegation, "_get_executor", lambda _n: LockingRejectingExecutor())
+    try:
+        result = json.loads(_run_batch(_batch(parent, child), background=True))
+    finally:
+        locked_ledger.unlock()
+
+    assert child.started.is_set() and result["results"][0]["status"] == "completed", result
+    assert async_delegation.active_count() == 0
+    assert child.close_count == 1 and parent._active_children == []
+
+
+def test_submission_success_survives_a_stale_monitor_start_failure(registry_state, monkeypatch):
+    """PR65-R3: ``executor.submit()`` succeeds -- the worker is really running -- before ``_ensure_stale_monitor``
+    is ever called (tools/async_delegation.py:795-796). A failure in THAT call must not be reported as "could not
+    be dispatched": the work already started, and a caller that retried on that message would dispatch a SECOND
+    copy of the same work. Mirrors the before/after-the-real-action split already used for the persist/schedule-
+    failure sites above: classify by where the exception originates, never a blanket catch around the dispatch."""
+    from tools.delegate_tool_dispatch import _run_batch
+
+    parent, child = _Parent(), _QuickChild()
+    batch = _batch(parent, child)
+
+    def failing_monitor():
+        raise RuntimeError("could not start thread")
+
+    monkeypatch.setattr(async_delegation, "_ensure_stale_monitor", failing_monitor)
+    result = json.loads(_run_batch(batch, background=True))
+
+    assert result["status"] == "dispatched", result
+    assert "could not be dispatched" not in json.dumps(result).lower(), result
+    completion = registry_state.get(timeout=5)
+    assert completion["delegation_id"] == result["delegation_id"]
+    assert completion["results"][0]["status"] == "completed"
+    assert child.started.is_set() and child.finished.is_set()
+    assert child.close_count == 1 and parent._active_children == []
+
+
+def test_partial_batch_running_unit_is_not_reported_not_started(registry_state, monkeypatch, tmp_path):
+    """PR65-R3 partial-batch sibling: a LATER unit of an independent-completions call whose worker already started
+    must not land in ``not_started`` just because ``_ensure_stale_monitor`` then failed for it -- ``not_started``
+    promises a task that never ran and invites the caller to resend it while the real one is still in flight."""
+    (tmp_path / "config.yaml").write_text(
+        "delegation:\n  max_concurrent_children: 3\n  worktree_isolation: false\n"
+        "  independent_completions: true\n",
+        encoding="utf-8",
+    )
+    from tools.delegate_tool_dispatch import _run_batch
+
+    parent = _Parent()
+    first, second = _QuickChild(), _QuickChild()
+    first.session_id += "-first"
+    second.session_id += "-second"
+    batch = _batch(parent, first, second)
+
+    real_monitor = async_delegation._ensure_stale_monitor
+    calls: list = []
+
+    def flaky_monitor():
+        calls.append(1)
+        if len(calls) == 2:
+            raise RuntimeError("could not start thread")
+        return real_monitor()
+
+    monkeypatch.setattr(async_delegation, "_ensure_stale_monitor", flaky_monitor)
+    result = json.loads(_run_batch(batch, background=True))
+
+    assert result["status"] == "dispatched", result
+    assert "not_started" not in result, result
+    assert len(result.get("units", [])) == 2, result
+    # Wait for both units' completions before reading ``started``: executor.submit() returning does not mean the
+    # pool has run the worker yet, so checking ``started`` first would race the thread that sets it.
+    completions = {registry_state.get(timeout=5)["delegation_id"] for _ in range(2)}
+    assert completions == {u["delegation_id"] for u in result["units"]}
+    assert first.started.is_set() and second.started.is_set()
+
+
+def test_submit_exception_after_the_work_item_already_ran_is_not_executed_again(registry_state, monkeypatch):
+    """PR65-R5 (ROUND1-ESCAPE): ThreadPoolExecutor.submit() enqueues the work item BEFORE it tries to
+    start a worker thread, so a late exception from that attempt does not mean the task never ran --
+    an existing or newly-created thread can still pick the queued item up and execute it for real.
+    Treating that exception as a clean "nothing was submitted" rejection let the caller run the SAME
+    task a second time inline. Reproduced here by letting the real submit() genuinely enqueue and run
+    the work, then raising afterward -- exactly the shape of a late thread-start failure."""
+    from tools.delegate_tool_dispatch import _run_batch
+
+    parent, child = _Parent(), _QuickChild()
+    batch = _batch(parent, child)
+
+    executor = async_delegation._get_executor(2)
+    real_submit = executor.submit
+    raised = threading.Event()
+
+    def failing_submit(fn, *a, **kw):
+        future = real_submit(fn, *a, **kw)
+        future.result(timeout=5)  # the real work item has already run by the time submit() "fails"
+        raised.set()
+        raise RuntimeError("injected: thread start failed after the work item was already queued")
+
+    monkeypatch.setattr(executor, "submit", failing_submit)
+    try:
+        result = json.loads(_run_batch(batch, background=True))
+    finally:
+        monkeypatch.setattr(executor, "submit", real_submit)
+
+    assert raised.is_set(), "the test did not exercise the late-submit-failure path"
+    assert child.finished.wait(5), "the real worker thread should have run the task once"
+    assert result.get("status") == "error", result
+    assert "inline_results" not in result, "the already-run task must not also run inline"
+    assert child.run_count == 1, "the task ran more than once"
