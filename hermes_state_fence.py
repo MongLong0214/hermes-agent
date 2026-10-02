@@ -57,7 +57,6 @@ LINEAGE_DAMAGED = "damaged"
 SCHEMA_INCOMPATIBLE_VERDICT_PREFIX = "schema_incompatible: "
 _FENCE_ABORT_PHRASE = "state db generation incompatible"
 _MISSING_FENCE_FUNCTION_PHRASE = f"no such function: {TURN_FENCE_FUNCTION}"
-_FENCE_REFUSAL_PHRASES = (_FENCE_ABORT_PHRASE, _MISSING_FENCE_FUNCTION_PHRASE)
 
 
 def _turn_fence_generation() -> int:
@@ -260,11 +259,13 @@ def fence_refusal_verdict(exc_or_text, *, db_path=None) -> Optional[str]:
     An exception counts only through a typed SQLite error on its chain, never through prose that quotes
     the phrases. The fence's RAISE(ABORT) is a refusal by itself. A missing fence function only says the
     writing connection never registered it, so it is a refusal only when *db_path*'s lineage shows a
-    store this build may not write. Bare text (init-error slots, RPC errors) has no type left and is
-    matched by phrase."""
+    store this build may not write. Bare text (init-error slots, RPC errors) has no type left, so only
+    the RAISE(ABORT) phrase is matched there (unambiguous by itself, as above) — the missing-function
+    phrase is never matched from bare text: with no store to probe, there is no lineage to confirm it
+    against, and matching it anyway would call any text that merely QUOTES it a fence refusal."""
     if not isinstance(exc_or_text, BaseException):
         text = str(exc_or_text)
-        if any(phrase in text.lower() for phrase in _FENCE_REFUSAL_PHRASES):
+        if _FENCE_ABORT_PHRASE in text.lower():
             return f"{SCHEMA_INCOMPATIBLE_VERDICT_PREFIX}{text}"
         return None
     for exc in exception_chain(exc_or_text):

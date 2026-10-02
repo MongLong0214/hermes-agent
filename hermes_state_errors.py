@@ -321,13 +321,15 @@ _PERSISTENCE_CAUSE_BY_TYPE = (
     (StateDbReplacedError, "replaced"),
     (StateDbCorruptError, "corrupt"),
 )
-# The fence trigger's RAISE text and the missing-UDF error: a generation refusal, never damage. Used
-# only for PLAIN TEXT with no exception object left to type-check (RPC/init-error slots) — an
-# exception routes through the typed ``fence_refusal_verdict`` check in ``classify_persistence_error``
-# instead, because the missing-UDF phrase alone is ambiguous (see that function).
+# The fence trigger's own RAISE(ABORT) text: a generation refusal, never damage, and unambiguous
+# by itself even as plain text with no exception object left to type-check (RPC/init-error slots).
+# The missing-UDF phrase and the three IncompatibleSchemaError heads are deliberately NOT here: all
+# four are also claims a tool result, a log line, or any other text could merely be QUOTING, and
+# with no exception object left, there is no type/__cause__ chain to confirm one against. An
+# exception routes through the typed ``fence_refusal_verdict``/``IncompatibleSchemaError`` checks in
+# ``classify_persistence_error`` instead; plain text that only quotes those phrases is "unknown".
 _SCHEMA_INCOMPATIBLE_PHRASES = (
-    "state db generation incompatible", "no such function: hermes_turn_fence_generation",
-    *(head.lower() for head in _INCOMPATIBLE_SCHEMA_HEADS.values()),
+    "state db generation incompatible",
 )
 _PERSISTENCE_CAUSE_BY_PHRASE = (
     (("turn lease",), "turn_lease"),

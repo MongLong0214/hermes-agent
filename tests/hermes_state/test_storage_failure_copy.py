@@ -30,9 +30,11 @@ def test_each_cause_has_a_stable_code_and_an_action(exc, code, command):
     assert "sqlite" not in failure.gloss.lower() and "OperationalError" not in failure.gloss
 
 
-def test_a_refused_store_gets_its_cause_remedy_even_after_crossing_a_string(tmp_path):
+def test_a_refused_store_gets_its_cause_remedy_from_the_typed_exception(tmp_path):
     """A store this build refuses is not "could not be opened, run doctor --fix": each refusal cause
-    has its own copy, and it survives ``str(e)`` (the gateway, TUI and CLI keep init errors as text)."""
+    has its own copy — but only from the typed exception. Gateway, TUI and CLI all now keep the
+    exception object alongside its text (L4-4) instead of collapsing it to ``str(e)`` first, because
+    the text alone can only ever QUOTE these phrases, never confirm them."""
     from hermes_state import SessionDB
     from tests.hermes_state.fork_store_fixture import REFUSED_KINDS, build_store
 
@@ -42,13 +44,27 @@ def test_a_refused_store_gets_its_cause_remedy_even_after_crossing_a_string(tmp_
         with pytest.raises(Exception) as caught:
             SessionDB(db_path=build_store(tmp_path / kind / "state.db", kind)).close()
         failure = describe_storage_failure(caught.value)
-        assert failure == describe_storage_failure(str(caught.value)), kind
         assert failure.cause == "schema_incompatible" and failure.code != unknown.code, (kind, failure)
         assert failure.gloss[0].islower() and "doctor --fix" not in failure.action, (kind, failure)
         glosses.setdefault(cause, set()).add(failure.gloss)
     # Kinds that share a cause share its copy; different causes never do.
     assert all(len(g) == 1 for g in glosses.values()), glosses
     assert len({next(iter(g)) for g in glosses.values()}) == len(glosses), glosses
+
+
+def test_a_refused_stores_text_alone_is_unknown_not_schema_incompatible(tmp_path):
+    """Once the exception crosses to bare ``str(e)`` (no type, no __cause__ chain left), it can only
+    ever QUOTE one of the refusal phrases above — it must not get the same cause/remedy as the real
+    typed exception. This is the L4-4 fix: text alone is "unknown", a real refusal is
+    "schema_incompatible"."""
+    from hermes_state import SessionDB
+    from tests.hermes_state.fork_store_fixture import REFUSED_KINDS, build_store
+
+    for kind in REFUSED_KINDS:
+        with pytest.raises(Exception) as caught:
+            SessionDB(db_path=build_store(tmp_path / kind / "state.db", kind)).close()
+        text_only_failure = describe_storage_failure(str(caught.value))
+        assert text_only_failure.cause == "unknown", (kind, text_only_failure)
 
 
 def test_undetermined_schema_refusal_is_not_defaulted_to_fence_mismatch(monkeypatch):
