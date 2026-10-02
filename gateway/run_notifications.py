@@ -160,17 +160,18 @@ class GatewayNotificationsMixin:
         proceed: bool = True
         early_result: Optional[bool] = None
 
-    async def _deliver_platform_notice(self, source, content: str) -> None:
-        """Deliver a setup/operational notice using platform-specific privacy rules."""
+    async def _deliver_platform_notice(self, source, content: str, *, adapter=None) -> bool:
+        """Deliver a setup/operational notice using platform-specific privacy rules. ``adapter`` reuses a
+        transport the caller already resolved. False when nothing was sent (no adapter, or the send failed)."""
         from gateway.run import _is_slack_ignored_channel
-        adapter = self._delivery_adapter_for(source)
+        adapter = adapter or self._delivery_adapter_for(source)
         if not adapter:
-            return
+            return False
         config = getattr(self, "config", None)
         chat_id = getattr(source, "chat_id", None)
         if config and getattr(source, "platform", None) == Platform.SLACK and _is_slack_ignored_channel(config, chat_id, adapter):
             logger.info("Skipping Slack platform notice for configured ignored channel %s", chat_id)
-            return
+            return True
         # The routed adapter carries ITS profile's ``platforms.<p>`` block; ``self.config`` is the
         # launch profile's, so a served secondary's ``notice_delivery: private`` would be ignored.
         adapter_config = getattr(adapter, "config", None)
@@ -191,8 +192,9 @@ class GatewayNotificationsMixin:
             ):
                 result = await adapter.send_private_notice(source.chat_id, source.user_id, content, metadata=metadata)
                 if getattr(result, "success", False):
-                    return
-        await adapter.send(source.chat_id, content, metadata=metadata)
+                    return True
+        result = await adapter.send(source.chat_id, content, metadata=metadata)
+        return getattr(result, "success", True) is not False
 
     async def _resolve_compression_lineage_target(
         self, session_db: Any, session_entry: SessionEntry, pinned_session_id: str,
@@ -1594,8 +1596,7 @@ class GatewayNotificationsMixin:
                     return None
                 identity_claimed = True
             if evt.get("type") == "async_delegation" and self._load_delegation_completion_delivery() == "quiet":
-                injection_result = await self._record_quiet_delegation_completion(
-                    synth_text, evt, batch_size=1 + len(sibling_claims))
+                injection_result = await self._record_quiet_delegation_completion(synth_text, evt)
             else:
                 injection_result = await self._inject_watch_notification(synth_text, evt, raise_not_accepted=True)
             if injection_result is not True:
@@ -1621,12 +1622,15 @@ class GatewayNotificationsMixin:
             if accepted and sibling_claims:
                 self._record_coalesced_completion_siblings([event for event, _claim_id in sibling_claims])
 
-    async def _record_quiet_delegation_completion(self, synth_text: str, evt: dict, *, batch_size: int = 1) -> bool:
+    async def _record_quiet_delegation_completion(self, synth_text: str, evt: dict) -> bool:
         """``delegation.completion_delivery: quiet`` on a push chat: record the result in the session the
         chat's next message reads (the wake path's resolver picks it) and send the chat a plain-text notice
-        instead of starting an agent turn. A session with a turn in flight refuses the row; that raises
-        WakeNotAccepted, which defers the claim without spending an attempt. An event that names no
-        spawning session, or a route that cannot push, keeps the wake path so no result is stranded."""
+        through the same transport instead of starting an agent turn. Each unit is recorded under its own
+        delegation id (quiet groups are never coalesced), so a replay re-finds its row rather than writing
+        a second one. A session with a turn in flight refuses the row; that raises WakeNotAccepted, which
+        defers the claim without spending an attempt. A notice that is not sent returns False so the claim
+        is retried; the replay re-finds the recorded row and only re-sends the notice. An event that names
+        no spawning session, or a route that cannot push, keeps the wake path so no result is stranded."""
         from gateway.wake import WakeNotAccepted, _delegation_display_metadata, adapter_supports_push
         from hermes_state_errors import SessionTurnLeaseLostError
         from tools.process_registry_notifications import async_delegation_display_text
@@ -1654,14 +1658,16 @@ class GatewayNotificationsMixin:
             return False
         logger.info("Async delegation %s recorded in session %s without a wake turn (delegation.completion_delivery: quiet)",
                     evt.get("delegation_id"), session_entry.session_id)
-        notice = async_delegation_display_text(evt)
-        if batch_size > 1:
-            notice += f" (+{batch_size - 1} more)"
+        notice = f"{async_delegation_display_text(evt)} — saved to this chat; read with your next message."
         try:
-            await self._deliver_platform_notice(source, f"{notice} — saved to this chat; read with your next message.")
+            sent = await self._deliver_platform_notice(source, notice, adapter=adapter)
         except Exception:
             logger.warning("Quiet delegation completion notice failed for session %s", session_entry.session_id, exc_info=True)
-        return True
+            sent = False
+        if not sent:
+            logger.warning("Quiet delegation completion notice for session %s was not sent; the claim will be retried",
+                           session_entry.session_id)
+        return sent
 
     @staticmethod
     def _event_route_key(evt: dict, fields: tuple[str, ...]) -> tuple[str, ...]:
@@ -1823,9 +1829,9 @@ class GatewayNotificationsMixin:
     async def _deliver_async_delegation_group_scoped(self, group: list[dict]) -> Optional[bool]:
         from gateway.run import _format_gateway_process_notification
         from tools.process_registry import process_registry as _pr
-        # API delivery does not start a model turn, so there is nothing to coalesce.
+        # API delivery and quiet delivery start no model turn, so there is nothing to coalesce.
         # Keep each unit's stable identity with its row across partial delivery/retry.
-        if group and group[0].get("origin_session_id"):
+        if group and (group[0].get("origin_session_id") or self._load_delegation_completion_delivery() == "quiet"):
             outcomes = []
             for evt in group:
                 text = _format_gateway_process_notification(evt)

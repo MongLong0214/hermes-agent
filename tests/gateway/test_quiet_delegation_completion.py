@@ -49,7 +49,8 @@ def _config(home, mode):
 def _runner(home):
     runner = object.__new__(GatewayRunner)
     runner._running = True
-    runner.adapters = {Platform.TELEGRAM: SimpleNamespace(handle_message=AdmittingHandler())}
+    runner.adapters = {Platform.TELEGRAM: SimpleNamespace(
+        handle_message=AdmittingHandler(), send=AsyncMock(return_value=SimpleNamespace(success=True)), config=None)}
     entry = SimpleNamespace(session_key=SESSION_KEY, session_id="sess_parent")
     runner.session_store = SimpleNamespace(_ensure_loaded=lambda: None, _entries={},
                                            get_or_create_session=lambda source, **kwargs: entry)
@@ -61,7 +62,9 @@ def _runner(home):
     runner._background_tasks = set()
     runner._session_db = AsyncSessionDB(home.db)
     runner._peek_session_state = lambda session_key: None
-    runner._deliver_platform_notice = AsyncMock()
+    runner._thread_metadata_for_source = lambda source: None
+    # The notice must use the transport the completion resolved, even when the generic lookup finds none.
+    runner._delivery_adapter_for = lambda source: None
     return runner
 
 
@@ -106,8 +109,9 @@ def test_quiet_records_the_result_for_the_next_turn_and_sends_a_plain_notice(hom
     assert len(rows) == 1 and rows[0]["role"] == "user" and rows[0]["display_kind"] == "async_delegation_complete"
     history = home.db.get_messages_as_conversation("sess_parent")
     assert any(m["role"] == "user" and "Found it" in m["content"] for m in history), "the next turn reads the result"
-    runner._deliver_platform_notice.assert_awaited_once()
-    notice = runner._deliver_platform_notice.await_args.args[1]
+    adapter = runner.adapters[Platform.TELEGRAM]
+    adapter.send.assert_awaited_once()
+    notice = adapter.send.await_args.args[1]
     assert "Investigate flaky test" in notice and "Found it" not in notice
     assert _durable("deleg_quiet")["delivery_state"] == "delivered"
 
@@ -121,7 +125,7 @@ def test_quiet_defers_while_a_turn_holds_the_session_then_records_once(home):
     try:
         assert _deliver(runner, dict(event)) is False
         assert home.db.get_messages("sess_parent") == []
-        runner._deliver_platform_notice.assert_not_awaited()
+        runner.adapters[Platform.TELEGRAM].send.assert_not_awaited()
         row = _durable("deleg_quiet")
         assert row["delivery_state"] == "pending" and row["delivery_attempts"] == 0, "deferred, no attempt spent"
     finally:
@@ -129,7 +133,7 @@ def test_quiet_defers_while_a_turn_holds_the_session_then_records_once(home):
 
     assert _deliver(runner, dict(event)) is True
     assert len(home.db.get_messages("sess_parent")) == 1
-    runner._deliver_platform_notice.assert_awaited_once()
+    runner.adapters[Platform.TELEGRAM].send.assert_awaited_once()
     runner.adapters[Platform.TELEGRAM].handle_message.assert_not_awaited()
 
 
@@ -142,7 +146,7 @@ def test_wake_stays_the_default(home):
     assert _deliver(runner, event) is True
     runner.adapters[Platform.TELEGRAM].handle_message.assert_awaited_once()
     assert home.db.get_messages("sess_parent") == []
-    runner._deliver_platform_notice.assert_not_awaited()
+    runner.adapters[Platform.TELEGRAM].send.assert_not_awaited()
 
 
 def test_quiet_without_a_spawning_session_keeps_the_wake_path(home):
@@ -158,3 +162,44 @@ def test_quiet_without_a_spawning_session_keeps_the_wake_path(home):
 def test_unknown_completion_delivery_value_falls_back_to_wake(home):
     _config(home, "silent")
     assert _runner(home)._load_delegation_completion_delivery() == "wake"
+
+
+def test_quiet_group_records_every_unit_under_its_own_id_on_replay(home):
+    """A replay after unit A's row was written but before its claim was acknowledged, now grouped with
+    unit B: B's result must be recorded too, not acknowledged under A's existing row."""
+    _config(home, "quiet")
+    runner = _runner(home)
+    evt_a = _event("deleg_a", summary="Result A")
+    evt_b = _event("deleg_b", summary="Result B", goal="Second task")
+    for evt in (evt_a, evt_b):
+        _persist_pending(evt)
+    home.db.append_delegation_delivery("sess_parent", "earlier attempt for A", {"delegation_id": "deleg_a"})
+
+    assert asyncio.run(runner._deliver_async_delegation_group([dict(evt_a), dict(evt_b)])) is True
+
+    rows = home.db.get_messages("sess_parent")
+    assert len(rows) == 2, "A keeps its one row and B gets its own"
+    assert any("Result B" in row["content"] for row in rows), "B's result is recorded"
+    assert _durable("deleg_a")["delivery_state"] == "delivered"
+    assert _durable("deleg_b")["delivery_state"] == "delivered"
+    runner.adapters[Platform.TELEGRAM].handle_message.assert_not_awaited()
+
+
+@pytest.mark.parametrize("failure", ["unsuccessful", "raises"])
+def test_quiet_unsent_notice_keeps_the_claim_and_resends_only_the_notice(home, failure):
+    _config(home, "quiet")
+    runner = _runner(home)
+    adapter = runner.adapters[Platform.TELEGRAM]
+    first = SimpleNamespace(success=False) if failure == "unsuccessful" else RuntimeError("telegram down")
+    adapter.send = AsyncMock(side_effect=[first, SimpleNamespace(success=True)])
+    event = _event()
+    _persist_pending(event)
+
+    assert _deliver(runner, dict(event)) is False
+    assert len(home.db.get_messages("sess_parent")) == 1, "the result is recorded once"
+    assert _durable("deleg_quiet")["delivery_state"] == "pending", "the claim stays retryable"
+
+    assert _deliver(runner, dict(event)) is True
+    assert len(home.db.get_messages("sess_parent")) == 1, "the replay re-finds the row instead of writing another"
+    assert adapter.send.await_count == 2
+    assert _durable("deleg_quiet")["delivery_state"] == "delivered"
