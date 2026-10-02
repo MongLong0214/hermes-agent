@@ -3687,9 +3687,16 @@ class GatewayTurnMixin:
 
         if self._draining and (pending_event or pending):
             logger.info(
-                "Discarding pending follow-up for session %s during gateway %s",
+                "Not starting a new turn for session %s during gateway %s — returning the "
+                "accepted follow-up to the queue instead of discarding it",
                 session_key or "?", self._status_action_label(),
             )
+            # The FIFO head was already popped (and possibly replaced by an overflow promotion)
+            # above; hand it back so shutdown's flush/recovery still sees it exactly once instead
+            # of losing it here. A bare interrupt-message/leftover-steer `pending` (no backing
+            # `pending_event`) was never queued in the FIFO, so there is nothing to restore for it.
+            if pending_event is not None and adapter is not None and session_key:
+                self._restore_undrained_pending_event(session_key, adapter, pending_event)
             pending_event = None
             pending = None
         return pending_event, pending
