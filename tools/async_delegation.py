@@ -781,22 +781,8 @@ def _dispatch_admitted(
         "_context": contextvars.copy_context(),
         # Stale-monitor bookkeeping (see _stale_monitor_loop).
         "_progress_token": None, "_progress_ts": dispatched_at, "_interrupted_at": None}
-    with _records_lock:
-        active_slots = {r.get("slot_key") or r["delegation_id"] for r in _records.values() if r.get("status") in _ACTIVE_STATES}
-        if record["slot_key"] not in active_slots and len(active_slots) >= max_async_children:
-            return {"status": "rejected", "error": capacity_error}
-        _records[delegation_id] = record
-        live_units = sum(1 for r in _records.values() if r.get("status") in _LIVE_STATES)
-    try:
-        _persist_dispatch(record)
-    except Exception as exc:  # noqa: BLE001 — a locked/full state.db must not strand the slot
-        _forget_unsubmitted(delegation_id)
-        # ``reason`` tells callers this is not a full pool: running the work inline instead would hide the failure.
-        return {"status": "rejected", "reason": "persistence", "error": f"Failed to persist async delegation{label}: {exc}"}
-    # Units of one call share a slot, so live units can exceed slots: size the pool by units or a
-    # unit queues behind a full pool and the stale monitor kills it before its child ever starts.
-    executor = _get_executor(max(max_async_children, live_units))
-
+    # Everything the hand-off needs that does not depend on admission is built BEFORE the record exists:
+    # a failure here (even a failed allocation) leaves nothing to release.
     from hermes_cli.backend_retirement import retirement
 
     # The worker's own exit is the only proof retirement can trust: the stall monitor may force-
@@ -831,13 +817,37 @@ def _dispatch_admitted(
             _finalize(delegation_id, result, status)
             _release_worker_reservation()
 
-    # The outer dispatch reservation prevents a freeze during this handoff. Retain a worker
-    # reservation too: the stall monitor may finalize its registry record before it really exits.
-    retirement.acquire()
+    with _records_lock:
+        active_slots = {r.get("slot_key") or r["delegation_id"] for r in _records.values() if r.get("status") in _ACTIVE_STATES}
+        if record["slot_key"] not in active_slots and len(active_slots) >= max_async_children:
+            return {"status": "rejected", "error": capacity_error}
+        _records[delegation_id] = record
+        live_units = sum(1 for r in _records.values() if r.get("status") in _LIVE_STATES)
+    try:
+        _persist_dispatch(record)
+    except Exception as exc:  # noqa: BLE001 — a locked/full state.db must not strand the slot
+        _forget_unsubmitted(delegation_id)
+        # ``reason`` tells callers this is not a full pool: running the work inline instead would hide the failure.
+        return {"status": "rejected", "reason": "persistence", "error": f"Failed to persist async delegation{label}: {exc}"}
     ambiguous = False
     dispatch_error = None
+    worker_reserved = False
+    # Flips the instant submit() is entered. Before that, nothing can have reached the pool's queue: a
+    # failure in the executor lookup, the worker reservation or the parent-context wrapper is a proven
+    # non-submission exactly like a submit() raising ``never_enqueued`` (see DaemonThreadPoolExecutor).
+    in_submit = False
+    executor = None
     try:
-        executor.submit(propagate_context_to_thread(_worker))
+        # Units of one call share a slot, so live units can exceed slots: size the pool by units or a
+        # unit queues behind a full pool and the stale monitor kills it before its child ever starts.
+        executor = _get_executor(max(max_async_children, live_units))
+        # The outer dispatch reservation prevents a freeze during this handoff. Retain a worker
+        # reservation too: the stall monitor may finalize its registry record before it really exits.
+        retirement.acquire()
+        worker_reserved = True
+        task = propagate_context_to_thread(_worker)
+        in_submit = True
+        executor.submit(task)
     except Exception as exc:  # pragma: no cover — pool submit failure is rare
         dispatch_error = f"Failed to schedule async delegation{label}: {exc}"
         # ThreadPoolExecutor.submit() enqueues the work item BEFORE it tries to start a new worker
@@ -856,12 +866,13 @@ def _dispatch_admitted(
         # reservation stay untouched (a real completion still delivers through `_finalize`) and the
         # caller must not also run it inline (PR65-R5): tag the rejection "raised" the way an admission
         # exception is, instead of claiming a clean rejection we cannot actually back.
-        if getattr(exc, "never_enqueued", False):
+        if not in_submit or getattr(exc, "never_enqueued", False):
             ambiguous = False
         else:
             ambiguous = _discard_queued_work_item(executor, _worker) is False
         if not ambiguous:
-            _release_worker_reservation()
+            if worker_reserved:
+                _release_worker_reservation()
             _forget_unsubmitted(delegation_id)
             return {"status": "rejected", "error": dispatch_error}
     # A retained ambiguous unit (the item may really be running `_worker` right now) is just as

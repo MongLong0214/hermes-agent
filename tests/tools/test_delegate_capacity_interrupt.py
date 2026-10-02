@@ -796,3 +796,130 @@ def test_prequeue_submit_failure_is_not_treated_as_ambiguous(registry_state, mon
     assert handle2["status"] == "dispatched", handle2
     assert registry_state.get(timeout=5)["summary"] == "ok"
     assert not ran.is_set(), "the phantom work item ran anyway"
+
+
+def _fail_nth_call(real, n, message):
+    """Wrap *real* so its *n*-th call raises ``MemoryError`` (a transient allocation failure) and every
+    other call -- before and after -- runs the real operation."""
+    calls = []
+
+    def wrapper(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == n:
+            raise MemoryError(message)
+        return real(*args, **kwargs)
+
+    return wrapper, calls
+
+
+def _inject_prequeue_failure(monkeypatch, site, fence):
+    """Make one real pre-enqueue step of a dispatch fail. Every site runs AFTER the record, its ledger row
+    and its capacity slot exist and BEFORE the work item reaches the executor's ``_work_queue``."""
+    from tools import daemon_pool
+
+    if site == "pool_context_capture":  # DaemonThreadPoolExecutor.submit's own copy_context()
+        failing, calls = _fail_nth_call(daemon_pool.copy_context, 1, "injected: pool context capture")
+        monkeypatch.setattr(daemon_pool, "copy_context", failing)
+    elif site == "parent_wrapper":  # propagate_context_to_thread(_worker), built before submit() is called
+        failing, calls = _fail_nth_call(async_delegation.propagate_context_to_thread, 1, "injected: parent wrapper")
+        monkeypatch.setattr(async_delegation, "propagate_context_to_thread", failing)
+    elif site == "executor_lookup":  # _get_executor(), right after the ledger row is persisted
+        failing, calls = _fail_nth_call(async_delegation._get_executor, 1, "injected: executor lookup")
+        monkeypatch.setattr(async_delegation, "_get_executor", failing)
+    elif site == "worker_reservation":  # the worker's own retirement.acquire() (call 1 is the outer dispatch's)
+        failing, calls = _fail_nth_call(fence.acquire, 2, "injected: worker reservation")
+        monkeypatch.setattr(fence, "acquire", failing)
+    else:
+        raise AssertionError(site)
+    return calls
+
+
+def _ledger_rows():
+    conn = async_delegation._connect()
+    try:
+        return conn.execute("SELECT delegation_id, state FROM async_delegations").fetchall()
+    finally:
+        conn.close()
+
+
+_PREQUEUE_SITES = ["pool_context_capture", "parent_wrapper", "executor_lookup", "worker_reservation"]
+
+
+def _assert_nothing_leaked(fence, executor_before):
+    assert async_delegation.active_count() == 0, "the phantom record still holds a capacity slot"
+    assert async_delegation._records == {}, "the forgotten record must really be gone"
+    assert _ledger_rows() == [], "a 'running' ledger row was left behind for a unit that never queued"
+    assert fence.active_count() == 0, "the retirement reservation leaked"
+    executor = async_delegation._executor or executor_before
+    assert executor is None or executor._work_queue.empty(), "nothing should have reached the queue"
+
+
+def _assert_capacity_recovered(registry_state):
+    done = threading.Event()
+
+    def ok_runner():
+        done.set()
+        return {"summary": "healthy"}
+
+    handle = async_delegation.dispatch_async_delegation(
+        goal="healthy", context=None, toolsets=None, role="leaf", model=None, session_key="test",
+        runner=ok_runner, max_async_children=1)
+    assert handle["status"] == "dispatched", f"the slot was never freed: {handle}"
+    assert registry_state.get(timeout=5)["summary"] == "healthy"
+    assert done.is_set()
+
+
+@pytest.mark.parametrize("site", _PREQUEUE_SITES)
+def test_every_prequeue_failure_phase_is_a_clean_single_rejection(registry_state, monkeypatch, site):
+    """R-PREQUEUE-PHANTOM round 2: the ``_WorkItem`` allocation was the only pre-enqueue step tagged
+    ``never_enqueued``. A failure at any EARLIER step -- the pool's own context capture, the parent
+    context wrapper, the executor lookup, or the worker's retirement reservation -- also leaves the queue
+    empty with nothing running, but fell into the ambiguous branch (or straight out of dispatch): the
+    record, its ledger row, its capacity slot and its retirement reservation were held forever and a
+    later healthy dispatch was rejected at capacity."""
+    from hermes_cli import backend_retirement
+
+    fence = backend_retirement.RetirementFence()
+    monkeypatch.setattr(backend_retirement, "retirement", fence)
+    executor_before = async_delegation._executor
+    ran = threading.Event()
+
+    def runner():
+        ran.set()
+        return {"summary": "must never run"}
+
+    calls = _inject_prequeue_failure(monkeypatch, site, fence)
+    handle = async_delegation.dispatch_async_delegation(
+        goal="test", context=None, toolsets=None, role="leaf", model=None, session_key="test",
+        runner=runner, max_async_children=1)
+    assert calls, "the injected site was never reached"
+
+    assert handle["status"] == "rejected", handle
+    assert handle.get("reason") is None, handle  # proven clean: it was never queued, so it can never run
+    _assert_nothing_leaked(fence, executor_before)
+    _assert_capacity_recovered(registry_state)
+    assert not ran.is_set(), "the never-queued work item ran anyway"
+
+
+@pytest.mark.parametrize("site", _PREQUEUE_SITES)
+def test_every_prequeue_failure_phase_is_a_clean_batch_rejection(registry_state, monkeypatch, site):
+    """R-PREQUEUE-PHANTOM round 2, batch dispatch: the same pre-enqueue failures must be a confirmed
+    non-start (the batch then runs inline exactly once, as for any clean rejection) -- never
+    ``outcome_uncertain`` with the unit's record, ledger row, slot and reservation leaked."""
+    from hermes_cli import backend_retirement
+    from tools.delegate_tool_dispatch import _run_batch
+
+    fence = backend_retirement.RetirementFence()
+    monkeypatch.setattr(backend_retirement, "retirement", fence)
+    executor_before = async_delegation._executor
+    parent, child = _Parent(), _QuickChild()
+
+    calls = _inject_prequeue_failure(monkeypatch, site, fence)
+    result = json.loads(_run_batch(_batch(parent, child), background=True))
+    assert calls, "the injected site was never reached"
+
+    assert not result.get("outcome_uncertain"), result
+    assert "outcome_uncertain" not in json.dumps(result), result
+    assert child.run_count == 1, "a confirmed non-start runs inline exactly once"
+    _assert_nothing_leaked(fence, executor_before)
+    _assert_capacity_recovered(registry_state)
