@@ -1216,7 +1216,10 @@ class GatewayTurnMixin:
                 )
         # Configured aux model failed, recovered on the main model: only the user can fix that config.
         elif _comp is not None and getattr(_comp, "_last_aux_model_failure_model", None):
-            # Egress scrub: provider exception text may carry credentials (opaque Bearer tokens too).
+            # Strict egress scrub (R-COMPRESSION-SECRETS): provider exception text may carry
+            # credentials — opaque Bearer tokens AND credential-bearing URL query params (no
+            # vendor prefix). It is never legitimate URL content, so this does not need the
+            # magic-link/OAuth-callback passthrough the ordinary scrub keeps for other replies.
             from gateway.run import _redact_gateway_user_facing_secrets
             _aux_model = getattr(_comp, "_last_aux_model_failure_model", "")
             _aux_err = getattr(_comp, "_last_aux_model_failure_error", None) or "unknown error"
@@ -1225,7 +1228,8 @@ class GatewayTurnMixin:
                     f"ℹ️ Configured compression model `{_aux_model}` "
                     f"failed ({_aux_err}). Recovered using your main "
                     "model — context is intact — but you may want to "
-                    "check `auxiliary.compression.model` in config.yaml."),
+                    "check `auxiliary.compression.model` in config.yaml.",
+                    redact_url_credentials=True),
                 "aux-model-fallback notice",
             )
 

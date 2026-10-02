@@ -71,6 +71,16 @@ _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
 
+# Automatic-compression abort warning (agent/conversation_compression.py::_candidate_rejected,
+# "⚠ Compression aborted: {err}. ..."), reached via agent._emit_warning -> status_callback ->
+# _prepare_gateway_status_message. It is a deliberate VISIBLE carve-out from the noise filter
+# (_TELEGRAM_NOISY_STATUS_RE never matches it), so it is NOT filtered here — it embeds a raw
+# provider/summariser exception, which can carry a credential-bearing URL query param the
+# default egress scrub leaves alone for magic-link/OAuth-callback URLs (R-COMPRESSION-SECRETS
+# R2). Matched independently of the noise filter so widening/narrowing that regex can never
+# silently turn this redaction off.
+_COMPRESSION_ABORT_STATUS_RE = re.compile(r"compression\s+aborted:", re.IGNORECASE)
+
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not gateway chats
     r"auxiliary\s+.+\s+failed"
@@ -562,12 +572,17 @@ def _gateway_loop_exception_handler(
     loop.default_exception_handler(context)
 
 
-def _redact_gateway_user_facing_secrets(text: str) -> str:
+def _redact_gateway_user_facing_secrets(text: str, *, redact_url_credentials: bool = False) -> str:
     """Secret redaction before text can leave the gateway for a chat platform: the shared egress scrub
-    (``force=True`` holds even when ``security.redact_secrets`` is off; fails closed). See #23810."""
+    (``force=True`` holds even when ``security.redact_secrets`` is off; fails closed). See #23810.
+
+    ``redact_url_credentials=True``: also mask credential-bearing URL query params / userinfo (no
+    vendor prefix, not a ``Bearer`` shape) that the default pass leaves alone for magic-link/OAuth-
+    callback URLs. Opt in only where the text is a raw provider/compression exception, never
+    legitimate URL content (R-COMPRESSION-SECRETS)."""
     from agent.redact import redact_for_egress
 
-    return redact_for_egress(text)
+    return redact_for_egress(text, redact_url_credentials=redact_url_credentials)
 
 
 def _redact_approval_command(cmd: "str | None") -> str:
@@ -736,7 +751,14 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
     if _gateway_surface_passes_raw_text(platform):
         return text
 
-    text = _redact_gateway_user_facing_secrets(text)
+    # The automatic-compression abort warning carries a raw provider/summariser exception —
+    # never legitimate URL content — so it gets the same strict URL-credential scrub the manual
+    # /compress and hygiene failure replies use (R-COMPRESSION-SECRETS R2), independent of the
+    # noise-filter regex below.
+    if _COMPRESSION_ABORT_STATUS_RE.search(text):
+        text = _redact_gateway_user_facing_secrets(text, redact_url_credentials=True)
+    else:
+        text = _redact_gateway_user_facing_secrets(text)
     # Opt-in `compression.progress_notices` lets ROUTINE (template-derived) progress through; other noise stays.
     if _TELEGRAM_NOISY_STATUS_RE.search(text) and not (
         _gateway_compression_progress_notices_enabled() and _COMPRESSION_PROGRESS_STATUS_RE.search(text)

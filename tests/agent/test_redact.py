@@ -765,6 +765,31 @@ class TestStrictUrlCredentialRedaction:
         text = "/metrics?token_count=17&session_id=public"
         assert redact_sensitive_text(text, redact_url_credentials=True) == text
 
+    @pytest.mark.parametrize("param_name", sorted(
+        __import__("agent.redact", fromlist=["_SENSITIVE_QUERY_PARAMS"])._SENSITIVE_QUERY_PARAMS
+    ))
+    def test_every_declared_sensitive_param_is_masked(self, param_name):
+        """R-COMPRESSION-SECRETS R1 regression: the strict matcher's canonicalization folds
+        hyphens to underscores (``_canonical_url_param_name``) before checking the sensitive-name
+        set. ``x-amz-signature`` is declared WITH a hyphen in ``_SENSITIVE_QUERY_PARAMS``, so the
+        pre-fix code canonicalized the candidate (``x_amz_signature``) but checked it against the
+        un-canonicalized set — a lookup that could never hit for any hyphenated name. Every
+        declared name must round-trip through the exact query-param spelling it is declared as."""
+        secret = "SIG_" + "a" * 60
+        text = f"https://x.test/cb?{param_name}={secret}&view=public"
+        result = redact_sensitive_text(text, redact_url_credentials=True)
+        assert secret not in result, f"{param_name!r} leaked verbatim: {result!r}"
+        assert "view=public" in result
+
+    def test_x_amz_signature_masked(self):
+        """Exact reviewer fixture: a pre-signed S3 URL signature must not survive strict
+        redaction — same bug class as the parametrized sweep above, pinned standalone."""
+        secret = "a" * 64
+        text = f"https://bucket.s3.amazonaws.com/key?X-Amz-Signature={secret}&X-Amz-Expires=3600"
+        result = redact_sensitive_text(text, redact_url_credentials=True)
+        assert secret not in result
+        assert "X-Amz-Expires=3600" in result
+
 
 class TestBareTokenUserinfoRedaction:
     """Regression tests for #6396 — a bare credential in URL userinfo

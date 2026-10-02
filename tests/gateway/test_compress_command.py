@@ -179,6 +179,15 @@ async def test_compress_command_aux_failure_reply_scrubs_credentials(tmp_path, m
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     secret = "sk-testFAKEKEY1234567890ABCDEFGHIJ"
     opaque = "opaqueFixtureToken1234567890ABCDE"
+    # R-COMPRESSION-SECRETS: a credential-bearing URL query param carries no vendor prefix and
+    # is not a "Bearer <token>" shape, so only strict URL-credential redaction catches it.
+    url_cred_token = "opaqueFixtureToken1234567890ABCDE"
+    url_cred = f"https://service.example/api?access_token={url_cred_token}"
+    # R1 witness: a pre-signed URL signature param, declared with a hyphen in
+    # _SENSITIVE_QUERY_PARAMS ("x-amz-signature") — the strict matcher's canonicalization bug
+    # let this survive verbatim even though access_token (above) was already masked correctly.
+    sig_token = "SIGFIXTURE" + "a" * 54
+    sig_url = f"https://bucket.s3.amazonaws.com/key?X-Amz-Signature={sig_token}"
     history = _make_history()
     compressed = [history[0], {"role": "assistant", "content": "summary via main model"}, history[-1]]
     runner = _make_runner(history)
@@ -193,7 +202,7 @@ async def test_compress_command_aux_failure_reply_scrubs_credentials(tmp_path, m
     agent_instance.context_compressor._last_aux_model_failure_model = "fixture-aux"
     agent_instance.context_compressor._last_aux_model_failure_error = (
         f"litellm.AuthenticationError: Incorrect API key provided: {secret}; "
-        f"upstream rejected Bearer {opaque}")
+        f"upstream rejected Bearer {opaque}; GET {url_cred} failed; GET {sig_url} failed")
     agent_instance.session_id = "sess-1"
     agent_instance._compress_context.return_value = (compressed, "")
     agent_instance._compression_skipped_due_to_lock = False
@@ -209,8 +218,57 @@ async def test_compress_command_aux_failure_reply_scrubs_credentials(tmp_path, m
 
     assert "Compressed:" in result
     assert "fixture-aux" in result  # the notice itself still reaches the user
-    for credential in (secret, opaque):
+    for credential in (secret, opaque, url_cred_token, sig_token):
         assert credential not in result, f"raw credential in the /compress reply: {result!r}"
+
+
+@pytest.mark.asyncio
+async def test_compress_command_aborted_reply_scrubs_url_credential_param(tmp_path, monkeypatch):
+    """R-COMPRESSION-SECRETS: the ABORTED branch of ``_manual_compression_reply_lines``
+    (``_last_compress_aborted`` -> ``gateway.compress.aborted``, gateway/slash_commands_session.py
+    ~82-86) must not echo a credential-bearing URL query param from the summariser's provider
+    exception. Sibling of the aux-failure branch covered just above; the reviewer's exact fixture:
+    ``https://service.example/api?access_token=opaqueFixtureToken1234567890ABCDE``."""
+    import gateway.run as gateway_run
+    (tmp_path / "config.yaml").write_text("display: {warning_notifications: true}")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    url_cred_token = "opaqueFixtureToken1234567890ABCDE"
+    url_cred = f"https://service.example/api?access_token={url_cred_token}"
+    # R1 witness: hyphenated sensitive param name — see the aux-failure sibling test above for
+    # why this is a distinct regression from the access_token case.
+    sig_token = "SIGFIXTURE" + "a" * 54
+    sig_url = f"https://bucket.s3.amazonaws.com/key?X-Amz-Signature={sig_token}"
+    history = _make_history()
+    # Aborted: no usable summary, messages unchanged (fallback marker), but compress_now still
+    # reports status "compressed" (see agent/conversation_compression_manual.py:138).
+    compressed = list(history)
+    runner = _make_runner(history)
+    agent_instance = MagicMock()
+    agent_instance._cached_system_prompt = ""
+    agent_instance.tools = None
+    agent_instance.context_compressor.has_content_to_compress.return_value = True
+    agent_instance.context_compressor._last_compress_aborted = True
+    agent_instance.context_compressor._last_summary_fallback_used = False
+    agent_instance.context_compressor._last_summary_dropped_count = 0
+    agent_instance.context_compressor._last_summary_error = (
+        f"litellm.APIError: upstream rejected GET {url_cred}; GET {sig_url} failed")
+    agent_instance.context_compressor._last_aux_model_failure_model = None
+    agent_instance.session_id = "sess-1"
+    agent_instance._compress_context.return_value = (compressed, "")
+    agent_instance._compression_skipped_due_to_lock = False
+
+    with (
+        patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "***"}),
+        patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+        patch("run_agent.AIAgent", return_value=agent_instance),
+        patch("agent.model_metadata.estimate_request_tokens_rough",
+              side_effect=lambda messages, **_kw: 100 if messages == history else 100),
+    ):
+        result = await runner._handle_compress_command(_make_event())
+
+    assert "Compression aborted" in result
+    for credential in (url_cred_token, sig_token):
+        assert credential not in result, f"raw URL credential in the /compress reply: {result!r}"
 
 
 @pytest.mark.asyncio
@@ -564,34 +622,56 @@ async def test_compress_command_cleanup_does_not_block_event_loop():
 @pytest.mark.asyncio
 async def test_compress_command_failure_reply_scrubs_credentials(monkeypatch):
     """ROUND1-ESCAPE-2: the ordinary /compress failure reply (``_handle_compress_command_inner``'s
-    except branch) must not echo a raw provider exception's credential straight into the chat."""
+    except branch) must not echo a raw provider exception's credential straight into the chat.
+
+    R-COMPRESSION-SECRETS: also covers the reviewer's exact credential-bearing URL query param,
+    which the ordinary egress scrub (no vendor prefix, not a ``Bearer`` shape) lets through."""
     from gateway.run import GatewayRunner
 
     runner = _make_runner(_make_history())
     secret = "sk-testFAKEKEY1234567890ABCDEFGHIJ"
+    url_cred_token = "opaqueFixtureToken1234567890ABCDE"
+    url_cred = f"https://service.example/api?access_token={url_cred_token}"
+    # R1 witness: hyphenated sensitive param name (see test_every_declared_sensitive_param_is_masked).
+    sig_token = "SIGFIXTURE" + "a" * 54
+    sig_url = f"https://bucket.s3.amazonaws.com/key?X-Amz-Signature={sig_token}"
 
     async def _boom(*args, **kwargs):
-        raise RuntimeError(f"litellm.AuthenticationError: Incorrect API key provided: {secret}")
+        raise RuntimeError(
+            f"litellm.AuthenticationError: Incorrect API key provided: {secret}; "
+            f"GET {url_cred} failed; GET {sig_url} failed")
 
     monkeypatch.setattr(GatewayRunner, "_run_manual_compression", _boom, raising=False)
     reply = await runner._handle_compress_command_inner(_make_event())
     assert secret not in reply
+    for credential in (url_cred_token, sig_token):
+        assert credential not in reply, f"raw URL credential in the /compress reply: {reply!r}"
 
 
 @pytest.mark.asyncio
 async def test_compress_command_codex_app_server_failure_reply_scrubs_credentials(monkeypatch):
     """ROUND1-ESCAPE-2, the Codex app-server variant's except branch (direct ``t(...)`` call with
-    the raw exception, no redaction)."""
+    the raw exception, no redaction).
+
+    R-COMPRESSION-SECRETS: also covers the reviewer's exact credential-bearing URL query param,
+    which the ordinary egress scrub (no vendor prefix, not a ``Bearer`` shape) lets through."""
     from gateway.run import GatewayRunner
 
     runner = _make_runner(_make_history())
     secret = "sk-testFAKEKEY1234567890ABCDEFGHIJ"
+    url_cred_token = "opaqueFixtureToken1234567890ABCDE"
+    url_cred = f"https://service.example/api?access_token={url_cred_token}"
+    # R1 witness: hyphenated sensitive param name (see test_every_declared_sensitive_param_is_masked).
+    sig_token = "SIGFIXTURE" + "a" * 54
+    sig_url = f"https://bucket.s3.amazonaws.com/key?X-Amz-Signature={sig_token}"
     agent = MagicMock()
     agent._codex_session = object()
     agent.context_compressor.compression_count = 0
 
     def _compress(*args, **kwargs):
-        raise RuntimeError(f"litellm.AuthenticationError: Incorrect API key provided: {secret}")
+        raise RuntimeError(
+            f"litellm.AuthenticationError: Incorrect API key provided: {secret}; "
+            f"GET {url_cred} failed; GET {sig_url} failed")
 
     agent._compress_context = _compress
     monkeypatch.setattr(GatewayRunner, "_cached_agent_for", lambda self, *a, **kw: agent, raising=False)
@@ -602,3 +682,5 @@ async def test_compress_command_codex_app_server_failure_reply_scrubs_credential
     monkeypatch.setattr(GatewayRunner, "_run_in_executor_with_context", lambda self, fn: _run_sync(fn), raising=False)
     reply = await runner._compress_codex_app_server_session(session_key="k1", session_id="sess-1")
     assert secret not in reply
+    for credential in (url_cred_token, sig_token):
+        assert credential not in reply, f"raw URL credential in the /compress reply: {reply!r}"

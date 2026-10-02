@@ -733,7 +733,8 @@ def _redact_query_string(query: str) -> str:
 
 
 def _canonical_url_param_name(name: str) -> str:
-    """Decode a URL parameter name (up to 3 unquote rounds) for case-insensitive matching."""
+    """Decode a URL parameter name (up to 3 unquote rounds) for case-insensitive, hyphen/underscore-
+    insensitive matching (``client-secret`` and ``client_secret`` are the same param to a server)."""
     decoded = name
     for _ in range(3):
         next_value = unquote_plus(decoded)
@@ -743,12 +744,20 @@ def _canonical_url_param_name(name: str) -> str:
     return decoded.casefold().replace("-", "_")
 
 
+# _canonical_url_param_name() also folds "-" to "_", so a set entry spelled with a hyphen
+# (``x-amz-signature``) must be folded the SAME way or it never matches its own canonicalized
+# candidate (#R-COMPRESSION-SECRETS R1: X-Amz-Signature leaked verbatim through the strict matcher).
+_SENSITIVE_QUERY_PARAMS_CANONICAL = frozenset(
+    _canonical_url_param_name(_name) for _name in _SENSITIVE_QUERY_PARAMS
+)
+
+
 def _redact_strict_url_credentials(text: str) -> str:
     """Strict egress-boundary redaction of URL credentials (absolute, relative and
     network references); preserves keys, separators, public params, hosts, paths."""
     text = _STRICT_URL_PARAM_RE.sub(
         lambda m: f"{m.group(1)}{m.group(2)}=***"
-        if _canonical_url_param_name(m.group(2)) in _SENSITIVE_QUERY_PARAMS else m.group(0), text)
+        if _canonical_url_param_name(m.group(2)) in _SENSITIVE_QUERY_PARAMS_CANONICAL else m.group(0), text)
     return _STRICT_URL_USERINFO_RE.sub(
         lambda m: f"{m.group(1)}{m.group(2).partition(':')[0]}:***@" if ":" in m.group(2) else f"{m.group(1)}***@",
         text)
@@ -1139,14 +1148,20 @@ REDACTION_UNAVAILABLE = "[redaction-unavailable]"
 _BEARER_RESIDUE_RE = re.compile(r"\bBearer\s+(?:\[[^\]]+\]|[A-Za-z0-9._~+/-]{20,}=*)", re.IGNORECASE)
 
 
-def redact_for_egress(text: str) -> str:
+def redact_for_egress(text: str, *, redact_url_credentials: bool = False) -> str:
     """The one scrub for text leaving the process for a remote reader (chat platforms, A2A peers,
     telemetry). ``redact_sensitive_text(force=True)`` — the only secret-pattern list — plus a bearer
     sweep, because a ``Bearer <opaque>`` value with no vendor prefix carries no shape the prefix
-    matcher can key on. Fails CLOSED: if the redactor raises, the raw text is never returned."""
+    matcher can key on. Fails CLOSED: if the redactor raises, the raw text is never returned.
+
+    ``redact_url_credentials=True`` (default False, same opt-in as ``redact_sensitive_text``):
+    also mask credential-bearing URL query params / userinfo. Off by default because ordinary
+    egress (a final assistant reply, a status line) may legitimately carry a magic-link / OAuth-
+    callback URL the default scrub must leave alone; callers whose text is a raw provider/
+    compression exception — never legitimate URL content — opt in (R-COMPRESSION-SECRETS)."""
     text = str(text or "")
     try:
-        text = redact_sensitive_text(text, force=True)
+        text = redact_sensitive_text(text, force=True, redact_url_credentials=redact_url_credentials)
     except Exception:
         return REDACTION_UNAVAILABLE
     if "earer" in text:

@@ -66,9 +66,11 @@ def _sattr(obj, name: str) -> str:
 def _manual_compression_reply_lines(summary: dict, compressor, focus_topic) -> list[str]:
     """Manual /compress confirmation lines, surfacing summariser/aux-model failures.
     ``_last_compress_aborted`` = no usable summary, messages unchanged.  The reply goes out through
-    the adapter's inline path with no final-response sanitization, so every line gets the gateway
-    egress scrub (forced, opaque Bearer tokens included); an aux model recovered via main is an
-    info note so the user can fix their config."""
+    the adapter's inline path with no final-response sanitization, so every line gets the STRICT
+    egress scrub (forced, opaque Bearer tokens AND credential-bearing URL query params included —
+    R-COMPRESSION-SECRETS: a raw provider/summariser exception is never legitimate URL content, so
+    the magic-link/OAuth-callback passthrough the default scrub keeps for ordinary replies does not
+    apply here); an aux model recovered via main is an info note so the user can fix their config."""
     from gateway.run import _redact_gateway_user_facing_secrets
     lines = [f"🗜️ {summary['headline']}"]
     if focus_topic:
@@ -83,7 +85,7 @@ def _manual_compression_reply_lines(summary: dict, compressor, focus_topic) -> l
     elif aux_fail_model:
         aux_err = getattr(compressor, "_last_aux_model_failure_error", None) or "unknown error"
         lines.append(t("gateway.compress.aux_failed", model=aux_fail_model, error=aux_err))
-    return [_redact_gateway_user_facing_secrets(line) for line in lines]
+    return [_redact_gateway_user_facing_secrets(line, redact_url_credentials=True) for line in lines]
 
 
 def _compress_preview_reply(history, partial: bool, keep_last, focus_topic, agg_note: str) -> str:
@@ -533,8 +535,12 @@ class GatewaySessionCommandsMixin:
             await self._run_in_executor_with_context(
                 lambda: agent._compress_context([], "", force=True, task_id=session_id or "default"))
         except Exception as exc:
+            # Strict egress scrub (R-COMPRESSION-SECRETS): a raw provider exception is never
+            # legitimate URL content, so also mask credential-bearing query params the ordinary
+            # scrub leaves alone for magic-link/OAuth-callback URLs.
             from gateway.run import _redact_gateway_user_facing_secrets
-            return t("gateway.compress.failed", error=_redact_gateway_user_facing_secrets(str(exc)))
+            return t("gateway.compress.failed",
+                     error=_redact_gateway_user_facing_secrets(str(exc), redact_url_credentials=True))
         if getattr(compressor, "compression_count", 0) > count_before:
             return (
                 "🗜️ Codex app-server thread compacted (thread/compact). The transcript mirror is "
@@ -566,8 +572,12 @@ class GatewaySessionCommandsMixin:
             return await self._run_manual_compression(source, session_entry, history, request)
         except Exception as e:
             logger.warning("Manual compress failed: %s", e)
+            # Strict egress scrub (R-COMPRESSION-SECRETS): a raw provider exception is never
+            # legitimate URL content, so also mask credential-bearing query params the ordinary
+            # scrub leaves alone for magic-link/OAuth-callback URLs.
             from gateway.run import _redact_gateway_user_facing_secrets
-            return t("gateway.compress.failed", error=_redact_gateway_user_facing_secrets(str(e)))
+            return t("gateway.compress.failed",
+                     error=_redact_gateway_user_facing_secrets(str(e), redact_url_credentials=True))
 
     async def _run_manual_compression(self, source, session_entry, history: list, request) -> str:
         """Build a temporary agent, run the shared compress core, persist, and describe the outcome."""
