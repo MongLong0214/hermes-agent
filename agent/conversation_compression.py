@@ -2622,7 +2622,8 @@ class _CompactionLifecycle:
 class _CompressionLease:
     """The per-attempt durable compression lock plus its lifecycle plumbing.
     ``holder`` is None when no durable lock is owned (legacy DB, no session db); ``watermark`` is MAX(id) of
-    active rows at lease start (None = archive everything, no concurrent-tail preservation this cycle)."""
+    active rows at lease start (None only without a durable lock = archive everything, no concurrent-tail
+    preservation; a held lock whose watermark cannot be read sits out instead)."""
 
     def __init__(
         self, agent: Any, *, db: Any, sid: str, ttl: float, refresh_interval: Any,
@@ -2637,6 +2638,8 @@ class _CompressionLease:
         self._lifecycle = lifecycle
         self.holder: Optional[str] = None
         self.watermark: Optional[int] = None
+        # The lock was won but its start watermark could not be read: this attempt sat out (fail closed).
+        self.watermark_unreadable = False
         self._refresher: Optional[_CompressionLockLeaseRefresher] = None
         self._released = False
         self._release_guard = threading.Lock()
@@ -2671,13 +2674,13 @@ class _CompressionLease:
             if not self._released:
                 self._refresher = candidate.start()
 
-    def release_holder_only(self) -> None:
-        """Stop this holder's refresher and release only its durable lock.
+    def release_holder_only(self) -> bool:
+        """Stop this holder's refresher and release only its durable lock; False when the DELETE kept failing.
         Holder-qualified and idempotent: safe for the host after a timeout because a newer holder's lease can
         never be deleted by this stale release."""
         with self._release_guard:
             if self._released:
-                return
+                return True
             self._released = True
             if getattr(self._agent, "_active_compression_lock_holder", None) == self.holder:
                 self._agent._active_compression_lock_holder = None
@@ -2685,8 +2688,8 @@ class _CompressionLease:
                 with _swallow('compression lock refresher stop failed: %s'):
                     self._refresher.stop()
             if self.db is not None and self.sid and self.holder:
-                with _swallow('compression lock release failed: %s'):
-                    self.db.release_compression_lock(self.sid, self.holder)
+                return _release_lock_row(self.db, self.sid, self.holder)
+            return True
 
     def release(self) -> None:
         """Finish lifecycle cleanup and release the OLD session lock once."""
@@ -2701,6 +2704,29 @@ class _CompressionLease:
                         self._commit_fence.clear_cancelled_lock_release(self.release_holder_only)
                 finally:
                     self.finish_lock_setup()
+
+
+_LOCK_RELEASE_ATTEMPTS = 3
+_LOCK_RELEASE_RETRY_DELAY_S = 0.25
+
+
+def _release_lock_row(db: Any, sid: str, holder: str) -> bool:
+    """Holder-qualified DELETE of the durable lock, retried: nobody refreshes or deletes a released holder's row,
+    so one transient failure would leave every later attempt sitting out until the TTL. ``None`` (a DB or double
+    without a release result) counts as released."""
+    for attempt in range(1, _LOCK_RELEASE_ATTEMPTS + 1):
+        try:
+            if db.release_compression_lock(sid, holder) is not False:
+                return True
+        except Exception as exc:
+            logger.debug("compression lock release attempt %d failed: %s", attempt, exc)
+        if attempt < _LOCK_RELEASE_ATTEMPTS:
+            time.sleep(_LOCK_RELEASE_RETRY_DELAY_S * attempt)
+    logger.warning(
+        "compression lock release failed %d times for session=%s holder=%s — the lease stays until its TTL expires",
+        _LOCK_RELEASE_ATTEMPTS, sid, holder,
+    )
+    return False
 
 
 def _resolve_lock_api(lock_db: Any) -> Tuple[Any, Optional[Exception]]:
@@ -2735,29 +2761,32 @@ def _abort_lease(
 def _try_acquire_durable_lock(lease: _CompressionLease, try_acquire: Any, commit_fence: Any) -> bool:
     """Acquire the durable lock for ``lease.holder`` and capture the start watermark.
     Watermark = MAX(id) of active rows at START: appends aren't blocked during summary; later rows are
-    concurrent tail that archive_and_compact re-sequences. Capture is safety-additive (fallback archives
-    everything), so its failure never aborts. An acquire that raises is not version skew: fail closed and
-    release holder-qualified best-effort (safe if never acquired)."""
+    concurrent tail that archive_and_compact re-sequences. A failed capture fails closed (``None`` would
+    archive those rows unsummarized): release the lock and set ``lease.watermark_unreadable``. An acquire
+    that raises is not version skew: fail closed and release holder-qualified best-effort (safe if never
+    acquired)."""
     try:
         acquired = try_acquire(lease.sid, lease.holder, ttl_seconds=lease.ttl)
         if acquired:
             try:
                 lease.watermark = lease.db.get_active_message_watermark(lease.sid)
-                # A captured watermark makes the commit safe against later rows on BOTH commit
-                # paths; tell the fence so a host may keep this attempt's admission.
-                if commit_fence is not None:
-                    with contextlib.suppress(AttributeError):  # test doubles without the method
-                        commit_fence.mark_commit_watermark_fenced()
             except Exception as _wm_err:
                 logger.warning(
-                    "compression watermark capture failed for session=%s (%s) — concurrent appends this cycle "
-                    "will be archived with the snapshot", lease.sid, _wm_err,
+                    "compression watermark capture failed for session=%s (%s) — skipping compression this cycle "
+                    "so rows appended during the summary are not archived with the snapshot", lease.sid, _wm_err,
                 )
-                lease.watermark = None
+                lease.watermark_unreadable = True
+                _release_lock_row(lease.db, lease.sid, lease.holder)
+                lease.holder = None
+                return False
+            # A captured watermark makes the commit safe against later rows on BOTH commit
+            # paths; tell the fence so a host may keep this attempt's admission.
+            if commit_fence is not None:
+                with contextlib.suppress(AttributeError):  # test doubles without the method
+                    commit_fence.mark_commit_watermark_fenced()
         return acquired
     except Exception as _lock_err:
-        with _swallow('compression lock cleanup after failed acquire failed: %s'):
-            lease.db.release_compression_lock(lease.sid, lease.holder)
+        _release_lock_row(lease.db, lease.sid, lease.holder)
         lease.holder = None
         logger.warning(
             "compression lock acquisition raised unexpectedly for session=%s (%s: %s) — skipping compression this cycle",
@@ -2853,6 +2882,9 @@ def _acquire_compression_lease(
             _lock_acquired = _try_acquire_durable_lock(lease, _try_acquire_lock, commit_fence)
         if not _lock_acquired:
             lease.finish_lock_setup()
+            if lease.watermark_unreadable:
+                agent._last_compaction_in_place = False
+                return _abort_lease(agent, lifecycle, system_message, attempt_started_at, "watermark_unreadable")
             return _sit_out_lock_contention(
                 agent, lease, lifecycle, system_message, approx_tokens, attempt_started_at
             )
@@ -3331,10 +3363,12 @@ def _publish_rotated_compaction(
         raise RuntimeError(f"Compression parent already ended: {old_session_id}")
     # Foreign-tail ceiling: the flush below writes OUR rows (already in handoff);
     # rows above the start watermark up to this MAX(id) are foreign appends.
-    # No trustworthy ceiling means the clone could duplicate the handoff: skip tail preservation this rotation.
-    _foreign_tail_ceiling = None
-    with contextlib.suppress(Exception):
+    # A failed read must abort, not publish without tail preservation: the child would then lack every row
+    # appended since the snapshot, which the summary never saw. Raised before the flush; the caller rolls back.
+    try:
         _foreign_tail_ceiling = agent._session_db.get_active_message_watermark(agent.session_id)
+    except Exception as exc:
+        raise RuntimeError(f"Compression foreign-tail ceiling read failed for {old_session_id}: {exc}") from exc
     with contextlib.suppress(Exception):  # best-effort — don't block compression on a flush error
         agent._flush_messages_to_session_db(messages, conversation_history=persisted_history)
     # Publish closure + child + handoff in one transaction so no reader sees an

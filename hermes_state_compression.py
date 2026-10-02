@@ -479,14 +479,18 @@ class SessionCompressionMixin:
             logger.warning("try_acquire_compression_lock(%s) failed: %s", session_id, exc)
             return False
 
-    def release_compression_lock(self, session_id: str, holder: str) -> None:
-        """Release the compression lock iff we own it; idempotent when gone/reclaimed."""
+    def release_compression_lock(self, session_id: str, holder: str) -> bool:
+        """Release the compression lock iff we own it; idempotent when gone/reclaimed. True once the DELETE
+        committed; False (logged) when it failed, so the caller can retry instead of leaving a live lease."""
         if not session_id:
-            return
-        self._write_sql_logged(
-            "release_compression_lock", session_id,
-            "DELETE FROM compression_locks WHERE session_id = ? AND holder = ?",
-            (session_id, holder))
+            return True
+        try:
+            self._write_sql(
+                "DELETE FROM compression_locks WHERE session_id = ? AND holder = ?", (session_id, holder))
+        except sqlite3.Error as exc:
+            logger.warning("release_compression_lock(%s) failed: %s", session_id, exc)
+            return False
+        return True
 
     def _session_turn_lease_key_on_conn(self, conn, session_id: str) -> str:
         """Walk compression parents on ``conn`` to the conversation lease key. Must share
