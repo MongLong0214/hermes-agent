@@ -264,9 +264,13 @@ def claim_next() -> Optional[dict]:
 
 def _finish(
     execution_id: str, *, error: Optional[str], suppressed: bool = False, accepted: bool = False,
-    parked: Optional[list] = None,
+    parked: Optional[list] = None, uncertain: bool = False,
 ) -> bool:
-    status = "failed" if error else "suppressed" if suppressed else "delivered"
+    # ``uncertain``: a send began and never confirmed; it was not resent, so it is neither
+    # delivered nor failed — the same ``unknown`` a gateway that died mid-send leaves behind.
+    status = "failed" if error else "unknown" if uncertain else "suppressed" if suppressed else "delivered"
+    if status == "unknown":
+        error = "send began but was not confirmed; outcome is unknown and was not retried"
     safe_error = (
         redact_sensitive_text(str(error), force=True, redact_url_credentials=True)
         if error
@@ -350,7 +354,8 @@ def drain(
             _finish(row["execution_id"], error=error,
                     suppressed=bool(row["job"].get("_notification_all_targets_suppressed")),
                     accepted=bool(row["job"].get("_delivery_accepted")),
-                    parked=row["job"].get("_delivery_parked"))
+                    parked=row["job"].get("_delivery_parked"),
+                    uncertain=bool(row["job"].get("_delivery_uncertain")))
         finally:
             with _lock:
                 _ACTIVE_DELIVERIES.discard(row["execution_id"])

@@ -9,7 +9,7 @@ from concurrent.futures import Future
 from unittest.mock import patch
 
 
-from agent.async_utils import safe_schedule_threadsafe, safe_schedule_threadsafe_with_dispatch_signal
+from agent.async_utils import safe_schedule_threadsafe, safe_schedule_threadsafe_gated
 
 
 # ---------------------------------------------------------------------------
@@ -97,12 +97,12 @@ class TestSafeScheduleThreadsafe:
             loop.close()
 
 
-class TestSafeScheduleThreadsafeWithDispatchSignal:
-    """Regression for sol-audit L6-2 (duplicate live cron sends, cron/scheduler_delivery.py)."""
+class TestSafeScheduleThreadsafeGated:
+    """Regression for sol-audit L6-2 / R68-1 (duplicate live cron sends, cron/scheduler_delivery.py)."""
 
-    def test_dispatch_began_is_set_once_the_coroutine_runs(self):
-        """The event is the coroutine's own first action — set once it actually runs,
-        independent of whether the caller later sees a result or a timeout."""
+    def test_a_coroutine_that_ran_wins_the_gate(self):
+        """The coroutine claims the gate as its first action, so once it ran, a caller that
+        stops waiting can no longer abandon it."""
         import threading
 
         loop = asyncio.new_event_loop()
@@ -126,10 +126,10 @@ class TestSafeScheduleThreadsafeWithDispatchSignal:
             async def _sample():
                 return 42
 
-            fut, dispatch_began = safe_schedule_threadsafe_with_dispatch_signal(_sample(), loop)
+            fut, gate = safe_schedule_threadsafe_gated(_sample(), loop)
             assert isinstance(fut, Future)
             assert fut.result(timeout=2) == 42
-            assert dispatch_began.is_set()
+            assert gate.abandon() is False
         finally:
             stop.set()
             t.join(timeout=2)
@@ -152,12 +152,36 @@ class TestSafeScheduleThreadsafeWithDispatchSignal:
                     "agent.async_utils.asyncio.run_coroutine_threadsafe",
                     side_effect=RuntimeError("scheduler down"),
                 ):
-                    result, dispatch_began = safe_schedule_threadsafe_with_dispatch_signal(coro, loop)
+                    result, gate = safe_schedule_threadsafe_gated(coro, loop)
                 del coro
                 gc.collect()
 
             assert result is None
-            assert not dispatch_began.is_set()
+            assert gate.abandon() is True
+            assert _no_unawaited_warnings(caught)
+        finally:
+            loop.close()
+
+    def test_abandoned_before_its_first_step_the_body_never_runs(self):
+        """The caller abandons while the Task is still queued (loop not pumped yet); when the
+        loop then runs, the coroutine is refused: its body never executes, the future ends
+        cancelled, and nothing is left unawaited."""
+        loop = asyncio.new_event_loop()
+        ran = []
+        try:
+            async def _sample():
+                ran.append(True)
+                return "sent"
+
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                fut, gate = safe_schedule_threadsafe_gated(_sample(), loop)
+                assert gate.abandon() is True
+                loop.run_until_complete(asyncio.sleep(0.01))
+                gc.collect()
+
+            assert ran == []
+            assert fut.cancelled()
             assert _no_unawaited_warnings(caught)
         finally:
             loop.close()

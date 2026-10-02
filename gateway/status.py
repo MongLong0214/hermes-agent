@@ -44,6 +44,10 @@ _gateway_lock_guard = threading.RLock()
 # the JSON payload so status/PID readers can read while another process holds it.
 _WINDOWS_LOCK_OFFSET = 1024 * 1024
 _GATEWAY_RUNNING_PID_CACHE_TTL_SECONDS = 1.0
+# A gateway stamps a fresh token here when it claims its home (published as the PID record's
+# ``lineage``); every child it spawns inherits it, so a takeover can still find them once they are
+# reparented. Restart-safe workers are spawned without it. See gateway_lineage_survivors().
+GATEWAY_LINEAGE_ENV = "_HERMES_GATEWAY_LINEAGE"
 _gateway_running_pid_cache_lock = threading.Lock()
 # key: (pid_path, cleanup_stale, include_runtime_status) -> (cached_at, file signature, pid)
 _gateway_running_pid_cache: dict[tuple[str, bool, bool], tuple[float, tuple, Optional[int]]] = {}
@@ -1030,12 +1034,14 @@ def _is_gateway_runtime_lock_active_strict(lock_path: Path) -> bool:
         raise RuntimeError(f"gateway runtime lock probe failed: {exc}") from exc
 
 
-def write_pid_file() -> None:
+def write_pid_file(*, stop_leash_s: Optional[float] = None, lineage: Optional[str] = None) -> None:
     """Write this process's PID record via O_CREAT|O_EXCL; a racing gateway's FileExistsError
-    propagates for the caller to decide."""
+    propagates for the caller to decide. ``stop_leash_s``/``lineage`` are published for a later
+    takeover (takeover_exit_wait_s, gateway_lineage_survivors)."""
     path = _get_pid_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    _write_json_excl(path, _build_pid_record())
+    published = {"stop_leash_s": stop_leash_s, "lineage": lineage}
+    _write_json_excl(path, {**_build_pid_record(), **{k: v for k, v in published.items() if v is not None}})
     _clear_running_pid_cache()
 
 
@@ -1826,8 +1832,51 @@ def reap_gateway_children(children: list, *, parent_pid: int, timeout: float = 5
     return reaped
 
 
+def takeover_exit_wait_s(pid_record: Optional[dict[str, Any]]) -> float:
+    """Seconds a takeover (``--replace``, a credential-lock handoff) gives a SIGTERMed gateway
+    before SIGKILL: that gateway's own shutdown-watchdog leash — it drains chat and cron work and
+    cleans up inside it, then hard-exits — plus the watchdog's dump margin. The leash it started
+    with is published in its PID record (``stop_leash_s``): this process's config may differ (edited
+    since, another profile). A record from an older build falls back to this process's config."""
+    from gateway.restart import DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT, LAUNCHD_WATCHDOG_DUMP_MARGIN_S
+    from gateway.shutdown_watchdog import resolve_shutdown_watchdog_delay
+    leash = (pid_record or {}).get("stop_leash_s")
+    if isinstance(leash, bool) or not isinstance(leash, (int, float)) or not 0 < leash < math.inf:
+        try:
+            from gateway.run_config_loaders import GatewayConfigLoadersMixin
+            leash = resolve_shutdown_watchdog_delay(GatewayConfigLoadersMixin._load_restart_drain_timeout())
+        except Exception:
+            leash = resolve_shutdown_watchdog_delay(DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT)
+    return float(leash) + LAUNCHD_WATCHDOG_DUMP_MARGIN_S
+
+
+def gateway_lineage_survivors(pid_record: Optional[dict[str, Any]], known: list) -> list:
+    """``known`` (a pre-signal snapshot) plus every other live process stamped with the dead
+    gateway's ``lineage`` (GATEWAY_LINEAGE_ENV): unlike the snapshot this still finds children it
+    created after SIGTERM, once reparented. Call only after the gateway exited. This process, its
+    ancestors and descendants are spared. POSIX only (``known`` unchanged elsewhere); never raises."""
+    lineage = (pid_record or {}).get("lineage")
+    if _IS_WINDOWS or not isinstance(lineage, str) or not lineage:
+        return list(known)
+    found = list(known)
+    try:
+        import psutil  # type: ignore
+        me = psutil.Process()
+        spared = {me.pid, *(p.pid for p in me.parents()), *(p.pid for p in me.children(recursive=True)),
+                  *(getattr(p, "pid", None) for p in known)}
+        for proc in psutil.process_iter():
+            try:
+                if proc.pid not in spared and proc.environ().get(GATEWAY_LINEAGE_ENV) == lineage:
+                    found.append(proc)
+            except (psutil.Error, OSError):
+                continue
+    except Exception:
+        logger.debug("Lineage scan for a replaced gateway failed", exc_info=True)
+    return found
+
+
 def take_over_scoped_lock_holder(
-    record: dict[str, Any], *, graceful_attempts: int = 20, force_attempts: int = 20
+    record: dict[str, Any], *, graceful_attempts: Optional[int] = None, force_attempts: int = 20
 ) -> Optional[int]:
     """Terminate one verified scoped-lock holder for explicit ``--replace``. Returns the owner PID
     only after that exact PID/start-time identity exited; validation or marker-write failure returns
@@ -1837,6 +1886,10 @@ def take_over_scoped_lock_holder(
     if owner is None:
         return None
     owner_pid, owner_start_time, target_home = owner
+    # Validated above: the target home's PID record is this owner's; it publishes its stop leash.
+    owner_record = _read_json_file(target_home / "gateway.pid")
+    if graceful_attempts is None:
+        graceful_attempts = max(1, math.ceil(takeover_exit_wait_s(owner_record) / 0.5))
     # Snapshot while the owner is alive; afterwards children are reparented.
     owner_children = _snapshot_gateway_children(owner_pid)
     if not write_takeover_marker(
@@ -1852,7 +1905,7 @@ def take_over_scoped_lock_holder(
         # The target normally consumes the marker; clean up any remainder.
         clear_takeover_marker(target_home)
     if replaced is not None:
-        reap_gateway_children(owner_children, parent_pid=owner_pid)
+        reap_gateway_children(gateway_lineage_survivors(owner_record, owner_children), parent_pid=owner_pid)
     return replaced
 
 

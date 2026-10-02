@@ -41,41 +41,67 @@ def safe_schedule_threadsafe(
         return None
 
 
-def safe_schedule_threadsafe_with_dispatch_signal(
+class DispatchGate:
+    """One-shot handoff between a scheduled coroutine and a caller that may give up on it.
+
+    ``future.cancel()`` on a ``run_coroutine_threadsafe`` future proves nothing about whether the
+    coroutine ran or will run: the wrapper ``concurrent.futures.Future`` stays PENDING (so
+    ``cancel()`` returns True) while the Task is genuinely in flight, and a cancel issued before
+    the loop has even created the Task arrives AFTER that Task's first step was queued, so a
+    blocked loop that resumes still runs the body once. The gate replaces both guesses with a
+    single locked transition out of ``pending``: the coroutine's first action claims
+    ``dispatched``; a caller that stops waiting claims ``abandoned``. Exactly one side wins, and a
+    coroutine that loses never runs its body.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._state = "pending"
+
+    def _claim(self, state: str) -> bool:
+        with self._lock:
+            if self._state == "pending":
+                self._state = state
+            return self._state == state
+
+    def claim_dispatch(self) -> bool:
+        """Coroutine side: True = proceed; False = the caller already abandoned it."""
+        return self._claim("dispatched")
+
+    def abandon(self) -> bool:
+        """Caller side: True = the coroutine's body has not run and now never will; False = it
+        already began (its outcome is the coroutine's, not the caller's to replace)."""
+        return self._claim("abandoned")
+
+
+def safe_schedule_threadsafe_gated(
     coro: Coroutine[Any, Any, Any], loop: Optional[asyncio.AbstractEventLoop], *,
     logger: Optional[logging.Logger] = None,
     log_message: str = "Failed to schedule coroutine on loop", log_level: int = logging.DEBUG,
-) -> Tuple[Optional[Future], threading.Event]:
-    """Like :func:`safe_schedule_threadsafe`, plus a ``threading.Event`` the coroutine sets as its
-    very first action, before any real work.
+) -> Tuple[Optional[Future], DispatchGate]:
+    """Like :func:`safe_schedule_threadsafe`, but ``coro`` runs only if it claims the returned
+    :class:`DispatchGate` before the caller abandons it (see that class). A refused coroutine is
+    closed unstarted and its Task ends cancelled."""
+    gate = DispatchGate()
 
-    ``future.cancel()`` on a ``run_coroutine_threadsafe`` future does NOT prove ``coro`` never
-    started: the wrapper ``concurrent.futures.Future`` stays in the PENDING state (and therefore
-    cancellable, with ``cancel()`` returning True) for as long as the underlying Task has not
-    finished — including while it is genuinely in flight (``asyncio.futures._chain_future`` never
-    calls ``set_running_or_notify_cancel`` on it). The returned event is the only trustworthy
-    "did this ever run" signal: a Task cancelled before its first step throws ``CancelledError``
-    into the coroutine without executing any of its body, so the event stays unset forever; once
-    set it stays set, cancellation or not.
-    """
-    dispatch_began = threading.Event()
-
-    async def _signal_then_run() -> Any:
-        dispatch_began.set()
+    async def _gated() -> Any:
+        if not gate.claim_dispatch():
+            coro.close()
+            raise asyncio.CancelledError("abandoned before dispatch")
         return await coro
 
-    tracked = _signal_then_run()
+    gated = _gated()
     log = logger if logger is not None else _DEFAULT_LOGGER
     try:
         if loop is None:
             raise RuntimeError("loop is None")
-        future = asyncio.run_coroutine_threadsafe(tracked, loop)
+        future = asyncio.run_coroutine_threadsafe(gated, loop)
     except Exception as exc:
-        tracked.close()
+        gated.close()
         coro.close()
         log.log(log_level, "%s: %s", log_message, exc)
-        return None, dispatch_began
-    return future, dispatch_began
+        return None, gate
+    return future, gate
 
 
 def consume_detached_task_result(task: "asyncio.Future[Any]") -> None:

@@ -79,10 +79,9 @@ class TestLiveAdapterCancelDoesNotProveNeverDispatched:
         duplicate an accepted-but-slow Telegram send."""
         from cron import scheduler_delivery
 
-        # Shrink both budgets so the test completes in well under a second regardless of
-        # outcome; a shortened confirmation timeout is exactly what the finding calls for.
+        # Shrink the budget so the test completes in well under a second regardless of outcome;
+        # a shortened confirmation timeout is exactly what the finding calls for.
         monkeypatch.setattr(scheduler_delivery, "_LIVE_SEND_CONFIRM_TIMEOUT_S", 0.2)
-        monkeypatch.setattr(scheduler_delivery, "_DISPATCH_SIGNAL_GRACE_S", 0.3)
 
         dispatch_started = threading.Event()
 
@@ -119,49 +118,70 @@ class TestLiveAdapterCancelDoesNotProveNeverDispatched:
         standalone_send.assert_not_awaited()
         assert result is None, f"expected the in-flight send to count as handled, got: {result!r}"
 
-    def test_truly_wedged_dispatch_still_falls_back_to_standalone(self, monkeypatch):
-        """Preserve the other half of the original fix: a coroutine that never gets a chance
-        to run at all (loop wedged) must still fall through to standalone, or the cron
-        message is silently dropped."""
+    def test_fallback_after_timeout_excludes_a_late_live_dispatch(self, monkeypatch, loop_thread):
+        """sol-audit R68-1: a RUNNING gateway loop that is blocked past the confirmation timeout
+        still has the send queued. Once the scheduler falls back to standalone, releasing the loop
+        must not let that queued coroutine reach the live adapter as well — exactly one of the two
+        sends may happen. (An unpumped loop cannot witness this: ``live_adapter_ready`` requires a
+        running loop, so the live path, and the race, would be skipped entirely.)"""
         from cron import scheduler_delivery
 
         monkeypatch.setattr(scheduler_delivery, "_LIVE_SEND_CONFIRM_TIMEOUT_S", 0.2)
-        monkeypatch.setattr(scheduler_delivery, "_DISPATCH_SIGNAL_GRACE_S", 0.2)
 
-        # A loop that is created but never pumped: run_coroutine_threadsafe queues the
-        # scheduling callback, but nothing ever executes it, so the coroutine's first line
-        # (dispatch_began.set()) can never run — genuinely "never started".
-        wedged_loop = asyncio.new_event_loop()
+        sends = []
+        loop_blocked, release_loop = threading.Event(), threading.Event()
 
-        async def never_runs(chat_id, content, metadata=None):
-            raise AssertionError("must not run on a wedged loop")
+        def block_loop():
+            loop_blocked.set()
+            release_loop.wait(10)
 
-        adapter = SimpleNamespace(send=never_runs)
+        loop_thread.call_soon_threadsafe(block_loop)
+        assert loop_blocked.wait(5), "the gateway loop never reached the blocking callback"
+
+        async def live_send(chat_id, content, metadata=None):
+            sends.append("live accepted")
+            return SimpleNamespace(success=True, message_id="m-live", raw_response={})
+
+        async def standalone_send(*args, **kwargs):
+            sends.append("standalone accepted")
+            return {"success": True, "message_id": "m-standalone"}
+
+        scheduled = []
+        real_run_coroutine_threadsafe = asyncio.run_coroutine_threadsafe
+
+        def counting_run_coroutine_threadsafe(coro, loop):
+            scheduled.append(loop)
+            return real_run_coroutine_threadsafe(coro, loop)
 
         pconfig = MagicMock()
         pconfig.enabled = True
         mock_cfg = MagicMock()
         mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
-
         job = {
-            "id": "wedged-job",
+            "id": "blocked-loop-job",
             "deliver": "origin",
             "origin": {"platform": "telegram", "chat_id": "123"},
         }
 
-        standalone_send = AsyncMock(return_value={"success": True})
-
         try:
             with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
                  patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+                 patch("asyncio.run_coroutine_threadsafe", new=counting_run_coroutine_threadsafe), \
                  patch("tools.send_message_tool._send_to_platform", new=standalone_send):
                 result = _deliver_result(
                     job, "Hello world",
-                    adapters={Platform.TELEGRAM: adapter},
-                    loop=wedged_loop,
+                    adapters={Platform.TELEGRAM: SimpleNamespace(send=live_send)},
+                    loop=loop_thread,
                 )
+            assert sends == ["standalone accepted"], sends
         finally:
-            wedged_loop.close()
+            release_loop.set()
 
-        standalone_send.assert_awaited_once()
+        # Let the released loop run everything that was queued behind the block.
+        for _ in range(3):
+            asyncio.run_coroutine_threadsafe(asyncio.sleep(0.05), loop_thread).result(5)
+
+        assert scheduled == [loop_thread], "the live lane must actually have been attempted"
         assert result is None, f"expected the standalone fallback to deliver, got: {result!r}"
+        assert sends == ["standalone accepted"], (
+            f"fallback won, so the queued live send must refuse to dispatch; got {sends}")
