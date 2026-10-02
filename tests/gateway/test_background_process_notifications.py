@@ -323,6 +323,45 @@ async def test_post_turn_watch_drain_all_injects_from_queued_event_origin(monkey
 
 
 @pytest.mark.asyncio
+async def test_refused_watch_admission_waits_before_reinjecting(monkeypatch, tmp_path):
+    """A session whose busy queue sits at cap refuses every internal wake. The idle watcher drains
+    every 2s, so re-offering refused events on each pass logged about 310 refusals a minute for 53
+    minutes; the event must stay queued but wait out a growing delay."""
+    from gateway.session import SessionSource
+    import gateway.run_notifications as run_notifications
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    adapter = runner.adapters[Platform.TELEGRAM]
+    adapter.handle_message = AsyncMock()  # returns without the admission receipt, like the cap drop
+    runner.session_store._entries["agent:main:telegram:dm:123:42"] = SimpleNamespace(
+        origin=SessionSource(platform=Platform.TELEGRAM, chat_id="123", chat_type="dm", thread_id="42")
+    )
+    clock = [1000.0]
+    monkeypatch.setattr(run_notifications.time, "monotonic", lambda: clock[0])
+    completion_queue = queue.Queue()
+    evt = _watch_event()
+    completion_queue.put(evt)
+
+    await runner._drain_watch_notifications(completion_queue)
+    clock[0] += 2.0  # the next idle-watcher pass
+    await runner._drain_watch_notifications(completion_queue)
+
+    assert adapter.handle_message.await_count == 1, "re-offered on the very next pass"
+    assert completion_queue.qsize() == 1 and completion_queue.queue[0] is evt, "a refused event is kept"
+
+    # Each refusal doubles the wait from 5s up to the 60s cap: offers land at +5, +10, +20, +40, +60, +60.
+    offered_at = 1000.0
+    for offers, delay in enumerate((5.0, 10.0, 20.0, 40.0, 60.0, 60.0), start=2):
+        clock[0] = offered_at + delay - 0.5
+        await runner._drain_watch_notifications(completion_queue)
+        assert adapter.handle_message.await_count == offers - 1, f"held until {delay}s after the last offer"
+        clock[0] = offered_at = offered_at + delay
+        await runner._drain_watch_notifications(completion_queue)
+        assert adapter.handle_message.await_count == offers, f"offered again {delay}s after the last offer"
+    assert completion_queue.queue[0] is evt
+
+
+@pytest.mark.asyncio
 async def test_inject_watch_notification_carries_message_id_reply_anchor(monkeypatch, tmp_path):
     from gateway.session import SessionSource
 

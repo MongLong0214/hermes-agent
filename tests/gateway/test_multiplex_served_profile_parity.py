@@ -161,3 +161,52 @@ def test_served_profile_process_checkpoint_is_recovered_at_startup(served, monke
     assert [w["session_id"] for w in registry.pending_watchers] == ["proc_alpha01"]
     # Idempotent across homes: the process-global registry already tracks it.
     assert runner._recover_secondary_process_checkpoints(registry) == 0
+
+
+def test_watch_retry_is_dropped_when_its_profile_turns_notifications_off(served, monkeypatch):
+    """alpha refuses a watch event and it waits for its retry; alpha then turns notifications off.
+    The next drain drops alpha's event (turning them back on does not revive it), while the default
+    profile's refused event keeps its own retry."""
+    import gateway.run_notifications as run_notifications
+    from tools.process_registry import ProcessRegistry
+
+    runner = served.runner
+    alpha_config = served.alpha / "config.yaml"
+    alpha_config.write_text("display:\n  background_process_notifications: all\n")
+
+    offers = {"alpha": 0, "default": 0}
+
+    def refusing(name):
+        async def handle_message(event):  # returns without the admission receipt, like the busy-cap drop
+            offers[name] += 1
+        return handle_message
+
+    served.alpha_adapter.handle_message = refusing("alpha")
+    served.default_adapter.handle_message = refusing("default")
+    clock = [1000.0]
+    monkeypatch.setattr(run_notifications.time, "monotonic", lambda: clock[0])
+
+    def watch_event(profile, chat_id):
+        return {"type": "watch_match", "session_id": f"p-{profile}", "pattern": "DONE", "output": "DONE",
+                "command": "x", "platform": "telegram", "chat_type": "dm", "chat_id": chat_id,
+                "session_key": f"agent:{profile}:telegram:dm:{chat_id}"}
+
+    evt_alpha, evt_default = watch_event("alpha", "1001"), watch_event("main", "1002")
+    registry = ProcessRegistry()
+    registry.completion_queue.put(evt_alpha)
+    registry.completion_queue.put(evt_default)
+
+    asyncio.run(runner._drain_watch_notifications(registry.completion_queue))
+    assert offers == {"alpha": 1, "default": 1}
+    assert {id(e) for e in registry.completion_queue.queue} == {id(evt_alpha), id(evt_default)}
+
+    alpha_config.write_text("display:\n  background_process_notifications: 'off'\n")
+    clock[0] += 2.0  # before either retry is due
+    asyncio.run(runner._drain_watch_notifications(registry.completion_queue))
+    assert list(registry.completion_queue.queue) == [evt_default], "alpha's waiting event is dropped"
+    assert offers == {"alpha": 1, "default": 1}
+
+    alpha_config.write_text("display:\n  background_process_notifications: all\n")
+    clock[0] += 60.0
+    asyncio.run(runner._drain_watch_notifications(registry.completion_queue))
+    assert offers == {"alpha": 1, "default": 2}, "the dropped event stays dropped; default retries on time"
