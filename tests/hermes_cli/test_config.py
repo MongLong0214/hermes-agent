@@ -2113,3 +2113,11 @@ class TestEmptyDocumentMarkersAreNotExplicitNull:
     def test_a_written_null_under_markers_is_still_explicit_null(self, text):
         from hermes_cli.config import _is_explicit_null_document
         assert _is_explicit_null_document(text) is True
+
+    @pytest.mark.parametrize("text", ['!!null ""\n', "!!null ''\n", "!!null\n", "!!null |\n"])
+    def test_an_explicitly_tagged_empty_null_scalar_is_still_explicit_null(self, text):
+        """Round-4 regression: PyYAML resolves these to the null tag with an EMPTY value, the
+        same as a bare document marker with nothing after it -- but the author wrote something
+        here (an explicit !!null tag), so this must not be treated as an ordinary empty file."""
+        from hermes_cli.config import _is_explicit_null_document
+        assert _is_explicit_null_document(text) is True

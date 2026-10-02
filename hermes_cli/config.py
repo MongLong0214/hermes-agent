@@ -1914,6 +1914,11 @@ def cfg_get(cfg: Optional[Dict[str, Any]], *keys: str, default: Any = None) -> A
 
 
 _NULL_TAG = "tag:yaml.org,2002:null"
+# Structural YAML markers and comments -- stripped from a node's OWN source span (never the whole
+# document) to tell an explicitly-tagged empty null scalar from a bare document marker with
+# nothing after it. ``#`` only starts a comment outside a quoted string; a node's span for the
+# cases this matters for never contains a quoted "#", so a plain strip is safe here.
+_MARKERS_AND_COMMENTS_RE = re.compile(r"^%YAML[^\n]*$|^---\s*$|^\.\.\.\s*$|#.*$", re.MULTILINE)
 
 
 def _is_explicit_null_document(text: str) -> bool:
@@ -1933,13 +1938,20 @@ def _is_explicit_null_document(text: str) -> bool:
         return False
     if node is None or node.tag != _NULL_TAG:
         return False
-    # The null-tag resolver also fires on an EMPTY scalar with no content at all (a bare "---",
-    # or "---\n...\n") -- PyYAML resolves "nothing written" to the null type the same way it
-    # resolves the literal text "null". Those compose with value == "" (no text consumed); every
-    # written null spelling (null/Null/NULL/~, anchored, or under an explicit !!null tag) composes
-    # with a non-empty value. Only the latter counts as "the author wrote null" (round-3 regression:
-    # treating a bare document-start as an explicit null rejected ordinary empty-file first runs).
-    return node.value != ""
+    if node.value != "":
+        return True
+    # value=="" is still ambiguous: PyYAML's resolver gives the null tag both to "nothing was
+    # written" (a bare "---", "---\n...\n") AND to an explicitly tagged EMPTY null scalar
+    # (``!!null ""``, ``!!null ''``, a bare ``!!null``, ``!!null |``) -- round-4 regression: the
+    # value-only check treated every one of those explicit, author-written forms as implicit-empty.
+    # The node's own source span still carries its exact written text (including an explicit "!!"
+    # tag, if the author gave one) even when the resolved VALUE is empty; after stripping document
+    # markers/directives/comments/whitespace from just that span (not the whole document -- a
+    # legitimate comment elsewhere must not count), anything left over proves the author wrote
+    # something at this node, not nothing.
+    span = text[node.start_mark.pointer:node.end_mark.pointer]
+    stripped = _MARKERS_AND_COMMENTS_RE.sub("", span).strip()
+    return bool(stripped)
 
 
 def _reread_is_explicit_null(f) -> bool:
