@@ -203,3 +203,70 @@ def test_quiet_unsent_notice_keeps_the_claim_and_resends_only_the_notice(home, f
     assert len(home.db.get_messages("sess_parent")) == 1, "the replay re-finds the row instead of writing another"
     assert adapter.send.await_count == 2
     assert _durable("deleg_quiet")["delivery_state"] == "delivered"
+
+
+def test_mode_change_during_a_group_does_not_record_one_unit_under_another(home, monkeypatch):
+    """The group decides wake once; a switch to quiet before the delivery must not record the coalesced
+    text under the primary's existing row and acknowledge the sibling without its result."""
+    runner = _runner(home)
+    reads = iter(["wake"])
+    monkeypatch.setattr(runner, "_load_delegation_completion_delivery", lambda: next(reads, "quiet"))
+    evt_a = _event("deleg_a", summary="Result A")
+    evt_b = _event("deleg_b", summary="Result B", goal="Second task")
+    for evt in (evt_a, evt_b):
+        _persist_pending(evt)
+    home.db.append_delegation_delivery("sess_parent", "earlier attempt for A", {"delegation_id": "deleg_a"})
+
+    assert asyncio.run(runner._deliver_async_delegation_group([dict(evt_a), dict(evt_b)])) is True
+
+    handler = runner.adapters[Platform.TELEGRAM].handle_message
+    handler.assert_awaited_once()
+    assert "Result B" in handler.await_args.args[0].text, "B's result is delivered in the one wake turn"
+    assert len(home.db.get_messages("sess_parent")) == 1, "nothing was recorded quietly"
+
+
+def test_quiet_group_without_spawning_sessions_stays_one_wake_turn(home):
+    _config(home, "quiet")
+    runner = _runner(home)
+    events = [_event("deleg_x", parent_session_id="", summary="Result X"),
+              _event("deleg_y", parent_session_id="", summary="Result Y", goal="Other task")]
+    for evt in events:
+        _persist_pending(evt)
+
+    assert asyncio.run(runner._deliver_async_delegation_group([dict(e) for e in events])) is True
+
+    runner.adapters[Platform.TELEGRAM].handle_message.assert_awaited_once()
+    assert _durable("deleg_x")["delivery_state"] == "delivered"
+    assert _durable("deleg_y")["delivery_state"] == "delivered"
+
+
+def test_quiet_notice_primes_a_cold_relay_before_sending(home):
+    """A relay's per-chat routing is cold right after a restart; the notice must leave with the chat's
+    logical platform and DM user, as the wake path primes them."""
+    from gateway.relay.adapter import RelayAdapter
+    from gateway.session import SessionSource
+
+    _config(home, "quiet")
+    runner = _runner(home)
+    relay = object.__new__(RelayAdapter)
+    relay._scope_by_chat, relay._dm_user_by_chat, relay._platform_by_chat = {}, {}, {}
+    relay._chat_type_by_chat, relay._last_inbound_ts_by_chat = {}, {}
+    relay.handle_message = AdmittingHandler()
+    seen = {}
+
+    async def send(chat_id, content, metadata=None, **kwargs):
+        seen.update(platform=relay._platform_by_chat.get(str(chat_id)), scope=relay._with_scope(str(chat_id), None))
+        return SimpleNamespace(success=True)
+
+    relay.send = send
+    runner.adapters = {Platform.TELEGRAM: relay}
+    runner.session_store._entries[SESSION_KEY] = SimpleNamespace(origin=SessionSource(
+        platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm", thread_id="678", user_id="u1"))
+    event = _event()
+    _persist_pending(event)
+
+    assert _deliver(runner, event) is True
+    assert seen, "the notice was sent"
+    assert str(getattr(seen["platform"], "value", seen["platform"])) == "telegram"
+    assert seen["scope"].get("user_id") == "u1"
+    relay.handle_message.assert_not_awaited()
