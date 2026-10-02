@@ -114,6 +114,45 @@ def test_good_backup_is_written_only_for_the_active_home(homes, tmp_path):
     assert list((home / "backups" / "config").glob("config.yaml.good.*"))
 
 
+RESTRICTED_YAML = """
+    agent:
+      reasoning_effort: medium
+    display:
+      background_process_notifications: 'off'
+    """
+
+
+def test_non_mapping_root_serves_last_good_and_fail_closed_raises(homes):
+    """L7-1 regression: an edit whose root parses as valid YAML but is not a mapping (e.g. a bare
+    list — ``- stray``) must be rejected the same way broken YAML is, not silently coerced to
+    ``{}``. The live-reload path previously recorded that empty dict as last-good and overwrote
+    the ``good`` backup with it, so the NEXT gateway turn lost restricted settings like
+    ``display.background_process_notifications: off`` (reverts to the ``concise`` default) and
+    ``agent.reasoning_effort`` (reverts to the hardcoded default) even though the broken edit was
+    never applied."""
+    from hermes_cli.config_backups import load_newest_good_backup
+    from hermes_cli.config_effective import load_user_config_effective
+
+    home, _ = homes
+    _write(home / "config.yaml", RESTRICTED_YAML)
+    good = load_user_config_effective(home / "config.yaml")
+    assert good == {
+        "agent": {"reasoning_effort": "medium"},
+        "display": {"background_process_notifications": "off"},
+    }
+
+    (home / "config.yaml").write_text("- stray\n", encoding="utf-8")
+    _reset_caches_keep_last_good()
+
+    # The next gateway turn must still see the restricted settings, not {}.
+    assert load_user_config_effective(home / "config.yaml") == good
+    # The "good" backup must still hold the prior mapping — not get overwritten with the list.
+    assert load_newest_good_backup(home / "config.yaml") == good
+
+    with pytest.raises(TypeError):
+        load_user_config_effective(home / "config.yaml", fail_closed=True)
+
+
 def _reset_caches_keep_last_good():
     import hermes_cli.config as cfg
     from hermes_cli import config_effective

@@ -1216,8 +1216,11 @@ class GatewayTurnMixin:
                 )
         # Configured aux model failed, recovered on the main model: only the user can fix that config.
         elif _comp is not None and getattr(_comp, "_last_aux_model_failure_model", None):
+            # Force-redact: provider exception text may contain credentials; this reaches users.
+            from agent.redact import redact_sensitive_text
             _aux_model = getattr(_comp, "_last_aux_model_failure_model", "")
-            _aux_err = getattr(_comp, "_last_aux_model_failure_error", None) or "unknown error"
+            _aux_err = redact_sensitive_text(
+                getattr(_comp, "_last_aux_model_failure_error", None) or "unknown error", force=True)
             await self._hmwa_hygiene_notify(
                 source, attempt.meta, f"ℹ️ Configured compression model `{_aux_model}` "
                 f"failed ({_aux_err}). Recovered using your main "
