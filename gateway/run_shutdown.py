@@ -1141,13 +1141,28 @@ class GatewayShutdownMixin:
                 with suppress(Exception):
                     _strip(_session_messages)
             try:
-                _flush(_session_messages)
+                flushed = _flush(_session_messages)
             except Exception as _flush_err:
                 # Transcript could not be persisted (e.g. FTS/SQLite corruption): dump the live history
                 # to a JSON recovery snapshot rather than lose it. Non-fatal.
                 logger.warning(
                     "Shutdown transcript flush failed (%s); preserving %d in-memory message(s) to recovery snapshot",
                     _flush_err, len(_session_messages),
+                )
+                from gateway.shutdown_flush import flush_agent_history_to_file
+                flush_agent_history_to_file(getattr(agent, "session_id", None), _session_messages)
+                return
+            if flushed is False:
+                # No exception, but the writer itself reports failure (contract of
+                # ``_flush_messages_to_session_db_unlocked``) — the caller's unconditional release
+                # (``_release_evicted_agent_soft``/``_ensure_persisted_then_release_soft``) clears
+                # ``_session_messages`` right after this returns, so a False return left with no
+                # snapshot drops the transcript with zero recovery copies (#R67-3). Same snapshot as
+                # the exception branch above.
+                logger.warning(
+                    "Shutdown transcript flush reported failure for session %s (no exception); "
+                    "preserving %d in-memory message(s) to recovery snapshot",
+                    getattr(agent, "session_id", None), len(_session_messages),
                 )
                 from gateway.shutdown_flush import flush_agent_history_to_file
                 flush_agent_history_to_file(getattr(agent, "session_id", None), _session_messages)

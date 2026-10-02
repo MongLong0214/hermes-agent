@@ -217,6 +217,39 @@ class TestPersistenceGuard:
         finally:
             agent.close()
 
+    def test_a_dirtied_non_tail_row_blocks_eviction_too(self, tmp_path):
+        """ROUND1-ESCAPE sibling of R67-4: the reviewer's production reproduction was
+        micro-compaction defrag rewriting an EARLIER summary row (not the tail) in place,
+        clearing ITS marker without touching length or the tail's marker. The tail-only check
+        read this as caught up and LRU/TTL/pressure eviction cleared the transcript while SQLite
+        still held the stale (pre-defrag) summary -- the predicate must check every row."""
+        agent = self._agent(tmp_path, "dirtied-middle")
+        try:
+            messages = [
+                {"role": "assistant", "content": "summary of turns 1-50", "_compressed_summary": True},
+                {"role": "user", "content": "what's next"},
+                {"role": "assistant", "content": "next step"},
+            ]
+            agent._session_messages = messages
+            assert agent._flush_messages_to_session_db(messages) is True
+            assert transcript_persistence_caught_up(agent) is True
+
+            # Defrag rewrites the EARLIER summary row in place and pops ITS marker; the tail is
+            # untouched, length and watermark are untouched.
+            from agent.context_compressor import _DB_PERSISTED_MARKER
+            middle = messages[0]
+            middle["content"] = "re-summarized turns 1-50"
+            middle.pop(_DB_PERSISTED_MARKER, None)
+            assert messages[-1].get(_DB_PERSISTED_MARKER) is True  # tail still looks durable
+
+            assert agent._last_flushed_db_idx == len(messages)  # watermark never moved
+            assert transcript_persistence_caught_up(agent) is False, (
+                "a dirtied non-tail row must not read as durable just because the tail and "
+                "the positional watermark look caught up"
+            )
+        finally:
+            agent.close()
+
 
 class TestEvictionPlanner:
     def _entries(self, n):

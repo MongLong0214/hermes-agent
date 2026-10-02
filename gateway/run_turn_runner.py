@@ -1101,7 +1101,7 @@ class TurnRunner:
         self._runner._spawn_release_thread(
             self._runner._ensure_persisted_then_release_soft, (agent,),
             f"agent-xproc-evict-{str(self._ctx.session_key)[:24]}",
-            inline_fallback=True,
+            inline_fallback=True, session_key=self._ctx.session_key,
         )
 
     def _build_fresh_agent(self, turn_route, platform_key, combined_ephemeral, max_iterations,

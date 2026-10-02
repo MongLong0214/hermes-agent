@@ -1816,6 +1816,33 @@ class GatewayTurnMixin:
             _user_entry["message_id"] = str(event.message_id)
         return _user_entry
 
+    @staticmethod
+    async def _hmwa_recover_transcript_rows(
+        store, sid: str, rows: List[Dict[str, Any]], *, skip: bool, live_msgs: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        """Gateway-side recovery write for a turn the agent did not fully persist itself: a confirmed
+        batch append (row-id repair included) instead of the raw per-row insert that let a recovered
+        row duplicate on the agent's next flush or orphan an existing blank placeholder (#R67-2).
+        ``skip`` mirrors ``append_to_transcript``'s ``skip_db`` (agent already persisted — no-op).
+        ``live_msgs``, aligned 1:1 with *rows*, are the SAME dict objects the agent's own in-memory
+        transcript holds; on a confirmed write they are stamped durable so the agent's next flush does
+        not re-insert them. A batch failure falls back to the old fire-and-forget per-row retry queue
+        (``append_to_transcript``) rather than raising out of turn-closing — same durability guarantee
+        as before, just without repair on that rarer double-failure path."""
+        if skip or not rows:
+            return
+        try:
+            await store.append_transcript_batch(sid, rows)
+        except Exception:
+            logger.exception(
+                "Gateway recovery batch-append failed for session %s; falling back to per-row retry queue", sid)
+            for row in rows:
+                await store.append_to_transcript(sid, row)
+            return
+        if live_msgs:
+            from agent.transcript_repair import sync_flushed_message_markers
+            sync_flushed_message_markers(live_msgs, rows)
+
     async def _hmwa_persist_turn_transcript(
         self, *, event, source, session_entry, session_key, agent_result, agent_messages,
         prepared, response, agent_failed_early, hidden_reasoning_incomplete, is_context_overflow_failure,
@@ -1856,14 +1883,24 @@ class GatewayTurnMixin:
             if agent_failed_early or hidden_reasoning_incomplete:
                 # Transient failure / hidden-reasoning incomplete: persist the user message without
                 # the provider error text (a gateway hint, not model output). Dedupe on platform
-                # message_id (Telegram retries after transient failures).
-                if event.message_id and await store.has_platform_message_id(sid, str(event.message_id)):
+                # message_id (Telegram retries after transient failures); when the source carries no
+                # message_id, fall back to the same ownership check the exception path already uses
+                # (_hmwa_agent_error_reply) so a retried/re-admitted input with no platform id doesn't
+                # duplicate the user row (#R67-2).
+                _duplicate_user_turn = False
+                if event.message_id:
+                    _duplicate_user_turn = await store.has_platform_message_id(sid, str(event.message_id))
+                elif prepared.persistence_owner:
+                    _duplicate_user_turn = await store.has_input_owner(
+                        prepared.persistence_session_id or sid, prepared.persistence_owner,
+                    )
+                if _duplicate_user_turn:
                     logger.info(
                         "Skipping duplicate user turn (message_id=%s) in session %s",
                         event.message_id, sid,
                     )
                 else:
-                    await store.append_to_transcript(sid, _user_row, skip_db=agent_persisted)
+                    await self._hmwa_recover_transcript_rows(store, sid, [_user_row], skip=agent_persisted)
                 # Close the failed turn: a user-only tail lets alternation repair merge this request
                 # into an unrelated future message and replay stale side effects (#107070).
                 await self._hmwa_close_failed_turn(sid, self._hmwa_failed_turn_notice(agent_result))
@@ -1874,16 +1911,16 @@ class GatewayTurnMixin:
                 new_messages = agent_messages[history_len:] if len(agent_messages) > history_len else []
                 if not new_messages:
                     # Edge case: fall back to simple user/assistant rows.
-                    await store.append_to_transcript(sid, _user_row, skip_db=agent_persisted)
+                    _edge_case_rows = [_user_row]
                     if response:
-                        await store.append_to_transcript(
-                            sid, {"role": "assistant", "content": response, "timestamp": ts},
-                            skip_db=agent_persisted,
-                        )
+                        _edge_case_rows.append({"role": "assistant", "content": response, "timestamp": ts})
+                    await self._hmwa_recover_transcript_rows(store, sid, _edge_case_rows, skip=agent_persisted)
                 else:
                     # Attach the inbound platform message_id to the first user entry so platform-level
                     # quote-resolution (e.g. Yuanbao) can find earlier @bot messages by original id.
                     _user_msg_id_attached = False
+                    _recover_entries: List[Dict[str, Any]] = []
+                    _recover_live_msgs: List[Dict[str, Any]] = []
                     for msg in new_messages:
                         if msg.get("role") == "system":
                             continue  # rebuilt each run
@@ -1900,13 +1937,18 @@ class GatewayTurnMixin:
                         # row in this suffix is unwritten: turn-start persistence (and any mid-turn
                         # incremental flush) can already have committed earlier rows before the
                         # final flush failed. Re-appending a row still carrying ``_db_persisted``
-                        # would re-INSERT it (hermes_state_messages.py has no dedup) — recover only
-                        # the rows the agent never landed, which also covers row-repair: the
-                        # finalizer's blank-row fill clears the marker on a row it rewrites, so a
-                        # cleared marker here still reaches the DB like any other unpersisted row
-                        # (#L4-2/R67-2).
-                        await store.append_to_transcript(
-                            sid, entry, skip_db=agent_persisted or bool(msg.get("_db_persisted")),
+                        # would re-INSERT it — recover only the rows the agent never landed. Row-repair
+                        # (``_row_id`` carried through from ``entry``'s shallow copy of ``msg``) also
+                        # covers the finalizer's blank-row fill clearing the marker on a row it
+                        # rewrites: a cleared marker here still fills that same row rather than
+                        # inserting a second one (#L4-2/R67-2).
+                        if agent_persisted or msg.get("_db_persisted"):
+                            continue
+                        _recover_entries.append(entry)
+                        _recover_live_msgs.append(msg)
+                    if _recover_entries:
+                        await self._hmwa_recover_transcript_rows(
+                            store, sid, _recover_entries, skip=False, live_msgs=_recover_live_msgs,
                         )
 
         # The agent persists token counts/model itself; keep only last_prompt_tokens for hygiene.

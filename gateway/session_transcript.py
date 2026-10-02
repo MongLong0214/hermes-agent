@@ -117,6 +117,25 @@ class SessionTranscriptMixin:
         with self._get_transcript_drain_lock():
             self._append_to_transcript_serialized(self._follow_reroutes(session_id), message)
 
+    def append_transcript_batch(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
+        """Durable one-transaction recovery append for gateway-side fallback writes (turns the agent
+        itself did not fully persist): unlike ``append_to_transcript``'s fire-and-forget single-row
+        insert, this (a) raises instead of silently queuing, so the caller gets a real
+        confirmed-write acknowledgement, and (b) runs messages through
+        ``resolve_and_repair_transcript_batch`` (via ``SessionDB.append_messages_batch``), so an
+        assistant message still carrying ``_row_id`` from an earlier blank placeholder fills that row
+        in place instead of duplicating it (R67-2). Mutates *messages* in place with the durable
+        ``_row_id``/``timestamp`` (same contract as ``append_messages_batch``); callers that need the
+        live message objects marked durable still need ``sync_flushed_message_markers``. Callers own
+        retry/spool on failure — this never queues."""
+        if not messages:
+            return
+        session_id = self._follow_reroutes(session_id)
+        _db = self._db_for_session_id(session_id)
+        if _db is None:
+            raise RuntimeError(f"no owning session store for {session_id}; cannot batch-append")
+        _db.append_messages_batch(session_id=session_id, messages=messages)
+
     def _follow_reroutes(self, session_id: str) -> str:
         """Follow the compression reroute chain (cycle-guarded)."""
         reroutes = self._lazy("_transcript_reroutes", dict)

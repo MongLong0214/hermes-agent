@@ -854,7 +854,7 @@ class GatewayAgentCacheMixin:
             return
         self._spawn_release_thread(
             self._ensure_persisted_then_release_soft, (agent,), f"agent-replace-{str(session_key)[:24]}",
-            inline_fallback=True,
+            inline_fallback=True, session_key=session_key,
         )
 
     def _agent_cache_bounds(self):
