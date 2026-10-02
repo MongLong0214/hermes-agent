@@ -34,6 +34,26 @@ _approval_session_id: contextvars.ContextVar[str] = _ctx("approval_session_id")
 _hermes_interactive_ctx: contextvars.ContextVar[str | None] = _ctx("hermes_interactive", None)
 
 
+# Principal of the turn running in this context. ``"peer"`` is a canonical peer turn (another agent
+# relayed through a verified canonical binding): it never inherits the owner's approval bypass and
+# every approval gate refuses it. None is an ordinary owner turn.
+_turn_principal_ctx: contextvars.ContextVar[str | None] = _ctx("turn_principal", None)
+
+
+def set_turn_principal(principal: "str | None") -> contextvars.Token:
+    """Bind the current turn's principal; pair with :func:`reset_turn_principal`."""
+    return _turn_principal_ctx.set(principal)
+
+
+def reset_turn_principal(token: contextvars.Token) -> None:
+    _turn_principal_ctx.reset(token)
+
+
+def is_peer_turn() -> bool:
+    """True while a canonical peer turn runs in this context."""
+    return _turn_principal_ctx.get() == "peer"
+
+
 def set_hermes_interactive_context(interactive: bool) -> contextvars.Token:
     """Bind interactive mode for the current context instead of mutating os.environ."""
     return _hermes_interactive_ctx.set("1" if interactive else "")

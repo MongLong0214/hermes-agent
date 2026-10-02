@@ -1070,8 +1070,13 @@ def build_turn_context(
     # tool-loop follow-ups revert to "agent".
     agent._is_user_initiated_turn = True
 
-    # Preserve the original user message (no nudge injection).
-    original_user_message = persist_user_message if persist_user_message is not None else user_message
+    # Preserve the original user message (no nudge injection). A canonical peer turn's clean body
+    # is for storage only: semantic consumers (memory prefetch, reactions, external memory) see the
+    # same quoted rendering the model does, never the peer's text as if the owner typed it.
+    if persist_user_display_kind == "canonical_peer":
+        original_user_message = user_message
+    else:
+        original_user_message = persist_user_message if persist_user_message is not None else user_message
     should_review_memory = _tick_memory_nudge(agent)
     _emit_reaction(agent, original_user_message)
 
@@ -1195,6 +1200,7 @@ def build_api_messages(
     beyond the sidecar stamp, and the system prompt is built ONCE per session and
     replayed verbatim."""
     from agent.agent_runtime_helpers import fill_empty_non_final_wire_payload
+    from agent.canonical_peer import peer_metadata, peer_wire_text
     from agent.conversation_loop import _clone_message_for_send
     from agent.replay_cleanup import canonicalize_replay_history
 
@@ -1242,6 +1248,11 @@ def build_api_messages(
                 )
                 if _composed is not None:
                     api_msg["content"] = _composed
+        elif peer_metadata(msg) is not None:
+            # Historical canonical peer row: always the rendering of its metadata (plus the live
+            # sidecar's appended context when it is still consistent), whatever a replay transform
+            # did to the body or the sidecar. Raises on inconsistent provenance.
+            api_msg["content"] = peer_wire_text(msg)
         elif (
             isinstance(_api_content, str) and _api_content
             and msg.get("role") in ("user", "assistant")

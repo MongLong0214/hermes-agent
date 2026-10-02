@@ -305,6 +305,9 @@ def _is_background_review_harness_message(msg: Dict[str, Any]) -> bool:
     into real sessions; replaying them hijacks the session)."""
     if not isinstance(msg, dict) or msg.get("role") not in {"user", "system"}:
         return False
+    # A canonical peer row is identified by its admitted provenance, never by what its body says.
+    if msg.get("display_kind") == "canonical_peer":
+        return False
     content = msg.get("content")
     return isinstance(content, str) and content.lstrip().startswith(_REVIEW_HARNESS_PREFIXES)
 

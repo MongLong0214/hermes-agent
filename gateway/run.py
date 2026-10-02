@@ -1240,6 +1240,7 @@ def _build_gateway_agent_history(
 
     Observed context stays out of ``conversation_history`` so consecutive-user repair can't merge it in."""
     from hermes_time import get_timezone as _get_msg_tz
+    from agent.canonical_peer import peer_metadata, peer_wire_text
     from gateway.message_timestamps import (
         render_user_content_with_timestamp as _render_msg_ts,
         strip_leading_message_timestamps as _strip_msg_ts,
@@ -1257,6 +1258,16 @@ def _build_gateway_agent_history(
             continue
 
         content = msg.get("content")
+        if peer_metadata(msg) is not None:
+            # A canonical peer row replays as stored: clean body, its provenance, and the model
+            # rendering of that provenance. No timestamp, cleanup or mirror rewrite touches it, so
+            # it can never come back as plain owner text; inconsistent provenance raises.
+            agent_history.append({
+                "role": "user", "content": content, "api_content": peer_wire_text(msg),
+                "display_kind": msg["display_kind"], "display_metadata": msg["display_metadata"],
+                **({"timestamp": msg["timestamp"]} if msg.get("timestamp") is not None else {}),
+            })
+            continue
         if separate_observed_context and msg.get("observed") and role == "user" and content:
             if inject_timestamps and isinstance(content, str):
                 content = _render_msg_ts(content, msg.get("timestamp"), tz=_msg_tz)
@@ -3567,9 +3578,14 @@ class GatewayRunner(
         expected_actor: Any = None, expected_session_db: Any = None,
         expected_db_path: Any = None, expected_db_identity: Any = None,
         expected_run_generation: int | None = None,
-        held_lease: Any = None,
+        held_lease: Any = None, peer: Any = None,
     ) -> Any:
-        """Run one exact cached actor without creating, routing, or delivering anything."""
+        """Run one exact cached actor without creating, routing, or delivering anything.
+
+        The turn runs as a canonical *peer*: ``peer`` is the server-owned provenance the receipt
+        coordinator minted for this event. The model gets only its rendering, the body is stored
+        clean beside that metadata, and the turn's principal denies tools, approvals and the
+        background review whatever the owner's own settings are."""
         from gateway.canonical_surface import (
             bound_actor_db,
             cached_actor,
@@ -3655,6 +3671,18 @@ class GatewayRunner(
             require_expected_actor()
             if not bool(getattr(agent, "compression_in_place", True)):
                 raise ValueError("canonical_turn_refused")
+            from agent.canonical_peer import render_peer_turn, validate_peer_metadata
+            from gateway.canonical_surface import _runs_tools_outside_hermes
+            from tools.approval_context import reset_turn_principal, set_turn_principal
+
+            peer = validate_peer_metadata(peer)
+            if (peer["binding"], peer["author_id"], peer["channel_id"], peer["event_id"]) != (
+                    getattr(binding, "name", None), getattr(event, "author_id", None),
+                    getattr(event, "channel_id", None), getattr(event, "event_id", None)):
+                raise ValueError("canonical_peer_provenance_invalid")
+            peer_prompt = render_peer_turn(peer, event.text)
+            if _runs_tools_outside_hermes(agent):
+                raise ValueError("canonical_runtime_refused")
             outward_callbacks = {
                 name: value
                 for name, value in vars(agent).items()
@@ -3667,11 +3695,30 @@ class GatewayRunner(
                 agent_history, _ = _build_gateway_agent_history(history)
                 require_current_head()
                 self._init_cached_agent_for_turn(agent, 0)
+
+                def run_peer_turn():
+                    # Set on the worker thread that runs the turn: the agent attribute reaches the
+                    # tool dispatchers and the Codex runtime guard, the context variable the
+                    # approval gates. Both are restored only once the turn has actually returned.
+                    principal_token = set_turn_principal("peer")
+                    prior_principal = getattr(agent, "_turn_principal", None)
+                    prior_skip_review = getattr(agent, "skip_background_review", False)
+                    agent._turn_principal = "peer"
+                    agent.skip_background_review = True
+                    try:
+                        return agent.run_conversation(
+                            peer_prompt, conversation_history=agent_history, task_id=session_id,
+                            persist_user_message=event.text,
+                            persist_user_display_kind="canonical_peer",
+                            persist_user_display_metadata={"canonical_peer": peer},
+                        )
+                    finally:
+                        agent._turn_principal = prior_principal
+                        agent.skip_background_review = prior_skip_review
+                        reset_turn_principal(principal_token)
+
                 result = await run_owned_turn(
-                    self, agent,
-                    lambda: agent.run_conversation(
-                        event.text, conversation_history=agent_history, task_id=session_id,
-                    ),
+                    self, agent, run_peer_turn,
                     session_key=binding.session_key, task_id=session_id,
                     run_generation=expected_run_generation,
                 )

@@ -433,8 +433,15 @@ class SessionManager:
 
         # repair_alternation: this list becomes the resumed agent's LIVE conversation; a durable
         # ``user;user`` violation in state.db would otherwise re-fire the pre-request repair every request.
+        from agent.canonical_peer import PeerProvenanceError
+
         try:
             history = db.get_messages_as_conversation(session_id, repair_alternation=True)
+        except PeerProvenanceError:
+            # A canonical peer row whose provenance is missing or unadmitted: refuse the resume
+            # rather than start an agent on a history that could pass a peer off as the owner.
+            logger.error("Refusing to resume ACP session %s: canonical peer provenance is invalid", session_id)
+            return None
         except Exception:
             logger.warning("Failed to load messages for ACP session %s", session_id, exc_info=True)
             history = []

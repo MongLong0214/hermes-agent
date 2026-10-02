@@ -65,13 +65,19 @@ def _last_announced_surface(conversation_history: Any) -> str:
     Once a switch has been announced, that note — not the stored prompt's ``Platform:`` trailer —
     is the last thing the model was told it runs on.  Reading it back is also what keeps a fresh
     AIAgent per turn (the gateway shape) from stacking one copy of the note per turn."""
+    from agent.canonical_peer import peer_metadata, peer_wire_text
+
     for msg in reversed((conversation_history or [])[-_NOTE_SCAN_TAIL:]):
         # The note only ever lands on a user row: in its api_content sidecar, or as a text part
         # when the content is a multimodal list (which cannot take the string sidecar).
         if not isinstance(msg, dict) or msg.get("role") != "user":
             continue
-        sidecar = msg.get("api_content")
-        text = (sidecar if isinstance(sidecar, str) else "") + "\n" + flatten_message_text(msg.get("content"))
+        if peer_metadata(msg) is not None:
+            # Only what Hermes appended after a canonical peer's quoted body; never the body.
+            text = peer_wire_text(msg)[len(peer_wire_text(msg, with_sidecar=False)):]
+        else:
+            sidecar = msg.get("api_content")
+            text = (sidecar if isinstance(sidecar, str) else "") + "\n" + flatten_message_text(msg.get("content"))
         if _SURFACE_SWITCH_NOTE_PREFIX in text:
             tail = text.rsplit(_SURFACE_SWITCH_NOTE_PREFIX, 1)[1]
             return tail.split(_SURFACE_NAME_END, 1)[0].strip()

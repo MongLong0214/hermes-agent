@@ -3366,9 +3366,14 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         # Lazy import: agent_runtime_helpers pulls heavy transitive imports.
         from agent.agent_runtime_helpers import strip_think_blocks
         parts = []
+        from agent.canonical_peer import peer_metadata, peer_wire_text
         for msg in turns:
             role = msg.get("role", "unknown")
             content = msg.get("content")
+            is_peer = peer_metadata(msg) is not None
+            if is_peer:
+                # A canonical peer's body reaches the summarizer only quoted under its principal.
+                content = peer_wire_text(msg, with_sidecar=False)
             if isinstance(content, list):
                 content = "\n".join(_summary_part_text(part) for part in content if isinstance(part, (dict, str)))
             content = _redact_compaction_text(content or "")
@@ -3383,7 +3388,7 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
                 continue
             if role == "assistant" and msg.get("tool_calls", []):
                 content += "\n[Tool calls:\n" + "\n".join(map(self._render_tool_call_for_summary, msg["tool_calls"])) + "\n]"
-            parts.append(f"[{role.upper()}]: {content}")
+            parts.append(f"[{'PEER' if is_peer else role.upper()}]: {content}")
         return parts
 
     def _serialize_for_summary(self, turns: List[Dict[str, Any]]) -> str:
@@ -3414,9 +3419,12 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
                     except Exception:
                         parsed = args
                     _collect_paths_from_jsonish(parsed, relevant_files)
+        from agent.canonical_peer import peer_metadata, peer_wire_text
         for msg in turns_to_summarize:
             role = msg.get("role", "unknown")
-            text = _compact_fallback_turn(msg.get("content"))
+            # A canonical peer turn is never an owner ask: quoted under its principal, labelled PEER.
+            is_peer = peer_metadata(msg) is not None
+            text = _compact_fallback_turn(peer_wire_text(msg, with_sidecar=False) if is_peer else msg.get("content"))
             _collect_path_mentions(text, relevant_files)
             synthetic_user = role == "user" and self._is_synthetic_compression_user_turn(msg)
             tool_names = [_extract_tool_call_name_and_args(tc)[0] for tc in (msg.get("tool_calls") or [])] if role == "assistant" else []
@@ -3424,13 +3432,13 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
             if tool_names:
                 prefix = "tool calls: " + ", ".join(tool_names[:6])
                 turn_text = f"{prefix}; {turn_text}" if turn_text else prefix
-            turn_label = "INTERNAL CONTEXT" if synthetic_user else str(role).upper()
+            turn_label = "PEER" if is_peer else "INTERNAL CONTEXT" if synthetic_user else str(role).upper()
             if turn_text.strip():
                 last_dropped_turns.append(f"{turn_label}: {turn_text.strip()}")
                 del last_dropped_turns[:-8]
             if len(text) > 600:
                 text = text[:420].rstrip() + " ... " + text[-160:].lstrip()
-            if role == "user" and text and not synthetic_user:
+            if role == "user" and text and not synthetic_user and not is_peer:
                 user_asks.append(text)
             elif role == "assistant":
                 if tool_names:
