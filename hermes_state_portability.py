@@ -538,7 +538,10 @@ class SessionPortabilityMixin:
         return item
 
     def _import_session_row(self, conn, raw: Dict[str, Any], messages: List[Dict[str, Any]], session_id: str) -> None:
-        """INSERT one normalized session + its messages; counts fixed up after."""
+        """INSERT one normalized session + its messages; counts fixed up after. A peer-marked message
+        (``export_session``'s rendering of a canonical event this store never admitted) is inserted as
+        imported-unverified rather than rejected for the missing receipt or re-admitted on a borrowed
+        claim — see ``_insert_message_rows(importing=True)``/``_record_admitted_peer_row``."""
         started_at = coerce_epoch(raw.get("started_at"), session_id=session_id, field="started_at")
         params = {
             "id": session_id, "source": str(raw.get("source") or "import"),
@@ -555,7 +558,8 @@ class SessionPortabilityMixin:
         sanitized_messages = [
             {**msg, **{key: _json_value(msg.get(key)) for key in _IMPORT_MESSAGE_JSON_FIELDS}} for msg in messages
         ]
-        total_messages, total_tool_calls = self._insert_message_rows(conn, session_id, sanitized_messages)
+        total_messages, total_tool_calls = self._insert_message_rows(
+            conn, session_id, sanitized_messages, importing=True)
         conn.execute("UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
                      (total_messages, total_tool_calls, session_id))
 
