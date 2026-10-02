@@ -2096,3 +2096,20 @@ class TestCompatibleProvidersMalformedLegacyKey:
 
         assert names == ["legacy"]
         assert not [r for r in caplog.records if "custom_providers is a" in r.getMessage()]
+
+
+class TestEmptyDocumentMarkersAreNotExplicitNull:
+    """R3 (round-2 regression): an implicit-empty document under --- / ... markers (or a %YAML
+    directive with nothing after it) composes to the same null-tagged node PyYAML gives a real
+    null spelling, but with an EMPTY scalar value -- "nothing was written" must stay accepted as
+    an ordinary empty first-run config, not get rejected as an explicit null root."""
+
+    @pytest.mark.parametrize("text", ["---\n", "---\n...\n", "%YAML 1.1\n---\n", "---\n# just a comment\n"])
+    def test_document_markers_alone_are_not_explicit_null(self, text):
+        from hermes_cli.config import _is_explicit_null_document
+        assert _is_explicit_null_document(text) is False
+
+    @pytest.mark.parametrize("text", ["null\n", "~\n", "---\nnull\n", "%YAML 1.1\n---\nnull\n", "&a null\n"])
+    def test_a_written_null_under_markers_is_still_explicit_null(self, text):
+        from hermes_cli.config import _is_explicit_null_document
+        assert _is_explicit_null_document(text) is True

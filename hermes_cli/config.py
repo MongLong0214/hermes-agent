@@ -1931,7 +1931,15 @@ def _is_explicit_null_document(text: str) -> bool:
         node = yaml.compose(text, Loader=_fast_yaml_loader)
     except yaml.YAMLError:
         return False
-    return node is not None and node.tag == _NULL_TAG
+    if node is None or node.tag != _NULL_TAG:
+        return False
+    # The null-tag resolver also fires on an EMPTY scalar with no content at all (a bare "---",
+    # or "---\n...\n") -- PyYAML resolves "nothing written" to the null type the same way it
+    # resolves the literal text "null". Those compose with value == "" (no text consumed); every
+    # written null spelling (null/Null/NULL/~, anchored, or under an explicit !!null tag) composes
+    # with a non-empty value. Only the latter counts as "the author wrote null" (round-3 regression:
+    # treating a bare document-start as an explicit null rejected ordinary empty-file first runs).
+    return node.value != ""
 
 
 def _reread_is_explicit_null(f) -> bool:
