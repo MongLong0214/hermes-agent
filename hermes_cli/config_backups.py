@@ -57,9 +57,21 @@ def backup_config(config_path: Path, reason: str, *, keep: int = DEFAULT_KEEP) -
         existing = list_config_backups(config_path, reason)
         if existing and filecmp.cmp(config_path, existing[0], shallow=False):
             return None
-        dest = root / f"{config_path.name}.{reason}.{time.strftime('%Y%m%d-%H%M%S')}"
-        if dest.is_symlink() or dest.exists():  # never write through a planted link
-            return None
+        stamp = time.strftime('%Y%m%d-%H%M%S')
+        dest = root / f"{config_path.name}.{reason}.{stamp}"
+        if dest.is_symlink() or dest.exists():
+            # Never write through a planted link; a same-second collision with a DIFFERENT backup
+            # (two valid updates within one wall-clock second) must not silently skip this one --
+            # only a planted symlink should. Disambiguate with a counter instead of dropping the backup.
+            if dest.is_symlink():
+                return None
+            for n in range(1, 1000):
+                candidate = root / f"{config_path.name}.{reason}.{stamp}-{n}"
+                if not candidate.exists() and not candidate.is_symlink():
+                    dest = candidate
+                    break
+            else:
+                return None
         shutil.copy2(config_path, dest)
         for stale in [dest, *existing][keep:]:
             stale.unlink(missing_ok=True)

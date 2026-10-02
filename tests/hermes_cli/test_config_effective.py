@@ -200,3 +200,33 @@ def _reset_caches_keep_last_good():
 
     cfg._RAW_CONFIG_CACHE.clear()
     config_effective._EFFECTIVE_CACHE.clear()
+
+
+def test_valid_shared_cache_update_advances_recovery_state(homes):
+    """ROUND1-ESCAPE-1: a raw-cache HIT (the branch read_raw_config()/gateway_help_lines() warms)
+    must advance last-good/the good backup to the newer valid content, not preserve an older
+    fallback via setdefault. Otherwise a later corrupt write recovers the stale config A instead
+    of the valid update B."""
+    from hermes_cli.commands import gateway_help_lines
+    from hermes_cli.config_backups import load_newest_good_backup
+    from hermes_cli.config_effective import load_user_config_effective
+    from hermes_cli.tools_config import _get_platform_tools
+
+    home, _ = homes
+    path = home / "config.yaml"
+    _write(path, RESTRICTED_YAML)
+    a = load_user_config_effective(path)
+    assert a["display"]["background_process_notifications"] == "off"
+
+    _write(path, GATEWAY_RESTRICTED_YAML)
+    gateway_help_lines()  # warms the shared raw cache (read_raw_config) with B, the cache-hit path
+    b = load_user_config_effective(path)
+    assert "terminal" not in _get_platform_tools(b, "telegram")
+    assert b != a
+
+    path.write_text("- stray\n", encoding="utf-8")
+    _reset_caches_keep_last_good()
+
+    recovered = load_user_config_effective(path)
+    assert recovered == b, "recovery must serve the latest valid config B, not the earlier A"
+    assert load_newest_good_backup(path) == b

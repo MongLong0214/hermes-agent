@@ -74,7 +74,13 @@ def load_user_config_effective(config_path: Optional[Path] = None, *, fail_close
         raw_hit = _config._RAW_CONFIG_CACHE.get(path_key)
         if user_sig is not None and raw_hit is not None and raw_hit[:4] == user_sig:
             raw = copy.deepcopy(raw_hit[4])  # one parse per process, shared with read_raw_config()
-            _LAST_GOOD_USER_RAW.setdefault(path_key, copy.deepcopy(raw))
+            # Always advance, never setdefault: raw_hit is keyed on the CURRENT file signature, so a hit
+            # here means this is the latest successfully parsed content — an older last-good/backup from
+            # before this valid update must not be preserved (ROUND1-ESCAPE-1).
+            _LAST_GOOD_USER_RAW[path_key] = copy.deepcopy(raw)
+            if config_path == _config.get_config_path():
+                from hermes_cli.config_backups import backup_config
+                backup_config(config_path, "good")
         elif user_sig is not None:
             try:
                 with open(config_path, encoding="utf-8") as f:
