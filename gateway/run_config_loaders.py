@@ -495,6 +495,18 @@ class GatewayConfigLoadersMixin:
         return mode
 
     @staticmethod
+    def _load_delegation_completion_delivery() -> str:
+        """``delegation.completion_delivery`` (``wake`` default, or ``quiet``) for the AMBIENT profile —
+        callers deciding for another profile's event enter its scope first (``_completion_event_scope``)."""
+        from gateway.run import _load_gateway_config
+        mode = str(cfg_get(_load_gateway_config(), "delegation", "completion_delivery", default="") or "wake")
+        mode = mode.strip().lower()
+        if mode not in {"wake", "quiet"}:
+            logger.warning("Unknown delegation.completion_delivery '%s', defaulting to 'wake'", mode)
+            return "wake"
+        return mode
+
+    @staticmethod
     def _load_provider_routing() -> dict:
         """OpenRouter provider routing preferences (canonical fail-open loader: managed overlay + ${VAR})."""
         from gateway.run import _load_gateway_config
