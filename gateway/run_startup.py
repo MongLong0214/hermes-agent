@@ -511,7 +511,7 @@ class GatewayStartupMixin:
         reached the platform: an adapter may deliver the first chunks of a long reply, or retry a request
         internally, before the call that raises. A send cut short by a cancel is flagged for the caller,
         which settles it the same way."""
-        from gateway.delivery_ledger import mark_delivered, mark_failed
+        from gateway.delivery_ledger import is_reconnect_only, mark_delivered, mark_failed
 
         adapter = await self._obligation_adapter(row)
         if adapter is None:
@@ -529,6 +529,14 @@ class GatewayStartupMixin:
         except BaseException:
             row["send_interrupted"] = True
             raise
+        if (result is not None and not getattr(result, "success", False) and adapter.send_path_degraded
+                and is_reconnect_only(getattr(result, "error", ""))):
+            # Polling degraded again after the claim and the adapter refused locally, before any request:
+            # released unspent like a claim whose adapter vanished, or a flapping link spends the attempts
+            # cap on refusals that never reached the platform. The degraded check keeps a transport error
+            # that may follow delivered chunks (Discord reports it with the same error) spent.
+            await self._release_unsent_claims([row], reconnect_only=True)
+            return False
         with _log_suppressed(logging.DEBUG, "delivery ledger update failed", exc_info=True):
             if result is not None and getattr(result, "success", False):
                 await asyncio.to_thread(mark_delivered, row["obligation_id"], attempt=row.get("attempts"))

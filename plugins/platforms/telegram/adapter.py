@@ -39,6 +39,27 @@ def _redact_telegram_error_text(error: object) -> str:
         return "<telegram error redacted>"
 
 
+class _RedactTelegramLogRecord(logging.Filter):
+    """Force-redact every record this module emits, traceback included. Redacting only the message
+    is not enough: ``exc_info=True`` makes logging append the raw exception text, and a Bot API
+    URL in it carries the token; some sites also pass the raw exception as a message argument."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+            if message:
+                record.msg, record.args = _redact_telegram_error_text(message), None
+            if record.exc_info:
+                record.exc_text = _redact_telegram_error_text(logging.Formatter().formatException(record.exc_info))
+                record.exc_info = None
+        except Exception:
+            pass
+        return True
+
+
+logger.addFilter(_RedactTelegramLogRecord())
+
+
 def _consume_abandoned_task(task: asyncio.Task) -> None:
     """Observe a detached task's terminal exception to avoid noisy loop logs."""
     try:
@@ -2463,7 +2484,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         self._polling_conflict_count += 1
         MAX_CONFLICT_RETRIES = 5
-        # 15s, 25s, 35s, 45s, 55s — clears Telegram's ~30s session window without hammering the API.
+        # 20s, 30s, 40s, 50s, 60s — clears Telegram's ~30s session window without hammering the API.
         RETRY_DELAY = 10 + (self._polling_conflict_count * 10)  # seconds
         if self._polling_conflict_count <= MAX_CONFLICT_RETRIES:
             logger.warning(
@@ -2490,15 +2511,13 @@ class TelegramAdapter(BasePlatformAdapter):
             expected_generation = self._polling_generation + 1
             if not app:
                 raise RuntimeError("Telegram application was torn down during conflict reconnect")
-            # drop_pending_updates=True makes Telegram terminate any other getUpdates session for this
-            # token (zombie or our own prior retry); without it each retry is immediately 409'd.
-            # The competing session is either a zombie from the previous gateway process (whose long-poll
-            # hasn't expired server-side yet) or our own previous retry's still-expiring session. Without
-            # this, each retry starts a new getUpdates session that immediately gets 409'd by the previous
-            # one, creating the very conflict we are trying to recover from (#75017).
+            # Preserve pending updates, like the network reconnect: PTB forwards this flag to deleteWebhook,
+            # and True would discard every DM Telegram queued during the wait above. PTB's polling bootstrap
+            # calls deleteWebhook whatever the flag, so the competing (zombie or prior-retry) session is
+            # ended by the stop/wait/drain above and the growing delay, not by dropping the queue (#75017).
             self._polling_conflict_recovery_generation = expected_generation
             try:
-                await self._start_polling_once(app, drop_pending_updates=True, error_callback=self._polling_error_callback_ref)
+                await self._start_polling_once(app, drop_pending_updates=False, error_callback=self._polling_error_callback_ref)
                 logger.info(
                     "[%s] Telegram polling restarted after conflict retry %d/%d; health pending getUpdates progress",
                     self.name, self._polling_conflict_count, MAX_CONFLICT_RETRIES)
@@ -4559,6 +4578,10 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def _handle_model_picker_callback(self, query, data: str, chat_id: str) -> None:
         """Handle model picker callbacks (mp:/mpg:/mpv:/mm:/mc:/mb/mx/mg:)."""
+        # Same auth gate as the choice picker, before any state is read: strangers in a shared group
+        # must not switch the model or drive the picker.
+        if not await self._callback_authorized(query, self._callback_ctx(query), _UNAUTHORIZED):
+            return
         state = self._model_picker_state.get(chat_id)
         if not state:
             await query.answer(text="Picker expired — use /model again.")
@@ -6566,6 +6589,13 @@ class TelegramAdapter(BasePlatformAdapter):
             if event is not None:
                 self._hold_inbound_event(event, where=f"{where}-flush-cancelled")
             raise
+        except Exception:
+            # The pop already took the only copy (PTB acked the update): hold it like a cancel. A failure
+            # in the redispatch re-holds without rescheduling, so a poison event cannot tight-loop.
+            if event is None or getattr(event, "_gateway_accepted", False):
+                raise
+            logger.exception("[Telegram] %s flush dispatch failed; holding the event for redispatch", where)
+            self._hold_inbound_event(event, where=f"{where}-flush-failed")
         finally:
             if tasks.get(key) is current_task:
                 tasks.pop(key, None)

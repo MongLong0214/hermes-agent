@@ -124,6 +124,47 @@ async def test_in_place_redelivery_serves_the_owning_profiles_rows(tmp_path, mon
     assert _state(oid) == "delivered"
 
 
+def _attempts(oid):
+    with dl._connect() as conn:
+        return conn.execute("SELECT attempts FROM delivery_obligations WHERE obligation_id=?", (oid,)).fetchone()[0]
+
+
+@pytest.mark.asyncio
+async def test_degraded_again_after_the_claim_refunds_the_attempt_and_delivers_once():
+    """Polling degrades between the in-place handoff's claim and its send: the adapter refuses locally
+    (``send_path_degraded``, no request), so the claim goes back unspent. Flapping as many times as the
+    attempts cap must not abandon the reply; the next real recovery delivers it once."""
+    adapter = _adapter()
+    runner, _primary = _runner(adapter)
+    generation, _ = adapter._begin_polling_generation()
+    oid = await _refuse_while_degraded(adapter)
+    attempts_before = _attempts(oid)
+
+    clear_resume = runner._clear_resume_pending_for_claimed_obligations
+    flaps = {"left": dl.MAX_ATTEMPTS}
+
+    async def degrade_after_claim(claimed, **kwargs):
+        if flaps["left"]:
+            flaps["left"] -= 1
+            flaps["generation"], _ = adapter._begin_polling_generation()  # polling dies again
+        return await clear_resume(claimed, **kwargs)
+
+    runner._clear_resume_pending_for_claimed_obligations = degrade_after_claim
+    for _ in range(dl.MAX_ATTEMPTS):
+        assert adapter._record_polling_progress(generation) is True  # in-place recovery edge
+        await _drain(adapter)
+        generation = flaps["generation"]
+        assert _state(oid) == "failed"
+        assert _attempts(oid) == attempts_before  # a local refusal spends no attempt
+        adapter._bot.send_message.assert_not_awaited()
+
+    assert adapter._record_polling_progress(generation) is True  # recovers and stays up this time
+    await _drain(adapter)
+    assert _state(oid) == "delivered"
+    assert adapter._bot.send_message.await_count == 1
+    assert _REPLY in adapter._bot.send_message.await_args.kwargs["text"]
+
+
 class _Request:
     """PTB request double: ``initialize`` reopens a closed client, ``shutdown`` closes it."""
 

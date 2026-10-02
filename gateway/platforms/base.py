@@ -4297,10 +4297,13 @@ class BasePlatformAdapter(ABC):
     async def _notify_turn_error(self, event: MessageEvent, e: BaseException) -> Optional[dict]:
         """Tell the user a turn failed rather than leaving radio silence (last resort:
         a failing notice is logged, never raised). Returns the thread metadata used."""
+        from agent.redact import redact_sensitive_text
         _thread_metadata = None
         try:
             _thread_metadata = _thread_metadata_for_event(event)
-            error_detail = str(e)[:300] if str(e) else "no details available"
+            # Forced: the text leaves the host (exceptions can embed a Bot API URL with its token).
+            # Redact before truncating: a token cut off at the limit would no longer match the pattern.
+            error_detail = redact_sensitive_text(str(e), force=True)[:300] if str(e) else "no details available"
             # Only the policy reads bind the routed profile; the send stays in the launch scope
             # as before, so delivery bookkeeping keeps landing where boot-time recovery reads it.
             with self._media_delivery_scope(event.source):
@@ -4314,7 +4317,8 @@ class BasePlatformAdapter(ABC):
             await self.send(chat_id=event.source.chat_id, content=content, metadata=_thread_metadata)
         except Exception as notify_err:
             logger.error(
-                "[%s] Failed to send error notification to user: %s", self.name, notify_err, exc_info=True)
+                "[%s] Failed to send error notification to user: %s", self.name,
+                redact_sensitive_text(str(notify_err), force=True))
         return _thread_metadata
 
     async def _deliver_attachments(self, event: MessageEvent, extracted: "_ExtractedResponse",
