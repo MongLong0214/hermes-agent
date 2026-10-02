@@ -797,6 +797,22 @@ def _dispatch_admitted(
     # unit queues behind a full pool and the stale monitor kills it before its child ever starts.
     executor = _get_executor(max(max_async_children, live_units))
 
+    from hermes_cli.backend_retirement import retirement
+
+    # The worker's own exit is the only proof retirement can trust: the stall monitor may force-
+    # finalize this record before the real runner thread unwinds (PR65, `_finalize` alone is not
+    # enough), and the ambiguous branch below can leave `_worker` genuinely running on a thread
+    # that dequeued it despite `submit()` raising. Releasing from `_worker`'s own `finally` --
+    # guarded to fire exactly once -- is correct on every path: it is the only place that is
+    # guaranteed to run if and only if the worker really executes.
+    _reservation_released = False
+
+    def _release_worker_reservation() -> None:
+        nonlocal _reservation_released
+        if not _reservation_released:
+            _reservation_released = True
+            retirement.release()
+
     def _worker() -> None:
         result: Dict[str, Any] = {}
         status = "error"
@@ -813,20 +829,25 @@ def _dispatch_admitted(
             result = crash_result(f"{type(exc).__name__}: {exc}", round(time.time() - dispatched_at, 2))
         finally:
             _finalize(delegation_id, result, status)
-
-    from hermes_cli.backend_retirement import retirement
+            _release_worker_reservation()
 
     # The outer dispatch reservation prevents a freeze during this handoff. Retain a worker
     # reservation too: the stall monitor may finalize its registry record before it really exits.
     retirement.acquire()
+    ambiguous = False
+    dispatch_error = None
     try:
-        future = executor.submit(propagate_context_to_thread(_worker))
-        future.add_done_callback(lambda _: retirement.release())
+        executor.submit(propagate_context_to_thread(_worker))
     except Exception as exc:  # pragma: no cover — pool submit failure is rare
+        dispatch_error = f"Failed to schedule async delegation{label}: {exc}"
         # ThreadPoolExecutor.submit() enqueues the work item BEFORE it tries to start a new worker
         # thread, so a failure in that later step (e.g. the OS refusing a new thread) does not mean
         # the task never ran -- an existing or newly-spawned thread can still dequeue and execute it
-        # for real while we report "rejected". Resolve that FIRST, before touching the record: drain
+        # for real while we report "rejected". ``never_enqueued`` (set by
+        # ``DaemonThreadPoolExecutor.submit``, see there) is PROOF the item never reached the queue
+        # at all -- a submit() that raised before ``_work_queue.put()`` (e.g. a failed allocation
+        # inside the stdlib's own work-item construction): skip the scan entirely, since there is
+        # nothing to find, and go straight to the clean rejection below. Without that proof, drain
         # the pool's own queue looking for our item. Found => discard it and report a clean rejection
         # (nothing will ever run it, same as a submit() that failed before queuing anything -- a real
         # ThreadPoolExecutor whose submit() raises for another reason, or a test double with no queue,
@@ -835,13 +856,17 @@ def _dispatch_admitted(
         # reservation stay untouched (a real completion still delivers through `_finalize`) and the
         # caller must not also run it inline (PR65-R5): tag the rejection "raised" the way an admission
         # exception is, instead of claiming a clean rejection we cannot actually back.
-        ambiguous = _discard_queued_work_item(executor, _worker) is False
-        if ambiguous:
-            return {"status": "rejected", "reason": "raised",
-                    "error": f"Failed to schedule async delegation{label}: {exc}"}
-        retirement.release()
-        _forget_unsubmitted(delegation_id)
-        return {"status": "rejected", "error": f"Failed to schedule async delegation{label}: {exc}"}
+        if getattr(exc, "never_enqueued", False):
+            ambiguous = False
+        else:
+            ambiguous = _discard_queued_work_item(executor, _worker) is False
+        if not ambiguous:
+            _release_worker_reservation()
+            _forget_unsubmitted(delegation_id)
+            return {"status": "rejected", "error": dispatch_error}
+    # A retained ambiguous unit (the item may really be running `_worker` right now) is just as
+    # much "a running record with a progress_fn" as a cleanly-submitted one: arm the stale monitor
+    # for it too, or it is retained forever with no monitor watching it.
     if progress_fn is not None:
         try:
             _ensure_stale_monitor()
@@ -851,6 +876,8 @@ def _dispatch_admitted(
             # one included, so it is only unmonitored in between.
             logger.warning(f"Async delegation{label} %s: failed to start the stale monitor; it stays unmonitored "
                            "until the next dispatch retries", delegation_id, exc_info=True)
+    if ambiguous:
+        return {"status": "rejected", "reason": "raised", "error": dispatch_error}
     return {"status": "dispatched", "delegation_id": delegation_id}
 
 

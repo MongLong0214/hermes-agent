@@ -14,6 +14,7 @@ from __future__ import annotations
 import threading
 import weakref
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import thread as _cf_thread
 from concurrent.futures.thread import _worker
 from contextvars import copy_context
 
@@ -38,7 +39,31 @@ class DaemonThreadPoolExecutor(ThreadPoolExecutor):
         # ``_work_queue`` by identity. ``fn`` is what it actually submitted, so expose it the way
         # ``functools.wraps`` would -- ``inspect.unwrap`` then sees through this layer too.
         _run_with_context.__wrapped__ = fn
-        return super().submit(_run_with_context, *args, **kwargs)
+        # Reimplemented (not delegated to ``super().submit``) so a caller whose submit() raises
+        # can tell a PROVEN-safe failure from an ambiguous one. Anything raised inside this
+        # ``try`` happened before the work item ever reached ``_work_queue`` (construction, or
+        # the ``put`` itself) -- the item will never run, full stop -- and is tagged
+        # ``exc.never_enqueued = True``. A failure from ``_adjust_thread_count()`` below happens
+        # AFTER a successful ``put``: the item is irreversibly queued and an existing idle
+        # thread may dequeue and run it before the caller's except block even starts, so it is
+        # left untagged (the caller must scan ``_work_queue`` by identity instead, see
+        # ``async_delegation._discard_queued_work_item``).
+        try:
+            with self._shutdown_lock, _cf_thread._global_shutdown_lock:
+                if self._broken:
+                    raise _cf_thread.BrokenThreadPool(self._broken)
+                if self._shutdown:
+                    raise RuntimeError('cannot schedule new futures after shutdown')
+                if _cf_thread._shutdown:
+                    raise RuntimeError('cannot schedule new futures after interpreter shutdown')
+                future = _cf_thread._base.Future()
+                work_item = _cf_thread._WorkItem(future, _run_with_context, args, kwargs)
+                self._work_queue.put(work_item)
+        except Exception as exc:  # noqa: BLE001 — tag-and-reraise, not a handled error
+            exc.never_enqueued = True
+            raise
+        self._adjust_thread_count()
+        return future
 
     def _adjust_thread_count(self) -> None:
         # Mirrors CPython's implementation with two changes:

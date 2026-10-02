@@ -674,3 +674,125 @@ def test_partial_batch_submit_failure_after_real_run_is_outcome_uncertain_not_no
     assert first.run_count == 1 and second.run_count == 1, "a task ran more than once"
     completions = [registry_state.get(timeout=5) for _ in range(2)]
     assert all(c["results"][0]["status"] == "completed" for c in completions), completions
+
+
+def test_retained_ambiguous_worker_releases_retirement_reservation_after_real_exit(registry_state, monkeypatch):
+    """R-RETAINED-LIFECYCLE (gpt-6.1-sol BLOCKER): the retained/ambiguous branch of
+    ``_dispatch_admitted`` acquires a retirement reservation BEFORE ``submit()``, but used to release
+    it only via ``future.add_done_callback`` -- installed AFTER ``submit()`` returns. When ``submit()``
+    raises on a work item that was actually dequeued by another thread and is running for real (the
+    same scenario as ``test_submit_failure_after_a_real_dequeue_keeps_the_record_and_delivers_once``),
+    no ``future`` was ever obtained, so no callback was ever installed: the reservation leaked
+    permanently and the stale monitor was never armed for the retained record either (the old code
+    returned before reaching the ``_ensure_stale_monitor`` call). Reproduced with the real executor,
+    a stolen/really-run work item, and the real ``RetirementFence``."""
+    from hermes_cli import backend_retirement
+
+    fence = backend_retirement.RetirementFence()
+    monkeypatch.setattr(backend_retirement, "retirement", fence)
+
+    real_ensure_monitor = async_delegation._ensure_stale_monitor
+    monitor_calls: list = []
+
+    def counting_monitor():
+        monitor_calls.append(1)
+        return real_ensure_monitor()
+
+    monkeypatch.setattr(async_delegation, "_ensure_stale_monitor", counting_monitor)
+
+    executor = async_delegation._get_executor(1)
+    started = threading.Event()
+    release = threading.Event()
+
+    def runner():
+        started.set()
+        assert release.wait(10)
+        return {"summary": "ran for real"}
+
+    real_adjust_thread_count = executor._adjust_thread_count
+
+    def steal_then_fail():
+        item = executor._work_queue.get_nowait()
+        threading.Thread(target=item.run, daemon=True).start()
+        raise RuntimeError("injected: thread start failed after something else already dequeued the item")
+
+    monkeypatch.setattr(executor, "_adjust_thread_count", steal_then_fail)
+    try:
+        handle = async_delegation.dispatch_async_delegation(
+            goal="test", context=None, toolsets=None, role="leaf", model=None, session_key="test",
+            runner=runner, max_async_children=1, progress_fn=lambda: ("tok", False))
+    finally:
+        monkeypatch.setattr(executor, "_adjust_thread_count", real_adjust_thread_count)
+
+    assert handle["status"] == "rejected" and handle.get("reason") == "raised", handle
+    assert started.wait(5), "the stolen work item never actually ran"
+    assert async_delegation.active_count() == 1
+    assert fence.active_count() == 1, "the worker reservation must still be held while it's actually running"
+    assert monitor_calls, "the retained record was never armed with the stale monitor"
+
+    release.set()
+    completion = registry_state.get(timeout=5)
+    assert completion["summary"] == "ran for real"
+    assert async_delegation.active_count() == 0
+    deadline = time.monotonic() + 5
+    while fence.active_count() != 0 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert fence.active_count() == 0, "retirement reservation leaked after the retained worker really exited"
+
+
+def test_prequeue_submit_failure_is_not_treated_as_ambiguous(registry_state, monkeypatch):
+    """R-PREQUEUE-PHANTOM (gpt-6.1-sol BLOCKER): ``_discard_queued_work_item`` not finding our item in
+    the queue was treated as proof "something else already dequeued it" (ambiguous: may be running).
+    But submission can fail BEFORE the item is ever enqueued (e.g. the stdlib's own ``_WorkItem``
+    construction raising) -- then the queue scan ALSO finds nothing, for the opposite reason: the item
+    was never there to begin with. The old code could not tell the two apart and treated a proven,
+    permanent non-submission as ambiguous, leaking a `running` record, a capacity slot, and a
+    retirement reservation forever. Reproduced by making the real stdlib work-item construction raise
+    (via ``DaemonThreadPoolExecutor.submit``'s own ``_WorkItem`` call) before anything reaches the
+    queue."""
+    from concurrent.futures import thread as cf_thread
+    from hermes_cli import backend_retirement
+
+    fence = backend_retirement.RetirementFence()
+    monkeypatch.setattr(backend_retirement, "retirement", fence)
+
+    ran = threading.Event()
+
+    def runner():
+        ran.set()
+        return {"summary": "must never run"}
+
+    executor = async_delegation._get_executor(1)
+    real_work_item = cf_thread._WorkItem
+
+    def failing_work_item(*args, **kwargs):
+        raise MemoryError("injected: allocation failed before the item reached the queue")
+
+    monkeypatch.setattr(cf_thread, "_WorkItem", failing_work_item)
+    try:
+        handle = async_delegation.dispatch_async_delegation(
+            goal="test", context=None, toolsets=None, role="leaf", model=None, session_key="test",
+            runner=runner, max_async_children=1)
+    finally:
+        monkeypatch.setattr(cf_thread, "_WorkItem", real_work_item)
+
+    assert handle["status"] == "rejected"
+    assert handle.get("reason") is None, handle  # a proven clean rejection, never "raised"/ambiguous
+    assert async_delegation.active_count() == 0, "the phantom record must not be retained"
+    assert async_delegation._records == {}, "the forgotten record must really be gone"
+    assert fence.active_count() == 0, "the retirement reservation must not be leaked"
+    assert executor._work_queue.empty(), "nothing was ever queued"
+
+    # Prove a healthy dispatch at the same capacity still works and the slot was really freed.
+    done = threading.Event()
+
+    def ok_runner():
+        done.set()
+        return {"summary": "ok"}
+
+    handle2 = async_delegation.dispatch_async_delegation(
+        goal="test2", context=None, toolsets=None, role="leaf", model=None, session_key="test",
+        runner=ok_runner, max_async_children=1)
+    assert handle2["status"] == "dispatched", handle2
+    assert registry_state.get(timeout=5)["summary"] == "ok"
+    assert not ran.is_set(), "the phantom work item ran anyway"
