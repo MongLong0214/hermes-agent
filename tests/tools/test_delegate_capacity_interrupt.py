@@ -310,7 +310,12 @@ def test_accepted_background_child_keeps_registry_cancellation_ownership(registr
 class _QuickChild(_ControlledChild):
     """Finishes at once if it is ever run: a unit whose admission failed must never reach it."""
 
+    def __init__(self):
+        super().__init__()
+        self.run_count = 0
+
     def run_conversation(self, **_kwargs):
+        self.run_count += 1
         self.started.set()
         self.finished.set()
         return {"final_response": "ran", "completed": True, "api_calls": 0, "messages": []}
@@ -492,3 +497,38 @@ def test_partial_batch_running_unit_is_not_reported_not_started(registry_state, 
     completions = {registry_state.get(timeout=5)["delegation_id"] for _ in range(2)}
     assert completions == {u["delegation_id"] for u in result["units"]}
     assert first.started.is_set() and second.started.is_set()
+
+
+def test_submit_exception_after_the_work_item_already_ran_is_not_executed_again(registry_state, monkeypatch):
+    """PR65-R5 (ROUND1-ESCAPE): ThreadPoolExecutor.submit() enqueues the work item BEFORE it tries to
+    start a worker thread, so a late exception from that attempt does not mean the task never ran --
+    an existing or newly-created thread can still pick the queued item up and execute it for real.
+    Treating that exception as a clean "nothing was submitted" rejection let the caller run the SAME
+    task a second time inline. Reproduced here by letting the real submit() genuinely enqueue and run
+    the work, then raising afterward -- exactly the shape of a late thread-start failure."""
+    from tools.delegate_tool_dispatch import _run_batch
+
+    parent, child = _Parent(), _QuickChild()
+    batch = _batch(parent, child)
+
+    executor = async_delegation._get_executor(2)
+    real_submit = executor.submit
+    raised = threading.Event()
+
+    def failing_submit(fn, *a, **kw):
+        future = real_submit(fn, *a, **kw)
+        future.result(timeout=5)  # the real work item has already run by the time submit() "fails"
+        raised.set()
+        raise RuntimeError("injected: thread start failed after the work item was already queued")
+
+    monkeypatch.setattr(executor, "submit", failing_submit)
+    try:
+        result = json.loads(_run_batch(batch, background=True))
+    finally:
+        monkeypatch.setattr(executor, "submit", real_submit)
+
+    assert raised.is_set(), "the test did not exercise the late-submit-failure path"
+    assert child.finished.wait(5), "the real worker thread should have run the task once"
+    assert result.get("status") == "error", result
+    assert "inline_results" not in result, "the already-run task must not also run inline"
+    assert child.run_count == 1, "the task ran more than once"

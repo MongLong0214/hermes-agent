@@ -590,6 +590,34 @@ def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
 
 
 # ── In-memory registry queries ──────────────────────────────────────────────
+def _discard_queued_work_item(executor, fn) -> Optional[bool]:
+    """Best-effort: drain *executor*'s internal work queue looking for an item wrapping *fn* (by
+    identity) and discard it without running it. True if found and discarded, False if the queue
+    was inspectable and did not contain it (something else already dequeued it), None if the
+    executor exposes no queue to inspect (a test double, or a future stdlib change) -- callers
+    must treat None the same as "assume nothing is ambiguous", the historical, simpler behavior."""
+    work_queue = getattr(executor, "_work_queue", None)
+    if work_queue is None:
+        return None
+    drained = []
+    found = False
+    try:
+        while True:
+            item = work_queue.get_nowait()
+            if not found and getattr(item, "fn", None) is fn:
+                found = True
+                continue  # drop it: never run
+            drained.append(item)
+    except Exception:  # queue.Empty, or any queue implementation quirk
+        pass
+    for item in drained:
+        try:
+            work_queue.put(item)
+        except Exception:
+            pass
+    return found if found else False
+
+
 def _get_executor(max_workers: int) -> ThreadPoolExecutor:
     """Lazily create (or grow in place, never shrink) the shared daemon executor. Raising
     ``_max_workers`` is enough: the next ``submit`` spawns threads up to the new cap."""
@@ -791,6 +819,19 @@ def _dispatch_admitted(
     except Exception as exc:  # pragma: no cover — pool submit failure is rare
         retirement.release()
         _forget_unsubmitted(delegation_id)
+        # ThreadPoolExecutor.submit() enqueues the work item BEFORE it tries to start a new worker
+        # thread, so a failure in that later step (e.g. the OS refusing a new thread) does not mean
+        # the task never ran -- an existing or newly-spawned thread can still dequeue and execute it
+        # for real while we report "rejected". Drain the pool's own queue looking for our item: if
+        # it is still sitting there, discard it and report a clean rejection (nothing will ever run
+        # it, same as a submit() that failed before queuing anything -- a real ThreadPoolExecutor
+        # whose submit() raises for another reason, or a test double with no queue, behaves the
+        # same way). If it is NOT there, something already dequeued it, so the caller must not also
+        # run it inline (PR65-R5): tag the rejection "raised" the way an admission exception is.
+        ambiguous = _discard_queued_work_item(executor, _worker) is False
+        if ambiguous:
+            return {"status": "rejected", "reason": "raised",
+                    "error": f"Failed to schedule async delegation{label}: {exc}"}
         return {"status": "rejected", "error": f"Failed to schedule async delegation{label}: {exc}"}
     if progress_fn is not None:
         try:
