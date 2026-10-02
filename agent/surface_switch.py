@@ -73,9 +73,16 @@ def _last_announced_surface(conversation_history: Any) -> str:
         if not isinstance(msg, dict) or msg.get("role") != "user":
             continue
         if peer_metadata(msg) is not None:
-            # R-PEER-SIDECAR: a peer row's stored sidecar is never trusted (agent/canonical_peer.py
-            # peer_wire_text always re-renders from the authenticated body+metadata instead), so a
-            # peer row can never carry a switch note — nothing here to read back.
+            # A peer row's own body is never searched for a note (R-PEER-SIDECAR: it is the peer's
+            # text, not Hermes'). Its ``api_content`` is different: by the time it reaches here it
+            # is either the fresh rendering (no note — the common case) or an admission-ledger-
+            # authenticated sidecar that is Hermes' own appended context, a genuine switch note
+            # included, so it is searched the same way a non-peer sidecar is — the body is not.
+            sidecar = msg.get("api_content")
+            text = sidecar if isinstance(sidecar, str) else ""
+            if _SURFACE_SWITCH_NOTE_PREFIX in text:
+                tail = text.rsplit(_SURFACE_SWITCH_NOTE_PREFIX, 1)[1]
+                return tail.split(_SURFACE_NAME_END, 1)[0].strip()
             continue
         sidecar = msg.get("api_content")
         text = (sidecar if isinstance(sidecar, str) else "") + "\n" + flatten_message_text(msg.get("content"))
