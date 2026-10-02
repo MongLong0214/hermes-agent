@@ -44,7 +44,7 @@ from hermes_state_errors import (
 )
 from hermes_state_guard import (
     _STATE_DB_GUARD_BYPASS_ENV, _in_test_context, _is_production_state_db, _real_platform_state_root,
-    _register_test_instance, _set_last_init_error, get_last_init_error,
+    _register_test_instance, _set_last_init_error, get_last_init_error, get_last_init_error_exc,
 )
 from hermes_state_readpool import _READ_POOL_MAX, _proc_fd_targets, _read_budget_for
 from hermes_state_sessions import SessionSessionsMixin
@@ -394,7 +394,16 @@ def format_session_db_unavailable(
             "storage location."
         )
     from hermes_state_user_copy import describe_storage_failure
-    failure = describe_storage_failure(cause)
+    # Classify the typed failure when the recorded text is still that exception's; bare text only
+    # when no exception object was kept for it (same split as
+    # gateway/run_notifications.py:_send_session_db_warning_notifications). A real typed refusal on
+    # the cause chain (IncompatibleSchemaError, the fence's own SQLite error) decides the schema
+    # version-mismatch copy; text alone can only ever quote those phrases.
+    init_exc = get_last_init_error_exc()
+    failure_source = (
+        init_exc if init_exc is not None and cause == f"{type(init_exc).__name__}: {init_exc}" else cause
+    )
+    failure = describe_storage_failure(failure_source)
     gloss, action, hint = failure.gloss, failure.action, ""
     if any(m in cause.lower() for m in _WAL_INCOMPAT_MARKERS):
         if failure.cause == "unknown":
@@ -634,7 +643,11 @@ class SessionDB(
             initialization_complete = True
         except Exception as exc:
             # Surface WHY via /resume and friends; callers keep their ``_session_db = None`` path.
-            _set_last_init_error(f"{type(exc).__name__}: {exc}")
+            # Keep the exception alongside the text (see get_last_init_error_exc): the cause
+            # classifier needs its type and __cause__ chain to tell a real refusal from text that
+            # merely quotes a fence/version phrase, same as gateway/run_notifications.py's
+            # _record_session_db_init_error and tui_gateway/server.py's _db_error_exc.
+            _set_last_init_error(f"{type(exc).__name__}: {exc}", exc=exc)
             raise
         finally:
             if not initialization_complete:

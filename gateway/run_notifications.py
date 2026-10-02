@@ -1025,6 +1025,14 @@ class GatewayNotificationsMixin:
                 logger.info("Sent home-channel startup notification to %s:%s", platform.value, home.chat_id)
         return delivered
 
+    def _record_session_db_init_error(self, exc: BaseException) -> None:
+        """Record a startup store failure for :meth:`_send_session_db_warning_notifications`. The text
+        is what logs and tests read; the exception itself is what the cause classifier needs — its type
+        and ``__cause__`` chain tell a real refusal from an error that merely quotes fence text, and
+        ``str(exc)`` throws both away."""
+        self._session_db_init_error = str(exc)
+        self._session_db_init_exc = exc
+
     async def _send_session_db_warning_notifications(self) -> None:
         """Broadcast a state.db failure warning to all home channels.
 
@@ -1049,7 +1057,11 @@ class GatewayNotificationsMixin:
                 return
         from hermes_constants import get_default_hermes_root, profile_cli_selector
         from hermes_state import _default_db_path, classify_persistence_error
-        cause = classify_persistence_error(error)
+        # Classify the typed failure when the recorded text is still that exception's; bare text only
+        # when no exception object was kept for it.
+        init_exc = getattr(self, "_session_db_init_exc", None)
+        failure_source = init_exc if init_exc is not None and str(init_exc) == error else error
+        cause = classify_persistence_error(failure_source)
         # Copy-pasteable, so name the real store and pin the profile: a bare `hermes` follows
         # active_profile, which may be a different database (#105887).
         profile_arg = profile_cli_selector()
@@ -1082,7 +1094,7 @@ class GatewayNotificationsMixin:
             )
         else:
             from hermes_state_user_copy import describe_storage_failure
-            failure = describe_storage_failure(error)
+            failure = describe_storage_failure(failure_source)
             # The cause table owns the remedy: for a held retired-WAL generation a bare `doctor --fix`
             # is the second-writer trap this notice used to send users into (#110054). Its copy is
             # user-phrased, so a store-level failure still gets the operator tail — this gateway

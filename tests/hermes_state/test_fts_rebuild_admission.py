@@ -573,6 +573,102 @@ class TestDeferredFtsRetryInProcess:
         assert _meta_value(db_path, FTS_STALE_KEY) is None
         assert _base_fts_triggers(db_path) == set(_FTS_TRIGGERS)
 
+    def test_retry_defers_a_large_rebuild_instead_of_holding_the_live_writer_lock(
+        self, tmp_path, fast_timeout, monkeypatch
+    ):
+        """The live gateway's automatic retry runs inside SessionDB._lock — the SAME no-timeout
+        writer mutex a reply's transcript write takes (hermes_state.py's _execute_write) — for the
+        WHOLE drop/recreate/reindex transaction. On a store with enough stored messages that the
+        reindex takes real time, that stalls every reply until it finishes. Above
+        _AUTO_FTS_REBUILD_MAX_ROWS the automatic retry must SKIP (same policy as VACUUM: a turn is
+        never refused over housekeeping) and leave the breadcrumb for the next full-rebuild-
+        guaranteed open (gateway restart, any `hermes` CLI/TUI session) to repair before serving —
+        that path is untouched, proven by test_gateway_housekeeping_tick_drives_the_retry below
+        staying green on a small store."""
+        import hermes_state_schema
+
+        db_path = tmp_path / "state.db"
+        d = SessionDB(db_path=db_path)
+        if not d._fts_enabled:
+            d.close()
+            pytest.skip("FTS5 unavailable in this build")
+        d.create_session("s1", source="test")
+        rows = hermes_state_schema._AUTO_FTS_REBUILD_MAX_ROWS + 1
+        d._execute_write(lambda conn: conn.executemany(
+            "INSERT INTO messages (session_id, role, content, timestamp) VALUES ('s1', 'user', ?, ?)",
+            [(f"message {i}", float(i)) for i in range(rows)]))
+        d.close()
+        self._mark_stale(db_path)
+
+        with _rebuild_lock_held_by_other_process(db_path):
+            gw = SessionDB(db_path=db_path)  # long-lived "gateway" open, deferred at open time
+        try:
+            assert gw._fts_stale is True
+            gw._fts_stale_retry_after = 0.0
+            # Holder is gone (context exited) and the store is otherwise reachable — a SMALL store
+            # would fully recover right here (see test_retry_is_non_blocking_while_live_holder_and_
+            # backs_off); this one must still defer purely on size.
+            assert gw.retry_deferred_fts_recovery() is False
+            assert gw._fts_stale is True, "a large store's stale FTS must not be rebuilt by the live automatic retry"
+            assert gw._fts_enabled is False
+            # Ordinary writes still land — the skip must not itself take or hold the writer lock.
+            gw.append_message("s1", "user", "still writable while the rebuild is deferred")
+        finally:
+            gw.close()
+        assert _meta_value(db_path, FTS_STALE_KEY) == "1"
+        assert _base_fts_triggers(db_path) == set()
+        # The explicit full-rebuild guarantee is untouched: a fresh open (gateway restart, CLI, TUI)
+        # still recovers a store of ANY size unconditionally before it serves anything.
+        reopened = SessionDB(db_path=db_path)
+        try:
+            assert reopened._fts_stale is False
+            assert reopened._fts_enabled is True
+        finally:
+            reopened.close()
+
+    def test_retry_without_breadcrumb_also_defers_a_large_rebuild(self, tmp_path, fast_timeout):
+        """The other deferred-recovery shape: no stale breadcrumb, only an in-memory stale flag,
+        because the open's sync-trigger repair found another process holding the rebuild admission.
+        Its retry runs that repair — a full reindex — inside the same SessionDB._lock, so the size
+        gate must apply here too, not only to the breadcrumb path."""
+        import hermes_state_schema
+
+        db_path = tmp_path / "state.db"
+        d = SessionDB(db_path=db_path)
+        if not d._fts_enabled:
+            d.close()
+            pytest.skip("FTS5 unavailable in this build")
+        d.create_session("s1", source="test")
+        rows = hermes_state_schema._AUTO_FTS_REBUILD_MAX_ROWS + 1
+        d._execute_write(lambda conn: conn.executemany(
+            "INSERT INTO messages (session_id, role, content, timestamp) VALUES ('s1', 'user', ?, ?)",
+            [(f"message {i}", float(i)) for i in range(rows)]))
+        d.close()
+        dropped, installed = sorted(_FTS_TRIGGERS)[0], _base_fts_triggers(db_path)
+        raw = sqlite3.connect(str(db_path))
+        raw.execute(f"DROP TRIGGER IF EXISTS {dropped}")
+        raw.commit()
+        raw.close()
+
+        with _rebuild_lock_held_by_other_process(db_path):
+            gw = SessionDB(db_path=db_path)
+        try:
+            assert gw._fts_stale is True
+            assert _meta_value(db_path, FTS_STALE_KEY) is None, "this shape must have no breadcrumb"
+            gw._fts_stale_retry_after = 0.0
+            assert gw.retry_deferred_fts_recovery() is False
+            assert gw._fts_stale is True, "a large store's trigger repair must not run in the live automatic retry"
+            gw.append_message("s1", "user", "still writable while the repair is deferred")
+        finally:
+            gw.close()
+        assert _base_fts_triggers(db_path) == installed - {dropped}
+        reopened = SessionDB(db_path=db_path)
+        try:
+            assert reopened._fts_enabled is True
+        finally:
+            reopened.close()
+        assert _base_fts_triggers(db_path) == installed
+
     def test_gateway_housekeeping_tick_drives_the_retry(
         self, tmp_path, fast_timeout, monkeypatch
     ):

@@ -451,7 +451,7 @@ def _persist_session_row_for_submit(rid, session, text=None, display_kind=None):
     from hermes_state_user_copy import describe_storage_failure
     try:
         if _ensure_session_db_row(session) is False:
-            failure = describe_storage_failure(_db_error)
+            failure = describe_storage_failure(_db_failure())
             error = _err(
                 rid, 5072,
                 f"Session storage is unavailable, so this message was not saved. Cause: {failure.gloss}. "

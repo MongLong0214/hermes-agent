@@ -839,13 +839,13 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
                 # SessionDB drops the triggers itself.
                 if _schema_not_built(exc) or "no such tokenizer: cjk_unicode61" in str(exc).lower():
                     return None
-                return fence_refusal_verdict(exc) or f"fts5 write probe failed: {exc}"
+                return fence_refusal_verdict(exc, db_path=db_path) or f"fts5 write probe failed: {exc}"
             finally:
                 with contextlib.suppress(sqlite3.Error):
                     conn.execute("ROLLBACK")
             return None
     except sqlite3.DatabaseError as exc:
-        return fence_refusal_verdict(exc) or str(exc)
+        return fence_refusal_verdict(exc, db_path=db_path) or str(exc)
 
 
 def _live_writer_holds_db(db_path: Path) -> bool:

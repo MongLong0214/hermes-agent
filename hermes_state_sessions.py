@@ -504,6 +504,11 @@ class SessionSessionsMixin:
         The guard compares against the parent's started_at, not its current ended_at: a parent that was
         reopened and re-ended later still owns reset children from its earlier boundaries."""
         def _do(conn):
+            from hermes_state_errors import PRUNE_CLAIM_KEY_PREFIX, SessionBeingPrunedError
+            if conn.execute("SELECT 1 FROM state_meta WHERE key = ?",
+                            (PRUNE_CLAIM_KEY_PREFIX + session_id,)).fetchone() is not None:
+                # Its oldest rows are already gone; resuming it would serve a shortened history (PR73 R2-1).
+                raise SessionBeingPrunedError(f"Session {session_id!r} is being pruned and cannot be reopened")
             conn.execute(
                 "UPDATE sessions AS child SET model_config = json_set("
                 "COALESCE(child.model_config, '{}'), '$._reset_from', child.parent_session_id) "

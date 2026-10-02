@@ -153,18 +153,30 @@ def _register_test_instance(db: Any) -> None:
 # Last SessionDB() init error, per-process; surfaced by /resume-style slash
 # commands so users know WHY. Only SessionDB.__init__ writes it.
 _last_init_error: Optional[str] = None
+# The exception object behind _last_init_error, kept alongside the text for the same reason
+# gateway/run_notifications.py keeps _session_db_init_exc and tui_gateway/server.py keeps
+# _db_error_exc: the cause classifier needs the exception's type and __cause__ chain to tell a
+# real refusal from text that merely quotes a fence/version phrase, and str(exc) throws both away.
+_last_init_error_exc: Optional[BaseException] = None
 _last_init_error_lock = threading.Lock()
 
 
-def _set_last_init_error(msg: Optional[str]) -> None:
-    """Record (or clear with None) the most recent init failure. __init__ never
-    clears on success: a concurrent open would erase the cause another thread's
-    /resume is about to format."""
-    global _last_init_error
+def _set_last_init_error(msg: Optional[str], exc: Optional[BaseException] = None) -> None:
+    """Record (or clear with None) the most recent init failure, with the exception object (if
+    any) behind it. __init__ never clears on success: a concurrent open would erase the cause
+    another thread's /resume is about to format."""
+    global _last_init_error, _last_init_error_exc
     with _last_init_error_lock:
         _last_init_error = msg
+        _last_init_error_exc = exc if msg is not None else None
 
 
 def get_last_init_error() -> Optional[str]:
     """Most recent state.db init failure (None if none/never attempted)."""
     return _last_init_error
+
+
+def get_last_init_error_exc() -> Optional[BaseException]:
+    """The exception object behind :func:`get_last_init_error`, else None (no exception survived
+    this failure, e.g. the quarantine message built from text, not a caught exception)."""
+    return _last_init_error_exc

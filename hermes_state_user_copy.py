@@ -11,8 +11,9 @@ from dataclasses import dataclass
 from typing import Optional
 
 from hermes_state_errors import (
-    SCHEMA_CAUSE_BUILD_TOO_OLD, SCHEMA_CAUSE_FENCE_GENERATION_MISMATCH, SCHEMA_CAUSE_VERSION_UNREADABLE,
-    STORAGE_RECOVERY_DOCS_URL, classify_persistence_error, incompatible_schema_cause, is_disk_full_error,
+    SCHEMA_CAUSE_BUILD_TOO_OLD, SCHEMA_CAUSE_FENCE_GENERATION_MISMATCH, SCHEMA_CAUSE_UNKNOWN,
+    SCHEMA_CAUSE_VERSION_UNREADABLE, STORAGE_RECOVERY_DOCS_URL, IncompatibleSchemaError,
+    classify_persistence_error, incompatible_schema_cause, is_disk_full_error,
 )
 
 
@@ -114,20 +115,36 @@ _STORAGE_FAILURES: dict[str, tuple[str, str, str]] = {
         "rebuild it into a new database with `--output <new-file>`. "
         "`hermes {profile_arg}sessions repair` does not fix this.",
     ),
+    # The coarse classifier already said "schema_incompatible", but the typed sub-cause check could not
+    # pin down which of the three above it is (an ambiguous signal with no store to confirm it against —
+    # see schema_incompatibility_cause). Never default this to one of the specific causes above: each
+    # names a different version relationship, and only this one is actually known to be true.
+    SCHEMA_CAUSE_UNKNOWN: (
+        "storage_schema_incompatible",
+        "this version refused to open or write this profile's session history for a schema reason it "
+        "could not pin down, and has changed nothing",
+        "`hermes {profile_arg}doctor` shows what it found; `--fix` and `sessions repair` may not apply "
+        "to this store.",
+    ),
 }
 
 
 def schema_incompatibility_cause(exc_or_str) -> Optional[str]:
     """The refusal cause when *exc_or_str* is this build refusing a store another build owns, else None.
 
-    A write the store's fence aborted, or one made without the fence function, is a generation
-    mismatch: the store's fences name a build other than this one."""
-    cause = incompatible_schema_cause(exc_or_str)
-    if cause is None:
-        from hermes_state_fence import fence_refusal_verdict
+    A write the store's fence aborted is a generation mismatch: the store's fences name a build other
+    than this one. An exception is read by type only (an ``IncompatibleSchemaError`` or the fence's
+    typed SQLite error on its chain), so one that merely quotes a refusal is not one; bare text
+    (init-error slots, RPC errors) is matched by its head."""
+    from hermes_state_fence import exception_chain, fence_refusal_verdict
 
-        if exc_or_str is not None and fence_refusal_verdict(exc_or_str) is not None:
-            cause = SCHEMA_CAUSE_FENCE_GENERATION_MISMATCH
+    if isinstance(exc_or_str, BaseException):
+        cause = next((exc.cause for exc in exception_chain(exc_or_str)
+                      if isinstance(exc, IncompatibleSchemaError)), None)
+    else:
+        cause = incompatible_schema_cause(exc_or_str)
+    if cause is None and exc_or_str is not None and fence_refusal_verdict(exc_or_str) is not None:
+        cause = SCHEMA_CAUSE_FENCE_GENERATION_MISMATCH
     return cause
 
 
@@ -151,8 +168,10 @@ def describe_storage_failure(exc_or_str) -> StorageFailure:
     """Plain-language description of a persistence failure (never raises)."""
     cause = classify_persistence_error(exc_or_str)
     if cause == "schema_incompatible":
-        return describe_schema_refusal(
-            schema_incompatibility_cause(exc_or_str) or SCHEMA_CAUSE_FENCE_GENERATION_MISMATCH)
+        # The typed sub-cause classifier returning None means "could not determine which", never
+        # "assume the fence-generation-mismatch one" — that used to tell an owner their OWN build's
+        # store belonged to another version on nothing but an unconfirmed signal.
+        return describe_schema_refusal(schema_incompatibility_cause(exc_or_str) or SCHEMA_CAUSE_UNKNOWN)
     key = "disk_full" if cause == "disk" and is_disk_full_error(exc_or_str) else cause
     return _storage_failure(cause, key)
 

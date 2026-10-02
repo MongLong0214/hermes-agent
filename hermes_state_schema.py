@@ -49,6 +49,16 @@ _FTS_HOLDER_FUTILE_SECONDS = 1800.0
 # retries are non-blocking probes whose spacing doubles up to the cap.
 _FTS_STALE_RETRY_SECONDS = 60.0
 _FTS_STALE_RETRY_MAX_SECONDS = 3600.0
+# retry_deferred_fts_recovery's full rebuild runs inside self._lock (hermes_state.py's no-timeout
+# writer mutex _execute_write also takes), for the whole drop/recreate/reindex transaction — on a
+# store with this many stored messages or fewer that transaction is cheap enough for the live
+# gateway to absorb inline (mirrors hermes_state_maintenance._AUTO_PRUNE_BATCH_ROWS: the same "one
+# transaction a live writer can absorb" budget, chosen independently per mixin to avoid a cross-
+# module import for one constant). Above it the automatic retry defers instead of stalling a reply
+# behind the rebuild — same policy as VACUUM (never block a turn for housekeeping); the open-time
+# path (_init_fts, #100108's full-rebuild guarantee) is unconditional regardless of size, since
+# nothing is being served yet when it runs.
+_AUTO_FTS_REBUILD_MAX_ROWS = 2000
 
 
 def _holder_cmdline(pid: int) -> str:
@@ -668,6 +678,12 @@ class SessionSchemaMixin:
         ``_FTS_STALE_RETRY_MAX_SECONDS``, non-blocking admission (``timeout=0``) so a live holder is skipped
         and tried again later, no new thread — the caller is an existing periodic tick (gateway
         housekeeping). See #100108, #97940.
+
+        The rebuild itself runs inside ``self._lock`` for one whole drop/recreate/reindex transaction —
+        the same writer mutex a reply's transcript write takes with no timeout — so above
+        ``_AUTO_FTS_REBUILD_MAX_ROWS`` stored messages it defers instead of stalling a live reply behind
+        the rebuild (same policy as VACUUM). The open-time path (``_init_fts``) is unconditional regardless
+        of size: nothing is being served yet when it runs.
         """
         if not self._fts_stale:
             return False
@@ -703,7 +719,20 @@ class SessionSchemaMixin:
                     return False
                 cursor = self._conn.cursor()
                 legacy = self._db_has_legacy_inline_fts(cursor)
-                if cursor.execute("SELECT 1 FROM state_meta WHERE key = ? LIMIT 1", (FTS_STALE_KEY,)).fetchone():
+                row_count = cursor.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+                if row_count > _AUTO_FTS_REBUILD_MAX_ROWS:
+                    # Both repairs below reindex every stored message in one transaction inside the
+                    # self._lock this method already holds — on a store this size that runs long
+                    # enough to stall a reply's own transcript write, which takes the SAME lock with
+                    # no timeout. Defer, same as the admission-held case above: the breadcrumb (or,
+                    # without one, the still-missing triggers) survives for the next full-rebuild-
+                    # guaranteed open to repair.
+                    logger.debug(
+                        "Deferred state.db FTS rebuild skipped automatically (%d stored messages "
+                        "> %d): restart the gateway (or open the store from the CLI) to retry it "
+                        "before any turns resume.", row_count, _AUTO_FTS_REBUILD_MAX_ROWS)
+                    recovered = False
+                elif cursor.execute("SELECT 1 FROM state_meta WHERE key = ? LIMIT 1", (FTS_STALE_KEY,)).fetchone():
                     recovered = self._recover_stale_fts(cursor, legacy=legacy, timeout_seconds=0.0)
                     if recovered:
                         # CJK was detached alongside the base indexes; its own ensure path

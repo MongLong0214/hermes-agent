@@ -212,7 +212,7 @@ class SessionMessagesMixin:
     def _check_transcript_write_guards(self, conn, session_id: str, compression_lock_holder: Optional[str],
         turn_lease_holder: Optional[str] = None, turn_lease_ttl_seconds: float = 300.0,
         reject_active_turn_lease: bool = False, reject_active_compression_lock: bool = False,
-        allow_closed_compression_parent: bool = False) -> None:
+        allow_closed_compression_parent: bool = False, ignore_prune_claim: bool = False) -> None:
         """Transcript-write admission checks, run INSIDE the write txn by every writer. Ordinary appends do
         NOT check compression_locks: the lock only stops two COMPRESSIONS colliding and archive_and_compact()
         commits against a watermark, so concurrent appends are safe (blocking them killed turns during slow
@@ -225,7 +225,15 @@ class SessionMessagesMixin:
         unowned turn lease in that same transaction.
         """
         from hermes_state import SessionCompressionInProgressError
-        from hermes_state_errors import CompressionSessionClosedError, SessionTurnLeaseLostError
+        from hermes_state_errors import (
+            PRUNE_CLAIM_KEY_PREFIX, CompressionSessionClosedError, SessionBeingPrunedError, SessionTurnLeaseLostError,
+        )
+        # A session whose sub-batched retention prune has started has already lost its oldest rows:
+        # any write here would resume a silently shortened history (PR73 R2-1). Checked in this same
+        # transaction, so it cannot interleave with the prune's own claim write.
+        if not ignore_prune_claim and conn.execute(
+                "SELECT 1 FROM state_meta WHERE key = ?", (PRUNE_CLAIM_KEY_PREFIX + session_id,)).fetchone() is not None:
+            raise SessionBeingPrunedError(f"Session {session_id!r} is being pruned and cannot be written")
         # NOTE (#75316 redesign): appends do NOT check compression_locks. The lock's job is to stop two
         # COMPRESSIONS colliding, not to fence ordinary transcript writes. Concurrent appends during a
         # compression are safe by construction: archive_and_compact() commits against a watermark captured
