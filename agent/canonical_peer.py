@@ -27,6 +27,14 @@ PEER_METADATA_KEY = "canonical_peer"
 PEER_FIELDS = ("principal", "binding", "author_id", "channel_id", "event_id", "receipt", "nonce")
 # One state_meta row per admitted peer message row: ``<prefix><messages.id>``.
 PEER_ROW_LEDGER_PREFIX = "canonical-peer-row:v1:"
+# One state_meta row per IMPORTED peer message row (``import_sessions``/cross-store lineage
+# adoption only): same ledger value shape as PEER_ROW_LEDGER_PREFIX, but filed under a distinct
+# prefix because it makes no admission claim. An imported row's receipt names a claim this store
+# never made (it was recorded by whichever store originally admitted the event), so importing it
+# neither requires nor fabricates that receipt; it is never treated as this store's own verified
+# ingress, never promoted into one, and grants no authority. See hermes_state_messages.py's
+# ``_record_admitted_peer_row``/``_require_imported_peer``.
+PEER_IMPORTED_ROW_LEDGER_PREFIX = "canonical-peer-imported-row:v1:"
 PEER_PROVENANCE_INVALID = "canonical_peer_provenance_invalid"
 ENVELOPE_ESCAPE = "canonical_envelope_escape"
 _RECEIPT_PREFIX = "canonical-receipt:"
