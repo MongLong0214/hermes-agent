@@ -741,6 +741,115 @@ class TestLifecycleGuardAuditHook(unittest.TestCase):
         self.assertFalse(record_path.exists(),
                           "the stub launchctl must never have been invoked")
 
+    def test_patched_shlex_join_does_not_disable_the_guard(self):
+        """R70-1 round 2 (a): the hook flattened a list argv with ``shlex.join(parts)`` -- a name
+        resolved through the runner's ``__main__`` globals and then the shared ``shlex`` module on
+        EVERY call. ``import __main__; __main__.shlex.join = lambda _: "echo safe"`` turns every
+        later argv into the text ``echo safe`` before the classifier sees it, so the dynamically
+        built lifecycle argv below reached the stub."""
+        result, record_path = self._run_with_stub_launchctl(textwrap.dedent("""\
+            import shlex  # the very module object ``__main__.shlex`` named in the runner
+            import subprocess
+            shlex.join = lambda _: "echo safe"
+            a = "launch"
+            b = "ctl"
+            subprocess.run([a + b, "bootout", "gui/501/ai.hermes.gateway"], check=False)
+            """))
+        self.assertEqual(result["status"], "error", result)
+        self.assertIn("Blocked:", result["error"])
+        self.assertFalse(record_path.exists(),
+                          "the stub launchctl must never have been invoked")
+
+    def test_patched_classifier_dependency_does_not_disable_the_guard(self):
+        """R70-1 round 2 (a), sibling site: ``scan_gateway_lifecycle`` resolves its own helpers
+        through shared modules at call time -- e.g. ``from tools.shell_heredoc import
+        strip_inert_heredoc_bodies`` runs inside the scan, so a cell that replaces that function
+        first makes the classifier read an empty command and answer "safe"."""
+        result, record_path = self._run_with_stub_launchctl(textwrap.dedent("""\
+            import subprocess
+            import tools.shell_heredoc
+            tools.shell_heredoc.strip_inert_heredoc_bodies = lambda text, *a, **k: ""
+            a = "launch"
+            b = "ctl"
+            subprocess.run([a + b, "bootout", "gui/501/ai.hermes.gateway"], check=False)
+            """))
+        self.assertEqual(result["status"], "error", result)
+        self.assertIn("Blocked:", result["error"])
+        self.assertFalse(record_path.exists(),
+                          "the stub launchctl must never have been invoked")
+
+    # A child interpreter that builds the lifecycle argv itself: nothing in the PARENT's argv
+    # (``python -c <this text>``) names the command, so only a hook inside the child can stop it.
+    _GRANDCHILD = (
+        "import subprocess; a = 'launch'; b = 'ctl'; "
+        "subprocess.run([a + b, 'bootout', 'gui/501/ai.hermes.gateway'], check=False)"
+    )
+
+    def _assert_grandchild_blocked(self, result, record_path):
+        self.assertEqual(result["status"], "success", result)
+        self.assertIn("Blocked: cannot restart or stop the gateway", result["output"])
+        self.assertFalse(record_path.exists(),
+                          "the stub launchctl must never have been invoked")
+
+    def test_python_c_grandchild_is_guarded(self):
+        """R70-1 round 2 (b): ``sys.addaudithook`` is per-interpreter, so a ``python -c`` child the
+        cell starts ran with no Hermes hook at all and reached the stub."""
+        result, record_path = self._run_with_stub_launchctl(textwrap.dedent("""\
+            import subprocess, sys
+            r = subprocess.run([sys.executable, "-c", %r], capture_output=True, text=True)
+            print(r.returncode, r.stderr)
+            """ % self._GRANDCHILD))
+        self._assert_grandchild_blocked(result, record_path)
+
+    def test_python_c_grandchild_with_scrubbed_env_is_guarded(self):
+        """(b) sibling: the child is armed through its environment, so a cell passing an explicit
+        env without the Hermes variables must not be enough to start an unguarded child."""
+        result, record_path = self._run_with_stub_launchctl(textwrap.dedent("""\
+            import os, subprocess, sys
+            env = {k: v for k, v in os.environ.items()
+                   if k != "PYTHONPATH" and not k.startswith("HERMES_KERNEL_")}
+            r = subprocess.run([sys.executable, "-c", %r], env=env, capture_output=True, text=True)
+            print(r.returncode, r.stderr)
+            """ % self._GRANDCHILD))
+        self._assert_grandchild_blocked(result, record_path)
+
+    def test_python_c_grandchild_after_bootstrap_overwrite_is_guarded(self):
+        """(b) sibling: the child-side bootstrap is a file in the kernel's own (cell-writable)
+        staging dir; emptying it must not leave the next child unguarded."""
+        result, record_path = self._run_with_stub_launchctl(textwrap.dedent("""\
+            import os, subprocess, sys
+            site = os.environ.get("HERMES_KERNEL_LIFECYCLE_GUARD_SITE", "")
+            if site:
+                with open(os.path.join(site, "sitecustomize.py"), "w") as f:
+                    f.write("")
+            r = subprocess.run([sys.executable, "-c", %r], capture_output=True, text=True)
+            print(r.returncode, r.stderr)
+            """ % self._GRANDCHILD))
+        self._assert_grandchild_blocked(result, record_path)
+
+    def test_ordinary_python_grandchild_and_its_own_sitecustomize_still_work(self):
+        """No regression from arming children: an ordinary ``python -c`` child runs, and a
+        ``sitecustomize`` the cell put on the child's own PYTHONPATH still runs too (the Hermes
+        bootstrap sits first on the path and chains to it rather than shadowing it)."""
+        result, record_path = self._run_with_stub_launchctl(textwrap.dedent("""\
+            import os, subprocess, sys, tempfile
+            user_site = tempfile.mkdtemp()
+            with open(os.path.join(user_site, "sitecustomize.py"), "w") as f:
+                f.write("import os; os.environ['USER_SITE_RAN'] = '1'")
+            env = dict(os.environ, PYTHONPATH=user_site)
+            r = subprocess.run(
+                [sys.executable, "-c",
+                 "import os, subprocess; print('child-ok', os.environ.get('USER_SITE_RAN')); "
+                 "print(subprocess.run(['echo', 'gc-ok'], capture_output=True, text=True).stdout.strip())"],
+                env=env, capture_output=True, text=True)
+            print(r.returncode, r.stdout, r.stderr)
+            """))
+        self.assertEqual(result["status"], "success", result)
+        self.assertIn("child-ok 1", result["output"])
+        self.assertIn("gc-ok", result["output"])
+        self.assertNotIn("Error in sitecustomize", result["output"])
+        self.assertFalse(record_path.exists())
+
 
 class TestLifecycleGuardSupervisedGatewayOnly(unittest.TestCase):
     """R70-2: ``tools/code_execution_env.py::_build_child_env`` wired the audit-hook guard into
