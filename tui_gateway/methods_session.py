@@ -2052,7 +2052,13 @@ _BRANCH_COPY_FIELDS = (
     # the truncate ordinal address space.
     "display_kind", "display_metadata",
     # Branch copies are history, not new activity: keep the parent's timestamps.
-    "timestamp")
+    "timestamp",
+    # The parent's durable row id, when the source history still carries one (resume's display
+    # projection does). _insert_message_rows reads it to tell a reinserted row's provenance class
+    # from its SOURCE row's own ledger entry (R-PEER-01) instead of defaulting a copied peer row to
+    # admitted; harmless for ordinary rows and for assistant rows (the lookup is scoped to the new
+    # child's session id, which never already holds the parent's row id).
+    "_row_id")
 
 
 def _branch_source_history(db, session: dict, old_key: str) -> list:

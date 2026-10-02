@@ -528,17 +528,27 @@ class SessionMessagesMixin:
         Never touches sessions.* counters (callers reconcile differently); reasoning kept for assistant rows.
         ``importing``: True only from the ``import_sessions`` payload path (never from a live/model/remote
         caller) — a peer-marked message is admitted as imported-unverified instead of requiring this store's
-        own receipt. See ``_record_admitted_peer_row``."""
+        own receipt. See ``_record_admitted_peer_row``.
+
+        A *msg* that carries an existing integer ``_row_id`` is a reinsertion of that durable row
+        (compaction, compression rotation, retry/undo replace, branch seed all pass such copies through
+        here) rather than brand-new content; that id is read BEFORE it gets overwritten with the fresh
+        row's id below, and handed to ``_record_admitted_peer_row`` so a peer row's provenance class
+        follows its source instead of defaulting to admitted."""
         now_ts = time.time()
         inserted = tool_calls_total = 0
         for msg in messages:
             role = msg.get("role", "unknown")
+            source_row_id = msg.get("_row_id")
+            if not (isinstance(source_row_id, int) and not isinstance(source_row_id, bool)):
+                source_row_id = None
             tool_calls = _parse_tool_calls(msg.get("tool_calls"))
             message_timestamp = _coerce_timestamp(msg.get("timestamp"), now_ts)
             params = self._message_row_params(
                 session_id, role, msg, tool_calls, message_timestamp, keep_reasoning=role == "assistant")
             cur = conn.execute(_INSERT_MESSAGE_SQL, params)
-            self._record_admitted_peer_row(conn, cur.lastrowid, params, importing=importing)
+            self._record_admitted_peer_row(conn, cur.lastrowid, params, importing=importing,
+                                           source_row_id=source_row_id)
             # Keep the caller's live row aligned with the durable identity. Rows created without an explicit
             # timestamp (notably mid-turn steers) may be carried through several compaction generations; if
             # the generated timestamp exists only in SQLite, every copy receives a new identity and renders
@@ -554,9 +564,29 @@ class SessionMessagesMixin:
             self._drop_shadowed_checkpoint_rows(conn, session_id, messages[carrier]["_row_id"])
         return inserted, tool_calls_total
 
+    @staticmethod
+    def _source_row_was_imported(conn, source_row_id: int, peer: Dict[str, str], encoded_content: Any) -> bool:
+        """Whether the earlier durable row ``source_row_id`` — the one THIS insert reinserts (a
+        reinsertion carries the original's row id forward as ``msg["_row_id"]``; see callers of
+        :meth:`_insert_message_rows`) — was itself filed under the imported ledger.
+
+        Checked against that row's OWN stored ledger entry, never against anything in the caller's
+        message dict: a caller cannot choose "imported" for a row whose prior ledger entry does not
+        already say so. No entry under the imported prefix for ``source_row_id`` means False (fall
+        through to the ordinary admitted/receipt-required path); an entry that exists but does not
+        match this insert's peer metadata or content is a provenance refusal, not a silent fallback."""
+        row = conn.execute("SELECT value FROM state_meta WHERE key = ?",
+                           (f"{PEER_IMPORTED_ROW_LEDGER_PREFIX}{source_row_id}",)).fetchone()
+        if row is None:
+            return False
+        record = parse_peer_ledger_value(row[0])
+        if record["peer"] != peer or record["content_sha256"] != peer_content_digest(encoded_content):
+            raise PeerProvenanceError()
+        return True
+
     @classmethod
     def _record_admitted_peer_row(cls, conn, row_id: Optional[int], params: tuple, *,
-                                  importing: bool = False) -> None:
+                                  importing: bool = False, source_row_id: Optional[int] = None) -> None:
         """Record, in the inserting transaction, that row ``row_id`` is an admitted (or imported)
         canonical peer row.
 
@@ -572,7 +602,16 @@ class SessionMessagesMixin:
         never in this one, so this store neither requires nor fabricates it. The row is filed under
         ``PEER_IMPORTED_ROW_LEDGER_PREFIX`` instead of ``PEER_ROW_LEDGER_PREFIX`` — a distinct ledger
         every read path (``_require_imported_peer``) treats as peer-quoted content with no authority,
-        never as this store's own verified ingress."""
+        never as this store's own verified ingress.
+
+        ``source_row_id`` (every OTHER insert path — compaction, compression rotation, retry/undo
+        replace, branch seed — whenever the message being (re)inserted carries the durable row id it
+        is a byte-exact copy of): when set and ``importing`` is False, the copy's class follows its
+        SOURCE row's own recorded class (:meth:`_source_row_was_imported`) instead of defaulting to
+        admitted. This is what keeps a reinserted imported row imported (no receipt fabricated, no
+        rollback) while a reinserted admitted row still requires its receipt to be present. Ignored
+        when ``importing`` is True: an explicit import never consults local ids, which belong to a
+        different store's numbering and could coincide with an unrelated local row by chance."""
         kind, meta_json = params[_PARAM_DISPLAY_KIND], params[_PARAM_DISPLAY_METADATA]
         if kind != PEER_DISPLAY_KIND and not (isinstance(meta_json, str) and PEER_METADATA_KEY in meta_json):
             return
@@ -582,7 +621,8 @@ class SessionMessagesMixin:
             return
         if row_id is None:
             raise PeerProvenanceError()
-        if importing:
+        if importing or (source_row_id is not None
+                         and cls._source_row_was_imported(conn, source_row_id, peer, params[_PARAM_CONTENT])):
             conn.execute("INSERT INTO state_meta (key, value) VALUES (?, ?)",
                          (f"{PEER_IMPORTED_ROW_LEDGER_PREFIX}{row_id}", peer_ledger_value(peer, params[_PARAM_CONTENT])))
             return
@@ -695,10 +735,16 @@ class SessionMessagesMixin:
             raise PeerProvenanceError() from exc
         return True
 
-    def _validated_peer_ledger_values(self, conn, row_ids: List[int]) -> Dict[int, str]:
+    def _validated_peer_ledger_values(self, conn, row_ids: List[int], *,
+                                      skip_ids: frozenset = frozenset()) -> Dict[int, str]:
         """Stored ledger values of the admitted peer rows among ``row_ids``, each re-validated against its
         row (metadata, record, receipt, content digest) inside the caller's transaction; raises
-        :class:`PeerProvenanceError` for a peer row whose provenance does not validate."""
+        :class:`PeerProvenanceError` for a peer row whose provenance does not validate.
+
+        ``skip_ids`` (ids already confirmed IMPORTED by the caller, e.g. :meth:`_clone_message_rows`
+        checking :meth:`_validated_imported_peer_ledger_values` first) are left out of the admitted
+        check entirely: an imported row has no admission record by design, and without this exclusion
+        this method would read that absence as a stripped/forged admitted row and raise."""
         stored = {int(key[len(PEER_ROW_LEDGER_PREFIX):]): value for key, value in conn.execute(
             f"SELECT key, value FROM state_meta WHERE key IN ({_placeholders(row_ids)})",
             tuple(f"{PEER_ROW_LEDGER_PREFIX}{row_id}" for row_id in row_ids))}
@@ -707,14 +753,43 @@ class SessionMessagesMixin:
         for row in conn.execute(
                 "SELECT id, role, content, display_kind, display_metadata FROM messages "
                 f"WHERE id IN ({_placeholders(row_ids)})", tuple(row_ids)):
+            row_id = int(row["id"])
+            if row_id in skip_ids:
+                continue
             msg: Dict[str, Any] = {"role": row["role"], "display_kind": row["display_kind"]}
             if row["display_metadata"] and (decoded := self._decode_display_metadata(row["display_metadata"])) is not None:
                 msg["display_metadata"] = decoded
-            if self._validated_peer(msg, records.get(int(row["id"])), row["content"]) is not None:
-                admitted[int(row["id"])] = stored[int(row["id"])]
+            if self._validated_peer(msg, records.get(row_id), row["content"]) is not None:
+                admitted[row_id] = stored[row_id]
         if set(stored) - set(admitted):  # a record whose row is gone or is not a peer row
             raise PeerProvenanceError()
         return admitted
+
+    def _validated_imported_peer_ledger_values(self, conn, row_ids: List[int]) -> Dict[int, str]:
+        """Like :meth:`_validated_peer_ledger_values` but for the IMPORTED ledger: stored values of the
+        imported-unverified peer rows among ``row_ids``, each re-validated (metadata, record, content
+        digest — no receipt requirement) against its row inside the caller's transaction. A clone that
+        skips this and only consulted the admitted ledger would silently drop an imported row's
+        provenance record entirely when that row is column-cloned (compression rotation's concurrent
+        tail), leaving the clone peer-marked with no record — refused on the next read."""
+        stored = {int(key[len(PEER_IMPORTED_ROW_LEDGER_PREFIX):]): value for key, value in conn.execute(
+            f"SELECT key, value FROM state_meta WHERE key IN ({_placeholders(row_ids)})",
+            tuple(f"{PEER_IMPORTED_ROW_LEDGER_PREFIX}{row_id}" for row_id in row_ids))}
+        if not stored:
+            return {}
+        records = {row_id: parse_peer_ledger_value(value) for row_id, value in stored.items()}
+        validated: Dict[int, str] = {}
+        for row in conn.execute(
+                "SELECT id, role, content, display_kind, display_metadata FROM messages "
+                f"WHERE id IN ({_placeholders(row_ids)})", tuple(row_ids)):
+            msg: Dict[str, Any] = {"role": row["role"], "display_kind": row["display_kind"]}
+            if row["display_metadata"] and (decoded := self._decode_display_metadata(row["display_metadata"])) is not None:
+                msg["display_metadata"] = decoded
+            if self._validated_imported_peer(msg, records.get(int(row["id"])), row["content"]) is not None:
+                validated[int(row["id"])] = stored[int(row["id"])]
+        if set(stored) - set(validated):  # a record whose row is gone or is not a peer row
+            raise PeerProvenanceError()
+        return validated
 
     def _drop_shadowed_checkpoint_rows(self, conn, session_id: str, carrier_row_id: int) -> int:
         """Rewrite older active assistant rows so only the row *carrier_row_id* keeps a ``type: "compaction"``
@@ -837,11 +912,16 @@ class SessionMessagesMixin:
         """Pure-SQL clone of *tail_ids* as fresh live rows (new id/display order, active=1, compacted=0;
         message payload columns stay byte-exact and FTS triggers index the clones), into *session_id* when given.
 
-        An admitted canonical peer row's admission record follows its clone to the fresh id in this same
+        A canonical peer row's admission record follows its clone to the fresh id in this same
         transaction, after the source row is re-validated; a source peer row whose provenance does not
-        validate raises :class:`PeerProvenanceError`, so the caller's whole publication rolls back."""
+        validate raises :class:`PeerProvenanceError`, so the caller's whole publication rolls back. An
+        IMPORTED row's record follows the same way, filed back under the imported prefix rather than
+        the admitted one — a clone must preserve its source's class, never promote it (dropping the
+        record entirely would be just as wrong: the clone would come back peer-marked with no record,
+        refused on the next read)."""
         retarget = session_id is not None
-        peer_values = self._validated_peer_ledger_values(conn, tail_ids)
+        imported_peer_values = self._validated_imported_peer_ledger_values(conn, tail_ids)
+        peer_values = self._validated_peer_ledger_values(conn, tail_ids, skip_ids=frozenset(imported_peer_values))
         before = int(conn.execute("SELECT COALESCE(MAX(id), 0) FROM messages").fetchone()[0])
         # A clone is a newly positioned display generation. Copy its indexed
         # identity, but let the insert trigger assign order from rows that are
@@ -853,20 +933,22 @@ class SessionMessagesMixin:
             f"SELECT {col_list}, {'?, ' if retarget else ''}1, 0 FROM messages "
             f"WHERE id IN ({_placeholders(tail_ids)}) ORDER BY id",
             [session_id, *tail_ids] if retarget else tail_ids)
-        if not peer_values:
+        if not peer_values and not imported_peer_values:
             return
         # The clones took ids above ``before`` in source-id order (ORDER BY id, one writer).
         clones = conn.execute("SELECT id, content FROM messages WHERE id > ? ORDER BY id", (before,)).fetchall()
         if len(clones) != len(tail_ids):
             raise PeerProvenanceError()
         for source_id, clone in zip(sorted(tail_ids), clones):
-            if source_id not in peer_values:
+            imported = source_id in imported_peer_values
+            value = imported_peer_values[source_id] if imported else peer_values.get(source_id)
+            if value is None:
                 continue
-            value = peer_values[source_id]
             if parse_peer_ledger_value(value)["content_sha256"] != peer_content_digest(clone["content"]):
                 raise PeerProvenanceError()
+            prefix = PEER_IMPORTED_ROW_LEDGER_PREFIX if imported else PEER_ROW_LEDGER_PREFIX
             conn.execute("INSERT INTO state_meta (key, value) VALUES (?, ?)",
-                         (f"{PEER_ROW_LEDGER_PREFIX}{int(clone['id'])}", value))
+                         (f"{prefix}{int(clone['id'])}", value))
 
     def _resolve_carried_row_ids(
         self, conn, session_id: str, carried_messages: List[Dict[str, Any]],
