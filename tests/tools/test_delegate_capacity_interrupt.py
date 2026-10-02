@@ -532,3 +532,428 @@ def test_submit_exception_after_the_work_item_already_ran_is_not_executed_again(
     assert result.get("status") == "error", result
     assert "inline_results" not in result, "the already-run task must not also run inline"
     assert child.run_count == 1, "the task ran more than once"
+
+
+def test_submit_failure_with_item_still_queued_is_found_and_cleanly_discarded(registry_state, monkeypatch):
+    """R-ASYNC-SUBMIT (gpt-6.1-sol BLOCKER): a queued work item's ``.fn`` is never the bare ``_worker``
+    passed to ``_discard_queued_work_item`` -- ``propagate_context_to_thread`` wraps it once, then
+    ``DaemonThreadPoolExecutor.submit`` wraps that again in its own context closure. Matching the
+    unwrapped ``_worker`` by identity against ``item.fn`` could therefore never succeed, so even an item
+    that is genuinely, permanently stuck in the queue (no thread will ever exist to run it) was reported
+    merely "ambiguous" (``reason="raised"``) instead of the clean, provably-safe rejection it actually
+    is. Force the very FIRST worker thread's start() to fail on a fresh real executor --
+    ``ThreadPoolExecutor.submit()`` always enqueues before trying to start a thread, so with zero
+    threads ever created, the item sits there forever."""
+    ran = threading.Event()
+
+    def runner():
+        ran.set()
+        return {"summary": "must never run"}
+
+    executor = async_delegation._get_executor(1)
+    real_start = threading.Thread.start
+
+    def failing_start(self):
+        if self.name == "async-delegate_0":
+            raise RuntimeError("injected: OS refused to start the worker thread")
+        return real_start(self)
+
+    monkeypatch.setattr(threading.Thread, "start", failing_start)
+    try:
+        handle = async_delegation.dispatch_async_delegation(
+            goal="test", context=None, toolsets=None, role="leaf", model=None,
+            session_key="test", runner=runner, max_async_children=1)
+    finally:
+        monkeypatch.setattr(threading.Thread, "start", real_start)
+
+    assert handle["status"] == "rejected"
+    assert handle.get("reason") is None, handle  # a clean rejection: confirmed, it will never run
+    assert async_delegation.active_count() == 0
+    assert async_delegation._records == {}, "the forgotten record must really be gone"
+    assert executor._work_queue.empty(), "the discarded item must be removed, not left behind"
+
+    # Don't just trust the empty queue: start a real worker and let it drain anything still there.
+    done = threading.Event()
+    executor.submit(lambda: done.set())
+    assert done.wait(5)
+    assert not ran.is_set(), "the discarded work item ran anyway"
+
+
+def test_submit_failure_after_a_real_dequeue_keeps_the_record_and_delivers_once(registry_state, monkeypatch):
+    """R-ASYNC-SUBMIT sibling: when the queue does NOT contain the item (something else already dequeued
+    it -- it may be running right now), the old code called ``_forget_unsubmitted`` unconditionally
+    BEFORE even checking the queue, so the record (and the completion routing it carries) was gone by
+    the time the real run finished: ``_finalize`` no-ops on a missing record and the result is silently
+    lost. Reproduced with the REAL queue and the REAL wrapped callable chain: pull the genuine queued
+    ``_WorkItem`` off ``executor._work_queue`` ourselves and run it for real on our own thread -- exactly
+    what a stdlib worker loop does after a successful dequeue -- before the thread-start step "fails",
+    mirroring a worker-start failure that lost a genuine race to an existing thread."""
+    executor = async_delegation._get_executor(1)
+    started = threading.Event()
+    release = threading.Event()
+
+    def runner():
+        started.set()
+        assert release.wait(10)
+        return {"summary": "ran for real"}
+
+    real_adjust_thread_count = executor._adjust_thread_count
+
+    def steal_then_fail():
+        item = executor._work_queue.get_nowait()
+        threading.Thread(target=item.run, daemon=True).start()
+        raise RuntimeError("injected: thread start failed after something else already dequeued the item")
+
+    monkeypatch.setattr(executor, "_adjust_thread_count", steal_then_fail)
+    try:
+        handle = async_delegation.dispatch_async_delegation(
+            goal="test", context=None, toolsets=None, role="leaf", model=None,
+            session_key="test", runner=runner, max_async_children=1)
+    finally:
+        monkeypatch.setattr(executor, "_adjust_thread_count", real_adjust_thread_count)
+
+    assert handle["status"] == "rejected"
+    assert handle.get("reason") == "raised", handle  # uncertain, not a confirmed clean rejection
+    assert started.wait(5), "the real work item (stolen off the real queue) never actually ran"
+    # The record must still be alive while the real run is in flight -- not forgotten out from under it.
+    assert async_delegation.active_count() == 1
+
+    release.set()
+    completion = registry_state.get(timeout=5)
+    assert completion["summary"] == "ran for real"
+    assert async_delegation.active_count() == 0
+
+
+def test_partial_batch_submit_failure_after_real_run_is_outcome_uncertain_not_not_started(
+    registry_state, monkeypatch, tmp_path,
+):
+    """R-ASYNC-SUBMIT batch sibling (the reviewer's second probe): a later independent-completions unit's
+    own submission genuinely ran the real child (dequeued and executed before the late thread-start
+    failure surfaced) -- ``not_started`` promises a task that never ran and would invite the model to
+    resend one that already ran once. It must be reported ``outcome_uncertain``, never ``not_started``,
+    and must not also be run inline on top of the real run."""
+    (tmp_path / "config.yaml").write_text(
+        "delegation:\n  max_concurrent_children: 3\n  worktree_isolation: false\n"
+        "  independent_completions: true\n",
+        encoding="utf-8",
+    )
+    from tools.delegate_tool_dispatch import _run_batch
+
+    parent = _Parent()
+    first, second = _QuickChild(), _QuickChild()
+    first.session_id += "-first"
+    second.session_id += "-second"
+    batch = _batch(parent, first, second)
+
+    executor = async_delegation._get_executor(3)
+    real_submit = executor.submit
+    calls: list = []
+
+    def flaky_submit(fn, *a, **kw):
+        calls.append(1)
+        future = real_submit(fn, *a, **kw)
+        if len(calls) == 2:
+            future.result(timeout=5)  # the real work item has already run by the time submit() "fails"
+            raise RuntimeError("injected: thread start failed after the work item was already queued")
+        return future
+
+    monkeypatch.setattr(executor, "submit", flaky_submit)
+    try:
+        result = json.loads(_run_batch(batch, background=True))
+    finally:
+        monkeypatch.setattr(executor, "submit", real_submit)
+
+    assert len(calls) == 2, "the test did not exercise both units' submission"
+    assert result.get("status") == "dispatched", result
+    assert "not_started" not in result, result
+    assert "inline_results" not in result, "the already-run unit must not also run inline"
+    uncertain = result.get("outcome_uncertain")
+    assert uncertain and len(uncertain) == 1, result
+    assert uncertain[0]["task_index"] == 1 and uncertain[0]["outcome_uncertain"] is True, uncertain
+    assert first.finished.wait(5) and second.finished.wait(5)
+    assert first.run_count == 1 and second.run_count == 1, "a task ran more than once"
+    completions = [registry_state.get(timeout=5) for _ in range(2)]
+    assert all(c["results"][0]["status"] == "completed" for c in completions), completions
+
+
+def test_retained_ambiguous_worker_releases_retirement_reservation_after_real_exit(registry_state, monkeypatch):
+    """R-RETAINED-LIFECYCLE (gpt-6.1-sol BLOCKER): the retained/ambiguous branch of
+    ``_dispatch_admitted`` acquires a retirement reservation BEFORE ``submit()``, but used to release
+    it only via ``future.add_done_callback`` -- installed AFTER ``submit()`` returns. When ``submit()``
+    raises on a work item that was actually dequeued by another thread and is running for real (the
+    same scenario as ``test_submit_failure_after_a_real_dequeue_keeps_the_record_and_delivers_once``),
+    no ``future`` was ever obtained, so no callback was ever installed: the reservation leaked
+    permanently and the stale monitor was never armed for the retained record either (the old code
+    returned before reaching the ``_ensure_stale_monitor`` call). Reproduced with the real executor,
+    a stolen/really-run work item, and the real ``RetirementFence``."""
+    from hermes_cli import backend_retirement
+
+    fence = backend_retirement.RetirementFence()
+    monkeypatch.setattr(backend_retirement, "retirement", fence)
+
+    real_ensure_monitor = async_delegation._ensure_stale_monitor
+    monitor_calls: list = []
+
+    def counting_monitor():
+        monitor_calls.append(1)
+        return real_ensure_monitor()
+
+    monkeypatch.setattr(async_delegation, "_ensure_stale_monitor", counting_monitor)
+
+    executor = async_delegation._get_executor(1)
+    started = threading.Event()
+    release = threading.Event()
+
+    def runner():
+        started.set()
+        assert release.wait(10)
+        return {"summary": "ran for real"}
+
+    real_adjust_thread_count = executor._adjust_thread_count
+
+    def steal_then_fail():
+        item = executor._work_queue.get_nowait()
+        threading.Thread(target=item.run, daemon=True).start()
+        raise RuntimeError("injected: thread start failed after something else already dequeued the item")
+
+    monkeypatch.setattr(executor, "_adjust_thread_count", steal_then_fail)
+    try:
+        handle = async_delegation.dispatch_async_delegation(
+            goal="test", context=None, toolsets=None, role="leaf", model=None, session_key="test",
+            runner=runner, max_async_children=1, progress_fn=lambda: ("tok", False))
+    finally:
+        monkeypatch.setattr(executor, "_adjust_thread_count", real_adjust_thread_count)
+
+    assert handle["status"] == "rejected" and handle.get("reason") == "raised", handle
+    assert started.wait(5), "the stolen work item never actually ran"
+    assert async_delegation.active_count() == 1
+    assert fence.active_count() == 1, "the worker reservation must still be held while it's actually running"
+    assert monitor_calls, "the retained record was never armed with the stale monitor"
+
+    release.set()
+    completion = registry_state.get(timeout=5)
+    assert completion["summary"] == "ran for real"
+    assert async_delegation.active_count() == 0
+    deadline = time.monotonic() + 5
+    while fence.active_count() != 0 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert fence.active_count() == 0, "retirement reservation leaked after the retained worker really exited"
+
+
+def test_prequeue_submit_failure_is_not_treated_as_ambiguous(registry_state, monkeypatch):
+    """R-PREQUEUE-PHANTOM (gpt-6.1-sol BLOCKER): ``_discard_queued_work_item`` not finding our item in
+    the queue was treated as proof "something else already dequeued it" (ambiguous: may be running).
+    But submission can fail BEFORE the item is ever enqueued (e.g. the stdlib's own ``_WorkItem``
+    construction raising) -- then the queue scan ALSO finds nothing, for the opposite reason: the item
+    was never there to begin with. The old code could not tell the two apart and treated a proven,
+    permanent non-submission as ambiguous, leaking a `running` record, a capacity slot, and a
+    retirement reservation forever. Reproduced by making the real stdlib work-item construction raise
+    (via ``DaemonThreadPoolExecutor.submit``'s own ``_WorkItem`` call) before anything reaches the
+    queue."""
+    from concurrent.futures import thread as cf_thread
+    from hermes_cli import backend_retirement
+
+    fence = backend_retirement.RetirementFence()
+    monkeypatch.setattr(backend_retirement, "retirement", fence)
+
+    ran = threading.Event()
+
+    def runner():
+        ran.set()
+        return {"summary": "must never run"}
+
+    executor = async_delegation._get_executor(1)
+    real_work_item = cf_thread._WorkItem
+
+    def failing_work_item(*args, **kwargs):
+        raise MemoryError("injected: allocation failed before the item reached the queue")
+
+    monkeypatch.setattr(cf_thread, "_WorkItem", failing_work_item)
+    try:
+        handle = async_delegation.dispatch_async_delegation(
+            goal="test", context=None, toolsets=None, role="leaf", model=None, session_key="test",
+            runner=runner, max_async_children=1)
+    finally:
+        monkeypatch.setattr(cf_thread, "_WorkItem", real_work_item)
+
+    assert handle["status"] == "rejected"
+    assert handle.get("reason") is None, handle  # a proven clean rejection, never "raised"/ambiguous
+    assert async_delegation.active_count() == 0, "the phantom record must not be retained"
+    assert async_delegation._records == {}, "the forgotten record must really be gone"
+    assert fence.active_count() == 0, "the retirement reservation must not be leaked"
+    assert executor._work_queue.empty(), "nothing was ever queued"
+
+    # Prove a healthy dispatch at the same capacity still works and the slot was really freed.
+    done = threading.Event()
+
+    def ok_runner():
+        done.set()
+        return {"summary": "ok"}
+
+    handle2 = async_delegation.dispatch_async_delegation(
+        goal="test2", context=None, toolsets=None, role="leaf", model=None, session_key="test",
+        runner=ok_runner, max_async_children=1)
+    assert handle2["status"] == "dispatched", handle2
+    assert registry_state.get(timeout=5)["summary"] == "ok"
+    assert not ran.is_set(), "the phantom work item ran anyway"
+
+
+def _fail_nth_call(real, n, message):
+    """Wrap *real* so its *n*-th call raises ``MemoryError`` (a transient allocation failure) and every
+    other call -- before and after -- runs the real operation."""
+    calls = []
+
+    def wrapper(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == n:
+            raise MemoryError(message)
+        return real(*args, **kwargs)
+
+    return wrapper, calls
+
+
+def _inject_prequeue_failure(monkeypatch, site, fence):
+    """Make one real pre-enqueue step of a dispatch fail. Every site runs AFTER the record, its ledger row
+    and its capacity slot exist and BEFORE the work item reaches the executor's ``_work_queue``."""
+    from tools import daemon_pool
+
+    if site == "pool_context_capture":  # DaemonThreadPoolExecutor.submit's own copy_context()
+        failing, calls = _fail_nth_call(daemon_pool.copy_context, 1, "injected: pool context capture")
+        monkeypatch.setattr(daemon_pool, "copy_context", failing)
+    elif site == "parent_wrapper":  # propagate_context_to_thread(_worker), built before submit() is called
+        failing, calls = _fail_nth_call(async_delegation.propagate_context_to_thread, 1, "injected: parent wrapper")
+        monkeypatch.setattr(async_delegation, "propagate_context_to_thread", failing)
+    elif site == "executor_lookup":  # _get_executor(), right after the ledger row is persisted
+        failing, calls = _fail_nth_call(async_delegation._get_executor, 1, "injected: executor lookup")
+        monkeypatch.setattr(async_delegation, "_get_executor", failing)
+    elif site == "worker_reservation":  # the worker's own retirement.acquire() (call 1 is the outer dispatch's)
+        failing, calls = _fail_nth_call(fence.acquire, 2, "injected: worker reservation")
+        monkeypatch.setattr(fence, "acquire", failing)
+    else:
+        raise AssertionError(site)
+    return calls
+
+
+def _ledger_rows():
+    conn = async_delegation._connect()
+    try:
+        return conn.execute("SELECT delegation_id, state FROM async_delegations").fetchall()
+    finally:
+        conn.close()
+
+
+_PREQUEUE_SITES = ["pool_context_capture", "parent_wrapper", "executor_lookup", "worker_reservation"]
+
+
+def _assert_nothing_leaked(fence, executor_before):
+    assert async_delegation.active_count() == 0, "the phantom record still holds a capacity slot"
+    assert async_delegation._records == {}, "the forgotten record must really be gone"
+    assert _ledger_rows() == [], "a 'running' ledger row was left behind for a unit that never queued"
+    assert fence.active_count() == 0, "the retirement reservation leaked"
+    executor = async_delegation._executor or executor_before
+    assert executor is None or executor._work_queue.empty(), "nothing should have reached the queue"
+
+
+def _assert_capacity_recovered(registry_state):
+    done = threading.Event()
+
+    def ok_runner():
+        done.set()
+        return {"summary": "healthy"}
+
+    handle = async_delegation.dispatch_async_delegation(
+        goal="healthy", context=None, toolsets=None, role="leaf", model=None, session_key="test",
+        runner=ok_runner, max_async_children=1)
+    assert handle["status"] == "dispatched", f"the slot was never freed: {handle}"
+    assert registry_state.get(timeout=5)["summary"] == "healthy"
+    assert done.is_set()
+
+
+@pytest.mark.parametrize("site", _PREQUEUE_SITES)
+def test_every_prequeue_failure_phase_is_a_clean_single_rejection(registry_state, monkeypatch, site):
+    """R-PREQUEUE-PHANTOM round 2: the ``_WorkItem`` allocation was the only pre-enqueue step tagged
+    ``never_enqueued``. A failure at any EARLIER step -- the pool's own context capture, the parent
+    context wrapper, the executor lookup, or the worker's retirement reservation -- also leaves the queue
+    empty with nothing running, but fell into the ambiguous branch (or straight out of dispatch): the
+    record, its ledger row, its capacity slot and its retirement reservation were held forever and a
+    later healthy dispatch was rejected at capacity."""
+    from hermes_cli import backend_retirement
+
+    fence = backend_retirement.RetirementFence()
+    monkeypatch.setattr(backend_retirement, "retirement", fence)
+    executor_before = async_delegation._executor
+    ran = threading.Event()
+
+    def runner():
+        ran.set()
+        return {"summary": "must never run"}
+
+    calls = _inject_prequeue_failure(monkeypatch, site, fence)
+    handle = async_delegation.dispatch_async_delegation(
+        goal="test", context=None, toolsets=None, role="leaf", model=None, session_key="test",
+        runner=runner, max_async_children=1)
+    assert calls, "the injected site was never reached"
+
+    assert handle["status"] == "rejected", handle
+    assert handle.get("reason") is None, handle  # proven clean: it was never queued, so it can never run
+    _assert_nothing_leaked(fence, executor_before)
+    _assert_capacity_recovered(registry_state)
+    assert not ran.is_set(), "the never-queued work item ran anyway"
+
+
+@pytest.mark.parametrize("site", _PREQUEUE_SITES)
+def test_every_prequeue_failure_phase_is_a_clean_batch_rejection(registry_state, monkeypatch, site):
+    """R-PREQUEUE-PHANTOM round 2, batch dispatch: the same pre-enqueue failures must be a confirmed
+    non-start (the batch then runs inline exactly once, as for any clean rejection) -- never
+    ``outcome_uncertain`` with the unit's record, ledger row, slot and reservation leaked."""
+    from hermes_cli import backend_retirement
+    from tools.delegate_tool_dispatch import _run_batch
+
+    fence = backend_retirement.RetirementFence()
+    monkeypatch.setattr(backend_retirement, "retirement", fence)
+    executor_before = async_delegation._executor
+    parent, child = _Parent(), _QuickChild()
+
+    calls = _inject_prequeue_failure(monkeypatch, site, fence)
+    result = json.loads(_run_batch(_batch(parent, child), background=True))
+    assert calls, "the injected site was never reached"
+
+    assert not result.get("outcome_uncertain"), result
+    assert "outcome_uncertain" not in json.dumps(result), result
+    assert child.run_count == 1, "a confirmed non-start runs inline exactly once"
+    _assert_nothing_leaked(fence, executor_before)
+    _assert_capacity_recovered(registry_state)
+
+
+def test_finalize_failure_still_releases_the_worker_reservation(registry_state, monkeypatch):
+    """R-FINALIZER-RESERVATION (gpt-6.1-sol BLOCKER, round 3): moving reservation release off the
+    Future callback and into the worker's own ``finally`` put ``_finalize(...)`` BEFORE
+    ``_release_worker_reservation()`` with no guard between them -- a ``_finalize`` that raises
+    (e.g. while pruning completed records) skips the release entirely, leaking the reservation
+    forever even though the worker genuinely exited and its completion was delivered."""
+    from hermes_cli import backend_retirement
+
+    fence = backend_retirement.RetirementFence()
+    monkeypatch.setattr(backend_retirement, "retirement", fence)
+
+    real_finalize = async_delegation._finalize
+
+    def failing_finalize(delegation_id, result, status):
+        real_finalize(delegation_id, result, status)
+        raise MemoryError("injected: _finalize itself raised after doing its real work")
+
+    monkeypatch.setattr(async_delegation, "_finalize", failing_finalize)
+
+    handle = async_delegation.dispatch_async_delegation(
+        goal="test", context=None, toolsets=None, role="leaf", model=None, session_key="test",
+        runner=lambda: {"summary": "done"}, max_async_children=1)
+    assert handle["status"] == "dispatched"
+
+    completion = registry_state.get(timeout=5)
+    assert completion["summary"] == "done"
+    assert async_delegation.active_count() == 0
+
+    deadline = time.monotonic() + 5
+    while fence.active_count() != 0 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert fence.active_count() == 0, "retirement reservation leaked after a raising _finalize"

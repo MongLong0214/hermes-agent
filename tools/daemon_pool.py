@@ -14,6 +14,7 @@ from __future__ import annotations
 import threading
 import weakref
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import thread as _cf_thread
 from concurrent.futures.thread import _worker
 from contextvars import copy_context
 
@@ -29,11 +30,47 @@ class DaemonThreadPoolExecutor(ThreadPoolExecutor):
         drops profile secret scope / HERMES_HOME override — under the multiplexed
         gateway a credential read then fails closed with ``UnscopedSecretError``.
         Unconditional: on 3.14+ ``ctx.run`` re-applies the same context (no-op)."""
-        ctx = copy_context()
+        # Reimplemented (not delegated to ``super().submit``) so a caller whose submit() raises can
+        # tell a PROVEN-safe failure from an ambiguous one. Every step that can raise BEFORE the
+        # work item reaches ``_work_queue`` -- this context capture and wrapper, the shutdown
+        # checks, the Future/_WorkItem construction, the ``put`` itself -- tags the exception
+        # ``exc.never_enqueued = True``: the item will never run, full stop. A failure from
+        # ``_adjust_thread_count()`` happens AFTER a successful ``put``: the item is irreversibly
+        # queued and an idle thread may dequeue and run it before the caller's except block even
+        # starts, so it is left untagged (the caller must scan ``_work_queue`` by identity instead,
+        # see ``async_delegation._discard_queued_work_item``). The tagging wraps only those steps,
+        # never the lock scope: ``_adjust_thread_count()`` stays under ``_shutdown_lock`` and the
+        # stdlib's ``_global_shutdown_lock`` exactly as in ``ThreadPoolExecutor.submit``, which is
+        # what keeps concurrent submits from each spawning a worker past ``max_workers`` and
+        # ``shutdown(wait=True)`` from returning before an admitted item's worker is registered.
+        try:
+            ctx = copy_context()
 
-        def _run_with_context(*call_args, **call_kwargs):
-            return ctx.run(fn, *call_args, **call_kwargs)
-        return super().submit(_run_with_context, *args, **kwargs)
+            def _run_with_context(*call_args, **call_kwargs):
+                return ctx.run(fn, *call_args, **call_kwargs)
+            # A caller that loses its Future to a submit() failure must still be able to find its
+            # own item sitting in ``_work_queue`` by identity. ``fn`` is what it actually submitted,
+            # so expose it the way ``functools.wraps`` would -- ``inspect.unwrap`` sees through it.
+            _run_with_context.__wrapped__ = fn
+        except Exception as exc:  # noqa: BLE001 — tag-and-reraise, not a handled error
+            exc.never_enqueued = True
+            raise
+        with self._shutdown_lock, _cf_thread._global_shutdown_lock:
+            try:
+                if self._broken:
+                    raise _cf_thread.BrokenThreadPool(self._broken)
+                if self._shutdown:
+                    raise RuntimeError('cannot schedule new futures after shutdown')
+                if _cf_thread._shutdown:
+                    raise RuntimeError('cannot schedule new futures after interpreter shutdown')
+                future = _cf_thread._base.Future()
+                work_item = _cf_thread._WorkItem(future, _run_with_context, args, kwargs)
+                self._work_queue.put(work_item)
+            except Exception as exc:  # noqa: BLE001 — tag-and-reraise, not a handled error
+                exc.never_enqueued = True
+                raise
+            self._adjust_thread_count()
+            return future
 
     def _adjust_thread_count(self) -> None:
         # Mirrors CPython's implementation with two changes:

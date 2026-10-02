@@ -10,6 +10,7 @@ crash-recovery wiring. Only the async lifecycle lives here; the child run is an 
 from __future__ import annotations
 
 import contextvars
+import inspect
 import json
 import logging
 import os
@@ -595,7 +596,12 @@ def _discard_queued_work_item(executor, fn) -> Optional[bool]:
     identity) and discard it without running it. True if found and discarded, False if the queue
     was inspectable and did not contain it (something else already dequeued it), None if the
     executor exposes no queue to inspect (a test double, or a future stdlib change) -- callers
-    must treat None the same as "assume nothing is ambiguous", the historical, simpler behavior."""
+    must treat None the same as "assume nothing is ambiguous", the historical, simpler behavior.
+
+    A queued item's ``.fn`` is never *fn* itself: ``DaemonThreadPoolExecutor.submit`` wraps it in
+    its own context closure, which itself wrapped whatever ``propagate_context_to_thread`` returned
+    for *fn*. Both wrapper layers set ``__wrapped__`` (see those modules), so ``inspect.unwrap``
+    sees through all of them to the real target the caller is looking for."""
     work_queue = getattr(executor, "_work_queue", None)
     if work_queue is None:
         return None
@@ -604,7 +610,7 @@ def _discard_queued_work_item(executor, fn) -> Optional[bool]:
     try:
         while True:
             item = work_queue.get_nowait()
-            if not found and getattr(item, "fn", None) is fn:
+            if not found and inspect.unwrap(getattr(item, "fn", None)) is fn:
                 found = True
                 continue  # drop it: never run
             drained.append(item)
@@ -775,21 +781,23 @@ def _dispatch_admitted(
         "_context": contextvars.copy_context(),
         # Stale-monitor bookkeeping (see _stale_monitor_loop).
         "_progress_token": None, "_progress_ts": dispatched_at, "_interrupted_at": None}
-    with _records_lock:
-        active_slots = {r.get("slot_key") or r["delegation_id"] for r in _records.values() if r.get("status") in _ACTIVE_STATES}
-        if record["slot_key"] not in active_slots and len(active_slots) >= max_async_children:
-            return {"status": "rejected", "error": capacity_error}
-        _records[delegation_id] = record
-        live_units = sum(1 for r in _records.values() if r.get("status") in _LIVE_STATES)
-    try:
-        _persist_dispatch(record)
-    except Exception as exc:  # noqa: BLE001 — a locked/full state.db must not strand the slot
-        _forget_unsubmitted(delegation_id)
-        # ``reason`` tells callers this is not a full pool: running the work inline instead would hide the failure.
-        return {"status": "rejected", "reason": "persistence", "error": f"Failed to persist async delegation{label}: {exc}"}
-    # Units of one call share a slot, so live units can exceed slots: size the pool by units or a
-    # unit queues behind a full pool and the stale monitor kills it before its child ever starts.
-    executor = _get_executor(max(max_async_children, live_units))
+    # Everything the hand-off needs that does not depend on admission is built BEFORE the record exists:
+    # a failure here (even a failed allocation) leaves nothing to release.
+    from hermes_cli.backend_retirement import retirement
+
+    # The worker's own exit is the only proof retirement can trust: the stall monitor may force-
+    # finalize this record before the real runner thread unwinds (PR65, `_finalize` alone is not
+    # enough), and the ambiguous branch below can leave `_worker` genuinely running on a thread
+    # that dequeued it despite `submit()` raising. Releasing from `_worker`'s own `finally` --
+    # guarded to fire exactly once -- is correct on every path: it is the only place that is
+    # guaranteed to run if and only if the worker really executes.
+    _reservation_released = False
+
+    def _release_worker_reservation() -> None:
+        nonlocal _reservation_released
+        if not _reservation_released:
+            _reservation_released = True
+            retirement.release()
 
     def _worker() -> None:
         result: Dict[str, Any] = {}
@@ -806,33 +814,75 @@ def _dispatch_admitted(
             logger.exception(f"Async delegation{label} %s crashed", delegation_id)
             result = crash_result(f"{type(exc).__name__}: {exc}", round(time.time() - dispatched_at, 2))
         finally:
-            _finalize(delegation_id, result, status)
+            try:
+                _finalize(delegation_id, result, status)
+            finally:
+                # Always release, even if _finalize itself raises (e.g. pruning completed
+                # records) -- a raised _finalize must not leave retirement's reservation held
+                # forever (R-FINALIZER-RESERVATION): the worker genuinely exited either way.
+                _release_worker_reservation()
 
-    from hermes_cli.backend_retirement import retirement
-
-    # The outer dispatch reservation prevents a freeze during this handoff. Retain a worker
-    # reservation too: the stall monitor may finalize its registry record before it really exits.
-    retirement.acquire()
+    with _records_lock:
+        active_slots = {r.get("slot_key") or r["delegation_id"] for r in _records.values() if r.get("status") in _ACTIVE_STATES}
+        if record["slot_key"] not in active_slots and len(active_slots) >= max_async_children:
+            return {"status": "rejected", "error": capacity_error}
+        _records[delegation_id] = record
+        live_units = sum(1 for r in _records.values() if r.get("status") in _LIVE_STATES)
     try:
-        future = executor.submit(propagate_context_to_thread(_worker))
-        future.add_done_callback(lambda _: retirement.release())
-    except Exception as exc:  # pragma: no cover — pool submit failure is rare
-        retirement.release()
+        _persist_dispatch(record)
+    except Exception as exc:  # noqa: BLE001 — a locked/full state.db must not strand the slot
         _forget_unsubmitted(delegation_id)
+        # ``reason`` tells callers this is not a full pool: running the work inline instead would hide the failure.
+        return {"status": "rejected", "reason": "persistence", "error": f"Failed to persist async delegation{label}: {exc}"}
+    ambiguous = False
+    dispatch_error = None
+    worker_reserved = False
+    # Flips the instant submit() is entered. Before that, nothing can have reached the pool's queue: a
+    # failure in the executor lookup, the worker reservation or the parent-context wrapper is a proven
+    # non-submission exactly like a submit() raising ``never_enqueued`` (see DaemonThreadPoolExecutor).
+    in_submit = False
+    executor = None
+    try:
+        # Units of one call share a slot, so live units can exceed slots: size the pool by units or a
+        # unit queues behind a full pool and the stale monitor kills it before its child ever starts.
+        executor = _get_executor(max(max_async_children, live_units))
+        # The outer dispatch reservation prevents a freeze during this handoff. Retain a worker
+        # reservation too: the stall monitor may finalize its registry record before it really exits.
+        retirement.acquire()
+        worker_reserved = True
+        task = propagate_context_to_thread(_worker)
+        in_submit = True
+        executor.submit(task)
+    except Exception as exc:  # pragma: no cover — pool submit failure is rare
+        dispatch_error = f"Failed to schedule async delegation{label}: {exc}"
         # ThreadPoolExecutor.submit() enqueues the work item BEFORE it tries to start a new worker
         # thread, so a failure in that later step (e.g. the OS refusing a new thread) does not mean
         # the task never ran -- an existing or newly-spawned thread can still dequeue and execute it
-        # for real while we report "rejected". Drain the pool's own queue looking for our item: if
-        # it is still sitting there, discard it and report a clean rejection (nothing will ever run
-        # it, same as a submit() that failed before queuing anything -- a real ThreadPoolExecutor
-        # whose submit() raises for another reason, or a test double with no queue, behaves the
-        # same way). If it is NOT there, something already dequeued it, so the caller must not also
-        # run it inline (PR65-R5): tag the rejection "raised" the way an admission exception is.
-        ambiguous = _discard_queued_work_item(executor, _worker) is False
-        if ambiguous:
-            return {"status": "rejected", "reason": "raised",
-                    "error": f"Failed to schedule async delegation{label}: {exc}"}
-        return {"status": "rejected", "error": f"Failed to schedule async delegation{label}: {exc}"}
+        # for real while we report "rejected". ``never_enqueued`` (set by
+        # ``DaemonThreadPoolExecutor.submit``, see there) is PROOF the item never reached the queue
+        # at all -- a submit() that raised before ``_work_queue.put()`` (e.g. a failed allocation
+        # inside the stdlib's own work-item construction): skip the scan entirely, since there is
+        # nothing to find, and go straight to the clean rejection below. Without that proof, drain
+        # the pool's own queue looking for our item. Found => discard it and report a clean rejection
+        # (nothing will ever run it, same as a submit() that failed before queuing anything -- a real
+        # ThreadPoolExecutor whose submit() raises for another reason, or a test double with no queue,
+        # behaves the same way) -- only now is it safe to free the slot and the retirement reservation.
+        # Not found => something already dequeued it: it may be running right now, so the record and
+        # reservation stay untouched (a real completion still delivers through `_finalize`) and the
+        # caller must not also run it inline (PR65-R5): tag the rejection "raised" the way an admission
+        # exception is, instead of claiming a clean rejection we cannot actually back.
+        if not in_submit or getattr(exc, "never_enqueued", False):
+            ambiguous = False
+        else:
+            ambiguous = _discard_queued_work_item(executor, _worker) is False
+        if not ambiguous:
+            if worker_reserved:
+                _release_worker_reservation()
+            _forget_unsubmitted(delegation_id)
+            return {"status": "rejected", "error": dispatch_error}
+    # A retained ambiguous unit (the item may really be running `_worker` right now) is just as
+    # much "a running record with a progress_fn" as a cleanly-submitted one: arm the stale monitor
+    # for it too, or it is retained forever with no monitor watching it.
     if progress_fn is not None:
         try:
             _ensure_stale_monitor()
@@ -842,6 +892,8 @@ def _dispatch_admitted(
             # one included, so it is only unmonitored in between.
             logger.warning(f"Async delegation{label} %s: failed to start the stale monitor; it stays unmonitored "
                            "until the next dispatch retries", delegation_id, exc_info=True)
+    if ambiguous:
+        return {"status": "rejected", "reason": "raised", "error": dispatch_error}
     return {"status": "dispatched", "delegation_id": delegation_id}
 
 

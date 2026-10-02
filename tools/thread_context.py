@@ -71,4 +71,9 @@ def propagate_context_to_thread(target: Callable) -> Callable:
 
         return ctx.run(_inner)
 
+    # Identify the real target through any number of further executor wrapper layers (e.g.
+    # DaemonThreadPoolExecutor.submit's own context wrapper) -- a caller that needs to find its
+    # own queued work item by identity (tools/async_delegation.py's submit-failure cleanup) must
+    # be able to unwrap down to *target* with ``inspect.unwrap``.
+    _runner.__wrapped__ = target
     return _runner

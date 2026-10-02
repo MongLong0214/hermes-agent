@@ -153,6 +153,139 @@ def test_worker_gets_initializer_when_executor_stores_initializer_fields(monkeyp
     assert (initializer, initargs) == (init, (1, 2))
 
 
+def _gate_worker_starts(monkeypatch, prefix, on_start):
+    """Run *on_start(thread)* just before each real ``Thread.start`` of a worker named *prefix*_N (then
+    start it for real). Only scheduling is controlled; the executor's own code runs unmodified."""
+    real_start = threading.Thread.start
+
+    def gated_start(self):
+        if self.name.startswith(prefix + "_"):
+            on_start(self)
+        return real_start(self)
+
+    monkeypatch.setattr(threading.Thread, "start", gated_start)
+
+
+def test_concurrent_submissions_never_create_more_workers_than_max_workers(monkeypatch):
+    """R-EXECUTOR-LOCKING: ``submit()`` must create and register its worker under the same locks as the
+    enqueue, the way the stdlib does. Hold the first worker's start open: a second, concurrent submit()
+    that is not serialized behind it sees zero registered threads and spawns a second worker even though
+    ``max_workers=1``."""
+    pool = DaemonThreadPoolExecutor(max_workers=1, thread_name_prefix="serial-probe")
+    starts = []
+    first_start = threading.Event()
+    second_start = threading.Event()
+
+    def on_start(thread):
+        starts.append(thread)
+        if len(starts) == 1:
+            first_start.set()
+            second_start.wait(1.0)  # a serialized second submit() can never get here while we wait
+        else:
+            second_start.set()
+
+    _gate_worker_starts(monkeypatch, "serial-probe", on_start)
+    release = threading.Event()
+    futures = []
+    submitters = [threading.Thread(target=lambda: futures.append(pool.submit(release.wait, 10)))
+                  for _ in range(2)]
+    try:
+        submitters[0].start()
+        assert first_start.wait(5)
+        submitters[1].start()
+        for t in submitters:
+            t.join(10)
+        assert len(futures) == 2
+        release.set()
+        assert all(f.result(timeout=10) is True for f in futures)
+        assert len(starts) == 1, f"max_workers=1 but {len(starts)} worker threads were started"
+        assert len(pool._threads) == 1
+    finally:
+        release.set()
+        pool.shutdown(wait=True)
+
+
+def test_shutdown_wait_waits_for_an_admitted_submission(monkeypatch):
+    """R-EXECUTOR-LOCKING: once submit() has admitted an item, ``shutdown(wait=True)`` must not return
+    until that item's worker exists and has run it. With worker creation outside the shutdown lock,
+    shutdown slipped in between the enqueue and the worker's registration, found no threads to join,
+    and returned with the admitted item still unrun."""
+    pool = DaemonThreadPoolExecutor(max_workers=1, thread_name_prefix="shutdown-probe")
+    in_start = threading.Event()
+    gate = threading.Event()
+
+    def on_start(_thread):
+        in_start.set()
+        assert gate.wait(10)
+
+    _gate_worker_starts(monkeypatch, "shutdown-probe", on_start)
+    ran = threading.Event()
+    observed = {}
+
+    def do_shutdown():
+        pool.shutdown(wait=True)
+        observed["ran_when_shutdown_returned"] = ran.is_set()
+
+    submitter = threading.Thread(target=pool.submit, args=(ran.set,))
+    stopper = threading.Thread(target=do_shutdown)
+    try:
+        submitter.start()
+        assert in_start.wait(5), "the admitted submission never reached its worker start"
+        stopper.start()
+        stopper.join(0.5)  # a correctly serialized shutdown is still blocked behind the submission here
+    finally:
+        gate.set()
+        submitter.join(10)
+        stopper.join(10)
+    assert not stopper.is_alive()
+    assert observed == {"ran_when_shutdown_returned": True}, (
+        "shutdown(wait=True) returned before the admitted submission's worker ran it")
+
+
+def test_failure_before_enqueue_is_tagged_never_enqueued(monkeypatch):
+    """Every step of submit() that can fail before the item reaches ``_work_queue`` -- including the
+    pool's own context capture, the very first thing it does -- must tag the exception
+    ``never_enqueued`` so a caller can release what it reserved for the item."""
+    pool = DaemonThreadPoolExecutor(max_workers=1)
+
+    def failing_copy_context():
+        raise MemoryError("injected: context capture")
+
+    monkeypatch.setattr(daemon_pool, "copy_context", failing_copy_context)
+    try:
+        try:
+            pool.submit(lambda: None)
+        except MemoryError as exc:
+            assert getattr(exc, "never_enqueued", False) is True
+        else:
+            raise AssertionError("submit() did not raise")
+        assert pool._work_queue.empty()
+        assert not pool._threads
+    finally:
+        pool.shutdown(wait=True)
+
+
+def test_worker_start_failure_after_enqueue_is_not_tagged_never_enqueued(monkeypatch):
+    """The opposite case: a worker-start failure happens AFTER the item is queued (an idle or later
+    worker can still run it), so it must stay untagged -- callers fall back to scanning the queue."""
+    pool = DaemonThreadPoolExecutor(max_workers=1, thread_name_prefix="start-fail-probe")
+
+    def on_start(_thread):
+        raise RuntimeError("injected: can't start new thread")
+
+    _gate_worker_starts(monkeypatch, "start-fail-probe", on_start)
+    try:
+        try:
+            pool.submit(lambda: None)
+        except RuntimeError as exc:
+            assert not getattr(exc, "never_enqueued", False)
+        else:
+            raise AssertionError("submit() did not raise")
+        assert pool._work_queue.qsize() == 1, "the item was queued before the worker start failed"
+    finally:
+        pool.shutdown(wait=False)
+
+
 def _repo_root():
     import pathlib
 
