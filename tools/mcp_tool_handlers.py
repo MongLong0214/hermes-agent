@@ -377,7 +377,9 @@ async def _track_inflight_rpc(server: Any, server_name: str, op: str, *, retry_s
             inflight.discard(task)
 
 
-async def _call_tool_racing_stdio_death(server, server_name: str, tool_name: str, args: dict):
+async def _call_tool_racing_stdio_death(
+    server, server_name: str, tool_name: str, args: dict, *, meta: Optional[Dict[str, Any]] = None,
+):
     """``session.call_tool`` that fails fast when the stdio child is/gets dead: pre-call (a dead
     child must not hold the slot for the full timeout) and mid-call (race against
     ``_watch_stdio_children``). Both raise :class:`_StdioChildExited` for the respawn path, which
@@ -391,7 +393,7 @@ async def _call_tool_racing_stdio_death(server, server_name: str, tool_name: str
             f"MCP stdio subprocess for '{server_name}' had already exited when the call was dispatched",
             in_flight=False,
         )
-    _call_coro = server.session.call_tool(tool_name, arguments=args)
+    _call_coro = server.session.call_tool(tool_name, arguments=args, meta=meta)
     _watch_children = getattr(server, "_watch_stdio_children", None)
     if not (inspect.iscoroutinefunction(_watch_children) and asyncio.iscoroutine(_call_coro)):
         # Stubbed sessions return a non-awaitable, or there is no child-watcher to race: plain await.
@@ -557,6 +559,13 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     op = f"tools/call {tool_name}"
 
     def _handler(args: dict, **kwargs) -> str:
+        from tools.mcp_call_provenance import build_call_provenance, strip_caller_provenance
+        # Host-derived call provenance (session/principal/delegation/lineage), never trusting
+        # caller- or model-supplied arguments: a server-side guard distinguishes this call's real
+        # origin from a request a model could otherwise forge by stuffing a convincing-looking
+        # "_meta" into its own tool call.
+        args = strip_caller_provenance(args)
+        call_provenance = build_call_provenance()
         # Security boundary: untrusted-server write tools need approval before ANY transport work (incl. lazy spawn).
         error = _trust_gate_check(server_name, tool_name) or _check_circuit_breaker(server_name)
         if error is not None:
@@ -572,7 +581,9 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             async with server._rpc_lock, _track_inflight_rpc(server, server_name, op, retry_safe=read_only):
                 server._pending_call_context = contextvars.copy_context()  # for the elicitation callback
                 try:
-                    result = await _call_tool_racing_stdio_death(server, server_name, tool_name, args)
+                    from tools.mcp_call_provenance import PROVENANCE_META_KEY
+                    result = await _call_tool_racing_stdio_death(
+                        server, server_name, tool_name, args, meta={PROVENANCE_META_KEY: call_provenance})
                 finally:
                     server._pending_call_context = None
             if getattr(server, "_mark_session_proven", None) is not None:  # round-trip done: transport healthy

@@ -34,6 +34,7 @@ from tools.delegate_tool_config import (  # noqa: F401
     _resolve_child_runtime, _resolve_delegation_credentials,
     _subagent_auto_approve, _subagent_auto_deny,
 )
+from tools.approval_context import as_delegation_hop
 from tools.delegate_tool_dispatch import _Batch, _announce_batch, _capture_origin, _run_batch
 from tools.delegate_tool_progress import (  # noqa: F401
     DelegateEvent, SUBAGENT_FAILURE_STATUSES, _batch_prefix, _build_child_progress_callback,
@@ -296,6 +297,9 @@ def _build_child_agent(
         )
     return child
 
+# MCP call provenance: every child run is one subagent hop, dispatched synchronously (the parent's own
+# thread) or from an async worker; the decorator restores the caller's depth however the run ends.
+@as_delegation_hop
 def _run_single_child(
     task_index: int, goal: str, child=None, parent_agent=None, *, owner_session_id: Optional[str] = None,
     owner_transport: Any = None, owner_session_record: Any = None, **_kwargs,

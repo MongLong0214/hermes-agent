@@ -54,6 +54,52 @@ def is_peer_turn() -> bool:
     return _turn_principal_ctx.get() == "peer"
 
 
+def get_turn_principal() -> str:
+    """The current turn's principal for provenance/observability: "owner" for an ordinary turn
+    (the ContextVar default, None, means nobody called set_turn_principal), or the bound value
+    (e.g. "peer")."""
+    return _turn_principal_ctx.get() or "owner"
+
+
+# How many async-delegation hops deep the current context is: 0 for an ordinary top-level turn,
+# N for the Nth-generation subagent. tools.thread_context.propagate_context_to_thread copies the
+# PARENT's contextvars into a delegated worker thread, so without an explicit bump here a subagent
+# tool call is indistinguishable from the top-level turn that dispatched it.
+_delegation_depth_ctx: contextvars.ContextVar[int] = contextvars.ContextVar("delegation_depth", default=0)
+
+
+def get_delegation_depth() -> int:
+    """0 for an ordinary turn; >0 while running inside an async-delegation subagent."""
+    return _delegation_depth_ctx.get()
+
+
+def bind_delegation_depth(depth: int) -> contextvars.Token:
+    """Bind the current context's delegation depth; pair with :func:`reset_delegation_depth`."""
+    return _delegation_depth_ctx.set(depth)
+
+
+def reset_delegation_depth(token: contextvars.Token) -> None:
+    _delegation_depth_ctx.reset(token)
+
+
+def as_delegation_hop(fn):
+    """Run *fn* one async-delegation hop deeper, restoring the caller's depth on every exit path.
+
+    A synchronous child runs on its PARENT's own thread and context, so an unrestored bump would leave
+    the parent (and every later sibling) reporting the child's depth -- the parent's own later MCP
+    calls would then claim to come from a subagent."""
+    import functools
+
+    @functools.wraps(fn)
+    def _hop(*args, **kwargs):
+        token = _delegation_depth_ctx.set(_delegation_depth_ctx.get() + 1)
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _delegation_depth_ctx.reset(token)
+    return _hop
+
+
 def set_hermes_interactive_context(interactive: bool) -> contextvars.Token:
     """Bind interactive mode for the current context instead of mutating os.environ."""
     return _hermes_interactive_ctx.set("1" if interactive else "")
