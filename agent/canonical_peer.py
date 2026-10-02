@@ -29,6 +29,13 @@ PEER_FIELDS = ("principal", "binding", "author_id", "channel_id", "event_id", "r
 PEER_ROW_LEDGER_PREFIX = "canonical-peer-row:v1:"
 PEER_PROVENANCE_INVALID = "canonical_peer_provenance_invalid"
 ENVELOPE_ESCAPE = "canonical_envelope_escape"
+# Set ONLY by a reader that has already authenticated ``api_content`` against the admission
+# ledger's sidecar digest (``hermes_state_messages.py::_require_admitted_peer``), by the live
+# turn's own sidecar stamp (``agent/turn_context.py::_stamp_api_content_sidecar`` — Hermes
+# composing its own context onto the in-memory dict, never data read back from storage), or by
+# code re-deriving a message from one of those. Never set by a row's own stored columns, so a
+# stored sidecar can never self-authenticate merely by being present: see :func:`peer_wire_text`.
+PEER_SIDECAR_VERIFIED_KEY = "_peer_sidecar_verified"
 _RECEIPT_PREFIX = "canonical-receipt:"
 _NONCE_RE = re.compile(r"[0-9a-f]{32}")
 _DIGEST_RE = re.compile(r"[0-9a-f]{64}")
@@ -115,29 +122,55 @@ def peer_metadata(msg: Any) -> Optional[dict[str, str]]:
     return validate_peer_metadata(meta[PEER_METADATA_KEY])
 
 
-def peer_wire_text(msg: Mapping[str, Any], *, with_sidecar: bool = True) -> str:
+def peer_wire_text(msg: Mapping[str, Any]) -> str:
     """The exact text a model receives for a peer-marked message.
 
     ``content`` is either the clean body (a row loaded from the store) or the rendering itself (the
-    live turn's own dict); the result is always the rendering of the metadata, optionally followed
-    by the per-turn context the live send appended after a blank line (kept from ``api_content`` so
-    replay stays byte-stable). Anything else is refused.
+    live turn's own dict); either way the fresh rendering is recomputed from it every call.
+
+    A stored ``api_content`` sidecar is used VERBATIM in place of the fresh rendering only when
+    ``msg[PEER_SIDECAR_VERIFIED_KEY]`` is set — a signal this function never sets itself and a
+    plain row load never carries, so a stored sidecar can never trust itself merely by starting
+    with the correct rendering (R-PEER-SIDECAR: the exact shape the old prefix-acceptance check
+    let through). Only the admission-ledger digest check in
+    ``hermes_state_messages.py::_require_admitted_peer`` — which alone can tell a genuine
+    Hermes-appended sidecar (memory/plugin/surface-switch context) from one a stored-row edit
+    tampered with — may set it, and only after that check passes; the live turn's own stamp sets
+    it on the in-memory dict it just composed (so same-turn and retained-history consumers of that
+    dict send the bytes the live request sent); code that re-derives a message
+    from an already-verified one (e.g. gateway replay's history rebuild) may carry the flag
+    forward, never originate it. Even then the sidecar must still be a well-formed extension of
+    this exact rendering (the correct header, the correct nonce, no foreign nonce) or it is
+    refused rather than trusted blindly.
     """
+    rendering, appended = _peer_wire_parts(msg)
+    return rendering + appended
+
+
+def peer_appended_context(msg: Mapping[str, Any]) -> str:
+    """Hermes' own context appended after a peer message's rendering in its trusted sidecar (memory,
+    plugin and surface-switch notes); "" when there is none or the sidecar is not trusted.
+
+    Never includes the rendering, so never the peer's quoted body: a reader looking for Hermes'
+    own notes (``agent/surface_switch.py``) must search only this, or a peer could forge one by
+    quoting its shape."""
+    return _peer_wire_parts(msg)[1]
+
+
+def _peer_wire_parts(msg: Mapping[str, Any]) -> tuple[str, str]:
+    """``(rendering, appended)`` of a peer-marked message; see :func:`peer_wire_text`."""
     peer = peer_metadata(msg)
     if peer is None:
         raise PeerProvenanceError()
     content = msg.get("content")
     if not isinstance(content, str):
         raise PeerProvenanceError()
-    rendered = content if _unrendered_body(peer, content) is not None else render_peer_turn(peer, content)
-    if not with_sidecar:
-        return rendered
+    rendering = content if _unrendered_body(peer, content) is not None else render_peer_turn(peer, content)
     sidecar = msg.get("api_content")
-    if isinstance(sidecar, str) and sidecar and sidecar != rendered:
-        if not sidecar.startswith(rendered + "\n\n"):
-            raise PeerProvenanceError()
-        return sidecar
-    return rendered
+    if (msg.get(PEER_SIDECAR_VERIFIED_KEY) and isinstance(sidecar, str) and sidecar.startswith(rendering)
+            and peer["nonce"] not in sidecar[len(rendering):]):
+        return rendering, sidecar[len(rendering):]
+    return rendering, ""
 
 
 def peer_body(msg: Mapping[str, Any]) -> str:
@@ -156,13 +189,43 @@ def content_digest(encoded_content: Any) -> str:
     return hashlib.sha256(raw.encode("utf-8", "surrogatepass")).hexdigest()
 
 
-def ledger_value(peer: Mapping[str, str], encoded_content: Any) -> str:
-    return json.dumps({"peer": validate_peer_metadata(peer), "content_sha256": content_digest(encoded_content)},
-                      ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+def sidecar_digest(api_content: str) -> str:
+    """Digest of a row's COMPLETE model-facing ``api_content`` sidecar, as the ledger records
+    it. Covers the whole string (rendering plus any Hermes-appended memory/plugin/surface-switch
+    context), so a reload can tell a genuine sidecar from one a stored-row edit tampered with."""
+    return hashlib.sha256(api_content.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def ledger_value(peer: Mapping[str, str], encoded_content: Any, *, api_content: Optional[str] = None) -> str:
+    """Admission record binding a row's ``content`` digest (always) and its ``api_content``
+    sidecar digest (when known at write time) into one ledger value. ``api_content=None`` omits
+    the sidecar digest — the row was admitted before any sidecar existed, or genuinely carries
+    none; :func:`rebind_sidecar` adds it later, in the same transaction as the sidecar write."""
+    return _ledger_json(validate_peer_metadata(peer), content_digest(encoded_content), api_content)
+
+
+def rebind_sidecar(record: Mapping[str, Any], api_content: Optional[str]) -> str:
+    """Re-serialize an existing admission *record* (as :func:`parse_ledger_value` returned it)
+    with *api_content*'s digest bound in, preserving ``peer`` and ``content_sha256`` unchanged.
+    For the backfill writers that stamp a peer row's ``api_content`` after admission — the
+    content digest they must never touch; only the sidecar digest is new."""
+    return _ledger_json(record["peer"], record["content_sha256"], api_content)
+
+
+def _ledger_json(peer: Mapping[str, str], content_sha256: str, api_content: Optional[str]) -> str:
+    record: dict[str, Any] = {"peer": peer, "content_sha256": content_sha256}
+    if api_content is not None:
+        record["sidecar_sha256"] = sidecar_digest(api_content)
+    return json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def parse_ledger_value(value: Any) -> dict[str, Any]:
     """The admission record a :func:`ledger_value` wrote, or :class:`PeerProvenanceError`.
+
+    ``sidecar_sha256`` is optional (absent on a row admitted before any sidecar existed, or on a
+    legacy row written before this field existed); its absence means "no authenticated sidecar
+    digest to check a stored sidecar against", never "the sidecar is valid" — callers must treat
+    it as ``None`` and fall back to the fresh rendering, not as a trusted empty value.
 
     An unreadable or malformed record is a provenance refusal, never a generic load failure a
     caller could mistake for an empty history. Every failure decoding or validating the record —
@@ -171,11 +234,17 @@ def parse_ledger_value(value: Any) -> dict[str, Any]:
     or validator happened to raise; a caller must never see anything else from this path."""
     try:
         record = json.loads(value)
-        if (not isinstance(record, dict) or set(record) != {"peer", "content_sha256"}
+        if (not isinstance(record, dict) or not {"peer", "content_sha256"} <= set(record)
+                or set(record) - {"peer", "content_sha256", "sidecar_sha256"}
                 or not isinstance(record["content_sha256"], str)
                 or not _DIGEST_RE.fullmatch(record["content_sha256"])):
             raise PeerProvenanceError()
-        return {"peer": validate_peer_metadata(record["peer"]), "content_sha256": record["content_sha256"]}
+        sidecar_sha256 = record.get("sidecar_sha256")
+        if sidecar_sha256 is not None and (
+                not isinstance(sidecar_sha256, str) or not _DIGEST_RE.fullmatch(sidecar_sha256)):
+            raise PeerProvenanceError()
+        return {"peer": validate_peer_metadata(record["peer"]), "content_sha256": record["content_sha256"],
+                "sidecar_sha256": sidecar_sha256}
     except PeerProvenanceError:
         raise
     except (TypeError, ValueError, RecursionError):
