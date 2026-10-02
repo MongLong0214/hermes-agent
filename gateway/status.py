@@ -1841,6 +1841,12 @@ _LEGACY_RECORD_ASSUMED_DRAIN_S = 300.0
 # way: the cron worker's argv (cron/scheduler.py) and the kanban worker's env (kanban_db_dispatch).
 _RESTART_SAFE_WORKER_ARG = "--external-worker-file"
 _RESTART_SAFE_WORKER_ENV = "HERMES_KANBAN_TASK"
+# The gateway's own detached restart watcher (see GatewayShutdownMixin._restart_watcher_env) is
+# deliberately started WITHOUT _HERMES_GATEWAY or the lineage token -- it must outlive the gateway
+# it is waiting to restart, so a takeover's reap must never catch it either (ROUND1-ESCAPE-1: it
+# was still being selected and killed because the cron/kanban-only predicate below did not
+# recognize it).
+_RESTART_WATCHER_ENV = "HERMES_RESTART_WATCHER"
 
 
 def takeover_exit_wait_s(pid_record: Optional[dict[str, Any]]) -> float:
@@ -1874,7 +1880,8 @@ def _is_restart_safe_worker_or_descendant(proc) -> bool:
     for candidate in chain:
         try:
             if (_RESTART_SAFE_WORKER_ARG in candidate.cmdline()
-                    or _RESTART_SAFE_WORKER_ENV in candidate.environ()):
+                    or _RESTART_SAFE_WORKER_ENV in candidate.environ()
+                    or _RESTART_WATCHER_ENV in candidate.environ()):
                 return True
         except Exception:
             continue
@@ -1905,18 +1912,25 @@ def gateway_lineage_survivors(
         me = psutil.Process()
         spared = {me.pid, *(p.pid for p in me.parents()), *(p.pid for p in me.children(recursive=True)),
                   *(getattr(p, "pid", None) for p in known)}
+        known_pids = {getattr(p, "pid", None) for p in known}
         for proc in psutil.process_iter() if lineage or legacy_scan else ():
             try:
                 if proc.pid in spared:
                     continue
-                env = proc.environ()
                 if lineage:
-                    matched = env.get(GATEWAY_LINEAGE_ENV) == lineage
+                    matched = proc.environ().get(GATEWAY_LINEAGE_ENV) == lineage
                 else:
-                    # create_time is coarse on some platforms; 1s of slack keeps the boundary in.
-                    matched = (env.get("_HERMES_GATEWAY") == "1" and proc.create_time() >= since - 1.0
-                               and _same_hermes_home(env.get("HERMES_HOME", "").strip()
-                                                     or _get_platform_default_hermes_home(), old_home))
+                    # No lineage token exists to prove ownership for a legacy record (R68-5: env
+                    # markers + home + a coarse creation-time window alone can match an unrelated
+                    # process that merely happens to share them -- an independently spawned orphan
+                    # carrying the same markers would be killed despite never belonging to the old
+                    # gateway). Require real OS-level ancestry instead: only a still-direct child of
+                    # one of the known old-gateway PIDs, caught before it is reparented to init. This
+                    # is strictly narrower than the old scan (a child already reparented by the time
+                    # this runs is missed, same as any best-effort reap), but it never signals a
+                    # process this gateway did not actually spawn.
+                    matched = (env_marker_ok := proc.environ().get("_HERMES_GATEWAY") == "1"
+                               ) and proc.ppid() in known_pids
                 if matched:
                     found.append(proc)
             except (psutil.Error, OSError):

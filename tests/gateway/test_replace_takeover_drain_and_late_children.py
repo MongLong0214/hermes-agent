@@ -394,8 +394,22 @@ async def test_takeover_reaps_late_children_and_spares_restart_safe_workers(
 
         early_pid, worker_pid, kanban_pid, late_pid = spawned[:] = map(
             int, out_path.read_text().split())
-        assert _wait_for(lambda: _gone(late_pid), timeout=10), (
-            "a child the old gateway created after SIGTERM survived the takeover")
+        if with_lineage:
+            assert _wait_for(lambda: _gone(late_pid), timeout=10), (
+                "a child the old gateway created after SIGTERM survived the takeover")
+        else:
+            # R68-5: a legacy record has no lineage token to prove ownership, so the late-child
+            # scan now requires real OS ancestry (still a direct child of the old gateway's PID at
+            # scan time) rather than env-marker + home + a coarse time window -- the latter could
+            # match an unrelated process and kill it (see
+            # test_takeover_spares_an_unrelated_process_with_matching_markers). By the time this
+            # scan runs the old gateway has already exited and late_pid has typically been
+            # reparented to init, so it is no longer provably this gateway's child and is correctly
+            # left alone: a known, accepted narrowing of R68-4's best-effort reach in exchange for
+            # never signalling a process this gateway did not actually spawn.
+            time.sleep(0.5)
+            assert not _gone(late_pid), (
+                "a legacy-record late child with no provable ancestry must be left alone, not killed")
         assert _wait_for(lambda: _gone(early_pid), timeout=10), "a pre-SIGTERM child survived"
         assert not _gone(worker_pid), (
             "a restart-safe worker already running before SIGTERM must outlive the takeover")
@@ -409,3 +423,82 @@ async def test_takeover_reaps_late_children_and_spares_restart_safe_workers(
                 os.kill(pid, 9)
             except ProcessLookupError:
                 pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["replace", "credential_lock"])
+async def test_takeover_spares_an_unrelated_process_with_matching_markers(monkeypatch, tmp_path, path):
+    """R68-5: a legacy record (no lineage token) cannot prove ownership through env markers and a
+    coarse creation-time window alone -- an independently spawned process that merely happens to
+    carry the same _HERMES_GATEWAY/HERMES_HOME markers, started in the same time window, must not
+    be mistaken for one of the old gateway's own children and killed."""
+    home = tmp_path / "home"
+    home.mkdir()
+    env = {k: v for k, v in os.environ.items() if k != _LINEAGE_ENV}
+    env.update({"_HERMES_GATEWAY": "1", "HERMES_HOME": str(home)})
+    ready_path = tmp_path / "old_ready"
+    old = subprocess.Popen(
+        [sys.executable, "-c",
+         f"open({str(ready_path)!r}, 'w').close(); import time; time.sleep(60)"], env=env)
+    # Independently spawned -- NOT a child of `old` -- but carries the same markers and starts in
+    # the same window, which is exactly what the legacy env-only scan used to match on.
+    unrelated = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"], env=dict(env))
+    try:
+        assert _wait_for(ready_path.exists), "the simulated old gateway never became ready"
+        record = _hand_built_record(home, pid=old.pid)
+        real_pid_exists = status._pid_exists
+        monkeypatch.setattr(
+            status, "_pid_exists",
+            lambda pid: old.poll() is None if pid == old.pid else real_pid_exists(pid))
+        if path == "replace":
+            monkeypatch.setenv("HERMES_HOME", str(home))
+            _stub_replace_io(monkeypatch, record)
+            from gateway import run as gateway_run
+            assert await gateway_run._start_gateway_replace_existing_instance(old.pid, True) is True
+        else:
+            (home / "gateway.pid").write_text(json.dumps(record))
+            replacer_home = tmp_path / "replacer"
+            replacer_home.mkdir()
+            monkeypatch.setenv("HERMES_HOME", str(replacer_home))
+            monkeypatch.setattr(
+                status, "_scoped_lock_owner_state",
+                lambda pid, start: "same" if old.poll() is None else "exited")
+            monkeypatch.setattr(
+                status, "_read_process_cmdline", lambda pid: "python -m hermes_cli.main gateway run")
+            assert status.take_over_scoped_lock_holder(record) == old.pid
+        time.sleep(1.0)  # give any (wrong) reap attempt a moment to land
+        assert not _gone(unrelated.pid), "an unrelated process with matching markers was killed"
+    finally:
+        for p in (old, unrelated):
+            if p.poll() is None:
+                p.kill()
+                p.wait(5)
+
+
+def test_restart_watcher_env_is_marked_restart_safe():
+    """ROUND1-ESCAPE-1: the gateway's own detached restart watcher has neither _HERMES_GATEWAY nor
+    a lineage token (by design -- it must outlive the gateway it is waiting to restart), so without
+    its own marker it was indistinguishable from an ordinary stray child and got reaped, defeating
+    the restart it exists to perform."""
+    from gateway.run_shutdown import GatewayShutdownMixin
+    from gateway.status import _RESTART_WATCHER_ENV, _is_restart_safe_worker_or_descendant
+
+    watcher_env = GatewayShutdownMixin._restart_watcher_env()
+    assert watcher_env.get(_RESTART_WATCHER_ENV) == "1"
+
+    class _FakeProc:
+        def __init__(self, env):
+            self._env = env
+
+        def parents(self):
+            return []
+
+        def cmdline(self):
+            return ["python", "-c", "..."]
+
+        def environ(self):
+            return self._env
+
+    assert _is_restart_safe_worker_or_descendant(_FakeProc(watcher_env))
+    assert not _is_restart_safe_worker_or_descendant(_FakeProc({}))
