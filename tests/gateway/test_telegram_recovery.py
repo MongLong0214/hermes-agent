@@ -312,3 +312,56 @@ async def test_disconnect_closes_transports_after_the_init_ladder_is_exhausted(m
     await asyncio.wait_for(adapter.disconnect(), timeout=10)
 
     assert all(request.closed for request in requests)
+
+
+@pytest.mark.asyncio
+async def test_recovery_edge_during_refund_commit_survives_cancellation(monkeypatch):
+    """Same race as the test above, but the redelivery task itself is cancelled right after the
+    handback commit resumes (not awaited to completion) — exactly what drops a reply if the shielded
+    recheck/spawn in ``_finish_degraded_refund`` is removed."""
+    import threading
+
+    from gateway import delivery_ledger as dl_module
+
+    adapter = _adapter()
+    runner, _primary = _runner(adapter)
+    generation, _ = adapter._begin_polling_generation()
+    oid = await _refuse_while_degraded(adapter)
+    assert _state(oid) == "failed"
+
+    generation, _ = adapter._begin_polling_generation()
+
+    entered_commit = threading.Event()
+    release_commit = threading.Event()
+    real_release_runtime_claim = dl_module.release_runtime_claim
+
+    def _paused_release_runtime_claim(*args, **kwargs):
+        entered_commit.set()
+        assert release_commit.wait(timeout=5), "test never released the paused handback commit"
+        return real_release_runtime_claim(*args, **kwargs)
+
+    monkeypatch.setattr(dl_module, "release_runtime_claim", _paused_release_runtime_claim)
+
+    redeliver = asyncio.ensure_future(runner._redeliver_failed_obligations_for_platform(Platform.TELEGRAM))
+    await asyncio.wait_for(asyncio.to_thread(entered_commit.wait), timeout=5)
+    assert adapter._record_polling_progress(generation) is True
+    await _drain(adapter)
+    adapter._bot.send_message.assert_not_awaited()
+
+    release_commit.set()
+    redeliver.cancel()  # cancel as the paused thread resumes, racing the shield's own completion
+    try:
+        await redeliver
+    except asyncio.CancelledError:
+        pass
+
+    # The shielded recheck/spawn must still complete even though the task awaiting it was cancelled.
+    for _ in range(200):
+        if getattr(runner, "_background_tasks", None):
+            break
+        await asyncio.sleep(0.02)
+    if getattr(runner, "_background_tasks", None):
+        await _drain(runner)
+    await _drain(adapter)
+
+    assert _state(oid) == "delivered", "cancelling the caller must not strand the shielded recovery spawn"
