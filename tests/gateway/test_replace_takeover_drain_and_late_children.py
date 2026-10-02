@@ -163,7 +163,12 @@ async def test_replace_still_force_kills_an_instance_that_never_exits(monkeypatc
 
     assert await gateway_run._start_gateway_replace_existing_instance(_OLD_PID, True) is True
     forced_at = [at for at, force in old.signals if force]
-    assert forced_at and forced_at[0] < 600, f"the forced kill must stay bounded: {old.signals}"
+    # A legacy record (no published stop_leash_s) cannot prove its owner's drain budget, so the
+    # takeover waits out a long conservative ceiling instead of a short guess (R68-3) -- but a
+    # genuinely hung owner must still be force-killed eventually, not waited on forever.
+    from gateway.status import _LEGACY_RECORD_ASSUMED_DRAIN_S
+    assert forced_at and forced_at[0] < _LEGACY_RECORD_ASSUMED_DRAIN_S + 600, (
+        f"the forced kill must stay bounded: {old.signals}")
 
 
 @pytest.mark.parametrize("published, exit_at", [
@@ -174,6 +179,9 @@ async def test_replace_still_force_kills_an_instance_that_never_exits(monkeypatc
     # Round-2 R68-3: an older build's record cannot prove its owner's budget, so this side's 0 s
     # drain (a 62 s wait) must not be taken as the owner's: it started with 50 s, exits at 90 s.
     (False, 90.0),
+    # Round-3 R68-3: the reviewer's own reproduction -- an older owner configured for a 600 s
+    # drain naturally exits at 450 s; the previous 300 s floor force-killed it at ~362 s.
+    (False, 450.0),
 ])
 def test_credential_lock_takeover_waits_out_the_owners_drain(
     monkeypatch, tmp_path, published, exit_at,

@@ -1836,7 +1836,15 @@ def reap_gateway_children(children: list, *, parent_pid: int, timeout: float = 5
 # started with (this process's config may have been edited since). Assume it drained at least this
 # long: a shorter real leash still ends it on its own watchdog, so only a wedged instance waits the
 # whole bound before SIGKILL. A legacy owner configured with a longer drain is still cut short.
-_LEGACY_RECORD_ASSUMED_DRAIN_S = 300.0
+# A legacy record (an older build that never published ``stop_leash_s``) cannot prove its owner's
+# real drain budget, and ``restart_drain_timeout`` has no configured upper bound -- any fixed guess
+# can still be shorter than what that owner was actually configured with, force-killing it mid-
+# drain (R68-3: an old owner configured for a 600s drain was SIGKILLed at ~362s under the previous
+# 300s floor, before its natural exit at ~450s). Refusing an unprovable short deadline outright is
+# the only floor that cannot be wrong in that direction; this one-hour ceiling keeps a genuinely
+# hung legacy owner from blocking the takeover forever, at the cost of a much longer wait in that
+# rare case -- a legacy record only exists on the first takeover after upgrading past this build.
+_LEGACY_RECORD_ASSUMED_DRAIN_S = 3600.0
 # Restart-safe workers are launched to outlive their gateway, and older builds mark them the same
 # way: the cron worker's argv (cron/scheduler.py) and the kanban worker's env (kanban_db_dispatch).
 _RESTART_SAFE_WORKER_ARG = "--external-worker-file"
@@ -1866,8 +1874,10 @@ def takeover_exit_wait_s(pid_record: Optional[dict[str, Any]]) -> float:
         except Exception:
             drain = DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
         leash = resolve_shutdown_watchdog_delay(max(drain, _LEGACY_RECORD_ASSUMED_DRAIN_S))
-        logger.info("Replaced gateway's PID record publishes no stop budget (older build); "
-                    "allowing it up to %.0fs to exit on its own before SIGKILL.", leash)
+        logger.warning("Replaced gateway's PID record publishes no stop budget (older build), so its "
+                       "real drain budget cannot be proven; allowing it up to %.0fs to exit on its own "
+                       "before SIGKILL rather than guessing a shorter deadline that could cut its drain "
+                       "short. If it is genuinely hung, stop it manually to proceed sooner.", leash)
     return float(leash) + LAUNCHD_WATCHDOG_DUMP_MARGIN_S
 
 
