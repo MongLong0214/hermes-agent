@@ -46,7 +46,7 @@ from hermes_constants import (  # noqa: F401
     apply_secure_dir_policy, get_managed_system)
 # Re-export from hermes_constants — canonical definition lives there.
 from hermes_constants import get_hermes_home, get_process_hermes_home  # noqa: F401
-from utils import atomic_replace, fast_safe_load, file_signature
+from utils import _fast_yaml_loader, atomic_replace, fast_safe_load, file_signature
 from hermes_cli.config_read_errors import (
     _CONFIG_PARSE_FAILURES, _FIX_PERMS, _FIX_YAML, FailedConfigRead, _backups_dir_display,
     _refuse_failed_read, _refuse_overwrite, _warn_config_parse_failure, _yaml_error_details,
@@ -434,14 +434,20 @@ def require_parseable_user_config(*, ignore_user_config: bool = False) -> None:
     try:
         with open(config_path, encoding="utf-8") as f:
             data = fast_safe_load(f)
+            explicit_null = data is None and _reread_is_explicit_null(f)
     except FileNotFoundError:
         return
     except Exception as exc:
         parse_error = exc
     else:
-        if data is None or isinstance(data, dict):
+        if explicit_null:
+            # Means "config is null", not "no config written yet" — reject like any other
+            # non-mapping root instead of conflating it with a legitimate first-run empty file.
+            parse_error = TypeError("top-level YAML value must be a mapping, got NoneType (explicit null)")
+        elif data is None or isinstance(data, dict):
             return
-        parse_error = TypeError(f"top-level YAML value must be a mapping, got {type(data).__name__}")
+        else:
+            parse_error = TypeError(f"top-level YAML value must be a mapping, got {type(data).__name__}")
 
     from hermes_cli.config_backups import backup_config
     backup_path = backup_config(config_path, "corrupt")
@@ -924,6 +930,7 @@ def _read_config_version_stamp(*, raise_on_parse_error: bool = False) -> Tuple[O
     try:
         with open(config_path, encoding="utf-8") as f:
             config = fast_safe_load(f)
+            explicit_null = config is None and _reread_is_explicit_null(f)
     except Exception as e:
         _warn_config_parse_failure(config_path, e)
         if raise_on_parse_error:
@@ -932,7 +939,17 @@ def _read_config_version_stamp(*, raise_on_parse_error: bool = False) -> Tuple[O
             ) from e
         return latest, latest
 
-    if config is None:
+    if explicit_null:
+        # An explicit null root means "config is null", not "no config written yet" — reject it
+        # the same way as any other non-mapping root (R-CONFIG-NULL) instead of treating it as a
+        # valid first-run empty state.
+        if raise_on_parse_error:
+            raise InvalidUserConfigError(
+                f"Cannot inspect {config_path}: config.yaml top-level value must be "
+                f"a mapping, got NoneType (explicit null)"
+            )
+        config = {}
+    elif config is None:
         config = {}  # empty file / bare document: valid first-run state
     if not isinstance(config, dict):
         # A list/scalar root parses fine but is just as unusable as broken YAML: save_config()
@@ -1896,13 +1913,68 @@ def cfg_get(cfg: Optional[Dict[str, Any]], *keys: str, default: Any = None) -> A
     return node
 
 
+_NULL_TAG = "tag:yaml.org,2002:null"
+# Structural YAML markers and comments -- stripped from a node's OWN source span (never the whole
+# document) to tell an explicitly-tagged empty null scalar from a bare document marker with
+# nothing after it. ``#`` only starts a comment outside a quoted string; a node's span for the
+# cases this matters for never contains a quoted "#", so a plain strip is safe here.
+_MARKERS_AND_COMMENTS_RE = re.compile(r"^%YAML[^\n]*$|^---\s*$|^\.\.\.\s*$|#.*$", re.MULTILINE)
+
+
+def _is_explicit_null_document(text: str) -> bool:
+    """True when *text* composes to an explicit null root — a lone ``null``/``~``/anchored/
+    explicitly-``!!null``-tagged scalar, however it is wrapped (BOM, ``%YAML`` directive,
+    ``---``/``...`` markers, a trailing comment) — as opposed to a document that is empty or
+    comment-only, which ``yaml.safe_load`` also returns as ``None`` but which means "no config
+    written here", not "config is null". Uses ``yaml.compose`` with the same loader class
+    ``fast_safe_load`` uses: an empty/comment-only document composes to ``None`` (no node); an
+    explicit null root composes to a node tagged ``tag:yaml.org,2002:null`` even when its value
+    isn't the literal text ``null`` (e.g. ``!!null foo``). A line-based classifier missed
+    BOM-prefixed nulls, directive documents, anchors and explicit tags; this reuses the real
+    parser instead of re-deriving its grammar."""
+    try:
+        node = yaml.compose(text, Loader=_fast_yaml_loader)
+    except yaml.YAMLError:
+        return False
+    if node is None or node.tag != _NULL_TAG:
+        return False
+    if node.value != "":
+        return True
+    # value=="" is still ambiguous: PyYAML's resolver gives the null tag both to "nothing was
+    # written" (a bare "---", "---\n...\n") AND to an explicitly tagged EMPTY null scalar
+    # (``!!null ""``, ``!!null ''``, a bare ``!!null``, ``!!null |``) -- round-4 regression: the
+    # value-only check treated every one of those explicit, author-written forms as implicit-empty.
+    # The node's own source span still carries its exact written text (including an explicit "!!"
+    # tag, if the author gave one) even when the resolved VALUE is empty; after stripping document
+    # markers/directives/comments/whitespace from just that span (not the whole document -- a
+    # legitimate comment elsewhere must not count), anything left over proves the author wrote
+    # something at this node, not nothing.
+    span = text[node.start_mark.pointer:node.end_mark.pointer]
+    stripped = _MARKERS_AND_COMMENTS_RE.sub("", span).strip()
+    return bool(stripped)
+
+
+def _reread_is_explicit_null(f) -> bool:
+    """Re-read stream *f* from the top and classify it with :func:`_is_explicit_null_document`.
+    Callers invoke this only after ``fast_safe_load(f)`` returned ``None`` — re-reading the raw
+    text only in that (rare) branch keeps the stream object itself (not its text) the thing every
+    caller/test fault-injects and caches on."""
+    f.seek(0)
+    return _is_explicit_null_document(f.read())
+
+
 def _load_user_mapping(f) -> Dict[str, Any]:
     """Parse a user ``config.yaml`` stream for a cache / ``good``-backup publisher: ``{}`` for an
-    empty file, else the root mapping. Any other root raises ``TypeError``: ``fast_safe_load(f) or {}``
-    turns ``[]``/``false``/``0``/``''`` into ``{}``, which every shared reader then serves as a
-    successful parse — evicting the last-good config instead of falling back to it."""
+    empty or comment-only file, else the root mapping. Any other root raises ``TypeError``:
+    ``fast_safe_load(f) or {}`` turns ``[]``/``false``/``0``/``''`` into ``{}``, which every shared
+    reader then serves as a successful parse — evicting the last-good config instead of falling
+    back to it. An explicit ``null``/``~`` root parses to the same ``None`` as an empty file but
+    means "config is null", not "no config written yet" — reject it the same way as the other
+    non-mapping roots instead of conflating it with a legitimate first-run empty file."""
     data = fast_safe_load(f)
     if data is None:
+        if _reread_is_explicit_null(f):
+            raise TypeError("top-level YAML must be a mapping, got NoneType (explicit null)")
         return {}
     if not isinstance(data, dict):
         raise TypeError(f"top-level YAML must be a mapping, got {type(data).__name__}")
@@ -2008,19 +2080,23 @@ def require_readable_config_before_write(config_path: Optional[Path] = None) -> 
     try:
         with open(config_path, encoding="utf-8") as f:
             loaded = fast_safe_load(f)
+            explicit_null = loaded is None and _reread_is_explicit_null(f)
     except OSError as exc:
         raise _refuse_overwrite(config_path, "cannot be read", exc, _FIX_PERMS) from exc
     except Exception as exc:
         _warn_config_parse_failure(config_path, exc, fallback="refuse-write")
         raise _refuse_overwrite(
             config_path, "has a formatting error", exc, _FIX_YAML.format(backups=_backups_dir_display())) from exc
-    if loaded is None:
+    if loaded is None and not explicit_null:
         return {}
-    if not isinstance(loaded, dict):
-        exc = TypeError(f"top-level YAML must be a mapping, got {type(loaded).__name__}")
+    if explicit_null or not isinstance(loaded, dict):
+        # An explicit null root means "config is null", not "no config written yet" — reject it
+        # the same way as any other non-mapping root instead of silently returning {}.
+        type_name = "NoneType (explicit null)" if explicit_null else type(loaded).__name__
+        exc = TypeError(f"top-level YAML must be a mapping, got {type_name}")
         _warn_config_parse_failure(config_path, exc, fallback="refuse-write")
         raise _refuse_overwrite(
-            config_path, f"must start with settings names, but its top level is a {type(loaded).__name__}",
+            config_path, f"must start with settings names, but its top level is a {type_name}",
             exc, _FIX_YAML.format(backups=_backups_dir_display())) from exc
     return loaded
 

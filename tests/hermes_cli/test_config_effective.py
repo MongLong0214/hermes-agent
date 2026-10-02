@@ -159,14 +159,28 @@ GATEWAY_RESTRICTED_YAML = RESTRICTED_YAML + """
     """
 
 
-@pytest.mark.parametrize("bad_root", ["[]\n", "false\n", "0\n", "''\n", "- stray\n"])
+@pytest.mark.parametrize(
+    "bad_root",
+    [
+        "[]\n", "false\n", "0\n", "''\n", "- stray\n", "null\n", "~\n", "Null\n", "NULL\n", "---\nnull\n",
+        # YAML-valid null spellings the line-based classifier missed: BOM-prefixed, a null
+        # followed by a comment on an "end" line, a %YAML directive document, an anchored null
+        # and an explicitly tagged null. All compose to the same explicit-null root as the forms
+        # above under yaml.compose() with the production loader class.
+        "﻿null\n", "null\n# end\n", "%YAML 1.1\n---\nnull\n", "&a null\n", "!!null foo\n",
+    ],
+)
 def test_non_mapping_root_survives_shared_cache_readers(homes, bad_root):
     """L7-1 regression, with every cache kept live: the raw reader (``read_raw_config()`` behind
     ``gateway_help_lines()`` / ``/help``) and the defaults loader (``load_config()``) parse the
     same file and publish into the shared raw cache / the ``good`` backup. A falsy non-mapping
     root (``[]``, ``false``, ``0``, ``''``) used to be coerced to ``{}`` there and then served to
     the gateway's effective reader as a successful parse — dropping the restricted settings and
-    widening the Telegram toolsets to the default bundle (terminal, file, code execution)."""
+    widening the Telegram toolsets to the default bundle (terminal, file, code execution).
+    R-CONFIG-NULL: an explicit null root (``null``, ``~``, any case spelling, or a lone ``---``
+    document holding one) parses to the same Python ``None`` as an empty/comment-only file via
+    ``yaml.safe_load`` — it must be rejected exactly like the other non-mapping roots above, not
+    conflated with "no config here"."""
     from hermes_cli.commands import gateway_help_lines
     from hermes_cli.config import load_config
     from hermes_cli.config_backups import load_newest_good_backup
@@ -192,6 +206,27 @@ def test_non_mapping_root_survives_shared_cache_readers(homes, bad_root):
     assert load_newest_good_backup(path) == good
     with pytest.raises(TypeError):
         load_user_config_effective(path, fail_closed=True)
+
+
+@pytest.mark.parametrize("empty_body", ["", "\n", "   \n", "# just a comment\n", "# one\n\n# two\n"])
+def test_empty_or_comment_only_root_is_not_treated_as_a_failure(homes, empty_body):
+    """An empty file or a comment-only file also parses to ``None`` via ``yaml.safe_load`` — the
+    same Python value an explicit ``null`` root produces — but it means "no config written yet",
+    not "config is null". It must load as ``{}`` with no recovery and no raised error even under
+    ``fail_closed=True``, and must never trip the parse-failure path (no ``corrupt`` backup, no
+    warning recorded for ``get_active_config_parse_failure``)."""
+    from hermes_cli.config_backups import list_config_backups
+    from hermes_cli.config_effective import load_user_config_effective
+    from hermes_cli.config_read_errors import get_active_config_parse_failure
+
+    home, _ = homes
+    path = home / "config.yaml"
+    path.write_text(empty_body, encoding="utf-8")
+
+    assert load_user_config_effective(path) == {}
+    assert load_user_config_effective(path, fail_closed=True) == {}
+    assert not list_config_backups(path, "corrupt")
+    assert get_active_config_parse_failure() is None
 
 
 def _reset_caches_keep_last_good():
