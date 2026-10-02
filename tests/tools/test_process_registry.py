@@ -2863,6 +2863,75 @@ class TestSystemdCgroupIsolation:
         assert pr._stop_systemd_unit("hermes-worker-gone.scope") is True
 
 
+class TestPtyFallbackCleanup:
+    """Without a systemd scope (no gateway identity — the common desktop/CLI case), a PTY
+    child that spawned successfully but failed a LATER setup step (the reader thread) must be
+    reaped before the pipe fallback runs a second copy of the same command, and a later kill
+    must target the tracked fallback process, not the stale PTY handle."""
+
+    def test_reader_thread_failure_reaps_pty_before_distinct_pipe_fallback(
+        self, registry, monkeypatch,
+    ):
+        from ptyprocess import PtyProcess
+
+        fake_pty = MagicMock()
+        fake_pty.pid = 4321
+        fake_pty.isalive.return_value = True
+
+        fake_proc = MagicMock()
+        fake_proc.pid = 9999
+        fake_proc.stdout = iter([])
+        fake_proc.stdin = MagicMock()
+        fake_proc.poll.return_value = None
+
+        events = []
+
+        def fake_thread(*args, name="", **kwargs):
+            thread = MagicMock()
+            if name.startswith("proc-pty-reader-"):
+                events.append(("pty-reader-start-attempt", None))
+                thread.start.side_effect = RuntimeError("reader failed")
+            else:
+                events.append(("pipe-reader-start", None))
+            return thread
+
+        def fake_popen(argv, **_kwargs):
+            events.append(("pipe-spawn", list(argv)))
+            return fake_proc
+
+        monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/bin/bash")
+        monkeypatch.setattr(
+            "tools.process_registry._systemd_run_user_scope_available", lambda: False,
+        )
+
+        with patch.object(PtyProcess, "spawn", return_value=fake_pty) as pty_spawn, \
+            patch("subprocess.Popen", side_effect=fake_popen), \
+            patch("threading.Thread", side_effect=fake_thread), \
+            patch.object(registry, "_write_checkpoint"):
+            session = registry.spawn_local("codex", cwd="/tmp", use_pty=True)
+
+        # Exactly one PTY spawn, one failed reader-start attempt, then exactly one pipe
+        # fallback spawn — never two live copies of "codex" running at once.
+        assert pty_spawn.call_count == 1
+        assert [e[0] for e in events] == [
+            "pty-reader-start-attempt", "pipe-spawn", "pipe-reader-start",
+        ]
+
+        # The orphaned PTY child must be reaped (terminated) before the fallback ran, and
+        # its handle cleared so it can never be mistaken for the live, tracked process.
+        fake_pty.terminate.assert_called_once_with(force=True)
+        assert session._pty is None
+        assert session.process is fake_proc
+
+        with patch.object(registry, "_terminate_host_pid") as terminate_host_pid, \
+            patch.object(registry, "_write_checkpoint"):
+            registry.kill_process(session.id)
+
+        # A later kill must target the tracked pipe process, not the stale (already-reaped)
+        # PTY handle: _signal_kill checks `session._pty` first, so a cleared handle is what
+        # routes the kill to session.process.
+        terminate_host_pid.assert_called_once_with(fake_proc.pid, session.host_start_time)
+        assert fake_pty.terminate.call_count == 1  # not signalled again on kill
 
 
 class TestNotificationRedaction:

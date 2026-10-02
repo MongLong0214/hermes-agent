@@ -154,6 +154,13 @@ class EnvironmentConnectionError(RuntimeError):
             "automatic once the backend is back.")
 
 
+class PostSpawnExecutionError(RuntimeError):
+    """``execute()`` failed after the command was already spawned (collecting output, updating
+    state, ...) — the shell may already have produced a side effect (``git push``, a sent mail),
+    so a caller MUST NOT blindly retry on this, unlike a failure proven to precede spawn. Wraps
+    the original exception as ``__cause__``."""
+
+
 def set_activity_callback(cb: Callable[[str], None] | None) -> None:
     """Register a callback that _wait_for_process fires periodically."""
     _activity_callback_local.callback = cb
@@ -631,10 +638,15 @@ class BaseEnvironment(ABC):
             if fenced:  # the hard-exit kill may have stopped waiting for us before we registered
                 self._force_kill_process(spawned)
             try:
-                return self._wait_for_process(
-                    spawned, timeout=effective_timeout, bounded_capture=bounded_capture,
-                    watch_interrupt_tid=parent_tid,
-                    **({"yield_handler": yield_handler} if yield_handler is not None else {}))
+                try:
+                    return self._wait_for_process(
+                        spawned, timeout=effective_timeout, bounded_capture=bounded_capture,
+                        watch_interrupt_tid=parent_tid,
+                        **({"yield_handler": yield_handler} if yield_handler is not None else {}))
+                except Exception as exc:
+                    # The shell is already running (or ran) at this point — a caller retrying on
+                    # this exception would repeat whatever side effect it already produced.
+                    raise PostSpawnExecutionError(str(exc)) from exc
             finally:
                 with _live_foreground_cond:
                     _live_foreground.pop(id(spawned), None)

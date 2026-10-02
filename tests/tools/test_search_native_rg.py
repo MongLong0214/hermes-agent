@@ -125,3 +125,20 @@ def test_limit_hit_keeps_drained_matches_when_group_kill_is_refused(tree, ops_fa
     monkeypatch.setattr(os, "killpg", lambda pgid, sig: (_ for _ in ()).throw(PermissionError(1, "Operation not permitted")))
     result = ops.search(pattern="needle", path=str(tree), limit=2)
     assert not result.error and len(result.matches) == 2, result.to_dict()
+
+
+def test_native_runner_tolerates_pgid_lookup_racing_rg_exit(tree, ops_factory, monkeypatch):
+    """rg can exit (and be reaped by an unrelated ``Popen`` cleanup elsewhere in the same
+    process) between the cleanup's ``proc.poll()`` check and its ``os.getpgid`` lookup; unlike
+    the ``killpg`` EPERM case above, this earlier lookup has no cached pgid to fall back to, so
+    the ``ProcessLookupError`` must not escape and discard the already-drained output (18/day
+    ``search_files`` '[Errno 3] No such process' failures in production)."""
+    import os
+    import subprocess
+
+    monkeypatch.setattr(subprocess.Popen, "poll", lambda self: None)
+    monkeypatch.setattr(os, "getpgid", lambda pid: (_ for _ in ()).throw(ProcessLookupError(3, "No such process")))
+    ops = ops_factory(tree, [])
+    result = ops._run_rg_native(["sh", "-c", "'echo needle-one; echo needle-two'"], 10, timeout=5)
+    assert result.exit_code == 0
+    assert "needle-one" in result.stdout and "needle-two" in result.stdout, result.stdout

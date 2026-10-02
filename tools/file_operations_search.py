@@ -4,6 +4,7 @@
 (no I/O).
 """
 
+import contextlib
 import os
 import posixpath
 import re
@@ -371,7 +372,14 @@ class SearchMixin:
                 exit_code = 124
                 break
         if proc.poll() is None:
-            _kill_process_group_posix(proc)  # native lane is POSIX-only (gate above)
+            # rg can exit (and get reaped by an unrelated Popen cleanup elsewhere in this
+            # process) between the poll() above and the group lookup inside
+            # _kill_process_group_posix; unlike the sibling local-command path, this proc has
+            # no cached _hermes_pgid, so that lookup raises ESRCH with nothing to fall back to.
+            # ESRCH there means the group is already gone, so there is nothing left to signal
+            # — don't let it discard the output already drained into `lines`.
+            with contextlib.suppress(ProcessLookupError):
+                _kill_process_group_posix(proc)  # native lane is POSIX-only (gate above)
         proc.wait()
         drainer.join()
         proc.stdout.close()

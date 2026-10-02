@@ -1206,6 +1206,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 logger.warning("ptyprocess not installed, falling back to pipe mode")
             except Exception as e:
                 logger.warning("PTY spawn failed (%s), falling back to pipe mode", e)
+                if session._pty is not None:
+                    self._reap_untracked_pty(session)
                 if session.systemd_unit:
                     pty_scope_attempted = True
                     if not _stop_systemd_unit(session.systemd_unit):
@@ -1239,6 +1241,18 @@ class ProcessRegistry(ProcessCheckpointMixin):
             self._reap_untracked(session, proc)
             raise
         return session
+
+    def _reap_untracked_pty(self, session: ProcessSession) -> None:
+        """A PTY child spawned successfully but a later setup step (``_track_started``)
+        failed: terminate and close it and clear ``session._pty`` before the pipe fallback
+        runs the same command again. Without this the PTY child keeps running unmanaged, the
+        fallback starts a second copy of it, and ``_signal_kill`` would prefer the stale PTY
+        handle over the tracked fallback process (it checks ``session._pty`` first)."""
+        pty_proc, session._pty = session._pty, None
+        with suppress(Exception):
+            pty_proc.terminate(force=True)
+        with suppress(Exception):
+            pty_proc.close()
 
     def _reap_untracked(self, session: ProcessSession, proc: subprocess.Popen) -> None:
         """Post-Popen setup failed: kill the orphaned subprocess (and any setsid
