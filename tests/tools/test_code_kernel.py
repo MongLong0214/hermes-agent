@@ -827,6 +827,32 @@ class TestLifecycleGuardAuditHook(unittest.TestCase):
             """ % self._GRANDCHILD))
         self._assert_grandchild_blocked(result, record_path)
 
+    def test_posix_spawn_with_an_explicit_env_runs_without_lifecycle_content(self):
+        """R70-4: os.posix_spawn/os.exec* convert the env before auditing it, so this hook cannot
+        arm it in place; that must not block an ordinary (non-lifecycle) call -- only a genuine
+        lifecycle command is ever refused."""
+        result, _record_path = self._run_with_stub_launchctl(textwrap.dedent("""\
+            import os
+            pid = os.posix_spawn("/bin/echo", ["echo", "posix-spawn-ok"], {"PATH": "/usr/bin:/bin"})
+            os.waitpid(pid, 0)
+            print("spawned")
+            """))
+        self.assertEqual(result["status"], "success", result)
+        self.assertIn("spawned", result["output"])
+
+    def test_popen_with_an_immutable_env_runs_without_lifecycle_content(self):
+        """R70-4 sibling: a read-only env mapping (MappingProxyType) cannot be armed in place
+        either; it must not block an ordinary subprocess call."""
+        result, _record_path = self._run_with_stub_launchctl(textwrap.dedent("""\
+            import subprocess
+            from types import MappingProxyType
+            r = subprocess.run(["/bin/echo", "ok"], env=MappingProxyType({"PATH": "/usr/bin:/bin"}),
+                                capture_output=True, text=True)
+            print(r.returncode, r.stdout.strip())
+            """))
+        self.assertEqual(result["status"], "success", result)
+        self.assertIn("0 ok", result["output"])
+
     def test_ordinary_python_grandchild_and_its_own_sitecustomize_still_work(self):
         """No regression from arming children: an ordinary ``python -c`` child runs, and a
         ``sitecustomize`` the cell put on the child's own PYTHONPATH still runs too (the Hermes

@@ -355,9 +355,13 @@ def _install_hermes_lifecycle_guard():
             raise _PermissionError(tamper_message % replaced)
         if _classify_cmdline(cmdline):
             raise _PermissionError(block_message)
-        unarmed = _arm_child(event, env)
-        if unarmed:
-            raise _PermissionError(unarmed_message % unarmed)
+        # Best-effort only (R70-4): an ordinary, non-lifecycle command must still run even when its
+        # env cannot be armed for descendant coverage (an immutable mapping, or os.exec*/
+        # os.posix_spawn's pre-converted env that must already be armed to take effect). Blocking
+        # a harmless call here does not close any boundary -- it only breaks supported subprocess
+        # use -- while the real coverage gap this would have caught is the already-documented
+        # unarmed-descendant limitation (R70-1).
+        _arm_child(event, env)
 
     sys.addaudithook(_audit_hook)
     if site_dir and site_source is not None:
