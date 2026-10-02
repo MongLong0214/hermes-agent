@@ -11,7 +11,12 @@ from typing import Any, MutableMapping, Optional, TypeVar
 # outgoing copy and the token estimator ignores them: one set, so an estimate
 # never prices bytes the provider never receives (an edit's inline_diff in
 # display_metadata is ~9KB and would trigger premature compaction).
-PERSISTENCE_ONLY_MESSAGE_FIELDS = frozenset({"timestamp", "display_kind", "display_metadata", "_row_id"})
+PERSISTENCE_ONLY_MESSAGE_FIELDS = frozenset({
+    "timestamp", "display_kind", "display_metadata", "_row_id",
+    # Runtime-only trust marker (agent.canonical_peer.PEER_SIDECAR_VERIFIED_KEY duplicated as a
+    # literal to avoid a module import cycle): never provider-visible, never priced.
+    "_peer_sidecar_verified",
+})
 
 _Message = TypeVar("_Message", bound=MutableMapping[str, Any])
 

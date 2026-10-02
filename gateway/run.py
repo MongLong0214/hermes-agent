@@ -1241,7 +1241,7 @@ def _build_gateway_agent_history(
 
     Observed context stays out of ``conversation_history`` so consecutive-user repair can't merge it in."""
     from hermes_time import get_timezone as _get_msg_tz
-    from agent.canonical_peer import peer_metadata, peer_wire_text
+    from agent.canonical_peer import PEER_SIDECAR_VERIFIED_KEY, peer_metadata, peer_wire_text
     from gateway.message_timestamps import (
         render_user_content_with_timestamp as _render_msg_ts,
         strip_leading_message_timestamps as _strip_msg_ts,
@@ -1263,9 +1263,18 @@ def _build_gateway_agent_history(
             # A canonical peer row replays as stored: clean body, its provenance, and the model
             # rendering of that provenance. No timestamp, cleanup or mirror rewrite touches it, so
             # it can never come back as plain owner text; inconsistent provenance raises.
+            #
+            # ``peer_wire_text(msg)`` reads ``msg`` as the loader produced it — already carrying
+            # PEER_SIDECAR_VERIFIED_KEY when its stored sidecar's digest matched the admission
+            # ledger — and returns either that authenticated sidecar (Hermes' own appended
+            # memory/plugin/surface-switch context survives) or a fresh rendering otherwise. The
+            # rebuilt row below is itself first-party (``content``/``api_content`` came straight
+            # out of that call, never from an untrusted source), so the same trust carries forward
+            # for whichever later pass re-derives this row's wire text from it.
             agent_history.append({
                 "role": "user", "content": content, "api_content": peer_wire_text(msg),
                 "display_kind": msg["display_kind"], "display_metadata": msg["display_metadata"],
+                PEER_SIDECAR_VERIFIED_KEY: True,
                 **({"timestamp": msg["timestamp"]} if msg.get("timestamp") is not None else {}),
             })
             continue

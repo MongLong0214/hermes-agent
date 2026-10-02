@@ -15,9 +15,10 @@ from agent.context_compressor import (
     _newest_checkpoint_carrier, split_user_originated_turn)
 from agent.memory_manager import sanitize_context
 from agent.canonical_peer import (
-    PEER_DISPLAY_KIND, PEER_METADATA_KEY, PEER_ROW_LEDGER_PREFIX, PeerProvenanceError,
-    content_digest as peer_content_digest, ledger_value as peer_ledger_value,
-    parse_ledger_value as parse_peer_ledger_value, peer_metadata, peer_wire_text)
+    PEER_DISPLAY_KIND, PEER_METADATA_KEY, PEER_ROW_LEDGER_PREFIX, PEER_SIDECAR_VERIFIED_KEY,
+    PeerProvenanceError, content_digest as peer_content_digest, ledger_value as peer_ledger_value,
+    parse_ledger_value as parse_peer_ledger_value, peer_metadata, peer_wire_text,
+    rebind_sidecar as peer_rebind_sidecar, sidecar_digest as peer_sidecar_digest)
 from agent.message_sanitization import _sanitize_surrogates
 from hermes_cli.timefmt import coerce_epoch
 from hermes_state_common import (
@@ -38,8 +39,9 @@ _INSERT_MESSAGE_SQL = """INSERT INTO messages (session_id, role, content, tool_c
 # key (and its typed decoder) even when a row holds a BLOB, so no reader ever loses msg["content"].
 _INSERT_MESSAGE_COLUMNS = tuple(re.findall(r"\w+", _INSERT_MESSAGE_SQL.split("(", 1)[1].split(")", 1)[0]))
 _MESSAGE_SCHEMA_KEYS = frozenset(_INSERT_MESSAGE_COLUMNS) | {"id", "compacted", "display_order"}
-_PARAM_ROLE, _PARAM_CONTENT, _PARAM_DISPLAY_KIND, _PARAM_DISPLAY_METADATA = (
-    _INSERT_MESSAGE_COLUMNS.index(column) for column in ("role", "content", "display_kind", "display_metadata"))
+_PARAM_ROLE, _PARAM_CONTENT, _PARAM_API_CONTENT, _PARAM_DISPLAY_KIND, _PARAM_DISPLAY_METADATA = (
+    _INSERT_MESSAGE_COLUMNS.index(column)
+    for column in ("role", "content", "api_content", "display_kind", "display_metadata"))
 _BUMP_GENERATION_SQL = """
             INSERT INTO conversation_generations (source, session_key, generation)
             VALUES (?, ?, 1)
@@ -569,8 +571,30 @@ class SessionMessagesMixin:
         if row_id is None or conn.execute(
                 "SELECT 1 FROM state_meta WHERE key = ?", (peer["receipt"],)).fetchone() is None:
             raise PeerProvenanceError()
+        # api_content rarely exists yet at insert time (the live sidecar is usually stamped as a
+        # backfill after this row lands, see set_message_api_content/set_latest_user_api_content
+        # below); when it does, bind its digest in immediately instead of waiting for a backfill
+        # that may never come (e.g. gateway replay inserts carrying the sidecar already).
         conn.execute("INSERT INTO state_meta (key, value) VALUES (?, ?)",
-                     (f"{PEER_ROW_LEDGER_PREFIX}{row_id}", peer_ledger_value(peer, params[_PARAM_CONTENT])))
+                     (f"{PEER_ROW_LEDGER_PREFIX}{row_id}",
+                      peer_ledger_value(peer, params[_PARAM_CONTENT], api_content=params[_PARAM_API_CONTENT])))
+
+    @staticmethod
+    def _rebind_peer_sidecar_ledger(conn, row_id: Optional[int], api_content: Optional[str]) -> None:
+        """When *row_id* is an admitted peer row, bind *api_content*'s digest into its ledger
+        value in the CALLER's transaction — the same one writing the ``api_content`` column —
+        so the two can never be observed apart. No-op for an ordinary row (no ledger entry) or
+        a missing row id; a malformed existing record still raises (same refusal as everywhere
+        else that reads the ledger)."""
+        if row_id is None:
+            return
+        key = f"{PEER_ROW_LEDGER_PREFIX}{row_id}"
+        row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
+        if row is None:
+            return
+        record = parse_peer_ledger_value(row[0])
+        conn.execute("UPDATE state_meta SET value = ? WHERE key = ?",
+                     (peer_rebind_sidecar(record, api_content), key))
 
     @staticmethod
     def _peer_admission_records(conn, values: Dict[int, Any]) -> Dict[int, Dict[str, Any]]:
@@ -616,10 +640,31 @@ class SessionMessagesMixin:
 
     @classmethod
     def _require_admitted_peer(cls, row, msg: Dict[str, Any], records: Dict[int, Dict[str, Any]]) -> bool:
-        """True for a consistent admitted peer row (its sidecar is then the model rendering); False for
-        an ordinary row. Every inconsistency, rendering included, is the provenance refusal."""
-        if cls._validated_peer(msg, records.get(row["id"]), row["content"]) is None:
+        """True for a consistent admitted peer row; False for an ordinary row. Every
+        inconsistency, rendering included, is the provenance refusal.
+
+        The row's stored ``api_content`` sidecar (already on ``msg`` — see ``_rows_to_conversation``)
+        carries Hermes' own appended context (memory/plugin/surface-switch notes) when the row is a
+        live/replayed peer turn. It is kept ONLY when its digest still matches the one the admission
+        ledger bound to it (``_rebind_peer_sidecar_ledger``, written atomically with the sidecar); a
+        missing digest (never stamped, or a legacy row from before this field existed) or a mismatch
+        (tampered, or a stale sidecar stamped before a since-changed body) both fall back to discarding
+        it and sending ``msg``'s caller the fresh rendering of the authenticated body instead (R1)."""
+        record = records.get(row["id"])
+        if cls._validated_peer(msg, record, row["content"]) is None:
             return False
+        stored_sidecar = msg.get("api_content")
+        sidecar_sha256 = record.get("sidecar_sha256") if record else None
+        if (isinstance(stored_sidecar, str) and stored_sidecar and sidecar_sha256
+                and peer_sidecar_digest(stored_sidecar) == sidecar_sha256):
+            # Digest-authenticated: this IS the signal peer_wire_text requires to trust a
+            # stored sidecar (PEER_SIDECAR_VERIFIED_KEY) rather than discard it (R1).
+            msg[PEER_SIDECAR_VERIFIED_KEY] = True
+        else:
+            # Not (or no longer) authenticated — missing digest (legacy row / never stamped) or
+            # mismatch (tampered, or a stale sidecar stamped before a since-changed body): never
+            # let an unverified stored sidecar reach peer_wire_text.
+            msg.pop("api_content", None)
         try:
             msg["api_content"] = peer_wire_text(msg)
         except PeerProvenanceError:
@@ -954,11 +999,25 @@ class SessionMessagesMixin:
         :meth:`_insert_message_rows`), use :meth:`set_message_api_content`
         instead — it addresses the exact row and cannot land on a neighbour.
         """
-        return self._write_rowcount(
-            "UPDATE messages SET api_content = ? WHERE id = (SELECT id FROM messages "
-            "WHERE session_id = ? AND role = 'user' AND active = 1 ORDER BY id DESC LIMIT 1"
-            ") AND content IS ?",
-            (_scrub_surrogates(api_content), session_id, self._encode_content(content)))
+        scrubbed = _scrub_surrogates(api_content)
+        def _do(conn) -> int:
+            row = conn.execute(
+                "SELECT id FROM messages WHERE session_id = ? AND role = 'user' AND active = 1 "
+                "ORDER BY id DESC LIMIT 1", (session_id,)).fetchone()
+            if row is None:
+                return 0
+            row_id = row[0]
+            rowcount = conn.execute(
+                "UPDATE messages SET api_content = ? WHERE id = ? AND content IS ?",
+                (scrubbed, row_id, self._encode_content(content))).rowcount
+            if rowcount is None or rowcount < 0:
+                rowcount = conn.execute("SELECT changes()").fetchone()[0]
+            if rowcount:
+                # Same transaction as the api_content write: a peer row's ledger digest must
+                # never be observable out of sync with its stored sidecar (R1).
+                self._rebind_peer_sidecar_ledger(conn, row_id, scrubbed)
+            return rowcount
+        return self._execute_write(_do)
 
     def set_message_api_content(
         self, session_id: str, row_id: int, content: Any, api_content: str
@@ -982,10 +1041,20 @@ class SessionMessagesMixin:
         """
         if not session_id or isinstance(row_id, bool) or not isinstance(row_id, int) or row_id <= 0:
             return 0
-        return self._write_rowcount(
-            "UPDATE messages SET api_content = ? WHERE id = ? AND session_id = ? "
-            "AND role = 'user' AND active = 1 AND content IS ?",
-            (_scrub_surrogates(api_content), row_id, session_id, self._encode_content(content)))
+        scrubbed = _scrub_surrogates(api_content)
+        def _do(conn) -> int:
+            rowcount = conn.execute(
+                "UPDATE messages SET api_content = ? WHERE id = ? AND session_id = ? "
+                "AND role = 'user' AND active = 1 AND content IS ?",
+                (scrubbed, row_id, session_id, self._encode_content(content))).rowcount
+            if rowcount is None or rowcount < 0:
+                rowcount = conn.execute("SELECT changes()").fetchone()[0]
+            if rowcount:
+                # Same transaction as the api_content write: a peer row's ledger digest must
+                # never be observable out of sync with its stored sidecar (R1).
+                self._rebind_peer_sidecar_ledger(conn, row_id, scrubbed)
+            return rowcount
+        return self._execute_write(_do)
 
     def set_user_message_content(self, session_id: str, row_id: int, content: Any) -> int:
         """Rewrite the content of ONE known active user row. Used when a user turn was written at submit
