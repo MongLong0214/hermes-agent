@@ -655,6 +655,11 @@ def finalize_turn(
             (getattr(agent, "request_overrides", {}) or {}).get("extra_body") or {}
         ).get("service_tier"),
         "session_id": agent.session_id,
+        # Whether this turn's own _persist_session() flush actually landed. Default True preserves
+        # the pre-L4-2 contract (no DB / nothing ever tracked this); only an explicit write
+        # exception sets it False, telling the gateway its own transcript append must still run
+        # instead of trusting a flush that silently failed.
+        "agent_persisted": getattr(agent, "_last_persist_succeeded", True),
     }
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()

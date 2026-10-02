@@ -485,12 +485,17 @@ class SessionTranscriptMixin:
         """Replace a session's transcript (/retry, /compress). DESTRUCTIVE by default:
         ``active_only=False`` DELETEs every row incl. soft-archived compaction history (pass
         ``active_only=True`` for sessions that may carry archived rows). True when the write lands
-        or there is no DB, False on failure — callers committing a destructive change on top
-        (/compress repointing) must check it. ``reject_active_turn_lease`` is for user-initiated
-        rewrites that do not own the cross-process turn lease."""
+        or the store is deliberately DB-less (JSONL-only); False on failure, INCLUDING when the
+        canonical store resolved to a real path but cannot currently be opened (RecoverableHandleCache
+        backoff) — callers committing a destructive change on top (/compress repointing) must check
+        it. ``reject_active_turn_lease`` is for user-initiated rewrites that do not own the
+        cross-process turn lease."""
         db = self._db_for_session_id(session_id)
         if not db:
-            return True
+            # Only a deliberately DB-less store (``store._db = None``) counts as "nothing to write";
+            # an unavailable canonical store is a failure, not permission to proceed as if the
+            # destructive replace had landed (#L4-1).
+            return self._pinned_db() is None
         with self._get_transcript_drain_lock():
             try:
                 # Even when the current agent doesn't "own" persistence, the session on disk may already
@@ -541,7 +546,15 @@ class SessionTranscriptMixin:
         same routing writes use — the in-memory reroute map, then the durable compression tip —
         otherwise the transcript "vanishes" while every message sits under the child."""
         if not self._db_for_session_id(session_id):
-            return []
+            if self._pinned_db() is None:
+                # Deliberately configured without SQLite backing (``store._db = None``,
+                # JSONL-only tests) — a genuinely empty, not a failed, read.
+                return []
+            # The canonical store resolved to a real path but its last open attempt is still
+            # failing/backing off (RecoverableHandleCache) — NOT the same as "no DB": an existing
+            # session's history may be sitting behind that unavailable store, so fail like any
+            # other unreadable history instead of inventing an empty one.
+            raise TranscriptReadError(session_id)
         session_id = self._follow_reroutes(session_id)
         with contextlib.suppress(Exception):
             # Durable successor survives restart; the reroute map doesn't.

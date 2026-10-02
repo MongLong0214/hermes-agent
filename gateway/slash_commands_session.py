@@ -950,7 +950,10 @@ class GatewaySessionCommandsMixin:
         await self.async_session_store.set_model_override(session_key, None)
         # Evict so the next turn rebuilds with the right session_id — the cached AIAgent's memory
         # provider cached _session_id at initialize() and would keep writing to the wrong session.
-        self._evict_cached_agent(session_key)
+        # Forced: the route now points at target_id, so leaving the old agent cached under this key
+        # would misdirect the next turn's writes regardless of its own flush state (#L4-2's guard is
+        # for same-session refreshes, not a session_id swap).
+        self._evict_cached_agent(session_key, require_persisted=False)
         title = await self._session_db.get_session_title(target_id) or name
         try:
             history = await self.async_session_store.load_transcript(target_id)

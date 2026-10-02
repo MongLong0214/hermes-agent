@@ -350,12 +350,17 @@ class SessionPersistenceMixin:
         The persist user-message *override* is NOT applied here — it is resolved inside
         ``_flush_messages_to_session_db`` and written only to the DB row, never mutating the live message
         list used by the API call (#48677 is thus closed for every persist caller, not just this one).
+
+        ``_last_persist_succeeded`` records this flush's outcome (``False`` only on a write
+        exception, never on "nothing to flush" — no DB / persist-disabled) so the finalizer can
+        report an honest ``agent_persisted`` instead of assuming the write landed (#L4-2).
         """
         from agent.agent_runtime_helpers import note_turn_persisted
         with _persist_lock(self):
             self._drop_trailing_empty_response_scaffolding(messages)
             self._session_messages = messages
-            self._flush_messages_to_session_db(messages, conversation_history)
+            flush_result = self._flush_messages_to_session_db(messages, conversation_history)
+            self._last_persist_succeeded = flush_result is not False
             # Drain async token-accounting deltas at every persist point; cheap no-op when nothing queued.
             if self._session_db is not None:
                 self._session_db.flush_token_counts()

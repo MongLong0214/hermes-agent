@@ -379,6 +379,16 @@ class TestConfiguredBoundsReachTheCache:
         assert runner._agent_cache_cap() == gw_run._AGENT_CACHE_MAX_SIZE
         assert runner._agent_cache_idle_ttl() == gw_run._AGENT_CACHE_IDLE_TTL_SECS
 
+    @staticmethod
+    def _flushed_mock_agent() -> MagicMock:
+        """A MagicMock whose transcript_persistence_caught_up() reads as fully flushed -- a bare
+        MagicMock's auto-mocked ``_session_messages``/``_last_flushed_db_idx`` otherwise read as
+        unsafe-to-evict (#L4-2) and these tests are exercising cap/TTL eviction, not that guard."""
+        agent = MagicMock()
+        agent._session_messages = []
+        agent._last_flushed_db_idx = 0
+        return agent
+
     def test_configured_cap_bounds_the_real_enforcer(self):
         """A configured cap must actually shrink the cache, not just report."""
         runner = self._runner(AgentCacheBounds(max_size=2))
@@ -390,7 +400,7 @@ class TestConfiguredBoundsReachTheCache:
 
         with runner._agent_cache_lock:
             for i in range(5):
-                runner._agent_cache[f"s{i}"] = (MagicMock(), "sig")
+                runner._agent_cache[f"s{i}"] = (self._flushed_mock_agent(), "sig")
             runner._enforce_agent_cache_cap()
 
         assert len(runner._agent_cache) == 2
@@ -406,7 +416,7 @@ class TestConfiguredBoundsReachTheCache:
         runner._release_evicted_agent_soft = lambda agent: None
         runner.session_store = None
 
-        stale = MagicMock()
+        stale = self._flushed_mock_agent()
         stale._last_activity_ts = _t.time() - 5.0
         runner._agent_cache["s-stale"] = (stale, "sig")
 

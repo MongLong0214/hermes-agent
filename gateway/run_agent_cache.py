@@ -294,7 +294,10 @@ class GatewayAgentCacheMixin:
         and each such generation would otherwise pin its token (and its ``_SessionLease``) forever.
         Identity-checked + idempotent, so a live successor's token is never affected."""
         self._release_running_agent_state(session_key, run_generation=run_generation)
-        self._evict_cached_agent(session_key)
+        # Forced: the turn is being interrupted/reaped, so the slot must clear even with an
+        # unflushed tail -- leaving a stale/dead agent cached would route the next message to it
+        # (#L4-2's persistence guard is for ordinary refresh eviction, not this teardown path).
+        self._evict_cached_agent(session_key, require_persisted=False)
         state = self._peek_session_state(session_key)
         registry = getattr(self, "_turn_leases", None)
         if state is None or registry is None:
@@ -679,7 +682,7 @@ class GatewayAgentCacheMixin:
         )
         return hashlib.sha256(repr(key_tuple).encode("utf-8")).hexdigest()
 
-    def _evict_cached_agent(self, session_key: str) -> None:
+    def _evict_cached_agent(self, session_key: str, *, require_persisted: bool = True) -> None:
         """Remove a cached agent (/new, /model, ...) and soft-release its LLM client pool (AIAgent
         holds reference cycles; without it RSS grows across /new). Soft = frees clients and child
         subagents but PRESERVES terminal sandbox / browser / bg processes since the session may
@@ -691,8 +694,15 @@ class GatewayAgentCacheMixin:
         reference cycles (callbacks, tool state) that delay refcount collection, so a manual release is
         required to keep gateway RSS flat across many /new, /model, undo and reset operations (#29298, same
         leak class as #25315).
+
+        ``require_persisted`` (default True) keeps an unflushed transcript's only copy cached instead
+        of releasing it (#L4-2). Pass False for a forced/terminal eviction where the slot MUST clear
+        regardless — ``_drop_turn_slot`` (/stop, interrupt, reaper): the agent is being torn down or
+        is already stale/dead, so leaving it cached would route the next message to a zombie, which is
+        worse than an unflushed tail (the durable transcript up to the interrupt is unaffected).
         """
         from gateway.run import _AGENT_PENDING_SENTINEL
+        from gateway.agent_cache_pressure import transcript_persistence_caught_up
         # Prompt-stability state rides the agent-cache lifecycle: a fresh agent must re-render its
         # session-context bytes (the pin) and re-see the current voice-channel state once.
         state = self._peek_session_state(session_key)
@@ -713,6 +723,18 @@ class GatewayAgentCacheMixin:
         agent = _first_agent(evicted)
         # Never tear down an agent that's mid-turn — its client, sandbox and child subagents are in use.
         if agent is None or agent is _AGENT_PENDING_SENTINEL or id(agent) in self._running_agent_ids():
+            return
+        if require_persisted and not transcript_persistence_caught_up(agent):
+            # The live transcript has turns that never reached state.db; releasing now would discard
+            # the only remaining copy (#L4-2). Put the entry back so the session stays reachable —
+            # a later turn's own flush (or a future eviction pass once it catches up) can retire it.
+            if _lock:
+                with _lock:
+                    self._agent_cache.setdefault(session_key, evicted)
+            else:
+                _cache = getattr(self, "_agent_cache", None)
+                if _cache is not None:
+                    _cache.setdefault(session_key, evicted)
             return
         self._spawn_release_thread(
             self._release_evicted_agent_soft, (agent,), f"agent-evict-{str(session_key)[:24]}", inline_fallback=True,
@@ -928,8 +950,9 @@ class GatewayAgentCacheMixin:
 
     def _enforce_agent_cache_cap(self) -> None:
         """Evict oldest cached agents past the LRU cap (requires _agent_cache_lock); cleanup on a
-        daemon thread. Mid-turn agents are SKIPPED, so the cache may stay over cap until the next
-        insert."""
+        daemon thread. Mid-turn agents and agents with an unflushed transcript (#L4-2) are SKIPPED,
+        so the cache may stay over cap until the next insert."""
+        from gateway.agent_cache_pressure import transcript_persistence_caught_up
         _cache = getattr(self, "_agent_cache", None)
         # OrderedDict.popitem(last=False) pops oldest; plain dict lacks the arg so skip enforcement
         # if a test fixture swapped the cache type.
@@ -943,7 +966,10 @@ class GatewayAgentCacheMixin:
         # history) to protect a long-running one. Cache may stay over cap until the next insert.
         cap = self._agent_cache_cap()
         candidates = [(key, _tuple_agent(_cache.get(key))) for key in list(_cache.keys())[:max(0, len(_cache) - cap)]]
-        evict_plan = [(key, agent) for key, agent in candidates if agent is None or id(agent) not in running_ids]
+        evict_plan = [
+            (key, agent) for key, agent in candidates
+            if agent is None or (id(agent) not in running_ids and transcript_persistence_caught_up(agent))
+        ]
         for key, _ in evict_plan:
             _cache.pop(key, None)
         remaining_over_cap = len(_cache) - cap
@@ -963,7 +989,9 @@ class GatewayAgentCacheMixin:
 
     def _sweep_idle_cached_agents(self) -> int:
         """Evict cached agents idle past the idle TTL (lock acquired internally; cleanup on daemon
-        threads; mid-turn agents SKIPPED); returns the number evicted."""
+        threads; mid-turn agents and agents with an unflushed transcript (#L4-2) SKIPPED); returns
+        the number evicted."""
+        from gateway.agent_cache_pressure import transcript_persistence_caught_up
         _cache = getattr(self, "_agent_cache", None)
         _lock = getattr(self, "_agent_cache_lock", None)
         if _cache is None or _lock is None:
@@ -977,6 +1005,8 @@ class GatewayAgentCacheMixin:
                 agent = _tuple_agent(entry)
                 if agent is None or id(agent) in running_ids:
                     continue  # mid-turn — don't tear it down
+                if not transcript_persistence_caught_up(agent):
+                    continue  # unflushed transcript — the only remaining copy, don't discard it
                 last_activity = getattr(agent, "_last_activity_ts", None)
                 if last_activity is None or (now - last_activity) <= idle_ttl:
                     continue
