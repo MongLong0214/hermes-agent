@@ -7,6 +7,7 @@ named on the child's result as orphaned before teardown kills it.
 """
 
 import json
+import threading
 import time
 import weakref
 
@@ -191,4 +192,118 @@ def test_post_run_exception_names_unhanded_background_process(monkeypatch, clean
         orphaned = entry.get("orphaned_processes") or []
         assert any(p["session_id"] == spawned["session"].id for p in orphaned), entry
     finally:
+        process_registry.kill_all(source="test")
+
+
+class _TimedOutChildWithProcess:
+    """A child that starts a REAL ``sleep 30`` under its own task id, then hangs past the delegation timeout and
+    unwinds only when the test says so. ``close()`` kills what the child owns exactly as ``AIAgent.close`` does
+    (``ClientLifecycleMixin._close_task_resources``: ``kill_process(..., consume_output=True)``), so a close that
+    wins the race leaves the process neither running nor unread."""
+
+    tool_progress_callback = None
+    _credential_pool = None
+    _delegate_saved_tool_names: list = []
+    _delegate_role = "leaf"
+    _delegate_depth = 1
+    _subagent_id = None
+    model = "test-model"
+    session_prompt_tokens = session_completion_tokens = 0
+    session_estimated_cost_usd = 0.0
+
+    def __init__(self):
+        self.session = None
+        self.task_id = None
+        self.interrupted = threading.Event()
+        self.allow_finish = threading.Event()
+        self.finished = threading.Event()
+        self.closed = threading.Event()
+
+    def run_conversation(self, task_id=None, **_kwargs):
+        self.task_id = task_id
+        self.session = process_registry.spawn_local("sleep 30", task_id=task_id, owner_task_id=task_id)
+        try:
+            assert self.interrupted.wait(timeout=10)
+            assert self.allow_finish.wait(timeout=10)
+            return {"final_response": "", "completed": False, "interrupted": True, "api_calls": 1, "messages": []}
+        finally:
+            self.finished.set()
+
+    def hard_interrupt(self, _reason=None, **_kwargs):
+        self.interrupted.set()
+
+    def get_activity_summary(self):
+        return {"api_call_count": 1}
+
+    def close(self):
+        for proc in process_registry.list_sessions():
+            if proc["owner_task_id"] == self.task_id and proc["status"] == "running":
+                process_registry.kill_process(proc["session_id"], source="agent_close", consume_output=True)
+        self.closed.set()
+
+
+def _run_timed_out_child(monkeypatch, child):
+    from types import SimpleNamespace
+    from tools import delegate_tool
+
+    parent = SimpleNamespace(session_id="parent-timeout-process", _current_task_id=None,
+                             _active_children=[child], _active_children_lock=threading.Lock())
+    monkeypatch.setattr(delegate_tool, "_get_child_timeout", lambda: 0.5)
+    monkeypatch.setattr(delegate_tool, "_get_worktree_isolation", lambda: False)
+    return delegate_tool._run_single_child(task_index=0, goal="start a watcher, then hang", child=child,
+                                           parent_agent=parent)
+
+
+def test_timeout_accounting_survives_close_winning_the_race(monkeypatch, clean_queue):
+    """PR65-R2 (close wins): the worker settles between await_child's unfinished-future check and the deferred-close
+    registration, so ``add_done_callback`` runs ``close()`` at once and kills+consumes the live process. Accounting
+    that runs after that point finds nothing, and the timeout entry silently drops a process the parent never heard
+    of. Accounting must be captured before any deferred close can consume the process."""
+    from tools import delegate_tool_child_run
+
+    child = _TimedOutChildWithProcess()
+    real_defer = delegate_tool_child_run._defer_close_after_timeout
+
+    def worker_settles_first(c, future):
+        c.allow_finish.set()
+        future.result(timeout=10)  # the worker is done: the close below runs synchronously in this thread
+        real_defer(c, future)
+
+    monkeypatch.setattr(delegate_tool_child_run, "_defer_close_after_timeout", worker_settles_first)
+    try:
+        entry = _run_timed_out_child(monkeypatch, child)
+        assert entry["status"] == "timeout"
+        assert child.closed.wait(timeout=5)
+        assert process_registry.get(child.session.id).exited, "close() did not kill the child's process"
+        orphaned = entry.get("orphaned_processes") or []
+        assert any(p["session_id"] == child.session.id for p in orphaned), entry
+    finally:
+        child.allow_finish.set()
+        process_registry.kill_all(source="test")
+
+
+def test_timeout_accounting_names_a_still_running_process_truthfully(monkeypatch, clean_queue):
+    """PR65-R2 (accounting wins): the timed-out worker is still unwinding when the result is returned, so its
+    process is still RUNNING and only a deferred close will end it. Rendering it as "TERMINATED ... Re-launch" tells
+    the parent to start a duplicate next to the live original; the entry must say it is still running until the
+    abandoned worker exits -- and the child must not be closed early to make that true."""
+    child = _TimedOutChildWithProcess()
+    try:
+        entry = _run_timed_out_child(monkeypatch, child)
+        assert entry["status"] == "timeout"
+        assert not child.finished.is_set() and not child.closed.is_set(), "the unwinding worker was closed early"
+        assert not process_registry.get(child.session.id).exited
+        orphaned = entry.get("orphaned_processes") or []
+        assert any(p["session_id"] == child.session.id for p in orphaned), entry
+
+        rendered = "\n".join(_process_accounting_lines(entry))
+        assert child.session.id in rendered
+        assert "TERMINATED" not in rendered and "Re-launch" not in rendered, rendered
+        assert "still running" in rendered.lower(), rendered
+
+        child.allow_finish.set()
+        assert child.closed.wait(timeout=5), "deferred close never ran after the worker unwound"
+        assert process_registry.get(child.session.id).exited
+    finally:
+        child.allow_finish.set()
         process_registry.kill_all(source="test")

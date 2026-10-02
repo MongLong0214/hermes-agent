@@ -937,6 +937,9 @@ class _ChildRun:
         }
         self.finish_failed(_error_entry, _late_pending_steer, preview=f"Timed out after {duration}s" if is_timeout else str(exc))
         close_deferred = is_timeout and not future.done()
+        # Account BEFORE installing the deferred close: a worker that settles in between makes add_done_callback run
+        # close() at once, which kills and consumes the child's processes before any later accounting could see them.
+        self.account_background_processes(_error_entry, close_deferred=close_deferred)
         if close_deferred:
             _defer_close_after_timeout(child, future)
         return None, _error_entry, close_deferred
@@ -962,10 +965,12 @@ class _ChildRun:
             else:
                 entry["stale_paths"] = mod_paths
 
-    def account_background_processes(self, entry: Dict[str, Any]) -> None:
+    def account_background_processes(self, entry: Dict[str, Any], *, close_deferred: bool = False) -> None:
         """Name the child's background processes on the result BEFORE ``cleanup`` kills them: handed-off ones now
         belong to the parent (their completion lands in the parent's chat); anything else still running is about to be
-        terminated, and the parent must hear that from the runtime rather than trust a child's "watcher running"."""
+        terminated, and the parent must hear that from the runtime rather than trust a child's "watcher running".
+        ``close_deferred``: a timed-out worker still owns the child, so its leftovers keep running until that worker
+        exits — the entry says so instead of calling them terminated (a relaunch now would duplicate them)."""
         handed = list(getattr(self.child, "_handed_off_processes", None) or [])
         if handed:
             entry["handed_off_processes"] = handed
@@ -976,6 +981,8 @@ class _ChildRun:
                 entry["orphaned_processes"] = [
                     {"session_id": s.id, "command": s.command[:200], "runtime_seconds": round(time.time() - s.started_at)}
                     for s in leftover]
+                if close_deferred:
+                    entry["orphaned_processes_close_deferred"] = True
             unread = process_registry.unread_completions_owned_by(self.child_task_id)
             if unread:
                 entry["unread_completions"] = [

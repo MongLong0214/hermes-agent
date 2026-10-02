@@ -334,8 +334,7 @@ def _run_single_child(
         run.seed_workspace()
         result, failure_entry, _child_close_deferred = run.await_child()
         if failure_entry is not None:
-            run.account_background_processes(failure_entry)
-            return failure_entry
+            return failure_entry  # await_child already accounted for its processes, before any deferred close
 
         schema = _validate_child_output_schema(child, result, task_index, run.child_task_id, run.relay_text)
         _merge_late_steer(result, _subagent_id, child)

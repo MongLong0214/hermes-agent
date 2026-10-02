@@ -684,6 +684,19 @@ def _batch_status(combined: Dict[str, Any]) -> str:
     return "error" if child_results and all(r.get("status") not in ok for r in child_results) else "completed"
 
 
+def _forget_unsubmitted(delegation_id: str) -> None:
+    """Undo an admission whose worker was never submitted: free its slot, then best-effort delete its ledger row. The
+    database may be what just failed, so the delete never raises; a row it cannot remove is only logged (if its INSERT
+    had committed, restart recovery later reports it as outcome unknown)."""
+    with _records_lock:
+        _records.pop(delegation_id, None)
+    try:
+        with _DB_LOCK, _transaction() as conn:
+            conn.execute("DELETE FROM async_delegations WHERE delegation_id=?", (delegation_id,))
+    except Exception:  # noqa: BLE001 — cleanup of a failed dispatch must not turn it into a raise
+        logger.warning("Async delegation %s never started; could not remove its ledger row", delegation_id, exc_info=True)
+
+
 def _dispatch(**kwargs) -> Dict[str, Any]:
     from hermes_cli.backend_retirement import retirement
 
@@ -743,11 +756,9 @@ def _dispatch_admitted(
     try:
         _persist_dispatch(record)
     except Exception as exc:  # noqa: BLE001 — a locked/full state.db must not strand the slot
-        with _records_lock:
-            _records.pop(delegation_id, None)
-        with _DB_LOCK, _transaction() as conn:
-            conn.execute("DELETE FROM async_delegations WHERE delegation_id=?", (delegation_id,))
-        return {"status": "rejected", "error": f"Failed to persist async delegation{label}: {exc}"}
+        _forget_unsubmitted(delegation_id)
+        # ``reason`` tells callers this is not a full pool: running the work inline instead would hide the failure.
+        return {"status": "rejected", "reason": "persistence", "error": f"Failed to persist async delegation{label}: {exc}"}
     # Units of one call share a slot, so live units can exceed slots: size the pool by units or a
     # unit queues behind a full pool and the stale monitor kills it before its child ever starts.
     executor = _get_executor(max(max_async_children, live_units))
@@ -779,10 +790,7 @@ def _dispatch_admitted(
         future.add_done_callback(lambda _: retirement.release())
     except Exception as exc:  # pragma: no cover — pool submit failure is rare
         retirement.release()
-        with _records_lock:
-            _records.pop(delegation_id, None)
-        with _DB_LOCK, _transaction() as conn:
-            conn.execute("DELETE FROM async_delegations WHERE delegation_id=?", (delegation_id,))
+        _forget_unsubmitted(delegation_id)
         return {"status": "rejected", "error": f"Failed to schedule async delegation{label}: {exc}"}
     if progress_fn is not None:
         _ensure_stale_monitor()
@@ -799,7 +807,8 @@ def dispatch_async_delegation(
     ``session_key``/``parent_session_id`` are captured on the parent thread (the worker carries
     no contextvars) and route the completion back to the spawning session.
     ``progress_fn() -> (token, in_tool)`` enables stale monitoring; omitted = unmonitored.
-    Returns ``{"status": "dispatched", "delegation_id"}`` or ``{"status": "rejected", "error"}``."""
+    Returns ``{"status": "dispatched", "delegation_id"}`` or ``{"status": "rejected", "error"}``; a rejection
+    carrying ``"reason": "persistence"`` means state.db could not record the dispatch (not a full pool)."""
     delegation_id = _new_delegation_id()
     handle = _dispatch(
         delegation_id=delegation_id, goal=goal, goals=None, context=context,
