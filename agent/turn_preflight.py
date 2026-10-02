@@ -65,8 +65,9 @@ def run_preflight_compression(
     ``v.action``. A compression pass that never reaches the provider refunds the
     call/budget in every branch (skip, re-run, timeout) so ``api_call_count`` never
     over-reports; a lock/transient skip refunds the attempt and leaves the progress
-    blocker unarmed. A forced provider-overflow preflight that any gate blocks fails
-    closed (llama.cpp may silently truncate)."""
+    blocker unarmed (a forced one ends the turn deferred, unsent). A forced
+    provider-overflow preflight that any other gate blocks fails closed (llama.cpp may
+    silently truncate)."""
     from agent.conversation_loop import (
         _COMPRESSION_TIMEOUT_FINAL_RESPONSE, _HANDOFF_SKIP_FINAL_RESPONSE,
         _compression_deferred_result, _maybe_grow_local_window, _provider_overflow_exhausted_result,
@@ -167,6 +168,14 @@ def run_preflight_compression(
             v._last_preflight_pressure = None
             if v.pending_moa_prepared_request is moa_prepared_request:
                 v.pending_moa_prepared_request = None
+            if provider_overflow_preflight:
+                # The provider proved this request cannot fit, so don't resend it — but nothing was spent,
+                # so end deferred (as the 413 recovery does), not via the forced-preflight exhaustion below.
+                agent._persist_session(v.messages, v.conversation_history)
+                return _done("return", _compression_deferred_result(
+                    agent, v.messages, v.api_call_count,
+                    reason="lock" if compression_skipped_due_to_lock(agent) else "transient_block",
+                ))
         else:
             _reset_retry_state_after_compaction(agent)
             # Re-baseline the flush cursor: rotation returns None (child flushes

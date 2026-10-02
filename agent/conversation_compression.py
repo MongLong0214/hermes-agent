@@ -2680,7 +2680,8 @@ class _CompressionLease:
         never be deleted by this stale release. ``_released`` is set only once the DELETE actually commits (or
         there was nothing to delete), so a failed attempt leaves the holder pending: a later cleanup call
         (callers release idempotently, e.g. an abort branch followed by the enclosing ``finally``) retries the
-        DELETE instead of reporting a release that never happened."""
+        DELETE instead of reporting a release that never happened. The pending holder is also parked on the
+        agent, so the agent's next acquisition retries it even when the failing caller drops this lease."""
         with self._release_guard:
             if self._released:
                 return True
@@ -2692,6 +2693,7 @@ class _CompressionLease:
                 self._refresher = None
             if self.db is not None and self.sid and self.holder:
                 if not _release_lock_row(self.db, self.sid, self.holder):
+                    _park_unreleased_lock(self._agent, self.db, self.sid, self.holder)
                     return False
             self._released = True
             return True
@@ -2732,6 +2734,38 @@ def _release_lock_row(db: Any, sid: str, holder: str) -> bool:
         _LOCK_RELEASE_ATTEMPTS, sid, holder,
     )
     return False
+
+
+_unreleased_locks_guard = threading.Lock()
+
+
+def _park_unreleased_lock(agent: Any, db: Any, sid: str, holder: str) -> None:
+    """Keep a holder whose DELETE batch failed reachable from its agent: the acquisition aborts drop the lease
+    right after a failed release (the contention sit-out even clears ``lease.holder``), and the agent's own
+    next attempt would otherwise sit out behind its abandoned holder until the TTL. Holder ids are unique per
+    acquisition, so a late retry can only ever delete this holder's row."""
+    with _unreleased_locks_guard:
+        parked = getattr(agent, "_unreleased_compression_locks", None)
+        if not isinstance(parked, list):
+            parked = []
+            with contextlib.suppress(Exception):
+                agent._unreleased_compression_locks = parked
+        if not any(entry[1:] == (sid, holder) for entry in parked):
+            parked.append((db, sid, holder))
+
+
+def _retry_unreleased_locks(agent: Any) -> None:
+    """Retry the holder-qualified DELETE of every parked holder before taking a new lock; one that still fails
+    stays parked for the next attempt."""
+    with _unreleased_locks_guard:
+        parked = getattr(agent, "_unreleased_compression_locks", None)
+        if not isinstance(parked, list) or not parked:
+            return
+        pending = list(parked)
+        parked.clear()
+    for db, sid, holder in pending:
+        if not _release_lock_row(db, sid, holder):
+            _park_unreleased_lock(agent, db, sid, holder)
 
 
 def _resolve_lock_api(lock_db: Any) -> Tuple[Any, Optional[Exception]]:
@@ -2843,6 +2877,7 @@ def _acquire_compression_lease(
     # Clear stale lock-skip so this call's outcome alone is visible; else a manual
     # /compress after an auto lock-skip falsely reports "already in progress".
     agent._compression_skipped_due_to_lock = None
+    _retry_unreleased_locks(agent)
     _try_acquire_lock, _lock_lookup_error = _resolve_lock_api(_lock_db)
     _lock_ttl = 300.0
     with contextlib.suppress(TypeError, ValueError):
@@ -3377,6 +3412,9 @@ def _publish_rotated_compaction(
     try:
         _foreign_tail_ceiling = agent._session_db.get_active_message_watermark(agent.session_id)
     except Exception as exc:
+        # Same transient defer as an unreadable start watermark (_acquire_compression_lease): the rolled-back
+        # transcript is unchanged, and without the signal callers read it as a session that cannot shrink.
+        agent._compression_blocked_transient = "watermark_unreadable"
         raise RuntimeError(f"Compression foreign-tail ceiling read failed for {old_session_id}: {exc}") from exc
     with contextlib.suppress(Exception):  # best-effort — don't block compression on a flush error
         agent._flush_messages_to_session_db(messages, conversation_history=persisted_history)

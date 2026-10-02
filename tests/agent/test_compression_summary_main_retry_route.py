@@ -103,20 +103,47 @@ def test_main_retry_uses_main_provider_when_summary_route_is_another_provider():
 
 
 def test_main_retry_pin_does_not_leak_into_the_next_compression():
-    """The main route is pinned for the retry call only; the next compression asks the configured route again."""
-    attempts, requests = [], []
+    """The main route is pinned for the retry call only: on the SAME compressor, a compression whose summary
+    model failed and retried on the main route is followed by one that asks the configured route again."""
+    from agent import context_compressor
+
+    attempts, requests, pins_taken = [], [], []
+    failing = {SUMMARY_MODEL}
 
     def _cached_client(provider, model=None, **_kw):
-        return _RecordingClient(provider, requests, set()), model
+        return _RecordingClient(provider, requests, failing), model
+
+    real_take = context_compressor.take_pinned_summary_route
+
+    def _take_spy():
+        route = real_take()
+        if route is not None:
+            pins_taken.append(route.get("model"))
+        return route
 
     with patch("agent.context_compressor.get_model_context_length", return_value=272_000):
-        c = ContextCompressor(model=MAIN_MODEL, provider=MAIN_PROVIDER, quiet_mode=True)
+        c = ContextCompressor(
+            model=MAIN_MODEL, provider=MAIN_PROVIDER, base_url="https://chatgpt.com/backend-api/codex",
+            api_key="main-route-token", api_mode="codex_responses", quiet_mode=True,
+            abort_on_summary_failure=False,
+        )
     with patch("agent.auxiliary_client._get_auxiliary_task_config",
                side_effect=lambda task: {"provider": MAIN_PROVIDER, "model": SUMMARY_MODEL}
                if task == "compression" else {}), \
             patch("agent.auxiliary_client._get_cached_client", side_effect=_cached_client), \
-            patch("agent.auxiliary_client._resolve_task_provider_model", side_effect=_resolver_spy(attempts)):
-        c._generate_summary(_msgs())
+            patch("agent.auxiliary_client._resolve_task_provider_model", side_effect=_resolver_spy(attempts)), \
+            patch("agent.context_compressor.take_pinned_summary_route", side_effect=_take_spy):
+        first = c._generate_summary(_msgs())
+        assert first is not None and f"summary written by {MAIN_MODEL}" in first
+        assert attempts == [(MAIN_PROVIDER, SUMMARY_MODEL), (MAIN_PROVIDER, MAIN_MODEL)], attempts
+        assert pins_taken == [MAIN_MODEL]  # the retry consumed the main-route pin exactly once
 
-    assert attempts == [(MAIN_PROVIDER, SUMMARY_MODEL)]
-    assert requests == [(MAIN_PROVIDER, SUMMARY_MODEL)]
+        failing.clear()  # the configured summary model is healthy again
+        attempts.clear()
+        requests.clear()
+        second = c._generate_summary(_msgs())
+
+    assert second is not None and f"summary written by {SUMMARY_MODEL}" in second
+    assert attempts == [(MAIN_PROVIDER, SUMMARY_MODEL)], attempts
+    assert requests == [(MAIN_PROVIDER, SUMMARY_MODEL)], requests
+    assert pins_taken == [MAIN_MODEL]  # nothing pinned reached the unrelated compression
