@@ -172,6 +172,16 @@ class SessionTurnLeaseLostError(RuntimeError):
     be persisting a newer turn, and landing this one would interleave a stale reply."""
 
 
+class SessionBeingPrunedError(RuntimeError):
+    """The session is part-way through an automatic retention prune: some of its oldest messages are
+    already gone. Reopening or appending to it would resume a silently shortened history, so the
+    write is refused (no ``_execute_write`` retry) and the next prune pass finishes the delete."""
+
+
+# state_meta key marking a session whose sub-batched prune has started (value: claim time).
+PRUNE_CLAIM_KEY_PREFIX = "prune-claim:v1:"
+
+
 class StateDbReplacedError(RuntimeError):
     """The state.db path no longer names the file this SessionDB opened
     (out-of-band cp/mv/restore). In-place FTS repair and fail-open trigger

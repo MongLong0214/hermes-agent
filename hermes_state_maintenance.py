@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from hermes_state_common import (
     AUTO_VACUUM_MIN_FREELIST_RATIO, _id_chunks, _placeholders, _sql_session_last_active, escape_like as _escape_like
 )
+from hermes_state_errors import PRUNE_CLAIM_KEY_PREFIX
 from hermes_startup_watchdog import report_startup_progress
 
 # caplog tests pin the "hermes_state" logger name.
@@ -117,9 +118,11 @@ class SessionMaintenanceMixin:
         from hermes_state import SessionCompressionInProgressError
         from hermes_state_errors import SessionTurnLeaseLostError
         try:
+            # The prune's own eligibility probe: its claim on a part-pruned session is not a live guard.
             self._check_transcript_write_guards(
                 conn, sid, compression_lock_holder=None, turn_lease_holder=None,
-                reject_active_turn_lease=True, reject_active_compression_lock=True, **kwargs)
+                reject_active_turn_lease=True, reject_active_compression_lock=True,
+                ignore_prune_claim=True, **kwargs)
         except (SessionCompressionInProgressError, SessionTurnLeaseLostError):
             return True
         return False
@@ -310,6 +313,9 @@ class SessionMaintenanceMixin:
                 conn.execute(f"UPDATE sessions SET parent_session_id = NULL WHERE parent_session_id IN ({ph})", chunk)
                 conn.execute(f"DELETE FROM messages WHERE session_id IN ({ph})", chunk)
                 conn.execute(f"DELETE FROM sessions WHERE id IN ({ph})", chunk)
+                # A session an earlier oversized pass left part-pruned (claimed) finishes here once small.
+                conn.execute(f"DELETE FROM state_meta WHERE key IN ({ph})",
+                             [PRUNE_CLAIM_KEY_PREFIX + sid for sid in chunk])
             if only_ids is None:
                 self._delete_unreferenced_system_prompts(conn)
             return list(session_ids)
@@ -381,6 +387,8 @@ class SessionMaintenanceMixin:
         a live turn had claimed. Rows already deleted stay deleted; a later prune finishes the session
         if it is eligible again. Returns *session_id* once removed, None if it was (or became)
         ineligible."""
+        claim_key = PRUNE_CLAIM_KEY_PREFIX + session_id
+
         def _delete_chunk(conn) -> Optional[bool]:
             # None = no longer eligible (stop, keep the rest); True = session gone; False = more rows left.
             if conn.execute(f"SELECT 1 FROM sessions s WHERE s.id = ? AND {where}",
@@ -389,6 +397,12 @@ class SessionMaintenanceMixin:
             if exclude_active_write_guards and self._write_guards_reject(
                     conn, session_id, allow_closed_compression_parent=True):
                 return None
+            # Claim the session in the same transaction as its first delete (PR73 R2-1): from here on
+            # reopen_session and every transcript write refuse it, so a session whose oldest rows are
+            # already gone can never be resumed with that silently shortened history. A pass that
+            # stops early leaves the claim in place; the next pass finishes the delete.
+            conn.execute("INSERT OR IGNORE INTO state_meta (key, value) VALUES (?, ?)",
+                         (claim_key, str(time.time())))
             deleted = conn.execute(
                 "DELETE FROM messages WHERE id IN "
                 "(SELECT id FROM messages WHERE session_id = ? ORDER BY id LIMIT ?)",
@@ -397,6 +411,7 @@ class SessionMaintenanceMixin:
                 return False
             conn.execute("UPDATE sessions SET parent_session_id = NULL WHERE parent_session_id = ?", (session_id,))
             conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            conn.execute("DELETE FROM state_meta WHERE key = ?", (claim_key,))
             return True
         while True:
             done = self._execute_write(_delete_chunk)
