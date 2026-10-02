@@ -169,6 +169,51 @@ async def test_compress_command_surfaces_aux_model_failure_even_when_recovered(t
 
 
 @pytest.mark.asyncio
+async def test_compress_command_aux_failure_reply_scrubs_credentials(tmp_path, monkeypatch):
+    """L1-3 regression: the manual /compress reply is returned to the adapter's inline delivery path
+    (``BasePlatformAdapter._dispatch_inline_reply``), which sends it verbatim — no final-response
+    sanitization. A recovered aux-model failure whose provider error echoes a credential (a
+    vendor-prefixed key or an opaque ``Bearer`` token) must not reach the chat."""
+    import gateway.run as gateway_run
+    (tmp_path / "config.yaml").write_text("display: {warning_notifications: true}")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    secret = "sk-testFAKEKEY1234567890ABCDEFGHIJ"
+    opaque = "opaqueFixtureToken1234567890ABCDE"
+    history = _make_history()
+    compressed = [history[0], {"role": "assistant", "content": "summary via main model"}, history[-1]]
+    runner = _make_runner(history)
+    agent_instance = MagicMock()
+    agent_instance._cached_system_prompt = ""
+    agent_instance.tools = None
+    agent_instance.context_compressor.has_content_to_compress.return_value = True
+    agent_instance.context_compressor._last_compress_aborted = False
+    agent_instance.context_compressor._last_summary_fallback_used = False
+    agent_instance.context_compressor._last_summary_dropped_count = 0
+    agent_instance.context_compressor._last_summary_error = None
+    agent_instance.context_compressor._last_aux_model_failure_model = "fixture-aux"
+    agent_instance.context_compressor._last_aux_model_failure_error = (
+        f"litellm.AuthenticationError: Incorrect API key provided: {secret}; "
+        f"upstream rejected Bearer {opaque}")
+    agent_instance.session_id = "sess-1"
+    agent_instance._compress_context.return_value = (compressed, "")
+    agent_instance._compression_skipped_due_to_lock = False
+
+    with (
+        patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "***"}),
+        patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+        patch("run_agent.AIAgent", return_value=agent_instance),
+        patch("agent.model_metadata.estimate_request_tokens_rough",
+              side_effect=lambda messages, **_kw: 100 if messages == history else 60),
+    ):
+        result = await runner._handle_compress_command(_make_event())
+
+    assert "Compressed:" in result
+    assert "fixture-aux" in result  # the notice itself still reaches the user
+    for credential in (secret, opaque):
+        assert credential not in result, f"raw credential in the /compress reply: {result!r}"
+
+
+@pytest.mark.asyncio
 async def test_compress_command_in_place_skips_destructive_rewrite():
     """In-place compaction (compression.in_place / #38763) persists via
     archive_and_compact() inside _compress_context — the previous active rows

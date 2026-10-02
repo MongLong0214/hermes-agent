@@ -21,7 +21,6 @@ from typing import Any, Dict, Optional, Tuple
 from hermes_cli import config as _config
 from hermes_cli import managed_scope
 from hermes_cli.config_read_errors import _warn_config_parse_failure
-from utils import fast_safe_load
 
 # path -> raw user mapping from the last successful parse in this process; served (through the
 # normal pipeline) when the file is later found mid-edit as broken YAML.
@@ -79,30 +78,21 @@ def load_user_config_effective(config_path: Optional[Path] = None, *, fail_close
         elif user_sig is not None:
             try:
                 with open(config_path, encoding="utf-8") as f:
-                    loaded = fast_safe_load(f)
+                    # Non-mapping root -> TypeError: handled exactly like broken YAML, never cached.
+                    raw = _config._load_user_mapping(f)
             except Exception as exc:
                 if fail_closed:
                     raise
                 raw, recovered = _recover_user_raw(config_path, path_key, exc), True
             else:
-                if loaded is not None and not isinstance(loaded, dict):
-                    # A non-mapping root (e.g. a bare YAML list) parses without error but is not a
-                    # usable config: treat it exactly like broken YAML — never update the raw cache
-                    # or "good" backup with it, so a stray edit can't evict the last-good mapping.
-                    exc = TypeError(f"top-level YAML must be a mapping, got {type(loaded).__name__}")
-                    if fail_closed:
-                        raise exc
-                    raw, recovered = _recover_user_raw(config_path, path_key, exc), True
-                else:
-                    raw = loaded if isinstance(loaded, dict) else {}
-                    _config._RAW_CONFIG_CACHE[path_key] = (*user_sig, copy.deepcopy(raw))
-                    _LAST_GOOD_USER_RAW[path_key] = copy.deepcopy(raw)
-                    # Same copy load_config keeps: a fresh process recovers from it (see _recover_user_raw).
-                    # Only for the ACTIVE home — a read of another profile's file (doctor, TUI cwd lookup)
-                    # must not create backups/ inside that profile.
-                    if config_path == _config.get_config_path():
-                        from hermes_cli.config_backups import backup_config
-                        backup_config(config_path, "good")
+                _config._RAW_CONFIG_CACHE[path_key] = (*user_sig, copy.deepcopy(raw))
+                _LAST_GOOD_USER_RAW[path_key] = copy.deepcopy(raw)
+                # Same copy load_config keeps: a fresh process recovers from it (see _recover_user_raw).
+                # Only for the ACTIVE home — a read of another profile's file (doctor, TUI cwd lookup)
+                # must not create backups/ inside that profile.
+                if config_path == _config.get_config_path():
+                    from hermes_cli.config_backups import backup_config
+                    backup_config(config_path, "good")
 
         env_snapshot = _config._env_ref_snapshot(raw)
         managed = managed_scope.load_managed_config()

@@ -153,6 +153,47 @@ def test_non_mapping_root_serves_last_good_and_fail_closed_raises(homes):
         load_user_config_effective(home / "config.yaml", fail_closed=True)
 
 
+GATEWAY_RESTRICTED_YAML = RESTRICTED_YAML + """
+    platform_toolsets:
+      telegram: [web]
+    """
+
+
+@pytest.mark.parametrize("bad_root", ["[]\n", "false\n", "0\n", "''\n", "- stray\n"])
+def test_non_mapping_root_survives_shared_cache_readers(homes, bad_root):
+    """L7-1 regression, with every cache kept live: the raw reader (``read_raw_config()`` behind
+    ``gateway_help_lines()`` / ``/help``) and the defaults loader (``load_config()``) parse the
+    same file and publish into the shared raw cache / the ``good`` backup. A falsy non-mapping
+    root (``[]``, ``false``, ``0``, ``''``) used to be coerced to ``{}`` there and then served to
+    the gateway's effective reader as a successful parse — dropping the restricted settings and
+    widening the Telegram toolsets to the default bundle (terminal, file, code execution)."""
+    from hermes_cli.commands import gateway_help_lines
+    from hermes_cli.config import load_config
+    from hermes_cli.config_backups import load_newest_good_backup
+    from hermes_cli.config_effective import load_user_config_effective
+    from hermes_cli.tools_config import _get_platform_tools
+
+    home, _ = homes
+    path = home / "config.yaml"
+    _write(path, GATEWAY_RESTRICTED_YAML)
+    good = load_user_config_effective(path)
+    assert good["display"]["background_process_notifications"] == "off"
+    good_tools = _get_platform_tools(good, "telegram")
+    assert "terminal" not in good_tools
+    assert load_config()["display"]["background_process_notifications"] == "off"
+
+    path.write_text(bad_root, encoding="utf-8")  # no cache reset: the bypass needs live caches
+    gateway_help_lines()  # raw reader runs first, as on a gateway /help
+    assert load_config()["display"]["background_process_notifications"] == "off"
+
+    served = load_user_config_effective(path)
+    assert served == good
+    assert _get_platform_tools(served, "telegram") == good_tools
+    assert load_newest_good_backup(path) == good
+    with pytest.raises(TypeError):
+        load_user_config_effective(path, fail_closed=True)
+
+
 def _reset_caches_keep_last_good():
     import hermes_cli.config as cfg
     from hermes_cli import config_effective
