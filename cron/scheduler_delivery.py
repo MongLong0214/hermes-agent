@@ -1974,7 +1974,11 @@ def _deliver_result(
             job["_delivery_uncertain"] = [{"queue": external_execution}]
             _record_delivery_verification(job, refreshed.get("last_delivery_unverified") or [
                 f"queued delivery {external_execution}: {error or 'outcome unknown'}"])
-            error = None
+            # Keep only a partial error the gateway reported alongside it (skipped media, another
+            # target); the uncertainty itself is not a delivery error.
+            from cron.delivery_queue import UNCERTAIN_SEND_ERROR
+            partial = (error or "").partition(f"{UNCERTAIN_SEND_ERROR}; ")
+            error = partial[2] if not partial[0] and partial[1] else None
         # The draining gateway records whether any target took the message (its joined error cannot
         # say). A row no gateway has finished, or one that parked handoffs, is still open.
         if delivery_status and delivery_status.get("accepted"):

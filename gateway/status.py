@@ -1832,44 +1832,96 @@ def reap_gateway_children(children: list, *, parent_pid: int, timeout: float = 5
     return reaped
 
 
+# A PID record from an older build publishes no stop leash, and nothing proves what that instance
+# started with (this process's config may have been edited since). Assume it drained at least this
+# long: a shorter real leash still ends it on its own watchdog, so only a wedged instance waits the
+# whole bound before SIGKILL. A legacy owner configured with a longer drain is still cut short.
+_LEGACY_RECORD_ASSUMED_DRAIN_S = 300.0
+# Restart-safe workers are launched to outlive their gateway, and older builds mark them the same
+# way: the cron worker's argv (cron/scheduler.py) and the kanban worker's env (kanban_db_dispatch).
+_RESTART_SAFE_WORKER_ARG = "--external-worker-file"
+_RESTART_SAFE_WORKER_ENV = "HERMES_KANBAN_TASK"
+
+
 def takeover_exit_wait_s(pid_record: Optional[dict[str, Any]]) -> float:
     """Seconds a takeover (``--replace``, a credential-lock handoff) gives a SIGTERMed gateway
     before SIGKILL: that gateway's own shutdown-watchdog leash — it drains chat and cron work and
     cleans up inside it, then hard-exits — plus the watchdog's dump margin. The leash it started
     with is published in its PID record (``stop_leash_s``): this process's config may differ (edited
-    since, another profile). A record from an older build falls back to this process's config."""
+    since, another profile). A record from an older build cannot prove it, so the wait covers this
+    process's config and at least ``_LEGACY_RECORD_ASSUMED_DRAIN_S``."""
     from gateway.restart import DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT, LAUNCHD_WATCHDOG_DUMP_MARGIN_S
     from gateway.shutdown_watchdog import resolve_shutdown_watchdog_delay
     leash = (pid_record or {}).get("stop_leash_s")
     if isinstance(leash, bool) or not isinstance(leash, (int, float)) or not 0 < leash < math.inf:
         try:
             from gateway.run_config_loaders import GatewayConfigLoadersMixin
-            leash = resolve_shutdown_watchdog_delay(GatewayConfigLoadersMixin._load_restart_drain_timeout())
+            drain = GatewayConfigLoadersMixin._load_restart_drain_timeout()
         except Exception:
-            leash = resolve_shutdown_watchdog_delay(DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT)
+            drain = DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
+        leash = resolve_shutdown_watchdog_delay(max(drain, _LEGACY_RECORD_ASSUMED_DRAIN_S))
+        logger.info("Replaced gateway's PID record publishes no stop budget (older build); "
+                    "allowing it up to %.0fs to exit on its own before SIGKILL.", leash)
     return float(leash) + LAUNCHD_WATCHDOG_DUMP_MARGIN_S
 
 
-def gateway_lineage_survivors(pid_record: Optional[dict[str, Any]], known: list) -> list:
+def _is_restart_safe_worker_or_descendant(proc) -> bool:
+    """True when ``proc`` or an ancestor is a restart-safe worker (see _RESTART_SAFE_WORKER_ARG)."""
+    try:
+        chain = [proc, *proc.parents()]
+    except Exception:
+        chain = [proc]
+    for candidate in chain:
+        try:
+            if (_RESTART_SAFE_WORKER_ARG in candidate.cmdline()
+                    or _RESTART_SAFE_WORKER_ENV in candidate.environ()):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def gateway_lineage_survivors(
+    pid_record: Optional[dict[str, Any]], known: list, *, since: Optional[float] = None,
+) -> list:
     """``known`` (a pre-signal snapshot) plus every other live process stamped with the dead
     gateway's ``lineage`` (GATEWAY_LINEAGE_ENV): unlike the snapshot this still finds children it
-    created after SIGTERM, once reparented. Call only after the gateway exited. This process, its
-    ancestors and descendants are spared. POSIX only (``known`` unchanged elsewhere); never raises."""
-    lineage = (pid_record or {}).get("lineage")
-    if _IS_WINDOWS or not isinstance(lineage, str) or not lineage:
+    created after SIGTERM, once reparented. A record from an older build has no lineage; then, best
+    effort, take processes created at or after ``since`` (epoch seconds, read before the snapshot)
+    that carry the gateway marker (``_HERMES_GATEWAY``) and the dead gateway's HERMES_HOME — a
+    child that dropped both is still missed. Restart-safe workers and their descendants are left
+    out, snapshot included. Call only after the gateway exited. This process, its ancestors and
+    descendants are spared. POSIX only (``known`` unchanged elsewhere); never raises."""
+    if _IS_WINDOWS:
         return list(known)
+    record = pid_record or {}
+    lineage = record.get("lineage")
+    lineage = lineage if isinstance(lineage, str) and lineage else None
+    old_home = record.get("hermes_home")
+    legacy_scan = lineage is None and since is not None and isinstance(old_home, str) and bool(old_home)
     found = list(known)
     try:
         import psutil  # type: ignore
         me = psutil.Process()
         spared = {me.pid, *(p.pid for p in me.parents()), *(p.pid for p in me.children(recursive=True)),
                   *(getattr(p, "pid", None) for p in known)}
-        for proc in psutil.process_iter():
+        for proc in psutil.process_iter() if lineage or legacy_scan else ():
             try:
-                if proc.pid not in spared and proc.environ().get(GATEWAY_LINEAGE_ENV) == lineage:
+                if proc.pid in spared:
+                    continue
+                env = proc.environ()
+                if lineage:
+                    matched = env.get(GATEWAY_LINEAGE_ENV) == lineage
+                else:
+                    # create_time is coarse on some platforms; 1s of slack keeps the boundary in.
+                    matched = (env.get("_HERMES_GATEWAY") == "1" and proc.create_time() >= since - 1.0
+                               and _same_hermes_home(env.get("HERMES_HOME", "").strip()
+                                                     or _get_platform_default_hermes_home(), old_home))
+                if matched:
                     found.append(proc)
             except (psutil.Error, OSError):
                 continue
+        found = [p for p in found if not _is_restart_safe_worker_or_descendant(p)]
     except Exception:
         logger.debug("Lineage scan for a replaced gateway failed", exc_info=True)
     return found
@@ -1891,6 +1943,7 @@ def take_over_scoped_lock_holder(
     if graceful_attempts is None:
         graceful_attempts = max(1, math.ceil(takeover_exit_wait_s(owner_record) / 0.5))
     # Snapshot while the owner is alive; afterwards children are reparented.
+    snapshot_at = time.time()
     owner_children = _snapshot_gateway_children(owner_pid)
     if not write_takeover_marker(
         owner_pid, target_home=target_home, target_start_time=owner_start_time
@@ -1905,7 +1958,8 @@ def take_over_scoped_lock_holder(
         # The target normally consumes the marker; clean up any remainder.
         clear_takeover_marker(target_home)
     if replaced is not None:
-        reap_gateway_children(gateway_lineage_survivors(owner_record, owner_children), parent_pid=owner_pid)
+        reap_gateway_children(
+            gateway_lineage_survivors(owner_record, owner_children, since=snapshot_at), parent_pid=owner_pid)
     return replaced
 
 

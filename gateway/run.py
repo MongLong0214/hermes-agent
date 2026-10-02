@@ -5393,6 +5393,7 @@ async def _start_gateway_replace_existing_instance(existing_pid: int, replace: b
     except Exception as e:
         logger.debug("Could not write takeover marker: %s", e)
     # Snapshot children BEFORE signalling: reparented orphans are invisible yet hold scoped token locks.
+    _old_snapshot_at = time.time()
     try:
         from gateway.status import _snapshot_gateway_children
         _old_gateway_children = _snapshot_gateway_children(existing_pid)
@@ -5440,7 +5441,8 @@ async def _start_gateway_replace_existing_instance(existing_pid: int, replace: b
     try:
         from gateway.status import gateway_lineage_survivors, reap_gateway_children
         reap_gateway_children(
-            gateway_lineage_survivors(_old_record, _old_gateway_children), parent_pid=existing_pid)
+            gateway_lineage_survivors(_old_record, _old_gateway_children, since=_old_snapshot_at),
+            parent_pid=existing_pid)
     except Exception:
         logger.debug("Child reap for replaced gateway PID %d failed", existing_pid, exc_info=True)
     remove_pid_file()

@@ -167,10 +167,13 @@ async def test_replace_still_force_kills_an_instance_that_never_exits(monkeypatc
 
 
 @pytest.mark.parametrize("published, exit_at", [
-    # An older build's record: the wait comes from this host's config (default: 60 s leash).
+    # An older build's record: no published leash; the wait still covers this short natural exit.
     (False, _NATURAL_EXIT_S),
     # The owner published a 110 s leash (restart_drain_timeout=50); this side's config says 0.
     (True, 90.0),
+    # Round-2 R68-3: an older build's record cannot prove its owner's budget, so this side's 0 s
+    # drain (a 62 s wait) must not be taken as the owner's: it started with 50 s, exits at 90 s.
+    (False, 90.0),
 ])
 def test_credential_lock_takeover_waits_out_the_owners_drain(
     monkeypatch, tmp_path, published, exit_at,
@@ -288,3 +291,121 @@ async def test_replace_reaps_a_child_created_after_sigterm(monkeypatch, tmp_path
                     os.kill(pid, 9)
                 except ProcessLookupError:
                     pass
+
+
+@pytest.mark.asyncio
+async def test_replace_does_not_size_a_legacy_owners_deadline_from_its_own_config(monkeypatch, tmp_path):
+    """Round-2 R68-3: a record from an older build publishes no stop leash. The old instance
+    started with ``restart_drain_timeout=50`` (110 s leash) and exits on its own at 90 s; this
+    side's config now says 0. Reusing it (a 62 s wait) SIGKILLs an instance inside its own budget."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_RESTART_DRAIN_TIMEOUT", "0")
+
+    replaced, old = await _replace_simulated(monkeypatch, _hand_built_record(tmp_path), exit_at=90.0)
+
+    assert replaced is True
+    assert old.signals == [(0.0, False)], f"force-killed before its natural exit: {old.signals}"
+
+
+# Round-2 R68-4 and ROUND1-ESCAPE-1, on both takeover paths and both record shapes. The old gateway
+# runs with the environment a real one has (``_HERMES_GATEWAY=1`` is set at gateway/run.py import,
+# HERMES_HOME names its home). Before SIGTERM it already has a plain child (must be reaped) and a
+# restart-safe cron worker (``--external-worker-file``, the real launcher's argv) and a kanban worker
+# (``HERMES_KANBAN_TASK``, kanban_db_dispatch's env) that must both survive;
+# its SIGTERM handler creates one more child and exits at once (must be reaped).
+_OLD_GATEWAY_WITH_EARLY_CHILDREN_SCRIPT = r"""
+import os, signal, subprocess, sys, time
+out_path, ready_path, lineage_env = sys.argv[1], sys.argv[2], sys.argv[3]
+sleeper = [sys.executable, "-c", "import time; time.sleep(120)"]
+early = subprocess.Popen(sleeper)
+worker_env = {k: v for k, v in os.environ.items() if k != lineage_env}
+worker = subprocess.Popen(sleeper + ["--external-worker-file", "payload.json"], env=worker_env,
+                          start_new_session=True)
+kanban = subprocess.Popen(sleeper, env={**worker_env, "HERMES_KANBAN_TASK": "t-1"},
+                          start_new_session=True)
+
+def on_term(signum, frame):
+    late = subprocess.Popen(sleeper)
+    with open(out_path, "w") as fh:
+        fh.write(f"{early.pid} {worker.pid} {kanban.pid} {late.pid}")
+    os._exit(0)
+
+signal.signal(signal.SIGTERM, on_term)
+open(ready_path, "w").write("ready")
+while True:
+    time.sleep(0.05)
+"""
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX reap path")
+# Real signals to processes this test spawned; a guard below refuses to reap anything else.
+@pytest.mark.live_system_guard_bypass
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["replace", "credential_lock"])
+@pytest.mark.parametrize("with_lineage", [False, True], ids=["legacy-record", "lineage-record"])
+async def test_takeover_reaps_late_children_and_spares_restart_safe_workers(
+    monkeypatch, tmp_path, path, with_lineage,
+):
+    home = tmp_path / "home"
+    home.mkdir()
+    lineage = f"test-lineage-{os.getpid()}-{time.time_ns()}" if with_lineage else None
+    out_path, ready_path = tmp_path / "children", tmp_path / "ready"
+    env = {k: v for k, v in os.environ.items() if k != _LINEAGE_ENV}
+    env.update({"_HERMES_GATEWAY": "1", "HERMES_HOME": str(home)})
+    if lineage:
+        env[_LINEAGE_ENV] = lineage
+    old = subprocess.Popen(
+        [sys.executable, "-c", _OLD_GATEWAY_WITH_EARLY_CHILDREN_SCRIPT, str(out_path),
+         str(ready_path), _LINEAGE_ENV], env=env)
+    spawned = []
+    try:
+        assert _wait_for(ready_path.exists), "the simulated old gateway never became ready"
+        record = _hand_built_record(home, pid=old.pid)
+        if lineage:
+            record["lineage"] = lineage
+        real_pid_exists, real_reap = status._pid_exists, status.reap_gateway_children
+
+        def guarded_reap(children, *, parent_pid, timeout=5.0):
+            mine = set(map(int, out_path.read_text().split()))
+            stray = {c.pid for c in children} - mine
+            assert not stray, f"the reap reached processes this test did not spawn: {stray}"
+            return real_reap(children, parent_pid=parent_pid, timeout=timeout)
+
+        monkeypatch.setattr(status, "reap_gateway_children", guarded_reap)
+        monkeypatch.setattr(
+            status, "_pid_exists",
+            lambda pid: old.poll() is None if pid == old.pid else real_pid_exists(pid))
+        if path == "replace":
+            monkeypatch.setenv("HERMES_HOME", str(home))
+            _stub_replace_io(monkeypatch, record)
+            from gateway import run as gateway_run
+            assert await gateway_run._start_gateway_replace_existing_instance(old.pid, True) is True
+        else:
+            (home / "gateway.pid").write_text(json.dumps(record))
+            replacer_home = tmp_path / "replacer"
+            replacer_home.mkdir()
+            monkeypatch.setenv("HERMES_HOME", str(replacer_home))
+            monkeypatch.setattr(
+                status, "_scoped_lock_owner_state",
+                lambda pid, start: "same" if old.poll() is None else "exited")
+            monkeypatch.setattr(
+                status, "_read_process_cmdline", lambda pid: "python -m hermes_cli.main gateway run")
+            assert status.take_over_scoped_lock_holder(record) == old.pid
+
+        early_pid, worker_pid, kanban_pid, late_pid = spawned[:] = map(
+            int, out_path.read_text().split())
+        assert _wait_for(lambda: _gone(late_pid), timeout=10), (
+            "a child the old gateway created after SIGTERM survived the takeover")
+        assert _wait_for(lambda: _gone(early_pid), timeout=10), "a pre-SIGTERM child survived"
+        assert not _gone(worker_pid), (
+            "a restart-safe worker already running before SIGTERM must outlive the takeover")
+        assert not _gone(kanban_pid), "a kanban worker must outlive the takeover"
+    finally:
+        if old.poll() is None:
+            old.kill()
+            old.wait(5)
+        for pid in spawned:
+            try:
+                os.kill(pid, 9)
+            except ProcessLookupError:
+                pass

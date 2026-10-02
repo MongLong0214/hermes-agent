@@ -2786,11 +2786,13 @@ def _classify_delivery_outcome(
     normalized_deliver: str, incident_acked: bool, success: bool,
     delivery_queued=None, notification_suppressed: bool = False, delivery_uncertain: bool = False,
 ) -> str:
+    if should_deliver and delivery_uncertain:
+        # A send began and never confirmed; it was not resent (it may have landed). Ahead of
+        # delivery_error: a partial failure (skipped media, another target) is kept on the run's
+        # last_delivery_error, but must not turn a possibly-landed message into "failed".
+        return "uncertain"
     if delivery_error:
         return "failed"
-    if should_deliver and delivery_uncertain:
-        # A send began and never confirmed; it was not resent (it may have landed).
-        return "uncertain"
     if should_deliver and delivery_queued:
         return "queued"
     if notification_suppressed:

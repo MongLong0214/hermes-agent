@@ -130,3 +130,90 @@ def test_queued_worker_delivery_records_the_uncertain_outcome(stalled_live_send,
     assert delivery_queue.get_status(execution["id"])["status"] == "unknown"
     assert len(calls.live) == 1
     _assert_uncertain_not_delivered(job["id"], calls)
+
+
+# Round-2 R68-2: the uncertain text send carried a MEDIA attachment. The attachment is skipped (the
+# loop is contended) and that skip is reported as a partial-delivery error; the error then
+# overrode the uncertainty, so both the ledger and the queue row said ``failed``. The uncertainty
+# must survive, and the partial error must be kept alongside it rather than dropped.
+
+
+@pytest.fixture
+def media_brief(tmp_path, monkeypatch):
+    media = tmp_path / "banner.png"
+    media.write_bytes(b"\x89PNG\r\n\x1a\n")
+    monkeypatch.setattr(
+        "gateway.platforms.base.BasePlatformAdapter.filter_media_delivery_paths",
+        staticmethod(lambda files, *args, **kwargs: list(files)))
+    return f"the brief\nMEDIA:{media}"
+
+
+def test_uncertain_send_with_skipped_media_stays_uncertain(stalled_live_send, media_brief, monkeypatch):
+    calls = stalled_live_send
+    monkeypatch.setattr(
+        scheduler, "run_job", lambda job, **kwargs: (True, "output", media_brief, None))
+    job = jobs.create_job(prompt="fixture only", schedule="every 1h", deliver="telegram:123")
+
+    assert scheduler.run_one_job(job, adapters=calls.adapters, loop=calls.loop) is True
+
+    _assert_uncertain_not_delivered(job["id"], calls)
+    assert jobs.get_job(job["id"])["last_delivery_error"], \
+        "the skipped attachment must still be reported alongside the uncertainty"
+
+
+def test_mixed_targets_uncertain_and_failed_stays_uncertain(stalled_live_send, monkeypatch):
+    """One target's send began and never confirmed, another failed outright on both lanes: the
+    failure is recorded, but the run is still uncertain (one message may have landed)."""
+    calls = stalled_live_send
+    stalled = calls.adapters[Platform.TELEGRAM].send
+
+    async def live_send(chat_id, content, metadata=None):
+        if str(chat_id) == "456":
+            raise RuntimeError("chat not found")
+        return await stalled(chat_id, content, metadata)
+
+    async def standalone_fails(*args, **kwargs):
+        calls.standalone.append(args)
+        return {"error": "chat not found"}
+
+    calls.adapters[Platform.TELEGRAM] = SimpleNamespace(send=live_send)
+    monkeypatch.setattr("tools.send_message_tool._send_to_platform", standalone_fails)
+    monkeypatch.setattr(
+        scheduler, "run_job", lambda job, **kwargs: (True, "output", "the brief", None))
+    job = jobs.create_job(
+        prompt="fixture only", schedule="every 1h", deliver="telegram:123,telegram:456")
+
+    assert scheduler.run_one_job(job, adapters=calls.adapters, loop=calls.loop) is True
+
+    assert all("456" in str(args) for args in calls.standalone), "123 must never be resent"
+    assert job.get("_delivery_uncertain") == ["telegram:123"]
+    assert jobs.get_job(job["id"])["last_delivery_error"], "the failed target must still be reported"
+    assert executions.latest_execution(job["id"])["delivery_outcome"] == "uncertain"
+
+
+def test_queued_uncertain_send_with_skipped_media_stays_unknown(
+        stalled_live_send, media_brief, monkeypatch):
+    calls = stalled_live_send
+    monkeypatch.setattr(
+        scheduler, "run_job", lambda job, **kwargs: (True, "output", media_brief, None))
+    job = jobs.create_job(prompt="fixture only", schedule="every 1h", deliver="telegram:123")
+    execution = executions.create_execution(job["id"], source="fixture")
+    job["execution_id"] = execution["id"]
+    monkeypatch.setenv("_HERMES_CRON_EXTERNAL_WORKER", execution["id"])
+    original_wait = delivery_queue.enqueue_and_wait
+
+    def drain_before_wait(execution_id, queued_job, content, *, for_failure=False):
+        delivery_queue.enqueue(execution_id, queued_job, content, for_failure=for_failure)
+        assert scheduler.drain_delivery_queue(calls.adapters, calls.loop) == 1
+        return original_wait(execution_id, queued_job, content, for_failure=for_failure)
+
+    monkeypatch.setattr(delivery_queue, "enqueue_and_wait", drain_before_wait)
+
+    scheduler.run_one_job(job)
+
+    row = delivery_queue.get_status(execution["id"])
+    assert row["status"] == "unknown", row
+    assert "media attachment" in (row["error"] or ""), row
+    assert len(calls.live) == 1
+    _assert_uncertain_not_delivered(job["id"], calls)
+    assert jobs.get_job(job["id"])["last_delivery_error"], "the skipped attachment was dropped"
