@@ -87,8 +87,12 @@ async def test_aux_model_fallback_notice_scrubs_credential_shaped_error(tmp_path
     secret = "sk-testFAKEKEY1234567890ABCDEFGHIJ"
     # No vendor prefix: only the egress scrub's Bearer sweep catches this one.
     opaque = "opaqueFixtureToken1234567890ABCDE"
+    # R-COMPRESSION-SECRETS: a credential-bearing URL query param (no vendor prefix, not a
+    # "Bearer <token>" shape) — only strict URL-credential redaction catches this one.
+    url_cred_token = "opaqueFixtureToken1234567890ABCDE"
+    url_cred = f"https://service.example/api?access_token={url_cred_token}"
     raw_error = (f"litellm.AuthenticationError: Incorrect API key provided: {secret}; "
-                 f"upstream rejected Bearer {opaque}")
+                 f"upstream rejected Bearer {opaque}; GET {url_cred} failed")
 
     class CompressorAgent:
         def __init__(self, **kwargs):
@@ -121,7 +125,7 @@ async def test_aux_model_fallback_notice_scrubs_credential_shaped_error(tmp_path
 
         warnings = [sent for sent in adapter.sent if "Configured compression model" in sent["content"]]
         assert len(warnings) == 1
-        for credential in (secret, opaque):
+        for credential in (secret, opaque, url_cred_token):
             assert credential not in warnings[0]["content"], (
                 f"raw credential reached the adapter's send(): {warnings[0]['content']!r}")
     finally:

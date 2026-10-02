@@ -562,12 +562,17 @@ def _gateway_loop_exception_handler(
     loop.default_exception_handler(context)
 
 
-def _redact_gateway_user_facing_secrets(text: str) -> str:
+def _redact_gateway_user_facing_secrets(text: str, *, redact_url_credentials: bool = False) -> str:
     """Secret redaction before text can leave the gateway for a chat platform: the shared egress scrub
-    (``force=True`` holds even when ``security.redact_secrets`` is off; fails closed). See #23810."""
+    (``force=True`` holds even when ``security.redact_secrets`` is off; fails closed). See #23810.
+
+    ``redact_url_credentials=True``: also mask credential-bearing URL query params / userinfo (no
+    vendor prefix, not a ``Bearer`` shape) that the default pass leaves alone for magic-link/OAuth-
+    callback URLs. Opt in only where the text is a raw provider/compression exception, never
+    legitimate URL content (R-COMPRESSION-SECRETS)."""
     from agent.redact import redact_for_egress
 
-    return redact_for_egress(text)
+    return redact_for_egress(text, redact_url_credentials=redact_url_credentials)
 
 
 def _redact_approval_command(cmd: "str | None") -> str:

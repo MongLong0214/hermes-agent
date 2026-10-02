@@ -1139,14 +1139,20 @@ REDACTION_UNAVAILABLE = "[redaction-unavailable]"
 _BEARER_RESIDUE_RE = re.compile(r"\bBearer\s+(?:\[[^\]]+\]|[A-Za-z0-9._~+/-]{20,}=*)", re.IGNORECASE)
 
 
-def redact_for_egress(text: str) -> str:
+def redact_for_egress(text: str, *, redact_url_credentials: bool = False) -> str:
     """The one scrub for text leaving the process for a remote reader (chat platforms, A2A peers,
     telemetry). ``redact_sensitive_text(force=True)`` — the only secret-pattern list — plus a bearer
     sweep, because a ``Bearer <opaque>`` value with no vendor prefix carries no shape the prefix
-    matcher can key on. Fails CLOSED: if the redactor raises, the raw text is never returned."""
+    matcher can key on. Fails CLOSED: if the redactor raises, the raw text is never returned.
+
+    ``redact_url_credentials=True`` (default False, same opt-in as ``redact_sensitive_text``):
+    also mask credential-bearing URL query params / userinfo. Off by default because ordinary
+    egress (a final assistant reply, a status line) may legitimately carry a magic-link / OAuth-
+    callback URL the default scrub must leave alone; callers whose text is a raw provider/
+    compression exception — never legitimate URL content — opt in (R-COMPRESSION-SECRETS)."""
     text = str(text or "")
     try:
-        text = redact_sensitive_text(text, force=True)
+        text = redact_sensitive_text(text, force=True, redact_url_credentials=redact_url_credentials)
     except Exception:
         return REDACTION_UNAVAILABLE
     if "earer" in text:
