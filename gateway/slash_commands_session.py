@@ -533,7 +533,8 @@ class GatewaySessionCommandsMixin:
             await self._run_in_executor_with_context(
                 lambda: agent._compress_context([], "", force=True, task_id=session_id or "default"))
         except Exception as exc:
-            return t("gateway.compress.failed", error=exc)
+            from gateway.run import _redact_gateway_user_facing_secrets
+            return t("gateway.compress.failed", error=_redact_gateway_user_facing_secrets(str(exc)))
         if getattr(compressor, "compression_count", 0) > count_before:
             return (
                 "🗜️ Codex app-server thread compacted (thread/compact). The transcript mirror is "
@@ -565,7 +566,8 @@ class GatewaySessionCommandsMixin:
             return await self._run_manual_compression(source, session_entry, history, request)
         except Exception as e:
             logger.warning("Manual compress failed: %s", e)
-            return t("gateway.compress.failed", error=e)
+            from gateway.run import _redact_gateway_user_facing_secrets
+            return t("gateway.compress.failed", error=_redact_gateway_user_facing_secrets(str(e)))
 
     async def _run_manual_compression(self, source, session_entry, history: list, request) -> str:
         """Build a temporary agent, run the shared compress core, persist, and describe the outcome."""

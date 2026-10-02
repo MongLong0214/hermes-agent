@@ -58,20 +58,24 @@ def backup_config(config_path: Path, reason: str, *, keep: int = DEFAULT_KEEP) -
         if existing and filecmp.cmp(config_path, existing[0], shallow=False):
             return None
         stamp = time.strftime('%Y%m%d-%H%M%S')
-        dest = root / f"{config_path.name}.{reason}.{stamp}"
-        if dest.is_symlink() or dest.exists():
-            # Never write through a planted link; a same-second collision with a DIFFERENT backup
-            # (two valid updates within one wall-clock second) must not silently skip this one --
-            # only a planted symlink should. Disambiguate with a counter instead of dropping the backup.
-            if dest.is_symlink():
-                return None
-            for n in range(1, 1000):
-                candidate = root / f"{config_path.name}.{reason}.{stamp}-{n}"
-                if not candidate.exists() and not candidate.is_symlink():
-                    dest = candidate
-                    break
-            else:
-                return None
+        # A monotonically increasing, zero-padded sequence number is ALWAYS part of the name (not
+        # only added on a same-second collision): this function's own retention prunes the oldest
+        # file for a stamp, which can free up that name; a later call at the identical (frozen or
+        # replayed) stamp would then reuse the freed name and, because list_config_backups sorts
+        # lexically and an unsuffixed name would otherwise be a string-prefix of a suffixed one,
+        # that NEWER backup could sort as the OLDEST among its same-stamp siblings -- misdirecting
+        # recovery to stale content. The sequence comes from a small per-reason counter file that
+        # only ever increases, so creation order and lexical order always agree regardless of what
+        # has since been pruned.
+        seq_file = root / f".{reason}.seq"
+        try:
+            seq = int(seq_file.read_text().strip()) + 1
+        except (OSError, ValueError):
+            seq = 1
+        seq_file.write_text(str(seq))
+        dest = root / f"{config_path.name}.{reason}.{stamp}-{seq:08d}"
+        if dest.is_symlink() or dest.exists():  # never write through a planted link
+            return None
         shutil.copy2(config_path, dest)
         for stale in [dest, *existing][keep:]:
             stale.unlink(missing_ok=True)

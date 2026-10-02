@@ -559,3 +559,46 @@ async def test_compress_command_cleanup_does_not_block_event_loop():
         "event loop was blocked during manual /compress cleanup: only "
         f"{observed.get('ticks_during_block')} ticks while agent.close() was running"
     )
+
+
+@pytest.mark.asyncio
+async def test_compress_command_failure_reply_scrubs_credentials(monkeypatch):
+    """ROUND1-ESCAPE-2: the ordinary /compress failure reply (``_handle_compress_command_inner``'s
+    except branch) must not echo a raw provider exception's credential straight into the chat."""
+    from gateway.run import GatewayRunner
+
+    runner = _make_runner(_make_history())
+    secret = "sk-testFAKEKEY1234567890ABCDEFGHIJ"
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError(f"litellm.AuthenticationError: Incorrect API key provided: {secret}")
+
+    monkeypatch.setattr(GatewayRunner, "_run_manual_compression", _boom, raising=False)
+    reply = await runner._handle_compress_command_inner(_make_event())
+    assert secret not in reply
+
+
+@pytest.mark.asyncio
+async def test_compress_command_codex_app_server_failure_reply_scrubs_credentials(monkeypatch):
+    """ROUND1-ESCAPE-2, the Codex app-server variant's except branch (direct ``t(...)`` call with
+    the raw exception, no redaction)."""
+    from gateway.run import GatewayRunner
+
+    runner = _make_runner(_make_history())
+    secret = "sk-testFAKEKEY1234567890ABCDEFGHIJ"
+    agent = MagicMock()
+    agent._codex_session = object()
+    agent.context_compressor.compression_count = 0
+
+    def _compress(*args, **kwargs):
+        raise RuntimeError(f"litellm.AuthenticationError: Incorrect API key provided: {secret}")
+
+    agent._compress_context = _compress
+    monkeypatch.setattr(GatewayRunner, "_cached_agent_for", lambda self, *a, **kw: agent, raising=False)
+
+    async def _run_sync(fn):
+        return fn()
+
+    monkeypatch.setattr(GatewayRunner, "_run_in_executor_with_context", lambda self, fn: _run_sync(fn), raising=False)
+    reply = await runner._compress_codex_app_server_session(session_key="k1", session_id="sess-1")
+    assert secret not in reply
