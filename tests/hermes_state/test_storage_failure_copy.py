@@ -51,6 +51,26 @@ def test_a_refused_store_gets_its_cause_remedy_even_after_crossing_a_string(tmp_
     assert len({next(iter(g)) for g in glosses.values()}) == len(glosses), glosses
 
 
+def test_undetermined_schema_refusal_is_not_defaulted_to_fence_mismatch(monkeypatch):
+    """``describe_storage_failure`` used to default an undetermined schema sub-cause (the typed
+    classifier returning None) straight to FENCE_GENERATION_MISMATCH, telling the user their store
+    "belongs to a different Hermes version" even when nothing confirmed that. When the typed
+    classifier cannot determine the sub-cause, the caller must get an explicit unknown/generic
+    cause instead of the fence-specific one."""
+    import hermes_state_user_copy
+    from hermes_state_errors import SCHEMA_CAUSE_FENCE_GENERATION_MISMATCH
+
+    monkeypatch.setattr(hermes_state_user_copy, "classify_persistence_error", lambda _exc: "schema_incompatible")
+    monkeypatch.setattr(hermes_state_user_copy, "schema_incompatibility_cause", lambda _exc: None)
+
+    failure = describe_storage_failure(RuntimeError("some schema-incompatible-shaped error"))
+
+    fence_mismatch_failure = hermes_state_user_copy.describe_schema_refusal(SCHEMA_CAUSE_FENCE_GENERATION_MISMATCH)
+    assert failure != fence_mismatch_failure, (
+        "an undetermined schema cause must not be defaulted to the fence-generation-mismatch copy")
+    assert "different hermes version" not in failure.gloss.lower()
+
+
 def test_details_line_is_flattened_and_bounded():
     details = storage_failure_details("line one\n   line two " + "x" * 400, limit=60)
     assert "\n" not in details and len(details) == 60 and details.endswith("...")

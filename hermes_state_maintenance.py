@@ -17,8 +17,12 @@ logger = logging.getLogger("hermes_state")
 
 _LAST_ACTIVE_SQL = _sql_session_last_active("s")
 # Automatic prune runs beside live turns on the same writer: each transaction deletes sessions until
-# about this many rows (sessions + their messages, each message firing the FTS triggers), then
-# releases the writer for a moment so a reply's transcript write is never queued behind the whole sweep.
+# about this many rows (sessions + their STORED messages — active and soft-archived both; prune
+# deletes every row, and compaction/rewind (`replace_messages(..., archive_dropped=True)`) leave
+# `sessions.message_count` at the active count only, so the budget must count real `messages` rows,
+# never `message_count`), then releases the writer for a moment so a reply's transcript write is
+# never queued behind the whole sweep. A single session whose own stored rows alone reach this many
+# is sub-batched the same way (see `_prune_one_oversized_session`), never deleted in one piece.
 _AUTO_PRUNE_BATCH_ROWS = 2000
 _AUTO_PRUNE_BATCH_PAUSE_S = 0.01
 _TOKENS_SQL = "(COALESCE(s.input_tokens, 0) + COALESCE(s.output_tokens, 0))"
@@ -285,7 +289,9 @@ class SessionMaintenanceMixin:
         or compression lock while expired/dead holders are reclaimed and fenced.
         ``batch_rows`` (automatic maintenance) commits per batch of whole sessions holding about that
         many rows instead of one transaction for the sweep; every batch re-applies the filters and
-        guards under its own write lock. None keeps an explicit prune all-or-nothing."""
+        guards under its own write lock. A session whose own stored rows alone reach *batch_rows* is
+        deleted through :meth:`_prune_one_oversized_session` instead, sub-batched the same way. None
+        keeps an explicit prune all-or-nothing."""
         where, where_params = self._prune_where(older_than_days, source, filters)
         def _do(conn, only_ids=None):
             sql, params = f"SELECT s.id FROM sessions s WHERE {where}", list(where_params)
@@ -315,6 +321,15 @@ class SessionMaintenanceMixin:
                 for batch in self._prune_batches(where, where_params, batch_rows):
                     if removed_ids:
                         time.sleep(_AUTO_PRUNE_BATCH_PAUSE_S)  # let a waiting reply-path write take the writer
+                    if len(batch) == 1:
+                        # Alone in its own batch because its stored rows already reach batch_rows
+                        # (or it is simply the last candidate) — either way, bound its own delete
+                        # the same way instead of risking one un-split multi-thousand-row DELETE.
+                        removed = self._prune_one_oversized_session(
+                            batch[0], where, where_params, exclude_active_write_guards, batch_rows)
+                        if removed is not None:
+                            removed_ids.append(removed)
+                        continue
                     removed_ids.extend(self._execute_write(lambda conn, ids=batch: _do(conn, ids)))
                 if removed_ids:
                     self._execute_write(self._delete_unreferenced_system_prompts)
@@ -325,11 +340,17 @@ class SessionMaintenanceMixin:
         return len(removed_ids)
 
     def _prune_batches(self, where: str, where_params: list, batch_rows: int):
-        """Prune candidates as lists of whole sessions, each about *batch_rows* rows (itself + messages)."""
+        """Prune candidates as lists of whole sessions, each about *batch_rows* rows (itself + its
+        STORED messages). Counts real ``messages`` rows, not ``sessions.message_count``: compaction
+        and rewind (``replace_messages(..., archive_dropped=True)``) leave ``message_count`` at the
+        active count only, while the delete below removes every stored row (active and archived) —
+        budgeting from ``message_count`` let an archived-heavy sweep land many sessions in one
+        nominally-small batch."""
         batch: List[str] = []
         rows = 0
         for row in self._read_all(
-                f"SELECT s.id, COALESCE(s.message_count, 0) FROM sessions s WHERE {where}", where_params):
+                f"SELECT s.id, (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) "
+                f"FROM sessions s WHERE {where}", where_params):
             batch.append(row[0])
             rows += 1 + max(int(row[1] or 0), 0)
             if rows >= batch_rows:
@@ -337,6 +358,43 @@ class SessionMaintenanceMixin:
                 batch, rows = [], 0
         if batch:
             yield batch
+
+    def _prune_one_oversized_session(
+        self, session_id: str, where: str, where_params: list, exclude_active_write_guards: bool,
+        batch_rows: int,
+    ) -> Optional[str]:
+        """Delete one session whose own stored rows alone reach *batch_rows*: its messages come out
+        in sub-batches of about *batch_rows* rows each, releasing the writer lock between sub-batches
+        exactly like the whole-session batching in :meth:`prune_sessions` — a slow-delete probe
+        showed a concurrent write waiting out an entire oversized session's delete otherwise.
+        Eligibility (the filters plus ``exclude_active_write_guards``) is checked once, before the
+        first sub-batch starts, same as an un-split delete already only checked once. Returns
+        *session_id* once removed, None if it was no longer eligible."""
+        def _eligible(conn) -> bool:
+            if conn.execute(f"SELECT 1 FROM sessions s WHERE s.id = ? AND {where}",
+                             [session_id] + where_params).fetchone() is None:
+                return False
+            return not (exclude_active_write_guards and self._write_guards_reject(
+                conn, session_id, allow_closed_compression_parent=True))
+        if not self._execute_write(_eligible):
+            return None
+        def _delete_chunk(conn) -> int:
+            return conn.execute(
+                "DELETE FROM messages WHERE id IN "
+                "(SELECT id FROM messages WHERE session_id = ? ORDER BY id LIMIT ?)",
+                (session_id, batch_rows)).rowcount
+        first = True
+        while True:
+            if not first:
+                time.sleep(_AUTO_PRUNE_BATCH_PAUSE_S)
+            first = False
+            if self._execute_write(_delete_chunk) < batch_rows:
+                break
+        def _finish(conn) -> None:
+            conn.execute("UPDATE sessions SET parent_session_id = NULL WHERE parent_session_id = ?", (session_id,))
+            conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+        self._execute_write(_finish)
+        return session_id
 
     def _page_pragmas(self, names: Tuple[str, ...], fail_msg: str) -> Optional[list]:
         """Integer PRAGMAs over the existing connection (never a byte probe); None + debug log on failure."""

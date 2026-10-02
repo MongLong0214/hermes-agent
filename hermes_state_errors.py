@@ -247,6 +247,11 @@ SCHEMA_CAUSE_VERSION_UNREADABLE = "SCHEMA_VERSION_UNREADABLE"
 SCHEMA_INCOMPATIBLE_CAUSES = (
     SCHEMA_CAUSE_BUILD_TOO_OLD, SCHEMA_CAUSE_FENCE_GENERATION_MISMATCH, SCHEMA_CAUSE_VERSION_UNREADABLE,
 )
+# NOT one of SCHEMA_INCOMPATIBLE_CAUSES: an IncompatibleSchemaError always carries one of those three —
+# this is only the caller-facing fallback for hermes_state_user_copy.describe_storage_failure when the
+# typed sub-cause classifier (schema_incompatibility_cause) could not pin one down, so the user gets an
+# honest "could not determine" cause instead of being defaulted to a specific (and possibly wrong) one.
+SCHEMA_CAUSE_UNKNOWN = "UNKNOWN"
 
 
 class IncompatibleSchemaError(RuntimeError):
@@ -306,11 +311,15 @@ _PERSISTENCE_CAUSE_BY_TYPE = (
     (StateDbReplacedError, "replaced"),
     (StateDbCorruptError, "corrupt"),
 )
+# The fence trigger's RAISE text and the missing-UDF error: a generation refusal, never damage. Used
+# only for PLAIN TEXT with no exception object left to type-check (RPC/init-error slots) — an
+# exception routes through the typed ``fence_refusal_verdict`` check in ``classify_persistence_error``
+# instead, because the missing-UDF phrase alone is ambiguous (see that function).
+_SCHEMA_INCOMPATIBLE_PHRASES = (
+    "state db generation incompatible", "no such function: hermes_turn_fence_generation",
+    *(head.lower() for head in _INCOMPATIBLE_SCHEMA_HEADS.values()),
+)
 _PERSISTENCE_CAUSE_BY_PHRASE = (
-    # The fence trigger's RAISE text and the missing-UDF error: a generation refusal, never damage.
-    (("state db generation incompatible", "no such function: hermes_turn_fence_generation",
-      *(head.lower() for head in _INCOMPATIBLE_SCHEMA_HEADS.values())),
-     "schema_incompatible"),
     (("turn lease",), "turn_lease"),
     (("closed by compression",), "compression_closed"),
     (("being compressed", "compression lease"), "compression"),
@@ -348,6 +357,23 @@ def classify_persistence_error(exc_or_str) -> str:
         return "fts_index"
     if _sqlite_primary_code(exc_or_str) in _SQLITE_LOCK_CODES:
         return "locked"
+    if isinstance(exc_or_str, BaseException):
+        # A real exception is read by TYPE, not prose: the fence's own RAISE(ABORT) is unambiguous
+        # by itself, but a missing turn-fence UDF only says this connection never registered it —
+        # as true of this build's own store as of another build's — so it counts only when
+        # ``fence_refusal_verdict`` confirms it (a store probe would be needed to go further; no
+        # db_path reaches this generic classifier, so that confirmation only ever comes from the
+        # unambiguous RAISE text here). An exception that merely QUOTES these phrases in an
+        # unrelated message (a tool result, a log line) must not be read as a refusal.
+        from hermes_state_fence import fence_refusal_verdict
+        if fence_refusal_verdict(exc_or_str) is not None:
+            return "schema_incompatible"
+    else:
+        # No exception object survives an RPC/init-error slot, so there is no type left to check —
+        # phrase matching is the only signal available, same as every other bucket below.
+        text = str(exc_or_str).lower()
+        if any(phrase in text for phrase in _SCHEMA_INCOMPATIBLE_PHRASES):
+            return "schema_incompatible"
     text = str(exc_or_str).lower()
     for markers, cause in _PERSISTENCE_CAUSE_BY_PHRASE:
         if any(marker in text for marker in markers):
