@@ -78,6 +78,25 @@ def test_codex_success_flushes_and_reports_persisted():
     assert result["agent_persisted"] is True
 
 
+def test_codex_flush_failure_reports_agent_persisted_false():
+    """L4-2/R67-1: codex sibling. ``_persist_projected_messages`` already computes the real flush
+    outcome (for the thread-id publish decision), but the turn result hardcoded
+    ``agent_persisted=True`` regardless — so a failed flush was reported as durable and the
+    gateway skipped the write that could have recovered it. The DB IS configured here; only the
+    flush call itself fails."""
+    agent = _make_agent(session_db=MagicMock())
+    agent._flush_messages_to_session_db = MagicMock(return_value=False)
+    result = run_codex_app_server_turn(
+        agent,
+        user_message="hello",
+        original_user_message="hello",
+        messages=[{"role": "user", "content": "hello"}],
+        effective_task_id="task-1",
+    )
+    assert result["completed"] is True
+    assert result["agent_persisted"] is False
+
+
 def test_codex_user_interrupt_is_reported_and_cleared():
     agent = _make_agent(session_db=None)
     turn = _make_turn()

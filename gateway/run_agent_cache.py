@@ -829,6 +829,34 @@ class GatewayAgentCacheMixin:
         if hasattr(agent, "_db_flush_scan_prefix"):
             agent._db_flush_scan_prefix = None
 
+    def _ensure_persisted_then_release_soft(self, agent: Any) -> None:
+        """Ordinary cache replacement (cross-process message-count invalidation, a changed config
+        signature building a new agent) must not silently drop an agent whose transcript hasn't
+        reached state.db (#L4-2/R67-3): ``_release_evicted_agent_soft`` below clears
+        ``_session_messages``, so without this the unflushed tail is just gone. Attempt the same
+        flush-or-durable-spool shutdown already uses (``_flush_agent_transcript_at_shutdown``)
+        before the ordinary soft release. /stop, the reaper and /resume are deliberate exceptions —
+        they go through ``_evict_cached_agent(require_persisted=False)`` instead, never this path."""
+        from gateway.agent_cache_pressure import transcript_persistence_caught_up
+        if not transcript_persistence_caught_up(agent):
+            self._flush_agent_transcript_at_shutdown(agent)
+        self._release_evicted_agent_soft(agent)
+
+    def _retire_replaced_agent(self, session_key: str, old_entry: Any) -> None:
+        """A changed config signature builds a fresh agent and overwrites the cache slot
+        (``_resolve_turn_agent``); whatever was in the slot must be released the same safe way
+        ``_evict_cached_agent`` releases one, not silently dropped by the overwrite (#L4-2/R67-3).
+        Mid-turn agents are skipped like every other eviction path here — a concurrent caller
+        still holding the slot owns its own release."""
+        from gateway.run import _AGENT_PENDING_SENTINEL
+        agent = _first_agent(old_entry)
+        if agent is None or agent is _AGENT_PENDING_SENTINEL or id(agent) in self._running_agent_ids():
+            return
+        self._spawn_release_thread(
+            self._ensure_persisted_then_release_soft, (agent,), f"agent-replace-{str(session_key)[:24]}",
+            inline_fallback=True,
+        )
+
     def _agent_cache_bounds(self):
         """Operator-configured agent-cache bounds, resolved once per process (lazily, not in
         ``__init__``, so ``__new__``-constructed test / slash-command runners work too)."""

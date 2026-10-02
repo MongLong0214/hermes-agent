@@ -1896,7 +1896,18 @@ class GatewayTurnMixin:
                         ):
                             entry["message_id"] = str(event.message_id)
                             _user_msg_id_attached = True
-                        await store.append_to_transcript(sid, entry, skip_db=agent_persisted)
+                        # agent_persisted=False means SOME write this turn failed, not that every
+                        # row in this suffix is unwritten: turn-start persistence (and any mid-turn
+                        # incremental flush) can already have committed earlier rows before the
+                        # final flush failed. Re-appending a row still carrying ``_db_persisted``
+                        # would re-INSERT it (hermes_state_messages.py has no dedup) — recover only
+                        # the rows the agent never landed, which also covers row-repair: the
+                        # finalizer's blank-row fill clears the marker on a row it rewrites, so a
+                        # cleared marker here still reaches the DB like any other unpersisted row
+                        # (#L4-2/R67-2).
+                        await store.append_to_transcript(
+                            sid, entry, skip_db=agent_persisted or bool(msg.get("_db_persisted")),
+                        )
 
         # The agent persists token counts/model itself; keep only last_prompt_tokens for hygiene.
         await store.update_session(

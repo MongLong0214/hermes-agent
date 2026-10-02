@@ -43,6 +43,13 @@ _IMAGE_PART_TYPES = {"image", "image_url", "input_image"}
 # Reasoning/codex fields are role-gated (assistant-only) inside _insert_message_rows.
 _ROW_REASONING_KEYS = ("reasoning", "reasoning_content", "reasoning_details", "codex_reasoning_items", "codex_message_items")
 _PERSIST_AFTER_ADMISSION_INTERRUPT = "_persist_after_admission_interrupt"
+# The FTS write-corruption guard (gateway/run.py::_select_cached_agent_history, #50502) can hand a
+# NEW turn the retained LIVE transcript (still carrying rows that never reached state.db) as its
+# conversation_history, instead of a genuine DB reload. Those rows are then both unflushed AND
+# present in conversation_history by identity — without this flag the "already in
+# conversation_history => durable" shortcut below falsely certifies them and skips writing them,
+# so the backlog is never recovered and eviction reads the session as caught up (#L4-2/R67-5).
+_RETAINED_UNFLUSHED_HISTORY_MARKER = "_retained_unflushed_history"
 
 
 def _is_ephemeral_scaffolding(msg: Any) -> bool:
@@ -242,7 +249,7 @@ def _db_flush_collect(agent, messages: List[Dict], conversation_history: Optiona
         # Already durable (history copy or caller-seeded): stamp so future flushes skip it.
         if (
             id(msg) in history_ids or id(msg) in seed_ids
-        ) and not msg.get(_PERSIST_AFTER_ADMISSION_INTERRUPT):
+        ) and not msg.get(_PERSIST_AFTER_ADMISSION_INTERRUPT) and not msg.get(_RETAINED_UNFLUSHED_HISTORY_MARKER):
             msg[_DB_PERSISTED_MARKER] = True
             continue
         if getattr(agent, "_mute_notification_reply", False):

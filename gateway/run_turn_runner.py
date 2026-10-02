@@ -1093,9 +1093,14 @@ class TurnRunner:
         return out
 
     def _release_evicted_agent(self, agent) -> None:
-        """Off-lock soft release on a daemon thread so teardown never blocks the gateway loop."""
+        """Off-lock soft release on a daemon thread so teardown never blocks the gateway loop.
+
+        Cross-process message-count invalidation is an ORDINARY replacement, not a forced teardown
+        (#L4-2/R67-3) — ``_ensure_persisted_then_release_soft`` flushes-or-spools an unflushed
+        transcript first instead of letting the soft release clear it unread."""
         self._runner._spawn_release_thread(
-            self._runner._release_evicted_agent_soft, (agent,), f"agent-xproc-evict-{str(self._ctx.session_key)[:24]}",
+            self._runner._ensure_persisted_then_release_soft, (agent,),
+            f"agent-xproc-evict-{str(self._ctx.session_key)[:24]}",
             inline_fallback=True,
         )
 
@@ -1161,10 +1166,17 @@ class TurnRunner:
             )
             if cache_lock and cache is not None:
                 with cache_lock:
+                    # A signature mismatch makes _lookup_cached_agent return early without
+                    # popping/evicting the old entry (unlike the msg_count/dead-sid branches
+                    # above) — capture it so the plain overwrite below doesn't silently drop an
+                    # unflushed transcript (#L4-2/R67-3).
+                    replaced = cache.get(ctx.session_key)
                     # Record the snapshot's session_id with message_count so the cross-process guard
                     # can skip the meaningless count comparison if the active session_id switches.
                     cache[ctx.session_key] = (agent, sig, msg_count, ctx.session_id)
                     runner._enforce_agent_cache_cap()
+                if replaced is not None:
+                    runner._retire_replaced_agent(ctx.session_key, replaced)
             logger.debug("Created new agent for session %s (sig=%s)", ctx.session_key, sig)
         return agent, found.reused
 
@@ -1990,9 +2002,15 @@ class TurnRunner:
             final_response = _sanitize_gateway_final_response(ctx.source.platform, final_response)
             if not final_response:
                 final_response = f"⚠️ {result['error']}" if result.get("error") else ""
-            # NOTE: deliberately omits agent_persisted/last_reasoning/response_* — the caller
-            # defaults agent_persisted differently when the key is absent.
-            return {"final_response": final_response, **common}
+            # NOTE: deliberately omits last_reasoning/response_* (there is no response to carry
+            # them for) but MUST still forward an explicit agent_persisted (#L4-2/R67-1): the
+            # finalizer/truncation/codex paths now report a real flush outcome even on an empty
+            # response, and dropping it here let a genuine False get silently overwritten by the
+            # caller's session-DB-existence default. Absent key only when nothing ever set it.
+            empty_result = {"final_response": final_response, **common}
+            if "agent_persisted" in result:
+                empty_result["agent_persisted"] = result["agent_persisted"]
+            return empty_result
         final_response = self._append_auto_media_tags(final_response, result, agent_history, history_media_paths)
         # Auto-titling runs at TURN START (agent/turn_context.py) from the user's message alone, so a
         # failed/interrupted turn is still titled.

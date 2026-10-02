@@ -371,7 +371,7 @@ class TestAgentCacheBoundedGrowth:
 
         old_agent = self._fake_agent()
         old_agent._memory_manager = MagicMock()  # has an external provider
-        old_agent._session_messages = [{"role": "user", "content": "hi"}]
+        old_agent._session_messages = [{"role": "user", "content": "hi", "_db_persisted": True}]
         old_agent._last_flushed_db_idx = 1  # fully flushed -- eviction must proceed
         old_agent.commit_memory_session = lambda msgs=None: commit_calls.append(msgs)
         new_agent = self._fake_agent()
@@ -386,7 +386,7 @@ class TestAgentCacheBoundedGrowth:
         while _t.time() < deadline and not release_calls:
             _t.sleep(0.02)
         # Memory committed with the live transcript, THEN client released.
-        assert commit_calls == [[{"role": "user", "content": "hi"}]]
+        assert commit_calls == [[{"role": "user", "content": "hi", "_db_persisted": True}]]
         assert old_agent in release_calls
 
 

@@ -312,3 +312,80 @@ async def test_transcript_read_failure_stops_turn_before_agent_or_append(
 # ── Test 4: normal path (new_messages found) uses skip_db=True ────────
 
 
+# ── R67-2 (L4-2): agent_persisted=False must not re-insert already-committed rows ──────
+
+
+@pytest.mark.asyncio
+async def test_agent_persisted_false_only_writes_the_unpersisted_tail(monkeypatch, tmp_path):
+    """Turn-start persistence (and any mid-turn incremental flush) can already have committed
+    the user row and earlier tool exchanges before the FINAL flush fails and the turn reports
+    ``agent_persisted=False`` (#L4-2/R67-1 now makes this a real, reachable signal). The gateway's
+    new_messages loop used to apply one blanket ``skip_db=agent_persisted`` to the entire
+    current-turn suffix, so a partial failure re-inserted rows the agent already wrote — a
+    probe through the real append path produced ``old user, old assistant, new user, new user,
+    new assistant``. Only rows the agent never persisted (no ``_db_persisted`` marker — including
+    ones the finalizer's blank-row fill cleared the marker on for a rewrite) may reach the DB."""
+    runner = _bootstrap(monkeypatch, tmp_path)
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "final answer",
+            "messages": [
+                {"role": "user", "content": "hi", "_db_persisted": True},
+                {
+                    "role": "assistant", "content": "", "_db_persisted": True,
+                    "tool_calls": [{"id": "c1", "function": {"name": "f", "arguments": "{}"}}],
+                },
+                {"role": "tool", "tool_call_id": "c1", "content": "ok", "_db_persisted": True},
+                {"role": "assistant", "content": "final answer"},  # the flush that FAILED
+            ],
+            "tools": [],
+            "history_offset": 0,
+            "agent_persisted": False,
+            "last_prompt_tokens": 0,
+        }
+    )
+
+    await runner._handle_message_with_agent(
+        _event(), _source(), "agent:main:telegram:group:-1001:12345", 1
+    )
+
+    calls = runner.session_store.append_to_transcript.call_args_list
+    by_content = {
+        call.args[1]["content"]: call.kwargs.get("skip_db", False)
+        for call in calls
+        if len(call.args) >= 2 and isinstance(call.args[1], dict)
+        and call.args[1].get("role") in {"user", "assistant", "tool"}
+    }
+    assert by_content["hi"] is True, by_content
+    assert by_content["ok"] is True, by_content
+    assert by_content["final answer"] is False, by_content
+
+
+@pytest.mark.asyncio
+async def test_agent_persisted_false_still_writes_everything_without_markers(monkeypatch, tmp_path):
+    """Guardrail: a runtime that never flushed anything itself (every message lacks
+    ``_db_persisted``) must keep writing the whole new-message tail, same as before this fix."""
+    runner = _bootstrap(monkeypatch, tmp_path)
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "final answer",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "final answer"},
+            ],
+            "tools": [],
+            "history_offset": 0,
+            "agent_persisted": False,
+            "last_prompt_tokens": 0,
+        }
+    )
+
+    await runner._handle_message_with_agent(
+        _event(), _source(), "agent:main:telegram:group:-1001:12345", 1
+    )
+
+    _assert_user_call_has_skip_db(
+        runner.session_store.append_to_transcript.call_args_list, False
+    )
+
+

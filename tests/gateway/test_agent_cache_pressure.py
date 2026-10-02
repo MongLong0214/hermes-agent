@@ -184,6 +184,39 @@ class TestPersistenceGuard:
         assert transcript_persistence_caught_up(object()) is False
         assert transcript_persistence_caught_up(None) is False
 
+    def test_a_filled_row_whose_marker_was_popped_blocks_eviction_at_unchanged_length(self, tmp_path):
+        """#L4-2/R67-4: ``turn_finalizer._close_transcript_tail``'s blank-row fill rewrites an
+        already-flushed tail's content and pops its ``_DB_PERSISTED_MARKER`` in place, without
+        changing ``len(messages)`` or ``_last_flushed_db_idx``. The reviewer's probe found the
+        predicate still returned True in exactly this shape (watermark == length == 2) and
+        explicit/LRU/idle-TTL eviction then cleared the agent's unflushed messages to ``[]``."""
+        agent = self._agent(tmp_path, "filled-tail")
+        try:
+            messages = [
+                {"role": "user", "content": "do it"},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "t1", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+                ]},
+            ]
+            agent._session_messages = messages
+            assert agent._flush_messages_to_session_db(messages) is True
+            assert transcript_persistence_caught_up(agent) is True
+
+            # The fill: rewrite the persisted tail's content in place and pop its marker, exactly
+            # as agent/turn_finalizer.py::_close_transcript_tail does — length/watermark untouched.
+            from agent.context_compressor import _DB_PERSISTED_MARKER
+            tail = messages[-1]
+            tail["content"] = "Here is your answer."
+            tail.pop(_DB_PERSISTED_MARKER, None)
+
+            assert agent._last_flushed_db_idx == len(messages)  # watermark never moved
+            assert transcript_persistence_caught_up(agent) is False, (
+                "a rewritten, re-dirtied tail must not read as durable just because the "
+                "positional watermark never moved"
+            )
+        finally:
+            agent.close()
+
 
 class TestEvictionPlanner:
     def _entries(self, n):
@@ -256,7 +289,8 @@ class TestGatewayPressureSweep:
 
     def _cached_agent(self, *, persisted=True, messages=2):
         agent = MagicMock()
-        agent._session_messages = [{"role": "user", "content": "x"}] * messages
+        tail = {"role": "user", "content": "x", **({"_db_persisted": True} if persisted else {})}
+        agent._session_messages = [tail] * messages
         agent._last_flushed_db_idx = messages if persisted else 0
         return agent
 
