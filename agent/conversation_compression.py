@@ -2451,10 +2451,15 @@ def _insert_real_user_anchor(messages: list, anchor: dict) -> CompressedUserTurn
     # Every assistant is user-preceded (or there are none). Appending is safe whenever the transcript does not already
     # end with a user turn. Never merge into a summary either: its prefix must stay at message start for summary
     # detection; repair_message_sequence merges adjacent user turns summary-first.
+    from agent.canonical_peer import peer_metadata
+
     if (
         not messages
         or _role(messages[-1]) != "user"
         or ContextCompressor._is_context_summary_content(_message_text(messages[-1]))
+        # A canonical peer anchor stays its own structured row (the per-call wire copy merges the
+        # user;user pair later); its body never becomes scaffolding text.
+        or peer_metadata(anchor) is not None
     ):
         return _place(len(messages))
     # Trailing user-role scaffolding (e.g. the todo snapshot): merge instead

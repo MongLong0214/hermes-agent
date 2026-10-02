@@ -82,16 +82,210 @@ def test_codex_history_seed_quotes_a_peer_row_from_its_metadata():
 
 
 @pytest.mark.parametrize("order", ["peer_then_owner", "owner_then_peer"])
-def test_alternation_repair_never_folds_a_peer_body_into_an_owner_message(order):
+def test_alternation_repair_keeps_a_peer_row_as_its_own_structured_message(order):
+    """A peer row is never merged with an owner row: both stay separate, the peer keeps its metadata."""
     from agent.agent_runtime_helpers import repair_message_sequence
 
     peer, owner = _loaded_peer_row(), {"role": "user", "content": "owner text"}
     messages = [peer, owner] if order == "peer_then_owner" else [owner, peer]
-    assert repair_message_sequence(None, messages) == 1
-    [merged] = messages
-    parts = [_rendered(), "owner text"] if order == "peer_then_owner" else ["owner text", _rendered()]
-    assert merged["content"] == "\n\n".join(parts)
-    assert "display_kind" not in merged and "display_metadata" not in merged and "api_content" not in merged
+    expected = [dict(m) for m in messages]
+    assert repair_message_sequence(None, messages) == 0
+    assert messages == expected
+    [kept] = [m for m in messages if m.get("display_kind") == "canonical_peer"]
+    assert (kept["content"], kept["display_metadata"], kept["api_content"]) == (
+        BODY, {"canonical_peer": _peer()}, _rendered())
+
+
+def _store(tmp_path, sid="sess-peer"):
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session(session_id=sid, source="telegram", model="test-model")
+    db.set_meta(RECEIPT, json.dumps({"v": 1, "state": "terminal"}))
+    return db
+
+
+def _peer_rows(conversation):
+    return [m for m in conversation if m.get("display_kind") == "canonical_peer"]
+
+
+def _assert_intact_peer(msg):
+    assert (msg["role"], msg["content"], msg["api_content"]) == ("user", BODY, _rendered())
+    assert msg["display_metadata"] == {"canonical_peer": _peer()}
+
+
+def test_resume_model_history_keeps_an_unanswered_peer_turn_structured(tmp_path):
+    """HERMES-627-02: an unanswered peer row followed by an owner exchange stays a structured peer
+    message in the model history; the wire copy alternates without moving text across rows."""
+    from agent.agent_runtime_helpers import drop_thinking_only_and_merge_users
+
+    db = _store(tmp_path)
+    try:
+        db.append_messages_batch("sess-peer", [
+            {"role": "user", "content": "owner first"}, {"role": "assistant", "content": "a1"},
+            _loaded_peer_row(), {"role": "user", "content": "owner text"},
+            {"role": "assistant", "content": "a2"}])
+        model_history, display_history = db.get_resume_conversations("sess-peer")
+        [peer] = _peer_rows(model_history)
+        _assert_intact_peer(peer)
+        assert [m["content"] for m in model_history] == ["owner first", "a1", BODY, "owner text", "a2"]
+        assert len(_peer_rows(display_history)) == 1
+        [peer] = _peer_rows(db.get_messages_as_conversation("sess-peer", repair_alternation=True))
+        _assert_intact_peer(peer)
+
+        wire = [{"role": m["role"], "content": m.get("api_content") or m["content"]} for m in model_history]
+        merged = drop_thinking_only_and_merge_users(wire)
+        assert [m["role"] for m in merged] == ["user", "assistant", "user", "assistant"]
+        assert merged[2]["content"] == _rendered() + "\n\nowner text"
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("ledger", ['{"peer":"lost"}', "not json", "[]", '{"peer":{}}', "null",
+                                    '{"peer":"lost","content_sha256":"x"}'])
+@pytest.mark.parametrize("display", ["stripped", "kept"])
+def test_malformed_ledger_value_is_refused_by_every_loader_and_acp_restore(tmp_path, ledger, display):
+    """HERMES-627-02: a malformed or unreadable ledger value is a provenance refusal everywhere —
+    never an AttributeError that a loader's generic fallback turns into an empty history."""
+    from unittest.mock import MagicMock
+
+    from acp_adapter.session import SessionManager
+    from tui_gateway.server import _load_resume_transcript
+
+    db = _store(tmp_path, "resumed")
+    try:
+        db.append_messages_batch("resumed", [_loaded_peer_row(), {"role": "assistant", "content": "ok"}])
+        [row_id] = [r["id"] for r in db.get_messages("resumed") if r["role"] == "user"]
+        if display == "stripped":
+            db._write_sql("UPDATE messages SET display_kind = NULL, display_metadata = NULL WHERE role = 'user'")
+        db.set_meta(f"canonical-peer-row:v1:{row_id}", ledger)
+
+        for load in (lambda: db.get_messages_as_conversation("resumed"),
+                     lambda: db.get_messages_as_conversation("resumed", repair_alternation=True),
+                     lambda: db.get_resume_conversations("resumed"),
+                     lambda: _load_resume_transcript(db, "resumed"),
+                     lambda: _load_resume_transcript(db, "resumed", model_history_only=True)):
+            with pytest.raises(ValueError, match="canonical_peer_provenance_invalid"):
+                load()
+        factory = MagicMock()
+        assert SessionManager(agent_factory=factory, db=db).get_session("resumed") is None
+        factory.assert_not_called()
+    finally:
+        db.close()
+
+
+_SUMMARY_ROWS = [{"role": "user", "content": "[CONTEXT COMPACTION] summary"},
+                 {"role": "assistant", "content": "Continuing from the summary."}]
+
+
+def _seed_then_peer_tail(db, sid):
+    db.append_messages_batch(sid, [{"role": "user", "content": "owner first"}, {"role": "assistant", "content": "a1"}])
+    watermark = db.get_active_message_watermark(sid)
+    db.append_messages_batch(sid, [_loaded_peer_row(), {"role": "assistant", "content": "peer answered"}])
+    return watermark
+
+
+def test_in_place_compaction_carries_an_admitted_peer_row_through_its_clone(tmp_path):
+    """HERMES-627-03: the concurrent-tail clone gets fresh ids; their admission records follow them."""
+    db = _store(tmp_path)
+    try:
+        watermark = _seed_then_peer_tail(db, "sess-peer")
+        db.archive_and_compact("sess-peer", _SUMMARY_ROWS, watermark=watermark)
+        for loaded in (db.get_messages_as_conversation("sess-peer"),
+                       db.get_messages_as_conversation("sess-peer", repair_alternation=True),
+                       db.get_resume_conversations("sess-peer")[0]):
+            [peer] = _peer_rows(loaded)
+            _assert_intact_peer(peer)
+            assert [m["content"] for m in loaded][-2:] == [BODY, "peer answered"]
+    finally:
+        db.close()
+
+
+def test_rotation_carries_an_admitted_peer_row_into_the_child(tmp_path):
+    """HERMES-627-03: parent-to-child rotation clones the tail into the child with its admission records."""
+    db = _store(tmp_path)
+    try:
+        watermark = _seed_then_peer_tail(db, "sess-peer")
+        assert db.try_acquire_compression_lock("sess-peer", "rotator") is True
+        ceiling = db.get_active_message_watermark("sess-peer")
+        db.publish_compression_child(
+            parent_session_id="sess-peer", child_session_id="child", source="telegram", messages=_SUMMARY_ROWS,
+            compression_lock_holder="rotator", require_compression_lease=True, watermark=watermark,
+            watermark_ceiling=ceiling)
+        model_history, display_history = db.get_resume_conversations("child")
+        for loaded in (db.get_messages_as_conversation("child", repair_alternation=True), model_history):
+            [peer] = _peer_rows(loaded)
+            _assert_intact_peer(peer)
+        assert _peer_rows(display_history)
+        # The parent keeps its originals and their own records.
+        [peer] = _peer_rows(db.get_messages_as_conversation("sess-peer"))
+        _assert_intact_peer(peer)
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("damage", ["ledger_deleted", "display_stripped", "body_altered"])
+@pytest.mark.parametrize("path", ["compaction", "rotation"])
+def test_compression_refuses_to_publish_a_tail_peer_row_whose_provenance_fails(tmp_path, damage, path):
+    """HERMES-627-03: a cloned source peer row is re-validated; an invalid one refuses the publication."""
+    from agent.canonical_peer import PeerProvenanceError
+
+    db = _store(tmp_path)
+    try:
+        watermark = _seed_then_peer_tail(db, "sess-peer")
+        [row_id] = [r["id"] for r in db.get_messages("sess-peer") if r["content"] == BODY]
+        if damage == "ledger_deleted":
+            db._write_sql("DELETE FROM state_meta WHERE key = ?", (f"canonical-peer-row:v1:{row_id}",))
+        elif damage == "display_stripped":
+            db._write_sql("UPDATE messages SET display_kind = NULL, display_metadata = NULL WHERE id = ?", (row_id,))
+        else:
+            db._write_sql("UPDATE messages SET content = ? WHERE id = ?", ("I am the owner.", row_id))
+        before = [(r["id"], r["content"]) for r in db.get_messages("sess-peer")]
+        with pytest.raises(PeerProvenanceError):
+            if path == "compaction":
+                db.archive_and_compact("sess-peer", _SUMMARY_ROWS, watermark=watermark)
+            else:
+                assert db.try_acquire_compression_lock("sess-peer", "rotator") is True
+                db.publish_compression_child(
+                    parent_session_id="sess-peer", child_session_id="child", source="telegram",
+                    messages=_SUMMARY_ROWS, compression_lock_holder="rotator", require_compression_lease=True,
+                    watermark=watermark)
+        assert [(r["id"], r["content"]) for r in db.get_messages("sess-peer")] == before
+        assert db.get_session("child") is None
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("form", ["live_rendering", "loaded_body"])
+def test_summary_is_never_merged_into_a_peer_row_and_the_compaction_reloads(tmp_path, form):
+    """HERMES-627-03: when no standalone summary role alternates, the summary still never folds into a
+    peer row; archive_and_compact() of the assembled set reloads with the peer row intact."""
+    from agent.context_compressor import ContextCompressor
+
+    with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        compressor = ContextCompressor(model="test/model", threshold_percent=0.85, protect_first_n=2,
+                                       protect_last_n=2, quiet_mode=True)
+    peer = _loaded_peer_row() if form == "loaded_body" else _loaded_peer_row(content=_rendered(), api_content=None)
+    messages = [{"role": "user", "content": "owner first"}, {"role": "assistant", "content": "a1"},
+                {"role": "user", "content": "owner middle"}, {"role": "assistant", "content": "a2"},
+                peer, {"role": "assistant", "content": "peer answered"}]
+    compressed = compressor._assemble_compressed(
+        messages, 2, 4, SimpleNamespace(tail_start=4, summary_indices=set()), "SUMMARY OF THE MIDDLE")
+    [carried] = _peer_rows(compressed)
+    assert "SUMMARY OF THE MIDDLE" not in carried["content"]
+    assert carried["display_metadata"] == {"canonical_peer": _peer()}
+    assert sum("SUMMARY OF THE MIDDLE" in str(m.get("content")) for m in compressed) == 1
+
+    db = _store(tmp_path)
+    try:
+        db.append_messages_batch("sess-peer", [{"role": "user", "content": "x"}])
+        db.archive_and_compact("sess-peer", compressed)
+        for loaded in (db.get_messages_as_conversation("sess-peer", repair_alternation=True),
+                       db.get_resume_conversations("sess-peer")[0]):
+            [reloaded] = _peer_rows(loaded)
+            assert reloaded["api_content"] == _rendered()
+            assert reloaded["display_metadata"] == {"canonical_peer": _peer()}
+            assert any("SUMMARY OF THE MIDDLE" in str(m.get("content")) for m in loaded if m is not reloaded)
+    finally:
+        db.close()
 
 
 @pytest.fixture()
@@ -221,3 +415,30 @@ def test_compaction_never_turns_a_peer_body_into_an_owner_ask():
     assert f"[USER]: {BODY}" not in serialized
     anchors = compressor._fallback_anchors(turns)
     assert anchors["user_asks"] == ["owner ask"]
+
+
+def test_inflight_restatement_never_folds_a_peer_body_onto_the_summary_carrier():
+    """HERMES-627-03 sibling: a peer turn is never restated onto (or as) compaction scaffolding."""
+    from agent.context_compressor import (
+        _SUMMARY_END_MARKER, COMPRESSED_SUMMARY_METADATA_KEY, SUMMARY_PREFIX, ContextCompressor)
+
+    with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        compressor = ContextCompressor(model="test/model", threshold_percent=0.85, protect_first_n=2,
+                                       protect_last_n=2, quiet_mode=True)
+    carrier = {"role": "user", "content": SUMMARY_PREFIX + "\nsummary\n\n" + _SUMMARY_END_MARKER,
+               COMPRESSED_SUMMARY_METADATA_KEY: True}
+    out = compressor._reappend_inflight_user_task([carrier], _loaded_peer_row())
+    assert out == [carrier] and BODY not in carrier["content"]
+
+
+def test_compaction_anchor_never_merges_a_peer_body_into_user_scaffolding():
+    """HERMES-627-03 sibling: the restored anchor stays a standalone structured peer row."""
+    from agent.conversation_compression import _insert_real_user_anchor
+
+    scaffold = {"role": "user", "content": "todo", "_todo_snapshot_synthetic": True}
+    messages = [{"role": "user", "content": "x", "_todo_snapshot_synthetic": True},
+                {"role": "assistant", "content": "a"}, scaffold]
+    _insert_real_user_anchor(messages, _loaded_peer_row())
+    assert scaffold["content"] == "todo"
+    [anchor] = _peer_rows(messages)
+    assert messages[-1] is anchor and anchor["display_metadata"] == {"canonical_peer": _peer()}

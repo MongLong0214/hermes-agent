@@ -553,7 +553,7 @@ def _prune_unanswered_tool_calls(messages: List[Dict]) -> Tuple[List[Dict], int]
 
 def _merge_consecutive_users(messages: List[Dict]) -> Tuple[List[Dict], int]:
     """Pass 3: merge consecutive plain-text user messages (no user input lost)."""
-    from agent.canonical_peer import peer_metadata, peer_wire_text
+    from agent.canonical_peer import peer_metadata
     from agent.context_compressor import _DB_PERSISTED_MARKER, split_user_originated_turn
 
     repairs = 0
@@ -571,21 +571,17 @@ def _merge_consecutive_users(messages: List[Dict]) -> Tuple[List[Dict], int]:
             and prev.get("display_kind") != STEER_DISPLAY_KIND
             # Only merge plain-text content; leave multimodal (list) content alone.
             and isinstance(prev.get("content", ""), str) and isinstance(msg.get("content", ""), str)
+            # A canonical peer row stays its own structured message (provenance never merges with
+            # owner text, either way round); like a carrier, the per-call wire copy merges later,
+            # where the peer is already its metadata rendering. Malformed provenance raises here.
+            and peer_metadata(prev) is None and peer_metadata(msg) is None
         ):
             prev_content, new_content = prev.get("content", ""), msg.get("content", "")
-            # A canonical peer row joins only as its quoted rendering, so the merge never turns a
-            # peer's body into owner text; the merged message is no longer a peer row.
-            prev_peer, new_peer = peer_metadata(prev) is not None, peer_metadata(msg) is not None
-            prev_text = peer_wire_text(prev, with_sidecar=False) if prev_peer else prev_content
-            new_text = peer_wire_text(msg, with_sidecar=False) if new_peer else new_content
             merged_content = (
-                (prev_text + "\n\n" + new_text) if prev_text and new_text else (prev_text or new_text)
+                (prev_content + "\n\n" + new_content) if prev_content and new_content else (prev_content or new_content)
             )
             had_api_sidecar = "api_content" in prev
             prev["content"] = merged_content
-            if prev_peer:
-                prev.pop("display_kind", None)
-                prev.pop("display_metadata", None)
             # Merged content invalidates the api_content sidecar; drop it so replay cannot use stale bytes.
             drop_stale_api_content(prev)
             # Pop the persist marker only when the durable row actually changed: a merge that

@@ -31,6 +31,7 @@ PEER_PROVENANCE_INVALID = "canonical_peer_provenance_invalid"
 ENVELOPE_ESCAPE = "canonical_envelope_escape"
 _RECEIPT_PREFIX = "canonical-receipt:"
 _NONCE_RE = re.compile(r"[0-9a-f]{32}")
+_DIGEST_RE = re.compile(r"[0-9a-f]{64}")
 _IDENTITY_FIELDS = ("binding", "author_id", "channel_id", "event_id")
 
 
@@ -158,3 +159,18 @@ def content_digest(encoded_content: Any) -> str:
 def ledger_value(peer: Mapping[str, str], encoded_content: Any) -> str:
     return json.dumps({"peer": validate_peer_metadata(peer), "content_sha256": content_digest(encoded_content)},
                       ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def parse_ledger_value(value: Any) -> dict[str, Any]:
+    """The admission record a :func:`ledger_value` wrote, or :class:`PeerProvenanceError`.
+
+    An unreadable or malformed record is a provenance refusal, never a generic load failure a
+    caller could mistake for an empty history."""
+    try:
+        record = json.loads(value)
+    except (TypeError, ValueError):
+        raise PeerProvenanceError() from None
+    if (not isinstance(record, dict) or set(record) != {"peer", "content_sha256"}
+            or not isinstance(record["content_sha256"], str) or not _DIGEST_RE.fullmatch(record["content_sha256"])):
+        raise PeerProvenanceError()
+    return {"peer": validate_peer_metadata(record["peer"]), "content_sha256": record["content_sha256"]}
