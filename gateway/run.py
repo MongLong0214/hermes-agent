@@ -14,6 +14,7 @@ import concurrent.futures
 import dataclasses
 import json
 import logging
+import math
 import os
 import re
 import shlex
@@ -2211,6 +2212,7 @@ from gateway.platforms.base import (
 )
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.restart import (
+    CRON_DRAIN_CLEANUP_RESERVE_S,
     DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT,
     DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT,
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
@@ -5405,9 +5407,20 @@ async def _start_gateway_replace_existing_instance(existing_pid: int, replace: b
         logger.error("Permission denied killing PID %d. Cannot replace.", existing_pid)
         _clear_takeover_marker_quiet()
         return False
-    # Up to 10s for SIGTERM, then SIGKILL.
-    if not await _wait_for_pid_exit(existing_pid, 20, 0.5):
-        logger.warning("Old gateway (PID %d) did not exit after SIGTERM, sending SIGKILL.", existing_pid)
+    # The old process's own stop() path drains an in-flight cron run for up to its configured
+    # cron_drain_timeout (an interrupted cron run is recorded unknown with no retry — see
+    # cron/scheduler_tick.py's pre-dispatch next-run advance and cron/executions.py's restart
+    # recovery), plus a cleanup margin for bookkeeping after the drain. SIGKILLing sooner than
+    # that cuts the drain off mid-job. Derive the wait from the SAME config value and the SAME
+    # cleanup margin the stop() path itself budgets (gateway/restart.py's CRON_DRAIN_CLEANUP_
+    # RESERVE_S), not a second hardcoded number; the forced-kill path below stays bounded.
+    _sigterm_poll_s = 0.5
+    _sigterm_grace_s = GatewayConfigLoadersMixin._load_cron_drain_timeout() + CRON_DRAIN_CLEANUP_RESERVE_S
+    _sigterm_attempts = max(1, math.ceil(_sigterm_grace_s / _sigterm_poll_s))
+    if not await _wait_for_pid_exit(existing_pid, _sigterm_attempts, _sigterm_poll_s):
+        logger.warning(
+            "Old gateway (PID %d) did not exit within %.0fs of SIGTERM (cron drain budget), "
+            "sending SIGKILL.", existing_pid, _sigterm_grace_s)
         old_gateway_exited = False
         try:
             terminate_pid(existing_pid, force=True, expected_start_time=existing_start_time)

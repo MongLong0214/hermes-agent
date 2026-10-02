@@ -37,6 +37,15 @@ _KNOWN_DELIVERY_PLATFORMS = frozenset({
 # deliver=origin destination.
 _NON_PUSH_ORIGIN_PLATFORMS = frozenset({"api_server"})
 
+# How long _live_send_text waits for the live adapter to confirm a send before treating it as a
+# slow confirmation rather than a failure (see the TimeoutError handling there).
+_LIVE_SEND_CONFIRM_TIMEOUT_S = 60
+# Grace window, after a confirmation timeout and a best-effort cancel, for a dispatch that was
+# already starting to register itself (see _live_send_text). Bounded and short: a live loop
+# starts an already-queued Task's first step promptly, so this is not "waiting for the send",
+# only for the loop to prove whether it ever began.
+_DISPATCH_SIGNAL_GRACE_S = 2.0
+
 # Platforms supporting a cron/notification home target -> env var used by gateway config.
 _HOME_TARGET_ENV_VARS = {
     "matrix": "MATRIX_HOME_ROOM",
@@ -1466,7 +1475,7 @@ def _live_send_text(
 ) -> tuple[bool, bool, Any]:
     """Schedule the text send on the gateway loop; returns ``(adapter_ok, timed_out, message_id)``.
     Re-raises a real send error so the caller falls through to standalone."""
-    from agent.async_utils import safe_schedule_threadsafe
+    from agent.async_utils import safe_schedule_threadsafe_with_dispatch_signal
     from gateway.delivery import DeliveryRouter, DeliveryTarget
     job = t.job
     router = DeliveryRouter(t.config, t.target_adapters)
@@ -1477,30 +1486,37 @@ def _live_send_text(
     # Send through the already-authorized transport: re-resolving from the plain target_adapters
     # dict cannot re-derive the SharedRouteAdapters satellite grant (the satellite owned
     # platforms.<p> block is disabled), yields None, and drops the delivery (#115656).
-    future = safe_schedule_threadsafe(
+    future, dispatch_began = safe_schedule_threadsafe_with_dispatch_signal(
         router._deliver_to_platform(
             route_target, text_to_send, route_metadata, transport=t.transport), t.loop)
     if future is None:
         target_errors.append("live adapter event loop scheduling failed")
         return False, False, None
     try:
-        send_result = future.result(timeout=60)
+        send_result = future.result(timeout=_LIVE_SEND_CONFIRM_TIMEOUT_S)
     except TimeoutError:
-        # Slow confirmation != failure; future.cancel() disambiguates. False -> already in flight,
-        # cannot be un-sent, standalone resend would DUPLICATE: assume delivered. True -> never
-        # started (loop wedged): MUST fall through to standalone or it is silently dropped.
-        if future.cancel():
-            msg = f"live adapter send to {t.where} timed out before the coroutine was dispatched"
-            logger.warning("Job '%s': %s, falling back to standalone", job["id"], msg)
-            target_errors.append(msg)
-            return False, False, None
-        logger.warning(
-            "Job '%s': live adapter send to %s:%s timed out "
-            "after 60s; already dispatched (in flight), "
-            "assuming delivered (skipping standalone fallback "
-            "to avoid duplicate)",
-            job["id"], t.platform_name, t.chat_id)
-        return True, True, None
+        # Slow confirmation != failure, but future.cancel() does NOT disambiguate: on a
+        # run_coroutine_threadsafe future it keeps returning True for as long as the underlying
+        # Task has not finished, including while it is genuinely in flight (see
+        # async_utils.safe_schedule_threadsafe_with_dispatch_signal) — a read-only probe confirmed
+        # this. Only dispatch_began, set as the coroutine's first action, can tell "never started"
+        # from "started and still running". Request cancellation (best-effort, in case it truly
+        # never started), then give an already-starting dispatch a short grace window to register
+        # before deciding — falling back to standalone when dispatch may have begun would
+        # DUPLICATE the send, so an ambiguous outcome is treated as uncertain, not as "never sent".
+        future.cancel()
+        if dispatch_began.wait(timeout=_DISPATCH_SIGNAL_GRACE_S):
+            logger.warning(
+                "Job '%s': live adapter send to %s:%s timed out "
+                "after %.0fs; dispatch had begun (in flight or just "
+                "starting), treating as uncertain (skipping standalone "
+                "fallback to avoid a possible duplicate)",
+                job["id"], t.platform_name, t.chat_id, _LIVE_SEND_CONFIRM_TIMEOUT_S)
+            return True, True, None
+        msg = f"live adapter send to {t.where} timed out before the coroutine was dispatched"
+        logger.warning("Job '%s': %s, falling back to standalone", job["id"], msg)
+        target_errors.append(msg)
+        return False, False, None
     except Exception as ex:
         # Real send error (not a slow confirmation): fall through to standalone.
         target_errors.append(f"live adapter send failed: {ex}")
