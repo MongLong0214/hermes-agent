@@ -15,6 +15,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import uuid
 import weakref
 from abc import ABC, abstractmethod
@@ -4297,15 +4298,21 @@ class BasePlatformAdapter(ABC):
     async def _notify_turn_error(self, event: MessageEvent, e: BaseException) -> Optional[dict]:
         """Tell the user a turn failed rather than leaving radio silence (last resort:
         a failing notice is logged, never raised). Returns the thread metadata used."""
+        from agent.redact import redact_sensitive_text
         _thread_metadata = None
         try:
             _thread_metadata = _thread_metadata_for_event(event)
-            error_detail = str(e)[:300] if str(e) else "no details available"
+            # No exception text in the chat-bound notice: pattern redaction only masks known
+            # credential SHAPES (a Bot API URL, a vendor-prefixed key) and cannot be made airtight
+            # against arbitrary private content an exception string can carry (a filename, a path,
+            # a non-vendor credential query param) — R71-1. The exception is already force-redacted
+            # and logged (with its traceback) by the caller before this runs, so nothing here is
+            # lost for diagnosis.
             # Only the policy reads bind the routed profile; the send stays in the launch scope
             # as before, so delivery bookkeeping keeps landing where boot-time recovery reads it.
             with self._media_delivery_scope(event.source):
                 content = None if diagnostic_wake_muted(event) else self.warning_text(
-                    f"Sorry, I encountered an error ({type(e).__name__}).\n{error_detail}\n"
+                    f"Sorry, I encountered an error ({type(e).__name__}).\n"
                     "Try again or use /reset to start a fresh session.",
                     "Sorry, I encountered an error.",
                     logical_platform=event.source.platform, chat_id=event.source.chat_id, metadata=_thread_metadata)
@@ -4314,7 +4321,8 @@ class BasePlatformAdapter(ABC):
             await self.send(chat_id=event.source.chat_id, content=content, metadata=_thread_metadata)
         except Exception as notify_err:
             logger.error(
-                "[%s] Failed to send error notification to user: %s", self.name, notify_err, exc_info=True)
+                "[%s] Failed to send error notification to user: %s", self.name,
+                redact_sensitive_text(str(notify_err), force=True, redact_url_credentials=True))
         return _thread_metadata
 
     async def _deliver_attachments(self, event: MessageEvent, extracted: "_ExtractedResponse",
@@ -4539,7 +4547,15 @@ class BasePlatformAdapter(ABC):
             raise
         except BaseException as e:
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
-            logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
+            # Force-redact the message AND traceback here (not exc_info=True, whose formatting is
+            # deferred to the handler's formatter and would only get the non-forced redaction a
+            # redact_secrets opt-out disables) — R71-1: this runs right before _notify_turn_error,
+            # and the exception can embed a Bot API URL token or another credential-bearing query
+            # param. This diagnostic sink stays fail-closed regardless of the opt-out.
+            from agent.redact import redact_sensitive_text
+            _tb_text = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+            logger.error("[%s] Error handling message: %s", self.name,
+                         redact_sensitive_text(_tb_text, force=True, redact_url_credentials=True))
             _thread_metadata = (await self._notify_turn_error(event, e)) or _thread_metadata
             # SystemExit/KeyboardInterrupt propagate; other BaseExceptions are contained.
             if isinstance(e, (SystemExit, KeyboardInterrupt)):

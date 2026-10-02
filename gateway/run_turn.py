@@ -2143,12 +2143,13 @@ class GatewayTurnMixin:
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
+        # Identifiers and lengths only: INFO reaches agent.log and its readers, so no conversation text.
         logger.info(
-            "inbound message: platform=%s user=%s chat=%s msg=%r reply_to_id=%s reply_to_text=%r",
+            "inbound message: platform=%s user=%s chat=%s msg_id=%s msg_len=%d reply_to_id=%s reply_to_len=%d",
             _platform_name, source.user_name or source.user_id or "unknown",
-            source.chat_id or "unknown", (event.text or "")[:80].replace("\n", " "),
+            source.chat_id or "unknown", getattr(event, "message_id", None), len(event.text or ""),
             getattr(event, "reply_to_message_id", None),
-            (getattr(event, "reply_to_text", None) or "")[:80].replace("\n", " "),
+            len(getattr(event, "reply_to_text", None) or ""),
         )
 
         resolved = await self._hmwa_resolve_session(event, source)

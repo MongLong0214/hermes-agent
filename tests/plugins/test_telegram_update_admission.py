@@ -84,12 +84,13 @@ def update(bot, uid=10, kind="text", *, edited=False, chat=42, text="hello", gro
 
 
 @asynccontextmanager
-async def connected(monkeypatch, *, extra=None, bot_id=111, is_reconnect=False):
+async def connected(monkeypatch, *, extra=None, bot_id=111, is_reconnect=False, request=None):
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token=f"{bot_id}:offline-test", extra=extra or {}))
     # Only transport/lifecycle services and the final model-work boundary are replaced.
     monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "88")
     monkeypatch.setenv("TELEGRAM_WEBHOOK_URL", "")
-    monkeypatch.setattr(adapter, "_build_ptb_requests", AsyncMock(return_value=(NoNetwork(bot_id), NoNetwork(bot_id))))
+    requests = (request, request) if request is not None else (NoNetwork(bot_id), NoNetwork(bot_id))
+    monkeypatch.setattr(adapter, "_build_ptb_requests", AsyncMock(return_value=requests))
     monkeypatch.setattr(adapter, "_start_polling_mode", AsyncMock())
     monkeypatch.setattr(adapter, "_start_post_connect_housekeeping", lambda: None)
     monkeypatch.setattr(adapter, "_restart_task_attr", lambda name, coroutine: coroutine.close())
@@ -790,3 +791,95 @@ async def test_redelivery_to_rebuilt_adapter_is_dropped(monkeypatch, tmp_path):
         await app.process_update(update(app.bot, 30))
         await asyncio.gather(*adapter._pending_text_batch_tasks.values())
         assert len(delivered) == 1
+
+
+class QueuedUpdates(NoNetwork):
+    """Offline Bot API queue for real PTB polling: deleteWebhook honours drop_pending_updates
+    as Telegram does, and getUpdates confirms everything below ``offset``."""
+
+    def __init__(self, real_sleep, bot_id=111):
+        super().__init__(bot_id)
+        self.pending, self.drops, self._sleep = [], [], real_sleep
+
+    def queue_dm(self, uid, text):
+        self.pending.append({"update_id": uid, "message": {
+            "message_id": uid, "date": 1800000000, "text": text, "chat": {"id": 42, "type": "private"},
+            "from": {"id": 88, "is_bot": False, "first_name": "Human"}}})
+
+    async def do_request(self, url, method, request_data=None, **kwargs):
+        endpoint = url.rsplit("/", 1)[-1]
+        params = request_data.parameters if request_data is not None else {}
+        if endpoint == "deleteWebhook":
+            self.drops.append(bool(params.get("drop_pending_updates")))
+            if self.drops[-1]:
+                self.pending.clear()
+            return 200, b'{"ok":true,"result":true}'
+        if endpoint == "getUpdates":
+            if params.get("offset") is not None:
+                self.pending = [u for u in self.pending if u["update_id"] >= params["offset"]]
+            if not self.pending:
+                await self._sleep(0.01)
+            return 200, json.dumps({"ok": True, "result": list(self.pending)}).encode()
+        return await super().do_request(url, method, request_data, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_dm_queued_during_polling_conflict_wait_is_admitted_once(monkeypatch):
+    """A DM Telegram queues while the adapter waits out a 409 Conflict reaches the gateway
+    exactly once: the retry restarts real PTB polling, whose bootstrap calls deleteWebhook."""
+    real_sleep = asyncio.sleep
+    api = QueuedUpdates(real_sleep)
+    async with connected(monkeypatch, request=api) as (adapter, app, delivered):
+        adapter.set_fatal_error_handler(AsyncMock())
+        adapter._polling_error_callback_ref = lambda error: None
+
+        async def conflict_wait(delay, *args, **kwargs):
+            if delay >= 10:  # the conflict back-off: the operator sends a DM meanwhile
+                api.queue_dm(5001, "sent during the 409 wait")
+                return None
+            return await real_sleep(delay, *args, **kwargs)
+
+        with monkeypatch.context() as patched:
+            patched.setattr(asyncio, "sleep", conflict_wait)
+            conflict = type("Conflict", (Exception,), {})
+            await adapter._handle_polling_conflict(conflict("Conflict: terminated by other getUpdates request"))
+            for _ in range(300):
+                if delivered:
+                    break
+                await real_sleep(0.01)
+            # Keep polling and the batch timer running long enough for a duplicate to surface.
+            await real_sleep(0.5)
+        assert [event.text for event in delivered] == ["sent during the 409 wait"]
+        assert api.drops == [False]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["text", "photo"])
+async def test_buffered_event_survives_a_one_time_dispatch_failure(monkeypatch, tmp_path, kind):
+    """The batch flush pops the buffered event before dispatching it; PTB has already acknowledged the
+    update, so a dispatch that raises once must not lose it: it is held and redispatched once."""
+    monkeypatch.setattr(PhotoSize, "get_file", AsyncMock(return_value=SimpleNamespace(
+        file_path="offline.png", download_as_bytearray=AsyncMock(return_value=bytearray(b"offline")))))
+    monkeypatch.setattr("plugins.platforms.telegram.adapter.cache_image_from_bytes_async",
+                        AsyncMock(return_value=str(tmp_path / "photo.png")))
+    async with connected(monkeypatch) as (adapter, app, delivered):
+        adapter._media_batch_delay_seconds = 0.01
+        record = adapter._start_session_processing
+        failures = []
+
+        def fail_once(event, session_key):
+            if not failures:
+                failures.append(event)
+                raise RuntimeError("session store briefly unavailable")
+            return record(event, session_key)
+
+        monkeypatch.setattr(adapter, "_start_session_processing", fail_once)
+        await app.process_update(update(app.bot, kind=kind))
+        await asyncio.gather(*adapter._pending_text_batch_tasks.values(), *adapter._pending_photo_batch_tasks.values(),
+                             return_exceptions=True)
+        assert len(failures) == 1
+        redispatch = adapter._held_inbound_redispatch_task
+        assert redispatch is not None, "the popped event was dropped instead of held"
+        await redispatch
+        assert len(delivered) == 1 and delivered[0] is failures[0]
+        assert not adapter._held_inbound_events

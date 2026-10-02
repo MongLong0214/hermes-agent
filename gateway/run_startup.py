@@ -511,7 +511,7 @@ class GatewayStartupMixin:
         reached the platform: an adapter may deliver the first chunks of a long reply, or retry a request
         internally, before the call that raises. A send cut short by a cancel is flagged for the caller,
         which settles it the same way."""
-        from gateway.delivery_ledger import mark_delivered, mark_failed
+        from gateway.delivery_ledger import is_reconnect_only, mark_delivered, mark_failed
 
         adapter = await self._obligation_adapter(row)
         if adapter is None:
@@ -529,6 +529,19 @@ class GatewayStartupMixin:
         except BaseException:
             row["send_interrupted"] = True
             raise
+        if (result is not None and not getattr(result, "success", False) and adapter.send_path_degraded
+                and is_reconnect_only(getattr(result, "error", ""))):
+            # Polling degraded again after the claim and the adapter refused locally, before any request:
+            # released unspent like a claim whose adapter vanished, or a flapping link spends the attempts
+            # cap on refusals that never reached the platform. The degraded check keeps a transport error
+            # that may follow delivered chunks (Discord reports it with the same error) spent.
+            # Shielded: the commit (release_runtime_claim, a worker thread) plus the degraded-to-healthy
+            # recheck and recovery-task spawn must survive THIS coroutine being cancelled (the caller
+            # dropping the whole redelivery task) between the commit and the recheck — previously a
+            # cancellation there left the row refunded but the recovery sweep never spawned, stranding
+            # the reply until the next restart or a manually requested sweep (R71-2).
+            await asyncio.shield(self._finish_degraded_refund(row, adapter))
+            return False
         with _log_suppressed(logging.DEBUG, "delivery ledger update failed", exc_info=True):
             if result is not None and getattr(result, "success", False):
                 await asyncio.to_thread(mark_delivered, row["obligation_id"], attempt=row.get("attempts"))
@@ -540,6 +553,21 @@ class GatewayStartupMixin:
             await asyncio.to_thread(mark_failed, row["obligation_id"],
                                     str(getattr(result, "error", "") or "send failed"), attempt=row.get("attempts"))
         return False
+
+    async def _finish_degraded_refund(self, row: dict, adapter: Any) -> None:
+        """The release commit plus the degraded-to-healthy recheck and recovery spawn, run under
+        ``asyncio.shield`` by the caller so a cancelled redelivery task cannot abandon it mid-flight."""
+        await self._release_unsent_claims([row], reconnect_only=True)
+        if not adapter.send_path_degraded:
+            # The handback above commits through a worker thread (release_runtime_claim). If the
+            # adapter's degraded-to-healthy edge fired WHILE that commit was still in flight,
+            # _record_polling_progress's own recovery sweep ran before this row was visible as
+            # `failed` and found nothing — that edge does not fire again, so without this recheck
+            # the reply would wait for the next restart or a manually requested sweep (R71-2).
+            task = self._retain_background_task(asyncio.ensure_future(
+                self._redeliver_failed_obligations_for_platform(adapter.platform, profile=row.get("profile"))))
+            task.add_done_callback(self._late_failure_callback(
+                "redelivery after a degraded-refund race failed", level=logging.DEBUG))
 
     async def _obligation_adapter(self, row: dict):
         """Resolve the adapter for a claimed ledger row, or None when it cannot be delivered now."""

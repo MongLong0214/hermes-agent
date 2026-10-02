@@ -124,6 +124,109 @@ async def test_in_place_redelivery_serves_the_owning_profiles_rows(tmp_path, mon
     assert _state(oid) == "delivered"
 
 
+def _attempts(oid):
+    with dl._connect() as conn:
+        return conn.execute("SELECT attempts FROM delivery_obligations WHERE obligation_id=?", (oid,)).fetchone()[0]
+
+
+@pytest.mark.asyncio
+async def test_degraded_again_after_the_claim_refunds_the_attempt_and_delivers_once():
+    """Polling degrades between the in-place handoff's claim and its send: the adapter refuses locally
+    (``send_path_degraded``, no request), so the claim goes back unspent. Flapping as many times as the
+    attempts cap must not abandon the reply; the next real recovery delivers it once."""
+    adapter = _adapter()
+    runner, _primary = _runner(adapter)
+    generation, _ = adapter._begin_polling_generation()
+    oid = await _refuse_while_degraded(adapter)
+    attempts_before = _attempts(oid)
+
+    clear_resume = runner._clear_resume_pending_for_claimed_obligations
+    flaps = {"left": dl.MAX_ATTEMPTS}
+
+    async def degrade_after_claim(claimed, **kwargs):
+        if flaps["left"]:
+            flaps["left"] -= 1
+            flaps["generation"], _ = adapter._begin_polling_generation()  # polling dies again
+        return await clear_resume(claimed, **kwargs)
+
+    runner._clear_resume_pending_for_claimed_obligations = degrade_after_claim
+    for _ in range(dl.MAX_ATTEMPTS):
+        assert adapter._record_polling_progress(generation) is True  # in-place recovery edge
+        await _drain(adapter)
+        generation = flaps["generation"]
+        assert _state(oid) == "failed"
+        assert _attempts(oid) == attempts_before  # a local refusal spends no attempt
+        adapter._bot.send_message.assert_not_awaited()
+
+    assert adapter._record_polling_progress(generation) is True  # recovers and stays up this time
+    await _drain(adapter)
+    assert _state(oid) == "delivered"
+    assert adapter._bot.send_message.await_count == 1
+    assert _REPLY in adapter._bot.send_message.await_args.kwargs["text"]
+
+
+@pytest.mark.asyncio
+async def test_recovery_edge_during_refund_commit_does_not_strand_the_reply(monkeypatch):
+    """R71-2: the refund branch's handback (``_release_unsent_claims(reconnect_only=True)``) commits
+    through a worker thread (``release_runtime_claim``). The previous test always lets that commit
+    finish before the next recovery edge is recorded, which never exercises the ordering where the
+    edge arrives WHILE the commit is still in flight.
+
+    If polling's degraded-to-healthy edge fires in that window, ``_record_polling_progress``'s own
+    recovery sweep (``_redeliver_failed_obligations_for_platform``, via ``schedule_in_place_redelivery``)
+    claims only ``failed`` rows and the row is still ``attempting`` — the sweep finds nothing, and the
+    edge does not fire again for this generation. Without a post-commit recheck, the reply would wait
+    for the next restart or a manually requested sweep."""
+    import threading
+
+    from gateway import delivery_ledger as dl_module
+
+    adapter = _adapter()
+    runner, _primary = _runner(adapter)
+    generation, _ = adapter._begin_polling_generation()
+    oid = await _refuse_while_degraded(adapter)
+    assert _state(oid) == "failed"
+
+    generation, _ = adapter._begin_polling_generation()  # degrades again before the resend is attempted
+
+    entered_commit = threading.Event()
+    release_commit = threading.Event()
+    real_release_runtime_claim = dl_module.release_runtime_claim
+
+    def _paused_release_runtime_claim(*args, **kwargs):
+        entered_commit.set()
+        assert release_commit.wait(timeout=5), "test never released the paused handback commit"
+        return real_release_runtime_claim(*args, **kwargs)
+
+    monkeypatch.setattr(dl_module, "release_runtime_claim", _paused_release_runtime_claim)
+
+    # This is the same call ``schedule_in_place_redelivery`` makes from a recovery edge: claim the
+    # `failed` row and retry its send. The retry finds the adapter degraded again (the flap above) and
+    # takes the new refund branch, whose handback pauses at the patched commit below.
+    redeliver = asyncio.ensure_future(runner._redeliver_failed_obligations_for_platform(Platform.TELEGRAM))
+    await asyncio.wait_for(asyncio.to_thread(entered_commit.wait), timeout=5)
+    assert _state(oid) == "attempting"  # the refund's handback has not committed yet
+
+    # The SAME degraded generation recovers while that handback commit is still in flight.
+    assert adapter._record_polling_progress(generation) is True
+    await _drain(adapter)  # the edge's own sweep runs now, while the row is still invisible to it
+    adapter._bot.send_message.assert_not_awaited()
+
+    release_commit.set()  # let the paused handback commit
+    await asyncio.wait_for(redeliver, timeout=5)
+    # The fix's post-commit recheck tracks its wake-up task on the RUNNER (same bookkeeping as
+    # ``_rearm_after_interrupted_send``), not the adapter — drain both when present, so an unfixed
+    # ``run_startup.py`` (which never creates ``runner._background_tasks``) fails on the state
+    # assertion below rather than on a missing attribute here.
+    if getattr(runner, "_background_tasks", None):
+        await _drain(runner)
+    await _drain(adapter)
+
+    assert _state(oid) == "delivered"
+    assert adapter._bot.send_message.await_count == 1
+    assert _REPLY in adapter._bot.send_message.await_args.kwargs["text"]
+
+
 class _Request:
     """PTB request double: ``initialize`` reopens a closed client, ``shutdown`` closes it."""
 
@@ -209,3 +312,63 @@ async def test_disconnect_closes_transports_after_the_init_ladder_is_exhausted(m
     await asyncio.wait_for(adapter.disconnect(), timeout=10)
 
     assert all(request.closed for request in requests)
+
+
+@pytest.mark.asyncio
+async def test_recovery_edge_during_refund_commit_survives_cancellation(monkeypatch):
+    """Same race as the test above, but the redelivery task itself is cancelled right after the
+    handback commit resumes (not awaited to completion) — exactly what drops a reply if the shielded
+    recheck/spawn in ``_finish_degraded_refund`` is removed."""
+    import threading
+
+    from gateway import delivery_ledger as dl_module
+
+    adapter = _adapter()
+    runner, _primary = _runner(adapter)
+    generation, _ = adapter._begin_polling_generation()
+    oid = await _refuse_while_degraded(adapter)
+    assert _state(oid) == "failed"
+
+    generation, _ = adapter._begin_polling_generation()
+
+    entered_commit = threading.Event()
+    release_commit = threading.Event()
+    real_release_runtime_claim = dl_module.release_runtime_claim
+
+    def _paused_release_runtime_claim(*args, **kwargs):
+        entered_commit.set()
+        assert release_commit.wait(timeout=5), "test never released the paused handback commit"
+        return real_release_runtime_claim(*args, **kwargs)
+
+    monkeypatch.setattr(dl_module, "release_runtime_claim", _paused_release_runtime_claim)
+
+    redeliver = asyncio.ensure_future(runner._redeliver_failed_obligations_for_platform(Platform.TELEGRAM))
+    await asyncio.wait_for(asyncio.to_thread(entered_commit.wait), timeout=5)
+    assert adapter._record_polling_progress(generation) is True
+    await _drain(adapter)
+    adapter._bot.send_message.assert_not_awaited()
+
+    release_commit.set()
+    redeliver.cancel()  # cancel as the paused thread resumes, racing the shield's own completion
+    try:
+        await redeliver
+    except asyncio.CancelledError:
+        pass
+
+    # The shielded recheck/spawn must still complete even though the task awaiting it was cancelled.
+    for _ in range(200):
+        if getattr(runner, "_background_tasks", None):
+            break
+        await asyncio.sleep(0.02)
+    if getattr(runner, "_background_tasks", None):
+        await _drain(runner)
+    await _drain(adapter)
+
+    assert _state(oid) == "delivered", "cancelling the caller must not strand the shielded recovery spawn"
+    # Exactly one API send: the cancelled caller's own send_message call on its (unprotected) line
+    # never ran, and the shielded recovery spawn is the only thing that actually delivered.
+    adapter._bot.send_message.assert_awaited_once()
+    # A later sweep for the same obligation finds nothing left to do (already delivered, not retried).
+    swept = await runner._redeliver_failed_obligations_for_platform(Platform.TELEGRAM)
+    assert swept == 0
+    adapter._bot.send_message.assert_awaited_once()
