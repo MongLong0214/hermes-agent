@@ -427,3 +427,68 @@ def test_schedule_failure_cleanup_survives_an_unavailable_ledger(registry_state,
     assert child.started.is_set() and result["results"][0]["status"] == "completed", result
     assert async_delegation.active_count() == 0
     assert child.close_count == 1 and parent._active_children == []
+
+
+def test_submission_success_survives_a_stale_monitor_start_failure(registry_state, monkeypatch):
+    """PR65-R3: ``executor.submit()`` succeeds -- the worker is really running -- before ``_ensure_stale_monitor``
+    is ever called (tools/async_delegation.py:795-796). A failure in THAT call must not be reported as "could not
+    be dispatched": the work already started, and a caller that retried on that message would dispatch a SECOND
+    copy of the same work. Mirrors the before/after-the-real-action split already used for the persist/schedule-
+    failure sites above: classify by where the exception originates, never a blanket catch around the dispatch."""
+    from tools.delegate_tool_dispatch import _run_batch
+
+    parent, child = _Parent(), _QuickChild()
+    batch = _batch(parent, child)
+
+    def failing_monitor():
+        raise RuntimeError("could not start thread")
+
+    monkeypatch.setattr(async_delegation, "_ensure_stale_monitor", failing_monitor)
+    result = json.loads(_run_batch(batch, background=True))
+
+    assert result["status"] == "dispatched", result
+    assert "could not be dispatched" not in json.dumps(result).lower(), result
+    completion = registry_state.get(timeout=5)
+    assert completion["delegation_id"] == result["delegation_id"]
+    assert completion["results"][0]["status"] == "completed"
+    assert child.started.is_set() and child.finished.is_set()
+    assert child.close_count == 1 and parent._active_children == []
+
+
+def test_partial_batch_running_unit_is_not_reported_not_started(registry_state, monkeypatch, tmp_path):
+    """PR65-R3 partial-batch sibling: a LATER unit of an independent-completions call whose worker already started
+    must not land in ``not_started`` just because ``_ensure_stale_monitor`` then failed for it -- ``not_started``
+    promises a task that never ran and invites the caller to resend it while the real one is still in flight."""
+    (tmp_path / "config.yaml").write_text(
+        "delegation:\n  max_concurrent_children: 3\n  worktree_isolation: false\n"
+        "  independent_completions: true\n",
+        encoding="utf-8",
+    )
+    from tools.delegate_tool_dispatch import _run_batch
+
+    parent = _Parent()
+    first, second = _QuickChild(), _QuickChild()
+    first.session_id += "-first"
+    second.session_id += "-second"
+    batch = _batch(parent, first, second)
+
+    real_monitor = async_delegation._ensure_stale_monitor
+    calls: list = []
+
+    def flaky_monitor():
+        calls.append(1)
+        if len(calls) == 2:
+            raise RuntimeError("could not start thread")
+        return real_monitor()
+
+    monkeypatch.setattr(async_delegation, "_ensure_stale_monitor", flaky_monitor)
+    result = json.loads(_run_batch(batch, background=True))
+
+    assert result["status"] == "dispatched", result
+    assert "not_started" not in result, result
+    assert len(result.get("units", [])) == 2, result
+    # Wait for both units' completions before reading ``started``: executor.submit() returning does not mean the
+    # pool has run the worker yet, so checking ``started`` first would race the thread that sets it.
+    completions = {registry_state.get(timeout=5)["delegation_id"] for _ in range(2)}
+    assert completions == {u["delegation_id"] for u in result["units"]}
+    assert first.started.is_set() and second.started.is_set()

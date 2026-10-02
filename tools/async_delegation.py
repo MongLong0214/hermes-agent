@@ -793,7 +793,14 @@ def _dispatch_admitted(
         _forget_unsubmitted(delegation_id)
         return {"status": "rejected", "error": f"Failed to schedule async delegation{label}: {exc}"}
     if progress_fn is not None:
-        _ensure_stale_monitor()
+        try:
+            _ensure_stale_monitor()
+        except Exception:  # noqa: BLE001 — the worker above is already submitted and running: a failure here must
+            # not be reported as a failed dispatch (a caller retrying on that would duplicate live work). The next
+            # dispatch with a progress_fn retries starting the monitor, which then sweeps every live record, this
+            # one included, so it is only unmonitored in between.
+            logger.warning(f"Async delegation{label} %s: failed to start the stale monitor; it stays unmonitored "
+                           "until the next dispatch retries", delegation_id, exc_info=True)
     return {"status": "dispatched", "delegation_id": delegation_id}
 
 
