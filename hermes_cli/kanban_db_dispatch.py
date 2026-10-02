@@ -2806,6 +2806,9 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     from gateway.session_context import _VAR_MAP
     for key in _VAR_MAP:
         env.pop(key, None)
+    # Fire-and-forget workers outlive the gateway: a takeover reaps what carries its lineage.
+    from gateway.status import GATEWAY_LINEAGE_ENV
+    env.pop(GATEWAY_LINEAGE_ENV, None)
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml:
     # without it the child's get_hermes_home() falls back to the DEFAULT

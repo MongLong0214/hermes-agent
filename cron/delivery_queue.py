@@ -34,6 +34,8 @@ _ACTIVE_DELIVERIES: set[str] = set()
 _TERMINAL = ("delivered", "failed", "unknown", "suppressed")
 MAX_TERMINAL_DELIVERIES = 1000
 DEFAULT_DELIVERY_WAIT_TIMEOUT_SECONDS = 300.0
+# Row error of a finished-but-uncertain send; any partial error follows after "; ".
+UNCERTAIN_SEND_ERROR = "send began but was not confirmed; outcome is unknown and was not retried"
 
 
 def _prune_terminal_unlocked(conn: sqlite3.Connection) -> None:
@@ -264,9 +266,14 @@ def claim_next() -> Optional[dict]:
 
 def _finish(
     execution_id: str, *, error: Optional[str], suppressed: bool = False, accepted: bool = False,
-    parked: Optional[list] = None,
+    parked: Optional[list] = None, uncertain: bool = False,
 ) -> bool:
-    status = "failed" if error else "suppressed" if suppressed else "delivered"
+    # ``uncertain``: a send began and never confirmed; it was not resent, so it is neither
+    # delivered nor failed — the same ``unknown`` a gateway that died mid-send leaves behind. It
+    # outranks a partial error (skipped media, another target), which is kept after the prefix.
+    status = "unknown" if uncertain else "failed" if error else "suppressed" if suppressed else "delivered"
+    if status == "unknown":
+        error = UNCERTAIN_SEND_ERROR + (f"; {error}" if error else "")
     safe_error = (
         redact_sensitive_text(str(error), force=True, redact_url_credentials=True)
         if error
@@ -350,7 +357,8 @@ def drain(
             _finish(row["execution_id"], error=error,
                     suppressed=bool(row["job"].get("_notification_all_targets_suppressed")),
                     accepted=bool(row["job"].get("_delivery_accepted")),
-                    parked=row["job"].get("_delivery_parked"))
+                    parked=row["job"].get("_delivery_parked"),
+                    uncertain=bool(row["job"].get("_delivery_uncertain")))
         finally:
             with _lock:
                 _ACTIVE_DELIVERIES.discard(row["execution_id"])

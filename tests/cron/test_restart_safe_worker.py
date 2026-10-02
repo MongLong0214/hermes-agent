@@ -610,6 +610,27 @@ def test_launch_external_worker_pins_the_gateways_tree_on_pythonpath(
     assert spawned[0][1]["cwd"] == str(repo_root)
 
 
+def test_launch_external_worker_does_not_carry_the_gateway_lineage(tmp_path, monkeypatch):
+    """sol-audit R68-4: a --replace takeover reaps every process carrying the old gateway's
+    lineage (gateway.status.gateway_lineage_survivors). The restart-safe worker exists to outlive
+    that gateway, so it must be spawned without the stamp."""
+    import cron.scheduler as scheduler
+    from gateway.status import GATEWAY_LINEAGE_ENV
+    from tools.process_registry import GatewayChildDispatch
+
+    job = {"id": "job-1", "execution_id": "exec-1", "prompt": "work"}
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(
+        "tools.process_registry.restart_safe_gateway_child_argv",
+        lambda command, **_: GatewayChildDispatch("degraded", command),
+    )
+    monkeypatch.setenv(GATEWAY_LINEAGE_ENV, "old-gateway-lineage")
+    spawned, _payloads, _handoff, _get = _stub_external_worker_launch(scheduler, monkeypatch)
+
+    assert scheduler._launch_external_cron_worker(job) is True
+    assert GATEWAY_LINEAGE_ENV not in spawned[0][1]["env"]
+
+
 def test_launch_external_worker_pin_extends_the_sanitized_env_not_os_environ(
     tmp_path, monkeypatch,
 ):

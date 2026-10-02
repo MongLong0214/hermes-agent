@@ -1377,11 +1377,19 @@ class GatewayShutdownMixin:
     # Restart orchestration
     @staticmethod
     def _restart_watcher_env() -> dict:
-        """Watcher env minus ``_HERMES_GATEWAY`` (else the CLI's self-restart guard refuses; gateway stays down)."""
+        """Watcher env minus ``_HERMES_GATEWAY`` (else the CLI's self-restart guard refuses; gateway stays down)
+        and minus the gateway lineage (it must outlive the gateway; a takeover reaps that lineage)."""
         from gateway.config_loader import drop_bridged_env
+        from gateway.status import GATEWAY_LINEAGE_ENV, _RESTART_WATCHER_ENV
         from tools.environments.local import build_subprocess_env
         watcher_env = drop_bridged_env(build_subprocess_env(scrub_secrets=False, inherit_profile_home=True))
         watcher_env.pop("_HERMES_GATEWAY", None)
+        watcher_env.pop(GATEWAY_LINEAGE_ENV, None)
+        # Marks this process (and the restart command it execs) so a takeover's reap recognizes it
+        # as deliberately outliving the gateway, the same way a cron/kanban restart-safe worker is
+        # recognized -- without this it has neither _HERMES_GATEWAY nor a lineage token and would
+        # otherwise be indistinguishable from an ordinary stray child (ROUND1-ESCAPE-1).
+        watcher_env[_RESTART_WATCHER_ENV] = "1"
         return watcher_env
 
     @staticmethod

@@ -37,6 +37,10 @@ _KNOWN_DELIVERY_PLATFORMS = frozenset({
 # deliver=origin destination.
 _NON_PUSH_ORIGIN_PLATFORMS = frozenset({"api_server"})
 
+# How long _live_send_text waits for the live adapter to confirm a send before treating it as a
+# slow confirmation rather than a failure (see the TimeoutError handling there).
+_LIVE_SEND_CONFIRM_TIMEOUT_S = 60
+
 # Platforms supporting a cron/notification home target -> env var used by gateway config.
 _HOME_TARGET_ENV_VARS = {
     "matrix": "MATRIX_HOME_ROOM",
@@ -1462,11 +1466,12 @@ def _live_route_metadata(t: _TargetDelivery) -> tuple[Optional[str], dict, dict]
 
 def _live_send_text(
     t: _TargetDelivery, text_to_send: str, route_thread_id: Optional[str], route_metadata: dict, *,
-    target_errors: list, delivery_errors: list, unverified_targets: list,
+    target_errors: list, delivery_errors: list, unverified_targets: list, uncertain_targets: list,
 ) -> tuple[bool, bool, Any]:
     """Schedule the text send on the gateway loop; returns ``(adapter_ok, timed_out, message_id)``.
+    ``timed_out`` = began but unconfirmed: never resent, recorded in ``uncertain_targets``.
     Re-raises a real send error so the caller falls through to standalone."""
-    from agent.async_utils import safe_schedule_threadsafe
+    from agent.async_utils import safe_schedule_threadsafe_gated
     from gateway.delivery import DeliveryRouter, DeliveryTarget
     job = t.job
     router = DeliveryRouter(t.config, t.target_adapters)
@@ -1477,30 +1482,34 @@ def _live_send_text(
     # Send through the already-authorized transport: re-resolving from the plain target_adapters
     # dict cannot re-derive the SharedRouteAdapters satellite grant (the satellite owned
     # platforms.<p> block is disabled), yields None, and drops the delivery (#115656).
-    future = safe_schedule_threadsafe(
+    future, dispatch_gate = safe_schedule_threadsafe_gated(
         router._deliver_to_platform(
             route_target, text_to_send, route_metadata, transport=t.transport), t.loop)
     if future is None:
         target_errors.append("live adapter event loop scheduling failed")
         return False, False, None
     try:
-        send_result = future.result(timeout=60)
+        send_result = future.result(timeout=_LIVE_SEND_CONFIRM_TIMEOUT_S)
     except TimeoutError:
-        # Slow confirmation != failure; future.cancel() disambiguates. False -> already in flight,
-        # cannot be un-sent, standalone resend would DUPLICATE: assume delivered. True -> never
-        # started (loop wedged): MUST fall through to standalone or it is silently dropped.
-        if future.cancel():
-            msg = f"live adapter send to {t.where} timed out before the coroutine was dispatched"
-            logger.warning("Job '%s': %s, falling back to standalone", job["id"], msg)
-            target_errors.append(msg)
-            return False, False, None
-        logger.warning(
-            "Job '%s': live adapter send to %s:%s timed out "
-            "after 60s; already dispatched (in flight), "
-            "assuming delivered (skipping standalone fallback "
-            "to avoid duplicate)",
-            job["id"], t.platform_name, t.chat_id)
-        return True, True, None
+        # Slow confirmation != failure, and future.cancel() cannot tell "never started" from "in
+        # flight" (see async_utils.DispatchGate). Abandoning the gate decides it atomically: won ->
+        # the send's body never ran and never will, so standalone cannot duplicate it; lost -> it
+        # already began, so a standalone resend could DUPLICATE it: uncertain, not resent.
+        future.cancel()
+        if not dispatch_gate.abandon():
+            logger.warning(
+                "Job '%s': live adapter send to %s:%s timed out "
+                "after %.0fs; dispatch had begun (in flight or just "
+                "starting), treating as uncertain (skipping standalone "
+                "fallback to avoid a possible duplicate)",
+                job["id"], t.platform_name, t.chat_id, _LIVE_SEND_CONFIRM_TIMEOUT_S)
+            uncertain_targets.append(t.where)
+            unverified_targets.append(f"{t.where} (send began, confirmation timed out; not resent)")
+            return True, True, None
+        msg = f"live adapter send to {t.where} timed out before the coroutine was dispatched"
+        logger.warning("Job '%s': %s, falling back to standalone", job["id"], msg)
+        target_errors.append(msg)
+        return False, False, None
     except Exception as ex:
         # Real send error (not a slow confirmation): fall through to standalone.
         target_errors.append(f"live adapter send failed: {ex}")
@@ -1610,9 +1619,10 @@ def _seed_live_delivery_sessions(t: _TargetDelivery, delivered_message_id) -> No
 
 def _deliver_via_live_adapter(
     t: _TargetDelivery, cleaned_text: str, media_files: list, *, target_errors: list,
-    delivery_errors: list, unverified_targets: list,
+    delivery_errors: list, unverified_targets: list, uncertain_targets: list,
 ) -> bool:
-    """Deliver one target via the live gateway adapter; True once delivered. ``target_errors`` =
+    """Deliver one target via the live gateway adapter; True once delivered or once a send began
+    whose outcome is uncertain (either way it must not be resent). ``target_errors`` =
     this lane's soft failures (surfaced only if standalone also fails); ``delivery_errors`` =
     partial failures (media, thread fallback) that surface even on success."""
     job = t.job
@@ -1633,7 +1643,7 @@ def _deliver_via_live_adapter(
             adapter_ok, timed_out, delivered_message_id = _live_send_text(
                 t, text_to_send, route_thread_id, route_metadata,
                 target_errors=target_errors, delivery_errors=delivery_errors,
-                unverified_targets=unverified_targets,
+                unverified_targets=unverified_targets, uncertain_targets=uncertain_targets,
             )
 
         # Media rides the same DM-topic-aware routing as text. Skipped after a confirmation
@@ -1653,7 +1663,14 @@ def _deliver_via_live_adapter(
                 f"{t.where} (live adapter confirmation timed out)",
                 delivery_errors)
 
-        if adapter_ok:
+        if adapter_ok and timed_out:
+            # Began but never confirmed: handled (never resent), not delivered — so no "delivered"
+            # log and no continuation seed for a brief the chat may never have received.
+            logger.warning(
+                "Job '%s': live adapter send to %s:%s outcome uncertain (not resent)",
+                job["id"], t.platform_name, t.chat_id)
+            delivered = True
+        elif adapter_ok:
             # Log WHERE it went: a ghost delivery in the wrong lane is otherwise indistinguishable.
             logger.info(
                 # Log WHERE it went, not just that it went: a ghost delivery that landed in the wrong lane
@@ -1916,8 +1933,11 @@ def _deliver_result(
     ``job["_delivery_parked"]``: the handoffs no target has finished yet (an unfinished durable-queue
     send, an open Bot Chat receipt), which are neither accepted nor failed. Read only by the drift
     alert-once commit: the joined error string cannot tell "one of two targets failed" from
-    "nothing was sent", and local/unresolved/suppressed/queued runs return None too."""
+    "nothing was sent", and local/unresolved/suppressed/queued runs return None too.
+    ``job["_delivery_uncertain"]`` lists sends that began but never confirmed (never resent, so
+    neither accepted nor failed); the run's ledger outcome reads it."""
     job.pop("_delivery_accepted", None)
+    job.pop("_delivery_uncertain", None)
     job.pop("_delivery_parked", None)
     job.pop("_bot_chat_delivery_receipts", None)
     job.pop("_notification_all_targets_suppressed", None)
@@ -1946,6 +1966,19 @@ def _deliver_result(
         from cron.jobs import get_job
         refreshed = get_job(job["id"]) or {}
         job["last_delivery_queued"] = refreshed.get("last_delivery_queued")
+        if delivery_status and delivery_status["status"] == "unknown":
+            # The gateway began the send and never confirmed it (confirmation timeout, gateway exit,
+            # wait timeout): never replayed, and not a failure either — record it as uncertain.
+            logger.warning("Job '%s': queued delivery %s outcome uncertain (not resent): %s",
+                           job["id"], external_execution, error)
+            job["_delivery_uncertain"] = [{"queue": external_execution}]
+            _record_delivery_verification(job, refreshed.get("last_delivery_unverified") or [
+                f"queued delivery {external_execution}: {error or 'outcome unknown'}"])
+            # Keep only a partial error the gateway reported alongside it (skipped media, another
+            # target); the uncertainty itself is not a delivery error.
+            from cron.delivery_queue import UNCERTAIN_SEND_ERROR
+            partial = (error or "").partition(f"{UNCERTAIN_SEND_ERROR}; ")
+            error = partial[2] if not partial[0] and partial[1] else None
         # The draining gateway records whether any target took the message (its joined error cannot
         # say). A row no gateway has finished, or one that parked handoffs, is still open.
         if delivery_status and delivery_status.get("accepted"):
@@ -1968,6 +2001,7 @@ def _deliver_result(
     # Targets acked with NO evidence (bare SendResult(success=True) — Slack/Matrix/Mattermost);
     # persisted as ``last_delivery_unverified`` so `hermes cron list` shows it.
     unverified_targets: list = []
+    uncertain_targets: list = []
     if wrap_response:
         task_name = job.get("name", job["id"])
         delivery_content = (
@@ -2060,15 +2094,16 @@ def _deliver_result(
         if t is None:
             continue
         target_errors: list = []
+        uncertain_before = len(uncertain_targets)
         delivered = t.live_adapter_ready and _deliver_via_live_adapter(
             t, cleaned_delivery_content, media_files,
             target_errors=target_errors, delivery_errors=delivery_errors,
-            unverified_targets=unverified_targets,
+            unverified_targets=unverified_targets, uncertain_targets=uncertain_targets,
         )
         if not delivered:
             delivered = _deliver_standalone(
                 t, cleaned_delivery_content, media_files, target_errors, delivery_errors)
-        accepted_targets += bool(delivered)
+        accepted_targets += bool(delivered) and len(uncertain_targets) == uncertain_before
 
     # Filter-time drops apply to every target; report them once. A run whose every target was
     # suppressed sent nothing, so there is no drop to report.
@@ -2077,6 +2112,8 @@ def _deliver_result(
     else:
         delivery_errors.extend(policy_drop_errors)
     _record_delivery_verification(job, unverified_targets)
+    if uncertain_targets:
+        job["_delivery_uncertain"] = uncertain_targets
     if accepted_targets:
         job["_delivery_accepted"] = True
     elif parked:

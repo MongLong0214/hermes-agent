@@ -44,6 +44,10 @@ _gateway_lock_guard = threading.RLock()
 # the JSON payload so status/PID readers can read while another process holds it.
 _WINDOWS_LOCK_OFFSET = 1024 * 1024
 _GATEWAY_RUNNING_PID_CACHE_TTL_SECONDS = 1.0
+# A gateway stamps a fresh token here when it claims its home (published as the PID record's
+# ``lineage``); every child it spawns inherits it, so a takeover can still find them once they are
+# reparented. Restart-safe workers are spawned without it. See gateway_lineage_survivors().
+GATEWAY_LINEAGE_ENV = "_HERMES_GATEWAY_LINEAGE"
 _gateway_running_pid_cache_lock = threading.Lock()
 # key: (pid_path, cleanup_stale, include_runtime_status) -> (cached_at, file signature, pid)
 _gateway_running_pid_cache: dict[tuple[str, bool, bool], tuple[float, tuple, Optional[int]]] = {}
@@ -1030,12 +1034,14 @@ def _is_gateway_runtime_lock_active_strict(lock_path: Path) -> bool:
         raise RuntimeError(f"gateway runtime lock probe failed: {exc}") from exc
 
 
-def write_pid_file() -> None:
+def write_pid_file(*, stop_leash_s: Optional[float] = None, lineage: Optional[str] = None) -> None:
     """Write this process's PID record via O_CREAT|O_EXCL; a racing gateway's FileExistsError
-    propagates for the caller to decide."""
+    propagates for the caller to decide. ``stop_leash_s``/``lineage`` are published for a later
+    takeover (takeover_exit_wait_s, gateway_lineage_survivors)."""
     path = _get_pid_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    _write_json_excl(path, _build_pid_record())
+    published = {"stop_leash_s": stop_leash_s, "lineage": lineage}
+    _write_json_excl(path, {**_build_pid_record(), **{k: v for k, v in published.items() if v is not None}})
     _clear_running_pid_cache()
 
 
@@ -1826,8 +1832,127 @@ def reap_gateway_children(children: list, *, parent_pid: int, timeout: float = 5
     return reaped
 
 
+# A PID record from an older build publishes no stop leash, and nothing proves what that instance
+# started with (this process's config may have been edited since). Assume it drained at least this
+# long: a shorter real leash still ends it on its own watchdog, so only a wedged instance waits the
+# whole bound before SIGKILL. A legacy owner configured with a longer drain is still cut short.
+# A legacy record (an older build that never published ``stop_leash_s``) cannot prove its owner's
+# real drain budget, and ``restart_drain_timeout`` has no configured upper bound -- any fixed guess
+# can still be shorter than what that owner was actually configured with, force-killing it mid-
+# drain (R68-3: an old owner configured for a 600s drain was SIGKILLed at ~362s under the previous
+# 300s floor, before its natural exit at ~450s). Refusing an unprovable short deadline outright is
+# the only floor that cannot be wrong in that direction; this one-hour ceiling keeps a genuinely
+# hung legacy owner from blocking the takeover forever, at the cost of a much longer wait in that
+# rare case -- a legacy record only exists on the first takeover after upgrading past this build.
+_LEGACY_RECORD_ASSUMED_DRAIN_S = 3600.0
+# Restart-safe workers are launched to outlive their gateway, and older builds mark them the same
+# way: the cron worker's argv (cron/scheduler.py) and the kanban worker's env (kanban_db_dispatch).
+_RESTART_SAFE_WORKER_ARG = "--external-worker-file"
+_RESTART_SAFE_WORKER_ENV = "HERMES_KANBAN_TASK"
+# The gateway's own detached restart watcher (see GatewayShutdownMixin._restart_watcher_env) is
+# deliberately started WITHOUT _HERMES_GATEWAY or the lineage token -- it must outlive the gateway
+# it is waiting to restart, so a takeover's reap must never catch it either (ROUND1-ESCAPE-1: it
+# was still being selected and killed because the cron/kanban-only predicate below did not
+# recognize it).
+_RESTART_WATCHER_ENV = "HERMES_RESTART_WATCHER"
+
+
+def takeover_exit_wait_s(pid_record: Optional[dict[str, Any]]) -> float:
+    """Seconds a takeover (``--replace``, a credential-lock handoff) gives a SIGTERMed gateway
+    before SIGKILL: that gateway's own shutdown-watchdog leash — it drains chat and cron work and
+    cleans up inside it, then hard-exits — plus the watchdog's dump margin. The leash it started
+    with is published in its PID record (``stop_leash_s``): this process's config may differ (edited
+    since, another profile). A record from an older build cannot prove it, so the wait covers this
+    process's config and at least ``_LEGACY_RECORD_ASSUMED_DRAIN_S``."""
+    from gateway.restart import DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT, LAUNCHD_WATCHDOG_DUMP_MARGIN_S
+    from gateway.shutdown_watchdog import resolve_shutdown_watchdog_delay
+    leash = (pid_record or {}).get("stop_leash_s")
+    if isinstance(leash, bool) or not isinstance(leash, (int, float)) or not 0 < leash < math.inf:
+        try:
+            from gateway.run_config_loaders import GatewayConfigLoadersMixin
+            drain = GatewayConfigLoadersMixin._load_restart_drain_timeout()
+        except Exception:
+            drain = DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
+        leash = resolve_shutdown_watchdog_delay(max(drain, _LEGACY_RECORD_ASSUMED_DRAIN_S))
+        logger.warning("Replaced gateway's PID record publishes no stop budget (older build), so its "
+                       "real drain budget cannot be proven; allowing it up to %.0fs to exit on its own "
+                       "before SIGKILL rather than guessing a shorter deadline that could cut its drain "
+                       "short. If it is genuinely hung, stop it manually to proceed sooner.", leash)
+    return float(leash) + LAUNCHD_WATCHDOG_DUMP_MARGIN_S
+
+
+def _is_restart_safe_worker_or_descendant(proc) -> bool:
+    """True when ``proc`` or an ancestor is a restart-safe worker (see _RESTART_SAFE_WORKER_ARG)."""
+    try:
+        chain = [proc, *proc.parents()]
+    except Exception:
+        chain = [proc]
+    for candidate in chain:
+        try:
+            if (_RESTART_SAFE_WORKER_ARG in candidate.cmdline()
+                    or _RESTART_SAFE_WORKER_ENV in candidate.environ()
+                    or _RESTART_WATCHER_ENV in candidate.environ()):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def gateway_lineage_survivors(
+    pid_record: Optional[dict[str, Any]], known: list, *, since: Optional[float] = None,
+) -> list:
+    """``known`` (a pre-signal snapshot) plus every other live process stamped with the dead
+    gateway's ``lineage`` (GATEWAY_LINEAGE_ENV): unlike the snapshot this still finds children it
+    created after SIGTERM, once reparented. A record from an older build has no lineage; then, best
+    effort, take processes created at or after ``since`` (epoch seconds, read before the snapshot)
+    that carry the gateway marker (``_HERMES_GATEWAY``) and the dead gateway's HERMES_HOME — a
+    child that dropped both is still missed. Restart-safe workers and their descendants are left
+    out, snapshot included. Call only after the gateway exited. This process, its ancestors and
+    descendants are spared. POSIX only (``known`` unchanged elsewhere); never raises."""
+    if _IS_WINDOWS:
+        return list(known)
+    record = pid_record or {}
+    lineage = record.get("lineage")
+    lineage = lineage if isinstance(lineage, str) and lineage else None
+    old_home = record.get("hermes_home")
+    legacy_scan = lineage is None and since is not None and isinstance(old_home, str) and bool(old_home)
+    found = list(known)
+    try:
+        import psutil  # type: ignore
+        me = psutil.Process()
+        spared = {me.pid, *(p.pid for p in me.parents()), *(p.pid for p in me.children(recursive=True)),
+                  *(getattr(p, "pid", None) for p in known)}
+        known_pids = {getattr(p, "pid", None) for p in known}
+        for proc in psutil.process_iter() if lineage or legacy_scan else ():
+            try:
+                if proc.pid in spared:
+                    continue
+                if lineage:
+                    matched = proc.environ().get(GATEWAY_LINEAGE_ENV) == lineage
+                else:
+                    # No lineage token exists to prove ownership for a legacy record (R68-5: env
+                    # markers + home + a coarse creation-time window alone can match an unrelated
+                    # process that merely happens to share them -- an independently spawned orphan
+                    # carrying the same markers would be killed despite never belonging to the old
+                    # gateway). Require real OS-level ancestry instead: only a still-direct child of
+                    # one of the known old-gateway PIDs, caught before it is reparented to init. This
+                    # is strictly narrower than the old scan (a child already reparented by the time
+                    # this runs is missed, same as any best-effort reap), but it never signals a
+                    # process this gateway did not actually spawn.
+                    matched = (env_marker_ok := proc.environ().get("_HERMES_GATEWAY") == "1"
+                               ) and proc.ppid() in known_pids
+                if matched:
+                    found.append(proc)
+            except (psutil.Error, OSError):
+                continue
+        found = [p for p in found if not _is_restart_safe_worker_or_descendant(p)]
+    except Exception:
+        logger.debug("Lineage scan for a replaced gateway failed", exc_info=True)
+    return found
+
+
 def take_over_scoped_lock_holder(
-    record: dict[str, Any], *, graceful_attempts: int = 20, force_attempts: int = 20
+    record: dict[str, Any], *, graceful_attempts: Optional[int] = None, force_attempts: int = 20
 ) -> Optional[int]:
     """Terminate one verified scoped-lock holder for explicit ``--replace``. Returns the owner PID
     only after that exact PID/start-time identity exited; validation or marker-write failure returns
@@ -1837,7 +1962,12 @@ def take_over_scoped_lock_holder(
     if owner is None:
         return None
     owner_pid, owner_start_time, target_home = owner
+    # Validated above: the target home's PID record is this owner's; it publishes its stop leash.
+    owner_record = _read_json_file(target_home / "gateway.pid")
+    if graceful_attempts is None:
+        graceful_attempts = max(1, math.ceil(takeover_exit_wait_s(owner_record) / 0.5))
     # Snapshot while the owner is alive; afterwards children are reparented.
+    snapshot_at = time.time()
     owner_children = _snapshot_gateway_children(owner_pid)
     if not write_takeover_marker(
         owner_pid, target_home=target_home, target_start_time=owner_start_time
@@ -1852,7 +1982,8 @@ def take_over_scoped_lock_holder(
         # The target normally consumes the marker; clean up any remainder.
         clear_takeover_marker(target_home)
     if replaced is not None:
-        reap_gateway_children(owner_children, parent_pid=owner_pid)
+        reap_gateway_children(
+            gateway_lineage_survivors(owner_record, owner_children, since=snapshot_at), parent_pid=owner_pid)
     return replaced
 
 

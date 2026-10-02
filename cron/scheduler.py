@@ -2784,8 +2784,13 @@ def _record_fire_ownership_lost(job_id: str, fire_owner: Optional[str], executio
 def _classify_delivery_outcome(
     *, delivery_error, should_deliver: bool, unresolved_origin: bool,
     normalized_deliver: str, incident_acked: bool, success: bool,
-    delivery_queued=None, notification_suppressed: bool = False,
+    delivery_queued=None, notification_suppressed: bool = False, delivery_uncertain: bool = False,
 ) -> str:
+    if should_deliver and delivery_uncertain:
+        # A send began and never confirmed; it was not resent (it may have landed). Ahead of
+        # delivery_error: a partial failure (skipped media, another target) is kept on the run's
+        # last_delivery_error, but must not turn a possibly-landed message into "failed".
+        return "uncertain"
     if delivery_error:
         return "failed"
     if should_deliver and delivery_queued:
@@ -3077,6 +3082,7 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
         delivery_error=d.delivery_error,
         delivery_queued=job.get("last_delivery_queued"),
         notification_suppressed=bool(job.get("_notification_all_targets_suppressed")),
+        delivery_uncertain=bool(job.get("_delivery_uncertain")),
         should_deliver=d.should_deliver,
         unresolved_origin=d.unresolved_origin,
         # Read the lane the notice was actually routed through (failure_deliver on failure).
@@ -3124,7 +3130,8 @@ def _deliver_crash_failure(
         delivery_error=delivery_error, should_deliver=True, unresolved_origin=unresolved_origin,
         normalized_deliver=normalized_deliver, incident_acked=False, success=False,
         delivery_queued=job.get("last_delivery_queued"),
-        notification_suppressed=bool(job.get("_notification_all_targets_suppressed")))
+        notification_suppressed=bool(job.get("_notification_all_targets_suppressed")),
+        delivery_uncertain=bool(job.get("_delivery_uncertain")))
     if delivery_outcome in ("delivered", "not_configured"):
         _mark_incident_alerted(failure_incident_id)
     return delivery_error, delivery_outcome
@@ -3535,6 +3542,9 @@ def _launch_external_cron_worker(job: dict) -> bool:
         "HERMES_EXEC_ASK",
     ):
         worker_env.pop(_presence_var, None)
+    # Restart-safe: a --replace takeover reaps what carries the gateway's lineage, so it must not.
+    from gateway.status import GATEWAY_LINEAGE_ENV
+    worker_env.pop(GATEWAY_LINEAGE_ENV, None)
     # `-m cron.scheduler` has no hermes_cli.main bootstrap; pin this checkout explicitly
     # (PYTHONSAFEPATH / stale editable mapping, #112729). See cron/scheduler_worker_env.py.
     from cron.scheduler_worker_env import pin_hermes_tree_on_pythonpath

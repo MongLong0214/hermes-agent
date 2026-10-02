@@ -1828,12 +1828,16 @@ class TestParallelTick:
 
 class TestDeliverResultTimeoutCancelsFuture:
     """When future.result(timeout=60) raises TimeoutError in the live adapter
-    delivery path, the outcome depends on whether the coroutine was already
-    running.  future.cancel() returning False means it is in flight on the wire
-    (cannot be un-sent) → treat as DELIVERED and skip the standalone fallback to
-    avoid a duplicate (#38922).  future.cancel() returning True means it never
-    started (wedged loop) → nothing was sent, so fall through to standalone or
-    the message is silently dropped.  Regression for #38922.
+    delivery path, the outcome depends on who wins the coroutine's DispatchGate
+    (see agent.async_utils.safe_schedule_threadsafe_gated). The coroutine having
+    claimed it means dispatch is in flight on the wire (cannot be un-sent) → an
+    uncertain outcome that skips the standalone fallback to avoid a duplicate
+    (#38922). The caller abandoning it first means it never ran and never will →
+    fall through to standalone or the message is silently dropped. Regression for
+    #38922, revised for sol-audit L6-2 / R68-1: this mocked harness cannot exercise
+    the real "cancel() races a live dispatch" bug (see
+    TestLiveAdapterCancelDoesNotProveNeverDispatched for the real-loop regression),
+    it only pins the surrounding gate-driven decision.
     """
 
     def test_live_adapter_timeout_assumes_delivered_no_duplicate(self):
@@ -1857,23 +1861,30 @@ class TestDeliverResultTimeoutCancelsFuture:
         loop.is_running.return_value = True
 
         # A real concurrent.futures.Future, but we override .result() to raise
-        # TimeoutError exactly like the 60s wait firing in production.  We make
-        # .cancel() return False to simulate the coroutine being ALREADY RUNNING
-        # on the gateway loop (in flight on the wire) — the case where the send
-        # cannot be un-sent and a standalone resend would be a duplicate.
+        # TimeoutError exactly like the 60s wait firing in production. The
+        # dispatch gate is pre-claimed to simulate the coroutine being
+        # ALREADY RUNNING on the gateway loop (in flight on the wire) — the case
+        # where the send cannot be un-sent and a standalone resend would be a
+        # duplicate. cancel() itself is irrelevant to the decision now (see
+        # TestLiveAdapterCancelDoesNotProveNeverDispatched); it is still
+        # recorded here only to confirm the code still attempts it.
         captured_future = Future()
         cancel_calls = []
 
-        def in_flight_cancel():
+        def tracked_cancel():
             cancel_calls.append(True)
-            return False  # already running — cannot be cancelled
+            return True  # return value is no longer trusted by the caller
 
-        captured_future.cancel = in_flight_cancel
+        captured_future.cancel = tracked_cancel
         captured_future.result = MagicMock(side_effect=TimeoutError("timed out"))
 
-        def fake_run_coro(coro, _loop):
+        from agent.async_utils import DispatchGate
+        dispatch_gate = DispatchGate()
+        assert dispatch_gate.claim_dispatch()  # already in flight when the timeout fires
+
+        def fake_schedule(coro, _loop):
             coro.close()
-            return captured_future
+            return captured_future, dispatch_gate
 
         job = {
             "id": "timeout-job",
@@ -1885,7 +1896,8 @@ class TestDeliverResultTimeoutCancelsFuture:
 
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
-             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro), \
+             patch("agent.async_utils.safe_schedule_threadsafe_gated",
+                   side_effect=fake_schedule), \
              patch("tools.send_message_tool._send_to_platform", new=standalone_send):
             result = _deliver_result(
                 job,
@@ -1894,7 +1906,7 @@ class TestDeliverResultTimeoutCancelsFuture:
                 loop=loop,
             )
 
-        # 1. cancel() was attempted (returned False = in flight).
+        # 1. cancel() was attempted (best-effort, regardless of its return value).
         assert cancel_calls == [True], "future.cancel() should be attempted on TimeoutError"
         # 2. Delivery is reported successful (no error string returned).
         assert result is None, f"expected successful delivery, got error: {result!r}"
@@ -1934,9 +1946,13 @@ class TestDeliverResultLiveAdapterUnconfirmed:
         completed_future = Future()
         completed_future.set_result(send_value)
 
-        def fake_run_coro(coro, _loop):
+        def fake_schedule(coro, _loop):
+            # `coro` here is the real send coroutine (not the gated wrapper): patching
+            # at this level, instead of asyncio.run_coroutine_threadsafe, means closing it here
+            # closes the actual awaited object, no orphaned inner coroutine left behind.
             coro.close()
-            return completed_future
+            from agent.async_utils import DispatchGate
+            return completed_future, DispatchGate()
 
         job = {
             "id": "unconfirmed-job",
@@ -1948,7 +1964,8 @@ class TestDeliverResultLiveAdapterUnconfirmed:
 
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
-             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro), \
+             patch("agent.async_utils.safe_schedule_threadsafe_gated",
+                   side_effect=fake_schedule), \
              patch("tools.send_message_tool._send_to_platform", new=standalone_send):
             result = _deliver_result(
                 job,

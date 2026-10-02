@@ -14,6 +14,7 @@ import concurrent.futures
 import dataclasses
 import json
 import logging
+import math
 import os
 import re
 import shlex
@@ -2204,7 +2205,7 @@ from gateway.run_voice import GatewayVoiceMixin
 from gateway.run_adapters import GatewayAdapterLifecycleMixin
 from gateway.run_topics import GatewayTopicThreadsMixin
 from gateway.run_turn import GatewayTurnMixin, is_context_overflow_failure_result
-from gateway.run_shutdown import GatewayShutdownMixin, _resolve_gateway_exit_verdict
+from gateway.run_shutdown import GatewayShutdownMixin, _effective_watchdog_leash, _resolve_gateway_exit_verdict
 from gateway.run_busy import GatewayBusySessionMixin
 from gateway.run_config_loaders import GatewayConfigLoadersMixin
 from gateway.run_startup import GatewayStartupMixin
@@ -5439,11 +5440,17 @@ async def _start_gateway_replace_existing_instance(existing_pid: int, replace: b
     except Exception as e:
         logger.debug("Could not write takeover marker: %s", e)
     # Snapshot children BEFORE signalling: reparented orphans are invisible yet hold scoped token locks.
+    _old_snapshot_at = time.time()
     try:
         from gateway.status import _snapshot_gateway_children
         _old_gateway_children = _snapshot_gateway_children(existing_pid)
     except Exception:
         _old_gateway_children = []
+    # Its PID record publishes the stop leash it started with and the lineage its children carry.
+    from gateway.status import _pid_from_record, _read_pid_record, takeover_exit_wait_s
+    _old_record = _read_pid_record()
+    if _pid_from_record(_old_record) != existing_pid:
+        _old_record = None
     try:
         terminate_pid(existing_pid, force=False)
     except ProcessLookupError:
@@ -5452,9 +5459,17 @@ async def _start_gateway_replace_existing_instance(existing_pid: int, replace: b
         logger.error("Permission denied killing PID %d. Cannot replace.", existing_pid)
         _clear_takeover_marker_quiet()
         return False
-    # Up to 10s for SIGTERM, then SIGKILL.
-    if not await _wait_for_pid_exit(existing_pid, 20, 0.5):
-        logger.warning("Old gateway (PID %d) did not exit after SIGTERM, sending SIGKILL.", existing_pid)
+    # The old process's stop() path drains chat and in-flight cron work (an interrupted cron run is
+    # recorded unknown with no retry — cron/scheduler_tick.py, cron/executions.py) and cleans up
+    # within its own shutdown-watchdog leash, sized from the timeouts IT started with. SIGKILLing
+    # sooner cuts that off; the forced-kill path below stays bounded.
+    _sigterm_poll_s = 0.5
+    _sigterm_grace_s = takeover_exit_wait_s(_old_record)
+    _sigterm_attempts = max(1, math.ceil(_sigterm_grace_s / _sigterm_poll_s))
+    if not await _wait_for_pid_exit(existing_pid, _sigterm_attempts, _sigterm_poll_s):
+        logger.warning(
+            "Old gateway (PID %d) did not exit within %.0fs of SIGTERM (its stop budget), "
+            "sending SIGKILL.", existing_pid, _sigterm_grace_s)
         old_gateway_exited = False
         try:
             terminate_pid(existing_pid, force=True, expected_start_time=existing_start_time)
@@ -5471,8 +5486,10 @@ async def _start_gateway_replace_existing_instance(existing_pid: int, replace: b
             return False
     # Reap orphaned children (POSIX; mirrors Windows taskkill /T) so they stop holding scoped token locks.
     try:
-        from gateway.status import reap_gateway_children
-        reap_gateway_children(_old_gateway_children, parent_pid=existing_pid)
+        from gateway.status import gateway_lineage_survivors, reap_gateway_children
+        reap_gateway_children(
+            gateway_lineage_survivors(_old_record, _old_gateway_children, since=_old_snapshot_at),
+            parent_pid=existing_pid)
     except Exception:
         logger.debug("Child reap for replaced gateway PID %d failed", existing_pid, exc_info=True)
     remove_pid_file()
@@ -5608,12 +5625,15 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
     return shutdown_signal_handler
 
 
-def _start_gateway_claim_pid_file(force: bool = False) -> bool:
-    """Claim the runtime lock + PID file (O_EXCL winner is the authoritative gateway). False = lost."""
+def _start_gateway_claim_pid_file(force: bool = False, runner: Optional["GatewayRunner"] = None) -> bool:
+    """Claim the runtime lock + PID file (O_EXCL winner is the authoritative gateway). False = lost.
+    The record publishes ``runner``'s stop leash and a fresh lineage stamped on every later child,
+    so a takeover waits out this process's own budget and still finds its late children."""
     import atexit
+    import uuid
     from gateway.status import (
-        acquire_gateway_runtime_lock, get_running_pid, release_gateway_runtime_lock,
-        remove_pid_file, write_pid_file)
+        GATEWAY_LINEAGE_ENV, acquire_gateway_runtime_lock, get_running_pid,
+        release_gateway_runtime_lock, remove_pid_file, write_pid_file)
     _current_pid = get_running_pid()
     if _current_pid is not None and _current_pid != os.getpid():
         logger.error("Another gateway instance (PID %d) started during our startup. "
@@ -5622,8 +5642,11 @@ def _start_gateway_claim_pid_file(force: bool = False) -> bool:
     if not acquire_gateway_runtime_lock():
         logger.error("Gateway runtime lock is already held by another instance. Exiting.")
         return False
+    lineage = uuid.uuid4().hex
+    os.environ[GATEWAY_LINEAGE_ENV] = lineage
     try:
-        write_pid_file()
+        write_pid_file(
+            stop_leash_s=_effective_watchdog_leash(runner) if runner is not None else None, lineage=lineage)
     except FileExistsError:
         release_gateway_runtime_lock()
         logger.error("PID file race lost to another gateway instance. Exiting.")
@@ -6154,7 +6177,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # owner over already freed the lock with that process. Consequence: a live holder this process
     # cannot interrogate (its record never published, or it speaks another HOST_PROTOCOL_VERSION
     # mid-upgrade) blocks every other unit with exit 75 until it exits; only --force gets past it.
-    if not _start_gateway_claim_pid_file(force=force):
+    if not _start_gateway_claim_pid_file(force=force, runner=runner):
         return False
 
     # Right after the PID claim (which makes us authoritative); non-fatal — consumers fall back to scan.
