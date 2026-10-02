@@ -10,6 +10,7 @@ crash-recovery wiring. Only the async lifecycle lives here; the child run is an 
 from __future__ import annotations
 
 import contextvars
+import inspect
 import json
 import logging
 import os
@@ -595,7 +596,12 @@ def _discard_queued_work_item(executor, fn) -> Optional[bool]:
     identity) and discard it without running it. True if found and discarded, False if the queue
     was inspectable and did not contain it (something else already dequeued it), None if the
     executor exposes no queue to inspect (a test double, or a future stdlib change) -- callers
-    must treat None the same as "assume nothing is ambiguous", the historical, simpler behavior."""
+    must treat None the same as "assume nothing is ambiguous", the historical, simpler behavior.
+
+    A queued item's ``.fn`` is never *fn* itself: ``DaemonThreadPoolExecutor.submit`` wraps it in
+    its own context closure, which itself wrapped whatever ``propagate_context_to_thread`` returned
+    for *fn*. Both wrapper layers set ``__wrapped__`` (see those modules), so ``inspect.unwrap``
+    sees through all of them to the real target the caller is looking for."""
     work_queue = getattr(executor, "_work_queue", None)
     if work_queue is None:
         return None
@@ -604,7 +610,7 @@ def _discard_queued_work_item(executor, fn) -> Optional[bool]:
     try:
         while True:
             item = work_queue.get_nowait()
-            if not found and getattr(item, "fn", None) is fn:
+            if not found and inspect.unwrap(getattr(item, "fn", None)) is fn:
                 found = True
                 continue  # drop it: never run
             drained.append(item)
@@ -817,21 +823,24 @@ def _dispatch_admitted(
         future = executor.submit(propagate_context_to_thread(_worker))
         future.add_done_callback(lambda _: retirement.release())
     except Exception as exc:  # pragma: no cover — pool submit failure is rare
-        retirement.release()
-        _forget_unsubmitted(delegation_id)
         # ThreadPoolExecutor.submit() enqueues the work item BEFORE it tries to start a new worker
         # thread, so a failure in that later step (e.g. the OS refusing a new thread) does not mean
         # the task never ran -- an existing or newly-spawned thread can still dequeue and execute it
-        # for real while we report "rejected". Drain the pool's own queue looking for our item: if
-        # it is still sitting there, discard it and report a clean rejection (nothing will ever run
-        # it, same as a submit() that failed before queuing anything -- a real ThreadPoolExecutor
-        # whose submit() raises for another reason, or a test double with no queue, behaves the
-        # same way). If it is NOT there, something already dequeued it, so the caller must not also
-        # run it inline (PR65-R5): tag the rejection "raised" the way an admission exception is.
+        # for real while we report "rejected". Resolve that FIRST, before touching the record: drain
+        # the pool's own queue looking for our item. Found => discard it and report a clean rejection
+        # (nothing will ever run it, same as a submit() that failed before queuing anything -- a real
+        # ThreadPoolExecutor whose submit() raises for another reason, or a test double with no queue,
+        # behaves the same way) -- only now is it safe to free the slot and the retirement reservation.
+        # Not found => something already dequeued it: it may be running right now, so the record and
+        # reservation stay untouched (a real completion still delivers through `_finalize`) and the
+        # caller must not also run it inline (PR65-R5): tag the rejection "raised" the way an admission
+        # exception is, instead of claiming a clean rejection we cannot actually back.
         ambiguous = _discard_queued_work_item(executor, _worker) is False
         if ambiguous:
             return {"status": "rejected", "reason": "raised",
                     "error": f"Failed to schedule async delegation{label}: {exc}"}
+        retirement.release()
+        _forget_unsubmitted(delegation_id)
         return {"status": "rejected", "error": f"Failed to schedule async delegation{label}: {exc}"}
     if progress_fn is not None:
         try:

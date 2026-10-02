@@ -441,6 +441,7 @@ def _dispatch_background(batch: _Batch) -> str:
     dispatched: List[tuple[_Batch, str]] = []
     inline_results: List[dict] = []
     not_started: List[dict] = []
+    outcome_uncertain: List[dict] = []
     slot_key: Optional[str] = None
     for k, unit in enumerate(units):
         # One unit keeps the live-transcript directory's id so the returned delegation_id matches
@@ -469,11 +470,33 @@ def _dispatch_background(batch: _Batch) -> str:
             if not dispatched:
                 for unsubmitted in units[k + 1:]:
                     _dispose_unrun(unsubmitted)
-                return tool_error(f"Background delegation could not be dispatched: {dispatch['error']}. Retry, or "
-                                  "run the task(s) with background=false.", status="error")
-            logger.warning("delegate_task: unit %d/%d not dispatched (%s); reporting it as not started.",
-                           k + 1, len(units), dispatch["error"])
-            not_started.extend({"task_index": i, "goal": t["goal"], "error": dispatch["error"]} for i, t, _ in unit.children)
+                if reason == "persistence":  # confirmed: never queued, retrying/running inline is safe
+                    return tool_error(f"Background delegation could not be dispatched: {dispatch['error']}. "
+                                      "Retry, or run the task(s) with background=false.", status="error")
+                # "raised": the executor's admission raised after the work may already have been queued
+                # or started, so whether it ran is unresolved -- retrying or running it inline now could
+                # duplicate work already in progress. ``outcome_uncertain`` matches the MCP mid-call
+                # convention (tools/mcp_tool_handlers.py): if it really is running, its result still
+                # arrives as a normal completion.
+                return tool_error(f"Background delegation scheduling raised and whether it started running "
+                                  f"is unresolved: {dispatch['error']}. Do not retry or run it with "
+                                  "background=false yet -- it may already be running and its result would "
+                                  "still arrive as a completion if so.", status="error", outcome_uncertain=True)
+            if reason == "persistence":
+                logger.warning("delegate_task: unit %d/%d not dispatched (%s); reporting it as not started.",
+                               k + 1, len(units), dispatch["error"])
+                not_started.extend({"task_index": i, "goal": t["goal"], "error": dispatch["error"]} for i, t, _ in unit.children)
+            else:
+                # Unlike "persistence", a raise does not prove the unit never started: report it as
+                # unresolved rather than "not started", which would invite the caller to resend work
+                # that may already be running (the batch probe this guards: the second child executed
+                # for real while an earlier fix still reported it as a confirmed non-start).
+                logger.warning("delegate_task: unit %d/%d admission raised (%s); whether it started is "
+                               "unresolved -- reporting it as such, not as a confirmed non-start.",
+                               k + 1, len(units), dispatch["error"])
+                outcome_uncertain.extend(
+                    {"task_index": i, "goal": t["goal"], "error": dispatch["error"], "outcome_uncertain": True}
+                    for i, t, _ in unit.children)
             continue
         if not dispatched:
             logger.info(
@@ -490,6 +513,11 @@ def _dispatch_background(batch: _Batch) -> str:
         payload["inline_results"] = inline_results
     if not_started:
         payload["not_started"] = not_started
+    if outcome_uncertain:
+        # Distinct from "not_started": admission raised without resolving whether the work was
+        # ever queued or started, so these tasks must not be resent or run inline on the strength
+        # of this report alone -- a real completion, if the work is running, still arrives normally.
+        payload["outcome_uncertain"] = outcome_uncertain
     return json.dumps(payload, ensure_ascii=False)
 
 def _run_batch(batch: _Batch, background: bool) -> str:

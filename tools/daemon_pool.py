@@ -33,6 +33,11 @@ class DaemonThreadPoolExecutor(ThreadPoolExecutor):
 
         def _run_with_context(*call_args, **call_kwargs):
             return ctx.run(fn, *call_args, **call_kwargs)
+        # A caller that loses its Future to a submit() failure (the stdlib enqueues before it
+        # tries to start a worker thread) must still be able to find its own item sitting in
+        # ``_work_queue`` by identity. ``fn`` is what it actually submitted, so expose it the way
+        # ``functools.wraps`` would -- ``inspect.unwrap`` then sees through this layer too.
+        _run_with_context.__wrapped__ = fn
         return super().submit(_run_with_context, *args, **kwargs)
 
     def _adjust_thread_count(self) -> None:

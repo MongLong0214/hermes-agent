@@ -532,3 +532,145 @@ def test_submit_exception_after_the_work_item_already_ran_is_not_executed_again(
     assert result.get("status") == "error", result
     assert "inline_results" not in result, "the already-run task must not also run inline"
     assert child.run_count == 1, "the task ran more than once"
+
+
+def test_submit_failure_with_item_still_queued_is_found_and_cleanly_discarded(registry_state, monkeypatch):
+    """R-ASYNC-SUBMIT (gpt-6.1-sol BLOCKER): a queued work item's ``.fn`` is never the bare ``_worker``
+    passed to ``_discard_queued_work_item`` -- ``propagate_context_to_thread`` wraps it once, then
+    ``DaemonThreadPoolExecutor.submit`` wraps that again in its own context closure. Matching the
+    unwrapped ``_worker`` by identity against ``item.fn`` could therefore never succeed, so even an item
+    that is genuinely, permanently stuck in the queue (no thread will ever exist to run it) was reported
+    merely "ambiguous" (``reason="raised"``) instead of the clean, provably-safe rejection it actually
+    is. Force the very FIRST worker thread's start() to fail on a fresh real executor --
+    ``ThreadPoolExecutor.submit()`` always enqueues before trying to start a thread, so with zero
+    threads ever created, the item sits there forever."""
+    ran = threading.Event()
+
+    def runner():
+        ran.set()
+        return {"summary": "must never run"}
+
+    executor = async_delegation._get_executor(1)
+    real_start = threading.Thread.start
+
+    def failing_start(self):
+        if self.name == "async-delegate_0":
+            raise RuntimeError("injected: OS refused to start the worker thread")
+        return real_start(self)
+
+    monkeypatch.setattr(threading.Thread, "start", failing_start)
+    try:
+        handle = async_delegation.dispatch_async_delegation(
+            goal="test", context=None, toolsets=None, role="leaf", model=None,
+            session_key="test", runner=runner, max_async_children=1)
+    finally:
+        monkeypatch.setattr(threading.Thread, "start", real_start)
+
+    assert handle["status"] == "rejected"
+    assert handle.get("reason") is None, handle  # a clean rejection: confirmed, it will never run
+    assert async_delegation.active_count() == 0
+    assert async_delegation._records == {}, "the forgotten record must really be gone"
+    assert executor._work_queue.empty(), "the discarded item must be removed, not left behind"
+
+    # Don't just trust the empty queue: start a real worker and let it drain anything still there.
+    done = threading.Event()
+    executor.submit(lambda: done.set())
+    assert done.wait(5)
+    assert not ran.is_set(), "the discarded work item ran anyway"
+
+
+def test_submit_failure_after_a_real_dequeue_keeps_the_record_and_delivers_once(registry_state, monkeypatch):
+    """R-ASYNC-SUBMIT sibling: when the queue does NOT contain the item (something else already dequeued
+    it -- it may be running right now), the old code called ``_forget_unsubmitted`` unconditionally
+    BEFORE even checking the queue, so the record (and the completion routing it carries) was gone by
+    the time the real run finished: ``_finalize`` no-ops on a missing record and the result is silently
+    lost. Reproduced with the REAL queue and the REAL wrapped callable chain: pull the genuine queued
+    ``_WorkItem`` off ``executor._work_queue`` ourselves and run it for real on our own thread -- exactly
+    what a stdlib worker loop does after a successful dequeue -- before the thread-start step "fails",
+    mirroring a worker-start failure that lost a genuine race to an existing thread."""
+    executor = async_delegation._get_executor(1)
+    started = threading.Event()
+    release = threading.Event()
+
+    def runner():
+        started.set()
+        assert release.wait(10)
+        return {"summary": "ran for real"}
+
+    real_adjust_thread_count = executor._adjust_thread_count
+
+    def steal_then_fail():
+        item = executor._work_queue.get_nowait()
+        threading.Thread(target=item.run, daemon=True).start()
+        raise RuntimeError("injected: thread start failed after something else already dequeued the item")
+
+    monkeypatch.setattr(executor, "_adjust_thread_count", steal_then_fail)
+    try:
+        handle = async_delegation.dispatch_async_delegation(
+            goal="test", context=None, toolsets=None, role="leaf", model=None,
+            session_key="test", runner=runner, max_async_children=1)
+    finally:
+        monkeypatch.setattr(executor, "_adjust_thread_count", real_adjust_thread_count)
+
+    assert handle["status"] == "rejected"
+    assert handle.get("reason") == "raised", handle  # uncertain, not a confirmed clean rejection
+    assert started.wait(5), "the real work item (stolen off the real queue) never actually ran"
+    # The record must still be alive while the real run is in flight -- not forgotten out from under it.
+    assert async_delegation.active_count() == 1
+
+    release.set()
+    completion = registry_state.get(timeout=5)
+    assert completion["summary"] == "ran for real"
+    assert async_delegation.active_count() == 0
+
+
+def test_partial_batch_submit_failure_after_real_run_is_outcome_uncertain_not_not_started(
+    registry_state, monkeypatch, tmp_path,
+):
+    """R-ASYNC-SUBMIT batch sibling (the reviewer's second probe): a later independent-completions unit's
+    own submission genuinely ran the real child (dequeued and executed before the late thread-start
+    failure surfaced) -- ``not_started`` promises a task that never ran and would invite the model to
+    resend one that already ran once. It must be reported ``outcome_uncertain``, never ``not_started``,
+    and must not also be run inline on top of the real run."""
+    (tmp_path / "config.yaml").write_text(
+        "delegation:\n  max_concurrent_children: 3\n  worktree_isolation: false\n"
+        "  independent_completions: true\n",
+        encoding="utf-8",
+    )
+    from tools.delegate_tool_dispatch import _run_batch
+
+    parent = _Parent()
+    first, second = _QuickChild(), _QuickChild()
+    first.session_id += "-first"
+    second.session_id += "-second"
+    batch = _batch(parent, first, second)
+
+    executor = async_delegation._get_executor(3)
+    real_submit = executor.submit
+    calls: list = []
+
+    def flaky_submit(fn, *a, **kw):
+        calls.append(1)
+        future = real_submit(fn, *a, **kw)
+        if len(calls) == 2:
+            future.result(timeout=5)  # the real work item has already run by the time submit() "fails"
+            raise RuntimeError("injected: thread start failed after the work item was already queued")
+        return future
+
+    monkeypatch.setattr(executor, "submit", flaky_submit)
+    try:
+        result = json.loads(_run_batch(batch, background=True))
+    finally:
+        monkeypatch.setattr(executor, "submit", real_submit)
+
+    assert len(calls) == 2, "the test did not exercise both units' submission"
+    assert result.get("status") == "dispatched", result
+    assert "not_started" not in result, result
+    assert "inline_results" not in result, "the already-run unit must not also run inline"
+    uncertain = result.get("outcome_uncertain")
+    assert uncertain and len(uncertain) == 1, result
+    assert uncertain[0]["task_index"] == 1 and uncertain[0]["outcome_uncertain"] is True, uncertain
+    assert first.finished.wait(5) and second.finished.wait(5)
+    assert first.run_count == 1 and second.run_count == 1, "a task ran more than once"
+    completions = [registry_state.get(timeout=5) for _ in range(2)]
+    assert all(c["results"][0]["status"] == "completed" for c in completions), completions
