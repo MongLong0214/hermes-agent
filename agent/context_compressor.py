@@ -12,7 +12,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from agent.image_eviction_policy import outbound_image_retire_count
 from agent.auxiliary_client import (
@@ -910,6 +910,10 @@ TAIL_MAX_CONTEXT_FRACTION = 0.20
 _LEAN_USER_MESSAGES_BUDGET_CHARS = 24_000  # ~6K tokens
 _LEAN_USER_MESSAGE_MAX_CHARS = 4_000
 _LEAN_USER_MESSAGES_HEADING = "## User Messages (newest first)"
+# An iterative round's carried-forward user section is relabeled under this heading instead of being
+# dropped or re-certified: its content (e.g. a standing constraint not restated in later turns) stays
+# available, but scoped as not re-verified against the turns actually being compacted this round.
+_LEAN_USER_MESSAGES_HISTORICAL_HEADING = "## Earlier User Messages (from a previous summary, not re-verified)"
 _LEAN_RECOVERY_HEADING = "## Context Recovery"
 # Demote tool results older than the newest N rounds so the tail budget binds
 # (the tool-group alignment floor otherwise keeps ~32K of tool output alive).
@@ -997,22 +1001,53 @@ def _build_recovery_footer(session_id: str, region_len: int) -> str:
     )
 
 
-def _replace_lean_section(summary: str, heading: str, build: Callable[[], str]) -> str:
-    """Rebuild ``heading``'s section from the CURRENT turns, replacing any occurrence already in
-    ``summary`` instead of trusting that the heading's mere presence means its content is still accurate.
-    An iterative prompt hands the model its own previous summary — including the lean sections this same
-    method appended last round — as "PREVIOUS SUMMARY" to preserve, so the model can echo an old heading
-    straight through with shortened or stale content under it (the bounded-selection omission disclosure
-    then never gets regenerated for this round's turns)."""
-    idx = summary.find(heading)
-    if idx == -1:
-        return summary + build()
-    start = idx
-    while start > 0 and summary[start - 1] == "\n":
-        start -= 1
-    end = summary.find("\n## ", idx + len(heading))
-    tail = summary[end:] if end != -1 else ""
-    return summary[:start].rstrip("\n") + tail + build()
+def _extract_all_sections(summary: str, heading: str) -> "tuple[str, list[str]]":
+    """Remove EVERY occurrence of ``heading``'s section from ``summary`` (not just the first),
+    returning the cleaned summary and each occurrence's body, oldest-occurrence-first. An iterative
+    prompt hands the model its own previous summary as "PREVIOUS SUMMARY" to preserve, so a reply can
+    echo a heading back more than once (e.g. a historical section nested alongside an also-echoed
+    current one) — leaving a second, un-removed copy is as wrong as trusting the first one's mere
+    presence."""
+    bodies: list[str] = []
+    while True:
+        idx = summary.find(heading)
+        if idx == -1:
+            return summary, bodies
+        start = idx
+        while start > 0 and summary[start - 1] == "\n":
+            start -= 1
+        body_start = idx + len(heading)
+        end = summary.find("\n## ", body_start)
+        end = len(summary) if end == -1 else end
+        bodies.append(summary[body_start:end].strip("\n"))
+        summary = summary[:start].rstrip("\n") + summary[end:]
+
+
+def _strip_user_section_certification(body: str) -> str:
+    """Drop a user-messages section's trailing certification note (the "quoted verbatim" / "bounded
+    selection" claim), keeping only the quoted messages beneath it. A carried-forward section is no
+    longer about THIS round's turns, so its claim of completeness/verbatim-ness for this round must
+    not ride along with the preserved quotes."""
+    body = body.strip("\n")
+    note_start = body.rfind("\n(")
+    if note_start != -1 and body.endswith(")"):
+        return body[:note_start].rstrip("\n")
+    return body
+
+
+def _build_historical_user_section(bodies: "list[str]") -> str:
+    """Carried-forward prior user-messages section(s), re-scoped as historical: quoted content kept,
+    this-round certification stripped (see ``_strip_user_section_certification``) so it is never
+    re-applied to turns outside the round that actually produced it."""
+    quotes = [q for q in (_strip_user_section_certification(b) for b in bodies) if q]
+    if not quotes:
+        return ""
+    return (
+        "\n\n" + _LEAN_USER_MESSAGES_HISTORICAL_HEADING + "\n" + "\n\n".join(quotes) + "\n"
+        "(Carried forward from a previous summary's user-messages section(s). The quoted text is "
+        "preserved as captured then, but is not re-verified against this round's turns and is not "
+        "certified complete or verbatim for the compacted region as a whole.)"
+    )
 
 
 # Detailed session log comes from the SAME single summary request (one aux LLM
@@ -3579,16 +3614,20 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
 
     def _augment_summary_lean(self, summary: str, turns_to_summarize: List[Dict[str, Any]]) -> str:
         """Append deterministic lean-mode sections to a summary; no-op in legacy mode.
-        The user-messages section always replaces any carried-forward occurrence (see
-        ``_replace_lean_section``): an iterative round can echo that heading back from the previous
-        summary with its bounded-selection omission disclosure gone or stale, and the heading's mere
-        presence must not be trusted as proof this round's selection was already disclosed."""
+        The user-messages section always replaces every carried-forward occurrence (current heading AND
+        any already-historical one — see ``_extract_all_sections``): an iterative round can echo either
+        heading back from the previous summary with its bounded-selection omission disclosure gone or
+        stale, and the heading's mere presence must not be trusted as proof this round's selection was
+        already disclosed. Carried-forward content is not discarded — it is kept, re-scoped as historical
+        (``_build_historical_user_section``) — because it can hold a standing constraint the CURRENT
+        turns never restate (e.g. an earlier "always use tabs" instruction)."""
         if getattr(self, "tail_mode", "lean") != "lean":
             return summary
-        summary = _replace_lean_section(
-            summary, _LEAN_USER_MESSAGES_HEADING, lambda: _redact_compaction_text(
-                _build_verbatim_user_section(turns_to_summarize, getattr(self, "_session_id", "") or "")),
-        )
+        summary, _current_bodies = _extract_all_sections(summary, _LEAN_USER_MESSAGES_HEADING)
+        summary, _historical_bodies = _extract_all_sections(summary, _LEAN_USER_MESSAGES_HISTORICAL_HEADING)
+        summary += _build_historical_user_section(_current_bodies + _historical_bodies)
+        summary += _redact_compaction_text(
+            _build_verbatim_user_section(turns_to_summarize, getattr(self, "_session_id", "") or ""))
         for heading, build in (
             (_LEAN_ANCHOR_HEADING, lambda: _redact_compaction_text(_build_anchor_index(turns_to_summarize))),
             (_LEAN_RECOVERY_HEADING, lambda: _build_recovery_footer(getattr(self, "_session_id", "") or "", len(turns_to_summarize))),

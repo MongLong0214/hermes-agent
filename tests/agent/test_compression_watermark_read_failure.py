@@ -245,3 +245,38 @@ def test_forced_pre_api_preflight_defers_instead_of_exhausting_on_a_watermark_re
     assert v.result.get("compression_deferred") is True
     assert not v.result.get("compression_exhausted")
     assert v.compression_attempts == 0
+
+
+@pytest.mark.parametrize("in_place,failing_read", _WATERMARK_FAILURES)
+def test_forced_pre_api_preflight_refunds_the_provisional_api_call_on_a_watermark_read_failure(
+    tmp_path: Path, in_place, failing_read
+):
+    """R3-2: the forced provider-overflow-preflight transient-defer branch never reaches the provider — zero
+    provider calls were made — so it must refund the provisional ``api_call_count``/iteration-budget slot
+    ``begin_iteration`` already consumed for this pass, exactly like the non-forced sibling branch just below
+    it does. Pre-fix it returned the deferred result without refunding: the replay reports one API call and
+    one consumed iteration for a pass that never sent anything."""
+    from agent.turn_preflight import PreflightGateVerdict, run_preflight_compression
+
+    db, agent, messages = _over_window_agent(
+        tmp_path, f"FORCED_PREFLIGHT_REFUND_WM_FAIL_{failing_read}", in_place=in_place
+    )
+    assert agent.iteration_budget.consume() is True  # mirrors begin_iteration's provisional increment
+    v = PreflightGateVerdict(
+        action="fallthrough", pending_moa_prepared_request=None, messages=messages, active_system_prompt="sys",
+        conversation_history=list(messages), api_call_count=1, compression_attempts=0, final_response=None,
+        failed=False, _turn_exit_reason=None, _compression_timeout_exhausted=False,
+        _preflight_compression_blocked=False, _provider_overflow_recovery_pending=True,
+        _last_preflight_pressure=None,
+    )
+    reads = _fail_watermark_read(db, on_call=failing_read)
+    with patch.object(db, "get_active_message_watermark", side_effect=reads):
+        v = run_preflight_compression(
+            agent, v, compressor=agent.context_compressor, request_pressure_tokens=_OVERSIZED_REQUEST,
+            provider_overflow_preflight=True, defer_preflight=lambda _t: False, moa_prepared_request=None,
+            system_message="sys", user_message="question", max_compression_attempts=3, effective_task_id=None,
+        )
+
+    assert v.action == "return" and v.result.get("compression_deferred") is True
+    assert v.api_call_count == 0  # refunded: zero provider calls were made
+    assert agent.iteration_budget.used == 0  # the consumed iteration was given back

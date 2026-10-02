@@ -171,6 +171,9 @@ def run_preflight_compression(
             if provider_overflow_preflight:
                 # The provider proved this request cannot fit, so don't resend it — but nothing was spent,
                 # so end deferred (as the 413 recovery does), not via the forced-preflight exhaustion below.
+                # Never reaches the provider — refund the provisional call/budget like every other
+                # never-sent branch above, else the deferred result over-reports api_call_count/iterations.
+                v.api_call_count = _refund_api_call(agent, v.api_call_count)
                 agent._persist_session(v.messages, v.conversation_history)
                 return _done("return", _compression_deferred_result(
                     agent, v.messages, v.api_call_count,
