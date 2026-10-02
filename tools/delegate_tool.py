@@ -34,6 +34,7 @@ from tools.delegate_tool_config import (  # noqa: F401
     _resolve_child_runtime, _resolve_delegation_credentials,
     _subagent_auto_approve, _subagent_auto_deny,
 )
+from tools.approval_context import as_delegation_hop
 from tools.delegate_tool_dispatch import _Batch, _announce_batch, _capture_origin, _run_batch
 from tools.delegate_tool_progress import (  # noqa: F401
     DelegateEvent, SUBAGENT_FAILURE_STATUSES, _batch_prefix, _build_child_progress_callback,
@@ -296,6 +297,9 @@ def _build_child_agent(
         )
     return child
 
+# MCP call provenance: every child run is one subagent hop, dispatched synchronously (the parent's own
+# thread) or from an async worker; the decorator restores the caller's depth however the run ends.
+@as_delegation_hop
 def _run_single_child(
     task_index: int, goal: str, child=None, parent_agent=None, *, owner_session_id: Optional[str] = None,
     owner_transport: Any = None, owner_session_record: Any = None, **_kwargs,
@@ -313,10 +317,6 @@ def _run_single_child(
 
     * ``"completed"``       — normal finish. See #97655.
     """
-    from tools.approval_context import bind_delegation_depth, get_delegation_depth
-    bind_delegation_depth(get_delegation_depth() + 1)  # MCP call provenance: every child run is one subagent hop,
-    # whether dispatched synchronously (this thread) or from the async worker thread (which already copied the
-    # parent's context via propagate_context_to_thread) -- a single bump here covers both paths.
     child_progress_cb = getattr(child, "tool_progress_callback", None)
     child_pool, leased_cred_id = _lease_child_credential(child)
     # Heartbeat keeps the parent's _last_activity_ts moving so the gateway inactivity timeout doesn't fire while the

@@ -74,8 +74,30 @@ def get_delegation_depth() -> int:
 
 
 def bind_delegation_depth(depth: int) -> contextvars.Token:
-    """Bind the current context's delegation depth; pair with reset via the returned Token."""
+    """Bind the current context's delegation depth; pair with :func:`reset_delegation_depth`."""
     return _delegation_depth_ctx.set(depth)
+
+
+def reset_delegation_depth(token: contextvars.Token) -> None:
+    _delegation_depth_ctx.reset(token)
+
+
+def as_delegation_hop(fn):
+    """Run *fn* one async-delegation hop deeper, restoring the caller's depth on every exit path.
+
+    A synchronous child runs on its PARENT's own thread and context, so an unrestored bump would leave
+    the parent (and every later sibling) reporting the child's depth -- the parent's own later MCP
+    calls would then claim to come from a subagent."""
+    import functools
+
+    @functools.wraps(fn)
+    def _hop(*args, **kwargs):
+        token = _delegation_depth_ctx.set(_delegation_depth_ctx.get() + 1)
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _delegation_depth_ctx.reset(token)
+    return _hop
 
 
 def set_hermes_interactive_context(interactive: bool) -> contextvars.Token:

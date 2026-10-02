@@ -79,30 +79,44 @@ class TestBuildCallProvenance:
         finally:
             bind_delegation_depth(before)
 
-    def test_nested_subagents_increment_depth_through_run_single_child(self, monkeypatch):
-        """The real bump site (tools.delegate_tool._run_single_child), not a direct unit call: a
-        grandchild dispatched from inside a child's own delegation must report depth 2, not 1."""
+    def test_sync_children_never_leak_depth_into_the_parent(self, monkeypatch):
+        """R-DELEGATION-DEPTH: a synchronous child runs on the parent's own thread and context. Two
+        sibling runs must each see depth 1 and leave the parent at 0 -- the bug was [1, 2] / [1, 2]."""
+        import tools.delegate_tool as dt
+        from tools.approval_context import get_delegation_depth
+
+        seen_child = []
+
+        def fake_lease(child):
+            seen_child.append(get_delegation_depth())
+            raise RuntimeError("stop here: depth observed")
+
+        monkeypatch.setattr(dt, "_lease_child_credential", fake_lease)
+        parent_after = []
+        for _ in range(2):
+            with pytest.raises(RuntimeError):
+                dt._run_single_child(task_index=0, goal="x", child=object(), parent_agent=None)
+            parent_after.append(get_delegation_depth())
+        assert seen_child == [1, 1]
+        assert parent_after == [0, 0]
+
+    def test_a_grandchild_reports_depth_two(self, monkeypatch):
+        """A child that itself delegates: its own child runs one more hop down, and both unwind."""
         import tools.delegate_tool as dt
         from tools.approval_context import get_delegation_depth
 
         seen = []
 
         def fake_lease(child):
-            return None, None
+            seen.append(get_delegation_depth())
+            if child == "child":
+                with pytest.raises(RuntimeError):
+                    dt._run_single_child(task_index=0, goal="g", child="grandchild", parent_agent=None)
+                seen.append(("after-grandchild", get_delegation_depth()))
+            raise RuntimeError("stop")
 
         monkeypatch.setattr(dt, "_lease_child_credential", fake_lease)
-
-        class _Boom(Exception):
-            pass
-
-        def record_and_raise(*a, **kw):
-            seen.append(get_delegation_depth())
-            raise _Boom()
-
-        monkeypatch.setattr(dt, "_run_single_child", dt._run_single_child)  # sanity: not monkeypatched away
-        # Patch deep enough in the body to observe depth without running a real child turn.
-        monkeypatch.setattr(dt, "_lease_child_credential", lambda child: (_ for _ in ()).throw(_Boom()))
-        before = get_delegation_depth()
-        with pytest.raises(_Boom):
-            dt._run_single_child(task_index=0, goal="x", child=object(), parent_agent=None)
-        assert get_delegation_depth() == before + 1, "the depth bump must land before the child body runs"
+        with pytest.raises(RuntimeError):
+            dt._run_single_child(task_index=0, goal="c", child="child", parent_agent=None)
+        assert seen == [1, 2, ("after-grandchild", 1)]
+        assert get_delegation_depth() == 0
