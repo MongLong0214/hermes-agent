@@ -76,9 +76,11 @@ def run_cell(request, execution_count):
 KERNEL_RUNNER_SOURCE = '''\
 """Auto-generated Hermes session-kernel runner. One exec cell per request."""
 import contextlib
+import importlib.util
 import io
 import json
 import os
+import shlex
 import sys
 import threading
 import traceback
@@ -177,6 +179,107 @@ _start_parent_process_watchdog()
 _start_parent_death_pipe_watchdog()
 
 _real_stdout = sys.stdout
+
+# Hard-block gateway-lifecycle commands against the REAL argv, not the cell's source text: the
+# guard in tools/code_execution_tool.py scans the cell's source for a lifecycle command before
+# this process is even spawned, so a cell that builds the argv at runtime (``a = "launch"; b =
+# "ctl"; subprocess.run([a + b, "bootout", ...])``) never looks like a literal string to that
+# scan. sys.addaudithook() callbacks cannot be removed or replaced by code that runs after them
+# in this interpreter -- including the cell's own code -- so installing this before the first
+# cell runs makes it unconditional for the life of this kernel.
+_HERMES_GUARD_ROOT = os.environ.pop("HERMES_KERNEL_LIFECYCLE_GUARD_ROOT", "")
+_HERMES_LIFECYCLE_CHECK = None
+if _HERMES_GUARD_ROOT:
+    try:
+        # Loaded by file path, not ``import cron.lifecycle_guard``: the ``cron`` package's own
+        # __init__ pulls in the scheduler, which a foreign code_execution.mode: project
+        # interpreter may not have the dependencies for. This file's own top-level imports are
+        # stdlib-only.
+        _guard_path = os.path.join(_HERMES_GUARD_ROOT, "cron", "lifecycle_guard.py")
+        _guard_spec = importlib.util.spec_from_file_location("_hermes_kernel_lifecycle_guard", _guard_path)
+        _guard_mod = importlib.util.module_from_spec(_guard_spec)
+        _guard_spec.loader.exec_module(_guard_mod)
+        _HERMES_LIFECYCLE_CHECK = _guard_mod.contains_gateway_lifecycle_command
+    except Exception:
+        _HERMES_LIFECYCLE_CHECK = None  # fails open to the source-text scan already run on this cell
+
+
+def _hermes_cmdline_text(value):
+    """Flatten a Popen/exec/spawn argv (str, bytes, path-like, or a sequence of those) into one
+    text blob -- the shape ``contains_gateway_lifecycle_command`` expects from a shell command
+    line."""
+    if not value:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    if isinstance(value, str):
+        return value
+    parts = []
+    try:
+        for item in value:
+            if isinstance(item, bytes):
+                parts.append(item.decode("utf-8", "replace"))
+            else:
+                try:
+                    parts.append(os.fspath(item))
+                except TypeError:
+                    parts.append(str(item))
+    except TypeError:
+        return str(value)
+    try:
+        return shlex.join(parts)
+    except (TypeError, ValueError):
+        return " ".join(parts)
+
+
+def _hermes_classify_cmdline(cmdline):
+    """Run the real classifier with the Hermes root transiently on sys.path -- its own lazy
+    sub-imports (profile lookup, heredoc stripping) need it -- and never leave it there for the
+    cell's own imports. Any classifier error fails OPEN: an import hiccup under a foreign
+    interpreter must not block ordinary subprocess use; the source-text scan already run on this
+    cell's code still covers the literal-command case either way."""
+    if not cmdline or _HERMES_LIFECYCLE_CHECK is None:
+        return False
+    sys.path.append(_HERMES_GUARD_ROOT)
+    try:
+        return bool(_HERMES_LIFECYCLE_CHECK(cmdline))
+    except Exception:
+        return False
+    finally:
+        try:
+            sys.path.remove(_HERMES_GUARD_ROOT)
+        except ValueError:
+            pass
+
+
+_HERMES_LIFECYCLE_BLOCK_MESSAGE = (
+    "Blocked: cannot restart or stop the gateway from inside the gateway process "
+    "(execute_code audit-hook guard). The gateway would kill this script before it could "
+    "complete. Run the lifecycle command from a shell outside the gateway."
+)
+
+
+def _hermes_lifecycle_audit_hook(event, args):
+    """``subprocess.Popen``, ``os.system``, the ``os.exec*`` family and the ``os.posix_spawn*``
+    family each raise one auditing event right before CPython creates the process; raising here
+    aborts that creation instead of merely logging it. ctypes calls straight into libc (a direct
+    ``execve``/``posix_spawn`` via ``ctypes.CDLL``) never go through these C implementations and
+    so never reach this hook -- out of reach of any Python-level audit hook, not just this one."""
+    if event == "os.system":
+        cmdline = args[0] if args else ""
+    elif event == "subprocess.Popen":
+        executable, popen_args, _cwd, _env = args
+        cmdline = (_hermes_cmdline_text(executable) + " " + _hermes_cmdline_text(popen_args)).strip()
+    elif event == "os.exec" or event == "os.posix_spawn":
+        path, exec_args, _env = args
+        cmdline = (_hermes_cmdline_text(path) + " " + _hermes_cmdline_text(exec_args)).strip()
+    else:
+        return
+    if _hermes_classify_cmdline(cmdline):
+        raise PermissionError(_HERMES_LIFECYCLE_BLOCK_MESSAGE)
+
+
+sys.addaudithook(_hermes_lifecycle_audit_hook)
 
 {cell_source}
 

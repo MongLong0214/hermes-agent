@@ -572,3 +572,67 @@ class TestStaleStagingDirSweep(unittest.TestCase):
                 self.assertFalse(old.exists())
                 self.assertTrue(young.exists())
                 self.assertTrue(bystander.exists())
+
+
+class TestLifecycleGuardAuditHook(unittest.TestCase):
+    """L7-2: execute_code's pre-dispatch guard only scans the cell's SOURCE TEXT for a gateway
+    lifecycle command, so a cell that builds the argv at runtime (``a = "launch"; b = "ctl"``)
+    never looks like a literal string to that scan and — with ``approvals.mode: off`` — the cell
+    then runs unchecked. The kernel's bootstrap installs a ``sys.addaudithook`` that re-applies
+    ``cron.lifecycle_guard.contains_gateway_lifecycle_command`` to the REAL argv right before
+    CPython would create the process, so terminal and Python enforce the same rule."""
+
+    @staticmethod
+    def _stub_launchctl(bin_dir: Path, record_path: Path) -> None:
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        stub = bin_dir / "launchctl"
+        stub.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            "with open(" + repr(str(record_path)) + ", 'a') as f:\n"
+            "    f.write(json.dumps(sys.argv) + chr(10))\n"
+        )
+        stub.chmod(0o755)
+
+    def _run_with_stub_launchctl(self, code: str):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bin_dir = tmp_path / "bin"
+            record_path = tmp_path / "launchctl_argv.jsonl"
+            self._stub_launchctl(bin_dir, record_path)
+            patched_path = str(bin_dir) + os.pathsep + os.environ.get("PATH", "")
+            with _kernel_config(), patch.dict(os.environ, {"PATH": patched_path}):
+                result = _run(code)
+            return result, record_path
+
+    def test_dynamically_built_lifecycle_argv_never_reaches_launchctl(self):
+        result, record_path = self._run_with_stub_launchctl(textwrap.dedent("""\
+            import subprocess
+            a = "launch"
+            b = "ctl"
+            subprocess.run([a + b, "bootout", "gui/501/ai.hermes.gateway"], check=False)
+            """))
+        self.assertEqual(result["status"], "error", result)
+        self.assertIn("Blocked: cannot restart or stop the gateway", result["error"])
+        self.assertFalse(record_path.exists(),
+                          "the stub launchctl must never have been invoked")
+
+    def test_literal_lifecycle_argv_still_blocked(self):
+        result, record_path = self._run_with_stub_launchctl(
+            'import subprocess\n'
+            'subprocess.run(["launchctl", "bootout", "gui/501/ai.hermes.gateway"], check=False)\n'
+        )
+        self.assertEqual(result["status"], "error", result)
+        self.assertIn("Blocked: cannot restart or stop the gateway", result["error"])
+        self.assertFalse(record_path.exists(),
+                          "the stub launchctl must never have been invoked")
+
+    def test_ordinary_subprocess_use_still_works(self):
+        result, record_path = self._run_with_stub_launchctl(
+            'import subprocess\n'
+            'r = subprocess.run(["echo", "ok"], capture_output=True, text=True)\n'
+            'print(r.stdout.strip())\n'
+        )
+        self.assertEqual(result["status"], "success", result)
+        self.assertIn("ok", result["output"])
+        self.assertFalse(record_path.exists())
