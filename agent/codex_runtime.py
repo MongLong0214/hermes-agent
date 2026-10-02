@@ -574,9 +574,12 @@ def _persist_projected_messages(agent, turn, messages: List[Dict[str, Any]]) -> 
     ``session_persistence.py``'s ``_persist_session``) so the caller's ``agent_persisted`` reflects
     whether this flush actually landed instead of assuming the agent always wrote it (#L4-2/R67-1:
     a failed flush was reported as persisted, so the gateway skipped the write that could have
-    recovered it)."""
+    recovered it). When there is nothing new to project, this function attempts no flush of its
+    own, so it must not touch ``_last_persist_succeeded`` at all — the turn-start flush
+    (``turn_context._persist_turn_start``, before the codex runtime ever ran) already recorded
+    the real outcome, and forcing it to ``True`` here silently erased a genuine turn-start
+    failure (ROUND1-ESCAPE sibling of #L4-2/R67-1)."""
     if not turn.projected_messages:
-        agent._last_persist_succeeded = True  # nothing new to persist — not a failure
         return False
     from agent.message_metadata import append_message
     projected_messages = turn.projected_messages

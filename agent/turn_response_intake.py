@@ -169,7 +169,8 @@ def normalize_model_response(
         agent._cleanup_task_resources(effective_task_id)
         agent._persist_session(messages, conversation_history)
         return _verdict("return", partial_result(
-            rolled_back_messages, api_call_count, "Incomplete REASONING_SCRATCHPAD after 2 retries"
+            rolled_back_messages, api_call_count, "Incomplete REASONING_SCRATCHPAD after 2 retries",
+            agent=agent,
         ))
     agent._incomplete_scratchpad_retries = 0
 
