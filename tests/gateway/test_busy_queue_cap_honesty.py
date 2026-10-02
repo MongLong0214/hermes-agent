@@ -121,3 +121,93 @@ class TestSteerFallbackBoundedByCap:
         assert runner._queue_depth(sk, adapter=adapter) == runner._BUSY_QUEUE_MAX_PENDING
         assert "queued for the next turn" not in reply.lower()
         assert "not queued" in reply.lower() or "queue is full" in reply.lower()
+
+
+class TestRunnerBusyFastPathRefusedWhenQueueFull:
+    """PR72-R2 — the runner's own busy fast-path (``_handle_message`` →
+    ``_hm_handle_running_session_message``) admits follow-ups through the same capped
+    ``_enqueue_fifo``, but ignored its result: during a restart drain it still answered "queued for
+    the next turn after it comes back", and the Telegram grace window, steer fallback, queue mode and
+    the subagent/compression-protected interrupt fallback stayed silent while dropping the message.
+    Every one of them must answer with the honest refusal and leave the cap intact."""
+
+    @staticmethod
+    def _runner_with_full_queue(monkeypatch, busy_input_mode: str, agent: object):
+        import time
+        from tests.gateway.test_steer_command import _make_runner as _make_dispatch_runner
+        from tests.gateway.test_steer_command import _make_event as _make_dispatch_event
+        from tests.gateway.test_steer_command import _session_entry
+
+        monkeypatch.setenv("HERMES_TELEGRAM_FOLLOWUP_GRACE_SECONDS", "0")
+        runner, adapter = _make_dispatch_runner(_session_entry())
+        runner._busy_input_mode = busy_input_mode
+        runner._draining = False
+        runner._restart_requested = False
+        runner._session_has_compression_in_flight = AsyncMock(return_value=False)
+        event = _make_dispatch_event("one more thing")
+        sk = build_session_key(event.source)
+        runner._running_agents[sk] = agent
+        runner._session_state(sk).turn.started_ts = time.time()
+        _fill_to_cap(runner, adapter, sk)
+        return runner, adapter, event, sk
+
+    @staticmethod
+    def _assert_refused(runner, adapter, event, sk, reply) -> None:
+        assert runner._queue_depth(sk, adapter=adapter) == runner._BUSY_QUEUE_MAX_PENDING
+        assert getattr(event, "_gateway_accepted", False) is not True
+        assert isinstance(reply, str), f"refusal was silent (reply={reply!r})"
+        assert "queued for the next turn" not in reply.lower()
+        assert "queue is full" in reply.lower()
+
+    @pytest.mark.asyncio
+    async def test_restart_drain_reply_is_honest_at_cap(self, monkeypatch):
+        agent = MagicMock()
+        agent._active_children = []
+        runner, adapter, event, sk = self._runner_with_full_queue(monkeypatch, "queue", agent)
+        runner._draining = True
+        runner._restart_requested = True
+
+        reply = await runner._handle_message(event)
+
+        self._assert_refused(runner, adapter, event, sk, reply)
+
+    @pytest.mark.asyncio
+    async def test_queue_mode_reply_is_honest_at_cap(self, monkeypatch):
+        agent = MagicMock()
+        agent._active_children = []
+        runner, adapter, event, sk = self._runner_with_full_queue(monkeypatch, "queue", agent)
+
+        reply = await runner._handle_message(event)
+
+        self._assert_refused(runner, adapter, event, sk, reply)
+
+    @pytest.mark.asyncio
+    async def test_steer_fallback_reply_is_honest_at_cap(self, monkeypatch):
+        agent = MagicMock(spec=[])  # no steer(): falls back to queue semantics
+        runner, adapter, event, sk = self._runner_with_full_queue(monkeypatch, "steer", agent)
+
+        reply = await runner._handle_message(event)
+
+        self._assert_refused(runner, adapter, event, sk, reply)
+
+    @pytest.mark.asyncio
+    async def test_protected_interrupt_fallback_reply_is_honest_at_cap(self, monkeypatch):
+        agent = MagicMock()
+        agent._active_children = [MagicMock()]  # active subagents demote the interrupt to queue
+        runner, adapter, event, sk = self._runner_with_full_queue(monkeypatch, "interrupt", agent)
+
+        reply = await runner._handle_message(event)
+
+        self._assert_refused(runner, adapter, event, sk, reply)
+        agent.interrupt.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_telegram_grace_queue_reply_is_honest_at_cap(self, monkeypatch):
+        agent = MagicMock()
+        agent._active_children = []
+        runner, adapter, event, sk = self._runner_with_full_queue(monkeypatch, "queue", agent)
+        monkeypatch.setenv("HERMES_TELEGRAM_FOLLOWUP_GRACE_SECONDS", "60")
+
+        reply = await runner._handle_message(event)
+
+        self._assert_refused(runner, adapter, event, sk, reply)

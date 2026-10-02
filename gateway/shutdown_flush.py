@@ -189,12 +189,30 @@ def _json_safe(value: Any) -> bool:
         return False
 
 
+def _event_recovery_text(event: Any) -> str:
+    """Text that stands for a queued ``MessageEvent`` once replayed as a user row.
+
+    A voice note transcribed while its turn was being drained keeps the transcript only in the STT
+    cache (``_gateway_pending_stt_text``, its ``text`` stays empty), and ``media_urls`` is not part
+    of ``text`` at all — so a media-only event serialised to empty text, which recovery rejects.
+    Prefer the cached transcript, and name every attachment by the placeholder the live drain uses.
+    """
+    stt_text = getattr(event, "_gateway_pending_stt_text", None)
+    text = stt_text if isinstance(stt_text, str) and stt_text else (getattr(event, "text", "") or "")
+    media_urls = getattr(event, "media_urls", None)
+    if not isinstance(media_urls, (list, tuple)) or not media_urls:
+        return text
+    from gateway.run import _build_media_placeholder
+    placeholder = _build_media_placeholder(event)
+    return f"{text}\n{placeholder}" if text else placeholder
+
+
 def _serialise_value(value: Any) -> Optional[dict]:
     """Convert a pending message value to a JSON-serialisable dict."""
     if hasattr(value, "text"):  # MessageEvent-like object
-        result: Dict[str, Any] = {"text": getattr(value, "text", "")}
+        result: Dict[str, Any] = {"text": _event_recovery_text(value)}
         for attr in ("session_id", "platform", "sender_id", "sender_name", "reply_to", "media",
-                     "raw_event"):
+                     "media_urls", "media_types", "raw_event"):
             val = getattr(value, attr, None)
             if val is not None:
                 result[attr] = val if _json_safe(val) else str(val)
