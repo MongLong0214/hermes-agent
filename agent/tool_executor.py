@@ -347,6 +347,22 @@ def _append_skipped_tool_results(
     return True
 
 
+_PEER_TOOL_REFUSAL = ("[Tool call not executed — {name} was requested during a canonical peer turn. A peer has no "
+                      "tool or approval authority; answer in text only.]")
+
+
+def _refuse_peer_tool_calls(agent, tool_calls, messages: list) -> bool:
+    """A canonical peer turn executes no tool and asks for no approval on Hermes' own loop: every
+    call gets a refusal result (so the assistant turn keeps its matching results) and nothing runs.
+    Authority follows the turn principal set by the canonical ingress, never message text."""
+    from tools.approval_context import is_peer_turn
+
+    if getattr(agent, "_turn_principal", None) != "peer" and not is_peer_turn():
+        return False
+    _append_skipped_tool_results(agent, messages, tool_calls, "", content=_PEER_TOOL_REFUSAL)
+    return True
+
+
 def _tool_search_scoped_names(agent) -> frozenset:
     """Deferrable tool names the session may invoke via ``tool_call``; the unwrap bypasses
     the bridge's scope check in ``model_tools.handle_function_call``, so restricted sessions
@@ -1517,6 +1533,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     ``finalize=False`` skips end-of-batch budget enforcement and /steer injection (the
     segmented dispatcher owns turn-end work)."""
     tool_calls = assistant_message.tool_calls
+    if _refuse_peer_tool_calls(agent, tool_calls, messages):
+        return
     num_tools = len(tool_calls)
     _tool_budget = _budget_for_agent(agent)  # once per turn, not per result
 
@@ -1784,6 +1802,8 @@ def _publish_sequential_result(agent, messages: list, ref: _ToolCallRef, managed
 def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
     from types import SimpleNamespace
     from agent.terminal_approval_batch import terminal_approval_batch, terminal_approval_runs
+    if _refuse_peer_tool_calls(agent, assistant_message.tool_calls, messages):
+        return
     for calls in terminal_approval_runs(agent, assistant_message.tool_calls):
         with terminal_approval_batch(agent, calls, messages, effective_task_id):
             _execute_tool_calls_sequential(agent, SimpleNamespace(tool_calls=calls), messages, effective_task_id, api_call_count, finalize=False)
@@ -1859,6 +1879,8 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
     interrupt flag up front, so an interrupt drains later segments with one result per call."""
     from types import SimpleNamespace
 
+    if _refuse_peer_tool_calls(agent, assistant_message.tool_calls, messages):
+        return
     if segments is None:
         _active_env = get_active_env(effective_task_id)
         _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else None

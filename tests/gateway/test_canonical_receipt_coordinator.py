@@ -56,7 +56,8 @@ def _runner(tmp_path, monkeypatch, home=None):
         def interrupt(self, text=None):
             self.interrupted = text
 
-        def run_conversation(self, text, *, conversation_history, task_id):
+        def run_conversation(self, text, *, conversation_history, task_id, **_peer_turn):
+            text = _peer_turn.get("persist_user_message", text)  # the event body, not its peer rendering
             self.calls += 1
             self._persist_user_message_idx = len(conversation_history)
             return {"completed": True, "session_id": task_id, "final_response": "done:" + text,
@@ -193,7 +194,7 @@ def test_canonical_turn_uses_shared_running_slot_and_interrupt_generation(tmp_pa
             def interrupt(_text):
                 released.set()
 
-            def blocked_run(text, *, conversation_history, task_id):
+            def blocked_run(text, *, conversation_history, task_id, **_peer_turn):
                 agent.calls += 1
                 entered.set()
                 assert released.wait(timeout=2)
@@ -244,7 +245,7 @@ def test_new_command_reaps_processes_spawned_by_canonical_turn_but_not_its_basel
                 reaped.set()
                 return len(killed)
 
-            def spawning_run(text, *, conversation_history, task_id):
+            def spawning_run(text, *, conversation_history, task_id, **_peer_turn):
                 agent.calls += 1
                 running.add("proc-p")
                 entered.set()
@@ -345,7 +346,7 @@ def test_cancel_while_worker_runs_interrupts_it_and_holds_the_turn_until_it_exit
         reaped = _mock_processes(monkeypatch, running)
         entered, interrupted, may_exit = threading.Event(), threading.Event(), threading.Event()
         try:
-            def blocked_run(text, *, conversation_history, task_id):
+            def blocked_run(text, *, conversation_history, task_id, **_peer_turn):
                 agent.calls += 1
                 running.add("proc-p")
                 entered.set()

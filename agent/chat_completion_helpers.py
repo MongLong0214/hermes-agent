@@ -34,6 +34,7 @@ from agent.chat_completion_accepted_failure import is_accepted_stream_failure, s
 from agent.transports.chat_completions import is_router_timeout_shim, router_timeout_shim_may_follow
 from agent.fast_mode import effective_request_overrides
 from agent.turn_context import substitute_api_content
+from agent.canonical_peer import peer_metadata, peer_wire_text
 from agent.gemini_native_adapter import is_native_gemini_base_url
 from agent.gemini_outbound_policy import is_gemini_outbound
 # Remote endpoints must never be fingerprinted: the probe waterfall is only valid for local/LM-Studio/Ollama
@@ -2246,6 +2247,10 @@ def _iteration_summary_api_messages(agent, messages: list) -> list:
         # tool_name (SQLite FTS bookkeeping), the codex_* reasoning carriers, timestamp (preserved on
         # gateway user replay entries for the stale-confirmation expiry check — #47868 rejection class), and
         # every Hermes-internal underscore-prefixed scaffolding key.
+        if peer_metadata(msg) is not None:
+            # A canonical peer row is sent only as the rendering of its metadata.
+            api_msg.pop("api_content", None)
+            api_msg["content"] = peer_wire_text(msg)
         substitute_api_content(api_msg)
         if needs_sanitize:
             agent._sanitize_tool_calls_for_strict_api(api_msg, model=sanitize_model)

@@ -17,6 +17,18 @@ from gateway.run import GatewayRunner
 from gateway.session import SessionSource
 
 
+def _event(text):
+    return SimpleNamespace(text=text, author_id="author", channel_id="channel", event_id="event")
+
+
+def _peer(binding):
+    """The provenance the receipt coordinator mints for a canonical event before running it."""
+    from agent.canonical_peer import new_peer_metadata
+
+    return new_peer_metadata(binding=binding.name, author_id="author", channel_id="channel",
+                             event_id="event", receipt="canonical-receipt:v2:test")
+
+
 def test_request_local_reply_sink_is_opaque_single_use_and_normalizes_failure():
     async def exercise() -> None:
         published: list[CanonicalTurnResult] = []
@@ -70,7 +82,7 @@ def test_existing_cached_actor_turn_returns_only_current_terminal(tmp_path, monk
             telegram_user_id=source.user_id,
             telegram_thread_id=source.thread_id,
         )
-        event = SimpleNamespace(text="canonical turn")
+        event = _event("canonical turn")
         prior_route_calls: list[str] = []
 
         class ExistingAgent:
@@ -81,7 +93,7 @@ def test_existing_cached_actor_turn_returns_only_current_terminal(tmp_path, monk
                 self.calls = 0
                 self.callback = lambda *_args, **_kwargs: prior_route_calls.append("callback")
 
-            def run_conversation(self, text, *, conversation_history, task_id):
+            def run_conversation(self, text, *, conversation_history, task_id, **_peer_turn):
                 self.calls += 1
                 self.callback("must stay request-local") if self.callback else None
                 self._persist_user_message_idx = len(conversation_history)
@@ -111,7 +123,7 @@ def test_existing_cached_actor_turn_returns_only_current_terminal(tmp_path, monk
             assert agent.calls == 0
 
             result = await runner.run_bound_existing_turn(
-                binding, event, entry, reply_sink=sink
+                binding, event, entry, reply_sink=sink, peer=_peer(binding),
             )
             assert result == CanonicalTurnResult("bound", "canonical terminal")
             assert published == []
@@ -124,7 +136,7 @@ def test_existing_cached_actor_turn_returns_only_current_terminal(tmp_path, monk
             with runner._agent_cache_lock:
                 runner._agent_cache.pop(entry.session_key)
             with pytest.raises(ValueError, match="^canonical_agent_missing$"):
-                await runner.run_bound_existing_turn(binding, event, entry, reply_sink=sink)
+                await runner.run_bound_existing_turn(binding, event, entry, reply_sink=sink, peer=_peer(binding))
         finally:
             runner.session_store.close_all_db_handles()
 
@@ -155,7 +167,7 @@ def test_existing_cached_actor_accepts_current_same_key_rotation_but_rejects_pre
             telegram_user_id=origin.user_id,
             telegram_thread_id=origin.thread_id,
         )
-        event = SimpleNamespace(text="rotated canonical turn")
+        event = _event("rotated canonical turn")
         existing_lookups: list[str] = []
 
         def lookup_existing(session_key: str):
@@ -171,7 +183,7 @@ def test_existing_cached_actor_accepts_current_same_key_rotation_but_rejects_pre
             def __init__(self) -> None:
                 self.calls = 0
 
-            def run_conversation(self, text, *, conversation_history, task_id):
+            def run_conversation(self, text, *, conversation_history, task_id, **_peer_turn):
                 self.calls += 1
                 self._persist_user_message_idx = len(conversation_history)
                 return {
@@ -193,7 +205,7 @@ def test_existing_cached_actor_accepts_current_same_key_rotation_but_rejects_pre
                 binding,
                 event,
                 current,
-                reply_sink=request_local_reply_sink(lambda _result: asyncio.sleep(0)),
+                reply_sink=request_local_reply_sink(lambda _result: asyncio.sleep(0)), peer=_peer(binding),
             )
             assert result == CanonicalTurnResult("bound", "rotated terminal")
             assert agent.calls == 1
@@ -203,7 +215,7 @@ def test_existing_cached_actor_accepts_current_same_key_rotation_but_rejects_pre
                     binding,
                     event,
                     previous,
-                    reply_sink=request_local_reply_sink(lambda _result: asyncio.sleep(0)),
+                    reply_sink=request_local_reply_sink(lambda _result: asyncio.sleep(0)), peer=_peer(binding),
                 )
             assert agent.calls == 1
             assert existing_lookups == [key, key, key, key]
@@ -284,9 +296,9 @@ def test_post_lease_head_replacement_refuses_before_transcript_or_actor(tmp_path
             with pytest.raises(ValueError, match="^canonical_binding_stale$"):
                 await runner.run_bound_existing_turn(
                     binding,
-                    SimpleNamespace(text="must not run"),
+                    _event("must not run"),
                     entry,
-                    reply_sink=request_local_reply_sink(lambda _result: asyncio.sleep(0)),
+                    reply_sink=request_local_reply_sink(lambda _result: asyncio.sleep(0)), peer=_peer(binding),
                 )
             assert current_head[0] is replacement
             assert existing_lookups == [entry.session_key]
@@ -367,9 +379,9 @@ def test_transcript_load_head_replacement_refuses_before_actor(tmp_path, monkeyp
             with pytest.raises(ValueError, match="^canonical_binding_stale$"):
                 await runner.run_bound_existing_turn(
                     binding,
-                    SimpleNamespace(text="must not run"),
+                    _event("must not run"),
                     entry,
-                    reply_sink=request_local_reply_sink(lambda _result: asyncio.sleep(0)),
+                    reply_sink=request_local_reply_sink(lambda _result: asyncio.sleep(0)), peer=_peer(binding),
                 )
             assert current_head[0] is replacement
             assert existing_lookups == [entry.session_key, entry.session_key]
@@ -427,7 +439,7 @@ def test_actor_completion_requires_unchanged_existing_current_head(
             def __init__(self) -> None:
                 self.calls = 0
 
-            def run_conversation(self, text, *, conversation_history, task_id):
+            def run_conversation(self, text, *, conversation_history, task_id, **_peer_turn):
                 self.calls += 1
                 self._persist_user_message_idx = len(conversation_history)
                 if swap_current_head:
@@ -456,17 +468,17 @@ def test_actor_completion_requires_unchanged_existing_current_head(
                 with pytest.raises(ValueError, match="^canonical_binding_stale$"):
                     await runner.run_bound_existing_turn(
                         binding,
-                        SimpleNamespace(text="canonical turn"),
+                        _event("canonical turn"),
                         entry,
-                        reply_sink=request_local_reply_sink(publish),
+                        reply_sink=request_local_reply_sink(publish), peer=_peer(binding),
                     )
                 assert current_head[0] is replacement
             else:
                 result = await runner.run_bound_existing_turn(
                     binding,
-                    SimpleNamespace(text="canonical turn"),
+                    _event("canonical turn"),
                     entry,
-                    reply_sink=request_local_reply_sink(publish),
+                    reply_sink=request_local_reply_sink(publish), peer=_peer(binding),
                 )
                 assert result == CanonicalTurnResult("bound", "canonical terminal")
                 assert current_head[0] is entry
@@ -559,7 +571,7 @@ def test_callback_quarantine_restores_every_request_callback_on_failure(tmp_path
                 for name in callback_names:
                     setattr(self, name, lambda *args, _name=name: outward[_name].append(args))
 
-            def run_conversation(self, text, *, conversation_history, task_id):
+            def run_conversation(self, text, *, conversation_history, task_id, **_peer_turn):
                 for name in callback_names:
                     callback = getattr(self, name)
                     if callback is not None:
@@ -586,9 +598,9 @@ def test_callback_quarantine_restores_every_request_callback_on_failure(tmp_path
             with pytest.raises(expected_error):
                 await runner.run_bound_existing_turn(
                     binding,
-                    SimpleNamespace(text="failed canonical turn"),
+                    _event("failed canonical turn"),
                     entry,
-                    reply_sink=request_local_reply_sink(publish),
+                    reply_sink=request_local_reply_sink(publish), peer=_peer(binding),
                 )
             assert outward == {name: [] for name in callback_names}
             assert delivered == []

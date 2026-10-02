@@ -335,6 +335,16 @@ class ExistingCanonicalBindingResolver:
         return entry, proof
 
 
+def _runs_tools_outside_hermes(actor: Any) -> bool:
+    """Whether the actor's turn would run on a runtime that executes tools and asks approvals outside
+    Hermes' own tool loop (the Codex app-server: exec, patch and MCP tools in its subprocess), where a
+    peer turn's no-tools/no-approvals restriction cannot be enforced. The primary runtime counts too:
+    a cached agent on a fallback restores it at turn start."""
+    primary = getattr(actor, "_primary_runtime", None)
+    modes = {getattr(actor, "api_mode", None), primary.get("api_mode") if isinstance(primary, dict) else None}
+    return "codex_app_server" in modes
+
+
 @contextmanager
 def _unconfirmed_once_claimed():
     """Report a refusal raised once the event's receipt row exists as an unconfirmed receipt.
@@ -518,6 +528,16 @@ class CanonicalReceiptCoordinator:
             actor, db = self._borrow_actor_db(self._runner, proof)
             if self._runner._is_session_running(proof.session_key):
                 raise ValueError("canonical_turn_busy")
+            if _runs_tools_outside_hermes(actor):
+                raise ValueError("canonical_runtime_refused")
+            # The event runs as a peer: its verified signer is structured provenance beside the body,
+            # and the model sees the body only quoted under a fresh per-turn nonce. A body that
+            # already carries the nonce could close the quote, so it is refused here, unclaimed.
+            from agent.canonical_peer import new_peer_metadata, render_peer_turn
+
+            peer = new_peer_metadata(binding=binding.name, author_id=event.author_id,
+                                     channel_id=event.channel_id, event_id=event.event_id, receipt=key)
+            render_peer_turn(peer, event.text)
         except ValueError as refusal:
             return self._recorded_or_refuse(binding, key, fingerprint, str(refusal), proof)
         owner = secrets.token_hex(16)
@@ -535,6 +555,10 @@ class CanonicalReceiptCoordinator:
                 self._require_current_claim_target(proof, actor, db)
                 if self._runner._is_session_running(proof.session_key):
                     raise ValueError("canonical_turn_busy")
+                # An open user row would be merged with this peer turn by the agent's alternation
+                # repair, erasing the boundary between the two principals. Checked under the lease.
+                if db.latest_conversation_role(proof.session_id) == "user":
+                    raise ValueError("canonical_history_unanswered")
             except ValueError as refusal:
                 return self._recorded_or_refuse(binding, key, fingerprint, str(refusal), proof)
             run_generation = self._runner._begin_session_run_generation(proof.session_key)
@@ -565,7 +589,7 @@ class CanonicalReceiptCoordinator:
                     expected_actor=actor, expected_session_db=db,
                     expected_db_path=proof.db_path, expected_db_identity=proof.db_identity,
                     expected_run_generation=run_generation,
-                    held_lease=lease,
+                    held_lease=lease, peer=peer,
                 )
                 if not isinstance(result, CanonicalTurnResult) or len(result.terminal_text) > _MAX_TEXT_CHARS:
                     raise ValueError("canonical_receipt_invalid")

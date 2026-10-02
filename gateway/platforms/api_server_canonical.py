@@ -24,6 +24,9 @@ _PRE_CLAIM_CODES = frozenset({
     "canonical_binding_stale",
     "canonical_agent_replaced",
     "canonical_turn_busy",
+    "canonical_runtime_refused",
+    "canonical_envelope_escape",
+    "canonical_history_unanswered",
 })
 
 

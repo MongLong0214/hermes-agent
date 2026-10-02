@@ -33,8 +33,11 @@ def _text_of(content: Any) -> str:
 
 
 def _render_row(msg: Dict[str, Any]) -> str:
+    from agent.canonical_peer import peer_metadata, peer_wire_text
+
     role = msg.get("role")
-    text = _text_of(msg.get("content")).strip()
+    # A canonical peer row is quoted from its metadata, never seeded as the owner's own words.
+    text = (peer_wire_text(msg) if peer_metadata(msg) is not None else _text_of(msg.get("content"))).strip()
     if role == "user":
         return f"[USER]\n{text}" if text else ""
     if role == "assistant":

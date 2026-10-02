@@ -56,6 +56,29 @@ class TestApprovalModeParsing:
             assert _get_approval_mode() == "off"
 
 
+@pytest.mark.parametrize("bypass", ["yolo", "mode_off"])
+def test_peer_principal_never_inherits_the_owner_approval_bypass(monkeypatch, bypass):
+    """Owner authority comes from the turn principal only: an owner's --yolo or approvals.mode=off
+    never authorizes a canonical peer turn, and every gate refuses rather than prompting."""
+    monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", bypass == "yolo")
+    monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "off" if bypass == "mode_off" else "manual")
+    assert approval_module.is_approval_bypass_active_for_session("owner-session") is True
+    token = approval_context.set_turn_principal("peer")
+    try:
+        assert approval_module.is_approval_bypass_active() is False
+        assert approval_module.is_approval_bypass_active_for_session("owner-session") is False
+        for decision in (
+            approval_module.check_dangerous_command("rm -rf /tmp/x", "local"),
+            approval_module.check_all_command_guards("rm -rf /tmp/x", "local"),
+            approval_module.check_dangerous_command("echo hi", "docker"),
+            approval_module.check_execute_code_guard("print(1)", "local"),
+        ):
+            assert decision["approved"] is False
+    finally:
+        approval_context.reset_turn_principal(token)
+    assert approval_module.is_approval_bypass_active_for_session("owner-session") is True
+
+
 class TestSmartApproval:
     def test_smart_approval_uses_call_llm(self):
         response = SimpleNamespace(

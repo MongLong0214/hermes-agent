@@ -553,6 +553,7 @@ def _prune_unanswered_tool_calls(messages: List[Dict]) -> Tuple[List[Dict], int]
 
 def _merge_consecutive_users(messages: List[Dict]) -> Tuple[List[Dict], int]:
     """Pass 3: merge consecutive plain-text user messages (no user input lost)."""
+    from agent.canonical_peer import peer_metadata
     from agent.context_compressor import _DB_PERSISTED_MARKER, split_user_originated_turn
 
     repairs = 0
@@ -570,6 +571,10 @@ def _merge_consecutive_users(messages: List[Dict]) -> Tuple[List[Dict], int]:
             and prev.get("display_kind") != STEER_DISPLAY_KIND
             # Only merge plain-text content; leave multimodal (list) content alone.
             and isinstance(prev.get("content", ""), str) and isinstance(msg.get("content", ""), str)
+            # A canonical peer row stays its own structured message (provenance never merges with
+            # owner text, either way round); like a carrier, the per-call wire copy merges later,
+            # where the peer is already its metadata rendering. Malformed provenance raises here.
+            and peer_metadata(prev) is None and peer_metadata(msg) is None
         ):
             prev_content, new_content = prev.get("content", ""), msg.get("content", "")
             merged_content = (

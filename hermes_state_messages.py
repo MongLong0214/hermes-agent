@@ -14,6 +14,10 @@ from agent.context_compressor import (
     _DB_PERSISTED_MARKER as _DB_PERSISTED_MARKER_KEY, MODEL_ONLY_DISPLAY_METADATA_KEY, _is_checkpoint_item,
     _newest_checkpoint_carrier, split_user_originated_turn)
 from agent.memory_manager import sanitize_context
+from agent.canonical_peer import (
+    PEER_DISPLAY_KIND, PEER_METADATA_KEY, PEER_ROW_LEDGER_PREFIX, PeerProvenanceError,
+    content_digest as peer_content_digest, ledger_value as peer_ledger_value,
+    parse_ledger_value as parse_peer_ledger_value, peer_metadata, peer_wire_text)
 from agent.message_sanitization import _sanitize_surrogates
 from hermes_cli.timefmt import coerce_epoch
 from hermes_state_common import (
@@ -32,9 +36,10 @@ _INSERT_MESSAGE_SQL = """INSERT INTO messages (session_id, role, content, tool_c
 # Every column this module knows how to read: the ones it writes plus the three SQLite/compaction
 # owns. `_row_to_message_dict` drops raw bytes ONLY outside this set — a schema column keeps its
 # key (and its typed decoder) even when a row holds a BLOB, so no reader ever loses msg["content"].
-_MESSAGE_SCHEMA_KEYS = frozenset(
-    re.findall(r"\w+", _INSERT_MESSAGE_SQL.split("(", 1)[1].split(")", 1)[0])
-) | {"id", "compacted", "display_order"}
+_INSERT_MESSAGE_COLUMNS = tuple(re.findall(r"\w+", _INSERT_MESSAGE_SQL.split("(", 1)[1].split(")", 1)[0]))
+_MESSAGE_SCHEMA_KEYS = frozenset(_INSERT_MESSAGE_COLUMNS) | {"id", "compacted", "display_order"}
+_PARAM_ROLE, _PARAM_CONTENT, _PARAM_DISPLAY_KIND, _PARAM_DISPLAY_METADATA = (
+    _INSERT_MESSAGE_COLUMNS.index(column) for column in ("role", "content", "display_kind", "display_metadata"))
 _BUMP_GENERATION_SQL = """
             INSERT INTO conversation_generations (source, session_key, generation)
             VALUES (?, ?, 1)
@@ -68,10 +73,14 @@ _INVALID = object()  # _json_or sentinel where the fallback must be distinguisha
 
 
 def _json_or(raw: Any, fallback: Any, warning: str) -> Any:
-    """``json.loads(raw)``; on failure log *warning* and return *fallback*."""
+    """``json.loads(raw)``; on failure log *warning* and return *fallback*. ``RecursionError`` is
+    caught alongside the ordinary decode errors: a pathologically nested stored value (e.g. a
+    corrupted ``display_metadata`` column) must fall back the same way malformed JSON always has,
+    never escape as an uncaught exception a distant generic handler could mistake for something
+    else and swallow into an empty result."""
     try:
         return json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
+    except (json.JSONDecodeError, TypeError, RecursionError):
         logger.warning(warning)
         return fallback
 
@@ -321,6 +330,7 @@ class SessionMessagesMixin:
             self._check_transcript_write_guards(conn, session_id, compression_lock_holder,
                 turn_lease_holder=turn_lease_holder, turn_lease_ttl_seconds=turn_lease_ttl_seconds)
             msg_id = conn.execute(_INSERT_MESSAGE_SQL, params).lastrowid
+            self._record_admitted_peer_row(conn, msg_id, params)
             self._bump_session_counters(conn, session_id, 1, _tool_calls_count(tool_calls), unit=True)
             return msg_id
         # THE critical write (failure aborts the turn): long patience so a sibling legitimately
@@ -521,8 +531,10 @@ class SessionMessagesMixin:
             role = msg.get("role", "unknown")
             tool_calls = _parse_tool_calls(msg.get("tool_calls"))
             message_timestamp = _coerce_timestamp(msg.get("timestamp"), now_ts)
-            cur = conn.execute(_INSERT_MESSAGE_SQL, self._message_row_params(
-                session_id, role, msg, tool_calls, message_timestamp, keep_reasoning=role == "assistant"))
+            params = self._message_row_params(
+                session_id, role, msg, tool_calls, message_timestamp, keep_reasoning=role == "assistant")
+            cur = conn.execute(_INSERT_MESSAGE_SQL, params)
+            self._record_admitted_peer_row(conn, cur.lastrowid, params)
             # Keep the caller's live row aligned with the durable identity. Rows created without an explicit
             # timestamp (notably mid-turn steers) may be carried through several compaction generations; if
             # the generated timestamp exists only in SQLite, every copy receives a new identity and renders
@@ -537,6 +549,105 @@ class SessionMessagesMixin:
         if carrier >= 0 and isinstance(messages[carrier].get("_row_id"), int):
             self._drop_shadowed_checkpoint_rows(conn, session_id, messages[carrier]["_row_id"])
         return inserted, tool_calls_total
+
+    @classmethod
+    def _record_admitted_peer_row(cls, conn, row_id: Optional[int], params: tuple) -> None:
+        """Record, in the inserting transaction, that row ``row_id`` is an admitted canonical peer row.
+
+        The record lives in ``state_meta`` beside the canonical event receipt, independent of the
+        row's own mutable display fields, so a reload can refuse a peer row whose provenance was
+        stripped (no display fields, record still present) or forged (display fields, no record). A
+        peer-marked row is written only while the receipt its metadata names exists in this store;
+        anything else raises and the whole insert rolls back."""
+        kind, meta_json = params[_PARAM_DISPLAY_KIND], params[_PARAM_DISPLAY_METADATA]
+        if kind != PEER_DISPLAY_KIND and not (isinstance(meta_json, str) and PEER_METADATA_KEY in meta_json):
+            return
+        peer = peer_metadata({"role": params[_PARAM_ROLE], "display_kind": kind,
+                              "display_metadata": cls._decode_display_metadata(meta_json)})
+        if peer is None:
+            return
+        if row_id is None or conn.execute(
+                "SELECT 1 FROM state_meta WHERE key = ?", (peer["receipt"],)).fetchone() is None:
+            raise PeerProvenanceError()
+        conn.execute("INSERT INTO state_meta (key, value) VALUES (?, ?)",
+                     (f"{PEER_ROW_LEDGER_PREFIX}{row_id}", peer_ledger_value(peer, params[_PARAM_CONTENT])))
+
+    @staticmethod
+    def _peer_admission_records(conn, values: Dict[int, Any]) -> Dict[int, Dict[str, Any]]:
+        """Parsed admission records (row id -> stored ledger value), each with its receipt confirmed
+        present. Any unreadable or malformed value raises :class:`PeerProvenanceError`."""
+        records = {row_id: parse_peer_ledger_value(value) for row_id, value in values.items()}
+        receipts = sorted({record["peer"]["receipt"] for record in records.values()})
+        present = {row[0] for row in conn.execute(
+            f"SELECT key FROM state_meta WHERE key IN ({_placeholders(receipts)})",
+            tuple(receipts))} if receipts else set()
+        for record in records.values():
+            record["receipt_present"] = record["peer"]["receipt"] in present
+        return records
+
+    def _admitted_peer_rows(self, rows) -> Dict[int, Dict[str, Any]]:
+        """Admission records for the peer rows among ``rows``, each with its receipt confirmed present.
+        One prefix range scan: only peer rows have records, so this is small whatever the session size."""
+        row_ids = {row["id"] for row in rows if row["id"] is not None}
+        if not row_ids:
+            return {}
+        values: Dict[int, Any] = {}
+        with self._read_ctx() as conn:
+            for key, value in conn.execute(
+                    "SELECT key, value FROM state_meta WHERE key >= ? AND key < ?",
+                    (PEER_ROW_LEDGER_PREFIX, PEER_ROW_LEDGER_PREFIX[:-1] + chr(ord(PEER_ROW_LEDGER_PREFIX[-1]) + 1))):
+                suffix = key[len(PEER_ROW_LEDGER_PREFIX):]
+                if suffix.isdigit() and int(suffix) in row_ids:
+                    values[int(suffix)] = value
+            return self._peer_admission_records(conn, values)
+
+    @staticmethod
+    def _validated_peer(msg: Dict[str, Any], record: Optional[Dict[str, Any]], raw_content: Any):
+        """The provenance of an admitted peer row, None for an ordinary row (no marker, no record).
+        Raises for a peer row whose provenance is missing, inconsistent or unadmitted: identity comes
+        only from the stored metadata and its record, never from the text."""
+        peer = peer_metadata(msg)
+        if peer is None and record is None:
+            return None
+        if (peer is None or record is None or record["peer"] != peer or not record["receipt_present"]
+                or record["content_sha256"] != peer_content_digest(raw_content)):
+            raise PeerProvenanceError()
+        return peer
+
+    @classmethod
+    def _require_admitted_peer(cls, row, msg: Dict[str, Any], records: Dict[int, Dict[str, Any]]) -> bool:
+        """True for a consistent admitted peer row (its sidecar is then the model rendering); False for
+        an ordinary row. Every inconsistency, rendering included, is the provenance refusal."""
+        if cls._validated_peer(msg, records.get(row["id"]), row["content"]) is None:
+            return False
+        try:
+            msg["api_content"] = peer_wire_text(msg)
+        except PeerProvenanceError:
+            raise
+        except ValueError as exc:  # e.g. a stored body that carries its own nonce
+            raise PeerProvenanceError() from exc
+        return True
+
+    def _validated_peer_ledger_values(self, conn, row_ids: List[int]) -> Dict[int, str]:
+        """Stored ledger values of the admitted peer rows among ``row_ids``, each re-validated against its
+        row (metadata, record, receipt, content digest) inside the caller's transaction; raises
+        :class:`PeerProvenanceError` for a peer row whose provenance does not validate."""
+        stored = {int(key[len(PEER_ROW_LEDGER_PREFIX):]): value for key, value in conn.execute(
+            f"SELECT key, value FROM state_meta WHERE key IN ({_placeholders(row_ids)})",
+            tuple(f"{PEER_ROW_LEDGER_PREFIX}{row_id}" for row_id in row_ids))}
+        records = self._peer_admission_records(conn, stored)
+        admitted: Dict[int, str] = {}
+        for row in conn.execute(
+                "SELECT id, role, content, display_kind, display_metadata FROM messages "
+                f"WHERE id IN ({_placeholders(row_ids)})", tuple(row_ids)):
+            msg: Dict[str, Any] = {"role": row["role"], "display_kind": row["display_kind"]}
+            if row["display_metadata"] and (decoded := self._decode_display_metadata(row["display_metadata"])) is not None:
+                msg["display_metadata"] = decoded
+            if self._validated_peer(msg, records.get(int(row["id"])), row["content"]) is not None:
+                admitted[int(row["id"])] = stored[int(row["id"])]
+        if set(stored) - set(admitted):  # a record whose row is gone or is not a peer row
+            raise PeerProvenanceError()
+        return admitted
 
     def _drop_shadowed_checkpoint_rows(self, conn, session_id: str, carrier_row_id: int) -> int:
         """Rewrite older active assistant rows so only the row *carrier_row_id* keeps a ``type: "compaction"``
@@ -657,8 +768,14 @@ class SessionMessagesMixin:
 
     def _clone_message_rows(self, conn, tail_ids: List[int], *, session_id: Optional[str] = None) -> None:
         """Pure-SQL clone of *tail_ids* as fresh live rows (new id/display order, active=1, compacted=0;
-        message payload columns stay byte-exact and FTS triggers index the clones), into *session_id* when given."""
+        message payload columns stay byte-exact and FTS triggers index the clones), into *session_id* when given.
+
+        An admitted canonical peer row's admission record follows its clone to the fresh id in this same
+        transaction, after the source row is re-validated; a source peer row whose provenance does not
+        validate raises :class:`PeerProvenanceError`, so the caller's whole publication rolls back."""
         retarget = session_id is not None
+        peer_values = self._validated_peer_ledger_values(conn, tail_ids)
+        before = int(conn.execute("SELECT COALESCE(MAX(id), 0) FROM messages").fetchone()[0])
         # A clone is a newly positioned display generation. Copy its indexed
         # identity, but let the insert trigger assign order from rows that are
         # still display-visible (the source may just have become rewind-only).
@@ -669,6 +786,20 @@ class SessionMessagesMixin:
             f"SELECT {col_list}, {'?, ' if retarget else ''}1, 0 FROM messages "
             f"WHERE id IN ({_placeholders(tail_ids)}) ORDER BY id",
             [session_id, *tail_ids] if retarget else tail_ids)
+        if not peer_values:
+            return
+        # The clones took ids above ``before`` in source-id order (ORDER BY id, one writer).
+        clones = conn.execute("SELECT id, content FROM messages WHERE id > ? ORDER BY id", (before,)).fetchall()
+        if len(clones) != len(tail_ids):
+            raise PeerProvenanceError()
+        for source_id, clone in zip(sorted(tail_ids), clones):
+            if source_id not in peer_values:
+                continue
+            value = peer_values[source_id]
+            if parse_peer_ledger_value(value)["content_sha256"] != peer_content_digest(clone["content"]):
+                raise PeerProvenanceError()
+            conn.execute("INSERT INTO state_meta (key, value) VALUES (?, ?)",
+                         (f"{PEER_ROW_LEDGER_PREFIX}{int(clone['id'])}", value))
 
     def _resolve_carried_row_ids(
         self, conn, session_id: str, carried_messages: List[Dict[str, Any]],
@@ -1218,8 +1349,16 @@ class SessionMessagesMixin:
         from hermes_state import _strip_background_review_harness, _strip_stale_tool_call_markers
         messages = []
         exact_user_clones: Dict[Tuple[Any, str], Dict[str, Any]] = {}
+        peer_records = self._admitted_peer_rows(rows)
         for row in rows:
-            content = self._loaded_view_content(row["role"], self._decode_content(row["content"]))
+            decoded_meta = (self._decode_display_metadata(row["display_metadata"])
+                            if row["display_metadata"] else None)
+            peer_marked = (row["display_kind"] == PEER_DISPLAY_KIND or row["id"] in peer_records
+                           or (decoded_meta is not None and PEER_METADATA_KEY in decoded_meta))
+            # A peer body is kept byte-exact: it reaches the model only inside its rendering.
+            content = self._decode_content(row["content"])
+            if not peer_marked:
+                content = self._loaded_view_content(row["role"], content)
             # Underscore-prefixed like ``_row_id``: transports strip it before the wire; compression's
             # assembly copies strip it so rotated child handoffs still flush (_fresh_compaction_message_copy).
             msg = {"role": row["role"], "content": content, _DB_PERSISTED_MARKER_KEY: True}
@@ -1231,8 +1370,10 @@ class SessionMessagesMixin:
             if include_row_ids and row["id"] is not None:
                 msg["_row_id"] = row["id"]
             msg.update((col, row[col]) for col in ("api_content", "display_kind") if row[col])
-            if row["display_metadata"] and (decoded := self._decode_display_metadata(row["display_metadata"])) is not None:
-                msg["display_metadata"] = decoded
+            if decoded_meta is not None:
+                msg["display_metadata"] = decoded_meta
+            if peer_marked:
+                self._require_admitted_peer(row, msg, peer_records)
             if include_summary_markers and row["_compressed_summary"]:
                 msg["_compressed_summary"] = True
             msg.update(
