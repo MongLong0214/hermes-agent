@@ -51,7 +51,7 @@ def _safe_int(value: Any) -> int | None:
 # Summary-route pin lives in a ContextVar (not on the shared compressor) so the retry after a stalled
 # summary sees it while the detached stalled worker does not. A stall raises nothing, so the aux client's
 # exception-path fallback never fires; the host pins a fallback route for exactly ONE retry (the sole aux
-# call per compaction). The main-model retry must NOT re-issue the pin.
+# call per compaction). The main-model retry must NOT re-issue that pin; it pins the main route instead.
 # ── Pinned summary route ───────────────────────────────────────────────── The summary call normally
 # resolves its provider/model from ``auxiliary.compression``. One caller needs to override that for a single
 # attempt: after the host's progress-aware timeout aborts a stalled summary (#78981),
@@ -63,7 +63,7 @@ def _safe_int(value: Any) -> int | None:
 # the pin reaches the retry's whole synchronous call chain and cannot leak into the stalled attempt or any
 # unrelated auxiliary call. Coverage is the single ``_generate_summary`` LLM call only. That is one call per
 # compression run (its only non-recursive call site is the compress path; the two recursive calls are the
-# deliberate main-model retry that must NOT re-issue the pin). The summary call is the ONLY auxiliary LLM
+# deliberate main-model retry, pinning the main route instead). The summary call is the ONLY auxiliary LLM
 # call a lean compaction attempt makes (#96603) — there are no sibling digest calls.
 _SUMMARY_ROUTE_PIN: contextvars.ContextVar[Optional[Dict[str, Any]]] = (
     contextvars.ContextVar("hermes_summary_route_pin", default=None)
@@ -896,7 +896,7 @@ def _reinject_pruned_skill_markers(summary: str, skill_names: list[str]) -> str:
     return summary + _redact_compaction_text(block)
 
 
-# Lean tail mode: small recency window; continuity via verbatim user messages in
+# Lean tail mode: small recency window; continuity via quoted user messages in
 # the summary, tool-result stubs with recovery pointers, and a session_search footer.
 
 # 2.5% of the context window, clamped; floor keeps small models workable.
@@ -909,7 +909,11 @@ TAIL_MAX_CONTEXT_FRACTION = 0.20
 # Newest-first budget, straddler truncated; lives inside the single summary message.
 _LEAN_USER_MESSAGES_BUDGET_CHARS = 24_000  # ~6K tokens
 _LEAN_USER_MESSAGE_MAX_CHARS = 4_000
-_LEAN_USER_MESSAGES_HEADING = "## User Messages (verbatim, newest first)"
+_LEAN_USER_MESSAGES_HEADING = "## User Messages (newest first)"
+# An iterative round's carried-forward user section is relabeled under this heading instead of being
+# dropped or re-certified: its content (e.g. a standing constraint not restated in later turns) stays
+# available, but scoped as not re-verified against the turns actually being compacted this round.
+_LEAN_USER_MESSAGES_HISTORICAL_HEADING = "## Earlier User Messages (from a previous summary, not re-verified)"
 _LEAN_RECOVERY_HEADING = "## Context Recovery"
 # Demote tool results older than the newest N rounds so the tail budget binds
 # (the tool-group alignment floor otherwise keeps ~32K of tool output alive).
@@ -939,35 +943,45 @@ def _synthetic_user_row(content: str) -> bool:
     return content.lstrip().startswith(_SYNTHETIC_USER_ROW_PREFIXES)
 
 
-def _build_verbatim_user_section(turns: List[Dict[str, Any]]) -> str:
-    """Compacted region's REAL user messages verbatim, newest-first under a char budget (straddler truncated); "" if none."""
+def _build_verbatim_user_section(turns: List[Dict[str, Any]], session_id: str = "") -> str:
+    """Compacted region's REAL user messages, newest-first under a char budget (straddler truncated); "" if none.
+    The note claims "verbatim" only when nothing was omitted or cut; otherwise it states what is missing."""
     collected: list[str] = []
-    used = 0
+    used = total = truncated = 0
     for msg in reversed(turns):
         if msg.get("role") != "user":
             continue
         content = _content_text_for_contains(msg.get("content"))
         if _synthetic_user_row(content):
             continue
+        total += 1
         remaining = _LEAN_USER_MESSAGES_BUDGET_CHARS - used
         if remaining <= 0:
-            break
+            continue  # counted as omitted
         text = content.strip()
+        cut = len(text) > min(_LEAN_USER_MESSAGE_MAX_CHARS, remaining)
         if len(text) > _LEAN_USER_MESSAGE_MAX_CHARS:
             text = text[:_LEAN_USER_MESSAGE_MAX_CHARS].rstrip() + " …[truncated]"
         if len(text) > remaining:
             text = text[:remaining].rstrip() + " …[truncated]"
+        truncated += cut
         collected.append("> " + text.replace("\n", "\n> "))
         used += len(text)
     if not collected:
         return ""
-    return (
-        "\n\n" + _LEAN_USER_MESSAGES_HEADING + "\n"
-        + "\n\n".join(collected)
-        + "\n(Every real user message from the compacted region, quoted "
-        "verbatim. These are the user's actual words and override any "
-        "paraphrase of them above.)"
-    )
+    omitted = total - len(collected)
+    if not omitted and not truncated:
+        note = ("(Every real user message from the compacted region, quoted verbatim. These are the user's actual "
+                "words and override any paraphrase of them above.)")
+    else:
+        missing = [f"{omitted} older message(s) omitted"] if omitted else []
+        missing += [f"{truncated} truncated (marked …[truncated])"] if truncated else []
+        where = f"session_search(query='<keywords>', session_id='{session_id}')" if session_id else "session_search"
+        note = (f"(A bounded selection, not every user message: {len(collected)} of {total} real user messages from "
+                f"the compacted region, newest first, within {_LEAN_USER_MESSAGES_BUDGET_CHARS:,} chars; "
+                f"{', '.join(missing)}. Quoted text is the user's own words and overrides any paraphrase of them "
+                f"above; recover omitted or truncated messages with {where} before relying on what they said.)")
+    return "\n\n" + _LEAN_USER_MESSAGES_HEADING + "\n" + "\n\n".join(collected) + "\n" + note
 
 
 def _build_recovery_footer(session_id: str, region_len: int) -> str:
@@ -984,6 +998,55 @@ def _build_recovery_footer(session_id: str, region_len: int) -> str:
         "reasoning), recover it with: "
         f"session_search(query='<keywords>', session_id='{session_id}') — "
         "do not guess at lost specifics when you can look them up."
+    )
+
+
+def _extract_all_sections(summary: str, heading: str) -> "tuple[str, list[str]]":
+    """Remove EVERY occurrence of ``heading``'s section from ``summary`` (not just the first),
+    returning the cleaned summary and each occurrence's body, oldest-occurrence-first. An iterative
+    prompt hands the model its own previous summary as "PREVIOUS SUMMARY" to preserve, so a reply can
+    echo a heading back more than once (e.g. a historical section nested alongside an also-echoed
+    current one) — leaving a second, un-removed copy is as wrong as trusting the first one's mere
+    presence."""
+    bodies: list[str] = []
+    while True:
+        idx = summary.find(heading)
+        if idx == -1:
+            return summary, bodies
+        start = idx
+        while start > 0 and summary[start - 1] == "\n":
+            start -= 1
+        body_start = idx + len(heading)
+        end = summary.find("\n## ", body_start)
+        end = len(summary) if end == -1 else end
+        bodies.append(summary[body_start:end].strip("\n"))
+        summary = summary[:start].rstrip("\n") + summary[end:]
+
+
+def _strip_user_section_certification(body: str) -> str:
+    """Drop a user-messages section's trailing certification note (the "quoted verbatim" / "bounded
+    selection" claim), keeping only the quoted messages beneath it. A carried-forward section is no
+    longer about THIS round's turns, so its claim of completeness/verbatim-ness for this round must
+    not ride along with the preserved quotes."""
+    body = body.strip("\n")
+    note_start = body.rfind("\n(")
+    if note_start != -1 and body.endswith(")"):
+        return body[:note_start].rstrip("\n")
+    return body
+
+
+def _build_historical_user_section(bodies: "list[str]") -> str:
+    """Carried-forward prior user-messages section(s), re-scoped as historical: quoted content kept,
+    this-round certification stripped (see ``_strip_user_section_certification``) so it is never
+    re-applied to turns outside the round that actually produced it."""
+    quotes = [q for q in (_strip_user_section_certification(b) for b in bodies) if q]
+    if not quotes:
+        return ""
+    return (
+        "\n\n" + _LEAN_USER_MESSAGES_HISTORICAL_HEADING + "\n" + "\n\n".join(quotes) + "\n"
+        "(Carried forward from a previous summary's user-messages section(s). The quoted text is "
+        "preserved as captured then, but is not re-verified against this round's turns and is not "
+        "certified complete or verbatim for the compacted region as a whole.)"
     )
 
 
@@ -3558,12 +3621,23 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         return result
 
     def _augment_summary_lean(self, summary: str, turns_to_summarize: List[Dict[str, Any]]) -> str:
-        """Append deterministic lean-mode sections to a summary; no-op in legacy mode."""
+        """Append deterministic lean-mode sections to a summary; no-op in legacy mode.
+        The user-messages section always replaces every carried-forward occurrence (current heading AND
+        any already-historical one — see ``_extract_all_sections``): an iterative round can echo either
+        heading back from the previous summary with its bounded-selection omission disclosure gone or
+        stale, and the heading's mere presence must not be trusted as proof this round's selection was
+        already disclosed. Carried-forward content is not discarded — it is kept, re-scoped as historical
+        (``_build_historical_user_section``) — because it can hold a standing constraint the CURRENT
+        turns never restate (e.g. an earlier "always use tabs" instruction)."""
         if getattr(self, "tail_mode", "lean") != "lean":
             return summary
+        summary, _current_bodies = _extract_all_sections(summary, _LEAN_USER_MESSAGES_HEADING)
+        summary, _historical_bodies = _extract_all_sections(summary, _LEAN_USER_MESSAGES_HISTORICAL_HEADING)
+        summary += _build_historical_user_section(_current_bodies + _historical_bodies)
+        summary += _redact_compaction_text(
+            _build_verbatim_user_section(turns_to_summarize, getattr(self, "_session_id", "") or ""))
         for heading, build in (
             (_LEAN_ANCHOR_HEADING, lambda: _redact_compaction_text(_build_anchor_index(turns_to_summarize))),
-            (_LEAN_USER_MESSAGES_HEADING, lambda: _redact_compaction_text(_build_verbatim_user_section(turns_to_summarize))),
             (_LEAN_RECOVERY_HEADING, lambda: _build_recovery_footer(getattr(self, "_session_id", "") or "", len(turns_to_summarize))),
         ):
             if heading not in summary:
@@ -3771,6 +3845,14 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             telemetry["failure_class"] = telemetry.get("failure_class") or "aux_model_fallback"
         self.summary_model = ""  # empty = use main model
         self._clear_compression_failure_cooldown()  # no cooldown — retry immediately
+
+    def _main_summary_route(self) -> Dict[str, Any]:
+        """The main runtime as an explicit summary route (empty fields are dropped when the pin is consumed)."""
+        provider = "" if str(self.provider or "").strip().lower() == "auto" else self.provider
+        return {
+            "provider": provider, "model": self.model, "base_url": self.base_url, "api_key": self.api_key,
+            "api_mode": self.api_mode,
+        }
 
     def _call_summary_llm(self, prompt: str, prompt_started_at: float) -> str:
         """Issue the single aux summary call; return validated content text.
@@ -4111,8 +4193,12 @@ Write only the summary body. Do not include any preamble or prefix."""
         ).strip()
         if _route_model and _route_model != self.model and not getattr(self, "_summary_model_fallen_back", False):
             self._fallback_to_main_for_compression(e, kind.fallback_reason(), failed_model=_route_model)
-            # Retry immediately on the main model.
-            return self._generate_summary(turns_to_summarize, focus_topic=focus_topic, memory_context=memory_context)
+            # Retry immediately on the main model. Pin its route: a call that names no model is resolved from
+            # auxiliary.compression.* again, i.e. back onto the model that just failed.
+            with pin_summary_route(self._main_summary_route()):
+                return self._generate_summary(
+                    turns_to_summarize, focus_topic=focus_topic, memory_context=memory_context
+                )
 
         # Transient errors: short cooldown for JSON-decode/streaming-closed/empty-content. Timeouts escalate
         # 60s→300s→900s (structural repeat offenders) and take precedence over the short rung; truncation
