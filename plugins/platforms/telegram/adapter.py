@@ -34,7 +34,10 @@ def _redact_telegram_error_text(error: object) -> str:
         return f"<{type(error).__name__}>" if error is not None else text
     try:
         from agent.redact import redact_sensitive_text
-        return redact_sensitive_text(text, force=True)
+        # redact_url_credentials=True: Telegram transport errors route through httpx/PTB, which can
+        # surface an upstream URL carrying a generic, non-vendor-prefixed credential query param
+        # (``?access_token=...``) that the default pattern pass deliberately leaves alone (R71-1).
+        return redact_sensitive_text(text, force=True, redact_url_credentials=True)
     except Exception:
         return "<telegram error redacted>"
 

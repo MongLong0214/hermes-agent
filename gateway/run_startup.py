@@ -536,6 +536,18 @@ class GatewayStartupMixin:
             # cap on refusals that never reached the platform. The degraded check keeps a transport error
             # that may follow delivered chunks (Discord reports it with the same error) spent.
             await self._release_unsent_claims([row], reconnect_only=True)
+            if not adapter.send_path_degraded:
+                # The handback above commits through a worker thread (release_runtime_claim). If the
+                # adapter's degraded-to-healthy edge fired WHILE that commit was still in flight,
+                # _record_polling_progress's own recovery sweep ran before this row was visible as
+                # `failed` and found nothing — that edge does not fire again, so without this recheck
+                # the reply would wait for the next restart or a manually requested sweep (R71-2). A
+                # background task (not an inline await) survives this coroutine being cancelled right
+                # after the handback commits.
+                task = self._retain_background_task(asyncio.ensure_future(
+                    self._redeliver_failed_obligations_for_platform(adapter.platform, profile=row.get("profile"))))
+                task.add_done_callback(self._late_failure_callback(
+                    "redelivery after a degraded-refund race failed", level=logging.DEBUG))
             return False
         with _log_suppressed(logging.DEBUG, "delivery ledger update failed", exc_info=True):
             if result is not None and getattr(result, "success", False):
