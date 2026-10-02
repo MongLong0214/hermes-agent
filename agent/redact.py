@@ -733,7 +733,8 @@ def _redact_query_string(query: str) -> str:
 
 
 def _canonical_url_param_name(name: str) -> str:
-    """Decode a URL parameter name (up to 3 unquote rounds) for case-insensitive matching."""
+    """Decode a URL parameter name (up to 3 unquote rounds) for case-insensitive, hyphen/underscore-
+    insensitive matching (``client-secret`` and ``client_secret`` are the same param to a server)."""
     decoded = name
     for _ in range(3):
         next_value = unquote_plus(decoded)
@@ -743,12 +744,20 @@ def _canonical_url_param_name(name: str) -> str:
     return decoded.casefold().replace("-", "_")
 
 
+# _canonical_url_param_name() also folds "-" to "_", so a set entry spelled with a hyphen
+# (``x-amz-signature``) must be folded the SAME way or it never matches its own canonicalized
+# candidate (#R-COMPRESSION-SECRETS R1: X-Amz-Signature leaked verbatim through the strict matcher).
+_SENSITIVE_QUERY_PARAMS_CANONICAL = frozenset(
+    _canonical_url_param_name(_name) for _name in _SENSITIVE_QUERY_PARAMS
+)
+
+
 def _redact_strict_url_credentials(text: str) -> str:
     """Strict egress-boundary redaction of URL credentials (absolute, relative and
     network references); preserves keys, separators, public params, hosts, paths."""
     text = _STRICT_URL_PARAM_RE.sub(
         lambda m: f"{m.group(1)}{m.group(2)}=***"
-        if _canonical_url_param_name(m.group(2)) in _SENSITIVE_QUERY_PARAMS else m.group(0), text)
+        if _canonical_url_param_name(m.group(2)) in _SENSITIVE_QUERY_PARAMS_CANONICAL else m.group(0), text)
     return _STRICT_URL_USERINFO_RE.sub(
         lambda m: f"{m.group(1)}{m.group(2).partition(':')[0]}:***@" if ":" in m.group(2) else f"{m.group(1)}***@",
         text)

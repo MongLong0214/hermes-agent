@@ -91,8 +91,13 @@ async def test_aux_model_fallback_notice_scrubs_credential_shaped_error(tmp_path
     # "Bearer <token>" shape) — only strict URL-credential redaction catches this one.
     url_cred_token = "opaqueFixtureToken1234567890ABCDE"
     url_cred = f"https://service.example/api?access_token={url_cred_token}"
+    # R1 witness: hyphenated sensitive param name ("x-amz-signature") — the strict matcher's
+    # canonicalization bug (agent/redact.py::_canonical_url_param_name) folded this to
+    # "x_amz_signature" before checking the un-folded sensitive-name set, so it never matched.
+    sig_token = "SIGFIXTURE" + "a" * 54
+    sig_url = f"https://bucket.s3.amazonaws.com/key?X-Amz-Signature={sig_token}"
     raw_error = (f"litellm.AuthenticationError: Incorrect API key provided: {secret}; "
-                 f"upstream rejected Bearer {opaque}; GET {url_cred} failed")
+                 f"upstream rejected Bearer {opaque}; GET {url_cred} failed; GET {sig_url} failed")
 
     class CompressorAgent:
         def __init__(self, **kwargs):
@@ -125,7 +130,7 @@ async def test_aux_model_fallback_notice_scrubs_credential_shaped_error(tmp_path
 
         warnings = [sent for sent in adapter.sent if "Configured compression model" in sent["content"]]
         assert len(warnings) == 1
-        for credential in (secret, opaque, url_cred_token):
+        for credential in (secret, opaque, url_cred_token, sig_token):
             assert credential not in warnings[0]["content"], (
                 f"raw credential reached the adapter's send(): {warnings[0]['content']!r}")
     finally:

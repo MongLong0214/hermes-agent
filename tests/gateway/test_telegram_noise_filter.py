@@ -359,3 +359,29 @@ def test_chat_gateways_redact_all_issue_23810_credential_shapes(platform, shape_
     # Prose around the secret is preserved — redaction is surgical.
     assert "here is the token you asked me to echo" in sanitized
     assert sanitized.endswith("done.")
+
+
+@pytest.mark.parametrize("platform", CHAT_PLATFORMS)
+def test_automatic_compression_abort_warning_scrubs_url_credential_param(platform):
+    """R-COMPRESSION-SECRETS R2 regression: an AUTOMATIC compression abort (not manual /compress,
+    not gateway session hygiene) embeds the summariser's raw provider exception in a warning
+    (agent/conversation_compression.py::_candidate_rejected, "Compression aborted: {err}.") that
+    flows through TurnRunner._status_callback_sync -> _prepare_gateway_status_message
+    (gateway/run.py ~744) with only the DEFAULT (non-strict) egress scrub — which deliberately
+    passes credential-bearing URL query params through for magic-link/OAuth-callback URLs. This
+    status message is a deliberate VISIBLE carve-out from the noise filter (see
+    VISIBLE_COMPRESSION_MESSAGES above), so it reaches the chat user with the credential intact
+    unless it ALSO gets the strict scrub the manual/hygiene compression-failure replies use."""
+    url_cred_token = "opaqueFixtureToken1234567890ABCDE"
+    url_cred = f"https://service.example/api?access_token={url_cred_token}"
+    message = (
+        f"⚠ Compression aborted: litellm.APIError: upstream rejected GET {url_cred}. No messages "
+        "were dropped — conversation continues unchanged. Run /compress to retry, or /new to "
+        "start a fresh session."
+    )
+
+    sanitized = _prepare_gateway_status_message(platform, "warn", message)
+
+    assert sanitized is not None
+    assert "Compression aborted" in sanitized  # the carve-out still reaches the user
+    assert url_cred_token not in sanitized, f"raw URL credential in the abort warning: {sanitized!r}"
