@@ -923,3 +923,37 @@ def test_every_prequeue_failure_phase_is_a_clean_batch_rejection(registry_state,
     assert child.run_count == 1, "a confirmed non-start runs inline exactly once"
     _assert_nothing_leaked(fence, executor_before)
     _assert_capacity_recovered(registry_state)
+
+
+def test_finalize_failure_still_releases_the_worker_reservation(registry_state, monkeypatch):
+    """R-FINALIZER-RESERVATION (gpt-6.1-sol BLOCKER, round 3): moving reservation release off the
+    Future callback and into the worker's own ``finally`` put ``_finalize(...)`` BEFORE
+    ``_release_worker_reservation()`` with no guard between them -- a ``_finalize`` that raises
+    (e.g. while pruning completed records) skips the release entirely, leaking the reservation
+    forever even though the worker genuinely exited and its completion was delivered."""
+    from hermes_cli import backend_retirement
+
+    fence = backend_retirement.RetirementFence()
+    monkeypatch.setattr(backend_retirement, "retirement", fence)
+
+    real_finalize = async_delegation._finalize
+
+    def failing_finalize(delegation_id, result, status):
+        real_finalize(delegation_id, result, status)
+        raise MemoryError("injected: _finalize itself raised after doing its real work")
+
+    monkeypatch.setattr(async_delegation, "_finalize", failing_finalize)
+
+    handle = async_delegation.dispatch_async_delegation(
+        goal="test", context=None, toolsets=None, role="leaf", model=None, session_key="test",
+        runner=lambda: {"summary": "done"}, max_async_children=1)
+    assert handle["status"] == "dispatched"
+
+    completion = registry_state.get(timeout=5)
+    assert completion["summary"] == "done"
+    assert async_delegation.active_count() == 0
+
+    deadline = time.monotonic() + 5
+    while fence.active_count() != 0 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert fence.active_count() == 0, "retirement reservation leaked after a raising _finalize"

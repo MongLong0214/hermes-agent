@@ -814,8 +814,13 @@ def _dispatch_admitted(
             logger.exception(f"Async delegation{label} %s crashed", delegation_id)
             result = crash_result(f"{type(exc).__name__}: {exc}", round(time.time() - dispatched_at, 2))
         finally:
-            _finalize(delegation_id, result, status)
-            _release_worker_reservation()
+            try:
+                _finalize(delegation_id, result, status)
+            finally:
+                # Always release, even if _finalize itself raises (e.g. pruning completed
+                # records) -- a raised _finalize must not leave retirement's reservation held
+                # forever (R-FINALIZER-RESERVATION): the worker genuinely exited either way.
+                _release_worker_reservation()
 
     with _records_lock:
         active_slots = {r.get("slot_key") or r["delegation_id"] for r in _records.values() if r.get("status") in _ACTIVE_STATES}
