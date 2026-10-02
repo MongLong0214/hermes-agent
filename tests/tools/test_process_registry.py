@@ -2876,7 +2876,13 @@ class TestPtyFallbackCleanup:
 
         fake_pty = MagicMock()
         fake_pty.pid = 4321
-        fake_pty.isalive.return_value = True
+        # terminate() CONFIRMS the child is gone (its real ptyprocess/winpty contract: True
+        # means terminated) and a post-terminate isalive() corroborates it — this is the
+        # "cleanup actually succeeded" case the fallback may follow. The uncertain/failed
+        # case (terminate() returns False, or isalive() still True) is
+        # test_reader_thread_failure_with_unreapable_pty_refuses_pipe_fallback below.
+        fake_pty.terminate.return_value = True
+        fake_pty.isalive.return_value = False
 
         fake_proc = MagicMock()
         fake_proc.pid = 9999
@@ -2932,6 +2938,76 @@ class TestPtyFallbackCleanup:
         # routes the kill to session.process.
         terminate_host_pid.assert_called_once_with(fake_proc.pid, session.host_start_time)
         assert fake_pty.terminate.call_count == 1  # not signalled again on kill
+
+    def test_reader_thread_failure_with_unreapable_pty_refuses_pipe_fallback(
+        self, registry, monkeypatch,
+    ):
+        """PR64-02: when termination cannot be CONFIRMED (the child is still alive after
+        ``terminate(force=True)`` — a refused signal, or a child that simply keeps running),
+        the pipe fallback must not run: it would start a second live copy of the same command
+        while the original PTY child is still out there, unmanaged. ``session._pty`` must stay
+        set so a later kill can still reach the orphan."""
+        from ptyprocess import PtyProcess
+
+        fake_pty = MagicMock()
+        fake_pty.pid = 4321
+        # The child refuses the signal (or termination can't be confirmed): terminate()
+        # reports failure, and the process is still observably alive either way.
+        fake_pty.terminate.return_value = False
+        fake_pty.isalive.return_value = True
+
+        def fake_thread(*args, name="", **kwargs):
+            thread = MagicMock()
+            thread.start.side_effect = RuntimeError("reader failed")
+            return thread
+
+        monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/bin/bash")
+        monkeypatch.setattr(
+            "tools.process_registry._systemd_run_user_scope_available", lambda: False,
+        )
+
+        with patch.object(PtyProcess, "spawn", return_value=fake_pty) as pty_spawn, \
+            patch("subprocess.Popen") as popen, \
+            patch("threading.Thread", side_effect=fake_thread), \
+            patch.object(registry, "_write_checkpoint"):
+            with pytest.raises(RuntimeError, match="refusing pipe fallback"):
+                registry.spawn_local("codex", cwd="/tmp", use_pty=True)
+
+        # The unreapable PTY was signalled, but the pipe fallback must never have run —
+        # otherwise "codex" would now be running twice.
+        fake_pty.terminate.assert_called_once_with(force=True)
+        popen.assert_not_called()
+        assert pty_spawn.call_count == 1
+
+    def test_reap_untracked_pty_keeps_handle_when_termination_unconfirmed(self, registry):
+        """Direct unit test of the retained-handle contract: ``_reap_untracked_pty`` must
+        return False and must NOT clear ``session._pty`` when termination cannot be
+        confirmed, so the orphan is never silently lost track of — only a confirmed-dead
+        PTY is detached from the session."""
+        session = _make_session()
+        fake_pty = MagicMock()
+        fake_pty.terminate.return_value = False
+        fake_pty.isalive.return_value = True
+        session._pty = fake_pty
+        session.pid = 4321
+
+        assert registry._reap_untracked_pty(session) is False
+        assert session._pty is fake_pty  # never cleared
+        fake_pty.close.assert_not_called()  # don't sever the fd of a still-alive child
+
+    def test_reap_untracked_pty_clears_handle_when_termination_confirmed(self, registry):
+        """Control: when ``terminate()`` and ``isalive()`` agree the child is gone, the
+        handle is cleared and closed — the happy path this fix must not regress."""
+        session = _make_session()
+        fake_pty = MagicMock()
+        fake_pty.terminate.return_value = True
+        fake_pty.isalive.return_value = False
+        session._pty = fake_pty
+        session.pid = 4321
+
+        assert registry._reap_untracked_pty(session) is True
+        assert session._pty is None
+        fake_pty.close.assert_called_once()
 
 
 class TestNotificationRedaction:

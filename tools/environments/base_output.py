@@ -19,6 +19,18 @@ from hermes_constants import get_hermes_home
 from tools.tool_output_truncate import head_tail_split, truncation_notice
 from hermes_cli._subprocess_compat import windows_hide_flags
 
+
+class PostSpawnExecutionError(RuntimeError):
+    """``execute()`` failed after the command was already spawned (collecting output, updating
+    state, ...) — the shell may already have produced a side effect (``git push``, a sent mail),
+    so a caller MUST NOT blindly retry on this, unlike a failure proven to precede spawn. Wraps
+    the original exception as ``__cause__``.
+
+    Defined here (not in ``tools.environments.base``, which imports it back) so ``_popen_bash``
+    and ``_run_bash`` can raise it directly for a failure discovered right after their own
+    ``Popen`` succeeds — the process exists by then, same as a failure base.py's
+    ``_spawn_and_wait`` discovers later in ``_wait_for_process``."""
+
 # Sentinel capacity for full-fidelity capture: large enough that the collector
 # never evicts, so bounded and unbounded modes share one code path.
 _UNBOUNDED_CAPTURE_CHARS = 2**63 - 1
@@ -261,7 +273,12 @@ def _popen_bash(cmd: list[str], stdin_data: str | None = None, **kwargs) -> subp
         text=True, encoding="utf-8", errors="replace",
         **kwargs)
     if stdin_data is not None:
-        _pipe_stdin(proc, stdin_data)
+        try:
+            _pipe_stdin(proc, stdin_data)
+        except Exception as exc:
+            # Popen already succeeded — the remote shell exists and may already be running —
+            # so a caller must not retry this as a pre-spawn failure (PR64-01).
+            raise PostSpawnExecutionError(str(exc)) from exc
     return proc
 
 

@@ -68,6 +68,75 @@ def test_post_spawn_failure_is_not_retried_and_runs_exactly_once():
     assert body.get("status") == "ambiguous", body
 
 
+def test_run_bash_raising_after_popen_is_not_retried(monkeypatch):
+    """A failure raised by ``_run_bash`` itself — not only one from ``_wait_for_process``
+    after ``_run_bash`` already returned — must also be classified as post-spawn when the
+    underlying process was already created. Real ``LocalEnvironment``, real subprocess
+    creation (counted at the actual ``subprocess.Popen`` boundary, per PR64-01's "Popen
+    succeeding = process exists"), supplied stdin (mirroring the ``sudo_stdin`` merge every
+    foreground command goes through), and an injected stdin writer-thread-start failure:
+    before the fix this replayed the command (multiple real ``Popen`` calls instead of one)."""
+    import contextlib
+    import subprocess as subprocess_mod
+
+    from tools.environments.local import LocalEnvironment
+    import tools.environments.local as local_mod
+
+    monkeypatch.setattr(terminal_tool.time, "sleep", lambda _seconds: None)  # skip 2/4/8s backoff
+
+    env = LocalEnvironment()  # real init_session() bootstrap happens before any patching below
+
+    # _prepare_command normally returns (command, sudo_stdin) — non-None sudo_stdin is how
+    # an ordinary foreground command (one using sudo with a cached password) ends up with
+    # non-None stdin_data reaching _run_bash. Stub it the same way rather than wiring the
+    # real sudo-password plumbing, which is incidental to what's under test here.
+    monkeypatch.setattr(LocalEnvironment, "_prepare_command", lambda self, command: (command, "dummy\n"))
+
+    def _boom_pipe_stdin(proc, data):
+        # Popen has already succeeded by the time _run_bash calls this — this
+        # simulates the writer thread failing to start (RuntimeError: can't
+        # start new thread), which happens AFTER the process exists.
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(local_mod, "_pipe_stdin", _boom_pipe_stdin)
+
+    spawned: list = []
+    real_popen = subprocess_mod.Popen
+
+    def _counting_popen(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr(local_mod.subprocess, "Popen", _counting_popen)
+
+    try:
+        result = terminal_tool._run_foreground(
+            "true", env, _plan(),
+            task_id="t-runbash-postspawn", session_id=None, session_key="runbash-postspawn-test",
+            workdir=None, approval_note=None, clear_interrupt=False,
+        )
+    finally:
+        for proc in spawned:
+            with contextlib.suppress(Exception):
+                proc.kill()
+                proc.wait(timeout=2)
+        env.cleanup()
+
+    assert len(spawned) == 1, (
+        f"the shell must not be re-spawned after a post-Popen failure; "
+        f"spawned {len(spawned)} real processes instead of 1"
+    )
+
+    import json
+    body = json.loads(result)
+    assert body.get("status") == "ambiguous", body
+
+    import json
+    body = json.loads(result)
+    assert body.get("status") == "ambiguous", body
+
+
 def test_pre_spawn_failure_still_retries(monkeypatch):
     """Control: a failure BEFORE the shell is spawned (the historical case this loop exists
     for) keeps retrying up to max_retries, unlike the post-spawn case above."""

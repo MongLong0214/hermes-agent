@@ -22,7 +22,7 @@ from typing import Callable, Iterable
 from hermes_constants import get_hermes_home
 from tools.interrupt import consume_yield, is_interrupted, is_thread_interrupted
 from tools.environments.base_output import (
-    ProcessHandle, _finalize_wait_result, _new_output_collector, _start_drain_thread,
+    PostSpawnExecutionError, ProcessHandle, _finalize_wait_result, _new_output_collector, _start_drain_thread,
 )
 from tools.environments.base_session_env import (
     _SHELL_ENV_NAME_RE, _SNAP_TMP_SUFFIX, _cwd_marker, _snapshot_bootstrap_script, _split_cwd_marker,
@@ -152,13 +152,6 @@ class EnvironmentConnectionError(RuntimeError):
             "Verify the backend is reachable (network, service running, "
             "credentials), then retry the same command — recovery is "
             "automatic once the backend is back.")
-
-
-class PostSpawnExecutionError(RuntimeError):
-    """``execute()`` failed after the command was already spawned (collecting output, updating
-    state, ...) — the shell may already have produced a side effect (``git push``, a sent mail),
-    so a caller MUST NOT blindly retry on this, unlike a failure proven to precede spawn. Wraps
-    the original exception as ``__cause__``."""
 
 
 def set_activity_callback(cb: Callable[[str], None] | None) -> None:

@@ -1207,7 +1207,11 @@ class ProcessRegistry(ProcessCheckpointMixin):
             except Exception as e:
                 logger.warning("PTY spawn failed (%s), falling back to pipe mode", e)
                 if session._pty is not None:
-                    self._reap_untracked_pty(session)
+                    if not self._reap_untracked_pty(session):
+                        raise RuntimeError(
+                            "PTY child could not be reaped; refusing pipe fallback "
+                            "to avoid duplicate command execution"
+                        ) from e
                 if session.systemd_unit:
                     pty_scope_attempted = True
                     if not _stop_systemd_unit(session.systemd_unit):
@@ -1242,17 +1246,34 @@ class ProcessRegistry(ProcessCheckpointMixin):
             raise
         return session
 
-    def _reap_untracked_pty(self, session: ProcessSession) -> None:
+    def _reap_untracked_pty(self, session: ProcessSession) -> bool:
         """A PTY child spawned successfully but a later setup step (``_track_started``)
         failed: terminate and close it and clear ``session._pty`` before the pipe fallback
         runs the same command again. Without this the PTY child keeps running unmanaged, the
         fallback starts a second copy of it, and ``_signal_kill`` would prefer the stale PTY
-        handle over the tracked fallback process (it checks ``session._pty`` first)."""
-        pty_proc, session._pty = session._pty, None
-        with suppress(Exception):
-            pty_proc.terminate(force=True)
+        handle over the tracked fallback process (it checks ``session._pty`` first).
+
+        Returns True only when termination is CONFIRMED (``terminate()``'s own return value,
+        corroborated by ``isalive()``) — mirrors the systemd sibling, which already refuses the
+        pipe fallback when scope teardown fails. On any failure or uncertainty, ``session._pty``
+        is left in place (never cleared) so ``_signal_kill`` can still find and kill the orphan;
+        the caller must refuse the fallback rather than risk running the command twice."""
+        pty_proc = session._pty
+        try:
+            terminated = bool(pty_proc.terminate(force=True))
+        except Exception:
+            terminated = False
+        if terminated:
+            try:
+                terminated = not pty_proc.isalive()
+            except Exception:
+                terminated = not self._is_host_pid_alive(session.pid)
+        if not terminated:
+            return False
+        session._pty = None
         with suppress(Exception):
             pty_proc.close()
+        return True
 
     def _reap_untracked(self, session: ProcessSession, proc: subprocess.Popen) -> None:
         """Post-Popen setup failed: kill the orphaned subprocess (and any setsid

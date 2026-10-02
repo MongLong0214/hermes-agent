@@ -6,6 +6,7 @@ natively with a bounded stdout read; the parser and every argument builder are
 shared, so the two transports must agree on results.
 """
 
+import contextlib
 import json
 import sys
 
@@ -142,3 +143,81 @@ def test_native_runner_tolerates_pgid_lookup_racing_rg_exit(tree, ops_factory, m
     result = ops._run_rg_native(["sh", "-c", "'echo needle-one; echo needle-two'"], 10, timeout=5)
     assert result.exit_code == 0
     assert "needle-one" in result.stdout and "needle-two" in result.stdout, result.stdout
+
+
+def test_native_runner_kills_surviving_group_via_cached_pgid_after_leader_reaped(tree, ops_factory, monkeypatch, tmp_path):
+    """PR64-03: a backgrounded descendant (plain ``&``, no ``setsid``) stays in the leader's
+    process group and keeps rg's stdout pipe open even after the leader itself exits and is
+    reaped — so ``os.getpgid(leader_pid)`` (the lookup inside ``_kill_process_group_posix``)
+    then raises ESRCH with no leader left to ask. The pgid cached right after ``Popen`` (mirrors
+    ``tools/environments/local.py``'s ``_run_bash``) must let the kill still reach the survivor
+    via its numeric pgid, instead of silently doing nothing and leaving it running."""
+    import os
+    import subprocess as subprocess_mod
+    import time
+
+    monkeypatch.setenv("HERMES_NATIVE_FILE_READ", "1")
+    ops = ops_factory(tree, [])
+
+    pidfile = tmp_path / "bg.pid"
+    real_getpgid = os.getpgid
+    calls = {"n": 0}
+
+    def _getpgid(pid):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return real_getpgid(pid)  # the spawn-time caching call: leader is still alive
+        raise ProcessLookupError(3, "No such process")  # every later lookup: leader already reaped
+
+    monkeypatch.setattr(os, "getpgid", _getpgid)
+    monkeypatch.setattr(subprocess_mod.Popen, "poll", lambda self: None)  # pre-kill check still sees "alive"
+
+    started = time.monotonic()
+    result = ops._run_rg_native(
+        ["sh", "-c", f"'echo needle; (sleep 20 & echo $! > {pidfile})'"], 10, timeout=1,
+    )
+    elapsed = time.monotonic() - started
+
+    assert "needle" in result.stdout, result.to_dict()
+    assert calls["n"] >= 2, "the kill-path lookup must actually run (and see the simulated ESRCH)"
+    # Generous bound: outer 1s deadline + _kill_process_group_posix's own TERM/KILL grace
+    # (up to 1s + 2s) is already ~4s in the legitimate worst case, before any scheduling
+    # slack under a loaded parallel test run — still far short of the 20s a left-running
+    # descendant (the bug) would take.
+    assert elapsed < 10.0, f"the cached pgid must let the kill reach the survivor, took {elapsed:.2f}s"
+
+    bg_pid = int(pidfile.read_text().strip())
+    with pytest.raises(ProcessLookupError):
+        os.kill(bg_pid, 0)  # confirms the survivor was actually killed, not just timed out past
+
+
+def test_native_runner_bounds_final_wait_when_group_cannot_be_killed(tree, ops_factory, monkeypatch, tmp_path):
+    """PR64-03: when the surviving descendant truly cannot be reached (both the cached and
+    the live pgid lookups fail — the already-gone-entirely case the ``suppress`` is for), the
+    final ``drainer.join()`` must still be bounded so the search returns with the output
+    already captured instead of hanging until the descendant exits on its own."""
+    import os
+    import time
+
+    monkeypatch.setenv("HERMES_NATIVE_FILE_READ", "1")
+    ops = ops_factory(tree, [])
+
+    pidfile = tmp_path / "bg.pid"
+    monkeypatch.setattr(os, "getpgid", lambda pid: (_ for _ in ()).throw(ProcessLookupError(3, "No such process")))
+
+    import subprocess as subprocess_mod
+    monkeypatch.setattr(subprocess_mod.Popen, "poll", lambda self: None)
+
+    started = time.monotonic()
+    try:
+        result = ops._run_rg_native(
+            ["sh", "-c", f"'echo needle; (sleep 20 & echo $! > {pidfile})'"], 10, timeout=1,
+        )
+        elapsed = time.monotonic() - started
+        assert "needle" in result.stdout, result.to_dict()
+        assert elapsed < 10.0, f"a surviving descendant must not hang the search, took {elapsed:.2f}s"
+    finally:
+        # Nothing in this test's fault injection can kill the survivor; clean it up ourselves
+        # so it doesn't keep running for the rest of the suite.
+        with contextlib.suppress(Exception):
+            os.kill(int(pidfile.read_text().strip()), 9)

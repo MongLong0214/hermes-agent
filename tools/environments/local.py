@@ -18,7 +18,7 @@ from pathlib import Path
 
 from hermes_constants import get_process_hermes_home
 from tools.environments.base import BaseEnvironment
-from tools.environments.base_output import _pipe_stdin
+from tools.environments.base_output import PostSpawnExecutionError, _pipe_stdin
 from hermes_cli._subprocess_compat import windows_hide_flags
 from tools.environments.local_env_policy import (  # noqa: F401 — _HERMES_PROVIDER_ENV_BLOCKLIST stays importable from here
     _ALWAYS_STRIP_KEYS, _HERMES_PROVIDER_ENV_BLOCKLIST, _HERMES_PROVIDER_ENV_FORCE_PREFIX,
@@ -952,7 +952,12 @@ class LocalEnvironment(BaseEnvironment):
             with contextlib.suppress(ProcessLookupError):
                 proc._hermes_pgid = os.getpgid(proc.pid)
         if stdin_data is not None:
-            _pipe_stdin(proc, stdin_data)
+            try:
+                _pipe_stdin(proc, stdin_data)
+            except Exception as exc:
+                # Popen already succeeded — the shell exists and may already be running — so
+                # a caller must not retry this as a pre-spawn failure (PR64-01).
+                raise PostSpawnExecutionError(str(exc)) from exc
         return proc
 
     def _kill_process(self, proc):
