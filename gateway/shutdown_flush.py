@@ -29,6 +29,10 @@ logger = logging.getLogger(__name__)
 TRANSCRIPT_CAP_DROP_REASON = "transcript_cap_drop"
 # Monotonic tiebreaker so same-second spool files replay in drop order.
 _TRANSCRIPT_SPOOL_SEQ = itertools.count()
+# Monotonic tiebreaker shared by every pending/overflow payload written in one flush pass
+# (head and overflow write their payloads back-to-back from the same shutdown call); recovery
+# sorts on this instead of the random UUID filename so FIFO arrival order survives (ROUND1-ESCAPE-1).
+_FLUSH_ORDER_SEQ = itertools.count()
 
 
 def _get_flush_dir():
@@ -44,8 +48,15 @@ def _get_flush_dir():
 
 
 def _write_payload(flush_dir: Path, payload: Dict[str, Any]) -> Path:
-    """Atomically write one private, uniquely named recovery payload; return its path."""
+    """Atomically write one private, uniquely named recovery payload; return its path.
+
+    Stamps ``flush_order`` with this process's next flush-sequence value: the filename itself
+    (a random UUID) carries no ordering information, so recovery cannot rely on it (ROUND1-ESCAPE-1).
+    """
     from utils import atomic_json_write
+    # Wall-clock nanoseconds first so files left by an earlier process's shutdown still sort
+    # before this one's (the counter restarts at 0 per process); the counter breaks same-ns ties.
+    payload = {**payload, "flush_order": [time.time_ns(), next(_FLUSH_ORDER_SEQ)]}
     final_path = flush_dir / f"pending-{uuid.uuid4().hex}.json"
     atomic_json_write(final_path, payload, mode=0o600, default=str)
     if os.name == "posix":
@@ -234,20 +245,44 @@ def recover_pending_to_db(session_db=None, *, session_resolver=None) -> int:
     branch. A returned ``db`` routes the append to the profile store owning the key (multiplexed
     gateways); ``None`` falls back to ``session_db``. Returns the number of messages recovered.
     """
-    flush_files = sorted(_get_flush_dir().glob("*.json"))
-    if not flush_files:
+    raw_paths = list(_get_flush_dir().glob("*.json"))
+    if not raw_paths:
         return 0
+    # Pre-read every payload so files can be recovered in flush order (ROUND1-ESCAPE-1): the
+    # filename is a random UUID and carries no ordering, but each payload written by
+    # ``_write_payload`` since the ROUND1-ESCAPE-1 fix carries a monotonic ``flush_order``. A file
+    # that fails to parse here is kept (payload=None) and re-attempted — and re-logged — in the
+    # recovery loop below, unchanged from the previous one-file-isolation behaviour.
+    entries = []
+    for path in raw_paths:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            payload = None
+        entries.append((path, payload))
+    def _order_key(entry):
+        path, payload = entry
+        order = payload.get("flush_order") if isinstance(payload, dict) else None
+        # Sequenced payloads sort first, by their flush order; legacy/unparseable files (no
+        # ``flush_order``) sort after, in a deterministic (filename) order among themselves.
+        if isinstance(order, int):  # an earlier build of this fix wrote a bare counter
+            order = [0, order]
+        valid = (isinstance(order, list) and len(order) == 2
+                 and all(isinstance(v, int) and not isinstance(v, bool) for v in order))
+        return (0, tuple(order), path.name) if valid else (1, (0, 0), path.name)
+    flush_files = sorted(entries, key=_order_key)
     own_db = session_db is None
     if own_db:
         from hermes_state_registry import acquire
         session_db = acquire()
     recovered = 0
     try:
-        for path in flush_files:
+        for path, payload in flush_files:
             # One unparseable payload or rejected append must only skip THIS file: the file is
             # never unlinked, so aborting the pass would re-poison every later boot.
             try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
+                if payload is None:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
                 # Agent-history snapshots are for manual operator recovery, not automatic DB
                 # insertion.
                 if payload.get("reason") == "shutdown-with-unpersisted-agent-history":

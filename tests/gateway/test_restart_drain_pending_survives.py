@@ -292,6 +292,53 @@ def _flush_and_recover(tmp_path, monkeypatch, pending: dict) -> MagicMock:
     return mock_db
 
 
+class TestHeadSurvivesDrainStartingDuringStopTypingAwait:
+    """PR72-R1 round-2 escape — the in-band drain handoff at the tail of
+    ``_process_message_background`` (the block that pops ``_pending_messages`` directly, not via
+    ``_run_agent_drain_pending``) pops the head, THEN awaits ``_stop_typing_refresh``, and only
+    after that await starts the drain task — with no recheck of drain state in between. If a
+    restart drain begins while that await is in flight, the popped head is neither in the slot
+    (so the shutdown flush cannot see it) nor delivered (the drain task it starts is dispatched to
+    a runner that now refuses new work): it is lost between the two checks. Ownership of the head
+    must survive the await — recheck drain state after it and hand the head back to the slot
+    instead of starting the task if draining began."""
+
+    @pytest.mark.asyncio
+    async def test_drain_starting_during_stop_typing_await_retains_head(self):
+        runner = _make_runner_draining()
+        runner._draining = False  # drain starts mid-turn, not before it
+        adapter = RestartTestAdapter()
+        adapter.gateway_runner = runner
+        source = _make_source()
+        sk = build_session_key(source)
+        running = MessageEvent(text="now", message_type=MessageType.TEXT, source=source, message_id="run-1")
+        head = MessageEvent(text="please also check the deploy", message_type=MessageType.TEXT,
+                            source=source, message_id="head-1")
+        handled = []
+
+        real_stop_typing_refresh = adapter._stop_typing_refresh
+
+        async def flipping_stop_typing_refresh(*args, **kwargs):
+            # Simulate request_restart() firing while this specific await is in flight.
+            runner._draining = True
+            return await real_stop_typing_refresh(*args, **kwargs)
+
+        async def handler(event):
+            handled.append(event)
+            if event is running:
+                adapter._pending_messages[sk] = head  # accepted while the turn ran
+                adapter._stop_typing_refresh = flipping_stop_typing_refresh
+                return None
+            return "⏳ Gateway is restarting and is not accepting new work right now."
+
+        adapter.set_message_handler(handler)
+        await adapter.handle_message(running)
+        await _settle_adapter_tasks(adapter)
+
+        assert handled == [running], "the head must not be dispatched once draining started mid-await"
+        assert adapter._pending_messages.get(sk) is head, "the head must survive for the shutdown flush"
+
+
 class TestRestoredMediaHeadIsRecoverable:
     """PR72-R3 — a restored head that carries media serialised to ``{"text": ""}``: the voice
     transcript produced by the drain lives only in the event's STT cache, ``media_urls`` was never

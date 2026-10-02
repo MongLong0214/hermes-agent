@@ -4531,8 +4531,15 @@ class BasePlatformAdapter(ABC):
                 logger.debug("[%s] Processing queued follow-up message", self.name)
                 self._clear_session_guard(session_key)
                 await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_thread_metadata)
-                self._spawn_drain_task(pending_event, session_key)
-                return  # Drain task owns the session now.
+                # A restart drain can start DURING the await above; a stale "not draining" check
+                # taken before it would start a task the now-draining runner only refuses (#round2
+                # PR72-R1 escape). Recheck ownership after the await: if draining began, hand the
+                # head back to the slot for the shutdown flush instead of dispatching it.
+                if getattr(self.gateway_runner, "_draining", False) is True:
+                    self._pending_messages[session_key] = pending_event
+                else:
+                    self._spawn_drain_task(pending_event, session_key)
+                return  # Drain task owns the session now, or the head is left for the flush.
         except asyncio.CancelledError:
             expected = asyncio.current_task() in self._expected_cancelled_tasks
             await self._run_processing_hook(
