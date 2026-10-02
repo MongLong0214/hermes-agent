@@ -443,8 +443,15 @@ class SessionManager:
             logger.error("Refusing to resume ACP session %s: canonical peer provenance is invalid", session_id)
             return None
         except Exception:
-            logger.warning("Failed to load messages for ACP session %s", session_id, exc_info=True)
-            history = []
+            # Any other history-load failure refuses the resume too, rather than silently
+            # continuing with an empty history: a session that cannot be proven free of
+            # improperly-admitted canonical peer rows must never be treated as if it had none.
+            # This is deliberately not narrowed to sessions known to contain peer rows — a
+            # failure that reaches here is, by definition, one we could not classify, and an
+            # ordinary non-peer session's history practically never fails to load, so refusing
+            # unconditionally costs nothing in the common case and closes the gap in the rare one.
+            logger.error("Refusing to resume ACP session %s: failed to load history", session_id, exc_info=True)
+            return None
 
         try:
             agent = self._make_agent(

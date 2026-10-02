@@ -165,12 +165,18 @@ def parse_ledger_value(value: Any) -> dict[str, Any]:
     """The admission record a :func:`ledger_value` wrote, or :class:`PeerProvenanceError`.
 
     An unreadable or malformed record is a provenance refusal, never a generic load failure a
-    caller could mistake for an empty history."""
+    caller could mistake for an empty history. Every failure decoding or validating the record —
+    including a pathologically nested value that exhausts the interpreter's recursion limit — is
+    normalized to the same refusal rather than left to propagate as whatever exception the parser
+    or validator happened to raise; a caller must never see anything else from this path."""
     try:
         record = json.loads(value)
-    except (TypeError, ValueError):
+        if (not isinstance(record, dict) or set(record) != {"peer", "content_sha256"}
+                or not isinstance(record["content_sha256"], str)
+                or not _DIGEST_RE.fullmatch(record["content_sha256"])):
+            raise PeerProvenanceError()
+        return {"peer": validate_peer_metadata(record["peer"]), "content_sha256": record["content_sha256"]}
+    except PeerProvenanceError:
+        raise
+    except (TypeError, ValueError, RecursionError):
         raise PeerProvenanceError() from None
-    if (not isinstance(record, dict) or set(record) != {"peer", "content_sha256"}
-            or not isinstance(record["content_sha256"], str) or not _DIGEST_RE.fullmatch(record["content_sha256"])):
-        raise PeerProvenanceError()
-    return {"peer": validate_peer_metadata(record["peer"]), "content_sha256": record["content_sha256"]}

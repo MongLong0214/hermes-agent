@@ -73,10 +73,14 @@ _INVALID = object()  # _json_or sentinel where the fallback must be distinguisha
 
 
 def _json_or(raw: Any, fallback: Any, warning: str) -> Any:
-    """``json.loads(raw)``; on failure log *warning* and return *fallback*."""
+    """``json.loads(raw)``; on failure log *warning* and return *fallback*. ``RecursionError`` is
+    caught alongside the ordinary decode errors: a pathologically nested stored value (e.g. a
+    corrupted ``display_metadata`` column) must fall back the same way malformed JSON always has,
+    never escape as an uncaught exception a distant generic handler could mistake for something
+    else and swallow into an empty result."""
     try:
         return json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
+    except (json.JSONDecodeError, TypeError, RecursionError):
         logger.warning(warning)
         return fallback
 
