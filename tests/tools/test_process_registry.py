@@ -2541,6 +2541,58 @@ class TestSystemdCgroupIsolation:
         stop_unit.assert_called_once()
         pipe_spawn.assert_not_called()
 
+    @pytest.mark.linux_only
+    def test_pty_refusal_still_stops_scope_before_raising(
+        self, registry, monkeypatch, _gateway_identity
+    ):
+        """PR64-R01: when the PTY child itself refuses to confirm termination (not the
+        ``PtyProcess.spawn`` call failing outright, like the siblings above, but a later
+        setup step such as reader-thread startup), the systemd scope cleanup must still
+        run before the pipe fallback is refused. Round-2 raised out of the
+        ``session._pty`` branch before ever reaching the existing ``_stop_systemd_unit``
+        call below it, leaking the worker's scope."""
+        from ptyprocess import PtyProcess
+
+        fake_pty = MagicMock()
+        fake_pty.pid = 4321
+        fake_pty.terminate.return_value = False
+        fake_pty.isalive.return_value = True
+
+        def fake_thread(*args, name="", **kwargs):
+            thread = MagicMock()
+            thread.start.side_effect = RuntimeError("reader failed")
+            return thread
+
+        monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/bin/bash")
+        monkeypatch.setattr(
+            "tools.process_registry._systemd_run_user_scope_available", lambda: True,
+        )
+        monkeypatch.setattr(
+            "gateway.restart.is_gateway_supervisor_process", lambda environ=None: True,
+        )
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run")
+        monkeypatch.setattr(registry, "_KILL_SETTLE_SECONDS", 0)
+
+        with patch.object(PtyProcess, "spawn", return_value=fake_pty), \
+            patch("subprocess.Popen") as popen, \
+            patch(
+                "tools.process_registry._stop_systemd_unit", return_value=True
+            ) as stop_unit, \
+            patch("threading.Thread", side_effect=fake_thread), \
+            patch.object(registry, "_write_checkpoint"):
+            with pytest.raises(RuntimeError, match="PTY child could not be reaped"):
+                registry.spawn_local("codex", cwd="/tmp", use_pty=True)
+
+        # The scope cleanup must have been attempted despite the PTY-level refusal —
+        # it was skipped entirely by the round-2 bug.
+        stop_unit.assert_called_once()
+        popen.assert_not_called()
+
+        # And the orphaned session must still be reachable, not discarded.
+        assert len(registry._running) == 1
+        session = next(iter(registry._running.values()))
+        assert registry.get(session.id) is session
+
     def test_worker_memory_limit_honors_local_guard_mb_override(self, monkeypatch):
         import tools.process_registry as pr
 
@@ -2978,6 +3030,57 @@ class TestPtyFallbackCleanup:
         fake_pty.terminate.assert_called_once_with(force=True)
         popen.assert_not_called()
         assert pty_spawn.call_count == 1
+
+    def test_reader_thread_failure_with_unreapable_pty_stays_registry_accessible(
+        self, registry, monkeypatch,
+    ):
+        """PR64-R01: refusing the pipe fallback must not also lose the orphaned child
+        from tracking. Before this fix the local ``session`` object raised past was
+        discarded by the caller — ``registry.get(session.id)`` returned None and
+        ``kill_process`` reported ``not_found`` even though the real PTY child was
+        still out there, unreaped and unmanaged."""
+        from ptyprocess import PtyProcess
+
+        fake_pty = MagicMock()
+        fake_pty.pid = 4321
+        fake_pty.terminate.return_value = False
+        fake_pty.isalive.return_value = True
+
+        def fake_thread(*args, name="", **kwargs):
+            thread = MagicMock()
+            thread.start.side_effect = RuntimeError("reader failed")
+            return thread
+
+        monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/bin/bash")
+        monkeypatch.setattr(
+            "tools.process_registry._systemd_run_user_scope_available", lambda: False,
+        )
+        # Keep the post-kill settle loop from actually sleeping its full 1s window —
+        # fake_pty.isalive() always reports True, so without this the survivor-poll
+        # loop below would burn its entire deadline every time.
+        monkeypatch.setattr(registry, "_KILL_SETTLE_SECONDS", 0)
+
+        with patch.object(PtyProcess, "spawn", return_value=fake_pty), \
+            patch("subprocess.Popen") as popen, \
+            patch("threading.Thread", side_effect=fake_thread), \
+            patch.object(registry, "_write_checkpoint"):
+            with pytest.raises(RuntimeError, match="refusing pipe fallback"):
+                registry.spawn_local("codex", cwd="/tmp", use_pty=True)
+
+        popen.assert_not_called()
+        assert len(registry._running) == 1, "the orphaned session must not be discarded"
+        session = next(iter(registry._running.values()))
+        assert session._pty is fake_pty
+
+        # get() must find it (not the None a discarded local object would produce)...
+        assert registry.get(session.id) is session
+
+        # ...and kill_process must be able to act on it instead of reporting not_found.
+        with patch.object(registry, "_write_checkpoint"):
+            result = registry.kill_process(session.id)
+        assert result.get("status") != "not_found", result
+        # _signal_kill checks session._pty first: the kill must have reached the orphan.
+        assert fake_pty.terminate.call_count == 2  # once during the failed reap, once on kill
 
     def test_reap_untracked_pty_keeps_handle_when_termination_unconfirmed(self, registry):
         """Direct unit test of the retained-handle contract: ``_reap_untracked_pty`` must

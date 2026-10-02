@@ -221,3 +221,48 @@ def test_native_runner_bounds_final_wait_when_group_cannot_be_killed(tree, ops_f
         # so it doesn't keep running for the rest of the suite.
         with contextlib.suppress(Exception):
             os.kill(int(pidfile.read_text().strip()), 9)
+
+
+def test_native_runner_kills_surviving_group_when_leader_already_exited(tree, ops_factory, monkeypatch, tmp_path):
+    """PR64-R02: no fault injection here — the leader (``sh``) backgrounds ``sleep`` and
+    writes its PID almost instantly, so by the time the drain loop gives up at the 1s
+    deadline, ``proc.poll()`` genuinely reports the leader as already exited. The
+    group-kill helper must still run in that case: the cached pgid can reach the live
+    descendant even though the leader itself is gone, and skipping the helper just
+    because ``proc.poll()`` is not None leaves that descendant (and its pipe) running
+    forever instead of being reaped."""
+    import os
+    import time
+
+    monkeypatch.setenv("HERMES_NATIVE_FILE_READ", "1")
+    ops = ops_factory(tree, [])
+
+    pidfile = tmp_path / "bg.pid"
+    started = time.monotonic()
+    try:
+        result = ops._run_rg_native(
+            ["sh", "-c", f"'echo needle; (sleep 20 & echo $! > {pidfile})'"], 10, timeout=1,
+        )
+        elapsed = time.monotonic() - started
+        assert "needle" in result.stdout, result.to_dict()
+        assert elapsed < 10.0, f"a surviving descendant must not hang the search, took {elapsed:.2f}s"
+
+        bg_pid = int(pidfile.read_text().strip())
+
+        def _dead():
+            try:
+                os.kill(bg_pid, 0)
+            except ProcessLookupError:
+                return True
+            return False
+
+        # The group-kill TERM/KILL grace (up to 1s + 2s inside _kill_process_group_posix)
+        # runs after the outer deadline fires; give it room to land before judging.
+        settle_deadline = time.monotonic() + 5.0
+        while time.monotonic() < settle_deadline and not _dead():
+            time.sleep(0.05)
+
+        assert _dead(), "the live descendant (sleep) must actually be terminated, not leaked"
+    finally:
+        with contextlib.suppress(Exception):
+            os.kill(int(pidfile.read_text().strip()), 9)

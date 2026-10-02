@@ -381,16 +381,19 @@ class SearchMixin:
             if time.monotonic() > deadline:
                 exit_code = 124
                 break
-        if proc.poll() is None:
-            # rg can exit (and get reaped by an unrelated Popen cleanup elsewhere in this
-            # process) between the poll() above and the group lookup inside
-            # _kill_process_group_posix; the cached _hermes_pgid above is what lets that
-            # lookup fall back instead of raising ESRCH with nothing to kill. A genuine
-            # already-gone-entirely case (no leader, no cached pgid either) still means
-            # there is nothing left to signal — don't let it discard the output already
-            # drained into `lines`.
-            with contextlib.suppress(ProcessLookupError):
-                _kill_process_group_posix(proc)  # native lane is POSIX-only (gate above)
+        # Always attempt the group-level cleanup, even when proc.poll() reports the
+        # leader itself already exited: a cached pgid can still reach a live descendant
+        # (a backgrounded `sleep &`, PR64-R02) that outlived the leader, and
+        # os.killpg/_kill_process_group_posix is idempotent on a group that is already
+        # fully gone. rg can also exit (and get reaped by an unrelated Popen cleanup
+        # elsewhere in this process) between the poll() above and the group lookup
+        # inside _kill_process_group_posix; the cached _hermes_pgid above is what lets
+        # that lookup fall back instead of raising ESRCH with nothing to kill. A genuine
+        # already-gone-entirely case (no leader, no cached pgid either) still means
+        # there is nothing left to signal — don't let it discard the output already
+        # drained into `lines`.
+        with contextlib.suppress(ProcessLookupError):
+            _kill_process_group_posix(proc)  # native lane is POSIX-only (gate above)
         proc.wait()
         # A descendant that survives the group kill (ignored signal, uninterruptible sleep,
         # or a psutil snapshot miss) can keep rg's stdout pipe open forever even though rg
