@@ -339,6 +339,54 @@ class TestHeadSurvivesDrainStartingDuringStopTypingAwait:
         assert adapter._pending_messages.get(sk) is head, "the head must survive for the shutdown flush"
 
 
+class TestDrainRestoreNeverOverwritesANewerAcceptedEvent:
+    @pytest.mark.asyncio
+    async def test_a_newer_event_admitted_during_the_await_is_never_overwritten(self):
+        """PR72-R1 round-3 escape: the draining recheck must only restore ``pending_event`` into
+        an EMPTY slot. If a concurrent inbound message was admitted into the session's single
+        pending slot during the same ``_stop_typing_refresh`` await (a distinct, already-accepted
+        event), restoring the OLDER pending_event there would silently drop the newer one."""
+        runner = _make_runner_draining()
+        runner._draining = False
+        adapter = RestartTestAdapter()
+        adapter.gateway_runner = runner
+        source = _make_source()
+        sk = build_session_key(source)
+        running = MessageEvent(text="now", message_type=MessageType.TEXT, source=source, message_id="run-1")
+        pending_event = MessageEvent(text="please also check the deploy", message_type=MessageType.TEXT,
+                                     source=source, message_id="pending-1")
+        newer_event = MessageEvent(text="actually never mind, do this instead", message_type=MessageType.TEXT,
+                                   source=source, message_id="newer-1")
+        handled = []
+
+        real_stop_typing_refresh = adapter._stop_typing_refresh
+
+        async def flipping_stop_typing_refresh(*args, **kwargs):
+            # A second inbound message is admitted into the now-EMPTY slot (pending_event was
+            # already popped by the caller before this await), THEN the drain starts.
+            adapter._pending_messages[sk] = newer_event
+            runner._draining = True
+            return await real_stop_typing_refresh(*args, **kwargs)
+
+        async def handler(event):
+            handled.append(event)
+            if event is running:
+                adapter._pending_messages[sk] = pending_event
+                adapter._stop_typing_refresh = flipping_stop_typing_refresh
+                return None
+            if event is pending_event:
+                return "should not run: the slot was already claimed by a newer event"
+            return "⏳ Gateway is restarting and is not accepting new work right now."
+
+        adapter.set_message_handler(handler)
+        await adapter.handle_message(running)
+        await _settle_adapter_tasks(adapter)
+
+        assert pending_event in handled, "a slot already claimed by a newer event must still be processed, not dropped"
+        assert adapter._pending_messages.get(sk) is newer_event, (
+            "the newer, already-accepted event must survive for the shutdown flush, not be overwritten")
+
+
 class TestRestoredMediaHeadIsRecoverable:
     """PR72-R3 — a restored head that carries media serialised to ``{"text": ""}``: the voice
     transcript produced by the drain lives only in the event's STT cache, ``media_urls`` was never

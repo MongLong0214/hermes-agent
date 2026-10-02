@@ -4535,7 +4535,13 @@ class BasePlatformAdapter(ABC):
                 # taken before it would start a task the now-draining runner only refuses (#round2
                 # PR72-R1 escape). Recheck ownership after the await: if draining began, hand the
                 # head back to the slot for the shutdown flush instead of dispatching it.
-                if getattr(self.gateway_runner, "_draining", False) is True:
+                if (getattr(self.gateway_runner, "_draining", False) is True
+                        and session_key not in self._pending_messages):
+                    # Only restore into an EMPTY slot: a concurrent inbound message admitted
+                    # during the await above already claimed this session's single pending slot
+                    # (PR72-R1 round-3 escape) -- overwriting it would silently drop that newer,
+                    # already-accepted event. With the slot taken, pending_event is processed now
+                    # instead of fighting for the one slot the shutdown flush can save.
                     self._pending_messages[session_key] = pending_event
                 else:
                     self._spawn_drain_task(pending_event, session_key)
