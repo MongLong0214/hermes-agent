@@ -11,7 +11,13 @@ from typing import Any, MutableMapping, Optional, TypeVar
 # outgoing copy and the token estimator ignores them: one set, so an estimate
 # never prices bytes the provider never receives (an edit's inline_diff in
 # display_metadata is ~9KB and would trigger premature compaction).
-PERSISTENCE_ONLY_MESSAGE_FIELDS = frozenset({"timestamp", "display_kind", "display_metadata", "_row_id"})
+PERSISTENCE_ONLY_MESSAGE_FIELDS = frozenset({
+    "timestamp", "display_kind", "display_metadata", "_row_id",
+    # Runtime-only bookkeeping (hermes_state_messages._ORIGINAL_ROW_ID_KEY duplicated as a literal
+    # to avoid an import cycle): the pre-mutation source row id captured for a reinsertion that
+    # might retry; never provider-visible, never priced.
+    "_source_row_id_before_reinsertion",
+})
 
 _Message = TypeVar("_Message", bound=MutableMapping[str, Any])
 

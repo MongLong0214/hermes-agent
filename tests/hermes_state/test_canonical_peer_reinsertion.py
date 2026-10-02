@@ -21,6 +21,7 @@ the same treatment directly, since it never goes through ``_insert_message_rows`
 from __future__ import annotations
 
 import json
+import sqlite3
 
 import pytest
 
@@ -408,3 +409,68 @@ class TestStaleCopyOfACorruptedSourceIsRefused:
 
         with pytest.raises(PeerProvenanceError, match="canonical_peer_provenance_invalid"):
             dest_db.replace_messages("sess-peer", [cached])
+
+
+class TestSourceIdentitySurvivesACommitRetry:
+    """R-PEER-01, round 3: _insert_message_rows overwrites a reinsertion copy's msg["_row_id"]
+    with the FRESH row's id while still inside the write transaction, before SessionDB._execute_write
+    actually commits. If commit() itself then raises (e.g. "database is locked"), _execute_write
+    rolls back and retries the WHOLE callback on the same Python message objects -- whose _row_id
+    was already overwritten by the failed attempt. The retry then reads the aborted attempt's new
+    id as if it were the source, losing or misclassifying provenance."""
+
+    @pytest.mark.parametrize("reinsert", _REINSERTION_PATHS)
+    def test_imported_copy_survives_one_commit_retry_separate_store(self, source_db, dest_db, reinsert):
+        row = _import_peer_row(source_db, dest_db)
+        cached = _reinsertion_dict(row)
+
+        real_commit = dest_db._conn.commit
+        calls = {"n": 0}
+
+        def flaky_commit():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise sqlite3.OperationalError("database is locked")
+            return real_commit()
+
+        dest_db._conn.commit = flaky_commit
+        try:
+            reinsert(dest_db, cached)
+        finally:
+            dest_db._conn.commit = real_commit
+
+        assert calls["n"] >= 2, "the test never actually exercised a commit retry"
+        session = "sess-peer-child" if reinsert is _reinsert_via_publish_compression_child else "sess-peer"
+        [new_row] = [r for r in dest_db.get_messages(session) if r["content"] == BODY]
+        assert dest_db.get_meta(f"{PEER_IMPORTED_ROW_LEDGER_PREFIX}{new_row['id']}") is not None, (
+            "an imported row must still be filed as imported after a commit retry")
+        assert dest_db.get_meta(f"{PEER_ROW_LEDGER_PREFIX}{new_row['id']}") is None, (
+            "a commit retry must never silently promote an imported row to admitted"
+        )
+
+    @pytest.mark.parametrize("reinsert", _REINSERTION_PATHS)
+    def test_admitted_copy_survives_one_commit_retry_same_store(self, dest_db, reinsert):
+        _seed_admitted_peer_session(dest_db, session_id="sess-peer")
+        [row] = [r for r in dest_db.get_messages("sess-peer") if r["content"] == BODY]
+        cached = _reinsertion_dict(row)
+
+        real_commit = dest_db._conn.commit
+        calls = {"n": 0}
+
+        def flaky_commit():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise sqlite3.OperationalError("database is locked")
+            return real_commit()
+
+        dest_db._conn.commit = flaky_commit
+        try:
+            reinsert(dest_db, cached)
+        finally:
+            dest_db._conn.commit = real_commit
+
+        assert calls["n"] >= 2
+        session = "sess-peer-child" if reinsert is _reinsert_via_publish_compression_child else "sess-peer"
+        [new_row] = [r for r in dest_db.get_messages(session) if r["content"] == BODY]
+        assert dest_db.get_meta(f"{PEER_ROW_LEDGER_PREFIX}{new_row['id']}") is not None, (
+            "an admitted row must still be filed as admitted after a commit retry")

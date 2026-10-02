@@ -112,9 +112,26 @@ def _tool_calls_count(tool_calls: Any) -> int:
 
 
 def _source_row_id(msg: Dict[str, Any]) -> Optional[int]:
-    """The durable row id a reinserted *msg* carries forward as ``_row_id`` (``None`` if it has none)."""
-    row_id = msg.get("_row_id")
+    """The durable row id a reinserted *msg* carries forward as ``_row_id`` (``None`` if it has none).
+
+    Reads ``_ORIGINAL_ROW_ID_KEY`` when present (stamped by :func:`_capture_original_row_id` before
+    the first insertion attempt) rather than the live ``_row_id`` -- a transaction that fails after
+    ``_insert_message_rows`` has already overwritten ``msg["_row_id"]`` with the NEW row's id gets
+    retried by ``_execute_write`` on the same Python objects: a retry reading the live field would
+    see the aborted attempt's id, not the true source, and silently lose or misclassify provenance
+    (R-PEER-01, round 3)."""
+    row_id = msg.get(_ORIGINAL_ROW_ID_KEY, msg.get("_row_id"))
     return row_id if isinstance(row_id, int) and not isinstance(row_id, bool) else None
+
+
+_ORIGINAL_ROW_ID_KEY = "_source_row_id_before_reinsertion"
+
+
+def _capture_original_row_id(msg: Dict[str, Any]) -> None:
+    """Stamp *msg*'s current ``_row_id`` as its immutable source identity, once. ``setdefault`` so a
+    retried attempt (same Python object, already mutated by the failed attempt) never re-captures
+    the wrong value."""
+    msg.setdefault(_ORIGINAL_ROW_ID_KEY, msg.get("_row_id"))
 
 
 def _tool_calls_len(raw: Any, scalar: int = 0) -> int:
@@ -549,6 +566,7 @@ class SessionMessagesMixin:
         now_ts = time.time()
         inserted = tool_calls_total = 0
         for msg in messages:
+            _capture_original_row_id(msg)  # idempotent; covers callers that precompute reinsertion_sources
             role = msg.get("role", "unknown")
             source_row_id = _source_row_id(msg)
             tool_calls = _parse_tool_calls(msg.get("tool_calls"))
@@ -584,6 +602,8 @@ class SessionMessagesMixin:
         then checked against the returned record in :meth:`_record_admitted_peer_row`. A source id that
         names no peer row and has no ledger record is absent from the result: the copy is then held to
         the brand-new-insert bar (admitted, receipt required)."""
+        for msg in messages:
+            _capture_original_row_id(msg)
         ids = [row_id for msg in messages
                if (row_id := _source_row_id(msg)) is not None and self._is_peer_marked(msg)]
         return self._validated_peer_ledger_classes(conn, list(dict.fromkeys(ids))) if ids else {}
