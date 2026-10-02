@@ -160,9 +160,11 @@ class GatewayNotificationsMixin:
         proceed: bool = True
         early_result: Optional[bool] = None
 
-    async def _deliver_platform_notice(self, source, content: str, *, adapter=None) -> bool:
+    async def _deliver_platform_notice(self, source, content: str, *, adapter=None, interim: bool = False) -> bool:
         """Deliver a setup/operational notice using platform-specific privacy rules. ``adapter`` reuses a
-        transport the caller already resolved. False when nothing was sent (no adapter, or the send failed)."""
+        transport the caller already resolved. False when nothing was sent (no adapter, or the send failed).
+        ``interim`` stamps ``_interim_send`` so a relay's foreground stream (keyed on the turn that opened
+        it) is not sealed by a notice sent while that turn, or another one, still holds the session."""
         from gateway.run import _is_slack_ignored_channel
         adapter = adapter or self._delivery_adapter_for(source)
         if not adapter:
@@ -185,6 +187,9 @@ class GatewayNotificationsMixin:
                 else "public"
             )
         metadata = self._thread_metadata_for_source(source)
+        if interim:
+            metadata = dict(metadata or {})
+            metadata["_interim_send"] = True
         if notice_delivery == "private" and getattr(source, "user_id", None):
             with _log_suppressed(
                 logging.DEBUG, "[%s] send_private_notice failed, falling back to public",
@@ -1669,7 +1674,10 @@ class GatewayNotificationsMixin:
         if callable(_prime):
             _prime(MessageEvent(text=notice, message_type=MessageType.TEXT, source=source, internal=True))
         try:
-            sent = await self._deliver_platform_notice(source, notice, adapter=adapter)
+            # Replay can deliver this notice while another turn holds the session lease (the row writer
+            # allows that for the row itself); _interim_send keeps a relay's foreground stream, keyed on
+            # whichever turn opened it, from treating the notice as that turn's final response (QD-04).
+            sent = await self._deliver_platform_notice(source, notice, adapter=adapter, interim=True)
         except Exception:
             logger.warning("Quiet delegation completion notice failed for session %s", session_entry.session_id, exc_info=True)
             sent = False

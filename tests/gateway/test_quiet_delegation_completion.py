@@ -270,3 +270,50 @@ def test_quiet_notice_primes_a_cold_relay_before_sending(home):
     assert str(getattr(seen["platform"], "value", seen["platform"])) == "telegram"
     assert seen["scope"].get("user_id") == "u1"
     relay.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_quiet_notice_does_not_seal_an_open_foreground_stream(home):
+    """A quiet notice can be delivered while a Relay foreground stream is open; it must not be
+    absorbed as that stream's final response (QD-04)."""
+    from gateway.session import SessionSource
+    from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+    from tests.gateway.relay.test_relay_live_cards import _connected_adapter
+
+    _config(home, "quiet")
+    runner = _runner(home)
+    relay, _stub = _connected_adapter()
+    relay.handle_message = AdmittingHandler()
+    runner.adapters = {Platform.TELEGRAM: relay}
+    runner.session_store._entries[SESSION_KEY] = SimpleNamespace(
+        origin=SessionSource(platform=Platform.TELEGRAM, chat_id="C1", chat_type="dm", user_id="u1"))
+    event = _event()
+    _persist_pending(event)
+
+    cfg = StreamConsumerConfig(transport="auto", chat_type="dm", edit_interval=0.01, buffer_threshold=1, cursor="")
+    consumer = GatewayStreamConsumer(relay, "C1", cfg, metadata={"thread_ts": "1700.8", "message_id": "1700.801"})
+    task = asyncio.create_task(consumer.run())
+    consumer.on_delta("partial answer on screen")
+    await asyncio.sleep(0.08)
+    try:
+        assert relay._open_draft_by_chat, "the foreground stream is open"
+        delivered = await runner._deliver_completion_notification(
+            _format_delivery_text(event), event)
+        assert delivered is True
+        assert relay._open_draft_by_chat, "the notice must not have sealed the open stream"
+    finally:
+        consumer.finish(final_text="final answer")
+        await asyncio.sleep(0.08)
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    assert len(home.db.get_messages("sess_parent")) == 1
+
+
+def _format_delivery_text(event):
+    from gateway.run import _format_gateway_process_notification
+
+    return _format_gateway_process_notification(event)
