@@ -343,6 +343,44 @@ class TestLedgerSettlement:
         assert body["status"] == "COMPLETED" and body["content"] == text
         assert body["evidenceDigest"] == "sha256:" + hashlib.sha256(body["content"].encode("utf-8")).hexdigest()
 
+    def test_delivery_is_the_closed_six_field_shape_acp_parses(self, gw):
+        """ACP's receipt port accepts delivery only as exactly these keys, ids as integers, at least
+        one sent message; anything else reads NOT_FOUND there and the turn never settles."""
+        from gateway.platforms.base import SendResult
+
+        admission = _admitted(gw)
+        adapter = self._adapter(gw)
+
+        async def split_send(chat_id, content, reply_to=None, metadata=None):
+            return SendResult(success=True, message_id="301", raw_response={"message_ids": ["301", "302", "303"]})
+
+        adapter.send = split_send
+        asyncio.run(adapter.send_final_ledgered(self._managed_event(gw, admission), gw.entry.session_key,
+                                                "long answer", {}, reply_to="55"))
+        delivery = receipts.lookup(gw.db, 901).to_response()["delivery"]
+        assert set(delivery) == {"obligation_id", "state", "content_digest", "chat_id",
+                                 "reply_to_message_id", "message_ids"}
+        assert delivery["state"] == "delivered" and delivery["message_ids"] == [301, 302, 303]
+        assert delivery["chat_id"] == 1718881034 and delivery["reply_to_message_id"] == 55
+        assert delivery["content_digest"] == receipts.lookup(gw.db, 901).evidence_digest
+
+    def test_a_delivery_without_message_ids_stays_in_doubt_and_is_never_aborted(self, gw, monkeypatch):
+        from gateway.platforms.base import SendResult
+
+        admission = _admitted(gw)
+        adapter = self._adapter(gw)
+
+        async def idless_send(chat_id, content, reply_to=None, metadata=None):
+            return SendResult(success=True, message_id=None)
+
+        adapter.send = idless_send
+        asyncio.run(adapter.send_final_ledgered(self._managed_event(gw, admission), gw.entry.session_key,
+                                                "answer", {}, reply_to="55"))
+        assert receipts.lookup(gw.db, 901).status == "PENDING"
+        monkeypatch.setattr(ingress, "_PROCESS_OWNER", "a-later-process")
+        assert ingress.sweep_at_startup(gw.runner) == []
+        assert receipts.lookup(gw.db, 901).status == "PENDING"
+
     def test_a_queued_follow_up_never_certifies_the_managed_receipt(self, gw):
         admission = _admitted(gw)
         adapter = self._adapter(gw)
@@ -379,8 +417,9 @@ class TestLedgerSettlement:
         assert ingress.sweep_at_startup(gw.runner) == []  # owed, not dead
         assert receipts.lookup(gw.db, 901).status == "PENDING"
         [row] = receipts.ledger_answers(gw.db, 901)
-        delivery_ledger.mark_delivered(row["obligation_id"])
+        delivery_ledger.mark_delivered(row["obligation_id"], message_ids=["78", "79"])
         assert ingress.settle_delivered(gw.runner, row["obligation_id"])
+        assert receipts.lookup(gw.db, 901).delivery["message_ids"] == [78, 79]
         assert receipts.lookup(gw.db, 901).receipt_id == f"hermes-tg:{row['obligation_id']}"
 
     def test_only_an_update_with_no_ledgered_answer_is_a_death_before_answer(self, gw, monkeypatch):

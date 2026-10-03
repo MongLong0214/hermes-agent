@@ -550,7 +550,9 @@ class GatewayStartupMixin:
             return False
         with _log_suppressed(logging.DEBUG, "delivery ledger update failed", exc_info=True):
             if result is not None and getattr(result, "success", False):
-                await asyncio.to_thread(mark_delivered, row["obligation_id"], attempt=row.get("attempts"))
+                from gateway.platforms.base import sent_message_ids
+                await asyncio.to_thread(mark_delivered, row["obligation_id"], attempt=row.get("attempts"),
+                                        message_ids=sent_message_ids(result))
                 # U4: a redelivered /acp answer settles its receipt from the ledger row. Own guard: a
                 # settlement failure leaves the receipt in doubt, never the redelivery's result.
                 with _log_suppressed(logging.WARNING, "ACP receipt redelivery settlement failed", exc_info=True):

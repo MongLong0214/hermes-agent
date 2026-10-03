@@ -1636,6 +1636,18 @@ class ExecApprovalPrompt:
         return [choice for _, choice, _ in self.actions]
 
 
+def sent_message_ids(result: Any) -> List[str]:
+    """Every platform message id a successful send occupies, in send order: the adapter's full list
+    (``raw_response["message_ids"]``) when it reports one, else the head id plus its continuations."""
+    raw = getattr(result, "raw_response", None)
+    listed = raw.get("message_ids") if isinstance(raw, dict) else None
+    if isinstance(listed, (list, tuple)) and listed:
+        return [str(m) for m in listed if m is not None and str(m)]
+    head = getattr(result, "message_id", None)
+    ids = [str(head)] if head else []
+    return ids + [str(m) for m in (getattr(result, "continuation_message_ids", ()) or ()) if m]
+
+
 @dataclass
 class SendResult:
     """Result of sending a message."""
@@ -4212,8 +4224,10 @@ class BasePlatformAdapter(ABC):
             from gateway.delivery_ledger import is_reconnect_only, mark_delivered, mark_failed
             # attempt=0: the producer's own send settles only while no redelivery has claimed the row.
             if getattr(result, "success", False):
-                if await asyncio.to_thread(mark_delivered, obligation_id, attempt=0) and getattr(
-                        event, "_acp_admission", None) is not None:
+                _acp = getattr(event, "_acp_admission", None) is not None
+                if await asyncio.to_thread(
+                        mark_delivered, obligation_id, attempt=0,
+                        message_ids=sent_message_ids(result) if _acp else None) and _acp:
                     await self._settle_acp_delivered(obligation_id)
                 return
             error = str(getattr(result, "error", "") or "")

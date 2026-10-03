@@ -179,23 +179,53 @@ def ledger_answers(db: Any, update_id: Any) -> list[dict]:
 
     try:
         rows = db._read_all(
-            "SELECT obligation_id, content, state FROM delivery_obligations "
+            "SELECT obligation_id, content, state, chat_id, delivered_message_ids FROM delivery_obligations "
             "WHERE acp_update_id = ? ORDER BY created_at", (str(update_id),))
     except sqlite3.OperationalError:
         return []
-    return [{"obligation_id": r[0], "content": r[1], "state": r[2]} for r in rows]
+    return [{"obligation_id": r[0], "content": r[1], "state": r[2], "chat_id": r[3],
+             "message_ids": r[4]} for r in rows]
 
 
-def _completed_terminal(answer: dict) -> dict:
-    """COMPLETED evidence from the ledgered answer that was actually delivered."""
+def _int_or_none(value: Any) -> Optional[int]:
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _completed_terminal(answer: dict, reply_to_message_id: Any) -> Optional[dict]:
+    """COMPLETED evidence from the ledgered answer that was actually delivered, in the delivery shape
+    ACP's receipt port parses: exactly {obligation_id, state, content_digest, chat_id,
+    reply_to_message_id, message_ids}, with integer ids and at least one sent message. None when the
+    row cannot prove that (no recorded message ids, a non-numeric id): the receipt then stays in doubt
+    rather than claiming a delivery ACP would reject."""
     import hashlib
 
+    try:
+        message_ids = [int(m) for m in json.loads(answer.get("message_ids") or "[]")]
+    except (TypeError, ValueError):
+        return None
+    chat_id, reply_to = _int_or_none(answer.get("chat_id")), _int_or_none(reply_to_message_id)
+    if not message_ids or chat_id is None or reply_to is None:
+        return None
     digest = "sha256:" + hashlib.sha256(answer["content"].encode("utf-8")).hexdigest()
     return {"status": "COMPLETED", "receipt_id": f"hermes-tg:{answer['obligation_id']}",
             "evidence_digest": digest, "content": answer["content"],
             "delivery": {"obligation_id": answer["obligation_id"], "state": "delivered",
-                         "content_digest": digest},
+                         "content_digest": digest, "chat_id": chat_id,
+                         "reply_to_message_id": reply_to, "message_ids": message_ids},
             "completed_at": time.time()}
+
+
+def _delivered_terminal(db: Any, update_id: Any, reply_to_message_id: Any,
+                        obligation_id: Optional[str] = None) -> Optional[dict]:
+    for answer in ledger_answers(db, update_id):
+        if answer["state"] == "delivered" and obligation_id in (None, answer["obligation_id"]):
+            terminal = _completed_terminal(answer, reply_to_message_id)
+            if terminal is not None:
+                return terminal
+    return None
 
 
 def lookup(db: Any, update_id: Any) -> TelegramTurnReceipt:
@@ -205,10 +235,9 @@ def lookup(db: Any, update_id: Any) -> TelegramTurnReceipt:
     receipt = decode(db.get_meta(receipt_key(update_id)), update_id)
     if receipt.status != "PENDING":
         return receipt
-    delivered = [a for a in ledger_answers(db, update_id) if a["state"] == "delivered"]
-    if not delivered:
+    terminal = _delivered_terminal(db, update_id, receipt.message_id)
+    if terminal is None:
         return receipt
-    terminal = _completed_terminal(delivered[0])
     return TelegramTurnReceipt(
         status="COMPLETED", update_id=receipt.update_id, message_id=receipt.message_id,
         turn_request_id=receipt.turn_request_id, receipt_identity=receipt.receipt_identity,
@@ -221,11 +250,14 @@ def settle_from_ledger(
     proven_db_identity: Optional[tuple],
 ) -> bool:
     """Settle COMPLETED from the delivered ledger row (``obligation_id`` when given)."""
-    for answer in ledger_answers(db, update_id):
-        if answer["state"] == "delivered" and obligation_id in (None, answer["obligation_id"]):
-            return _settle(db, update_id, terminal=_completed_terminal(answer),
-                           proven_db_path=proven_db_path, proven_db_identity=proven_db_identity)
-    return False
+    pending = decode(db.get_meta(receipt_key(update_id)), update_id)
+    if pending.status != "PENDING":
+        return False
+    terminal = _delivered_terminal(db, update_id, pending.message_id, obligation_id)
+    if terminal is None:
+        return False
+    return _settle(db, update_id, terminal=terminal,
+                   proven_db_path=proven_db_path, proven_db_identity=proven_db_identity)
 
 
 def claim_pending(
@@ -349,8 +381,10 @@ def sweep_dead_owner_receipts(
         answers = ledger_answers(db, update_id)
         if settle_from_ledger(db, update_id, **proof):
             continue
+        # "delivered" here is a delivered row without provable message ids: answered, so never a
+        # death before answer, but not COMPLETED evidence either — it stays in doubt.
         if parsed.get("obligation_id") or any(
-                a["state"] in ("pending", "attempting", "failed") for a in answers):
+                a["state"] in ("pending", "attempting", "failed", "delivered") for a in answers):
             continue
         reason = _ABORT_UNDELIVERABLE if answers else _ABORT_PROCESS_DIED
         if settle_aborted(db, update_id, reason_code=reason, **proof):

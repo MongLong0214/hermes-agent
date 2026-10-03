@@ -218,6 +218,11 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         # U4: the Telegram update an /acp task answered, written in the same INSERT as the obligation so
         # a ledgered answer is never without its receipt correlation (gateway.acp_managed_ingress).
         add_column_if_missing(conn, "delivery_obligations", "acp_update_id", "acp_update_id TEXT")
+    if "delivered_message_ids" not in columns:
+        # JSON list of the platform message ids the delivered answer occupies (send order), written by
+        # the same UPDATE that marks the row delivered: an /acp receipt's delivery evidence.
+        add_column_if_missing(conn, "delivery_obligations", "delivered_message_ids",
+                              "delivered_message_ids TEXT")
 
 
 def _transaction():
@@ -325,8 +330,10 @@ def mark_attempting(obligation_id: str) -> None:
     _update_state(obligation_id, "attempting")
 
 
-def mark_delivered(obligation_id: str, *, attempt: Optional[int] = None) -> bool:
-    return _update_state(obligation_id, "delivered", attempt=attempt)
+def mark_delivered(obligation_id: str, *, attempt: Optional[int] = None,
+                   message_ids: Optional[List[str]] = None) -> bool:
+    return _update_state(obligation_id, "delivered", attempt=attempt,
+                         delivered_message_ids=json.dumps([str(m) for m in message_ids]) if message_ids else None)
 
 
 def mark_failed(obligation_id: str, error: str = "", *, attempt: Optional[int] = None) -> bool:
@@ -359,7 +366,8 @@ def release_runtime_claim(obligation_id: str, error: str = "", *, attempt: Optio
     return bool(cursor.rowcount)
 
 
-def _update_state(obligation_id: str, state: str, error: str = "", *, attempt: Optional[int] = None) -> bool:
+def _update_state(obligation_id: str, state: str, error: str = "", *, attempt: Optional[int] = None,
+                  delivered_message_ids: Optional[str] = None) -> bool:
     """Write a checkpoint; False when nothing matched. With ``attempt`` it settles ONE claim: the row must
     still be ``attempting`` under this pid with that ``attempts`` count (every claim bumps it and re-stamps
     the owner). A claimant whose row was claimed since, by another process or by a later claim here,
@@ -370,10 +378,12 @@ def _update_state(obligation_id: str, state: str, error: str = "", *, attempt: O
     with _DB_LOCK, _transaction() as conn:
         cursor = conn.execute(
             """UPDATE delivery_obligations
-               SET state=?, updated_at=?, last_error=?
+               SET state=?, updated_at=?, last_error=?,
+                   delivered_message_ids=COALESCE(?, delivered_message_ids)
                WHERE obligation_id=?
                  AND (? IS NULL OR (state='attempting' AND owner_pid IS ? AND attempts=?))""",
-            (state, time.time(), error[:500] if error else None, obligation_id, attempt, pid, attempt))
+            (state, time.time(), error[:500] if error else None, delivered_message_ids,
+             obligation_id, attempt, pid, attempt))
     return bool(cursor.rowcount)
 
 
