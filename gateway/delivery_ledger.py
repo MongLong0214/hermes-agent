@@ -439,7 +439,7 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
                       content, state, attempts, created_at,
                       owner_pid, owner_started_at, adapter_profile, last_error, updated_at
                FROM delivery_obligations
-               WHERE state IN ('pending', 'attempting', 'failed')"""
+               WHERE state IN ('pending', 'attempting', 'failed') AND acp_update_id IS NULL"""
         ).fetchall()
         for (oid, session_key, platform, chat_id, thread_id, content, state, attempts, created_at,
              owner_pid, owner_started_at, adapter_profile, last_error, updated_at) in rows:
@@ -517,7 +517,7 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
                       content, attempts, created_at, owner_pid,
                       owner_started_at, last_error, adapter_profile, updated_at
                FROM delivery_obligations
-               WHERE state='failed' AND platform=?""", (platform,)).fetchall()
+               WHERE state='failed' AND platform=? AND acp_update_id IS NULL""", (platform,)).fetchall()
         for (oid, session_key, row_platform, chat_id, thread_id, content, attempts, created_at,
              owner_pid, owner_started_at, last_error, adapter_profile, updated_at) in rows:
             # Exact process-start matching prevents PID reuse from stealing work.
@@ -566,7 +566,8 @@ def pending_retries(now: Optional[float] = None) -> List[Dict[str, Any]]:
         rows = conn.execute(
             """SELECT platform, adapter_profile, updated_at, last_error, attempts, created_at
                FROM delivery_obligations
-               WHERE state='failed' AND owner_pid IS ? AND owner_started_at IS ?""", (pid, started)).fetchall()
+               WHERE state='failed' AND owner_pid IS ? AND owner_started_at IS ? AND acp_update_id IS NULL""",
+            (pid, started)).fetchall()
     earliest: Dict[tuple, float] = {}
     for platform, adapter_profile, updated_at, last_error, attempts, created_at in rows:
         # Reconnect-only rows (a claim released because the adapter was gone) are re-claimed by the

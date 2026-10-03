@@ -2199,6 +2199,25 @@ class GatewayTurnMixin:
             persist_user_display_kind, session_entry.session_id, owner,
         ), _session_env_tokens
 
+    @staticmethod
+    def _adopt_queued_terminal(event, agent_result) -> None:
+        """A queued (/queue) chain answered the LAST message of the chain, so the outer final send
+        (bracketed by the adapter against this event) must be ledgered under that message's id or
+        it collides with an earlier turn's row carrying the same text. Reply routing is untouched:
+        the anchor still comes from this event."""
+        if not isinstance(agent_result, dict):
+            return
+        _terminal_inbound = agent_result.get("queued_terminal_inbound_id")
+        if _terminal_inbound:
+            event.ledger_message_id = str(_terminal_inbound)
+            # The outer final now answers the chain's last follow-up, not the managed /acp task: it
+            # must never carry (and certify) that task's admission (U4-02).
+            event._acp_admission = None
+        if "queued_terminal_notification_category" in agent_result:
+            event.metadata["notification_category"] = agent_result["queued_terminal_notification_category"]
+        if isinstance(agent_result.get("_notification_reply_muted"), bool):
+            event._notification_reply_muted = agent_result["_notification_reply_muted"]
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -2255,25 +2274,18 @@ class GatewayTurnMixin:
                 persist_user_timestamp=prepared.persist_user_timestamp,
                 persist_user_display_kind=prepared.persist_user_display_kind,
                 persist_user_display_metadata={
-                    "gateway_input_owner": prepared.persistence_owner, **diagnostic_metadata(event)},
+                    "gateway_input_owner": prepared.persistence_owner, **diagnostic_metadata(event),
+                    # Marks the persisted task row so crash recovery never re-runs or redelivers a
+                    # managed /acp turn outside its admission (gateway/run_startup.py).
+                    **({"acp_update_id": str(event._acp_admission.update_id)}
+                       if getattr(event, "_acp_admission", None) is not None else {})},
                 message_type=event.message_type,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
                 acp_admission=getattr(event, "_acp_admission", None),
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
-            # A queued (/queue) chain answered the LAST message of the chain, so the outer final
-            # send (bracketed by the adapter against this event) must be ledgered under that
-            # message's id or it collides with an earlier turn's row carrying the same text. Reply
-            # routing is untouched: the anchor still comes from this event.
-            if isinstance(agent_result, dict):
-                _terminal_inbound = agent_result.get("queued_terminal_inbound_id")
-                if _terminal_inbound:
-                    event.ledger_message_id = str(_terminal_inbound)
-                if "queued_terminal_notification_category" in agent_result:
-                    event.metadata["notification_category"] = agent_result["queued_terminal_notification_category"]
-                if isinstance(agent_result.get("_notification_reply_muted"), bool):
-                    event._notification_reply_muted = agent_result["_notification_reply_muted"]
+            self._adopt_queued_terminal(event, agent_result)
 
             await self._hmwa_stop_typing_for_turn(event, source)
 

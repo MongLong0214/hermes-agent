@@ -407,27 +407,60 @@ class TestLedgerSettlement:
         assert ingress.sweep_at_startup(gw.runner) == []
         assert receipts.decode(gw.db.get_meta(receipts.receipt_key(901)), 901).status == "COMPLETED"
 
-    def test_an_undelivered_answer_waits_for_redelivery_then_completes(self, gw, monkeypatch):
+    def test_an_undelivered_answer_is_never_redelivered_and_stays_in_doubt(self, gw, monkeypatch):
+        """U4-04: no automatic sweep claims a managed row (recovery sends without the reply anchor
+        and with recovery decoration, which the receipt could not truthfully certify), while an
+        ordinary failed row beside it is still claimed by each of them."""
+        import time as _time
         from gateway import delivery_ledger
 
         admission = _admitted(gw)
         asyncio.run(self._adapter(gw, succeed=False).send_final_ledgered(
             self._managed_event(gw, admission), gw.entry.session_key, "the answer", {}, reply_to="55"))
+        [row] = receipts.ledger_answers(gw.db, 901)
+        assert row["state"] == "failed"
+        assert delivery_ledger.pending_retries() == []  # no timer for the managed row
+        delivery_ledger.record_obligation(obligation_id="ob-ordinary", session_key=gw.entry.session_key,
+                                          platform="telegram", chat_id="100200300", thread_id=None,
+                                          content="x")
+        delivery_ledger.mark_failed("ob-ordinary", "boom")
+        assert [r["platform"] for r in delivery_ledger.pending_retries()] == ["telegram"]
+        soon = _time.time() + 600  # past the retry backoff, inside the stale cutoff
+        assert [r["obligation_id"] for r in delivery_ledger.sweep_failed_for_runtime("telegram", now=soon)] \
+            == ["ob-ordinary"]
+        delivery_ledger.mark_failed("ob-ordinary", "boom")
+        monkeypatch.setattr(delivery_ledger, "_owner_alive", lambda *a: False)  # as seen by the next boot
+        assert [r["obligation_id"] for r in delivery_ledger.sweep_recoverable(now=soon)] == ["ob-ordinary"]
+        assert receipts.ledger_answers(gw.db, 901)[0]["state"] == "failed"
         monkeypatch.setattr(ingress, "_PROCESS_OWNER", "a-later-process")
         assert ingress.sweep_at_startup(gw.runner) == []  # owed, not dead
         assert receipts.lookup(gw.db, 901).status == "PENDING"
-        [row] = receipts.ledger_answers(gw.db, 901)
-        delivery_ledger.mark_delivered(row["obligation_id"], message_ids=["78", "79"])
-        assert ingress.settle_delivered(gw.runner, row["obligation_id"])
-        import hashlib
-        body = receipts.lookup(gw.db, 901).to_response()
-        # Boot redelivery reads back under the same contract as a live final delivery.
-        assert set(body["delivery"]) == {"obligation_id", "state", "content_digest", "chat_id",
-                                         "reply_to_message_id", "message_ids"}
-        assert body["delivery"]["message_ids"] == [78, 79]
-        assert body["evidenceDigest"] == body["delivery"]["content_digest"] == (
-            "sha256:" + hashlib.sha256(body["content"].encode("utf-8")).hexdigest())
-        assert receipts.lookup(gw.db, 901).receipt_id == f"hermes-tg:{row['obligation_id']}"
+
+    def test_an_unrecorded_obligation_withholds_the_managed_answer(self, gw, monkeypatch):
+        """U4-03: no ledger row, no managed send. The receipt is a definite non-delivery."""
+        from gateway import delivery_ledger
+
+        admission = _admitted(gw)
+        adapter = self._adapter(gw)
+        monkeypatch.setattr(delivery_ledger, "record_obligation",
+                            lambda **k: (_ for _ in ()).throw(OSError("disk I/O error")))
+        result, _ = asyncio.run(adapter.send_final_ledgered(
+            self._managed_event(gw, admission), gw.entry.session_key, "managed answer", {}, reply_to="55"))
+        assert result.success is False and adapter.sent == [ingress.UNRECORDED]
+        receipt = receipts.lookup(gw.db, 901)
+        assert receipt.status == "ABORTED" and receipt.reason_code == "HERMES_ANSWER_NOT_RECORDED"
+
+    def test_an_unrecorded_ordinary_answer_is_still_sent(self, gw, monkeypatch):
+        from gateway import delivery_ledger
+        from gateway.platforms.event import MessageEvent
+
+        adapter = self._adapter(gw)
+        monkeypatch.setattr(delivery_ledger, "record_obligation",
+                            lambda **k: (_ for _ in ()).throw(OSError("disk I/O error")))
+        asyncio.run(adapter.send_final_ledgered(
+            MessageEvent(text="hi", source=gw.source, message_id="56"), gw.entry.session_key,
+            "ordinary answer", {}, reply_to="56"))
+        assert adapter.sent == ["ordinary answer"]
 
     def test_only_an_update_with_no_ledgered_answer_is_a_death_before_answer(self, gw, monkeypatch):
         from gateway import delivery_ledger
@@ -510,26 +543,10 @@ class TestAdapterEntry:
         await adapter.handle_message(self._msg(gw, "ordinary", 3))
         assert busy_calls == ["ordinary"]  # ordinary text keeps its busy route
 
-    @pytest.mark.asyncio
-    async def test_text_before_a_task_is_its_own_update_and_a_split_tail_joins_the_task(self, gw):
-        """REG1: a >4096-char /acp paste arrives as a near-limit chunk plus continuations; the tail
-        must join the task, and ordinary text batched just before it must not."""
-        adapter = self._adapter(gw)
-        adapter._text_batch_delay_seconds = adapter._text_batch_split_delay_seconds = 0.05
-        head = "/acp " + "x" * 4095
-        adapter._enqueue_text_event(self._msg(gw, "hello", 10))
-        adapter._enqueue_text_event(self._msg(gw, head, 11))
-        adapter._enqueue_text_event(self._msg(gw, "TAIL", 12))
-        for _ in range(100):
-            if len(adapter.dispatched) == 2:
-                break
-            await asyncio.sleep(0.02)
-        assert sorted(adapter.dispatched, key=len) == ["hello", head + "\nTAIL"]
-
-
-class TestSplitEvidence:
-    """CEO a430c090: a split /acp paste joins only on Telegram's own evidence; an ordinary message
-    that merely arrives inside the batch window is never absorbed into the managed task."""
+class TestUpdateIdentity:
+    """U4-01 (option A, CEO d34c076b): an /acp message is always its own update. Telegram gives no
+    evidence that tells a client split from a separate message, so nothing is ever joined to a task,
+    and a task long enough to have been split is refused before ACP is asked."""
 
     def _run(self, gw, chunks):
         adapter = TestAdapterEntry()._adapter(gw)
@@ -537,11 +554,10 @@ class TestSplitEvidence:
         from gateway.platforms.event import MessageEvent, MessageType
 
         async def exercise():
-            for text, mid, extra in chunks:
-                source = extra.pop("source", gw.source)
+            for text, mid in chunks:
                 adapter._enqueue_text_event(MessageEvent(text=text, message_type=MessageType.TEXT,
-                                                         source=source, message_id=str(mid),
-                                                         platform_update_id=mid, **extra))
+                                                         source=gw.source, message_id=str(mid),
+                                                         platform_update_id=mid))
             for _ in range(100):
                 if len(adapter.dispatched) >= len(chunks):
                     break
@@ -550,25 +566,63 @@ class TestSplitEvidence:
             return adapter.dispatched
         return asyncio.run(exercise())
 
-    HEAD = "/acp " + "x" * 4095
+    @pytest.mark.parametrize("head", ["/acp deploy", "/acp " + "x" * 3990, "/acp " + "x" * 4091],
+                             ids=["short", "near_limit", "split_length"])
+    def test_an_ordinary_follow_up_is_never_absorbed(self, gw, head):
+        dispatched = self._run(gw, [("hello", 10), (head, 11), ("next message", 12)])
+        assert sorted(dispatched, key=len) == sorted(["hello", head, "next message"], key=len)
 
-    def test_a_real_split_tail_joins(self, gw):
-        assert self._run(gw, [(self.HEAD, 11, {}), ("TAIL", 12, {})]) == [self.HEAD + "\nTAIL"]
+    def test_a_split_length_task_is_refused_before_acp_is_asked(self, gw):
+        async def exercise():
+            async with _Lane(gw.sock, _allowed(gw)) as lane:
+                outcome = await _admit(gw, _event("/acp " + "x" * 3995))
+            return outcome, lane.envelopes
 
-    @pytest.mark.parametrize("label", ["other_sender", "explicit_reply", "id_gap", "short_head"])
-    def test_an_ordinary_follow_up_is_never_absorbed(self, gw, label):
-        head, follow = self.HEAD, ("next message", 12, {})
-        if label == "other_sender":
-            follow = ("next message", 12, {"source": SessionSource(
-                platform=Platform.TELEGRAM, chat_id="100200300", chat_type="dm", user_id="999")})
-        elif label == "explicit_reply":
-            follow = ("next message", 12, {"reply_to_message_id": "11"})
-        elif label == "id_gap":
-            follow = ("next message", 14, {})
-        elif label == "short_head":
-            head = "/acp deploy"
-        dispatched = self._run(gw, [(head, 11, {}), follow])
-        assert sorted(dispatched, key=len) == sorted([head, "next message"], key=len)
+        outcome, envelopes = asyncio.run(exercise())
+        assert outcome.reply == ingress.TOO_LONG and outcome.admission is None and envelopes == []
+        assert receipts.lookup(gw.db, 901).status == "NEVER_FOUND"
+
+    def test_a_task_under_the_limit_is_admitted(self, gw):
+        assert _admitted(gw, "/acp " + "x" * 3990).task_text == "x" * 3990
+
+
+class TestQueuedChain:
+    """U4-02: when a /queue chain ends on an ordinary follow-up, the outer final answers that
+    follow-up; it must not carry the managed task's admission into the follow-up's obligation."""
+
+    def test_the_terminal_handoff_drops_the_admission(self, gw):
+        from gateway.platforms.event import MessageEvent
+        from gateway.run_turn import GatewayTurnMixin
+
+        admission = _admitted(gw)
+        event = MessageEvent(text="deploy", source=gw.source, message_id="55")
+        event._acp_admission = admission
+        GatewayTurnMixin._adopt_queued_terminal(event, {"queued_terminal_inbound_id": "56"})
+        assert event.ledger_message_id == "56" and event._acp_admission is None
+
+    def test_a_failed_managed_answer_is_not_certified_by_the_follow_up(self, gw):
+        """The reviewer's chain: the managed answer's send fails, the follow-up's outer final
+        succeeds on the same event object. The receipt stays PENDING for its own answer."""
+        from gateway.platforms.event import MessageEvent
+        from gateway.run_turn import GatewayTurnMixin
+
+        admission = _admitted(gw)
+        settle = TestLedgerSettlement()
+        event = MessageEvent(text="deploy", source=gw.source, message_id="55")
+        event._acp_admission = admission
+
+        async def exercise():
+            await gw.runner._send_queued_final_text(settle._adapter(gw, succeed=False), gw.source,
+                                                    "managed answer", None, "55", gw.entry.session_key,
+                                                    "55", acp_admission=admission)
+            GatewayTurnMixin._adopt_queued_terminal(event, {"queued_terminal_inbound_id": "56"})
+            await settle._adapter(gw).send_final_ledgered(event, gw.entry.session_key,
+                                                          "follow-up answer", {}, reply_to="55")
+
+        asyncio.run(exercise())
+        receipt = receipts.lookup(gw.db, 901)
+        assert receipt.status == "PENDING"
+        assert [r["content"] for r in receipts.ledger_answers(gw.db, 901)] == ["managed answer"]
 
 
 class TestHandleMessageSeam:
@@ -635,3 +689,70 @@ class TestHandleMessageSeam:
         monkeypatch.setattr(gw.runner, "_hm_evict_reaped_agent", lambda key: None)
         reply = asyncio.run(gw.runner._handle_message(event("/acp deploy")))
         assert reply == ingress.BUSY and queued == [] and runs == []
+
+
+class TestStore:
+    """U4-05: receipts and the delivery ledger share one store, the launch home's state.db. A
+    binding whose session a named profile owns is not managed at all."""
+
+    def test_a_named_profile_binding_is_not_managed(self, gw, monkeypatch):
+        assert ingress.bound_binding(gw.runner, gw.source) is not None
+        monkeypatch.setattr(gw.runner.session_store, "_named_profile_for_key", lambda key: "work")
+        assert ingress.bound_binding(gw.runner, gw.source) is None
+
+    def test_a_store_other_than_the_ledgers_is_refused_unasked(self, gw, monkeypatch, tmp_path):
+        from gateway import delivery_ledger
+
+        monkeypatch.setattr(delivery_ledger, "_db_path", lambda: tmp_path / "elsewhere.db")
+
+        async def exercise():
+            async with _Lane(gw.sock, _allowed(gw)) as lane:
+                outcome = await _admit(gw, _event("/acp deploy"))
+            return outcome, lane.envelopes
+
+        outcome, envelopes = asyncio.run(exercise())
+        assert outcome.admission is None and "launch home" in outcome.reply and envelopes == []
+
+
+class TestCrashRecovery:
+    """A managed turn the dead process left marked is neither resumed (no admission covers a
+    second run) nor redelivered; an ordinary one keeps its recovery."""
+
+    def _history(self, meta, started):
+        from datetime import datetime, timezone
+        return [{"role": "user", "content": "deploy", "display_metadata": meta,
+                 "timestamp": started + 1},
+                {"role": "assistant", "content": "done",
+                 "timestamp": started + 2}]
+
+    def test_the_managed_marker_is_read_from_the_turns_own_user_row(self):
+        import time as _time
+        from gateway.run_startup import GatewayStartupMixin as M
+
+        started = _time.time() - 60
+        assert M._crash_left_turn_is_acp_managed(self._history({"acp_update_id": "901"}, started), started)
+        assert M._crash_left_turn_is_acp_managed(self._history(json.dumps({"acp_update_id": "901"}), started),
+                                                 started)
+        assert not M._crash_left_turn_is_acp_managed(self._history({"gateway_input_owner": "x"}, started), started)
+        # an earlier turn's managed row is not this turn's
+        assert not M._crash_left_turn_is_acp_managed(self._history({"acp_update_id": "901"}, started - 100),
+                                                     started)
+
+    @pytest.mark.parametrize("managed", [True, False])
+    def test_a_crash_left_managed_turn_is_cleared_not_resumed_or_ledgered(self, gw, monkeypatch, managed):
+        store = gw.runner.session_store
+        store.mark_turn_active(gw.entry.session_key)
+        started = store._entries[gw.entry.session_key].active_turn_started_at.timestamp()
+        meta = {"acp_update_id": "901"} if managed else {"gateway_input_owner": "x"}
+        history = self._history(meta, started)
+
+        async def load(session_id):
+            return history
+
+        monkeypatch.setattr(gw.runner.async_session_store, "load_transcript", load)
+        resumed, ledgered = asyncio.run(gw.runner._recover_unclean_sessions())
+        entry = store._entries[gw.entry.session_key]
+        if managed:
+            assert (resumed, ledgered) == (0, 0) and not entry.resume_pending
+        else:
+            assert (resumed, ledgered) == (0, 1)  # the persisted reply is owed delivery

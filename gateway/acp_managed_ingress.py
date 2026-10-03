@@ -37,6 +37,9 @@ _SOCKET_NAME = "telegram-update.ingress.sock"
 _KEYCHAIN_SERVICE = "com.agentcontrolplane.agentcpd"
 _KEYCHAIN_ACCOUNT = "ACP_TELEGRAM_EXTERNAL_SECRET"
 _ADMISSION_TIMEOUT_S = 15.0
+# Telegram splits a longer paste client-side into messages Hermes cannot tell from separate ones, so a
+# managed task must fit in one (the adapter's own split threshold).
+_MAX_TASK_MESSAGE_CHARS = 4000
 _MAX_ANSWER_BYTES = 16 * 1024
 _TURN_FIELDS = (
     "turnRequestId", "targetActorId", "promptDigest", "bindingGeneration", "targetBindingId",
@@ -47,6 +50,10 @@ REFUSED = "🛑 ACP did not admit this /acp task ({reason}); it was not run."
 UNKNOWN = ("⚠️ The ACP admission outcome for this /acp task is unknown. It was not run here and "
            "will not be retried automatically; check its state in ACP and resend if needed.")
 BUSY = "⏳ Another turn is running, so this /acp task was not admitted. Resend it when the turn ends."
+TOO_LONG = ("🛑 This /acp task is too long for one Telegram message, so it was not run. Send it under "
+            "4000 characters (or as a file and refer to it).")
+UNRECORDED = ("⚠️ The answer to this /acp task could not be recorded for delivery, so it was not sent. "
+              "It will not be retried; check the task in ACP and resend if needed.")
 DUPLICATE = "This /acp update was already handled and was not run again (receipt: {status})."
 
 
@@ -79,7 +86,28 @@ def bound_binding(runner: Any, source: Any) -> Any:
         return None
     if binding.telegram_user_id is not None and str(source.user_id) != str(binding.telegram_user_id):
         return None
+    named = getattr(runner.session_store, "_named_profile_for_key", None)
+    if callable(named) and named(binding.session_key) is not None:
+        # Managed /acp is supported only for a launch-home (agent:main) binding, whose receipts and
+        # delivery ledger share one state.db. A named-profile binding keeps today's ordinary path.
+        return None
     return binding
+
+
+def launch_home_store(runner: Any) -> Any:
+    """The one store receipts and the delivery ledger both live in: the binding's DB, accepted only
+    when it is the launch home's state.db (the ledger's file). None when they differ."""
+    from gateway.delivery_ledger import _db_path
+
+    binding = (getattr(getattr(runner, "config", None), "canonical_surface_bindings", None) or {}).get(_BINDING)
+    if binding is None:
+        return None
+    db = runner.session_store._db_for_key(binding.session_key)
+    try:
+        same = Path(db.db_path).resolve() == Path(_db_path()).resolve()
+    except Exception:
+        return None
+    return db if same else None
 
 
 def is_managed(runner: Any, event: Any, source: Any) -> bool:
@@ -178,6 +206,10 @@ async def admit(runner: Any, event: Any, source: Any, session_key: str, *, path:
         # would approve is not the session that would run, so the task is refused unasked.
         return Outcome(reply=REFUSED.format(reason="target mismatch"))
     task_text = receipts.acp_managed_task_text(event.text)
+    if len(event.text or "") >= _MAX_TASK_MESSAGE_CHARS:
+        return Outcome(reply=TOO_LONG)
+    if launch_home_store(runner) is None:
+        return Outcome(reply=REFUSED.format(reason="receipt store is not the launch home"))
     from gateway.delivery_ledger import ledger_enabled
     if not ledger_enabled():
         # The ledger row is the receipt's only evidence of an answer: without it, refuse unasked.
@@ -235,6 +267,13 @@ def abort_claimed(admission: Optional[Admission]) -> None:
                                 reason_code="REFUSED_BEFORE_RUN", **admission.proof)
 
 
+def abort_unrecorded(admission: Optional[Admission]) -> None:
+    """The answer was withheld because its obligation could not be recorded: a definite non-delivery."""
+    if admission is not None:
+        receipts.settle_aborted(admission.db, admission.update_id,
+                                reason_code="HERMES_ANSWER_NOT_RECORDED", **admission.proof)
+
+
 _PROCESS_OWNER: Optional[str] = None
 
 
@@ -276,9 +315,7 @@ def settle_delivered(runner: Any, obligation_id: str) -> bool:
 
 
 def _binding_db(runner: Any) -> Any:
-    config = getattr(runner, "config", None)
-    binding = (getattr(config, "canonical_surface_bindings", None) or {}).get(_BINDING)
-    return runner.session_store._db_for_key(binding.session_key) if binding is not None else None
+    return launch_home_store(runner)
 
 
 def sweep_at_startup(runner: Any) -> list:

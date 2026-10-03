@@ -2514,6 +2514,18 @@ class BasePlatformAdapter(ABC):
         """Session-scoped key for text batching (subclasses may override)."""
         return self._event_session_key(event)
 
+    async def _withhold_unrecorded_acp_answer(self, event, delivery_adapter, reply_to, metadata):
+        from gateway.acp_managed_ingress import UNRECORDED, abort_unrecorded
+        logger.error("ACP managed answer for update %s withheld: its delivery obligation was not recorded",
+                     event._acp_admission.update_id)
+        try:
+            await asyncio.to_thread(abort_unrecorded, event._acp_admission)
+        except Exception:
+            logger.warning("ACP receipt abort after an unrecorded answer failed", exc_info=True)
+        await delivery_adapter._send_with_retry(
+            chat_id=event.source.chat_id, content=UNRECORDED, reply_to=reply_to, metadata=metadata)
+        return SendResult(success=False, error="acp_obligation_unrecorded"), delivery_adapter
+
     async def _settle_acp_delivered(self, obligation_id: str) -> None:
         """U4: the ledgered /acp answer reached the chat — settle its receipt from the ledger row.
         A failed settlement leaves the receipt PENDING; GET and the startup sweep read the row."""
@@ -2541,28 +2553,18 @@ class BasePlatformAdapter(ABC):
             return
         key = self._text_batch_key(event)
         if self._is_acp_managed(event):
-            # U4 H2: an /acp task opens its own batch. Text batched before it goes out as its own
-            # update (merged in, it would run under that message's ids as ordinary text), while the
-            # continuation chunks of a split /acp paste still join the task that heads the batch.
+            # U4 H2: an /acp task is its own update, never batched. Text batched before it goes out on
+            # its own, and nothing after it can join: Telegram gives no evidence that tells a client
+            # split from a separate message, so a split-length /acp is refused at admission instead.
             prior = self._pop_text_batch(key)
             prior_task = self._pending_text_batch_tasks.pop(key, None)
             if prior_task is not None and not prior_task.done():
                 prior_task.cancel()
             if prior is not None:
                 self._dispatch_text_batch_detached(prior)
-            event._acp_batch_head = True  # type: ignore[attr-defined]
+            self._dispatch_text_batch_detached(event)
+            return
         existing = self._pending_text_batches.get(key)
-        if (existing is not None and getattr(existing, "_acp_batch_head", False)
-                and not self._is_split_continuation(existing, event)):
-            # Only a real client-side split continues an /acp task. Anything else (another sender, an
-            # explicit reply, a gap in message ids, a head that was not near the split length) is its
-            # own update: the task goes out now and this text opens an ordinary batch.
-            self._pop_text_batch(key)
-            head_task = self._pending_text_batch_tasks.pop(key, None)
-            if head_task is not None and not head_task.done():
-                head_task.cancel()
-            self._dispatch_text_batch_detached(existing)
-            existing = None
         if existing is None:
             existing = self._pending_text_batches[key] = event
         else:
@@ -2572,7 +2574,6 @@ class BasePlatformAdapter(ABC):
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
         existing._last_chunk_len = len(event.text or "")  # type: ignore[attr-defined]
-        existing._last_chunk_message_id = event.message_id  # type: ignore[attr-defined]
         prior_task = self._pending_text_batch_tasks.get(key)
         if prior_task and not prior_task.done():
             prior_task.cancel()
@@ -2582,23 +2583,6 @@ class BasePlatformAdapter(ABC):
         task = asyncio.create_task(self._dispatch_text_batch(event))
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
-
-    def _is_split_continuation(self, head: "MessageEvent", event: "MessageEvent") -> bool:
-        """U4 H2: does ``event`` continue the client-side split of the /acp task ``head``? Only on
-        Telegram's own evidence: same chat and sender, not an explicit reply, the previous chunk at
-        the split length, and the next message id in sequence."""
-        if self._is_acp_managed(event) or getattr(event, "reply_to_message_id", None):
-            return False
-        hs, es = head.source, event.source
-        if (str(getattr(hs, "chat_id", "")) != str(getattr(es, "chat_id", ""))
-                or str(getattr(hs, "user_id", "")) != str(getattr(es, "user_id", ""))):
-            return False
-        if getattr(head, "_last_chunk_len", 0) < self._SPLIT_THRESHOLD:
-            return False
-        try:
-            return int(str(event.message_id)) == int(str(getattr(head, "_last_chunk_message_id", None))) + 1
-        except (TypeError, ValueError):
-            return False
 
     def _text_batch_delay_for(self, pending: Optional["MessageEvent"]) -> float:
         """Quiet period before ``pending`` is dispatched; near-split chunks wait longer."""
@@ -4364,6 +4348,11 @@ class BasePlatformAdapter(ABC):
                     len(text_content), event.source.chat_id)
         obligation_id = await self._record_delivery_obligation(
             event, session_key, text_content, delivery_adapter, is_ephemeral_response)
+        if obligation_id is None and getattr(event, "_acp_admission", None) is not None:
+            # A managed /acp answer is sent only with its ledger row (its receipt's only evidence): with
+            # the row unrecorded, the answer is withheld, the receipt is aborted as a definite
+            # non-delivery, and the owner is told plainly — no unaccounted managed delivery.
+            return await self._withhold_unrecorded_acp_answer(event, delivery_adapter, reply_to, metadata)
         if obligation_id is not None:
             await self._release_turn_marker(event)  # the ledger now owns the crash recovery
         result = await delivery_adapter._send_with_retry(
