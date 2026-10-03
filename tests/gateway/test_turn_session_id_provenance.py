@@ -41,3 +41,54 @@ def test_a_reused_agent_turn_reports_its_own_session_in_mcp_provenance(monkeypat
 
     assert seen == ["20261001_092716_99cbd6"]
     assert after == ""  # bound for the turn only; the handler's context is left as it was
+
+
+class _ContendedDb:
+    """A session another process held (and compressed) while this turn waited for its lease."""
+
+    def get_session(self, session_id):
+        return {"id": session_id}
+
+    def acquire_session_turn_lease(self, session_id, holder, *, on_wait, **kwargs):
+        on_wait(0.5)
+        return True
+
+    def resolve_resume_session_id(self, session_id):
+        return "compressed-tip"
+
+    def get_messages_as_conversation(self, session_id, **kwargs):
+        return []
+
+    def release_session_turn_lease(self, session_id, holder):
+        pass
+
+
+def test_a_turn_that_waited_onto_a_compressed_tip_reports_the_tip(monkeypatch):
+    """The holder compressed the session while this turn waited for its lease; admission adopts the
+    continuation tip, and the turn's MCP calls must name that tip, not the id it was bound with."""
+    from agent.turn_facade_lease import admit_durable_turn_lease
+    from gateway.session_context import scoped_current_session_id
+    from tools.mcp_call_provenance import build_call_provenance
+
+    import threading
+
+    monkeypatch.setenv("HERMES_SESSION_ID", "")  # the legacy rebind also writes os.environ
+    monkeypatch.setattr("agent.turn_liveness.resolve_turn_liveness_settings", lambda cfg: (None, 1.0))
+    agent = SimpleNamespace(
+        _session_db=_ContendedDb(), session_id="live-agent", _persist_disabled=False,
+        _interrupt_requested=False, _interrupt_message=None, _execution_thread_id=None,
+        _session_turn_lease_refresh_interval=60.0, _emit_status=lambda *a: None,
+        _emit_warning=lambda *a: None, _touch_activity=lambda *a, **k: None,
+        _liveness_activity_lock=lambda: threading.Lock())
+    task_context = {"session_id": "live-agent", "task_id": "t", "platform": "telegram"}
+    with scoped_current_session_id("live-agent"):
+        admission = admit_durable_turn_lease(
+            agent, session_id="live-agent", relay_turn_id="live-agent:t:1",
+            task_context=task_context, conversation_history=[])
+        try:
+            reported = build_call_provenance()["session_id"]
+        finally:
+            admission.lease.release()
+
+    assert agent.session_id == "compressed-tip"
+    assert reported == "compressed-tip"

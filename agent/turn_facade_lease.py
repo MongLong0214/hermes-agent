@@ -295,6 +295,9 @@ def admit_durable_turn_lease(
             if latest_session_id:
                 agent.session_id = latest_session_id
                 task_context["session_id"] = latest_session_id
+                # Same rebind the compression writers do: MCP call provenance reads the context.
+                from agent.conversation_compression import _rebind_session_context
+                _rebind_session_context(latest_session_id)
             reloaded = db.get_messages_as_conversation(
                 agent.session_id, repair_alternation=True, include_row_ids=True
             )
