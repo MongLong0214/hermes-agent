@@ -119,17 +119,32 @@ class TestLateCommitAfterAdmissionTimeout:
     Zero duplicate execution means the late commit's settlement is refused, not re-applied."""
 
     def test_a_late_completion_after_the_timeout_tombstone_is_refused(self, db):
+        # A different attempt already owns "1" (the one admission is timing out on). This one
+        # gives up waiting and calls the exact H3 function the timeout path uses — not a bare
+        # settle_aborted — so the tombstone it writes, if any, is the real refuse_before_run
+        # outcome: here it writes nothing, because a receipt is already claimed (see
+        # test_refuse_before_run_does_not_clobber_an_already_claimed_receipt above).
         receipts.claim_pending(
             db, "1", message_id="m", turn_request_id="t", receipt_identity={}, owner="o1", **_proof(db),
         )
-        # Admission gave up waiting and tombstoned REFUSED_BEFORE_RUN before the real run answered.
-        assert receipts.settle_aborted(db, "1", reason_code="ADMISSION_TIMEOUT", **_proof(db))
-        # The turn that was actually running finishes late and tries to settle COMPLETED.
+        receipts.refuse_before_run(
+            db, "1", message_id="m", turn_request_id="t-timed-out", receipt_identity={}, **_proof(db),
+        )
+        assert receipts.lookup(db, "1").status == "PENDING"  # the live owner's claim, untouched
+        # The turn that was actually running (owner "o1") finishes late and settles COMPLETED —
+        # this is the real "late commit": zero duplicate execution means IT alone determines the
+        # outcome, and nothing the timed-out attempt wrote can race or overwrite it.
         late_commit_ok = receipts.settle_completed(
             db, "1", receipt_id="hermes-tg:ob1", evidence_digest="sha256:late", **_proof(db),
         )
-        assert late_commit_ok is False
-        assert receipts.lookup(db, "1").status == "ABORTED"  # never silently promoted, never re-run
+        assert late_commit_ok is True
+        assert receipts.lookup(db, "1").status == "COMPLETED"
+        # A SECOND late settlement (e.g. a retried admission that somehow also ran the turn)
+        # is refused — the terminal already recorded is never re-applied or overwritten.
+        assert receipts.settle_completed(
+            db, "1", receipt_id="hermes-tg:ob2", evidence_digest="sha256:duplicate", **_proof(db),
+        ) is False
+        assert receipts.lookup(db, "1").receipt_id == "hermes-tg:ob1"  # the first commit stands
 
 
 class TestDeadOwnerSweep:
