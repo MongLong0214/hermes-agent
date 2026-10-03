@@ -419,7 +419,14 @@ class TestLedgerSettlement:
         [row] = receipts.ledger_answers(gw.db, 901)
         delivery_ledger.mark_delivered(row["obligation_id"], message_ids=["78", "79"])
         assert ingress.settle_delivered(gw.runner, row["obligation_id"])
-        assert receipts.lookup(gw.db, 901).delivery["message_ids"] == [78, 79]
+        import hashlib
+        body = receipts.lookup(gw.db, 901).to_response()
+        # Boot redelivery reads back under the same contract as a live final delivery.
+        assert set(body["delivery"]) == {"obligation_id", "state", "content_digest", "chat_id",
+                                         "reply_to_message_id", "message_ids"}
+        assert body["delivery"]["message_ids"] == [78, 79]
+        assert body["evidenceDigest"] == body["delivery"]["content_digest"] == (
+            "sha256:" + hashlib.sha256(body["content"].encode("utf-8")).hexdigest())
         assert receipts.lookup(gw.db, 901).receipt_id == f"hermes-tg:{row['obligation_id']}"
 
     def test_only_an_update_with_no_ledgered_answer_is_a_death_before_answer(self, gw, monkeypatch):
@@ -518,6 +525,50 @@ class TestAdapterEntry:
                 break
             await asyncio.sleep(0.02)
         assert sorted(adapter.dispatched, key=len) == ["hello", head + "\nTAIL"]
+
+
+class TestSplitEvidence:
+    """CEO a430c090: a split /acp paste joins only on Telegram's own evidence; an ordinary message
+    that merely arrives inside the batch window is never absorbed into the managed task."""
+
+    def _run(self, gw, chunks):
+        adapter = TestAdapterEntry()._adapter(gw)
+        adapter._text_batch_delay_seconds = adapter._text_batch_split_delay_seconds = 0.05
+        from gateway.platforms.event import MessageEvent, MessageType
+
+        async def exercise():
+            for text, mid, extra in chunks:
+                source = extra.pop("source", gw.source)
+                adapter._enqueue_text_event(MessageEvent(text=text, message_type=MessageType.TEXT,
+                                                         source=source, message_id=str(mid),
+                                                         platform_update_id=mid, **extra))
+            for _ in range(100):
+                if len(adapter.dispatched) >= len(chunks):
+                    break
+                await asyncio.sleep(0.02)
+            await asyncio.sleep(0.15)
+            return adapter.dispatched
+        return asyncio.run(exercise())
+
+    HEAD = "/acp " + "x" * 4095
+
+    def test_a_real_split_tail_joins(self, gw):
+        assert self._run(gw, [(self.HEAD, 11, {}), ("TAIL", 12, {})]) == [self.HEAD + "\nTAIL"]
+
+    @pytest.mark.parametrize("label", ["other_sender", "explicit_reply", "id_gap", "short_head"])
+    def test_an_ordinary_follow_up_is_never_absorbed(self, gw, label):
+        head, follow = self.HEAD, ("next message", 12, {})
+        if label == "other_sender":
+            follow = ("next message", 12, {"source": SessionSource(
+                platform=Platform.TELEGRAM, chat_id="1718881034", chat_type="dm", user_id="999")})
+        elif label == "explicit_reply":
+            follow = ("next message", 12, {"reply_to_message_id": "11"})
+        elif label == "id_gap":
+            follow = ("next message", 14, {})
+        elif label == "short_head":
+            head = "/acp deploy"
+        dispatched = self._run(gw, [(head, 11, {}), follow])
+        assert sorted(dispatched, key=len) == sorted([head, "next message"], key=len)
 
 
 class TestHandleMessageSeam:

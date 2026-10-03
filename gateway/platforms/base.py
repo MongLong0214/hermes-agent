@@ -2549,10 +2549,20 @@ class BasePlatformAdapter(ABC):
             if prior_task is not None and not prior_task.done():
                 prior_task.cancel()
             if prior is not None:
-                task = asyncio.create_task(self._dispatch_text_batch(prior))
-                self._background_tasks.add(task)
-                task.add_done_callback(self._background_tasks.discard)
+                self._dispatch_text_batch_detached(prior)
+            event._acp_batch_head = True  # type: ignore[attr-defined]
         existing = self._pending_text_batches.get(key)
+        if (existing is not None and getattr(existing, "_acp_batch_head", False)
+                and not self._is_split_continuation(existing, event)):
+            # Only a real client-side split continues an /acp task. Anything else (another sender, an
+            # explicit reply, a gap in message ids, a head that was not near the split length) is its
+            # own update: the task goes out now and this text opens an ordinary batch.
+            self._pop_text_batch(key)
+            head_task = self._pending_text_batch_tasks.pop(key, None)
+            if head_task is not None and not head_task.done():
+                head_task.cancel()
+            self._dispatch_text_batch_detached(existing)
+            existing = None
         if existing is None:
             existing = self._pending_text_batches[key] = event
         else:
@@ -2562,10 +2572,33 @@ class BasePlatformAdapter(ABC):
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
         existing._last_chunk_len = len(event.text or "")  # type: ignore[attr-defined]
+        existing._last_chunk_message_id = event.message_id  # type: ignore[attr-defined]
         prior_task = self._pending_text_batch_tasks.get(key)
         if prior_task and not prior_task.done():
             prior_task.cancel()
         self._pending_text_batch_tasks[key] = asyncio.create_task(self._flush_text_batch(key))
+
+    def _dispatch_text_batch_detached(self, event: "MessageEvent") -> None:
+        task = asyncio.create_task(self._dispatch_text_batch(event))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    def _is_split_continuation(self, head: "MessageEvent", event: "MessageEvent") -> bool:
+        """U4 H2: does ``event`` continue the client-side split of the /acp task ``head``? Only on
+        Telegram's own evidence: same chat and sender, not an explicit reply, the previous chunk at
+        the split length, and the next message id in sequence."""
+        if self._is_acp_managed(event) or getattr(event, "reply_to_message_id", None):
+            return False
+        hs, es = head.source, event.source
+        if (str(getattr(hs, "chat_id", "")) != str(getattr(es, "chat_id", ""))
+                or str(getattr(hs, "user_id", "")) != str(getattr(es, "user_id", ""))):
+            return False
+        if getattr(head, "_last_chunk_len", 0) < self._SPLIT_THRESHOLD:
+            return False
+        try:
+            return int(str(event.message_id)) == int(str(getattr(head, "_last_chunk_message_id", None))) + 1
+        except (TypeError, ValueError):
+            return False
 
     def _text_batch_delay_for(self, pending: Optional["MessageEvent"]) -> float:
         """Quiet period before ``pending`` is dispatched; near-split chunks wait longer."""
