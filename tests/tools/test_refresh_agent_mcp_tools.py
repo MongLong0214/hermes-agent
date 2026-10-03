@@ -308,6 +308,70 @@ def test_preserve_prefix_keeps_the_bridge_tools_byte_identical(monkeypatch):
     assert [t["function"]["name"] for t in agent.tools][-1] == "mcp_late_tool"
 
 
+def _search_bridge(*deferred_names):
+    """The ``tool_search`` def the real assembler renders for these deferred tools."""
+    from tools.tool_search import bridge_tool_schemas
+    from tools.tool_search_catalog import build_catalog_listing_with_form
+
+    deferred = [{"type": "function", "function": {"name": n, "description": f"{n} does a thing"}}
+                for n in deferred_names]
+    listing, form = build_catalog_listing_with_form(deferred)
+    return bridge_tool_schemas(len(deferred), listing=listing, listing_form=form)[0]
+
+
+def test_a_server_connected_after_build_reaches_the_bridge_listing(monkeypatch):
+    """The listing in ``tool_search`` is the only place a deferred tool is named to the model.
+    A server that connects after the session was built (a newly enabled ``mcp_servers`` entry)
+    must appear there, or the model never learns its tools exist. A listing that only LOST an
+    entry (``check_fn`` flap) keeps the built bytes, so a flap still costs no cache prefix."""
+    from tools.tool_search_catalog import BRIDGE_TOOL_NAMES
+
+    built = _search_bridge("mcp__commitlore__query", "mcp__commitlore__stale")
+    shrunk = _search_bridge("mcp__commitlore__query")
+    grown = _search_bridge("mcp__commitlore__query", "mcp__commitlore__stale", "mcp__acp_ceo__run_create")
+    agent = _agent(["read_file"])
+    agent.tools.append(built)
+    agent.valid_tool_names.add("tool_search")
+    _registered(monkeypatch, ["read_file", *BRIDGE_TOOL_NAMES])
+
+    _serve(monkeypatch, [_tool("read_file"), shrunk])
+    _mcp_agent.refresh_agent_mcp_tools(agent, preserve_prefix=True)
+    assert agent.tools[1] == built
+
+    _serve(monkeypatch, [_tool("read_file"), grown])
+    _mcp_agent.refresh_agent_mcp_tools(agent, preserve_prefix=True)
+    assert agent.tools == [_tool("read_file"), grown]
+
+
+def test_a_same_code_pin_takes_the_bridge_listing_that_names_a_new_server(monkeypatch):
+    """An evicted or restarted session rebuilds from its pin. Same code keeps the pinned bridge
+    bytes — through a surface that defers fewer tools too — but not a listing that predates a
+    server this build now defers: the rebuilt agent advertises the new tools, and the pin is
+    rewritten so the next rebuild stays put."""
+    from tools import registry as registry_mod
+
+    pinned_bridge = _search_bridge("mcp__commitlore__query", "mcp__commitlore__stale")
+    fresh_bridge = _search_bridge("mcp__commitlore__query", "mcp__acp_ceo__run_create")
+    narrower_bridge = _search_bridge("mcp__commitlore__query")
+    monkeypatch.setattr(registry_mod.registry, "get_all_entries",
+                        lambda: [types.SimpleNamespace(name=n) for n in ("read_file", "tool_search")],
+                        raising=False)
+    persisted = []
+    monkeypatch.setattr(_mcp_agent, "persist_agent_tool_names", lambda agent: persisted.append(list(agent.tools)))
+    pin = {"version": _mcp_agent.tool_pin_version(), "tools": [_tool("read_file"), pinned_bridge]}
+
+    narrower = _agent([])
+    narrower.tools = [_tool("read_file"), narrower_bridge]
+    _mcp_agent.restore_agent_tool_prefix(narrower, pin)
+    rebuilt = _agent([])
+    rebuilt.tools = [_tool("read_file"), fresh_bridge]
+    _mcp_agent.restore_agent_tool_prefix(rebuilt, pin)
+
+    assert narrower.tools == pin["tools"]
+    assert rebuilt.tools == [_tool("read_file"), fresh_bridge]
+    assert persisted == [[_tool("read_file"), fresh_bridge]]
+
+
 # ---------------------------------------------------------------------------
 # tools[] freeze: eviction rebuild + the /reload-mcp re-probe hatch
 # ---------------------------------------------------------------------------

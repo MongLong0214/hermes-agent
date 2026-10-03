@@ -258,6 +258,38 @@ def hidden_declared_sources() -> List[Dict[str, Any]]:
     return rows
 
 
+_LISTING_HEADER_PREFIX = "Deferred tool catalog ("
+_GROUP_HEADER_RE = re.compile(r"^(.+?) tools \(\d+\):$")
+_GROUP_SUMMARY_RE = re.compile(r"^(.+?) \(\d+ tools — names not listed;")
+_GROUP_UNAVAILABLE_RE = re.compile(r"^(.+?) \((?:\d+ )?tools unavailable:")
+
+
+def listing_entries(text: str) -> frozenset[str]:
+    """What a rendered listing advertises: tool names and group labels, counts excluded.
+    The inverse of ``build_catalog_listing_with_form`` (keep the two in step), so a caller can
+    tell a listing that names something new from one that only lost or recounted entries."""
+    _, sep, listing = (text or "").partition(_LISTING_HEADER_PREFIX)
+    if not sep:
+        return frozenset()
+    entries: set = set()
+    after_header = False
+    for line in listing.splitlines()[1:]:
+        if line.startswith("- "):
+            entries.add(line[2:].split(":", 1)[0].strip())
+        elif (m := _GROUP_HEADER_RE.match(line)):
+            entries.add(f"group:{m.group(1)}")
+            after_header = True
+            continue
+        elif (m := _GROUP_SUMMARY_RE.match(line)):
+            entries.add(f"group:{m.group(1)}")
+        elif (m := _GROUP_UNAVAILABLE_RE.match(line)):
+            entries.add(f"unavailable:{m.group(1)}")
+        elif after_header and line:
+            entries.update(name.strip() for name in line.split(", ") if name.strip())
+        after_header = False
+    return frozenset(entries)
+
+
 def build_catalog_listing_with_form(
     deferrable: List[Dict[str, Any]], *, max_tokens: int = 4000) -> Tuple[Optional[str], str]:
     """Render the deferred-catalog manifest: ``- name: short desc`` lines grouped per source.
