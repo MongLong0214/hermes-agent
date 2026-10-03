@@ -10,6 +10,7 @@ the GET route (``handle_telegram_receipt_lookup``) is covered separately in
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -195,6 +196,29 @@ class TestDeadOwnerSweep:
         assert receipts.lookup(db, "1").status == "COMPLETED"
 
 
-def test_is_acp_managed_message_is_always_false_until_the_boundary_is_decided():
-    # H2 seam predicate: inert by construction until CEO 3c058be8's boundary is decided.
-    assert receipts.is_acp_managed_message(object(), object()) is False
+class TestAcpManagedBoundary:
+    """CEO 3c058be8's ruling: only an explicit ``/acp <task>`` prefix is the managed boundary —
+    never config opt-in, never body classification."""
+
+    def test_an_ordinary_message_is_not_managed(self):
+        assert receipts.acp_managed_task_text("hello there") is None
+        assert receipts.is_acp_managed_message(SimpleNamespace(text="hello there"), None) is False
+
+    def test_the_bare_command_with_no_task_text_is_not_managed(self):
+        assert receipts.acp_managed_task_text("/acp") is None
+        assert receipts.acp_managed_task_text("/acp   ") is None
+
+    def test_an_explicit_prefixed_task_is_managed_and_the_task_text_is_extracted(self):
+        assert receipts.acp_managed_task_text("/acp check the deploy status") == "check the deploy status"
+        assert receipts.is_acp_managed_message(
+            SimpleNamespace(text="/acp check the deploy status"), None,
+        ) is True
+
+    def test_acp_mentioned_mid_sentence_is_not_managed(self):
+        """The message must START with the prefix — discussing /acp elsewhere is ordinary chat."""
+        assert receipts.acp_managed_task_text("can you use /acp for this?") is None
+
+    def test_none_or_empty_text_is_not_managed(self):
+        assert receipts.acp_managed_task_text(None) is None
+        assert receipts.acp_managed_task_text("") is None
+        assert receipts.is_acp_managed_message(SimpleNamespace(text=None), None) is False

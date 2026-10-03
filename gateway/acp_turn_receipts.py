@@ -46,16 +46,38 @@ _ABORT_PROCESS_DIED = "HERMES_PROCESS_DIED_BEFORE_ANSWER"
 _ABORT_REFUSED_BEFORE_RUN = "REFUSED_BEFORE_RUN"
 
 
+_MANAGED_PREFIX = "/acp "
+_MANAGED_PREFIX_BARE = "/acp"  # the bare command with no task text is not managed — nothing to admit
+
+
+def acp_managed_task_text(event_text: Optional[str]) -> Optional[str]:
+    """The task text after an explicit ``/acp `` prefix, or None when this message is not a
+    managed-ingress candidate. CEO 3c058be8's ruling (2026-10-03, Buzz event 36ade192): only this
+    explicit prefix is the admission boundary — never a config opt-in flag or body classification,
+    which would risk pulling ordinary DM traffic into ACP admission. Whitespace around the prefix
+    is not trimmed first: a message must *start* with it, so quoting or discussing ``/acp`` text
+    elsewhere in a sentence is not managed."""
+    text = event_text or ""
+    if text.startswith(_MANAGED_PREFIX):
+        task = text[len(_MANAGED_PREFIX):].strip()
+        return task or None
+    return None
+
+
 def is_acp_managed_message(event: Any, source: Any) -> bool:
     """H2's single admission-boundary predicate: is this inbound message a candidate for ACP
-    claim/dispatch at all? Always False until CEO 3c058be8's "explicit managed boundary" is
-    decided (the `/acp <task>` command-prefix candidate was proposed, not yet ruled) — ordinary
-    chat and status/recovery requests must never be routed through ACP by accident. The seam
-    call site in ``run_inbound.py`` is not wired to the actual ACP admission call in this slice:
-    with this predicate always False the call is unreachable, so wiring it now would be
-    untested dead code (and ACP's A1/A2 contract, PR #1062, is itself still under repair).
-    Flipping this function's body is the entire remaining integration once both are settled."""
-    return False
+    claim/dispatch at all? True only for an explicit ``/acp <task>`` prefix on the Telegram
+    origin a canonical binding is bound to — ordinary chat and status/recovery requests always
+    take today's path, never routed through ACP by body classification or a config flag.
+
+    The seam call site in ``run_inbound.py`` is not wired to the actual ACP admission call in
+    this slice: even though this predicate can now return True, nothing yet dispatches the
+    ``telegram-update.ingress.sock`` call, writes the pending receipt, or runs the turn through
+    ACP — that integration needs ACP's A1/A2 contract (PR #1062) settled first; wiring a call
+    against a still-repairing contract would be untested. Until then a ``/acp`` message takes
+    the ordinary path like any other text, unrouted."""
+    text = getattr(event, "text", None)
+    return acp_managed_task_text(text) is not None
 
 
 def receipt_key(update_id: Any) -> str:
