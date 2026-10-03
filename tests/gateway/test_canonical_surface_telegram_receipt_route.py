@@ -152,6 +152,24 @@ def test_wrong_bearer_is_refused(get_receipt):
     asyncio.run(exercise())
 
 
+def test_an_unresolvable_store_answers_uncertain_not_never_found(get_receipt, ingress, monkeypatch):
+    """Review R1: the resolver returns None for "no store yet" AND for a transient filesystem
+    error on a binding that WAS previously claimed. Collapsing both to NEVER_FOUND would tell a
+    caller it is safe to resend an update whose outcome this process simply cannot read right
+    now. Demonstrated with a receipt already claimed on the real store, then made unresolvable."""
+    async def exercise():
+        from gateway.canonical_surface import ExistingCanonicalBindingResolver
+
+        receipts.claim_pending(
+            ingress.db, "42", message_id="m1", turn_request_id="t1", receipt_identity={}, **ingress.proof(),
+        )
+        monkeypatch.setattr(ExistingCanonicalBindingResolver, "_existing_db_path", lambda self, key: None)
+        status, body = await get_receipt("42")
+        assert status == 409
+        assert body["error"]["code"] == "canonical_event_uncertain"
+    asyncio.run(exercise())
+
+
 def test_zero_telegram_bindings_answers_binding_unknown(get_receipt, ingress):
     async def exercise():
         ingress.runner.config.canonical_surface_bindings = {}

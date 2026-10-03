@@ -131,9 +131,11 @@ async def handle_telegram_receipt_lookup(self, request: "web.Request") -> "web.R
     resolver = ExistingCanonicalBindingResolver(runner.session_store)
     db_path = resolver._existing_db_path(binding.session_key)
     if db_path is None:
-        # No durable store for this binding yet (fresh install, startup window): the key was
-        # never claimed on it either, so this is NEVER_FOUND, not an error.
-        return web.json_response(acp_turn_receipts.not_found(update_id).to_response())
+        # The resolver returns None for "no store yet" AND for a filesystem error or a transient
+        # profile-home lookup failure (canonical_surface.py's own broad except). None of those can
+        # establish that this update was never claimed — H1's contract is that unreadability is
+        # never permission to resend, so this is uncertainty, not NEVER_FOUND.
+        return _refusal("canonical_event_uncertain", 409)
     from hermes_state import SessionDB
 
     reader = SessionDB(db_path, read_only=True)
