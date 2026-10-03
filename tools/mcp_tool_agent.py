@@ -20,6 +20,24 @@ def _def_name(tool_def: dict) -> str:
     return (tool_def.get("function") or {}).get("name", "")
 
 
+def _bridge_listing_grew(kept: dict, fresh: Optional[dict]) -> bool:
+    """True when ``fresh`` (a ``tool_search`` def) advertises a deferred tool or group that
+    ``kept`` does not. The bridge's bytes stay frozen through check_fn flaps and recounts, but
+    its listing is how the model learns a deferred tool exists, so a newly connected server
+    must reach it — the same one-time prefix cost an eager tool appended at the tail pays."""
+    if fresh is None or _def_name(kept) != "tool_search":
+        return False
+    from tools.tool_search_catalog import listing_names_new_tools
+    describe = lambda d: (d.get("function") or {}).get("description", "")  # noqa: E731
+    return listing_names_new_tools(describe(kept), describe(fresh))
+
+
+def _search_listing_grew(current_defs: list, new_defs: list) -> bool:
+    search = lambda defs: next((d for d in defs if _def_name(d) == "tool_search"), None)  # noqa: E731
+    current = search(current_defs)
+    return current is not None and _bridge_listing_grew(current, search(new_defs))
+
+
 def _agent_tool_defs(agent) -> list:
     return list(getattr(agent, "tools", None) or [])
 
@@ -79,9 +97,10 @@ def _publish_tool_snapshot(
         new_defs, new_names = _drop_side_agent_tools(agent, new_defs, new_names)
         # Record the generation even when unchanged so an in-flight older caller can't clobber.
         agent._tool_snapshot_generation = max(published_gen, snapshot_generation)
-        # Same NAME set: no change for MCP-reload callers. Content-aware callers
-        # (compaction boundary) also diff serialized bytes.
-        if new_names == current and not (content_aware and _tool_defs_content_changed(agent, new_defs)):
+        # Same NAME set: no change for MCP-reload callers, unless a server landed only in the
+        # deferred listing. Content-aware callers (compaction boundary) also diff serialized bytes.
+        if (new_names == current and not _search_listing_grew(current_defs, new_defs)
+                and not (content_aware and _tool_defs_content_changed(agent, new_defs))):
             return None
         agent.tools = new_defs
         agent.valid_tool_names = new_names
@@ -211,7 +230,7 @@ def restore_agent_tool_prefix(agent, saved) -> bool:
 
     def _pinned_def(item):
         name = item if isinstance(item, str) else _def_name(item)
-        if isinstance(item, dict) and same_code:
+        if isinstance(item, dict) and same_code and not _bridge_listing_grew(item, fresh.get(name)):
             return item
         if name in fresh:
             return fresh[name]
@@ -246,8 +265,8 @@ def _merge_preserving_prefix(current_defs: list, new_defs: list, registered_name
 
     The bridge tools keep their BUILT entry, not the fresh one: ``tool_search``'s description
     is derived from the session (deferred count, listing, whether ``manage_connections`` was
-    present), so a late MCP server or a ``check_fn`` flap would rewrite it every turn. Search
-    reads the live catalog at dispatch, so the stale count costs nothing."""
+    present), so a ``check_fn`` flap would rewrite it every turn. Search reads the live catalog
+    at dispatch, so a stale count costs nothing; a listing that gained an entry is taken."""
     from tools.tool_search_catalog import BRIDGE_TOOL_NAMES
     fresh = {_def_name(entry): entry for entry in new_defs if _def_name(entry)}
     merged = []
@@ -255,7 +274,7 @@ def _merge_preserving_prefix(current_defs: list, new_defs: list, registered_name
         name = _def_name(entry)
         replacement = fresh.pop(name, None)
         if name in BRIDGE_TOOL_NAMES:
-            merged.append(entry)
+            merged.append(replacement if _bridge_listing_grew(entry, replacement) else entry)
         elif replacement is not None:
             merged.append(replacement)
         elif name and name in registered_names:
