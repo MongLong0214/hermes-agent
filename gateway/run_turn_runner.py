@@ -1962,6 +1962,16 @@ class TurnRunner:
         agent, reused_cached_agent = self._resolve_turn_agent(
             turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr,
         )
+        _acp = ctx.acp_admission
+        if _acp is not None:
+            from gateway import acp_managed_ingress
+            # Under this turn's slot and lease, with the executor resolved: run only the session and
+            # lineage ACP approved; anything else is recorded as a definite non-run.
+            if not acp_managed_ingress.target_still_matches(
+                    _acp, ctx.session_key, getattr(agent, "_session_db", None), getattr(agent, "session_id", None)):
+                acp_managed_ingress.abort_claimed(_acp)
+                return {"final_response": acp_managed_ingress.REFUSED.format(reason="target mismatch"),
+                        "messages": [], "api_calls": 0, "tools": []}
         if pending_fallback_notice:
             # Reuse the in-agent one-shot notice so the pre-agent provider switch is user-visible too.
             agent._pending_fallback_notice = pending_fallback_notice
@@ -1969,6 +1979,10 @@ class TurnRunner:
         agent_history, observed_group_context, history_media_paths = self._load_turn_history(agent, reused_cached_agent)
         persist_msg, persist_ts = self._prepare_turn_message(agent_history)
         result = self._run_conversation_with_approval(agent, agent_history, observed_group_context, persist_msg, persist_ts)
+        if _acp is not None:
+            # Settled from this turn's own final response before it is sealed or delivered, so no
+            # delivery path (stream, ledger, queued chain) can leave it unsettled or certify another.
+            acp_managed_ingress.settle_turn(_acp, result)
         self._finish_stream_consumer(result, agent_history, stream_consumer)
         # The streaming-TTS consumer's finish() runs on the outer loop thread after the executor
         # returns, so early run_sync returns are also finalised.

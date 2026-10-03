@@ -1363,7 +1363,10 @@ class GatewayInboundMixin:
                 acp_managed_ingress.abort_claimed(event._acp_admission)
             return _limit_message
 
-        event, source, is_internal = self._hm_rescue_orphaned_fifo(event, source, is_internal, _quick_key)
+        if not _acp_managed:
+            # A managed task must run as THIS turn: the rescue would park it behind an orphan, where
+            # it would later drain as an ordinary turn without its admission.
+            event, source, is_internal = self._hm_rescue_orphaned_fifo(event, source, is_internal, _quick_key)
 
         _claim_state = self._session_state(_quick_key)
         if _active_session_lease is not None:
