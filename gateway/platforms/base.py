@@ -4272,10 +4272,17 @@ class BasePlatformAdapter(ABC):
             event, session_key, text_content, delivery_adapter, is_ephemeral_response)
         if obligation_id is not None:
             await self._release_turn_marker(event)  # the ledger now owns the crash recovery
+        if getattr(event, "_acp_admission", None) is not None:
+            from gateway.acp_managed_ingress import attach_obligation
+            await asyncio.to_thread(attach_obligation, event, obligation_id)
         result = await delivery_adapter._send_with_retry(
             chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
         if obligation_id is not None:
             await self._finalize_delivery_obligation(obligation_id, result, event, delivery_adapter)
+        if getattr(event, "_acp_admission", None) is not None:
+            from gateway.acp_managed_ingress import settle_after_delivery
+            await asyncio.to_thread(settle_after_delivery, event, obligation_id=obligation_id,
+                                    text=text_content, result=result)
         return result, delivery_adapter
 
     async def _release_turn_marker(self, event: MessageEvent) -> None:
