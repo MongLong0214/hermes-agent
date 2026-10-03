@@ -6,9 +6,12 @@ This module deliberately does not receive ingress, create sessions, or deliver r
 import asyncio
 import hashlib
 import json
+import os
+import re
 import secrets
+import sqlite3
 import time
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol
@@ -18,6 +21,9 @@ from gateway.session_persistence import _DB_UNPINNED
 
 
 _EVENT_FIELDS = frozenset({"binding", "event_id", "author_id", "channel_id", "text"})
+_IDENTITY_FIELDS = frozenset({"session_id", "lineage_root_digest", "process_pid", "process_started_at"})
+_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_START_TOKEN = re.compile(r"(?:darwin-tv:[0-9]+\.[0-9]{6}|linux-clk:[0-9]+)\Z")
 _MAX_ID_CHARS = 256
 _MAX_TEXT_CHARS = 16_384
 _MAX_RECEIPT_CHARS = 32_768
@@ -28,6 +34,23 @@ def _required_text(value: Any, *, limit: int) -> str:
     """Validate text without normalizing caller-provided event identity."""
 
     if not isinstance(value, str) or not value.strip() or len(value) > limit:
+        raise ValueError("canonical_invalid_request")
+    return value
+
+def _expected_identity(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != _IDENTITY_FIELDS:
+        raise ValueError("canonical_invalid_request")
+    if (
+        not isinstance(value["session_id"], str)
+        or not value["session_id"].strip()
+        or len(value["session_id"]) > 512
+        or not isinstance(value["lineage_root_digest"], str)
+        or _DIGEST.fullmatch(value["lineage_root_digest"]) is None
+        or type(value["process_pid"]) is not int
+        or value["process_pid"] <= 0
+        or not isinstance(value["process_started_at"], str)
+        or _START_TOKEN.fullmatch(value["process_started_at"]) is None
+    ):
         raise ValueError("canonical_invalid_request")
     return value
 
@@ -171,6 +194,7 @@ class CanonicalIngressEvent:
     author_id: str
     channel_id: str
     text: str
+    expected_identity: dict[str, Any] | None = None
 
     @classmethod
     def from_json_bytes(cls, raw: bytes) -> "CanonicalIngressEvent":
@@ -191,7 +215,8 @@ class CanonicalIngressEvent:
             payload = json.loads(raw.decode("utf-8"), object_pairs_hook=closed_object)
         except (AttributeError, UnicodeDecodeError, json.JSONDecodeError):
             raise ValueError("canonical_invalid_request") from None
-        if duplicate or not isinstance(payload, dict) or set(payload) != _EVENT_FIELDS:
+        if (duplicate or not isinstance(payload, dict)
+                or set(payload) not in (_EVENT_FIELDS, _EVENT_FIELDS | _IDENTITY_FIELDS)):
             raise ValueError("canonical_invalid_request")
         return cls(
             binding=_required_text(payload["binding"], limit=_MAX_ID_CHARS),
@@ -199,6 +224,10 @@ class CanonicalIngressEvent:
             author_id=_required_text(payload["author_id"], limit=_MAX_ID_CHARS),
             channel_id=_required_text(payload["channel_id"], limit=_MAX_ID_CHARS),
             text=_required_text(payload["text"], limit=_MAX_TEXT_CHARS),
+            expected_identity=(
+                _expected_identity({key: payload[key] for key in _IDENTITY_FIELDS})
+                if _IDENTITY_FIELDS <= payload.keys() else None
+            ),
         )
 
 
@@ -500,11 +529,36 @@ class CanonicalReceiptCoordinator:
             proof.session_key, run_generation
         ):
             raise ValueError("canonical_turn_interrupted")
-        if self._runner.session_store.lookup_by_session_key_existing(proof.session_key) is not proof.entry:
+        if (self._runner.session_store.lookup_by_session_key_existing(proof.session_key) is not proof.entry
+                or getattr(proof.entry, "session_id", None) != proof.session_id):
             raise ValueError("canonical_binding_stale")
         current_actor, current_db = self._borrow_actor_db(self._runner, proof)
         if current_actor is not actor or current_db is not db:
             raise ValueError("canonical_agent_replaced")
+
+    @staticmethod
+    def _require_expected_identity(proof: CanonicalBindingProof, expected: dict[str, Any]) -> None:
+        """Compare durable lineage and native process identity under the held turn lease."""
+        from gateway.platforms.api_server_canonical import _process_started_at
+        from hermes_state_target_bind import _lineage_root_digest, _resolve_lineage_root
+
+        try:
+            with closing(sqlite3.connect(proof.db_path.resolve().as_uri() + "?mode=ro", uri=True)) as conn:
+                conn.row_factory = sqlite3.Row
+                if _path_identity(proof.db_path) != proof.db_identity:
+                    raise ValueError("canonical_binding_stale")
+                root = _resolve_lineage_root(conn, proof.session_id)
+            pid = os.getpid()
+            if (
+                expected["session_id"] != proof.session_id
+                or expected["lineage_root_digest"] != _lineage_root_digest(root)
+                or expected["process_pid"] != pid
+                or (started_at := _process_started_at(pid)) is None
+                or expected["process_started_at"] != started_at
+            ):
+                raise ValueError("canonical_binding_stale")
+        except (sqlite3.Error, OSError, RuntimeError):
+            raise ValueError("canonical_binding_stale") from None
 
     async def submit(
         self, binding: CanonicalSurfaceBinding, event: CanonicalIngressEvent
@@ -512,6 +566,8 @@ class CanonicalReceiptCoordinator:
         """Claim, run once, and durably terminalize an already-authenticated canonical event."""
         if event.binding != binding.name:
             raise ValueError("canonical_binding_stale")
+        if event.expected_identity is not None:
+            _expected_identity(event.expected_identity)
         fingerprint = self._fingerprint(binding, event)
         key = self._key(binding, event)
         # Principal admission is never answered from a receipt; every later refusal before this
@@ -553,6 +609,8 @@ class CanonicalReceiptCoordinator:
             # Waiting for the turn lease may have exposed a new head, actor, or DB generation.
             try:
                 self._require_current_claim_target(proof, actor, db)
+                if event.expected_identity is not None:
+                    self._require_expected_identity(proof, event.expected_identity)
                 if self._runner._is_session_running(proof.session_key):
                     raise ValueError("canonical_turn_busy")
                 # An open user row would be merged with this peer turn by the agent's alternation
