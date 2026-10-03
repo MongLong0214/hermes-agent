@@ -1300,20 +1300,29 @@ class GatewayInboundMixin:
             return _paused_notice
 
         _quick_key = self._session_key_for_source(source)
-        _reply = await self._hm_pending_reply_intercepts(event, source, _quick_key)
-        if _reply is not None:
-            return _reply
+        # U4 H2 (CEO 36ade192): an explicit ``/acp <task>`` on the bound Telegram chat runs only
+        # after ACP admits it. It never answers a pending prompt, never queues behind a busy turn
+        # (a queued message would later run without admission) and never dispatches as a command.
+        from gateway import acp_managed_ingress
+        _acp_managed = not is_internal and acp_managed_ingress.is_managed(self, event, source)
+        if not _acp_managed:
+            _reply = await self._hm_pending_reply_intercepts(event, source, _quick_key)
+            if _reply is not None:
+                return _reply
 
         # Evict a leaked/reaped ``_running_agents`` slot before the busy-session fast-path.
         self._hm_evict_idle_stale_agent(_quick_key)
         if self._is_session_running(_quick_key):
             self._hm_evict_reaped_agent(_quick_key)
         if self._is_session_running(_quick_key):
+            if _acp_managed:
+                return acp_managed_ingress.BUSY
             return await self._hm_handle_running_session_message(event, source, _quick_key)
 
-        _handled, _result = await self._hm_dispatch_idle_commands(event, source, _quick_key)
-        if _handled:
-            return _result
+        if not _acp_managed:
+            _handled, _result = await self._hm_dispatch_idle_commands(event, source, _quick_key)
+            if _handled:
+                return _result
 
         # Pending exec approvals go through /approve and /deny only — no bare-text matching, or a
         # conversational "yes" would execute a dangerous command.
@@ -1334,12 +1343,24 @@ class GatewayInboundMixin:
                     "please resend shortly."
                 )
 
+        if _acp_managed:
+            _acp = await acp_managed_ingress.admit(self, event, source, _quick_key)
+            if _acp.reply is not None:
+                return _acp.reply
+            # Admitted and the receipt claimed: the turn runs on the task text, and
+            # ``send_final_ledgered`` settles the receipt once the reply has an obligation id.
+            event._acp_admission = _acp.admission
+            event.text = _acp.admission.task_text
+
         # Claim this session before any await: many awaits sit between here and _run_agent
         # registering the real AIAgent; without this sentinel a second message during any of them
         # passes the "already running" guard and spins up a duplicate agent for the same session.
         _active_session_lease, _limit_message = self._claim_active_session_slot(_quick_key, source)
         if _limit_message is not None:
             logger.info("Rejecting new active session %s: max_concurrent_sessions reached", _quick_key)
+            if _acp_managed:
+                # The receipt is claimed but the turn will not run: record the definite non-run.
+                acp_managed_ingress.abort_claimed(event._acp_admission)
             return _limit_message
 
         event, source, is_internal = self._hm_rescue_orphaned_fifo(event, source, is_internal, _quick_key)

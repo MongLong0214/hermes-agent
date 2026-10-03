@@ -266,6 +266,59 @@ def refuse_before_run(
         )
 
 
+def attach_obligation(
+    db: Any, update_id: Any, obligation_id: str, *, proven_db_path: Path,
+    proven_db_identity: Optional[tuple],
+) -> bool:
+    """Record the final reply's delivery-ledger obligation on the PENDING receipt before the reply
+    is sent, so a crash between ledger and settlement leaves the answer findable: the redelivery
+    that later sends it settles the receipt (``settle_by_obligation``) instead of the dead-owner
+    sweep calling it a death before answer. False when the receipt is not PENDING."""
+    key = receipt_key(update_id)
+    pending_raw = db.get_meta(key)
+    try:
+        parsed = json.loads(pending_raw) if pending_raw else None
+    except Exception:
+        return False
+    if not isinstance(parsed, dict) or parsed.get("state") != "pending":
+        return False
+    if parsed.get("obligation_id") == obligation_id:
+        return True
+    return db.compare_and_set_meta(
+        key, pending_raw, _encode({**parsed, "obligation_id": obligation_id}),
+        proven_db_path=proven_db_path, proven_db_identity=proven_db_identity,
+    )
+
+
+def settle_by_obligation(
+    db: Any, obligation_id: str, content: str, *, proven_db_path: Path,
+    proven_db_identity: Optional[tuple],
+) -> list[str]:
+    """H3: a ledger obligation was (re)delivered — settle COMPLETED every PENDING receipt that
+    recorded it, with the delivered content as evidence. Returns the settled update ids."""
+    import hashlib
+
+    digest = "sha256:" + hashlib.sha256(content.encode("utf-8")).hexdigest()
+    settled: list[str] = []
+    for key, raw in db.list_meta_prefix(f"{_RECEIPT_NAMESPACE}:"):
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(parsed, dict) or parsed.get("state") != "pending":
+            continue
+        if parsed.get("obligation_id") != obligation_id:
+            continue
+        update_id = key[len(f"{_RECEIPT_NAMESPACE}:"):]
+        if settle_completed(
+            db, update_id, receipt_id=f"hermes-tg:{obligation_id}", evidence_digest=digest,
+            content=content, delivery={"state": "redelivered", "content_digest": digest},
+            proven_db_path=proven_db_path, proven_db_identity=proven_db_identity,
+        ):
+            settled.append(update_id)
+    return settled
+
+
 def sweep_dead_owner_receipts(
     db: Any, *, resuming_owners: Iterable[str], proven_db_path: Path,
     proven_db_identity: Optional[tuple],
@@ -287,6 +340,10 @@ def sweep_dead_owner_receipts(
         if not isinstance(parsed, dict) or parsed.get("state") != "pending":
             continue
         if parsed.get("owner") in resuming:
+            continue
+        if parsed.get("obligation_id"):
+            # Its final reply reached the delivery ledger before the process died: the answer
+            # exists and the ledger's redelivery settles it (settle_by_obligation), not this sweep.
             continue
         if settle_aborted(
             db, update_id, reason_code=_ABORT_PROCESS_DIED,
