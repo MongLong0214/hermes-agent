@@ -41,11 +41,11 @@ def gw(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr("hermes_state.DEFAULT_DB_PATH", home / "state.db")
     runner = GatewayRunner(GatewayConfig(sessions_dir=home / "sessions"))
-    source = SessionSource(platform=Platform.TELEGRAM, chat_id="1718881034", chat_type="dm", user_id="1718881034")
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="100200300", chat_type="dm", user_id="100200300")
     entry = runner.session_store.get_or_create_session(source)
     binding = CanonicalSurfaceBinding(
         name="acp-canonical-ceo", session_key=entry.session_key, session_id=entry.session_id,
-        telegram_chat_id="1718881034", telegram_chat_type="dm", telegram_user_id="1718881034",
+        telegram_chat_id="100200300", telegram_chat_type="dm", telegram_user_id="100200300",
         telegram_thread_id=None, allowed_author_ids=("a",), allowed_channel_ids=("c",),
     )
     runner.config.canonical_surface_bindings = {binding.name: binding}
@@ -123,7 +123,7 @@ def test_an_allowed_admission_claims_the_receipt_and_hands_back_the_task(gw):
     [envelope] = envelopes
     assert envelope["schema"] == "acp.telegram-external-update/v1" and envelope["binding"] == "acp-canonical-ceo"
     assert envelope["update"] == {"update_id": 901, "message": {
-        "message_id": 55, "from": {"id": 1718881034}, "chat": {"id": 1718881034, "type": "private"},
+        "message_id": 55, "from": {"id": 100200300}, "chat": {"id": 100200300, "type": "private"},
         "text": "/acp deploy the fix"}}
     receipt = receipts.lookup(gw.db, 901)
     assert receipt.status == "PENDING" and receipt.receipt_identity == _TURN
@@ -256,7 +256,7 @@ def test_a_bound_chat_routed_to_another_session_is_refused_unasked(gw):
     async def exercise():
         async with _Lane(gw.sock, _allowed(gw)) as lane:
             outcome = await ingress.admit(gw.runner, _event("/acp deploy"), gw.source,
-                                          "agent:other:telegram:dm:1718881034", path=gw.sock, secret="s")
+                                          "agent:other:telegram:dm:100200300", path=gw.sock, secret="s")
         return outcome, lane.envelopes
 
     outcome, envelopes = asyncio.run(exercise())
@@ -361,7 +361,7 @@ class TestLedgerSettlement:
         assert set(delivery) == {"obligation_id", "state", "content_digest", "chat_id",
                                  "reply_to_message_id", "message_ids"}
         assert delivery["state"] == "delivered" and delivery["message_ids"] == [301, 302, 303]
-        assert delivery["chat_id"] == 1718881034 and delivery["reply_to_message_id"] == 55
+        assert delivery["chat_id"] == 100200300 and delivery["reply_to_message_id"] == 55
         assert delivery["content_digest"] == receipts.lookup(gw.db, 901).evidence_digest
 
     def test_a_delivery_without_message_ids_stays_in_doubt_and_is_never_aborted(self, gw, monkeypatch):
@@ -442,7 +442,7 @@ class TestLedgerSettlement:
                                    json.dumps({**raw, "obligation_id": "ob-old"}), **proof)
         # 3: answered, but the ledger gave up delivering it.
         delivery_ledger.record_obligation(obligation_id="ob-3", session_key=gw.entry.session_key,
-                                          platform="telegram", chat_id="1718881034", thread_id=None,
+                                          platform="telegram", chat_id="100200300", thread_id=None,
                                           content="x", acp_update_id="3")
         delivery_ledger._update_state("ob-3", "abandoned")
         assert sorted(ingress.sweep_at_startup(gw.runner)) == ["1", "3"]
@@ -560,7 +560,7 @@ class TestSplitEvidence:
         head, follow = self.HEAD, ("next message", 12, {})
         if label == "other_sender":
             follow = ("next message", 12, {"source": SessionSource(
-                platform=Platform.TELEGRAM, chat_id="1718881034", chat_type="dm", user_id="999")})
+                platform=Platform.TELEGRAM, chat_id="100200300", chat_type="dm", user_id="999")})
         elif label == "explicit_reply":
             follow = ("next message", 12, {"reply_to_message_id": "11"})
         elif label == "id_gap":
