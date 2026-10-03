@@ -1734,7 +1734,12 @@ class TurnRunner:
             if ctx.inbound_message_id is not None:
                 kwargs["persist_user_platform_id"] = str(ctx.inbound_message_id)
             from agent.notification_presentation import notification_turn
-            with notification_turn(agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""):
+            from gateway.session_context import scoped_current_session_id
+            # _set_session_env binds HERMES_SESSION_ID to "" and only agent_init publishes the real
+            # id, so a reused cached agent's turn would send "" as MCP call provenance; bind the
+            # agent's own id for this turn (compression may still rotate it inside the scope).
+            with scoped_current_session_id(getattr(agent, "session_id", None) or None), \
+                    notification_turn(agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""):
                 return agent.run_conversation(api_message, **kwargs)
         finally:
             unregister_gateway_notify(session_key)
