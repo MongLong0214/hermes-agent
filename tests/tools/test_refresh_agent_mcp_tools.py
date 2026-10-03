@@ -308,6 +308,109 @@ def test_preserve_prefix_keeps_the_bridge_tools_byte_identical(monkeypatch):
     assert [t["function"]["name"] for t in agent.tools][-1] == "mcp_late_tool"
 
 
+def _search_bridge(*deferred_names):
+    """The ``tool_search`` def the real assembler renders for these deferred tools."""
+    from tools.tool_search import bridge_tool_schemas
+    from tools.tool_search_catalog import build_catalog_listing_with_form
+
+    deferred = [{"type": "function", "function": {"name": n, "description": f"{n} does a thing"}}
+                for n in deferred_names]
+    listing, form = build_catalog_listing_with_form(deferred)
+    return bridge_tool_schemas(len(deferred), listing=listing, listing_form=form)[0]
+
+
+def test_a_server_connected_after_build_reaches_the_bridge_listing(monkeypatch):
+    """The listing in ``tool_search`` is the only place a deferred tool is named to the model.
+    A server that connects after the session was built (a newly enabled ``mcp_servers`` entry)
+    must appear there, or the model never learns its tools exist. A listing that only LOST an
+    entry (``check_fn`` flap) keeps the built bytes, so a flap still costs no cache prefix."""
+    from tools.tool_search_catalog import BRIDGE_TOOL_NAMES
+
+    built = _search_bridge("mcp__commitlore__query", "mcp__commitlore__stale")
+    shrunk = _search_bridge("mcp__commitlore__query")
+    grown = _search_bridge("mcp__commitlore__query", "mcp__commitlore__stale", "mcp__acp_ceo__run_create")
+    agent = _agent(["read_file"])
+    agent.tools.append(built)
+    agent.valid_tool_names.add("tool_search")
+    _registered(monkeypatch, ["read_file", *BRIDGE_TOOL_NAMES])
+
+    _serve(monkeypatch, [_tool("read_file"), shrunk])
+    _mcp_agent.refresh_agent_mcp_tools(agent, preserve_prefix=True)
+    assert agent.tools[1] == built
+
+    _serve(monkeypatch, [_tool("read_file"), grown])
+    _mcp_agent.refresh_agent_mcp_tools(agent, preserve_prefix=True)
+    assert agent.tools == [_tool("read_file"), grown]
+
+
+def test_a_same_code_pin_takes_the_bridge_listing_that_names_a_new_server(monkeypatch):
+    """An evicted or restarted session rebuilds from its pin. Same code keeps the pinned bridge
+    bytes — through a surface that defers fewer tools too — but not a listing that predates a
+    server this build now defers: the rebuilt agent advertises the new tools, and the pin is
+    rewritten so the next rebuild stays put."""
+    from tools import registry as registry_mod
+
+    pinned_bridge = _search_bridge("mcp__commitlore__query", "mcp__commitlore__stale")
+    fresh_bridge = _search_bridge("mcp__commitlore__query", "mcp__acp_ceo__run_create")
+    narrower_bridge = _search_bridge("mcp__commitlore__query")
+    monkeypatch.setattr(registry_mod.registry, "get_all_entries",
+                        lambda: [types.SimpleNamespace(name=n) for n in ("read_file", "tool_search")],
+                        raising=False)
+    persisted = []
+    monkeypatch.setattr(_mcp_agent, "persist_agent_tool_names", lambda agent: persisted.append(list(agent.tools)))
+    pin = {"version": _mcp_agent.tool_pin_version(), "tools": [_tool("read_file"), pinned_bridge]}
+
+    narrower = _agent([])
+    narrower.tools = [_tool("read_file"), narrower_bridge]
+    _mcp_agent.restore_agent_tool_prefix(narrower, pin)
+    rebuilt = _agent([])
+    rebuilt.tools = [_tool("read_file"), fresh_bridge]
+    _mcp_agent.restore_agent_tool_prefix(rebuilt, pin)
+
+    assert narrower.tools == pin["tools"]
+    assert rebuilt.tools == [_tool("read_file"), fresh_bridge]
+    assert persisted == [[_tool("read_file"), fresh_bridge]]
+
+
+def test_only_a_newly_advertised_tool_counts_as_listing_growth(monkeypatch):
+    """Availability wording and the listing budget change the bridge text without adding a tool:
+    a server turning unavailable, a summarized server whose names fit once another server left,
+    or a listing that fits only now (the kept bridge named nothing and sent the model to search)
+    must keep the frozen bytes. A new server, summarized or listed, and a new tool of a
+    listed server are growth."""
+    from tools import tool_search_catalog as catalog
+    from tools.tool_search import bridge_tool_schemas
+
+    monkeypatch.setattr(catalog, "_classify_source", lambda name: ("mcp", "mcp-" + name.split("__")[1]))
+    hidden = []
+    monkeypatch.setattr(catalog, "hidden_declared_sources", lambda: list(hidden))
+
+    def bridge(servers, *, unavailable=(), max_tokens=4000):
+        hidden[:] = [{"name": n, "tool_count": 50, "unavailable": "probe failed"} for n in unavailable]
+        deferred = [{"type": "function", "function": {"name": f"mcp__{server}__tool{i:02d}", "description": "x"}}
+                    for server, count in servers.items() for i in range(count)]
+        listing, form = catalog.build_catalog_listing_with_form(deferred, max_tokens=max_tokens)
+        return bridge_tool_schemas(len(deferred), listing=listing, listing_form=form)[0], form
+
+    grew = _mcp_agent._bridge_listing_grew
+    listed, _ = bridge({"a": 2})
+    assert not grew(listed, bridge({}, unavailable=["a"])[0])
+    summarized, form = bridge({"x": 50, "y": 16}, max_tokens=100)
+    expanded, expanded_form = bridge({"y": 16}, unavailable=["x"], max_tokens=100)
+    assert (form, expanded_form) == ("groups", "names")
+    assert not grew(summarized, expanded)
+
+    servers = {f"s{i:02d}": 2 for i in range(16)}
+    unlisted, unlisted_form = bridge(servers, max_tokens=200)
+    fits_now, fits_form = bridge({"s00": 2}, unavailable=sorted(servers)[1:], max_tokens=200)
+    assert (unlisted_form, fits_form) == ("none", "full")
+    assert not grew(unlisted, fits_now)
+
+    assert grew(listed, bridge({"a": 2, "acp": 1})[0])
+    assert grew(listed, bridge({"a": 3})[0])
+    assert grew(summarized, bridge({"x": 50, "y": 16, "acp": 16}, max_tokens=100)[0])
+
+
 # ---------------------------------------------------------------------------
 # tools[] freeze: eviction rebuild + the /reload-mcp re-probe hatch
 # ---------------------------------------------------------------------------

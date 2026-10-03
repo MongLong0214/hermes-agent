@@ -258,6 +258,59 @@ def hidden_declared_sources() -> List[Dict[str, Any]]:
     return rows
 
 
+_LISTING_HEADER_PREFIX = "Deferred tool catalog ("
+_GROUP_HEADER_RE = re.compile(r"^(.+?) tools \(\d+\):$")
+_GROUP_SUMMARY_RE = re.compile(r"^(.+?) \(\d+ tools — names not listed;")
+_GROUP_UNAVAILABLE_RE = re.compile(r"^(.+?) \((?:\d+ )?tools unavailable:")
+
+
+def _listing_groups(text: str) -> Dict[str, Any]:
+    """Per group label, the tool names a rendered listing names, or ``"summary"`` /
+    ``"unavailable"`` for a group shown without names. The inverse of
+    ``build_catalog_listing_with_form``: keep the two in step."""
+    _, sep, listing = (text or "").partition(_LISTING_HEADER_PREFIX)
+    groups: Dict[str, Any] = {}
+    current: Optional[set] = None
+    after_header = False
+    for line in listing.splitlines()[1:] if sep else ():
+        if line.startswith("- "):
+            if current is not None:
+                current.add(line[2:].split(":", 1)[0].strip())
+        elif (m := _GROUP_HEADER_RE.match(line)):
+            current = groups.setdefault(m.group(1), set())
+            after_header = True
+            continue
+        elif (m := _GROUP_SUMMARY_RE.match(line)):
+            groups[m.group(1)], current = "summary", None
+        elif (m := _GROUP_UNAVAILABLE_RE.match(line)):
+            groups[m.group(1)], current = "unavailable", None
+        elif current is not None and after_header and line:
+            current.update(name.strip() for name in line.split(", ") if name.strip())
+        after_header = False
+    return {label: names if isinstance(names, str) else frozenset(names) for label, names in groups.items()}
+
+
+def listing_names_new_tools(kept: str, fresh: str) -> bool:
+    """True when ``fresh`` advertises an available group ``kept`` does not show at all, or names
+    a tool of a group ``kept`` listed by name without it. A group ``kept`` showed without names
+    (summarized or unavailable) already covers its tools, and a group ``fresh`` shows without
+    names adds none, so availability changes, recounts and budget-driven expansion or collapse
+    are not growth."""
+    if _LISTING_HEADER_PREFIX not in (kept or ""):
+        # Kept named nothing (listing off or over budget) and sent the model to search, which
+        # reads the live catalog; a listing that merely fits now advertises nothing new.
+        return False
+    kept_groups = _listing_groups(kept)
+    for label, names in _listing_groups(fresh).items():
+        if label not in kept_groups:
+            if names != "unavailable":
+                return True
+        elif not isinstance(names, str) and not isinstance(kept_groups[label], str):
+            if names - kept_groups[label]:
+                return True
+    return False
+
+
 def build_catalog_listing_with_form(
     deferrable: List[Dict[str, Any]], *, max_tokens: int = 4000) -> Tuple[Optional[str], str]:
     """Render the deferred-catalog manifest: ``- name: short desc`` lines grouped per source.
