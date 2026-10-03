@@ -147,6 +147,26 @@ class TestLateCommitAfterAdmissionTimeout:
         assert receipts.lookup(db, "1").receipt_id == "hermes-tg:ob1"  # the first commit stands
 
 
+class TestRefusalFirstLateCompletion:
+    """The reviewer's requested sibling: admission gives up BEFORE any claim exists (the real
+    timeout path — no live owner to race against), writing the REFUSED_BEFORE_RUN tombstone
+    through refuse_before_run itself. The turn that was, despite the timeout, still actually
+    running then tries to settle COMPLETED late. Zero duplicate execution: that late settlement
+    is refused, and the tombstone — not a second execution's result — is what GET answers."""
+
+    def test_a_timed_out_unclaimed_update_tombstones_and_refuses_the_late_completion(self, db):
+        receipts.refuse_before_run(
+            db, "1", message_id="m", turn_request_id="t-timed-out", receipt_identity={}, **_proof(db),
+        )
+        receipt = receipts.lookup(db, "1")
+        assert receipt.status == "ABORTED" and receipt.reason_code == "REFUSED_BEFORE_RUN"
+        late_commit_ok = receipts.settle_completed(
+            db, "1", receipt_id="hermes-tg:ob1", evidence_digest="sha256:late", **_proof(db),
+        )
+        assert late_commit_ok is False
+        assert receipts.lookup(db, "1").status == "ABORTED"  # the tombstone stands, never re-run
+
+
 class TestDeadOwnerSweep:
     def test_a_pending_receipt_with_no_resuming_owner_becomes_aborted_process_died(self, db):
         receipts.claim_pending(
