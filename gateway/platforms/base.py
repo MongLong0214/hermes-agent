@@ -2502,9 +2502,28 @@ class BasePlatformAdapter(ABC):
         """Session-scoped key for text batching (subclasses may override)."""
         return self._event_session_key(event)
 
+    def _is_acp_managed(self, event: "MessageEvent") -> bool:
+        """U4 H2: an explicit /acp task on the ACP-bound chat (gateway.acp_managed_ingress)."""
+        runner = getattr(self, "gateway_runner", None)
+        if runner is None or not (event.text or "").startswith("/acp"):
+            return False
+        try:
+            from gateway.acp_managed_ingress import is_managed
+            return is_managed(runner, event, event.source)
+        except Exception:
+            logger.debug("ACP managed check failed", exc_info=True)
+            return False
+
     def _enqueue_text_event(self, event: "MessageEvent") -> None:
         """Buffer a text event (merging into a pending one) and restart the flush timer."""
         if self._drop_unresolved(event):
+            return
+        if self._is_acp_managed(event):
+            # U4 H2: an /acp task is its own update — merged into a neighbour's batch it would run
+            # under that message's ids as ordinary text, with no ACP admission.
+            task = asyncio.create_task(self._dispatch_text_batch(event))
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
             return
         key = self._text_batch_key(event)
         existing = self._pending_text_batches.get(key)
@@ -4002,6 +4021,15 @@ class BasePlatformAdapter(ABC):
         # Certain commands must bypass the active-session guard and be dispatched directly to the gateway
         # runner. Without this, they are queued as pending messages and either: See #4926.
         self._canonicalize(event.source)  # identity FIRST (direct callers may skip handle_message)
+        if self._is_acp_managed(event):
+            # U4 H2: an /acp task never queues, steers or batches behind a busy turn — a queued one
+            # would later drain as an ordinary turn with no ACP admission. It is refused here.
+            from gateway.acp_managed_ingress import BUSY
+            await self._send_with_retry(chat_id=event.source.chat_id, content=BUSY,
+                                        reply_to=_reply_anchor_for_event(event),
+                                        metadata=_mark_notify_metadata(_thread_metadata_for_event(event)))
+            event._gateway_accepted = True
+            return
         cmd = event.get_command()
         from hermes_cli.commands import (is_interrupt_then_dispatch, should_bypass_active_session)
         if should_bypass_active_session(cmd):
@@ -4272,17 +4300,10 @@ class BasePlatformAdapter(ABC):
             event, session_key, text_content, delivery_adapter, is_ephemeral_response)
         if obligation_id is not None:
             await self._release_turn_marker(event)  # the ledger now owns the crash recovery
-        if getattr(event, "_acp_admission", None) is not None:
-            from gateway.acp_managed_ingress import attach_obligation
-            await asyncio.to_thread(attach_obligation, event, obligation_id)
         result = await delivery_adapter._send_with_retry(
             chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
         if obligation_id is not None:
             await self._finalize_delivery_obligation(obligation_id, result, event, delivery_adapter)
-        if getattr(event, "_acp_admission", None) is not None:
-            from gateway.acp_managed_ingress import settle_after_delivery
-            await asyncio.to_thread(settle_after_delivery, event, obligation_id=obligation_id,
-                                    text=text_content, result=result)
         return result, delivery_adapter
 
     async def _release_turn_marker(self, event: MessageEvent) -> None:

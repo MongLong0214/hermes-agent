@@ -270,8 +270,8 @@ class GatewayStartupMixin:
         """
         from gateway.run import _startup_restore_drain_timeout_secs
         claimed = await self._claim_pending_obligations()
-        # U4 H3: a managed /acp receipt left PENDING by a process that died before its reply reached
-        # the ledger is settled ABORTED now; one with a ledgered reply waits for the redelivery below.
+        # U4 H3: a managed /acp receipt left PENDING by a process that died before its turn answered
+        # is settled ABORTED now (a turn settles COMPLETED before its reply is sealed or ledgered).
         with _log_suppressed(logging.WARNING, "ACP receipt startup sweep failed", exc_info=True):
             from gateway.acp_managed_ingress import sweep_at_startup
             await asyncio.to_thread(sweep_at_startup, self)
@@ -550,11 +550,6 @@ class GatewayStartupMixin:
         with _log_suppressed(logging.DEBUG, "delivery ledger update failed", exc_info=True):
             if result is not None and getattr(result, "success", False):
                 await asyncio.to_thread(mark_delivered, row["obligation_id"], attempt=row.get("attempts"))
-                # U4 H3: a managed /acp receipt that recorded this obligation is now COMPLETED. Its own
-                # guard: a settlement failure leaves the receipt in doubt, never the redelivery result.
-                with _log_suppressed(logging.WARNING, "ACP receipt redelivery settlement failed", exc_info=True):
-                    from gateway.acp_managed_ingress import settle_redelivered
-                    await asyncio.to_thread(settle_redelivered, self, row["obligation_id"], row["content"])
                 logger.info(
                     "Redelivered recovered final response to %s:%s (obligation %s, attempt %d)",
                     row["platform"], row["chat_id"], row["obligation_id"], row["attempts"],

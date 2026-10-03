@@ -7,8 +7,9 @@ committed in one ACP transaction, ACP #1062). A deny, a timeout or an unreadable
 turn does not run here and is not retried: the outcome is reported to the owner and left to ACP,
 which sees the claimed turn as in doubt until it reads this gateway's receipt.
 
-The receipt (``gateway.acp_turn_receipts``) is claimed before the turn runs and settled COMPLETED
-by ``send_final_ledgered`` once the final reply has an obligation id. Nothing here writes ABORTED
+The receipt (``gateway.acp_turn_receipts``) is claimed before the turn runs and settled COMPLETED by
+the turn itself (``TurnRunner.run_sync``) from its own final response, before that response is sealed
+or delivered on any path (streamed, ledgered, queued). Nothing here writes ABORTED
 on a timeout: an admission whose answer never arrived may still have committed on ACP's side, so
 the receipt stays absent (NEVER_FOUND, i.e. in doubt for ACP) rather than claiming a non-run this
 process cannot prove.
@@ -155,6 +156,9 @@ class Admission:
     db: Any
     proof: dict
     task_text: str
+    turn: dict
+    session_key: str
+    lineage_root_digest: str
 
 
 @dataclass
@@ -167,6 +171,10 @@ async def admit(runner: Any, event: Any, source: Any, session_key: str, *, path:
                 secret: Optional[str] = None, timeout: float = _ADMISSION_TIMEOUT_S) -> Outcome:
     """Ask ACP to admit this managed message and claim its receipt; never runs the turn itself."""
     binding = bound_binding(runner, source)
+    if session_key != binding.session_key:
+        # The bound chat routed to another session (a profile route, a topic): the lineage ACP
+        # would approve is not the session that would run, so the task is refused unasked.
+        return Outcome(reply=REFUSED.format(reason="target mismatch"))
     task_text = receipts.acp_managed_task_text(event.text)
     secret = secret if secret is not None else read_secret()
     envelope = build_envelope(event, source, secret) if secret and task_text else None
@@ -209,7 +217,9 @@ async def admit(runner: Any, event: Any, source: Any, session_key: str, *, path:
     if not claimed:
         # An earlier delivery of this update already claimed (and ran) it: zero duplicate execution.
         return Outcome(reply=DUPLICATE.format(status=receipts.lookup(db, update_id).status))
-    return Outcome(admission=Admission(update_id=update_id, db=db, proof=proof, task_text=task_text))
+    return Outcome(admission=Admission(update_id=update_id, db=db, proof=proof, task_text=task_text,
+                                       turn=turn, session_key=binding.session_key,
+                                       lineage_root_digest=expected_lineage))
 
 
 def abort_claimed(admission: Optional[Admission]) -> None:
@@ -234,56 +244,45 @@ def process_owner() -> str:
     return _PROCESS_OWNER
 
 
-def settle_after_delivery(event: Any, *, obligation_id: Optional[str], text: str, result: Any) -> None:
-    """Called by ``send_final_ledgered`` after the final reply's obligation is finalized. A failed
-    settlement leaves the receipt PENDING — in doubt, never promoted (CEO 3c058be8)."""
-    admission = getattr(event, "_acp_admission", None)
-    if admission is None or obligation_id is None:
-        return
+def target_still_matches(admission: Admission, session_key: Optional[str], session_db: Any,
+                         session_id: Optional[str]) -> bool:
+    """Recheck under the turn's slot and lease, with the executing agent resolved: the session that
+    will run is the binding's, and its lineage root is the one ACP approved."""
+    if session_key != admission.session_key or not session_id or session_db is None:
+        return False
+    return _binding_lineage_digest(session_db, session_id) == admission.lineage_root_digest
+
+
+def settle_turn(admission: Admission, result: Any) -> bool:
+    """Settle the receipt from THIS turn's own final response, before it is sealed or delivered on
+    any path. A turn with no final answer, or a settlement that does not land, leaves the receipt
+    PENDING — in doubt for ACP, never promoted (CEO 3c058be8)."""
     import hashlib
 
-    digest = "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
-    delivery = {
-        "chat_id": str(event.source.chat_id), "reply_to_message_id": str(event.message_id),
-        "message_ids": [str(result.message_id)] if getattr(result, "message_id", None) else [],
-        "content_digest": digest, "state": "sent" if getattr(result, "success", False) else "failed",
-    }
+    final = result.get("final_response") if isinstance(result, dict) else None
+    if not isinstance(final, str) or not final.strip() or (isinstance(result, dict) and result.get("failed")):
+        logger.warning("ACP managed turn for update %s ended without a final answer; receipt left in doubt",
+                       admission.update_id)
+        return False
+    digest = "sha256:" + hashlib.sha256(final.encode("utf-8")).hexdigest()
     try:
         settled = receipts.settle_completed(
-            admission.db, admission.update_id, receipt_id=f"hermes-tg:{obligation_id}",
-            evidence_digest=digest, content=text, delivery=delivery, **admission.proof)
+            admission.db, admission.update_id,
+            receipt_id=f"hermes-tg:turn:{admission.turn['turnRequestId']}",
+            evidence_digest=digest, content=final, **admission.proof)
     except Exception:
         logger.exception("ACP receipt settlement failed for update %s; left in doubt", admission.update_id)
-        return
+        return False
     if not settled:
         logger.warning("ACP receipt for update %s was not PENDING at settlement; left as recorded",
                        admission.update_id)
+    return settled
 
 
 def _binding_db(runner: Any) -> Any:
     config = getattr(runner, "config", None)
     binding = (getattr(config, "canonical_surface_bindings", None) or {}).get(_BINDING)
     return runner.session_store._db_for_key(binding.session_key) if binding is not None else None
-
-
-def attach_obligation(event: Any, obligation_id: Optional[str]) -> None:
-    """Called by ``send_final_ledgered`` once the final reply has a ledger row, before the send."""
-    admission = getattr(event, "_acp_admission", None)
-    if admission is None or obligation_id is None:
-        return
-    try:
-        receipts.attach_obligation(admission.db, admission.update_id, obligation_id, **admission.proof)
-    except Exception:
-        logger.exception("ACP receipt obligation attach failed for update %s", admission.update_id)
-
-
-def settle_redelivered(runner: Any, obligation_id: str, content: str) -> list:
-    """The boot redelivery sent a ledgered final: settle the receipt that recorded it."""
-    db = _binding_db(runner)
-    if db is None:
-        return []
-    return receipts.settle_by_obligation(
-        db, obligation_id, content, proven_db_path=db.db_path, proven_db_identity=db._db_file_identity)
 
 
 def sweep_at_startup(runner: Any) -> list:
