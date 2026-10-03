@@ -374,8 +374,9 @@ def test_a_same_code_pin_takes_the_bridge_listing_that_names_a_new_server(monkey
 
 def test_only_a_newly_advertised_tool_counts_as_listing_growth(monkeypatch):
     """Availability wording and the listing budget change the bridge text without adding a tool:
-    a server turning unavailable, or a summarized server whose names fit once another server
-    left, must keep the frozen bytes. A new server, summarized or listed, and a new tool of a
+    a server turning unavailable, a summarized server whose names fit once another server left,
+    or a listing that fits only now (the kept bridge named nothing and sent the model to search)
+    must keep the frozen bytes. A new server, summarized or listed, and a new tool of a
     listed server are growth."""
     from tools import tool_search_catalog as catalog
     from tools.tool_search import bridge_tool_schemas
@@ -398,6 +399,12 @@ def test_only_a_newly_advertised_tool_counts_as_listing_growth(monkeypatch):
     expanded, expanded_form = bridge({"y": 16}, unavailable=["x"], max_tokens=100)
     assert (form, expanded_form) == ("groups", "names")
     assert not grew(summarized, expanded)
+
+    servers = {f"s{i:02d}": 2 for i in range(16)}
+    unlisted, unlisted_form = bridge(servers, max_tokens=200)
+    fits_now, fits_form = bridge({"s00": 2}, unavailable=sorted(servers)[1:], max_tokens=200)
+    assert (unlisted_form, fits_form) == ("none", "full")
+    assert not grew(unlisted, fits_now)
 
     assert grew(listed, bridge({"a": 2, "acp": 1})[0])
     assert grew(listed, bridge({"a": 3})[0])

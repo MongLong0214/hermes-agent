@@ -296,6 +296,10 @@ def listing_names_new_tools(kept: str, fresh: str) -> bool:
     (summarized or unavailable) already covers its tools, and a group ``fresh`` shows without
     names adds none, so availability changes, recounts and budget-driven expansion or collapse
     are not growth."""
+    if _LISTING_HEADER_PREFIX not in (kept or ""):
+        # Kept named nothing (listing off or over budget) and sent the model to search, which
+        # reads the live catalog; a listing that merely fits now advertises nothing new.
+        return False
     kept_groups = _listing_groups(kept)
     for label, names in _listing_groups(fresh).items():
         if label not in kept_groups:
