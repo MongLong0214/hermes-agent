@@ -325,6 +325,24 @@ class TestLedgerSettlement:
         assert receipt.receipt_id.startswith("hermes-tg:") and receipt.receipt_identity == _TURN
         assert receipt.content == "shaped final"
 
+    @pytest.mark.parametrize("settlement_write_fails", [False, True])
+    def test_get_content_bytes_hash_to_the_evidence_digest(self, gw, monkeypatch, settlement_write_fails):
+        """ACP's client counts a COMPLETED answer as found only when sha256(content) equals
+        evidenceDigest. Both come from the one ledgered text, whole (a reply the adapter splits on
+        the wire is ledgered unsplit), whether the receipt was settled or GET reads the row."""
+        import hashlib
+
+        text = "배포 완료 — " + "가나다 ✅ " * 600  # non-ASCII, longer than one Telegram message
+        admission = _admitted(gw)
+        with monkeypatch.context() as m:
+            if settlement_write_fails:
+                m.setattr(receipts, "_settle", lambda *a, **k: (_ for _ in ()).throw(OSError("disk")))
+            asyncio.run(self._adapter(gw).send_final_ledgered(
+                self._managed_event(gw, admission), gw.entry.session_key, text, {}, reply_to="55"))
+        body = receipts.lookup(gw.db, 901).to_response()
+        assert body["status"] == "COMPLETED" and body["content"] == text
+        assert body["evidenceDigest"] == "sha256:" + hashlib.sha256(body["content"].encode("utf-8")).hexdigest()
+
     def test_a_queued_follow_up_never_certifies_the_managed_receipt(self, gw):
         admission = _admitted(gw)
         adapter = self._adapter(gw)
