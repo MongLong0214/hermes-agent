@@ -2258,6 +2258,7 @@ class GatewayTurnMixin:
                     "gateway_input_owner": prepared.persistence_owner, **diagnostic_metadata(event)},
                 message_type=event.message_type,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
+                acp_admission=getattr(event, "_acp_admission", None),
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -3814,6 +3815,7 @@ class GatewayTurnMixin:
                     # The text send records a delivery-ledger obligation under this key, keyed on
                     # the raw inbound id (the anchor above is only the reply target).
                     session_key=session_key, inbound_message_id=turn_ctx.inbound_message_id,
+                    acp_admission=getattr(turn_ctx, "acp_admission", None),
                 )
             except Exception as e:
                 logger.warning("Failed to send first response before queued message: %s", e)
@@ -4285,11 +4287,17 @@ class GatewayTurnMixin:
         persist_user_message: Optional[Any] = None, persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None, message_type: Optional[str] = None,
         persist_user_display_metadata: Optional[dict] = None,
-        scheduled_heartbeat: bool = False,
+        scheduled_heartbeat: bool = False, acp_admission: Any = None,
     ) -> Dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
         Keys: "final_response", "messages", "api_calls", "completed"."""
+        if acp_admission is not None and self._get_proxy_url():
+            # The proxy runs the turn elsewhere, where this turn's receipt cannot be settled.
+            from gateway import acp_managed_ingress
+            acp_managed_ingress.abort_claimed(acp_admission)
+            return {"final_response": acp_managed_ingress.REFUSED.format(reason="proxy mode"),
+                    "messages": [], "api_calls": 0, "tools": []}
         if self._get_proxy_url():
             return await self._run_agent_via_proxy(
                 message=message, context_prompt=context_prompt, history=history, source=source,
@@ -4322,7 +4330,7 @@ class GatewayTurnMixin:
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,
             persist_user_display_metadata=persist_user_display_metadata,
-            scheduled_heartbeat=scheduled_heartbeat,
+            scheduled_heartbeat=scheduled_heartbeat, acp_admission=acp_admission,
         )
         _status_thread_metadata = self._run_agent_bind_turn_wiring(
             turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards,

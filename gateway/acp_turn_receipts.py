@@ -44,6 +44,8 @@ _SCHEMA = "hermes.gateway-turn-receipt/v1"
 _MAX_RECEIPT_CHARS = 32_768
 _ABORT_PROCESS_DIED = "HERMES_PROCESS_DIED_BEFORE_ANSWER"
 _ABORT_REFUSED_BEFORE_RUN = "REFUSED_BEFORE_RUN"
+# The answer was ledgered but the ledger abandoned it undelivered.
+_ABORT_UNDELIVERABLE = "HERMES_ANSWER_UNDELIVERABLE"
 
 
 _MANAGED_PREFIX = "/acp "
@@ -169,9 +171,61 @@ def decode(raw: Optional[str], update_id: Any) -> TelegramTurnReceipt:
     return _unreadable(update_id)
 
 
+def ledger_answers(db: Any, update_id: Any) -> list[dict]:
+    """The delivery-ledger rows answering one /acp update, read on the receipt's own store handle:
+    the ledger lives in the same state.db, and each row carries ``acp_update_id`` from the INSERT
+    that recorded the answer. A store without the table or the column has no answers."""
+    import sqlite3
+
+    try:
+        rows = db._read_all(
+            "SELECT obligation_id, content, state FROM delivery_obligations "
+            "WHERE acp_update_id = ? ORDER BY created_at", (str(update_id),))
+    except sqlite3.OperationalError:
+        return []
+    return [{"obligation_id": r[0], "content": r[1], "state": r[2]} for r in rows]
+
+
+def _completed_terminal(answer: dict) -> dict:
+    """COMPLETED evidence from the ledgered answer that was actually delivered."""
+    import hashlib
+
+    digest = "sha256:" + hashlib.sha256(answer["content"].encode("utf-8")).hexdigest()
+    return {"status": "COMPLETED", "receipt_id": f"hermes-tg:{answer['obligation_id']}",
+            "evidence_digest": digest, "content": answer["content"],
+            "delivery": {"obligation_id": answer["obligation_id"], "state": "delivered",
+                         "content_digest": digest},
+            "completed_at": time.time()}
+
+
 def lookup(db: Any, update_id: Any) -> TelegramTurnReceipt:
-    """Read-only answer for the GET route: one ``get_meta`` call, no write, no lease, no turn."""
-    return decode(db.get_meta(receipt_key(update_id)), update_id)
+    """Read-only answer for the GET route: no write, no lease, no turn. A PENDING receipt whose
+    answer the ledger records as delivered reads COMPLETED from that row, so a settlement write that
+    failed after delivery never leaves ACP waiting on an answer the owner already has."""
+    receipt = decode(db.get_meta(receipt_key(update_id)), update_id)
+    if receipt.status != "PENDING":
+        return receipt
+    delivered = [a for a in ledger_answers(db, update_id) if a["state"] == "delivered"]
+    if not delivered:
+        return receipt
+    terminal = _completed_terminal(delivered[0])
+    return TelegramTurnReceipt(
+        status="COMPLETED", update_id=receipt.update_id, message_id=receipt.message_id,
+        turn_request_id=receipt.turn_request_id, receipt_identity=receipt.receipt_identity,
+        receipt_id=terminal["receipt_id"], evidence_digest=terminal["evidence_digest"],
+        content=terminal["content"], delivery=terminal["delivery"])
+
+
+def settle_from_ledger(
+    db: Any, update_id: Any, *, obligation_id: Optional[str] = None, proven_db_path: Path,
+    proven_db_identity: Optional[tuple],
+) -> bool:
+    """Settle COMPLETED from the delivered ledger row (``obligation_id`` when given)."""
+    for answer in ledger_answers(db, update_id):
+        if answer["state"] == "delivered" and obligation_id in (None, answer["obligation_id"]):
+            return _settle(db, update_id, terminal=_completed_terminal(answer),
+                           proven_db_path=proven_db_path, proven_db_identity=proven_db_identity)
+    return False
 
 
 def claim_pending(
@@ -277,6 +331,7 @@ def sweep_dead_owner_receipts(
     longer exists. A receipt whose owner IS being resumed is left untouched — its turn may still
     answer it. Returns the update ids this call aborted."""
     resuming = set(resuming_owners)
+    proof = {"proven_db_path": proven_db_path, "proven_db_identity": proven_db_identity}
     aborted: list[str] = []
     for key, raw in db.list_meta_prefix(f"{_RECEIPT_NAMESPACE}:"):
         update_id = key[len(f"{_RECEIPT_NAMESPACE}:"):]
@@ -288,9 +343,16 @@ def sweep_dead_owner_receipts(
             continue
         if parsed.get("owner") in resuming:
             continue
-        if settle_aborted(
-            db, update_id, reason_code=_ABORT_PROCESS_DIED,
-            proven_db_path=proven_db_path, proven_db_identity=proven_db_identity,
-        ):
+        # The ledger decides before any abort: a delivered answer settles COMPLETED; an answer
+        # still owed (pending/attempting/failed) is the redelivery's to settle; a correlation an
+        # older build recorded on the receipt is never treated as a missing answer.
+        answers = ledger_answers(db, update_id)
+        if settle_from_ledger(db, update_id, **proof):
+            continue
+        if parsed.get("obligation_id") or any(
+                a["state"] in ("pending", "attempting", "failed") for a in answers):
+            continue
+        reason = _ABORT_UNDELIVERABLE if answers else _ABORT_PROCESS_DIED
+        if settle_aborted(db, update_id, reason_code=reason, **proof):
             aborted.append(update_id)
     return aborted

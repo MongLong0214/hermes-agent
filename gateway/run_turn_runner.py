@@ -1957,11 +1957,26 @@ class TurnRunner:
         reasoning_config = runner._resolve_session_reasoning_config(source=ctx.source, session_key=ctx.session_key, model=model)
         runner._reasoning_config = reasoning_config
         runner._service_tier = runner._resolve_session_service_tier(source=ctx.source, session_key=ctx.session_key)
-        stream_consumer, stream_delta_cb, interim_cb, want_interim = self._setup_stream_consumer(platform_key)
+        if ctx.acp_admission is not None:
+            # A managed /acp answer is delivered only through the ledgered final send, whose row is
+            # the receipt's evidence: a stream would deliver it before (or instead of) that row.
+            stream_consumer, stream_delta_cb, interim_cb, want_interim = None, None, None, False
+        else:
+            stream_consumer, stream_delta_cb, interim_cb, want_interim = self._setup_stream_consumer(platform_key)
         turn_route = runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
         agent, reused_cached_agent = self._resolve_turn_agent(
             turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr,
         )
+        _acp = ctx.acp_admission
+        if _acp is not None:
+            from gateway import acp_managed_ingress
+            # Under this turn's slot and lease, with the executor resolved: run only the session and
+            # lineage ACP approved; anything else is recorded as a definite non-run.
+            if not acp_managed_ingress.target_still_matches(
+                    _acp, ctx.session_key, getattr(agent, "_session_db", None), getattr(agent, "session_id", None)):
+                acp_managed_ingress.abort_claimed(_acp)
+                return {"final_response": acp_managed_ingress.REFUSED.format(reason="target mismatch"),
+                        "messages": [], "api_calls": 0, "tools": []}
         if pending_fallback_notice:
             # Reuse the in-agent one-shot notice so the pre-agent provider switch is user-visible too.
             agent._pending_fallback_notice = pending_fallback_notice
