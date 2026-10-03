@@ -264,30 +264,47 @@ _GROUP_SUMMARY_RE = re.compile(r"^(.+?) \(\d+ tools — names not listed;")
 _GROUP_UNAVAILABLE_RE = re.compile(r"^(.+?) \((?:\d+ )?tools unavailable:")
 
 
-def listing_entries(text: str) -> frozenset[str]:
-    """What a rendered listing advertises: tool names and group labels, counts excluded.
-    The inverse of ``build_catalog_listing_with_form`` (keep the two in step), so a caller can
-    tell a listing that names something new from one that only lost or recounted entries."""
+def _listing_groups(text: str) -> Dict[str, Any]:
+    """Per group label, the tool names a rendered listing names, or ``"summary"`` /
+    ``"unavailable"`` for a group shown without names. The inverse of
+    ``build_catalog_listing_with_form``: keep the two in step."""
     _, sep, listing = (text or "").partition(_LISTING_HEADER_PREFIX)
-    if not sep:
-        return frozenset()
-    entries: set = set()
+    groups: Dict[str, Any] = {}
+    current: Optional[set] = None
     after_header = False
-    for line in listing.splitlines()[1:]:
+    for line in listing.splitlines()[1:] if sep else ():
         if line.startswith("- "):
-            entries.add(line[2:].split(":", 1)[0].strip())
+            if current is not None:
+                current.add(line[2:].split(":", 1)[0].strip())
         elif (m := _GROUP_HEADER_RE.match(line)):
-            entries.add(f"group:{m.group(1)}")
+            current = groups.setdefault(m.group(1), set())
             after_header = True
             continue
         elif (m := _GROUP_SUMMARY_RE.match(line)):
-            entries.add(f"group:{m.group(1)}")
+            groups[m.group(1)], current = "summary", None
         elif (m := _GROUP_UNAVAILABLE_RE.match(line)):
-            entries.add(f"unavailable:{m.group(1)}")
-        elif after_header and line:
-            entries.update(name.strip() for name in line.split(", ") if name.strip())
+            groups[m.group(1)], current = "unavailable", None
+        elif current is not None and after_header and line:
+            current.update(name.strip() for name in line.split(", ") if name.strip())
         after_header = False
-    return frozenset(entries)
+    return {label: names if isinstance(names, str) else frozenset(names) for label, names in groups.items()}
+
+
+def listing_names_new_tools(kept: str, fresh: str) -> bool:
+    """True when ``fresh`` advertises an available group ``kept`` does not show at all, or names
+    a tool of a group ``kept`` listed by name without it. A group ``kept`` showed without names
+    (summarized or unavailable) already covers its tools, and a group ``fresh`` shows without
+    names adds none, so availability changes, recounts and budget-driven expansion or collapse
+    are not growth."""
+    kept_groups = _listing_groups(kept)
+    for label, names in _listing_groups(fresh).items():
+        if label not in kept_groups:
+            if names != "unavailable":
+                return True
+        elif not isinstance(names, str) and not isinstance(kept_groups[label], str):
+            if names - kept_groups[label]:
+                return True
+    return False
 
 
 def build_catalog_listing_with_form(

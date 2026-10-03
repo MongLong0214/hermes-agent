@@ -27,9 +27,9 @@ def _bridge_listing_grew(kept: dict, fresh: Optional[dict]) -> bool:
     must reach it — the same one-time prefix cost an eager tool appended at the tail pays."""
     if fresh is None or _def_name(kept) != "tool_search":
         return False
-    from tools.tool_search_catalog import listing_entries
+    from tools.tool_search_catalog import listing_names_new_tools
     describe = lambda d: (d.get("function") or {}).get("description", "")  # noqa: E731
-    return bool(listing_entries(describe(fresh)) - listing_entries(describe(kept)))
+    return listing_names_new_tools(describe(kept), describe(fresh))
 
 
 def _search_listing_grew(current_defs: list, new_defs: list) -> bool:

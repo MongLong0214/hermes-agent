@@ -372,6 +372,38 @@ def test_a_same_code_pin_takes_the_bridge_listing_that_names_a_new_server(monkey
     assert persisted == [[_tool("read_file"), fresh_bridge]]
 
 
+def test_only_a_newly_advertised_tool_counts_as_listing_growth(monkeypatch):
+    """Availability wording and the listing budget change the bridge text without adding a tool:
+    a server turning unavailable, or a summarized server whose names fit once another server
+    left, must keep the frozen bytes. A new server, summarized or listed, and a new tool of a
+    listed server are growth."""
+    from tools import tool_search_catalog as catalog
+    from tools.tool_search import bridge_tool_schemas
+
+    monkeypatch.setattr(catalog, "_classify_source", lambda name: ("mcp", "mcp-" + name.split("__")[1]))
+    hidden = []
+    monkeypatch.setattr(catalog, "hidden_declared_sources", lambda: list(hidden))
+
+    def bridge(servers, *, unavailable=(), max_tokens=4000):
+        hidden[:] = [{"name": n, "tool_count": 50, "unavailable": "probe failed"} for n in unavailable]
+        deferred = [{"type": "function", "function": {"name": f"mcp__{server}__tool{i:02d}", "description": "x"}}
+                    for server, count in servers.items() for i in range(count)]
+        listing, form = catalog.build_catalog_listing_with_form(deferred, max_tokens=max_tokens)
+        return bridge_tool_schemas(len(deferred), listing=listing, listing_form=form)[0], form
+
+    grew = _mcp_agent._bridge_listing_grew
+    listed, _ = bridge({"a": 2})
+    assert not grew(listed, bridge({}, unavailable=["a"])[0])
+    summarized, form = bridge({"x": 50, "y": 16}, max_tokens=100)
+    expanded, expanded_form = bridge({"y": 16}, unavailable=["x"], max_tokens=100)
+    assert (form, expanded_form) == ("groups", "names")
+    assert not grew(summarized, expanded)
+
+    assert grew(listed, bridge({"a": 2, "acp": 1})[0])
+    assert grew(listed, bridge({"a": 3})[0])
+    assert grew(summarized, bridge({"x": 50, "y": 16, "acp": 16}, max_tokens=100)[0])
+
+
 # ---------------------------------------------------------------------------
 # tools[] freeze: eviction rebuild + the /reload-mcp re-probe hatch
 # ---------------------------------------------------------------------------
