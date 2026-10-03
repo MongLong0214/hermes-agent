@@ -1957,7 +1957,12 @@ class TurnRunner:
         reasoning_config = runner._resolve_session_reasoning_config(source=ctx.source, session_key=ctx.session_key, model=model)
         runner._reasoning_config = reasoning_config
         runner._service_tier = runner._resolve_session_service_tier(source=ctx.source, session_key=ctx.session_key)
-        stream_consumer, stream_delta_cb, interim_cb, want_interim = self._setup_stream_consumer(platform_key)
+        if ctx.acp_admission is not None:
+            # A managed /acp answer is delivered only through the ledgered final send, whose row is
+            # the receipt's evidence: a stream would deliver it before (or instead of) that row.
+            stream_consumer, stream_delta_cb, interim_cb, want_interim = None, None, None, False
+        else:
+            stream_consumer, stream_delta_cb, interim_cb, want_interim = self._setup_stream_consumer(platform_key)
         turn_route = runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
         agent, reused_cached_agent = self._resolve_turn_agent(
             turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr,
@@ -1979,10 +1984,6 @@ class TurnRunner:
         agent_history, observed_group_context, history_media_paths = self._load_turn_history(agent, reused_cached_agent)
         persist_msg, persist_ts = self._prepare_turn_message(agent_history)
         result = self._run_conversation_with_approval(agent, agent_history, observed_group_context, persist_msg, persist_ts)
-        if _acp is not None:
-            # Settled from this turn's own final response before it is sealed or delivered, so no
-            # delivery path (stream, ledger, queued chain) can leave it unsettled or certify another.
-            acp_managed_ingress.settle_turn(_acp, result)
         self._finish_stream_consumer(result, agent_history, stream_consumer)
         # The streaming-TTS consumer's finish() runs on the outer loop thread after the executor
         # returns, so early run_sync returns are also finalised.

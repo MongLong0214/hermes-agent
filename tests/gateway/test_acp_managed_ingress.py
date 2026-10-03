@@ -195,11 +195,11 @@ def _admitted(gw, text="/acp deploy"):
     return outcome.admission
 
 
-class TestTurnSettlement:
-    """R2/R3: the managed turn settles from its OWN final response inside ``run_sync``, before the
-    stream consumer seals or any delivery path sends it; a follow-up turn never touches it."""
+class TestRunSync:
+    """A managed turn is not streamed (its answer must go out through the ledgered send) and runs
+    only on the session ACP approved; settlement is no longer the turn's job."""
 
-    def _run_sync(self, gw, monkeypatch, admission, result, *, session_key=None, agent=None):
+    def _run_sync(self, gw, monkeypatch, admission, *, agent=None):
         from gateway.run_turn_runner import TurnRunner
         from gateway.turn_context import TurnContext
         import gateway.run as gateway_run
@@ -207,7 +207,12 @@ class TestTurnSettlement:
         calls = []
         monkeypatch.setattr(gateway_run, "_current_max_iterations", lambda: 30)
         monkeypatch.setattr(TurnRunner, "_combined_ephemeral_prompt", lambda self: "")
-        monkeypatch.setattr(TurnRunner, "_setup_stream_consumer", lambda self, k: (None, None, None, False))
+
+        def stream(self, key):
+            calls.append("stream")
+            return None, None, None, False
+
+        monkeypatch.setattr(TurnRunner, "_setup_stream_consumer", stream)
         agent = agent or SimpleNamespace(_session_db=gw.db, session_id=gw.entry.session_id)
         monkeypatch.setattr(TurnRunner, "_resolve_turn_agent", lambda self, *a, **k: (agent, False))
         monkeypatch.setattr(TurnRunner, "_wire_turn_agent_callbacks", lambda self, *a, **k: None)
@@ -216,13 +221,10 @@ class TestTurnSettlement:
 
         def run(self, *a, **k):
             calls.append("run")
-            return result
-
-        def finish(self, *a, **k):
-            calls.append(("finish", receipts.lookup(gw.db, 901).status))
+            return {"final_response": "answer", "messages": [], "api_calls": 1}
 
         monkeypatch.setattr(TurnRunner, "_run_conversation_with_approval", run)
-        monkeypatch.setattr(TurnRunner, "_finish_stream_consumer", finish)
+        monkeypatch.setattr(TurnRunner, "_finish_stream_consumer", lambda self, *a, **k: None)
         monkeypatch.setattr(TurnRunner, "_sync_session_after_run", lambda self, *a, **k: (False, "s", 0))
         monkeypatch.setattr(TurnRunner, "_append_auto_media_tags", lambda self, r, *a, **k: r)
         runner = SimpleNamespace(
@@ -230,41 +232,21 @@ class TestTurnSettlement:
             _provider_routing=None, _resolve_session_reasoning_config=lambda **k: None,
             _resolve_session_service_tier=lambda **k: None, _resolve_turn_agent_config=lambda *a, **k: None,
         )
-        ctx = TurnContext(source=gw.source, session_key=session_key or gw.entry.session_key,
+        ctx = TurnContext(source=gw.source, session_key=gw.entry.session_key,
                           user_config={}, message="deploy", acp_admission=admission)
-        out = TurnRunner(runner, ctx).run_sync()
-        return out, calls
+        return TurnRunner(runner, ctx).run_sync(), calls
 
-    def test_the_turn_settles_completed_from_its_own_answer_before_the_stream_seals(self, gw, monkeypatch):
-        import hashlib
-
-        admission = _admitted(gw)
-        _, calls = self._run_sync(gw, monkeypatch, admission,
-                                  {"final_response": "deployed", "messages": [], "api_calls": 1})
-        assert calls == ["run", ("finish", "COMPLETED")]  # settled before the consumer seals
-        receipt = receipts.lookup(gw.db, 901)
-        assert receipt.receipt_id == "hermes-tg:turn:turn-1"
-        assert receipt.evidence_digest == "sha256:" + hashlib.sha256(b"deployed").hexdigest()
-        assert receipt.content == "deployed"
-
-    def test_a_follow_up_turn_without_the_admission_never_touches_the_receipt(self, gw, monkeypatch):
-        admission = _admitted(gw)
-        self._run_sync(gw, monkeypatch, None, {"final_response": "ordinary answer", "messages": []})
-        assert receipts.lookup(gw.db, 901).status == "PENDING"
-        self._run_sync(gw, monkeypatch, admission, {"final_response": "managed answer", "messages": []})
-        assert receipts.lookup(gw.db, 901).content == "managed answer"
-
-    def test_a_turn_without_a_final_answer_stays_in_doubt(self, gw, monkeypatch):
-        admission = _admitted(gw)
-        self._run_sync(gw, monkeypatch, admission, {"final_response": "", "failed": True, "messages": []})
-        assert receipts.lookup(gw.db, 901).status == "PENDING"
+    def test_a_managed_turn_is_not_streamed_and_an_ordinary_one_is(self, gw, monkeypatch):
+        _, managed = self._run_sync(gw, monkeypatch, _admitted(gw))
+        _, ordinary = self._run_sync(gw, monkeypatch, None)
+        assert managed == ["run"] and ordinary == ["stream", "run"]
+        assert receipts.lookup(gw.db, 901).status == "PENDING"  # settled by delivery, not the turn
 
     def test_an_executor_on_another_session_is_refused_before_running(self, gw, monkeypatch):
         """R4: under the slot, the session about to run must be the one ACP approved."""
-        admission = _admitted(gw)
         other = SimpleNamespace(_session_db=gw.db, session_id="some-other-session")
-        out, calls = self._run_sync(gw, monkeypatch, admission, {"final_response": "x"}, agent=other)
-        assert calls == [] and "target mismatch" in out["final_response"]
+        out, calls = self._run_sync(gw, monkeypatch, _admitted(gw), agent=other)
+        assert "run" not in calls and "target mismatch" in out["final_response"]
         receipt = receipts.lookup(gw.db, 901)
         assert receipt.status == "ABORTED" and receipt.reason_code == "REFUSED_BEFORE_RUN"
 
@@ -281,17 +263,128 @@ def test_a_bound_chat_routed_to_another_session_is_refused_unasked(gw):
     assert outcome.admission is None and "target mismatch" in outcome.reply and envelopes == []
 
 
-def test_a_process_that_died_mid_turn_is_aborted_but_a_settled_turn_is_not(gw):
-    """H3: settlement precedes every delivery, so a COMPLETED receipt has nothing left to lose and a
-    PENDING one from a dead owner never answered."""
-    admission = _admitted(gw)
-    proof = {"proven_db_path": gw.db.db_path, "proven_db_identity": gw.db._db_file_identity}
-    ingress.settle_turn(admission, {"final_response": "done"})
-    receipts.claim_pending(gw.db, 2, message_id="m", turn_request_id="t", receipt_identity=_TURN,
-                           owner="dead-process", **proof)
-    assert ingress.sweep_at_startup(gw.runner) == ["2"]
-    assert receipts.lookup(gw.db, 901).status == "COMPLETED"
-    assert receipts.lookup(gw.db, 2).reason_code == "HERMES_PROCESS_DIED_BEFORE_ANSWER"
+def test_a_disabled_delivery_ledger_refuses_unasked(gw, monkeypatch):
+    """Without the ledger there is no evidence an answer was delivered, so nothing is admitted."""
+    monkeypatch.setattr("gateway.delivery_ledger.ledger_enabled", lambda config=None: False)
+
+    async def exercise():
+        async with _Lane(gw.sock, _allowed(gw)) as lane:
+            return await _admit(gw, _event("/acp deploy")), lane.envelopes
+
+    outcome, envelopes = asyncio.run(exercise())
+    assert outcome.admission is None and "ledger" in outcome.reply and envelopes == []
+
+
+class TestLedgerSettlement:
+    """R2/R3 through the real delivery ledger (same state.db): the receipt settles from the answer
+    that was actually sent, live or redelivered, and no settlement-write failure, crash or upgrade
+    can turn an answered update into a death before answer."""
+
+    def _adapter(self, gw, *, succeed=True):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.base import BasePlatformAdapter, SendResult
+
+        class _Adapter(BasePlatformAdapter):
+            def __init__(self):
+                super().__init__(PlatformConfig(enabled=True, token="t"), Platform.TELEGRAM)
+                self.sent = []
+
+            async def connect(self):
+                return True
+
+            async def disconnect(self):
+                pass
+
+            async def send(self, chat_id, content, reply_to=None, metadata=None):
+                self.sent.append(content)
+                return SendResult(success=succeed, message_id="77", error=None if succeed else "flood")
+
+            async def get_chat_info(self, chat_id):
+                return {"id": chat_id}
+
+        adapter = _Adapter()
+        adapter.gateway_runner = gw.runner
+        return adapter
+
+    def _managed_event(self, gw, admission):
+        from gateway.platforms.event import MessageEvent
+        event = MessageEvent(text=admission.task_text, source=gw.source, message_id="55")
+        event._acp_admission = admission
+        return event
+
+    def test_the_delivered_final_text_is_the_evidence(self, gw):
+        import hashlib
+
+        admission = _admitted(gw, "/acp /deploy now")  # a task text starting with "/" is still ledgered
+        adapter = self._adapter(gw)
+        asyncio.run(adapter.send_final_ledgered(self._managed_event(gw, admission), gw.entry.session_key,
+                                                "shaped final", {}, reply_to="55"))
+        receipt = receipts.lookup(gw.db, 901)
+        assert adapter.sent == ["shaped final"] and receipt.status == "COMPLETED"
+        assert receipt.evidence_digest == "sha256:" + hashlib.sha256(b"shaped final").hexdigest()
+        assert receipt.receipt_id.startswith("hermes-tg:") and receipt.receipt_identity == _TURN
+        assert receipt.content == "shaped final"
+
+    def test_a_queued_follow_up_never_certifies_the_managed_receipt(self, gw):
+        admission = _admitted(gw)
+        adapter = self._adapter(gw)
+
+        async def exercise():
+            await gw.runner._send_queued_final_text(adapter, gw.source, "follow-up answer", None, "56",
+                                                    gw.entry.session_key, "56")
+            assert receipts.lookup(gw.db, 901).status == "PENDING"
+            await gw.runner._send_queued_final_text(adapter, gw.source, "managed answer", None, "55",
+                                                    gw.entry.session_key, "55", acp_admission=admission)
+
+        asyncio.run(exercise())
+        assert receipts.lookup(gw.db, 901).content == "managed answer"
+
+    def test_a_failed_settlement_write_still_reads_completed_and_is_settled_at_startup(self, gw, monkeypatch):
+        admission = _admitted(gw)
+        with monkeypatch.context() as broken:
+            broken.setattr(receipts, "_settle", lambda *a, **k: (_ for _ in ()).throw(OSError("disk")))
+            asyncio.run(self._adapter(gw).send_final_ledgered(
+                self._managed_event(gw, admission), gw.entry.session_key, "the answer", {}, reply_to="55"))
+        assert receipts.decode(gw.db.get_meta(receipts.receipt_key(901)), 901).status == "PENDING"
+        assert receipts.lookup(gw.db, 901).status == "COMPLETED"  # GET reads the delivered row
+        monkeypatch.setattr(ingress, "_PROCESS_OWNER", "a-later-process")
+        assert ingress.sweep_at_startup(gw.runner) == []
+        assert receipts.decode(gw.db.get_meta(receipts.receipt_key(901)), 901).status == "COMPLETED"
+
+    def test_an_undelivered_answer_waits_for_redelivery_then_completes(self, gw, monkeypatch):
+        from gateway import delivery_ledger
+
+        admission = _admitted(gw)
+        asyncio.run(self._adapter(gw, succeed=False).send_final_ledgered(
+            self._managed_event(gw, admission), gw.entry.session_key, "the answer", {}, reply_to="55"))
+        monkeypatch.setattr(ingress, "_PROCESS_OWNER", "a-later-process")
+        assert ingress.sweep_at_startup(gw.runner) == []  # owed, not dead
+        assert receipts.lookup(gw.db, 901).status == "PENDING"
+        [row] = receipts.ledger_answers(gw.db, 901)
+        delivery_ledger.mark_delivered(row["obligation_id"])
+        assert ingress.settle_delivered(gw.runner, row["obligation_id"])
+        assert receipts.lookup(gw.db, 901).receipt_id == f"hermes-tg:{row['obligation_id']}"
+
+    def test_only_an_update_with_no_ledgered_answer_is_a_death_before_answer(self, gw, monkeypatch):
+        from gateway import delivery_ledger
+
+        proof = {"proven_db_path": gw.db.db_path, "proven_db_identity": gw.db._db_file_identity}
+        for update in (1, 2, 3):
+            receipts.claim_pending(gw.db, update, message_id="m", turn_request_id="t",
+                                   receipt_identity=_TURN, owner="dead-process", **proof)
+        # 2: an older build recorded the answer's correlation on the receipt itself.
+        raw = json.loads(gw.db.get_meta(receipts.receipt_key(2)))
+        gw.db.compare_and_set_meta(receipts.receipt_key(2), gw.db.get_meta(receipts.receipt_key(2)),
+                                   json.dumps({**raw, "obligation_id": "ob-old"}), **proof)
+        # 3: answered, but the ledger gave up delivering it.
+        delivery_ledger.record_obligation(obligation_id="ob-3", session_key=gw.entry.session_key,
+                                          platform="telegram", chat_id="1718881034", thread_id=None,
+                                          content="x", acp_update_id="3")
+        delivery_ledger._update_state("ob-3", "abandoned")
+        assert sorted(ingress.sweep_at_startup(gw.runner)) == ["1", "3"]
+        assert receipts.lookup(gw.db, 1).reason_code == "HERMES_PROCESS_DIED_BEFORE_ANSWER"
+        assert receipts.lookup(gw.db, 2).status == "PENDING"
+        assert receipts.lookup(gw.db, 3).reason_code == "HERMES_ANSWER_UNDELIVERABLE"
 
 
 class TestAdapterEntry:
@@ -354,16 +447,20 @@ class TestAdapterEntry:
         assert busy_calls == ["ordinary"]  # ordinary text keeps its busy route
 
     @pytest.mark.asyncio
-    async def test_a_task_is_never_merged_into_a_neighbouring_text_batch(self, gw):
+    async def test_text_before_a_task_is_its_own_update_and_a_split_tail_joins_the_task(self, gw):
+        """REG1: a >4096-char /acp paste arrives as a near-limit chunk plus continuations; the tail
+        must join the task, and ordinary text batched just before it must not."""
         adapter = self._adapter(gw)
         adapter._text_batch_delay_seconds = adapter._text_batch_split_delay_seconds = 0.05
+        head = "/acp " + "x" * 4095
         adapter._enqueue_text_event(self._msg(gw, "hello", 10))
-        adapter._enqueue_text_event(self._msg(gw, "/acp deploy", 11))
-        for _ in range(50):
+        adapter._enqueue_text_event(self._msg(gw, head, 11))
+        adapter._enqueue_text_event(self._msg(gw, "TAIL", 12))
+        for _ in range(100):
             if len(adapter.dispatched) == 2:
                 break
             await asyncio.sleep(0.02)
-        assert sorted(adapter.dispatched) == ["/acp deploy", "hello"]  # two updates, never one
+        assert sorted(adapter.dispatched, key=len) == ["hello", head + "\nTAIL"]
 
 
 class TestHandleMessageSeam:

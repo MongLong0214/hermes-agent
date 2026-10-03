@@ -2502,6 +2502,15 @@ class BasePlatformAdapter(ABC):
         """Session-scoped key for text batching (subclasses may override)."""
         return self._event_session_key(event)
 
+    async def _settle_acp_delivered(self, obligation_id: str) -> None:
+        """U4: the ledgered /acp answer reached the chat — settle its receipt from the ledger row.
+        A failed settlement leaves the receipt PENDING; GET and the startup sweep read the row."""
+        try:
+            from gateway.acp_managed_ingress import settle_delivered
+            await asyncio.to_thread(settle_delivered, self.gateway_runner, obligation_id)
+        except Exception:
+            logger.warning("ACP receipt settlement after delivery failed for %s", obligation_id, exc_info=True)
+
     def _is_acp_managed(self, event: "MessageEvent") -> bool:
         """U4 H2: an explicit /acp task on the ACP-bound chat (gateway.acp_managed_ingress)."""
         runner = getattr(self, "gateway_runner", None)
@@ -2518,14 +2527,19 @@ class BasePlatformAdapter(ABC):
         """Buffer a text event (merging into a pending one) and restart the flush timer."""
         if self._drop_unresolved(event):
             return
-        if self._is_acp_managed(event):
-            # U4 H2: an /acp task is its own update — merged into a neighbour's batch it would run
-            # under that message's ids as ordinary text, with no ACP admission.
-            task = asyncio.create_task(self._dispatch_text_batch(event))
-            self._background_tasks.add(task)
-            task.add_done_callback(self._background_tasks.discard)
-            return
         key = self._text_batch_key(event)
+        if self._is_acp_managed(event):
+            # U4 H2: an /acp task opens its own batch. Text batched before it goes out as its own
+            # update (merged in, it would run under that message's ids as ordinary text), while the
+            # continuation chunks of a split /acp paste still join the task that heads the batch.
+            prior = self._pop_text_batch(key)
+            prior_task = self._pending_text_batch_tasks.pop(key, None)
+            if prior_task is not None and not prior_task.done():
+                prior_task.cancel()
+            if prior is not None:
+                task = asyncio.create_task(self._dispatch_text_batch(prior))
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
         existing = self._pending_text_batches.get(key)
         if existing is None:
             existing = self._pending_text_batches[key] = event
@@ -4154,8 +4168,10 @@ class BasePlatformAdapter(ABC):
         """Ledger the final response BEFORE the send so a crash before platform ACK redelivers on
         next boot; best-effort, skips slash-command and ephemeral replies. Returns the obligation id
         or None."""
-        if is_ephemeral_response or str(event.text or "").lstrip().startswith(
-            ("/", self.typed_command_prefix or "!")):
+        _acp = getattr(event, "_acp_admission", None)
+        # A managed /acp answer is always ledgered: its ledger row is the receipt's evidence.
+        if is_ephemeral_response or (_acp is None and str(event.text or "").lstrip().startswith(
+                ("/", self.typed_command_prefix or "!"))):
             return None
         try:
             from gateway.delivery_ledger import (
@@ -4175,7 +4191,8 @@ class BasePlatformAdapter(ABC):
                 platform=str(getattr(source.platform, "value", source.platform)),
                 chat_id=source.chat_id, thread_id=getattr(source, "thread_id", None),
                 content=text_content,
-                adapter_profile=getattr(delivery_adapter, "_owner_profile", None))
+                adapter_profile=getattr(delivery_adapter, "_owner_profile", None),
+                acp_update_id=_acp.update_id if _acp is not None else None)
             await asyncio.to_thread(mark_attempting, obligation_id)
             return obligation_id
         except Exception:
@@ -4195,7 +4212,9 @@ class BasePlatformAdapter(ABC):
             from gateway.delivery_ledger import is_reconnect_only, mark_delivered, mark_failed
             # attempt=0: the producer's own send settles only while no redelivery has claimed the row.
             if getattr(result, "success", False):
-                await asyncio.to_thread(mark_delivered, obligation_id, attempt=0)
+                if await asyncio.to_thread(mark_delivered, obligation_id, attempt=0) and getattr(
+                        event, "_acp_admission", None) is not None:
+                    await self._settle_acp_delivered(obligation_id)
                 return
             error = str(getattr(result, "error", "") or "")
             await asyncio.to_thread(mark_failed, obligation_id, error, attempt=0)

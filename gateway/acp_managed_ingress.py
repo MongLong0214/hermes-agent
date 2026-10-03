@@ -7,9 +7,11 @@ committed in one ACP transaction, ACP #1062). A deny, a timeout or an unreadable
 turn does not run here and is not retried: the outcome is reported to the owner and left to ACP,
 which sees the claimed turn as in doubt until it reads this gateway's receipt.
 
-The receipt (``gateway.acp_turn_receipts``) is claimed before the turn runs and settled COMPLETED by
-the turn itself (``TurnRunner.run_sync``) from its own final response, before that response is sealed
-or delivered on any path (streamed, ledgered, queued). Nothing here writes ABORTED
+The receipt (``gateway.acp_turn_receipts``) is claimed before the turn runs. The managed turn is not
+streamed: its answer goes out only through the ledgered final send, whose obligation row carries the
+update id in the same INSERT. The receipt settles COMPLETED from that row once it is delivered, live or
+by redelivery; GET and the startup sweep read the row too, so no settlement write can strand an answer
+the owner already has. Nothing here writes ABORTED
 on a timeout: an admission whose answer never arrived may still have committed on ACP's side, so
 the receipt stays absent (NEVER_FOUND, i.e. in doubt for ACP) rather than claiming a non-run this
 process cannot prove.
@@ -176,6 +178,10 @@ async def admit(runner: Any, event: Any, source: Any, session_key: str, *, path:
         # would approve is not the session that would run, so the task is refused unasked.
         return Outcome(reply=REFUSED.format(reason="target mismatch"))
     task_text = receipts.acp_managed_task_text(event.text)
+    from gateway.delivery_ledger import ledger_enabled
+    if not ledger_enabled():
+        # The ledger row is the receipt's only evidence of an answer: without it, refuse unasked.
+        return Outcome(reply=REFUSED.format(reason="delivery ledger disabled"))
     secret = secret if secret is not None else read_secret()
     envelope = build_envelope(event, source, secret) if secret and task_text else None
     if envelope is None:
@@ -253,30 +259,20 @@ def target_still_matches(admission: Admission, session_key: Optional[str], sessi
     return _binding_lineage_digest(session_db, session_id) == admission.lineage_root_digest
 
 
-def settle_turn(admission: Admission, result: Any) -> bool:
-    """Settle the receipt from THIS turn's own final response, before it is sealed or delivered on
-    any path. A turn with no final answer, or a settlement that does not land, leaves the receipt
-    PENDING — in doubt for ACP, never promoted (CEO 3c058be8)."""
-    import hashlib
-
-    final = result.get("final_response") if isinstance(result, dict) else None
-    if not isinstance(final, str) or not final.strip() or (isinstance(result, dict) and result.get("failed")):
-        logger.warning("ACP managed turn for update %s ended without a final answer; receipt left in doubt",
-                       admission.update_id)
+def settle_delivered(runner: Any, obligation_id: str) -> bool:
+    """A ledgered answer was delivered (live send or redelivery): settle the receipt of the /acp
+    update its ledger row names, from that row's content. Not an /acp answer: nothing to do."""
+    db = _binding_db(runner)
+    if db is None:
         return False
-    digest = "sha256:" + hashlib.sha256(final.encode("utf-8")).hexdigest()
-    try:
-        settled = receipts.settle_completed(
-            admission.db, admission.update_id,
-            receipt_id=f"hermes-tg:turn:{admission.turn['turnRequestId']}",
-            evidence_digest=digest, content=final, **admission.proof)
-    except Exception:
-        logger.exception("ACP receipt settlement failed for update %s; left in doubt", admission.update_id)
+    rows = db._read_all("SELECT acp_update_id FROM delivery_obligations WHERE obligation_id = ?",
+                        (obligation_id,))
+    update_id = rows[0][0] if rows else None
+    if update_id is None:
         return False
-    if not settled:
-        logger.warning("ACP receipt for update %s was not PENDING at settlement; left as recorded",
-                       admission.update_id)
-    return settled
+    return receipts.settle_from_ledger(
+        db, update_id, obligation_id=obligation_id,
+        proven_db_path=db.db_path, proven_db_identity=db._db_file_identity)
 
 
 def _binding_db(runner: Any) -> Any:

@@ -3815,6 +3815,7 @@ class GatewayTurnMixin:
                     # The text send records a delivery-ledger obligation under this key, keyed on
                     # the raw inbound id (the anchor above is only the reply target).
                     session_key=session_key, inbound_message_id=turn_ctx.inbound_message_id,
+                    acp_admission=getattr(turn_ctx, "acp_admission", None),
                 )
             except Exception as e:
                 logger.warning("Failed to send first response before queued message: %s", e)
