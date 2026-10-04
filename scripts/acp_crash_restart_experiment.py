@@ -38,8 +38,9 @@ import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
-SCENARIOS = ("managed-before-send", "managed-failed-send", "chain-followup", "chain-withheld-before-followup",
-             "chain-followup-unanswered", "pre-prompt-after-bind")
+# A managed turn runs no follow-up under its marker (the adapter's drain runs it as its own turn), so
+# the earlier chain-* scenarios no longer describe a production path and were removed.
+SCENARIOS = ("managed-before-send", "managed-failed-send", "pre-prompt-after-bind")
 UPDATE_ID = 901
 CHAT = "100200300"
 

@@ -843,19 +843,11 @@ class GatewayStartupMixin:
             if managed is None:
                 logger.warning("Crash-left turn on %s: identity unreadable; held for the next start", key)
                 continue
-            # A managed /acp turn is never re-run (no admission covers a second run) and its own
-            # answer is never redelivered (its receipt settles only from that answer's ledger row).
-            # An ordinary follow-up the chain ran under the same marker still owes its answer: it is
-            # ledgered like any crash-left reply. The marker is then cleared; a failed cleanup still
-            # leaves it held out of the resume step below.
-            try:
-                if await self._ledger_managed_chain_followup(key, token):
-                    ledgered += 1
-            except Exception:
-                # The follow-up's owed reply is not accounted for: keep the marker (still held out of
-                # the resume step) so the next start retries, rather than erase the ownership.
-                logger.warning("Managed chain follow-up recovery failed on %s; marker kept", key, exc_info=True)
-                continue
+            # A managed /acp turn is never re-run (no admission covers a second run) and its answer is
+            # never redelivered (its receipt settles only from that answer's ledger row). It never ran
+            # a follow-up under this marker (follow-ups go to the adapter's drain as their own turns),
+            # so nothing else is owed. The marker is cleared; a failed cleanup still leaves it held out
+            # of the resume step below.
             logger.warning("Crash-left managed /acp turn on %s: not resumed, its answer not redelivered", key)
             with _log_suppressed(logging.WARNING, "Managed marker cleanup failed: %s"):
                 await self.async_session_store.clear_turn_active(key, token)
@@ -865,46 +857,6 @@ class GatewayStartupMixin:
             resumed = await self.async_session_store.recover_interrupted_turns(
                 max_age_seconds=max_age, hold_tokens=frozenset(held))
         return resumed, ledgered
-
-    async def _ledger_managed_chain_followup(self, key: str, token: str) -> bool:
-        """What a crash-left managed chain owes is decided by the position recorded when its ordinary
-        follow-up started (acp_managed_ingress.mark_chain_followup), rather than inferring roles from the
-        transcript: with no recorded follow-up nothing is owed (the admitted task's answer belongs to
-        its receipt alone); with one, only a final reply among the rows after that position is ledgered,
-        as an ordinary crash-left reply deduplicated from the follow-up's start. Raises when the owed
-        reply cannot be accounted for, so the caller keeps the marker. True when a reply was ledgered."""
-        from gateway.acp_managed_ingress import chain_followup_position
-        from gateway.delivery_ledger import compute_obligation_id, ledger_enabled, record_crash_left_reply
-
-        position = await asyncio.to_thread(chain_followup_position, self, key, token)
-        if position is None:
-            return False
-        with self.session_store._lock:  # noqa: SLF001
-            entry = self.session_store._entries.get(key)  # noqa: SLF001
-            session_id = getattr(entry, "session_id", None)
-            origin = getattr(entry, "origin", None)
-            profile = getattr(entry, "transport_profile", None)
-        if session_id != position.get("session"):
-            logger.warning("Managed chain on %s moved to another session since its follow-up began; "
-                           "its reply cannot be located", key)
-            return False
-        if origin is None or not await asyncio.to_thread(ledger_enabled):
-            return False
-        history = await self.async_session_store.load_transcript(session_id)
-        after = [m for m in history[int(position["after"]):] if m.get("role") not in ("session_meta", "system")]
-        last_user = next((i for i in range(len(after) - 1, -1, -1) if after[i].get("role") == "user"), None)
-        if last_user is None:
-            return False  # the follow-up's prompt never became durable: nothing of it is owed
-        text = self._crash_left_reply(after[last_user:], 0.0, origin)
-        if not text:
-            return False
-        await asyncio.to_thread(
-            record_crash_left_reply,
-            obligation_id=compute_obligation_id(key, f"crash:{token}", text), session_key=key,
-            platform=str(getattr(origin.platform, "value", origin.platform)), chat_id=origin.chat_id,
-            thread_id=origin.thread_id, content=text, since=float(position.get("at") or 0.0),
-            adapter_profile=profile)
-        return True
 
     async def _acp_held_turn_markers(self) -> dict:
         """Marker token -> (session key, token, True) for an admitted /acp turn (cleared, never

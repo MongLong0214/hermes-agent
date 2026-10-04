@@ -3903,19 +3903,6 @@ class GatewayTurnMixin:
                 adapter.queue_message(session_key, pending)
             return turn_ctx.result_holder[0] or {"final_response": response, "messages": history}
 
-        _chain_admission = getattr(turn_ctx, "acp_admission", None)
-        if _chain_admission is not None and not await self._acp_mark_chain_followup(
-                _chain_admission, session_key, session_id):
-            # The follow-up's position under the managed marker is not durable, so a crash during it
-            # could not be recovered correctly. It runs later as its own turn (its own marker) instead,
-            # exactly as the depth cap above defers it; the managed answer goes out as this turn's final.
-            adapter = self._delivery_adapter_for(source)
-            if adapter and pending_event:
-                merge_pending_message_event(adapter._pending_messages, session_key, pending_event)
-            elif adapter and hasattr(adapter, 'queue_message'):
-                adapter.queue_message(session_key, pending)
-            return turn_ctx.result_holder[0] or {"final_response": response, "messages": history}
-
         # Interrupted: discard the response ("Operation interrupted." is noise).
         if not result.get("interrupted"):
             await self._run_agent_deliver_first_response(turn_ctx, adapter, response, result, stream_task)
@@ -4037,20 +4024,46 @@ class GatewayTurnMixin:
             }
         return merged
 
-    async def _acp_mark_chain_followup(self, admission: Any, session_key: str, session_id: str) -> bool:
-        """Record, under the managed turn's marker, where the chain's ordinary follow-up starts."""
-        from gateway import acp_managed_ingress
-        try:
-            with self.session_store._lock:  # noqa: SLF001 — this turn's own marker token
-                _entry = self.session_store._entries.get(session_key)  # noqa: SLF001
-                token = getattr(_entry, "active_turn_token", None)
-            rows_before = len(await self.async_session_store.load_transcript(session_id))
-        except Exception:
-            logger.warning("Managed chain follow-up position unavailable", exc_info=True)
-            return False
-        return await asyncio.to_thread(
-            acp_managed_ingress.mark_chain_followup, admission, token, session_id=session_id,
-            rows_before=rows_before, started_at=time.time())
+    async def _run_agent_next_followup(self, turn_ctx: Any, result: Any, adapter: Any, source: SessionSource,
+                                       session_key: Optional[str]) -> Tuple[Any, Optional[str]]:
+        """The follow-up this turn runs in-band, as ``(pending_event, pending)``. A managed /acp turn
+        runs none under its own marker and admission rather than chaining it: what arrived meanwhile stays in (or is merged
+        into) the adapter's pending slot, and the adapter's end-of-task drain runs it as its own
+        ordinary turn after this one's answer is delivered. Crash recovery of a managed marker
+        therefore never owes a follow-up."""
+        if getattr(turn_ctx, "acp_admission", None) is not None:
+            self._acp_leave_followups_for_drain(result, adapter, source, session_key)
+            return None, None
+        return await self._run_agent_drain_pending(result, adapter, source, session_key)
+
+    def _acp_leave_followups_for_drain(self, result: Any, adapter: Any, source: SessionSource,
+                                       session_key: Optional[str]) -> None:
+        """A managed turn's follow-ups are left to the adapter's end-of-task drain. A queued event
+        already sits in the adapter's pending slot and is not touched. Text that exists only in this
+        turn's result (a leftover /steer, a non-control interrupt message) is merged into that slot as
+        an event, never written over an event already there."""
+        from gateway.platforms.base import merge_pending_message_event
+        from gateway.platforms.event import MessageEvent, MessageType
+        from gateway.run import _is_control_interrupt_message
+
+        if not (result and adapter and session_key):
+            return
+        texts = []
+        if result.get("interrupted") and result.get("interrupt_message") \
+                and not _is_control_interrupt_message(result.get("interrupt_message")):
+            texts.append(result.get("interrupt_message"))
+        if result.get("pending_steer"):
+            texts.append(result.get("pending_steer"))
+        pending = getattr(adapter, "_pending_messages", None)
+        if pending is None:
+            if texts:
+                logger.warning("Managed turn follow-up text could not be queued for %s: adapter has no "
+                               "pending slot", session_key)
+            return
+        for text in texts:
+            merge_pending_message_event(pending, session_key,
+                                        MessageEvent(text=text, message_type=MessageType.TEXT, source=source),
+                                        merge_text=True)
 
     async def _run_agent_cleanup_turn_tasks(
         self, turn_ctx: TurnContext, *, progress_task: Any, log_task: Any, interrupt_monitor: "asyncio.Task",
@@ -4428,7 +4441,7 @@ class GatewayTurnMixin:
             result = turn_ctx.result_holder[0]
             adapter = self._delivery_adapter_for(source)
             await self._run_agent_finalize_streaming_tts(turn_ctx, adapter)
-            pending_event, pending = await self._run_agent_drain_pending(result, adapter, source, session_key)
+            pending_event, pending = await self._run_agent_next_followup(turn_ctx, result, adapter, source, session_key)
             if pending_event or pending:
                 return await self._run_agent_queued_followup(
                     turn_ctx, adapter, pending, pending_event, response, result, stream_task,
