@@ -159,7 +159,9 @@ jobs:
   contributor-check:
     name: Check contributors
     needs: detect
-    if: needs.detect.outputs.python == 'true'
+    # Upstream attribution policy: it checks every author since the merge base with upstream main,
+    # which a fork's release branch (carrying ported upstream commits) can never satisfy.
+    if: needs.detect.outputs.python == 'true' && github.repository_owner == 'NousResearch'
     uses: ./.github/workflows/contributor-check.yml
 
   uv-lockfile:

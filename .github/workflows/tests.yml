@@ -14,9 +14,9 @@ concurrency:
 jobs:
   test:
     name: Run tests (slice ${{ matrix.slice }}/8)
-    # Fork (2026-10-04, owner): no paid runners. The 96-core single job becomes eight
-    # slices on the standard hosted runner; the suite is ~126 s x 96 cores, so each
-    # 4-core slice is a few minutes plus setup. `--slice i/N` is the runner's own split.
+    # Standard hosted runners only (this fork has no larger runners). The 96-core single
+    # job becomes eight slices; the suite is ~126 s x 96 cores, so each 4-core slice is a
+    # few minutes plus setup. `--slice i/N` is the runner's own split.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
