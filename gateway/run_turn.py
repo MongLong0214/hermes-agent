@@ -3985,21 +3985,11 @@ class GatewayTurnMixin:
         # (the helper's own ``except Exception`` does not catch cancellation).
         _chain_admission = getattr(turn_ctx, "acp_admission", None)
         if _chain_admission is not None and not await self._acp_mark_followup_start(_chain_admission, session_key):
-            # Without a durable start the follow-up's answer could not be recovered after a crash, so
-            # it does not run under the managed marker: it goes back to the queue exactly as the
-            # draining path hands an accepted follow-up back, and runs later as its own turn.
-            logger.warning("Managed chain follow-up start not recorded for %s; deferring it", session_key)
-            if pending_event is not None and adapter is not None and session_key:
-                self._restore_undrained_pending_event(session_key, adapter, pending_event)
-            elif pending and adapter is not None and hasattr(adapter, "_pending_messages") and session_key:
-                from gateway.platforms.base import merge_pending_message_event
-                from gateway.platforms.event import MessageEvent, MessageType
-                merge_pending_message_event(adapter._pending_messages, session_key,
-                                            MessageEvent(text=pending, message_type=MessageType.TEXT, source=source),
-                                            merge_text=True)
-            await _run_followup_processing_hook(_hook_adapter, pending_event, "on_processing_complete",
-                                                ProcessingOutcome.SUCCESS)
-            return {**result, "final_response": None} if isinstance(result, dict) else result
+            # The follow-up still runs in-band (the drain's order, hooks and commands stay intact, and
+            # the managed answer keeps its own delivery). Only crash recovery degrades: without a
+            # recorded start, a crash during this follow-up suppresses its reply with the managed turn.
+            logger.warning("Managed chain follow-up start not recorded for %s; a crash during it will not "
+                           "recover its reply", session_key)
         try:
             await self._refresh_agent_cache_message_count(session_key, session_id)
 
