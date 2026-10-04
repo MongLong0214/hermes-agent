@@ -322,27 +322,9 @@ def bind_turn_marker(admission: Admission, token: Optional[str]) -> bool:
         return False
 
 
-_RELEASED = "released"
-
-
-def release_turn_marker(admission: Admission, token: Optional[str]) -> bool:
-    """The managed answer is behind the chain; an ordinary follow-up now runs under this marker.
-    Its identity becomes ordinary for crash recovery (the follow-up's answer is owed delivery)."""
-    if not token:
-        return False
-    try:
-        return bool(admission.db.compare_and_set_meta(
-            _turn_marker_key(token), str(admission.update_id), _RELEASED, **admission.proof))
-    except Exception:
-        logger.warning("ACP update %s: turn marker not released; a crash now suppresses the follow-up",
-                       admission.update_id, exc_info=True)
-        return False
-
-
 def crash_left_turn_is_managed(runner: Any, session_key: str, token: str) -> Optional[bool]:
     """Whether the turn the dead process left marked on *session_key* ran an admitted /acp task:
-    True when its marker was bound and not released, False when it was not, None when that cannot be
-    read. Read from the session's own store, independent of the current binding configuration: the
+    True when its marker was bound, False when it was not, None when that cannot be read. Read from the session's own store, independent of the current binding configuration: the
     marker was written there before the turn ran, and an edited or removed binding must not turn an
     admitted task back into an ordinary one."""
     if not token:
@@ -355,7 +337,7 @@ def crash_left_turn_is_managed(runner: Any, session_key: str, token: str) -> Opt
     except Exception:
         logger.warning("Crash-left turn on %s: marker store unreadable", session_key, exc_info=True)
         return None
-    return value is not None and value != _RELEASED
+    return value is not None
 
 
 _PROCESS_OWNER: Optional[str] = None

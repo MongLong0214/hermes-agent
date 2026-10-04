@@ -843,19 +843,65 @@ class GatewayStartupMixin:
             if managed is None:
                 logger.warning("Crash-left turn on %s: identity unreadable; held for the next start", key)
                 continue
-            # A managed /acp turn is never re-run (no admission covers a second run) nor redelivered
-            # (its receipt settles only from its own ledgered answer): the marker is cleared and the
-            # receipt is left to the startup sweep, in doubt or aborted. A failed cleanup still leaves
-            # the marker held out of the resume step below.
-            logger.warning("Crash-left managed /acp turn on %s: not resumed, not redelivered", key)
+            # A managed /acp turn is never re-run (no admission covers a second run) and its own
+            # answer is never redelivered (its receipt settles only from that answer's ledger row).
+            # An ordinary follow-up the chain ran under the same marker still owes its answer: it is
+            # ledgered like any crash-left reply. The marker is then cleared; a failed cleanup still
+            # leaves it held out of the resume step below.
+            with _log_suppressed(logging.WARNING, "Managed chain follow-up recovery failed: %s"):
+                if await self._ledger_managed_chain_followup(key, token):
+                    ledgered += 1
+            logger.warning("Crash-left managed /acp turn on %s: not resumed, its answer not redelivered", key)
             with _log_suppressed(logging.WARNING, "Managed marker cleanup failed: %s"):
                 await self.async_session_store.clear_turn_active(key, token)
         with _log_suppressed(logging.WARNING, "Crash-left reply recovery on startup failed: %s"):
-            ledgered = await self._ledger_crash_left_replies(max_age, held=held)
+            ledgered += await self._ledger_crash_left_replies(max_age, held=held)
         with _log_suppressed(logging.WARNING, "Exact active-turn recovery on startup failed: %s"):
             resumed = await self.async_session_store.recover_interrupted_turns(
                 max_age_seconds=max_age, hold_tokens=frozenset(held))
         return resumed, ledgered
+
+    async def _ledger_managed_chain_followup(self, key: str, token: str) -> bool:
+        """A managed marker's transcript, judged by its structure rather than by time: when the last
+        user row is the admitted task itself (its persisted metadata carries ``acp_update_id``) nothing
+        is owed here. When it is an ordinary follow-up the chain ran afterwards, that follow-up's final
+        reply is ledgered as an ordinary crash-left reply (and sent by the boot sweep). True when a
+        reply was ledgered."""
+        import json as _json
+        from gateway.delivery_ledger import compute_obligation_id, ledger_enabled, record_crash_left_reply
+
+        with self.session_store._lock:  # noqa: SLF001
+            entry = self.session_store._entries.get(key)  # noqa: SLF001
+            session_id = getattr(entry, "session_id", None)
+            origin = getattr(entry, "origin", None)
+            profile = getattr(entry, "transport_profile", None)
+            started_at = getattr(entry, "active_turn_started_at", None)
+        # Deduplicate against deliveries since the chain began (the marker's start), not all time.
+        since = started_at.timestamp() if started_at is not None else 0.0
+        if not session_id or origin is None or not await asyncio.to_thread(ledger_enabled):
+            return False
+        history = await self.async_session_store.load_transcript(session_id)
+        visible = [m for m in history if m.get("role") not in ("session_meta", "system")]
+        last_user = next((i for i in range(len(visible) - 1, -1, -1) if visible[i].get("role") == "user"), None)
+        if last_user is None:
+            return False
+        meta = visible[last_user].get("display_metadata")
+        if isinstance(meta, str):
+            try:
+                meta = _json.loads(meta)
+            except ValueError:
+                meta = None
+        if isinstance(meta, dict) and meta.get("acp_update_id"):
+            return False  # the admitted task is the last prompt: its answer is the receipt's alone
+        text = self._crash_left_reply(visible[last_user:], 0.0, origin)
+        if not text:
+            return False
+        await asyncio.to_thread(
+            record_crash_left_reply,
+            obligation_id=compute_obligation_id(key, f"crash:{token}", text), session_key=key,
+            platform=str(getattr(origin.platform, "value", origin.platform)), chat_id=origin.chat_id,
+            thread_id=origin.thread_id, content=text, since=since, adapter_profile=profile)
+        return True
 
     async def _acp_held_turn_markers(self) -> dict:
         """Marker token -> (session key, token, True) for an admitted /acp turn (cleared, never

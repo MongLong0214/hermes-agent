@@ -13,6 +13,11 @@ Scenarios:
   managed-failed-send   killed after the managed answer's send was rejected (ledger row ``failed``)
   chain-followup        killed while an ordinary follow-up runs inside the managed chain, after its
                         answer is in the transcript (the managed answer itself was delivered)
+  chain-withheld-before-followup
+                        the managed answer's obligation could not be recorded (withheld, receipt
+                        ABORTED); killed as the follow-up starts, before its prompt is persisted
+  chain-followup-unanswered
+                        killed after the follow-up's prompt is persisted, before it has an answer
 
 Usage: acp_crash_restart_experiment.py [scenario ...]   (all scenarios when none is given)
 Exit status 0 only when every scenario meets its expectation.
@@ -31,7 +36,8 @@ import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
-SCENARIOS = ("managed-before-send", "managed-failed-send", "chain-followup")
+SCENARIOS = ("managed-before-send", "managed-failed-send", "chain-followup", "chain-withheld-before-followup",
+             "chain-followup-unanswered")
 UPDATE_ID = 901
 CHAT = "100200300"
 
@@ -137,13 +143,17 @@ def child(scenario: str, home: Path) -> None:
 
     async def run_agent(*args, **kwargs):
         if kwargs.get("_interrupt_depth", 0):  # the ordinary follow-up inside the chain
+            if scenario == "chain-withheld-before-followup":
+                await park()  # before the follow-up's prompt is durable
             persist("user", kwargs["message"])
+            if scenario == "chain-followup-unanswered":
+                await park()
             persist("assistant", "ordinary follow-up answer")
             await park()
         if scenario == "managed-before-send":
             persist("assistant", "managed answer")
             await park()
-        if scenario == "chain-followup":
+        if scenario.startswith("chain-"):
             event = runner._experiment_event
             ctx = TurnContext(source=source, session_key=entry.session_key, session_id=entry.session_id,
                               history=[], acp_admission=event._acp_admission,
@@ -151,9 +161,22 @@ def child(scenario: str, home: Path) -> None:
 
             async def first_response(*a):
                 persist("assistant", "managed answer")
-                await runner._send_queued_final_text(adapter, source, "managed answer", None, "55",
-                                                     entry.session_key, "55",
-                                                     acp_admission=event._acp_admission)
+                if scenario == "chain-withheld-before-followup":
+                    from gateway import delivery_ledger
+
+                    real_record = delivery_ledger.record_obligation
+
+                    def failing_record(**k):
+                        raise OSError("disk I/O error")
+
+                    delivery_ledger.record_obligation = failing_record
+                try:
+                    await runner._send_queued_final_text(adapter, source, "managed answer", None, "55",
+                                                         entry.session_key, "55",
+                                                         acp_admission=event._acp_admission)
+                finally:
+                    if scenario == "chain-withheld-before-followup":
+                        delivery_ledger.record_obligation = real_record
 
             runner._run_agent_deliver_first_response = first_response
 
@@ -232,6 +255,12 @@ EXPECT = {
                                  and sum("ordinary follow-up answer" in s for s in r["restart_sends"]) == 1
                                  and not any("managed answer" in s for s in r["restart_sends"])
                                  and r["receipt"] == "COMPLETED"),
+    # A withheld managed answer stays unsent after the crash (the receipt stays ABORTED).
+    "chain-withheld-before-followup": lambda r: (r["resume_pending"] is False and r["restart_sends"] == []
+                                                 and r["receipt"] == "ABORTED"),
+    # An unanswered follow-up has no answer to deliver; nothing re-runs, nothing is re-sent.
+    "chain-followup-unanswered": lambda r: (r["resume_pending"] is False and r["restart_sends"] == []
+                                            and r["receipt"] == "COMPLETED"),
 }
 
 
@@ -263,9 +292,13 @@ EXPECT_PERSISTED = {
     and "managed answer" in p["assistant_rows"],
     "managed-failed-send": lambda p: p["bound"] == [str(UPDATE_ID)]
     and ("managed answer", "failed") in p["ledger"],
-    "chain-followup": lambda p: p["marker"] and p["bound"] == ["released"]
+    "chain-followup": lambda p: p["marker"] and p["bound"] == [str(UPDATE_ID)]
     and "ordinary follow-up answer" in p["assistant_rows"]
     and ("managed answer", "delivered") in p["ledger"],
+    "chain-withheld-before-followup": lambda p: p["marker"] and p["bound"] == [str(UPDATE_ID)]
+    and p["assistant_rows"] == ["managed answer"] and p["ledger"] == [],
+    "chain-followup-unanswered": lambda p: p["marker"] and p["bound"] == [str(UPDATE_ID)]
+    and p["assistant_rows"] == ["managed answer"] and ("managed answer", "delivered") in p["ledger"],
 }
 
 

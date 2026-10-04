@@ -1009,3 +1009,39 @@ class TestReviewRound3:
             rows = conn.execute(
                 "SELECT content, acp_update_id FROM delivery_obligations ORDER BY created_at").fetchall()
         assert recovered == (0, 1) and rows[-1] == ("ordinary follow-up answer", None)
+
+
+class TestManagedChainRecovery:
+    """Supplementary review (e1ba104095): recovery of a managed marker is decided by the transcript's
+    structure, with no ownership hand-off that could fail or open a window. Only an ordinary
+    follow-up's own reply is owed; the admitted task's answer never is."""
+
+    def _recover(self, gw):
+        from gateway import delivery_ledger
+
+        recovered = asyncio.run(gw.runner._recover_unclean_sessions())
+        with delivery_ledger._connect() as conn:
+            rows = conn.execute("SELECT content, acp_update_id FROM delivery_obligations").fetchall()
+        return recovered, rows
+
+    def test_a_withheld_managed_answer_is_never_sent_when_the_follow_up_never_started(self, gw):
+        """ESCAPE-SUPP-01: the managed answer is in the transcript but was withheld (no obligation),
+        and the crash comes before the follow-up's prompt is persisted."""
+        _, store = _marked_turn(gw, answer=True)
+        recovered, rows = self._recover(gw)
+        assert recovered == (0, 0) and rows == []
+        assert not store._entries[gw.entry.session_key].resume_pending
+
+    def test_an_unanswered_follow_up_owes_nothing_and_is_not_resumed(self, gw):
+        _, store = _marked_turn(gw, answer=True)
+        store.append_to_transcript(gw.entry.session_id, {"role": "user", "content": "ordinary leftover steer"})
+        recovered, rows = self._recover(gw)
+        assert recovered == (0, 0) and rows == []
+        assert not store._entries[gw.entry.session_key].resume_pending
+
+    def test_an_answered_follow_up_is_ledgered_once_as_ordinary(self, gw):
+        _, store = _marked_turn(gw, answer=True)
+        store.append_to_transcript(gw.entry.session_id, {"role": "user", "content": "ordinary leftover steer"})
+        store.append_to_transcript(gw.entry.session_id, {"role": "assistant", "content": "ordinary follow-up answer"})
+        recovered, rows = self._recover(gw)
+        assert recovered == (0, 1) and rows == [("ordinary follow-up answer", None)]
