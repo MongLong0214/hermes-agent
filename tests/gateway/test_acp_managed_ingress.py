@@ -1011,23 +1011,23 @@ class TestManagedChainFollowups:
             self._ctx(gw, _admitted(gw)), {"messages": []}, adapter, gw.source, gw.entry.session_key))
         assert pending == "queued follow-up"
 
-    def test_an_unrecordable_start_hands_the_follow_up_back_instead_of_running_it(self, gw, monkeypatch):
+    def test_an_unrecordable_start_still_runs_the_follow_up_in_band(self, gw, monkeypatch):
+        """SUPP-09..12: no hand-back (it diverged from the drain and erased an undelivered managed
+        answer); the follow-up runs in-band and the managed answer keeps its own delivery."""
         from unittest.mock import AsyncMock
-        from gateway.platforms.event import MessageEvent, MessageType
 
         admission, store = _marked_turn(gw)
         adapter = TestLedgerSettlement()._adapter(gw)
-        event = MessageEvent(text="queued follow-up", message_type=MessageType.TEXT, source=gw.source,
-                             message_id="56")
         monkeypatch.setattr(ingress, "mark_followup_start", lambda *a, **k: False)
-        followup = AsyncMock()
+        followup = AsyncMock(return_value={"final_response": "ordinary answer", "messages": []})
         monkeypatch.setattr(gw.runner, "_run_agent", followup)
         monkeypatch.setattr(gw.runner, "_run_agent_deliver_first_response", AsyncMock())
+        monkeypatch.setattr(gw.runner, "_refresh_agent_cache_message_count", AsyncMock())
         monkeypatch.setattr(gw.runner, "_delivery_adapter_for", lambda source: adapter)
-        asyncio.run(gw.runner._run_agent_queued_followup(
-            self._ctx(gw, admission), adapter, "queued follow-up", event, "managed answer",
+        result = asyncio.run(gw.runner._run_agent_queued_followup(
+            self._ctx(gw, admission), adapter, "queued follow-up", None, "managed answer",
             {"final_response": "managed answer", "messages": []}, None))
-        assert followup.await_count == 0 and adapter._pending_messages[gw.entry.session_key] is event
+        assert followup.await_count == 1 and result["final_response"] == "ordinary answer"
 
     def test_a_follow_up_reply_after_its_start_is_owed_once(self, gw):
         admission, store = _marked_turn(gw, answer=True)
