@@ -806,6 +806,8 @@ class TestReviewRound2:
         from gateway.turn_context import TurnContext
 
         admission = _admitted(gw)
+        # As in production, the managed turn's marker is bound before its chain runs.
+        assert ingress.bind_turn_marker(admission, gw.runner.session_store.mark_turn_active(gw.entry.session_key))
         settle = TestLedgerSettlement()
         adapter = settle._adapter(gw)
         ctx = TurnContext(source=gw.source, session_key=gw.entry.session_key,
@@ -1012,9 +1014,10 @@ class TestReviewRound3:
 
 
 class TestManagedChainRecovery:
-    """Supplementary review (e1ba104095): recovery of a managed marker is decided by the transcript's
-    structure, with no ownership hand-off that could fail or open a window. Only an ordinary
-    follow-up's own reply is owed; the admitted task's answer never is."""
+    """Supplementary reviews (e1ba104095, 5fb302e7fd): what a crash-left managed chain owes is decided
+    by the follow-up position recorded when the follow-up started, never by inferring roles from the
+    transcript. Only an ordinary follow-up's own reply is owed; the admitted task's answer, an earlier
+    turn's reply, or a reply whose position is unknown never is."""
 
     def _recover(self, gw):
         from gateway import delivery_ledger
@@ -1024,24 +1027,105 @@ class TestManagedChainRecovery:
             rows = conn.execute("SELECT content, acp_update_id FROM delivery_obligations").fetchall()
         return recovered, rows
 
-    def test_a_withheld_managed_answer_is_never_sent_when_the_follow_up_never_started(self, gw):
-        """ESCAPE-SUPP-01: the managed answer is in the transcript but was withheld (no obligation),
-        and the crash comes before the follow-up's prompt is persisted."""
+    def _start_followup(self, gw, admission, store):
+        import time as _time
+
+        token = store._entries[gw.entry.session_key].active_turn_token
+        rows = len(store.load_transcript(gw.entry.session_id))
+        assert ingress.mark_chain_followup(admission, token, session_id=gw.entry.session_id,
+                                           rows_before=rows, started_at=_time.time())
+
+    def test_a_withheld_managed_answer_is_never_sent_when_no_follow_up_started(self, gw):
+        """ESCAPE-SUPP-01 (both writers): no recorded follow-up -> nothing owed, whatever the prompt
+        row's metadata says (the gateway fallback writer stores none)."""
         _, store = _marked_turn(gw, answer=True)
+        store.rewrite_transcript(gw.entry.session_id, [
+            {**m, "display_metadata": {"gateway_input_owner": "fallback"}} if m.get("role") == "user" else m
+            for m in store.load_transcript(gw.entry.session_id)])
         recovered, rows = self._recover(gw)
         assert recovered == (0, 0) and rows == []
         assert not store._entries[gw.entry.session_key].resume_pending
 
+    def test_an_earlier_turns_reply_is_never_adopted(self, gw):
+        """ESCAPE-SUPP-03: the transcript ends with a previous, completed ordinary turn; the crash
+        comes right after the marker is bound, before the admitted prompt is durable."""
+        store = gw.runner.session_store
+        store.append_to_transcript(gw.entry.session_id, {"role": "user", "content": "earlier question"})
+        store.append_to_transcript(gw.entry.session_id, {"role": "assistant", "content": "earlier answer"})
+        admission = _admitted(gw)
+        token = store.mark_turn_active(gw.entry.session_key)
+        assert ingress.bind_turn_marker(admission, token)
+        recovered, rows = self._recover(gw)
+        assert recovered == (0, 0) and rows == []
+
     def test_an_unanswered_follow_up_owes_nothing_and_is_not_resumed(self, gw):
-        _, store = _marked_turn(gw, answer=True)
+        admission, store = _marked_turn(gw, answer=True)
+        self._start_followup(gw, admission, store)
         store.append_to_transcript(gw.entry.session_id, {"role": "user", "content": "ordinary leftover steer"})
         recovered, rows = self._recover(gw)
         assert recovered == (0, 0) and rows == []
         assert not store._entries[gw.entry.session_key].resume_pending
 
     def test_an_answered_follow_up_is_ledgered_once_as_ordinary(self, gw):
-        _, store = _marked_turn(gw, answer=True)
+        admission, store = _marked_turn(gw, answer=True)
+        self._start_followup(gw, admission, store)
         store.append_to_transcript(gw.entry.session_id, {"role": "user", "content": "ordinary leftover steer"})
         store.append_to_transcript(gw.entry.session_id, {"role": "assistant", "content": "ordinary follow-up answer"})
         recovered, rows = self._recover(gw)
         assert recovered == (0, 1) and rows == [("ordinary follow-up answer", None)]
+
+    def test_a_follow_up_reply_identical_to_the_managed_answer_is_still_owed(self, gw):
+        """ESCAPE-SUPP-04: a delivered managed answer with the same text is a different delivery."""
+        from gateway import delivery_ledger
+
+        admission, store = _marked_turn(gw, answer=True)
+        self._start_followup(gw, admission, store)
+        delivery_ledger.record_obligation(obligation_id="ob-managed", session_key=gw.entry.session_key,
+                                          platform="telegram", chat_id="100200300", thread_id=None,
+                                          content="done", acp_update_id="901")
+        delivery_ledger.mark_delivered("ob-managed", message_ids=["7"])
+        store.append_to_transcript(gw.entry.session_id, {"role": "user", "content": "and the other one?"})
+        store.append_to_transcript(gw.entry.session_id, {"role": "assistant", "content": "done"})
+        recovered, rows = self._recover(gw)
+        assert recovered == (0, 1) and ("done", None) in rows
+
+    def test_an_unaccounted_follow_up_reply_keeps_the_marker_for_the_next_start(self, gw, monkeypatch):
+        """ESCAPE-SUPP-02: an unreadable transcript (or a failed ledger write) keeps the ownership."""
+        admission, store = _marked_turn(gw, answer=True)
+        self._start_followup(gw, admission, store)
+        store.append_to_transcript(gw.entry.session_id, {"role": "user", "content": "ordinary leftover steer"})
+        store.append_to_transcript(gw.entry.session_id, {"role": "assistant", "content": "ordinary follow-up answer"})
+        real_load = gw.runner.async_session_store.load_transcript
+
+        async def unreadable(*a, **k):
+            raise OSError("disk")
+
+        monkeypatch.setattr(gw.runner.async_session_store, "load_transcript", unreadable)
+        assert self._recover(gw) == ((0, 0), [])
+        entry = store._entries[gw.entry.session_key]
+        assert entry.active_turn_token and not entry.resume_pending
+        monkeypatch.setattr(gw.runner.async_session_store, "load_transcript", real_load)
+        recovered, rows = self._recover(gw)  # the next, healthy start
+        assert recovered == (0, 1) and rows == [("ordinary follow-up answer", None)]
+
+    def test_an_unrecordable_position_defers_the_follow_up_to_its_own_turn(self, gw, monkeypatch):
+        """U4-R02 (fail closed): the follow-up does not run in the chain; it is queued as its own turn
+        and the managed answer remains this turn's final."""
+        from unittest.mock import AsyncMock
+        from gateway.turn_context import TurnContext
+
+        admission, store = _marked_turn(gw)
+        adapter = TestLedgerSettlement()._adapter(gw)
+        queued = []
+        adapter.queue_message = lambda key, text: queued.append((key, text))
+        ctx = TurnContext(source=gw.source, session_key=gw.entry.session_key, session_id=gw.entry.session_id,
+                          history=[], acp_admission=admission, inbound_message_id="55", event_message_id="55")
+        monkeypatch.setattr(ingress, "mark_chain_followup", lambda *a, **k: False)
+        followup = AsyncMock()
+        monkeypatch.setattr(gw.runner, "_run_agent", followup)
+        monkeypatch.setattr(gw.runner, "_delivery_adapter_for", lambda source: adapter)
+        result = asyncio.run(gw.runner._run_agent_queued_followup(
+            ctx, adapter, "ordinary leftover steer", None, "managed answer",
+            {"final_response": "managed answer", "messages": []}, None))
+        assert followup.await_count == 0 and queued == [(gw.entry.session_key, "ordinary leftover steer")]
+        assert result["final_response"] == "managed answer" and "queued_terminal_inbound_id" not in result

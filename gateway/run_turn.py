@@ -1819,6 +1819,9 @@ class GatewayTurnMixin:
             _user_entry["display_kind"] = prepared.persist_user_display_kind
         if prepared.persistence_owner:
             _user_entry["display_metadata"] = {"gateway_input_owner": prepared.persistence_owner}
+        _acp = getattr(event, "_acp_admission", None)
+        if _acp is not None:  # diagnostic, as on the agent's own writer (recovery does not read it)
+            _user_entry.setdefault("display_metadata", {})["acp_update_id"] = str(_acp.update_id)
         if getattr(event, "message_id", None):
             _user_entry["message_id"] = str(event.message_id)
         return _user_entry
@@ -3900,6 +3903,19 @@ class GatewayTurnMixin:
                 adapter.queue_message(session_key, pending)
             return turn_ctx.result_holder[0] or {"final_response": response, "messages": history}
 
+        _chain_admission = getattr(turn_ctx, "acp_admission", None)
+        if _chain_admission is not None and not await self._acp_mark_chain_followup(
+                _chain_admission, session_key, session_id):
+            # The follow-up's position under the managed marker is not durable, so a crash during it
+            # could not be recovered correctly. It runs later as its own turn (its own marker) instead,
+            # exactly as the depth cap above defers it; the managed answer goes out as this turn's final.
+            adapter = self._delivery_adapter_for(source)
+            if adapter and pending_event:
+                merge_pending_message_event(adapter._pending_messages, session_key, pending_event)
+            elif adapter and hasattr(adapter, 'queue_message'):
+                adapter.queue_message(session_key, pending)
+            return turn_ctx.result_holder[0] or {"final_response": response, "messages": history}
+
         # Interrupted: discard the response ("Operation interrupted." is noise).
         if not result.get("interrupted"):
             await self._run_agent_deliver_first_response(turn_ctx, adapter, response, result, stream_task)
@@ -4020,6 +4036,21 @@ class GatewayTurnMixin:
                     if pending_event is not None and pending_event.internal else "result"),
             }
         return merged
+
+    async def _acp_mark_chain_followup(self, admission: Any, session_key: str, session_id: str) -> bool:
+        """Record, under the managed turn's marker, where the chain's ordinary follow-up starts."""
+        from gateway import acp_managed_ingress
+        try:
+            with self.session_store._lock:  # noqa: SLF001 — this turn's own marker token
+                _entry = self.session_store._entries.get(session_key)  # noqa: SLF001
+                token = getattr(_entry, "active_turn_token", None)
+            rows_before = len(await self.async_session_store.load_transcript(session_id))
+        except Exception:
+            logger.warning("Managed chain follow-up position unavailable", exc_info=True)
+            return False
+        return await asyncio.to_thread(
+            acp_managed_ingress.mark_chain_followup, admission, token, session_id=session_id,
+            rows_before=rows_before, started_at=time.time())
 
     async def _run_agent_cleanup_turn_tasks(
         self, turn_ctx: TurnContext, *, progress_task: Any, log_task: Any, interrupt_monitor: "asyncio.Task",

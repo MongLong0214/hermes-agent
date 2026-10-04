@@ -310,7 +310,9 @@ def record_crash_left_reply(*, obligation_id: str, session_key: str, platform: s
     """Adopt a reply a killed process persisted but never ledgered. Unowned, so this boot's sweep
     claims it, and 'attempting', because a streamed reply may already be on screen: it is
     redelivered once, with the recovered marker. A no-op when the same reply was already ledgered
-    since *since* (the turn start), and idempotent across boots that die before their sweep."""
+    since *since* (the turn start), and idempotent across boots that die before their sweep. A managed
+    /acp answer's row is never "the same reply": an ordinary reply with identical text is its own
+    delivery."""
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
@@ -320,7 +322,8 @@ def record_crash_left_reply(*, obligation_id: str, session_key: str, platform: s
                 owner_pid, owner_started_at, adapter_profile)
                SELECT ?, ?, ?, ?, ?, ?, 'attempting', 0, ?, ?, NULL, NULL, ?
                WHERE NOT EXISTS (SELECT 1 FROM delivery_obligations
-                                 WHERE session_key = ? AND content = ? AND created_at >= ?)""",
+                                 WHERE session_key = ? AND content = ? AND created_at >= ?
+                                   AND acp_update_id IS NULL)""",
             (obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
              content, now, now, str(adapter_profile).strip() if adapter_profile else "default",
              session_key, content, since))

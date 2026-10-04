@@ -322,6 +322,37 @@ def bind_turn_marker(admission: Admission, token: Optional[str]) -> bool:
         return False
 
 
+def mark_chain_followup(admission: Admission, token: Optional[str], *, session_id: str, rows_before: int,
+                        started_at: float) -> bool:
+    """Before an ordinary follow-up runs in this managed chain, record where it starts: the session,
+    the transcript length before it and the time. Crash recovery adopts a reply only from rows after
+    that point (the follow-up's own), never the admitted task's answer or anything earlier. False
+    means the position is not durable and the follow-up must not run in this chain."""
+    if not token:
+        return False
+    key = _turn_marker_key(token)
+    try:
+        current = admission.db.get_meta(key)
+        if current is None:
+            return False
+        value = json.dumps({"update": str(admission.update_id), "session": session_id,
+                            "after": int(rows_before), "at": float(started_at)}, sort_keys=True)
+        return bool(admission.db.compare_and_set_meta(key, current, value, **admission.proof))
+    except Exception:
+        logger.warning("ACP update %s: follow-up position not recorded", admission.update_id, exc_info=True)
+        return False
+
+
+def chain_followup_position(runner: Any, session_key: str, token: str) -> Optional[dict]:
+    """The follow-up position recorded under a managed marker, or None when the chain ran none."""
+    db = runner.session_store._db_for_key(session_key)
+    value = db.get_meta(_turn_marker_key(token)) if db is not None else None
+    if not value or not value.startswith("{"):
+        return None
+    position = json.loads(value)
+    return position if isinstance(position, dict) and "after" in position else None
+
+
 def crash_left_turn_is_managed(runner: Any, session_key: str, token: str) -> Optional[bool]:
     """Whether the turn the dead process left marked on *session_key* ran an admitted /acp task:
     True when its marker was bound, False when it was not, None when that cannot be read. Read from the session's own store, independent of the current binding configuration: the

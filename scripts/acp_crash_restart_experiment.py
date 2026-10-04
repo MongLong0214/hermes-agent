@@ -18,6 +18,8 @@ Scenarios:
                         ABORTED); killed as the follow-up starts, before its prompt is persisted
   chain-followup-unanswered
                         killed after the follow-up's prompt is persisted, before it has an answer
+  pre-prompt-after-bind the session already holds a completed, delivered ordinary turn; killed after
+                        the marker is bound, before the admitted prompt is persisted
 
 Usage: acp_crash_restart_experiment.py [scenario ...]   (all scenarios when none is given)
 Exit status 0 only when every scenario meets its expectation.
@@ -37,7 +39,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 SCENARIOS = ("managed-before-send", "managed-failed-send", "chain-followup", "chain-withheld-before-followup",
-             "chain-followup-unanswered")
+             "chain-followup-unanswered", "pre-prompt-after-bind")
 UPDATE_ID = 901
 CHAT = "100200300"
 
@@ -134,14 +136,32 @@ def child(scenario: str, home: Path) -> None:
 
     runner._hm_admit_event = admitted
 
-    def persist(role, content):
-        runner.session_store.append_to_transcript(entry.session_id, {"role": role, "content": content})
+    def persist(role, content, metadata=None):
+        row = {"role": role, "content": content}
+        if metadata:
+            row["display_metadata"] = metadata
+        runner.session_store.append_to_transcript(entry.session_id, row)
+
+    if scenario == "pre-prompt-after-bind":  # an earlier, completed and delivered ordinary turn
+        from gateway import delivery_ledger
+
+        persist("user", "earlier question")
+        persist("assistant", "earlier answer")
+        delivery_ledger.record_obligation(obligation_id="earlier", session_key=entry.session_key,
+                                          platform="telegram", chat_id=CHAT, thread_id=None,
+                                          content="earlier answer")
+        delivery_ledger.mark_delivered("earlier", message_ids=["1"])
 
     async def park():
         ready.write_text(scenario)
         await asyncio.sleep(3600)  # SIGKILL lands here
 
     async def run_agent(*args, **kwargs):
+        if scenario == "pre-prompt-after-bind" and not kwargs.get("_interrupt_depth", 0):
+            await park()  # marker bound, admitted prompt not yet persisted
+        if not kwargs.get("_interrupt_depth", 0):  # the agent persists the admitted prompt first
+            persist("user", kwargs.get("persist_user_message") or kwargs.get("message") or "/acp deploy the fix",
+                    kwargs.get("persist_user_display_metadata"))
         if kwargs.get("_interrupt_depth", 0):  # the ordinary follow-up inside the chain
             if scenario == "chain-withheld-before-followup":
                 await park()  # before the follow-up's prompt is durable
@@ -255,6 +275,8 @@ EXPECT = {
                                  and sum("ordinary follow-up answer" in s for s in r["restart_sends"]) == 1
                                  and not any("managed answer" in s for s in r["restart_sends"])
                                  and r["receipt"] == "COMPLETED"),
+    # A turn that completed before this chain is never adopted as this chain's reply.
+    "pre-prompt-after-bind": lambda r: (r["resume_pending"] is False and r["restart_sends"] == []),
     # A withheld managed answer stays unsent after the crash (the receipt stays ABORTED).
     "chain-withheld-before-followup": lambda r: (r["resume_pending"] is False and r["restart_sends"] == []
                                                  and r["receipt"] == "ABORTED"),
@@ -277,6 +299,8 @@ def _persisted_state(home: Path) -> dict:
             "SELECT entry_json FROM gateway_routing"))
         bound = con.execute("SELECT value FROM state_meta WHERE key LIKE 'acp_turn_marker:%'").fetchall()
         rows = [r[0] for r in con.execute("SELECT content FROM messages WHERE role='assistant' ORDER BY id")]
+        users = [json.loads(r[0] or "{}").get("acp_update_id") for r in con.execute(
+            "SELECT display_metadata FROM messages WHERE role='user' ORDER BY id")]
         try:
             ledger = [tuple(r) for r in con.execute(
                 "SELECT content, state FROM delivery_obligations WHERE acp_update_id = ?", (str(UPDATE_ID),))]
@@ -284,20 +308,29 @@ def _persisted_state(home: Path) -> dict:
             ledger = []
     finally:
         con.close()
-    return {"marker": bool(marker), "bound": [b[0] for b in bound], "assistant_rows": rows, "ledger": ledger}
+    return {"marker": bool(marker), "bound": [b[0] for b in bound], "assistant_rows": rows,
+            "user_acp_ids": users, "ledger": ledger}
+
+
+def _followup_bound(p):
+    """The marker carries the follow-up position recorded when the chain's follow-up started."""
+    return (len(p["bound"]) == 1 and p["bound"][0].startswith("{")
+            and json.loads(p["bound"][0]).get("update") == str(UPDATE_ID))
 
 
 EXPECT_PERSISTED = {
-    "managed-before-send": lambda p: p["marker"] and p["bound"] == [str(UPDATE_ID)]
+    "managed-before-send": lambda p: str(UPDATE_ID) in p["user_acp_ids"] and p["marker"] and p["bound"] == [str(UPDATE_ID)]
     and "managed answer" in p["assistant_rows"],
-    "managed-failed-send": lambda p: p["bound"] == [str(UPDATE_ID)]
+    "managed-failed-send": lambda p: str(UPDATE_ID) in p["user_acp_ids"] and p["bound"] == [str(UPDATE_ID)]
     and ("managed answer", "failed") in p["ledger"],
-    "chain-followup": lambda p: p["marker"] and p["bound"] == [str(UPDATE_ID)]
+    "chain-followup": lambda p: str(UPDATE_ID) in p["user_acp_ids"] and p["marker"] and _followup_bound(p)
     and "ordinary follow-up answer" in p["assistant_rows"]
     and ("managed answer", "delivered") in p["ledger"],
-    "chain-withheld-before-followup": lambda p: p["marker"] and p["bound"] == [str(UPDATE_ID)]
+    "chain-withheld-before-followup": lambda p: str(UPDATE_ID) in p["user_acp_ids"] and p["marker"] and _followup_bound(p)
     and p["assistant_rows"] == ["managed answer"] and p["ledger"] == [],
-    "chain-followup-unanswered": lambda p: p["marker"] and p["bound"] == [str(UPDATE_ID)]
+    "pre-prompt-after-bind": lambda p: p["marker"] and p["bound"] == [str(UPDATE_ID)]
+    and p["assistant_rows"] == ["earlier answer"] and str(UPDATE_ID) not in p["user_acp_ids"],
+    "chain-followup-unanswered": lambda p: str(UPDATE_ID) in p["user_acp_ids"] and p["marker"] and _followup_bound(p)
     and p["assistant_rows"] == ["managed answer"] and ("managed answer", "delivered") in p["ledger"],
 }
 
