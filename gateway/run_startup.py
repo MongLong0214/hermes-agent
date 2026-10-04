@@ -844,10 +844,16 @@ class GatewayStartupMixin:
                 logger.warning("Crash-left turn on %s: identity unreadable; held for the next start", key)
                 continue
             # A managed /acp turn is never re-run (no admission covers a second run) and its answer is
-            # never redelivered (its receipt settles only from that answer's ledger row). It never ran
-            # a follow-up under this marker (follow-ups go to the adapter's drain as their own turns),
-            # so nothing else is owed. The marker is cleared; a failed cleanup still leaves it held out
-            # of the resume step below.
+            # never redelivered (its receipt settles only from that answer's ledger row). If the chain
+            # had started an ordinary follow-up, that follow-up owes exactly what an ordinary turn begun
+            # at its recorded start would owe. A failed recovery keeps the marker (held out of the
+            # resume step) for the next start; otherwise the marker is cleared.
+            try:
+                if await self._ledger_managed_chain_followup(key, token):
+                    ledgered += 1
+            except Exception:
+                logger.warning("Managed chain follow-up recovery failed on %s; marker kept", key, exc_info=True)
+                continue
             logger.warning("Crash-left managed /acp turn on %s: not resumed, its answer not redelivered", key)
             with _log_suppressed(logging.WARNING, "Managed marker cleanup failed: %s"):
                 await self.async_session_store.clear_turn_active(key, token)
@@ -857,6 +863,35 @@ class GatewayStartupMixin:
             resumed = await self.async_session_store.recover_interrupted_turns(
                 max_age_seconds=max_age, hold_tokens=frozenset(held))
         return resumed, ledgered
+
+    async def _ledger_managed_chain_followup(self, key: str, token: str) -> bool:
+        """Ledger the reply an ordinary follow-up in a crash-left managed chain owes, judged exactly as
+        ordinary crash-left recovery judges a turn begun at the follow-up's recorded start
+        (_crash_left_reply against that time, deduplicated from it). Nothing without a recorded start.
+        Raises when it cannot be accounted for. True when a reply was ledgered."""
+        from gateway.acp_managed_ingress import followup_start
+        from gateway.delivery_ledger import compute_obligation_id, ledger_enabled, record_crash_left_reply
+
+        started = await asyncio.to_thread(followup_start, self, key, token)
+        if started is None:
+            return False
+        with self.session_store._lock:  # noqa: SLF001
+            entry = self.session_store._entries.get(key)  # noqa: SLF001
+            session_id = getattr(entry, "session_id", None)
+            origin = getattr(entry, "origin", None)
+            profile = getattr(entry, "transport_profile", None)
+        if not session_id or origin is None or not await asyncio.to_thread(ledger_enabled):
+            return False
+        history = await self.async_session_store.load_transcript(session_id)
+        text = self._crash_left_reply(history, started, origin)
+        if not text:
+            return False
+        await asyncio.to_thread(
+            record_crash_left_reply,
+            obligation_id=compute_obligation_id(key, f"crash:{token}", text), session_key=key,
+            platform=str(getattr(origin.platform, "value", origin.platform)), chat_id=origin.chat_id,
+            thread_id=origin.thread_id, content=text, since=started, adapter_profile=profile)
+        return True
 
     async def _acp_held_turn_markers(self) -> dict:
         """Marker token -> (session key, token, True) for an admitted /acp turn (cleared, never

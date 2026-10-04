@@ -1363,11 +1363,9 @@ class GatewayInboundMixin:
                 acp_managed_ingress.abort_claimed(event._acp_admission)
             return _limit_message
 
-        if not _acp_managed and not getattr(event, "_acp_deferred_followup", False):
+        if not _acp_managed:
             # A managed task must run as THIS turn: the rescue would park it behind an orphan, where
-            # it would later drain as an ordinary turn without its admission. A managed turn's
-            # deferred follow-up is the head of its line (older than the overflow behind it, which
-            # its own turn drains in order), so it is not parked behind newer events either.
+            # it would later drain as an ordinary turn without its admission.
             event, source, is_internal = self._hm_rescue_orphaned_fifo(event, source, is_internal, _quick_key)
 
         _claim_state = self._session_state(_quick_key)

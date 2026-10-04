@@ -322,6 +322,34 @@ def bind_turn_marker(admission: Admission, token: Optional[str]) -> bool:
         return False
 
 
+_FOLLOWUP_PREFIX = "followup:"
+
+
+def mark_followup_start(admission: Admission, token: Optional[str], started_at: float) -> bool:
+    """Record, under the managed marker, the time an ordinary follow-up starts in this chain."""
+    if not token:
+        return False
+    try:
+        key = _turn_marker_key(token)
+        current = admission.db.get_meta(key)
+        if current is None:
+            return False
+        return bool(admission.db.compare_and_set_meta(key, current, f"{_FOLLOWUP_PREFIX}{float(started_at)}",
+                                                      **admission.proof))
+    except Exception:
+        logger.warning("ACP update %s: follow-up start not recorded", admission.update_id, exc_info=True)
+        return False
+
+
+def followup_start(runner: Any, session_key: str, token: str) -> Optional[float]:
+    """The follow-up start recorded under a managed marker, or None when the chain ran none."""
+    db = runner.session_store._db_for_key(session_key)
+    value = db.get_meta(_turn_marker_key(token)) if db is not None else None
+    if value and value.startswith(_FOLLOWUP_PREFIX):
+        return float(value[len(_FOLLOWUP_PREFIX):])
+    return None
+
+
 def crash_left_turn_is_managed(runner: Any, session_key: str, token: str) -> Optional[bool]:
     """Whether the turn the dead process left marked on *session_key* ran an admitted /acp task:
     True when its marker was bound, False when it was not, None when that cannot be read. Read from the session's own store, independent of the current binding configuration: the

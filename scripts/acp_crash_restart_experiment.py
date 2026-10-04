@@ -38,9 +38,8 @@ import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
-# A managed turn runs no follow-up under its marker (the adapter's drain runs it as its own turn), so
-# the earlier chain-* scenarios no longer describe a production path and were removed.
-SCENARIOS = ("managed-before-send", "managed-failed-send", "pre-prompt-after-bind")
+SCENARIOS = ("managed-before-send", "managed-failed-send", "chain-followup", "chain-withheld-before-followup",
+             "chain-followup-unanswered", "pre-prompt-after-bind")
 UPDATE_ID = 901
 CHAT = "100200300"
 
@@ -314,9 +313,8 @@ def _persisted_state(home: Path) -> dict:
 
 
 def _followup_bound(p):
-    """The marker carries the follow-up position recorded when the chain's follow-up started."""
-    return (len(p["bound"]) == 1 and p["bound"][0].startswith("{")
-            and json.loads(p["bound"][0]).get("update") == str(UPDATE_ID))
+    """The marker carries the follow-up start recorded when the chain's follow-up started."""
+    return len(p["bound"]) == 1 and p["bound"][0].startswith("followup:")
 
 
 EXPECT_PERSISTED = {

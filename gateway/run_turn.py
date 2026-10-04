@@ -3983,6 +3983,23 @@ class GatewayTurnMixin:
         await _run_followup_processing_hook(_hook_adapter, pending_event, "on_processing_start")
         # The re-baseline sits inside the try: a /stop landing on its DB await must still close the marker
         # (the helper's own ``except Exception`` does not catch cancellation).
+        _chain_admission = getattr(turn_ctx, "acp_admission", None)
+        if _chain_admission is not None and not await self._acp_mark_followup_start(_chain_admission, session_key):
+            # Without a durable start the follow-up's answer could not be recovered after a crash, so
+            # it does not run under the managed marker: it goes back to the queue exactly as the
+            # draining path hands an accepted follow-up back, and runs later as its own turn.
+            logger.warning("Managed chain follow-up start not recorded for %s; deferring it", session_key)
+            if pending_event is not None and adapter is not None and session_key:
+                self._restore_undrained_pending_event(session_key, adapter, pending_event)
+            elif pending and adapter is not None and hasattr(adapter, "_pending_messages") and session_key:
+                from gateway.platforms.base import merge_pending_message_event
+                from gateway.platforms.event import MessageEvent, MessageType
+                merge_pending_message_event(adapter._pending_messages, session_key,
+                                            MessageEvent(text=pending, message_type=MessageType.TEXT, source=source),
+                                            merge_text=True)
+            await _run_followup_processing_hook(_hook_adapter, pending_event, "on_processing_complete",
+                                                ProcessingOutcome.SUCCESS)
+            return {**result, "final_response": None} if isinstance(result, dict) else result
         try:
             await self._refresh_agent_cache_message_count(session_key, session_id)
 
@@ -4026,62 +4043,19 @@ class GatewayTurnMixin:
 
     async def _run_agent_next_followup(self, turn_ctx: Any, result: Any, adapter: Any, source: SessionSource,
                                        session_key: Optional[str]) -> Tuple[Any, Optional[str]]:
-        """The follow-up this turn runs in-band, as ``(pending_event, pending)``. A managed /acp turn
-        runs none under its own marker and admission rather than chaining it: what arrived meanwhile stays in (or is merged
-        into) the adapter's pending slot, and the adapter's end-of-task drain runs it as its own
-        ordinary turn after this one's answer is delivered. Crash recovery of a managed marker
-        therefore never owes a follow-up."""
-        if getattr(turn_ctx, "acp_admission", None) is not None:
-            self._acp_leave_followups_for_drain(result, adapter, source, session_key)
-            return None, None
+        """The follow-up this turn runs in-band, as ``(pending_event, pending)``: the same drain for
+        managed and ordinary turns (order, hooks and command handling are the drain's own)."""
         return await self._run_agent_drain_pending(result, adapter, source, session_key)
 
-    def _acp_leave_followups_for_drain(self, result: Any, adapter: Any, source: SessionSource,
-                                       session_key: Optional[str]) -> None:
-        """Leave a managed turn's follow-up to the adapter's end-of-task drain, choosing exactly what
-        the in-band drain would have run next (_run_agent_drain_pending), without consuming it:
-
-        - an event already in the adapter's pending slot stays there, untouched;
-        - an empty slot takes the FIFO overflow head (the in-band drain's promotion);
-        - otherwise only a non-control interrupt message, else a leftover /steer, becomes the queued
-          event, and a resolvable slash command among them is discarded as the in-band drain does.
-
-        The chosen event is marked so the ordinary turn the drain spawns runs it as the head of the
-        line: it is older than anything still in the overflow, which that turn then drains in order."""
-        from gateway.platforms.event import MessageEvent, MessageType
-        from gateway.run import _is_control_interrupt_message
-
-        if not (result and adapter and session_key):
-            return
-        slot = getattr(adapter, "_pending_messages", None)
-        if slot is None:
-            if result.get("interrupt_message") or result.get("pending_steer"):
-                logger.warning("Managed turn follow-up text could not be queued for %s: adapter has no "
-                               "pending slot", session_key)
-            return
-        head = slot.get(session_key)
-        if head is None:
-            overflow = self._overflow_queue(session_key)
-            if overflow:
-                head = slot[session_key] = overflow.pop(0)
-        if head is None:
-            text = None
-            interrupt = result.get("interrupt_message")
-            if result.get("interrupted") and interrupt and not _is_control_interrupt_message(interrupt):
-                text = interrupt
-            elif result.get("pending_steer"):
-                text = result.get("pending_steer")
-            if text and text.strip().startswith("/"):
-                word = text.strip().split(None, 1)[0][1:].lower()
-                with suppress(Exception):
-                    from hermes_cli.commands import resolve_command
-                    if word and resolve_command(word):
-                        logger.info("Discarding command '/%s' from a managed turn's follow-up", word)
-                        text = None
-            if text:
-                head = slot[session_key] = MessageEvent(text=text, message_type=MessageType.TEXT, source=source)
-        if head is not None:
-            head._acp_deferred_followup = True  # type: ignore[attr-defined]
+    async def _acp_mark_followup_start(self, admission: Any, session_key: str) -> bool:
+        """Before an ordinary follow-up runs in a managed chain, record its start time under the
+        managed marker; crash recovery then owes exactly the reply an ordinary turn begun at that time
+        would owe. False when it could not be recorded."""
+        from gateway import acp_managed_ingress
+        with self.session_store._lock:  # noqa: SLF001 — this turn's own marker token
+            _entry = self.session_store._entries.get(session_key)  # noqa: SLF001
+            token = getattr(_entry, "active_turn_token", None)
+        return await asyncio.to_thread(acp_managed_ingress.mark_followup_start, admission, token, time.time())
 
     async def _run_agent_cleanup_turn_tasks(
         self, turn_ctx: TurnContext, *, progress_task: Any, log_task: Any, interrupt_monitor: "asyncio.Task",
