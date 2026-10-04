@@ -322,24 +322,40 @@ def bind_turn_marker(admission: Admission, token: Optional[str]) -> bool:
         return False
 
 
-def crash_left_turn_is_managed(runner: Any, session_key: str, token: str) -> bool:
-    """Whether the turn the dead process left marked on *session_key* was an admitted /acp task, or
-    may have been: on the bound session an unreadable store answers True, so an admitted task is never
-    resumed or redelivered on a guess. Any other session is never managed."""
-    from gateway.delivery_ledger import _db_path
+_RELEASED = "released"
 
-    binding = (getattr(getattr(runner, "config", None), "canonical_surface_bindings", None) or {}).get(_BINDING)
-    if binding is None or session_key != binding.session_key or not token:
+
+def release_turn_marker(admission: Admission, token: Optional[str]) -> bool:
+    """The managed answer is behind the chain; an ordinary follow-up now runs under this marker.
+    Its identity becomes ordinary for crash recovery (the follow-up's answer is owed delivery)."""
+    if not token:
         return False
     try:
-        db = runner.session_store._db_for_key(binding.session_key)
-        if Path(db.db_path).resolve() != Path(_db_path()).resolve():
-            return False  # admission is refused unless the binding store is the launch home
-        return db.get_meta(_turn_marker_key(token)) is not None
+        return bool(admission.db.compare_and_set_meta(
+            _turn_marker_key(token), str(admission.update_id), _RELEASED, **admission.proof))
     except Exception:
-        logger.warning("Crash-left turn on the ACP-bound session: marker store unreadable; not resuming",
-                       exc_info=True)
-        return True
+        logger.warning("ACP update %s: turn marker not released; a crash now suppresses the follow-up",
+                       admission.update_id, exc_info=True)
+        return False
+
+
+def crash_left_turn_is_managed(runner: Any, session_key: str, token: str) -> Optional[bool]:
+    """Whether the turn the dead process left marked on *session_key* ran an admitted /acp task:
+    True when its marker was bound and not released, False when it was not, None when that cannot be
+    read. Read from the session's own store, independent of the current binding configuration: the
+    marker was written there before the turn ran, and an edited or removed binding must not turn an
+    admitted task back into an ordinary one."""
+    if not token:
+        return False
+    try:
+        db = runner.session_store._db_for_key(session_key)
+        if db is None:
+            return None
+        value = db.get_meta(_turn_marker_key(token))
+    except Exception:
+        logger.warning("Crash-left turn on %s: marker store unreadable", session_key, exc_info=True)
+        return None
+    return value is not None and value != _RELEASED
 
 
 _PROCESS_OWNER: Optional[str] = None

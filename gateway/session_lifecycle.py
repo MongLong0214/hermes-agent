@@ -7,7 +7,7 @@ import os
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from hermes_state_ids import new_session_id
 
@@ -153,16 +153,19 @@ class SessionLifecycleMixin:
             self._set_turn_marker_locked(session_key, entry, None, None)
         return True
 
-    def recover_interrupted_turns(self, max_age_seconds: int = 60 * 60) -> int:
+    def recover_interrupted_turns(self, max_age_seconds: int = 60 * 60, hold_tokens: Any = ()) -> int:
         """Promote crash-left turn markers into ``resume_pending`` (unclean startup only).
         Old/invalid markers are cleared without resuming; suspended sessions are never re-armed.
-        Returns the number of newly promoted sessions."""
+        A marker whose token is in *hold_tokens* is left exactly as it is: its turn must not resume
+        (an admitted /acp task, or one whose identity could not be read). Returns the number of
+        newly promoted sessions."""
+        held = frozenset(hold_tokens or ())
         now, epoch_now = _now(), time.time()
         promoted = 0
 
         def _promote(entry: SessionEntry) -> bool:
             nonlocal promoted
-            if not entry.active_turn_token:
+            if not entry.active_turn_token or entry.active_turn_token in held:
                 return False
             started_at = entry.active_turn_started_at
             # Epoch arithmetic: a pre-upgrade naive marker reads as local time, an aware one exactly.

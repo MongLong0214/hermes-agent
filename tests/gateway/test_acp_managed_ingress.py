@@ -900,3 +900,112 @@ class TestReviewRound2:
         head = "/acp " + "x" * 3995
         dispatched = TestUpdateIdentity()._run(gw, [(head, 11), ("ordinary", 12)])
         assert sorted(dispatched, key=len) == sorted([head, "ordinary"], key=len)
+
+
+# Final-review probes (hermes-agent-pr84 round-0003), kept as regression witnesses.
+
+def _marked_turn(gw, *, answer=False):
+    import time as _time
+    from datetime import datetime, timezone
+    from gateway.platforms.event import MessageEvent
+
+    admission = _admitted(gw)
+    store = gw.runner.session_store
+    token = store.mark_turn_active(gw.entry.session_key)
+    assert ingress.bind_turn_marker(admission, token)
+    event = MessageEvent(text="deploy", source=gw.source, message_id="55",
+                         timestamp=datetime.fromtimestamp(_time.time() - 10, timezone.utc))
+    _, text, ts = gw.runner._hmwa_apply_message_timestamp(event, event.text)
+    store.append_to_transcript(gw.entry.session_id, {"role": "user", "content": text, "timestamp": ts,
+                                                      "display_metadata": {"acp_update_id": str(admission.update_id)}})
+    if answer:
+        store.append_to_transcript(gw.entry.session_id, {"role": "assistant", "content": "managed answer"})
+    return admission, store
+
+
+class TestReviewRound3:
+    def test_a_marker_binding_failure_delivers_the_refusal(self, gw, monkeypatch):
+        """U4-R03: the real handler returns the refusal (not a crash) and never runs the turn."""
+        from unittest.mock import AsyncMock
+        from gateway.platforms.event import MessageEvent
+
+        admission = _admitted(gw)
+        event = MessageEvent(text="deploy", source=gw.source, message_id="55")
+        event._acp_admission = admission
+        runner = gw.runner
+        monkeypatch.setattr(runner, "_hmwa_resolve_session",
+                            AsyncMock(return_value=(gw.source, gw.entry, gw.entry.session_key)))
+        monkeypatch.setattr(runner, "_hmwa_open_session", AsyncMock(return_value=(False, False)))
+        monkeypatch.setattr(runner, "_set_session_env", lambda context: [])
+        monkeypatch.setattr(runner, "_clear_session_env", lambda tokens: None)
+        monkeypatch.setattr(runner, "_pinned_session_context_prompt", lambda *a: "")
+        monkeypatch.setattr(runner, "_hmwa_acquire_turn_lease", AsyncMock())
+        monkeypatch.setattr(ingress, "bind_turn_marker", lambda *a: False)
+        run = AsyncMock()
+        monkeypatch.setattr(runner, "_run_agent", run)
+        reply = asyncio.run(runner._handle_message_with_agent(event, gw.source, gw.entry.session_key, 1))
+        assert "turn identity could not be recorded" in reply and run.await_count == 0
+        assert receipts.lookup(gw.db, 901).status == "ABORTED"
+
+    def test_a_failed_managed_marker_cleanup_never_promotes_a_resume(self, gw, monkeypatch):
+        _, store = _marked_turn(gw)
+
+        async def unavailable(*args):
+            raise OSError("temporary failure persisting marker cleanup")
+
+        monkeypatch.setattr(gw.runner.async_session_store, "clear_turn_active", unavailable)
+        assert asyncio.run(gw.runner._recover_unclean_sessions()) == (0, 0)
+        assert not store._entries[gw.entry.session_key].resume_pending
+
+    def test_durable_managed_identity_survives_binding_removal(self, gw):
+        from unittest.mock import AsyncMock
+        from gateway import delivery_ledger
+
+        _marked_turn(gw, answer=True)
+        gw.runner.config.canonical_surface_bindings = {}
+        recovered = asyncio.run(gw.runner._recover_unclean_sessions())
+        with delivery_ledger._connect() as conn:
+            rows = conn.execute("SELECT content, acp_update_id FROM delivery_obligations").fetchall()
+        adapter = TestLedgerSettlement()._adapter(gw)
+        gw.runner._obligation_adapter = AsyncMock(return_value=adapter)
+        for row in delivery_ledger.sweep_recoverable():
+            asyncio.run(gw.runner._redeliver_claimed_row(row, delivery_ledger.RECOVERED_MARKER))
+        assert recovered == (0, 0) and rows == [] and adapter.sent == []
+
+    def test_an_ordinary_follow_up_keeps_crash_delivery_after_a_managed_turn(self, gw, monkeypatch):
+        """U4-R02: the follow-up takes ownership of the marker before it runs."""
+        from unittest.mock import AsyncMock
+        from gateway import delivery_ledger
+        from gateway.turn_context import TurnContext
+
+        admission, store = _marked_turn(gw)
+        adapter = TestLedgerSettlement()._adapter(gw, succeed=False)
+        ctx = TurnContext(source=gw.source, session_key=gw.entry.session_key,
+                          session_id=gw.entry.session_id, history=[], acp_admission=admission,
+                          inbound_message_id="55", event_message_id="55")
+
+        async def first_response(*args):
+            await gw.runner._send_queued_final_text(adapter, gw.source, "managed answer", None, "55",
+                                                    gw.entry.session_key, "55", acp_admission=admission)
+
+        async def ordinary_followup(**kwargs):
+            assert kwargs.get("acp_admission") is None
+            store.append_to_transcript(gw.entry.session_id, {"role": "assistant", "content": "managed answer"})
+            store.append_to_transcript(gw.entry.session_id, {"role": "user", "content": kwargs["message"]})
+            store.append_to_transcript(gw.entry.session_id,
+                                       {"role": "assistant", "content": "ordinary follow-up answer"})
+            return {"final_response": "ordinary follow-up answer", "messages": []}
+
+        monkeypatch.setattr(gw.runner, "_run_agent_deliver_first_response", first_response)
+        monkeypatch.setattr(gw.runner, "_run_agent", ordinary_followup)
+        monkeypatch.setattr(gw.runner, "_refresh_agent_cache_message_count", AsyncMock())
+        monkeypatch.setattr(gw.runner, "_delivery_adapter_for", lambda source: adapter)
+        result = asyncio.run(gw.runner._run_agent_queued_followup(
+            ctx, adapter, "ordinary leftover steer", None, {"final_response": "managed answer"},
+            {"messages": []}, None))
+        assert result["queued_terminal_inbound_id"] is None
+        recovered = asyncio.run(gw.runner._recover_unclean_sessions())  # died before the outer final
+        with delivery_ledger._connect() as conn:
+            rows = conn.execute(
+                "SELECT content, acp_update_id FROM delivery_obligations ORDER BY created_at").fetchall()
+        assert recovered == (0, 1) and rows[-1] == ("ordinary follow-up answer", None)

@@ -835,13 +835,49 @@ class GatewayStartupMixin:
         from gateway.run import _float_env
         resumed = ledgered = 0
         max_age = max(60 * 60, int(max(1.0, _float_env("HERMES_AGENT_TIMEOUT", 1800)) * 2))
+        # Decided first and for every marker, before anything that can fail: a turn that ran an
+        # admitted /acp task (or whose identity cannot be read) is held out of both recovery steps,
+        # even if the ledger step aborts or the managed marker's cleanup cannot be persisted.
+        held = await self._acp_held_turn_markers()
+        for key, token, managed in held.values():
+            if managed is None:
+                logger.warning("Crash-left turn on %s: identity unreadable; held for the next start", key)
+                continue
+            # A managed /acp turn is never re-run (no admission covers a second run) nor redelivered
+            # (its receipt settles only from its own ledgered answer): the marker is cleared and the
+            # receipt is left to the startup sweep, in doubt or aborted. A failed cleanup still leaves
+            # the marker held out of the resume step below.
+            logger.warning("Crash-left managed /acp turn on %s: not resumed, not redelivered", key)
+            with _log_suppressed(logging.WARNING, "Managed marker cleanup failed: %s"):
+                await self.async_session_store.clear_turn_active(key, token)
         with _log_suppressed(logging.WARNING, "Crash-left reply recovery on startup failed: %s"):
-            ledgered = await self._ledger_crash_left_replies(max_age)
+            ledgered = await self._ledger_crash_left_replies(max_age, held=held)
         with _log_suppressed(logging.WARNING, "Exact active-turn recovery on startup failed: %s"):
-            resumed = await self.async_session_store.recover_interrupted_turns(max_age_seconds=max_age)
+            resumed = await self.async_session_store.recover_interrupted_turns(
+                max_age_seconds=max_age, hold_tokens=frozenset(held))
         return resumed, ledgered
 
-    async def _ledger_crash_left_replies(self, max_age_seconds: int) -> int:
+    async def _acp_held_turn_markers(self) -> dict:
+        """Marker token -> (session key, token, True) for an admitted /acp turn (cleared, never
+        resumed or redelivered) or (session key, token, None) when its identity could not be read
+        (left in place for the next start, never resumed now)."""
+        from gateway.acp_managed_ingress import crash_left_turn_is_managed
+        with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
+            self.session_store._ensure_loaded_locked()  # noqa: SLF001
+            marked = [(e.session_key, e.active_turn_token)
+                      for e in self.session_store._entries.values()  # noqa: SLF001
+                      if e.active_turn_token]
+        held = {}
+        for key, token in marked:
+            try:
+                state = await asyncio.to_thread(crash_left_turn_is_managed, self, key, token)
+            except Exception:
+                state = None
+            if state is not False:
+                held[token] = (key, token, state)
+        return held
+
+    async def _ledger_crash_left_replies(self, max_age_seconds: int, held: Optional[dict] = None) -> int:
         """Settle every marked turn whose final reply was persisted and clear its marker, so
         auto-resume does not regenerate it: a reply live delivery would have suppressed is owed
         nothing, any other goes to the delivery ledger for the boot sweep. Without the ledger a
@@ -862,14 +898,8 @@ class GatewayStartupMixin:
             started = started_at.timestamp()  # aware UTC marker; a pre-upgrade naive one reads as local
             if started < cutoff:
                 continue
-            from gateway.acp_managed_ingress import crash_left_turn_is_managed
-            if await asyncio.to_thread(crash_left_turn_is_managed, self, key, token):
-                # A managed /acp turn is never re-run (no admission covers a second run) nor
-                # redelivered (its receipt settles only from its own ledgered answer): the marker is
-                # cleared and the receipt is left to the startup sweep, in doubt or aborted.
-                logger.warning("Crash-left managed /acp turn on %s: not resumed, not redelivered", key)
-                await self.async_session_store.clear_turn_active(key, token)
-                continue
+            if held and token in held:
+                continue  # an admitted /acp turn, or unreadable: never ledgered from its transcript
             history = await self.async_session_store.load_transcript(session_id)
             text = self._crash_left_reply(history, started, origin)
             if text is None or (text and not ledger_on):

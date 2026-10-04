@@ -2153,7 +2153,8 @@ class GatewayTurnMixin:
                 acp_managed_ingress.abort_claimed(event._acp_admission)
                 event._acp_admission = None
                 self._clear_session_env(_session_env_tokens)
-                return acp_managed_ingress.REFUSED.format(reason="turn identity could not be recorded")
+                return (acp_managed_ingress.REFUSED.format(reason="turn identity could not be recorded"),
+                        _session_env_tokens)
 
         # An unreadable store is not an empty conversation: stop before the agent invents continuity
         # from []. Restore task-local context here (before the broad cleanup finally).
@@ -3979,6 +3980,16 @@ class GatewayTurnMixin:
         await _run_followup_processing_hook(_hook_adapter, pending_event, "on_processing_start")
         # The re-baseline sits inside the try: a /stop landing on its DB await must still close the marker
         # (the helper's own ``except Exception`` does not catch cancellation).
+        _chain_admission = getattr(turn_ctx, "acp_admission", None)
+        if _chain_admission is not None:
+            # The chain now runs an ordinary follow-up under the managed turn's marker. Release the
+            # marker's managed identity first, so a crash from here recovers the follow-up like any
+            # ordinary turn (its answer is owed delivery) instead of suppressing it as managed.
+            from gateway import acp_managed_ingress
+            with self.session_store._lock:  # noqa: SLF001 — read this turn's own marker token
+                _entry = self.session_store._entries.get(session_key)  # noqa: SLF001
+                _marker = getattr(_entry, "active_turn_token", None)
+            await asyncio.to_thread(acp_managed_ingress.release_turn_marker, _chain_admission, _marker)
         try:
             await self._refresh_agent_cache_message_count(session_key, session_id)
 
