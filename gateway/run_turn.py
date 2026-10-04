@@ -4038,32 +4038,50 @@ class GatewayTurnMixin:
 
     def _acp_leave_followups_for_drain(self, result: Any, adapter: Any, source: SessionSource,
                                        session_key: Optional[str]) -> None:
-        """A managed turn's follow-ups are left to the adapter's end-of-task drain. A queued event
-        already sits in the adapter's pending slot and is not touched. Text that exists only in this
-        turn's result (a leftover /steer, a non-control interrupt message) is merged into that slot as
-        an event, never written over an event already there."""
-        from gateway.platforms.base import merge_pending_message_event
+        """Leave a managed turn's follow-up to the adapter's end-of-task drain, choosing exactly what
+        the in-band drain would have run next (_run_agent_drain_pending), without consuming it:
+
+        - an event already in the adapter's pending slot stays there, untouched;
+        - an empty slot takes the FIFO overflow head (the in-band drain's promotion);
+        - otherwise only a non-control interrupt message, else a leftover /steer, becomes the queued
+          event, and a resolvable slash command among them is discarded as the in-band drain does.
+
+        The chosen event is marked so the ordinary turn the drain spawns runs it as the head of the
+        line: it is older than anything still in the overflow, which that turn then drains in order."""
         from gateway.platforms.event import MessageEvent, MessageType
         from gateway.run import _is_control_interrupt_message
 
         if not (result and adapter and session_key):
             return
-        texts = []
-        if result.get("interrupted") and result.get("interrupt_message") \
-                and not _is_control_interrupt_message(result.get("interrupt_message")):
-            texts.append(result.get("interrupt_message"))
-        if result.get("pending_steer"):
-            texts.append(result.get("pending_steer"))
-        pending = getattr(adapter, "_pending_messages", None)
-        if pending is None:
-            if texts:
+        slot = getattr(adapter, "_pending_messages", None)
+        if slot is None:
+            if result.get("interrupt_message") or result.get("pending_steer"):
                 logger.warning("Managed turn follow-up text could not be queued for %s: adapter has no "
                                "pending slot", session_key)
             return
-        for text in texts:
-            merge_pending_message_event(pending, session_key,
-                                        MessageEvent(text=text, message_type=MessageType.TEXT, source=source),
-                                        merge_text=True)
+        head = slot.get(session_key)
+        if head is None:
+            overflow = self._overflow_queue(session_key)
+            if overflow:
+                head = slot[session_key] = overflow.pop(0)
+        if head is None:
+            text = None
+            interrupt = result.get("interrupt_message")
+            if result.get("interrupted") and interrupt and not _is_control_interrupt_message(interrupt):
+                text = interrupt
+            elif result.get("pending_steer"):
+                text = result.get("pending_steer")
+            if text and text.strip().startswith("/"):
+                word = text.strip().split(None, 1)[0][1:].lower()
+                with suppress(Exception):
+                    from hermes_cli.commands import resolve_command
+                    if word and resolve_command(word):
+                        logger.info("Discarding command '/%s' from a managed turn's follow-up", word)
+                        text = None
+            if text:
+                head = slot[session_key] = MessageEvent(text=text, message_type=MessageType.TEXT, source=source)
+        if head is not None:
+            head._acp_deferred_followup = True  # type: ignore[attr-defined]
 
     async def _run_agent_cleanup_turn_tasks(
         self, turn_ctx: TurnContext, *, progress_task: Any, log_task: Any, interrupt_monitor: "asyncio.Task",

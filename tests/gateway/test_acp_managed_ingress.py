@@ -1007,24 +1007,71 @@ class TestManagedTurnFollowups:
             self._ctx(gw, None), {"messages": []}, adapter, gw.source, gw.entry.session_key))
         assert pending == "queued follow-up" and gw.entry.session_key not in adapter._pending_messages
 
-    def test_steer_and_interrupt_text_merge_into_the_slot_without_overwriting(self, gw):
-        """SUPP-06: a bare leftover /steer has no event; it must not disappear, and an event already
-        accepted into the slot must not be overwritten."""
+    def test_a_queued_event_is_not_duplicated_by_interrupt_or_steer_text(self, gw):
+        """SUPP-08: an event-backed interrupt leaves its event in the slot; the interrupt text is the
+        same input and must not be appended again (nor a leftover steer, as the in-band drain does)."""
         adapter = TestLedgerSettlement()._adapter(gw)
-        adapter._pending_messages[gw.entry.session_key] = self._queued(gw, "accepted arrival")
-        result = {"messages": [], "pending_steer": "leftover steer", "interrupted": True,
-                  "interrupt_message": "change of plan"}
+        event = self._queued(gw, "followup-event")
+        adapter._pending_messages[gw.entry.session_key] = event
+        result = {"messages": [], "interrupted": True, "interrupt_message": "followup-event",
+                  "pending_steer": "leftover steer"}
         asyncio.run(gw.runner._run_agent_next_followup(
             self._ctx(gw, _admitted(gw)), result, adapter, gw.source, gw.entry.session_key))
-        text = adapter._pending_messages[gw.entry.session_key].text
-        assert "accepted arrival" in text and "leftover steer" in text and "change of plan" in text
+        assert adapter._pending_messages[gw.entry.session_key] is event and event.text == "followup-event"
+        assert event._acp_deferred_followup is True
+
+    def test_an_empty_slot_takes_the_interrupt_text_before_a_leftover_steer(self, gw):
+        adapter = TestLedgerSettlement()._adapter(gw)
+        result = {"messages": [], "interrupted": True, "interrupt_message": "change of plan",
+                  "pending_steer": "leftover steer"}
+        asyncio.run(gw.runner._run_agent_next_followup(
+            self._ctx(gw, _admitted(gw)), result, adapter, gw.source, gw.entry.session_key))
+        assert adapter._pending_messages[gw.entry.session_key].text == "change of plan"
 
     def test_a_bare_steer_alone_becomes_a_queued_event(self, gw):
+        """SUPP-06: a leftover /steer without any event is not lost."""
         adapter = TestLedgerSettlement()._adapter(gw)
         asyncio.run(gw.runner._run_agent_next_followup(
             self._ctx(gw, _admitted(gw)), {"messages": [], "pending_steer": "leftover steer"}, adapter,
             gw.source, gw.entry.session_key))
         assert adapter._pending_messages[gw.entry.session_key].text == "leftover steer"
+
+    def test_an_empty_slot_promotes_the_overflow_head_in_order(self, gw):
+        adapter = TestLedgerSettlement()._adapter(gw)
+        q2, q3 = self._queued(gw, "Q2"), self._queued(gw, "Q3")
+        gw.runner._session_state(gw.entry.session_key).conversation.queued_events.extend([q2, q3])
+        asyncio.run(gw.runner._run_agent_next_followup(
+            self._ctx(gw, _admitted(gw)), {"messages": []}, adapter, gw.source, gw.entry.session_key))
+        assert adapter._pending_messages[gw.entry.session_key] is q2
+        assert gw.runner._overflow_queue(gw.entry.session_key) == [q3]
+
+    def test_a_deferred_follow_up_runs_as_the_head_of_its_line(self, gw, monkeypatch):
+        """SUPP-09: Q1 (deferred from the slot) runs before the newer Q2/Q3 still in the overflow;
+        orphan rescue must not park it behind them."""
+        from gateway.platforms.event import MessageEvent
+
+        q1 = MessageEvent(text="Q1", source=gw.source, message_id="61", platform_update_id=61)
+        q1._acp_deferred_followup = True
+        gw.runner._session_state(gw.entry.session_key).conversation.queued_events.extend(
+            [MessageEvent(text="Q2", source=gw.source, message_id="62"),
+             MessageEvent(text="Q3", source=gw.source, message_id="63")])
+        ran = []
+
+        async def admitted(event):
+            return event, event.source, False
+
+        async def run_agent(event, source, key, generation):
+            ran.append(event.text)
+            return "answer"
+
+        monkeypatch.setattr(gw.runner, "_hm_admit_event", admitted)
+        monkeypatch.setattr(gw.runner, "_handle_message_with_agent", run_agent)
+        # The rescue only fires with a live adapter whose slot for this session is empty: exactly the
+        # state after the adapter's end-of-task drain popped Q1.
+        gw.runner.adapters[gw.source.platform] = TestLedgerSettlement()._adapter(gw)
+        asyncio.run(gw.runner._handle_message(q1))
+        assert ran == ["Q1"]
+        assert [e.text for e in gw.runner._overflow_queue(gw.entry.session_key)] == ["Q2", "Q3"]
 
     def test_a_crash_left_managed_marker_owes_nothing_even_with_later_rows(self, gw):
         _, store = _marked_turn(gw, answer=True)
