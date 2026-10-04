@@ -2144,6 +2144,16 @@ class GatewayTurnMixin:
         # A turn becomes durable recovery work only after it owns the per-session lease; marking
         # earlier would falsely recover a message that never began processing.
         await self._mark_durable_active_turn(event, session_entry.session_key)
+        if getattr(event, "_acp_admission", None) is not None:
+            # An admitted /acp task runs only once its crash identity is durable: startup recovery
+            # recognises it by this marker, never re-runs or redelivers it (acp_managed_ingress).
+            from gateway import acp_managed_ingress
+            if not await asyncio.to_thread(acp_managed_ingress.bind_turn_marker, event._acp_admission,
+                                           getattr(event, "_gateway_active_turn_token", None)):
+                acp_managed_ingress.abort_claimed(event._acp_admission)
+                event._acp_admission = None
+                self._clear_session_env(_session_env_tokens)
+                return acp_managed_ingress.REFUSED.format(reason="turn identity could not be recorded")
 
         # An unreadable store is not an empty conversation: stop before the agent invents continuity
         # from []. Restore task-local context here (before the broad cleanup finally).
@@ -2210,9 +2220,13 @@ class GatewayTurnMixin:
         _terminal_inbound = agent_result.get("queued_terminal_inbound_id")
         if _terminal_inbound:
             event.ledger_message_id = str(_terminal_inbound)
-            # The outer final now answers the chain's last follow-up, not the managed /acp task: it
-            # must never carry (and certify) that task's admission (U4-02).
+        if "queued_terminal_inbound_id" in agent_result and getattr(event, "_acp_admission", None) is not None:
+            # A follow-up ran (with or without a platform id: a leftover steer has none), so the outer
+            # final answers that follow-up, not the managed /acp task. It must never carry, and so
+            # certify, the task's admission (U4-02), and it is ledgered as the ordinary answer it is,
+            # not skipped because the task text it no longer answers began with "/".
             event._acp_admission = None
+            event._acp_handed_off = True
         if "queued_terminal_notification_category" in agent_result:
             event.metadata["notification_category"] = agent_result["queued_terminal_notification_category"]
         if isinstance(agent_result.get("_notification_reply_muted"), bool):
@@ -2275,8 +2289,8 @@ class GatewayTurnMixin:
                 persist_user_display_kind=prepared.persist_user_display_kind,
                 persist_user_display_metadata={
                     "gateway_input_owner": prepared.persistence_owner, **diagnostic_metadata(event),
-                    # Marks the persisted task row so crash recovery never re-runs or redelivers a
-                    # managed /acp turn outside its admission (gateway/run_startup.py).
+                    # Diagnostic only: crash recovery identifies a managed turn by its bound
+                    # active-turn marker (acp_managed_ingress.bind_turn_marker), not by this row.
                     **({"acp_update_id": str(event._acp_admission.update_id)}
                        if getattr(event, "_acp_admission", None) is not None else {})},
                 message_type=event.message_type,

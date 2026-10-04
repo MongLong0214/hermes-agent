@@ -267,11 +267,79 @@ def abort_claimed(admission: Optional[Admission]) -> None:
                                 reason_code="REFUSED_BEFORE_RUN", **admission.proof)
 
 
-def abort_unrecorded(admission: Optional[Admission]) -> None:
-    """The answer was withheld because its obligation could not be recorded: a definite non-delivery."""
-    if admission is not None:
-        receipts.settle_aborted(admission.db, admission.update_id,
-                                reason_code="HERMES_ANSWER_NOT_RECORDED", **admission.proof)
+def abort_unrecorded(admission: Optional[Admission]) -> bool:
+    """The answer was withheld because its obligation could not be recorded. That is a definite
+    non-delivery only when no earlier send of this update was ever recorded: an earlier attempt that
+    failed after submission may have reached the chat, so its receipt stays PENDING (in doubt), and so
+    does one whose ledger cannot be read. Returns True when the receipt was aborted."""
+    if admission is None:
+        return False
+    import sqlite3
+
+    try:
+        rows = admission.db._read_all(
+            "SELECT 1 FROM delivery_obligations WHERE acp_update_id = ? LIMIT 1",
+            (str(admission.update_id),))
+    except sqlite3.OperationalError as exc:
+        # The binding store is the ledger's own file (launch_home_store), so a ledger table that does
+        # not exist yet has recorded nothing; any other failure leaves the receipt in doubt.
+        if "no such table" not in str(exc):
+            logger.warning("ACP update %s: ledger unreadable, receipt left in doubt", admission.update_id)
+            return False
+        rows = []
+    except Exception:
+        logger.warning("ACP update %s: ledger unreadable, receipt left in doubt", admission.update_id)
+        return False
+    if rows:
+        return False
+    return bool(receipts.settle_aborted(admission.db, admission.update_id,
+                                        reason_code="HERMES_ANSWER_NOT_RECORDED", **admission.proof))
+
+
+# A crash-left managed turn is recognised by its durable active-turn marker rather than message time:
+# the persisted user row carries Telegram's authored time, which precedes the marker (round-2
+# ROUND1-ESCAPE-01). The marker token itself stays out of stored state; only its digest is kept, in the
+# launch-home store beside the receipt, written before the turn runs.
+_TURN_MARKER_PREFIX = "acp_turn_marker:"
+
+
+def _turn_marker_key(token: str) -> str:
+    import hashlib
+
+    return _TURN_MARKER_PREFIX + hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def bind_turn_marker(admission: Admission, token: Optional[str]) -> bool:
+    """Record that the active-turn marker *token* runs this admitted task. False means the binding is
+    not durable, and the caller must not run the turn."""
+    if not token:
+        return False
+    try:
+        return bool(admission.db.claim_meta_once(_turn_marker_key(token), str(admission.update_id),
+                                                 **admission.proof))
+    except Exception:
+        logger.warning("ACP update %s: turn marker not recorded", admission.update_id, exc_info=True)
+        return False
+
+
+def crash_left_turn_is_managed(runner: Any, session_key: str, token: str) -> bool:
+    """Whether the turn the dead process left marked on *session_key* was an admitted /acp task, or
+    may have been: on the bound session an unreadable store answers True, so an admitted task is never
+    resumed or redelivered on a guess. Any other session is never managed."""
+    from gateway.delivery_ledger import _db_path
+
+    binding = (getattr(getattr(runner, "config", None), "canonical_surface_bindings", None) or {}).get(_BINDING)
+    if binding is None or session_key != binding.session_key or not token:
+        return False
+    try:
+        db = runner.session_store._db_for_key(binding.session_key)
+        if Path(db.db_path).resolve() != Path(_db_path()).resolve():
+            return False  # admission is refused unless the binding store is the launch home
+        return db.get_meta(_turn_marker_key(token)) is not None
+    except Exception:
+        logger.warning("Crash-left turn on the ACP-bound session: marker store unreadable; not resuming",
+                       exc_info=True)
+        return True
 
 
 _PROCESS_OWNER: Optional[str] = None

@@ -862,14 +862,15 @@ class GatewayStartupMixin:
             started = started_at.timestamp()  # aware UTC marker; a pre-upgrade naive one reads as local
             if started < cutoff:
                 continue
-            history = await self.async_session_store.load_transcript(session_id)
-            if self._crash_left_turn_is_acp_managed(history, started):
+            from gateway.acp_managed_ingress import crash_left_turn_is_managed
+            if await asyncio.to_thread(crash_left_turn_is_managed, self, key, token):
                 # A managed /acp turn is never re-run (no admission covers a second run) nor
                 # redelivered (its receipt settles only from its own ledgered answer): the marker is
                 # cleared and the receipt is left to the startup sweep, in doubt or aborted.
                 logger.warning("Crash-left managed /acp turn on %s: not resumed, not redelivered", key)
                 await self.async_session_store.clear_turn_active(key, token)
                 continue
+            history = await self.async_session_store.load_transcript(session_id)
             text = self._crash_left_reply(history, started, origin)
             if text is None or (text and not ledger_on):
                 continue  # no final reply to deliver: the turn resumes
@@ -882,26 +883,6 @@ class GatewayStartupMixin:
             if await self.async_session_store.clear_turn_active(key, token) and text:
                 ledgered += 1
         return ledgered
-
-    @staticmethod
-    def _crash_left_turn_is_acp_managed(history: list, started: float) -> bool:
-        """Whether the turn begun at *started* answers an admitted /acp task: its persisted user row
-        carries ``acp_update_id`` in its display metadata."""
-        import json as _json
-        from hermes_cli.timefmt import coerce_epoch
-        for message in reversed(history):
-            if message.get("role") != "user":
-                continue
-            if (coerce_epoch(message.get("timestamp")) or 0) < started:
-                return False
-            meta = message.get("display_metadata")
-            if isinstance(meta, str):
-                try:
-                    meta = _json.loads(meta)
-                except ValueError:
-                    meta = None
-            return isinstance(meta, dict) and bool(meta.get("acp_update_id"))
-        return False
 
     def _crash_left_reply(self, history: list, started: float, origin) -> Optional[str]:
         """What a crash-left turn owes, judged as live delivery would have: ``None`` when it never

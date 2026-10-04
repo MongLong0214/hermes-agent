@@ -4199,7 +4199,8 @@ class BasePlatformAdapter(ABC):
         or None."""
         _acp = getattr(event, "_acp_admission", None)
         # A managed /acp answer is always ledgered: its ledger row is the receipt's evidence.
-        if is_ephemeral_response or (_acp is None and str(event.text or "").lstrip().startswith(
+        _handed_off = getattr(event, "_acp_handed_off", False)  # answers a chained follow-up instead
+        if is_ephemeral_response or (_acp is None and not _handed_off and str(event.text or "").lstrip().startswith(
                 ("/", self.typed_command_prefix or "!"))):
             return None
         try:
