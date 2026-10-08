@@ -1122,3 +1122,42 @@ class TestManagedChainFollowups:
             {"final_response": "managed answer", "messages": []}, None))
         recovered, rows = self._recover(gw)  # died before the outer final
         assert recovered == (0, 1) and ("ordinary answer", None) in rows
+
+
+class TestTurnErrorReply:
+    """Seventh supplementary review (ESCAPE-SUPP-15): an error notice is never the managed answer."""
+
+    def _raise(self, gw, monkeypatch, event):
+        from unittest.mock import AsyncMock
+
+        async def boom(*a, **k):
+            raise RuntimeError("follow-up failed")
+
+        prepared = gw.runner._PreparedTurn([], "", event.text, event.text, None, None, gw.entry.session_id, "o")
+        monkeypatch.setattr(gw.runner, "_hmwa_resolve_session",
+                            AsyncMock(return_value=(gw.source, gw.entry, gw.entry.session_key)))
+        monkeypatch.setattr(gw.runner, "_hmwa_prepare_turn", AsyncMock(return_value=(prepared, None)))
+        monkeypatch.setattr(gw.runner, "_run_agent", boom)
+        monkeypatch.setattr(gw.runner, "_hmwa_stop_typing_for_turn", AsyncMock())
+        monkeypatch.setattr(gw.runner, "_clear_session_env", lambda *a: None)
+        return asyncio.run(gw.runner._handle_message_with_agent(event, gw.source, gw.entry.session_key, 1))
+
+    def test_a_follow_up_error_after_a_refused_managed_send_never_certifies_the_receipt(self, gw, monkeypatch):
+        settle = TestLedgerSettlement()
+        admission = _admitted(gw)
+        event = settle._managed_event(gw, admission)
+        asyncio.run(settle._adapter(gw, succeed=False).send_final_ledgered(
+            event, gw.entry.session_key, "managed answer", {}, reply_to="55"))  # refused, row failed
+        reply = self._raise(gw, monkeypatch, event)
+        assert event._acp_admission is None and reply
+        asyncio.run(settle._adapter(gw).send_final_ledgered(event, gw.entry.session_key, reply, {}, reply_to="55"))
+        assert receipts.lookup(gw.db, 901).status == "PENDING"
+        assert [r["content"] for r in receipts.ledger_answers(gw.db, 901)] == ["managed answer"]
+
+    def test_a_turn_error_with_no_recorded_answer_is_a_definite_non_delivery(self, gw, monkeypatch):
+        settle = TestLedgerSettlement()
+        event = settle._managed_event(gw, _admitted(gw))
+        reply = self._raise(gw, monkeypatch, event)
+        asyncio.run(settle._adapter(gw).send_final_ledgered(event, gw.entry.session_key, reply, {}, reply_to="55"))
+        receipt = receipts.lookup(gw.db, 901)
+        assert receipt.status == "ABORTED" and receipt.reason_code == "HERMES_TURN_FAILED"
