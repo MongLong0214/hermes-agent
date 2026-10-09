@@ -225,10 +225,11 @@ jobs:
 
   # ─────────────────────────────────────────────────────────────────────
   # Gate: runs after everything. ``if: always()`` ensures it reports a
-  # status even when some deps were skipped. ``failure`` and ``cancelled``
-  # fail the gate. ``skipped`` passes only when that lane's own ``if:``
-  # condition (mirrored in ``EXPECTED`` below) says it was not supposed to
-  # run; a lane that should have run but was skipped fails the gate.
+  # status even when some deps were skipped. In the upstream repository only
+  # actual ``failure`` results cause it to fail; ``skipped`` is treated as
+  # success. Elsewhere ``failure`` and ``cancelled`` fail the gate, and
+  # ``skipped`` passes only when that lane's own ``if:`` condition (mirrored
+  # in ``EXPECTED`` below) says it was not supposed to run.
   #
   # Branch protection should require ONLY this check.
   #
@@ -314,6 +315,19 @@ jobs:
               'supply-chain': pr and (lane('scan') or lane('deps')),
               'review-labels': pr and (lane('ci_review') or lane('mcp_catalog') or critical),
           }
+
+          if os.environ['REPOSITORY_OWNER'] == 'NousResearch':
+              # Upstream keeps its original rule: only `failure` fails.
+              failed = [name for name, info in needs.items() if info['result'] == 'failure']
+              for name, info in sorted(needs.items()):
+                  result = info['result']
+                  icon = '✅' if result in ('success', 'skipped') else '❌'
+                  print(f'{icon} {name}: {result}')
+              if failed:
+                  print(f'::error::{len(failed)} job(s) failed: {", ".join(failed)}')
+                  sys.exit(1)
+              print('All checks passed (or were skipped)')
+              sys.exit(0)
 
           failed = []
           for name, info in sorted(needs.items()):
