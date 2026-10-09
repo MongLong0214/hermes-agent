@@ -2031,16 +2031,9 @@ class GatewayTurnMixin:
         # Retain Slack thread/workspace routing so a failed turn cannot leave its status visible.
         await self._hmwa_stop_typing_for_turn(event, source)
         logger.exception("Agent error in session %s", session_key)
-        if getattr(event, "_acp_admission", None) is not None:
-            # An error notice is never the managed task's answer (the turn, or a follow-up chained
-            # after it, raised): it must not carry or certify the admission. With no answer of the
-            # update ever recorded the receipt is a definite non-delivery; otherwise that answer's own
-            # ledger row decides it.
-            from gateway import acp_managed_ingress
-            with suppress(Exception):
-                await asyncio.to_thread(acp_managed_ingress.abort_failed_turn, event._acp_admission)
-            event._acp_admission = None
-            event._acp_handed_off = True
+        # An error notice is never the managed task's answer (the turn, or a follow-up chained after
+        # it, raised).
+        await self._acp_release_failed_turn(event)
         status_code = getattr(e, "status_code", None)
         if status_code in {400, 500} and len(prepared.history) > 50:
             # Context overflow / payload too large: a deterministic rejection (#107567), and the same
@@ -2223,6 +2216,18 @@ class GatewayTurnMixin:
             persist_user_display_kind, session_entry.session_id, owner,
         ), _session_env_tokens
 
+    async def _acp_release_failed_turn(self, event) -> None:
+        """A managed turn ended without an answer: what goes out is a notice, so it must not carry or
+        certify the admission. With no answer of the update ever recorded the receipt is a definite
+        non-delivery (HERMES_TURN_FAILED); otherwise that answer's own ledger row decides it."""
+        if getattr(event, "_acp_admission", None) is None:
+            return
+        from gateway import acp_managed_ingress
+        with suppress(Exception):
+            await asyncio.to_thread(acp_managed_ingress.abort_failed_turn, event._acp_admission)
+        event._acp_admission = None
+        event._acp_handed_off = True
+
     @staticmethod
     def _adopt_queued_terminal(event, agent_result) -> None:
         """A queued (/queue) chain answered the LAST message of the chain, so the outer final send
@@ -2336,6 +2341,10 @@ class GatewayTurnMixin:
             agent_failed_early, hidden_reasoning_incomplete, is_context_overflow_failure = (
                 self._hmwa_classify_turn_failure(agent_result, history, session_entry)
             )
+            if agent_failed_early:
+                # A failed turn (provider error, watchdog/timeout, context overflow) produced a notice,
+                # not the managed task's answer.
+                await self._acp_release_failed_turn(event)
             if agent_failed_early and not is_context_overflow_failure:
                 response = self._hmwa_add_failed_turn_notice(response, self._hmwa_failed_turn_notice(agent_result))
             response = self._hmwa_compression_exhaustion_notice(agent_result, response, session_entry, event)
