@@ -1264,12 +1264,25 @@ class SessionStore(
             return self._entry_locked(session_key)
 
     def lookup_by_session_key_existing(self, session_key: str) -> Optional[SessionEntry]:
-        """Return an already-loaded entry without creating, healing, or recovering it."""
+        """Return the existing entry for an exact key without creating, healing, or recovering it.
+
+        A store nothing has loaded yet is loaded first, by the same lazy load every other lookup does
+        (``_entry_locked``): a clean restart loads it only on the first ordinary inbound or crash
+        recovery, so a canonical event or a managed /acp task arriving first found every binding
+        stale. Only an unloaded store loads here; a loaded one is read as it stands, never
+        re-reconciled, so the same key keeps answering the same entry object for the callers' identity
+        re-checks. A key absent after the load is still None, and a load that fails answers None as
+        an unloaded store did before."""
         if not isinstance(session_key, str) or not session_key:
             return None
         with self._lock:
             if not self._loaded:
-                return None
+                try:
+                    self._ensure_loaded_locked()
+                except Exception:
+                    logger.warning("gateway.session: index load for an existing-only lookup failed",
+                                   exc_info=True)
+                    return None
             return self._entries.get(session_key)
 
     def _should_reset(self, entry: SessionEntry, source: SessionSource) -> Optional[str]:

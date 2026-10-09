@@ -2228,3 +2228,43 @@ class TestTelegramCommandMention:
         reply, envelopes = TestCommandShapes()._send(gw, event(text))
         assert reply == "final reply" and runs == ["deploy the fix"] and len(envelopes) == 1
         assert receipts.lookup(gw.db, 901).status == "PENDING"
+
+
+class TestFirstAfterCleanRestart:
+    """A clean restart loads the session index lazily. An /acp task arriving before any ordinary
+    inbound must still find the binding's existing session for its lineage check, not refuse an
+    admission ACP already committed as a target mismatch."""
+
+    def test_an_acp_task_first_after_a_clean_restart_is_admitted(self, gw, monkeypatch):
+        from gateway.platforms.event import MessageEvent
+
+        gw.runner.session_store.close_all_db_handles()
+        restarted = GatewayRunner(GatewayConfig(sessions_dir=gw.runner.session_store.sessions_dir))
+        restarted.config.canonical_surface_bindings = gw.runner.config.canonical_surface_bindings
+        assert restarted.session_store._loaded is False
+        runs = []
+
+        async def admitted(event):
+            return event, event.source, False
+
+        async def run_agent(event, source, key, generation):
+            runs.append(event.text)
+            return "final reply"
+
+        monkeypatch.setattr(restarted, "_hm_admit_event", admitted)
+        monkeypatch.setattr(restarted, "_handle_message_with_agent", run_agent)
+        monkeypatch.setattr(ingress, "socket_path", lambda: gw.sock)
+        monkeypatch.setattr(ingress, "read_secret", lambda: "lane-secret")
+        event = MessageEvent(text="/acp deploy the fix", source=gw.source, message_id="55", platform_update_id=901)
+
+        async def exercise():
+            async with _Lane(gw.sock, _allowed(gw)) as lane:
+                return await restarted._handle_message(event), lane.envelopes
+
+        try:
+            reply, envelopes = asyncio.run(exercise())
+            assert reply == "final reply" and runs == ["deploy the fix"] and len(envelopes) == 1
+            receipt = receipts.lookup(restarted.session_store._db_for_key(gw.entry.session_key), 901)
+            assert receipt.status == "PENDING"
+        finally:
+            restarted.session_store.close_all_db_handles()
