@@ -1460,3 +1460,130 @@ class TestHookProvenanceThroughTheGateway:
         png.write_bytes(b"\x89PNG")
         receipt = self._receipt(gw, monkeypatch, delivery, producer, answer.format(png=png), lambda r: None)
         assert receipt.status == "COMPLETED"
+
+
+class TestManagedAdmissionGate:
+    """``gateway.acp_managed_admission``: closed, an /acp message is refused right after it is
+    classified as managed — no ACP request, no receipt, no turn marker, no ACP-correlated ledger row —
+    and the refusal goes out as an ordinary reply. Ordinary messages never read the gate. Absent or
+    true, managed admission is unchanged. The gate is re-read per message (no restart)."""
+
+    _mtime = [1_900_000_000]
+
+    def _set_gate(self, value):
+        import os
+
+        path = Path(os.environ["HERMES_HOME"]) / "config.yaml"
+        if value is None:
+            path.unlink(missing_ok=True)
+            return
+        path.write_text(f"gateway:\n  acp_managed_admission: {value}\n", encoding="utf-8")
+        self._mtime[0] += 10  # a distinct file signature, so the config cache re-reads it
+        os.utime(path, (self._mtime[0], self._mtime[0]))
+
+    def _wire(self, gw, monkeypatch):
+        runs, _ = TestHandleMessageSeam()._wire(gw, monkeypatch, None)
+        from gateway.platforms.event import MessageEvent
+
+        def event(text, update_id=901, message_id="55"):
+            return MessageEvent(text=text, source=gw.source, message_id=message_id,
+                                platform_update_id=update_id)
+        return runs, event
+
+    def _managed_state(self, gw):
+        import sqlite3
+
+        markers = gw.db._read_all("SELECT key FROM state_meta WHERE key LIKE 'acp_turn_marker:%'")
+        receipt_rows = gw.db._read_all("SELECT key FROM state_meta WHERE key LIKE 'acp-tg-receipt%'")
+        try:
+            acp_rows = gw.db._read_all(
+                "SELECT obligation_id FROM delivery_obligations WHERE acp_update_id IS NOT NULL")
+        except sqlite3.OperationalError as exc:
+            assert "no such table" in str(exc)
+            acp_rows = []
+        return len(markers), len(receipt_rows), len(acp_rows)
+
+    def _deliver(self, gw, event, reply):
+        adapter = TestLedgerSettlement()._adapter(gw)
+        asyncio.run(adapter.send_final_ledgered(event, gw.entry.session_key, reply, {}, reply_to="55"))
+        return adapter.sent
+
+    def test_closed_gate_refuses_an_acp_task_before_any_managed_write(self, gw, monkeypatch):
+        self._set_gate("false")
+        runs, event = self._wire(gw, monkeypatch)
+        managed = event("/acp deploy the fix")
+
+        async def exercise():
+            async with _Lane(gw.sock, _allowed(gw)) as lane:
+                return await gw.runner._handle_message(managed), lane.envelopes
+
+        reply, envelopes = asyncio.run(exercise())
+        assert reply == ingress.PAUSED and "managed admission paused" in reply
+        assert envelopes == [] and runs == []
+        assert getattr(managed, "_acp_admission", None) is None
+        # The refusal is delivered as an ordinary reply: no admission, no ACP-correlated ledger row.
+        assert self._deliver(gw, managed, reply) == [ingress.PAUSED]
+        assert self._managed_state(gw) == (0, 0, 0)
+        assert receipts.lookup(gw.db, 901).status == "NEVER_FOUND"
+
+    def test_closed_gate_refuses_on_the_adapter_busy_route_too(self, gw):
+        self._set_gate("false")
+        entry = TestAdapterEntry()
+        adapter = entry._adapter(gw)
+        key = adapter._event_session_key(entry._msg(gw, "x", 1))
+        adapter._active_sessions[key] = asyncio.Event()
+        asyncio.run(adapter.handle_message(entry._msg(gw, "/acp deploy", 2)))
+        assert adapter.sent == [ingress.PAUSED] and key not in adapter._pending_messages
+        assert self._managed_state(gw) == (0, 0, 0)
+
+    @pytest.mark.parametrize("gate", [None, "true", "false"])
+    def test_an_ordinary_message_is_processed_the_same_whatever_the_gate(self, gw, monkeypatch, gate):
+        self._set_gate(gate)
+        runs, event = self._wire(gw, monkeypatch)
+        ordinary = event("how are you")
+
+        async def exercise():
+            async with _Lane(gw.sock, _allowed(gw)) as lane:
+                return await gw.runner._handle_message(ordinary), lane.envelopes
+
+        reply, envelopes = asyncio.run(exercise())
+        assert reply == "final reply" and runs == ["how are you"] and envelopes == []
+        assert self._deliver(gw, ordinary, reply) == ["final reply"]
+        from gateway import delivery_ledger
+        with delivery_ledger._connect() as conn:
+            rows = conn.execute("SELECT content, acp_update_id FROM delivery_obligations").fetchall()
+        assert [tuple(r) for r in rows] == [("final reply", None)]  # ordinary ledgered delivery
+        assert self._managed_state(gw) == (0, 0, 0)
+
+    @pytest.mark.parametrize("gate", [None, "true"])
+    def test_an_open_gate_keeps_managed_admission_unchanged(self, gw, monkeypatch, gate):
+        self._set_gate(gate)
+        runs, event = self._wire(gw, monkeypatch)
+
+        async def exercise():
+            async with _Lane(gw.sock, _allowed(gw)) as lane:
+                return await gw.runner._handle_message(event("/acp deploy the fix")), lane.envelopes
+
+        reply, envelopes = asyncio.run(exercise())
+        assert reply == "final reply" and runs == ["deploy the fix"] and len(envelopes) == 1
+        assert receipts.lookup(gw.db, 901).status == "PENDING"
+
+    def test_the_gate_is_read_per_message(self, gw, monkeypatch):
+        runs, event = self._wire(gw, monkeypatch)
+
+        async def exercise():
+            replies = []
+            async with _Lane(gw.sock, _allowed(gw)) as lane:
+                self._set_gate("false")
+                replies.append(await gw.runner._handle_message(event("/acp one", 901, "55")))
+                self._set_gate("true")
+                replies.append(await gw.runner._handle_message(event("/acp two", 902, "56")))
+                self._set_gate("off")
+                replies.append(await gw.runner._handle_message(event("/acp three", 903, "57")))
+            return replies, lane.envelopes
+
+        replies, envelopes = asyncio.run(exercise())
+        assert replies == [ingress.PAUSED, "final reply", ingress.PAUSED]
+        assert runs == ["two"] and [e["update"]["update_id"] for e in envelopes] == [902]
+        assert [receipts.lookup(gw.db, u).status for u in (901, 902, 903)] == [
+            "NEVER_FOUND", "PENDING", "NEVER_FOUND"]

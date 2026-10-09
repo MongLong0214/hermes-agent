@@ -6,11 +6,14 @@ ACP's ``HermesGatewayReceiptPort`` learns a managed turn's outcome only through
 from the record this module reads and writes — never from a live turn, so a slow or crashed
 gateway cannot make the port wait on one.
 
-This module owns the receipt's shape and state machine. Writing it (claiming ``PENDING``,
-settling ``COMPLETED``/``ABORTED``) is the managed-ingress seam's job (H2): a single predicate at
-that seam decides which messages are managed, and the seam is not wired to call it yet. Today
-nothing claims a receipt, so every lookup answers ``NEVER_FOUND`` and no behavior changes; the
-contract is in place so the seam and ACP's A1/A2 can land in a later slice without moving it.
+This module owns the receipt's shape and state machine. Writing it is the managed-ingress seam's
+job (``gateway.acp_managed_ingress``, H2): an explicit ``/acp <task>`` on the bound chat is admitted
+by ACP over its ingress lane, and only an allowed admission claims ``PENDING`` before the turn runs.
+A dispatched turn refused before it runs, or one that fails with no answer recorded, settles
+``ABORTED``. The answer goes out only through the ledgered final send, whose delivery-obligation
+row carries the update id; the receipt settles ``COMPLETED`` from that delivered row
+(``settle_from_ledger``), and ``lookup`` reads the row too. An update that was never admitted here has no receipt and answers
+``NEVER_FOUND``.
 
 State machine, one ``state_meta`` row per update id, on the Telegram-bound canonical binding's own
 SessionDB (claimed and settled with the same proven-handle primitives the canonical POST ingress
