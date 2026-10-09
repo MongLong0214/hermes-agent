@@ -300,6 +300,28 @@ def abort_unrecorded(admission: Optional[Admission]) -> bool:
 # the persisted user row carries Telegram's authored time, which precedes the marker (round-2
 # ROUND1-ESCAPE-01). The marker token itself stays out of stored state; only its digest is kept, in the
 # launch-home store beside the receipt, written before the turn runs.
+def abort_failed_turn(admission: Optional[Admission]) -> bool:
+    """The turn raised: abort the receipt HERMES_TURN_FAILED only when no answer of this update was
+    ever recorded (an earlier recorded send keeps it in doubt). True when aborted."""
+    if admission is None or _recorded_answers(admission) != 0:
+        return False
+    return bool(receipts.settle_aborted(admission.db, admission.update_id,
+                                        reason_code="HERMES_TURN_FAILED", **admission.proof))
+
+
+def _recorded_answers(admission: Admission) -> Optional[int]:
+    """How many ledger rows answer this update; None when the ledger cannot be read."""
+    import sqlite3
+
+    try:
+        return len(admission.db._read_all(
+            "SELECT 1 FROM delivery_obligations WHERE acp_update_id = ? LIMIT 1", (str(admission.update_id),)))
+    except sqlite3.OperationalError as exc:
+        return 0 if "no such table" in str(exc) else None
+    except Exception:
+        return None
+
+
 _TURN_MARKER_PREFIX = "acp_turn_marker:"
 
 

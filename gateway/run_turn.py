@@ -2031,6 +2031,16 @@ class GatewayTurnMixin:
         # Retain Slack thread/workspace routing so a failed turn cannot leave its status visible.
         await self._hmwa_stop_typing_for_turn(event, source)
         logger.exception("Agent error in session %s", session_key)
+        if getattr(event, "_acp_admission", None) is not None:
+            # An error notice is never the managed task's answer (the turn, or a follow-up chained
+            # after it, raised): it must not carry or certify the admission. With no answer of the
+            # update ever recorded the receipt is a definite non-delivery; otherwise that answer's own
+            # ledger row decides it.
+            from gateway import acp_managed_ingress
+            with suppress(Exception):
+                await asyncio.to_thread(acp_managed_ingress.abort_failed_turn, event._acp_admission)
+            event._acp_admission = None
+            event._acp_handed_off = True
         status_code = getattr(e, "status_code", None)
         if status_code in {400, 500} and len(prepared.history) > 50:
             # Context overflow / payload too large: a deterministic rejection (#107567), and the same
