@@ -779,6 +779,8 @@ class SessionStore(
         self.config = config
         self._entries: Dict[str, SessionEntry] = {}
         self._loaded = False
+        # Set when an existing-only reader read the index first; the first ordinary load then prunes.
+        self._startup_prune_pending = False
         # A fallback-only initial load is reconciled with state.db once the handle recovers.
         self._routing_db_loaded = False
         self._routing_fallback_baseline: Optional[Dict[str, Any]] = None
@@ -1266,19 +1268,20 @@ class SessionStore(
     def lookup_by_session_key_existing(self, session_key: str) -> Optional[SessionEntry]:
         """Return the existing entry for an exact key without creating, healing, or recovering it.
 
-        A store nothing has loaded yet is loaded first, by the same lazy load every other lookup does
-        (``_entry_locked``): a clean restart loads it only on the first ordinary inbound or crash
-        recovery, so a canonical event or a managed /acp task arriving first found every binding
-        stale. Only an unloaded store loads here; a loaded one is read as it stands, never
-        re-reconciled, so the same key keeps answering the same entry object for the callers' identity
-        re-checks. A key absent after the load is still None, and a load that fails answers None as
-        an unloaded store did before."""
+        A store nothing has loaded yet reads its routing index first, without recovery
+        (``_read_index_without_recovery_locked``): a clean restart loads it only on the first ordinary
+        inbound or crash recovery, so a canonical event or a managed /acp task arriving first found
+        every binding stale; but this reader must never prune, reopen or repoint a route, so a route
+        to an ended session is answered as it stands (and refused by the caller), and the prune stays
+        owed to the first ordinary load. A loaded store is read as it stands, never re-reconciled, so
+        the same key keeps answering the same entry object for the callers' identity re-checks. A key
+        absent after the read is still None, and a read that fails answers None as before."""
         if not isinstance(session_key, str) or not session_key:
             return None
         with self._lock:
             if not self._loaded:
                 try:
-                    self._ensure_loaded_locked()
+                    self._read_index_without_recovery_locked()
                 except Exception:
                     logger.warning("gateway.session: index load for an existing-only lookup failed",
                                    exc_info=True)

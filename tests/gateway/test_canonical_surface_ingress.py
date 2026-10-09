@@ -861,13 +861,9 @@ def test_no_agent_is_built_for_a_binding_that_does_not_resolve(ingress, send, mo
     assert factory.built == []
     with restarted._agent_cache_lock:
         assert restarted._agent_cache == {}
-    (routes, sessions), (routes_before, sessions_before) = _routing_and_sessions(ingress), before
-    assert sessions == sessions_before  # no session created or reopened
-    if case == "ended":
-        # The lazy index load prunes the ended session's route, as the first ordinary inbound's would.
-        assert routes == []
-    else:
-        assert routes == routes_before
+    # No session created or reopened, no route created, pruned or repointed: the existing-only read
+    # of the index leaves an ended session's route for the first ordinary load to deal with.
+    assert _routing_and_sessions(ingress) == before
 
 
 def test_an_ordinary_turn_racing_the_first_canonical_event_shares_one_agent(ingress, send, monkeypatch):
@@ -984,3 +980,183 @@ def test_the_first_request_after_a_process_restart_is_a_canonical_event_and_it_r
     finally:
         adapter._response_store.close()
         runner.session_store.close_all_db_handles()
+
+
+def test_an_ended_bound_session_stays_ended_after_a_restart_and_is_refused(ingress, send, monkeypatch):
+    """Reviewer G1: the bound session ended (``agent_close``) and the gateway restarted. The first
+    canonical event's existing-only lookup ran the lazy load's recovery, reopened the session,
+    built an agent and answered 200. The lookup now reads the index without recovery: the session
+    stays ended, nothing is built, the event is refused, and the prune stays owed to the first
+    ordinary load, which still runs it exactly once."""
+    ingress.runner.session_store._db.end_session(ingress.entry.session_id, "agent_close")
+    restarted = _clean_restart(ingress, send)
+    factory = _agent_build_path(monkeypatch, restarted)
+    before = _routing_and_sessions(ingress)
+    [(_sid, ended_at)] = before[1]
+    assert ended_at is not None
+    assert _code(asyncio.run(send())) == (409, "canonical_binding_stale")
+    assert factory.built == []
+    assert _routing_and_sessions(ingress) == before  # still ended, route untouched
+    store = restarted.session_store
+    pruned = []
+    real_prune = type(store)._prune_stale_sessions_locked
+    monkeypatch.setattr(type(store), "_prune_stale_sessions_locked",
+                        lambda self: pruned.append(1) or real_prune(self))
+    store._ensure_loaded()  # the first ordinary load
+    store._ensure_loaded()
+    assert pruned == [1] and store._startup_prune_pending is False
+
+
+def _hold_the_lease(runner, session_id):
+    """An ordinary turn holding the session's turn lease, and a probe for a waiter queued behind it."""
+    async def acquire():
+        return await runner._turn_leases.acquire(session_id, owner_key="ordinary-turn", generation=1)
+
+    lease = runner._turn_leases._get_or_create(session_id)
+    return acquire, lease
+
+
+@pytest.mark.parametrize("change", ["ended", "suspended", "rerouted"])
+def test_a_binding_that_changes_while_the_event_waits_for_the_lease_builds_nothing(
+        ingress, send, monkeypatch, change):
+    """Reviewer G2: the route changed, or the session ended or was suspended, while the first
+    canonical event after a restart waited for the turn lease. It built an agent for the departed
+    session, and for an ended or suspended one even ran (200). The complete resolution now runs
+    again once the lease is held, before any build."""
+    restarted = _clean_restart(ingress, send)
+    factory = _agent_build_path(monkeypatch, restarted)
+    key, sid = ingress.entry.session_key, ingress.entry.session_id
+    acquire, lease = _hold_the_lease(restarted, sid)
+
+    async def exercise():
+        token = await acquire()
+        canonical = asyncio.ensure_future(send())
+        for _ in range(500):
+            await asyncio.sleep(0.01)
+            if lease.pending_acquires:
+                break
+        assert lease.pending_acquires  # the event resolved its binding and now waits on the lease
+        if change == "ended":
+            restarted.session_store._db_for_key(key).end_session(sid, "agent_close")
+        elif change == "suspended":
+            assert restarted.session_store.suspend_session(key)
+        else:
+            assert restarted.session_store.reset_session(key).session_id != sid
+        restarted._turn_leases.release(token)
+        return await canonical
+
+    assert _code(asyncio.run(exercise())) == (409, "canonical_binding_stale")
+    assert factory.built == [] and ingress.receipts() == []
+
+
+def test_a_session_that_ends_during_the_build_is_refused_before_the_claim(ingress, send, monkeypatch):
+    """Reviewer G2, second half: a full re-validation after the build, before anything is claimed."""
+    restarted = _clean_restart(ingress, send)
+    factory = _agent_build_path(monkeypatch, restarted)
+    key, sid = ingress.entry.session_key, ingress.entry.session_id
+    factory.probe = lambda: restarted.session_store._db_for_key(key).end_session(sid, "agent_close")
+    assert _code(asyncio.run(send())) == (409, "canonical_binding_stale")
+    assert len(factory.built) == 1 and factory.built[0][1].calls == [] and ingress.receipts() == []
+
+
+def test_a_cached_agents_session_that_ends_while_the_event_waits_is_refused(ingress, send):
+    """Reviewer G2 on the borrow path: the same re-resolution guards an event whose agent is cached."""
+    sid = ingress.entry.session_id
+    acquire, lease = _hold_the_lease(ingress.runner, sid)
+
+    async def exercise():
+        token = await acquire()
+        canonical = asyncio.ensure_future(send())
+        for _ in range(500):
+            await asyncio.sleep(0.01)
+            if lease.pending_acquires:
+                break
+        assert lease.pending_acquires
+        ingress.runner.session_store._db.end_session(sid, "agent_close")
+        ingress.runner._turn_leases.release(token)
+        return await canonical
+
+    assert _code(asyncio.run(exercise())) == (409, "canonical_binding_stale")
+    assert ingress.actor.calls == [] and ingress.receipts() == []
+
+
+def test_cancelling_the_first_canonical_event_holds_the_lease_until_its_build_finishes(
+        ingress, send, monkeypatch):
+    """Reviewer G3: cancelling the canonical request while its agent was being constructed released
+    the turn lease with the constructor still running, and an ordinary turn then built a second
+    agent beside it. The cancelled request now holds the lease until the construction finishes."""
+    import threading
+    from gateway.platforms.event import MessageEvent
+
+    restarted = _clean_restart(ingress, send)
+    gate, entered = threading.Event(), threading.Event()
+    factory = _agent_build_path(monkeypatch, restarted, gate)
+    factory.probe = lambda: entered.set() or "constructor entered"
+    lease = restarted._turn_leases._get_or_create(ingress.entry.session_id)
+
+    async def admitted(event):
+        return event, event.source, False
+    monkeypatch.setattr(restarted, "_hm_admit_event", admitted)
+
+    async def exercise():
+        canonical = asyncio.ensure_future(send())
+        assert await asyncio.to_thread(entered.wait, 10)  # the construction is running
+        canonical.cancel()
+        await asyncio.sleep(0.2)
+        held_after_cancel = lease.lock.locked()
+        ordinary = asyncio.ensure_future(restarted._handle_message(MessageEvent(
+            text="ordinary hello", source=ingress.source, message_id="77")))
+        await asyncio.sleep(0.3)
+        constructors_started = len(factory.probed)
+        gate.set()
+        with contextlib.suppress(asyncio.CancelledError):
+            await canonical
+        return held_after_cancel, constructors_started, await ordinary
+
+    held_after_cancel, constructors_started, ordinary = asyncio.run(exercise())
+    assert held_after_cancel is True and constructors_started == 1
+    assert len(factory.built) == 1 and ordinary == _TERMINAL
+    assert factory.built[0][1].calls == ["ordinary hello"]  # the ordinary turn reused that one agent
+
+
+def test_the_build_reads_the_owning_profiles_configuration_a_b_a(tmp_path, monkeypatch):
+    """Reviewer G4: under multiplexing, profile B's agent was built with profile A's disabled
+    toolsets (read before B's scope was entered) while using B's DB. Every profile-dependent read
+    now happens inside the owning profile's scope: A, then B, then A again each get their own."""
+    from datetime import datetime
+
+    from agent import secret_scope
+    from hermes_constants import get_hermes_home
+
+    default_home, user_home = tmp_path / ".hermes", tmp_path / "user"
+    prof_b = default_home / "profiles" / "b"
+    prof_b.mkdir(parents=True)
+    user_home.mkdir()
+    (default_home / "config.yaml").write_text("agent:\n  disabled_toolsets: [only_in_a]\n")
+    (prof_b / "config.yaml").write_text("agent:\n  disabled_toolsets: [only_in_b]\n")
+    (default_home / ".env").write_text("")
+    (prof_b / ".env").write_text("")
+    monkeypatch.setenv("HOME", str(user_home))
+    monkeypatch.setattr(Path, "home", lambda: user_home)
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+    monkeypatch.setattr("hermes_state.DEFAULT_DB_PATH", default_home / "state.db")
+    runner = GatewayRunner(GatewayConfig(sessions_dir=default_home / "sessions", multiplex_profiles=True))
+    homes = {"chat-a1": default_home, "chat-b": prof_b, "chat-a2": default_home}
+    monkeypatch.setattr(runner, "_resolve_profile_home_for_source", lambda source: homes[source.chat_id])
+    factory = _agent_build_path(monkeypatch, runner)
+    factory.probe = lambda: str(get_hermes_home())
+    now = datetime.now()
+    secret_scope.set_multiplex_active(True)
+    try:
+        for chat in ("chat-a1", "chat-b", "chat-a2"):
+            entry = SimpleNamespace(
+                origin=SessionSource(platform=Platform.TELEGRAM, chat_id=chat, chat_type="dm", user_id="user"),
+                session_key=f"agent:main:telegram:dm:{chat}", session_id=f"sid-{chat}",
+                created_at=now, updated_at=now)
+            asyncio.run(runner._build_agent_for_resolved_session(entry))
+    finally:
+        secret_scope.set_multiplex_active(False)
+        runner.session_store.close_all_db_handles()
+    assert [kwargs["disabled_toolsets"] for kwargs, _ in factory.built] == [
+        ["only_in_a"], ["only_in_b"], ["only_in_a"]]
+    assert factory.probed == [str(default_home), str(prof_b), str(default_home)]

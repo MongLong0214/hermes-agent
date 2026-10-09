@@ -2467,28 +2467,43 @@ class GatewayTurnMixin:
         ``resolve_channel_prompt`` (as the Telegram adapter fills ``event.channel_prompt``),
         ``_run_agent_display_settings`` + ``_run_agent_build_turn_context`` (as ``_run_agent_inner``),
         ``_profile_scope_for_source`` (as ``_run_agent``) and ``TurnRunner.resolve_turn_agent`` (as
-        ``run_sync``)."""
+        ``run_sync``). The owning profile's scope is entered before any of them, so its config, PII
+        setting and toolsets are the ones read, never the ambient profile's.
+
+        Cancellation never outlives the construction: a cancelled caller waits here until the worker
+        thread has finished, so the caller's turn lease is released only once no build is running."""
         from gateway.platforms.base import resolve_channel_prompt
         from run_agent import AIAgent
 
         source = getattr(entry, "origin", None)
         if source is None or self._get_proxy_url():
             raise ValueError("canonical_runtime_refused")
-        context_prompt = self._pinned_session_context_prompt(
-            build_session_context(source, self.config, entry), self._redact_pii_enabled(), entry.session_key)
-        adapter = self._intake_adapter_for(source) or self._delivery_adapter_for(source)
-        thread_id = str(source.thread_id) if source.thread_id else None
-        channel_prompt = resolve_channel_prompt(
-            getattr(getattr(adapter, "config", None), "extra", None) or {}, thread_id or str(source.chat_id),
-            str(source.chat_id) if thread_id else None)
-        _ctx, turn_runner, _ = self._run_agent_build_turn_context(
-            self._run_agent_display_settings(source), AIAgent, message="", source=source,
-            session_key=entry.session_key, run_generation=None, context_prompt=context_prompt,
-            history=[], session_id=entry.session_id, channel_prompt=channel_prompt,
-        )
         try:
             with self._profile_scope_for_source(source):
-                await asyncio.to_thread(turn_runner.resolve_turn_agent)
+                context_prompt = self._pinned_session_context_prompt(
+                    build_session_context(source, self.config, entry), self._redact_pii_enabled(),
+                    entry.session_key)
+                adapter = self._intake_adapter_for(source) or self._delivery_adapter_for(source)
+                thread_id = str(source.thread_id) if source.thread_id else None
+                channel_prompt = resolve_channel_prompt(
+                    getattr(getattr(adapter, "config", None), "extra", None) or {},
+                    thread_id or str(source.chat_id), str(source.chat_id) if thread_id else None)
+                _ctx, turn_runner, _ = self._run_agent_build_turn_context(
+                    self._run_agent_display_settings(source), AIAgent, message="", source=source,
+                    session_key=entry.session_key, run_generation=None, context_prompt=context_prompt,
+                    history=[], session_id=entry.session_id, channel_prompt=channel_prompt,
+                )
+                # Created inside the scope, so the worker thread runs under it (copied context).
+                worker = asyncio.ensure_future(asyncio.to_thread(turn_runner.resolve_turn_agent))
+                try:
+                    await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    while not worker.done():
+                        with suppress(asyncio.CancelledError):
+                            await asyncio.wait({worker})
+                    if not worker.cancelled():
+                        worker.exception()  # retrieved: the caller is cancelled whatever it returned
+                    raise
         except Exception:
             logger.warning("Agent for resolved session %s could not be built", entry.session_id, exc_info=True)
             raise ValueError("canonical_runtime_refused") from None

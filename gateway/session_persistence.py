@@ -271,17 +271,41 @@ class SessionPersistenceMixin:
         keys the DB doesn't have, then persisted to the DB on the next _save).
         """
         if self._loaded:
+            if getattr(self, "_startup_prune_pending", False):
+                # An existing-only reader read the index first (``_read_index_without_recovery_locked``):
+                # this is the first load that may act on it, so it owes the startup prune now, once,
+                # exactly as a first load does (and, like one, without the reconcile pass).
+                self._startup_prune_pending = False
+                self.sessions_dir.mkdir(parents=True, exist_ok=True)
+                self._prune_stale_sessions_locked()
+                return
             self._reconcile_recovered_routing_locked()
             return
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        self._read_routing_index_locked()
+        # A hard crash skips graceful shutdown and leaves sessions.json pointing at ended sessions.
+        self._prune_stale_sessions_locked()
+
+    def _read_routing_index_locked(self) -> None:
+        """Read the routing index into ``_entries`` and mark the store loaded (lock held): state.db
+        rows, then the legacy sessions.json for keys the DB lacks. Reads only."""
         db_load_succeeded = self._load_routing_rows_locked()
         db_had_entries = db_load_succeeded and bool(self._entries)
         self._import_legacy_sessions_json(db_had_entries)
         self._loaded = True
         self._routing_db_loaded = db_load_succeeded
         self._routing_fallback_baseline = None if db_load_succeeded else self._entries_as_dicts()
-        # A hard crash skips graceful shutdown and leaves sessions.json pointing at ended sessions.
-        self._prune_stale_sessions_locked()
+
+    def _read_index_without_recovery_locked(self) -> None:
+        """For existing-only readers (lock held): the routing index exactly as the lazy load reads it,
+        but none of what the lazy load then does to it — no stale-entry prune, no recovery or reopen of
+        an ended session, no repoint, no save, no directory created. The prune stays owed to the first
+        ordinary load (``_ensure_loaded_locked``), so a route to an ended session is read as it is and
+        refused by the reader, and the ordinary path still heals it as before."""
+        if self._loaded:
+            return
+        self._read_routing_index_locked()
+        self._startup_prune_pending = True
 
     def _import_legacy_sessions_json(self, db_had_entries: bool) -> None:
         """Legacy import: sessions.json fills only keys the DB lacks. Lock held."""

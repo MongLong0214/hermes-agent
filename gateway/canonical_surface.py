@@ -488,6 +488,18 @@ class CanonicalReceiptCoordinator:
             raise ValueError("canonical_binding_stale")
         return bound
 
+    def _require_same_resolution(
+        self, binding: CanonicalSurfaceBinding, event: Any, proof: CanonicalBindingProof
+    ) -> None:
+        """Resolve the binding again, with every lifecycle check (route entry, Telegram origin, not
+        suspended, session row open, compression tip, DB proof), and require the very entry, session
+        and DB file ``proof`` named. Anything else is ``canonical_binding_stale``."""
+        entry, fresh = ExistingCanonicalBindingResolver(self._runner.session_store).resolve_with_proof(
+            binding, event)
+        if (entry is not proof.entry or fresh.session_key != proof.session_key
+                or fresh.session_id != proof.session_id or fresh.db_identity != proof.db_identity):
+            raise ValueError("canonical_binding_stale")
+
     async def _build_actor_db(self, proof: CanonicalBindingProof, entry: Any) -> tuple[Any, Any]:
         """The agent for a resolved live session that had none cached, built the way an ordinary turn
         builds it and then borrowed exactly as a cached one. Called holding the session's turn lease,
@@ -635,10 +647,14 @@ class CanonicalReceiptCoordinator:
             return self._recorded_or_refuse(binding, key, fingerprint, "canonical_turn_busy", proof)
         run_generation: int | None = None
         try:
-            # Waiting for the turn lease may have exposed a new head, actor, or DB generation.
+            # Waiting for the turn lease may have exposed a new head, actor, or DB generation, and the
+            # session may have been ended, suspended or re-routed meanwhile: the complete resolution
+            # runs again before anything is built or claimed, and again after a build.
             try:
+                self._require_same_resolution(binding, event, proof)
                 if actor is None:
                     actor, db = await self._build_actor_db(proof, entry)
+                    self._require_same_resolution(binding, event, proof)
                 self._require_current_claim_target(proof, actor, db)
                 if event.expected_identity is not None:
                     self._require_expected_identity(proof, event.expected_identity)
