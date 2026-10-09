@@ -1,0 +1,126 @@
+Limit: A managed turn whose final reply never reaches send_final_ledgered (ledger disabled, exception before the send) leaves its receipt PENDING until the next restart, when the dead-owner sweep settles it ABORTED HERMES_PROCESS_DIED_BEFORE_ANSWER even though the process did not die
+Warn: A timed-out or unreadable admission writes no receipt on purpose: ACP may already have committed the claim, so the receipt stays absent (in doubt for ACP) and nothing here retries; adding an ABORTED tombstone on timeout would let ACP settle a turn this process cannot prove did not run
+Record-Id: r-ef37584520b6
+Provenance: inherited 81445c6a5c58ada08e17de846e6b062410062dbc
+
+Limit: COMPLETED is written after run_conversation returns and before the stream consumer seals, so for a stream-is-the-message adapter the final frames can already be visible when a process death in that window leaves the receipt PENDING, later aborted as HERMES_PROCESS_DIED_BEFORE_ANSWER; receiptId is hermes-tg:turn:<turnRequestId>, not a delivery-ledger obligation, because streamed and ledger-disabled finals have no obligation
+Warn: A managed /acp message skips the FIFO orphan rescue, so orphans parked before it wait for the next ordinary turn; the rescue would otherwise park the admitted task behind an orphan where it later drains as an ordinary turn without its admission
+Record-Id: r-2be31283c6ad
+Provenance: inherited a6636dc3ba2d1432ba5eda96d3df6a604681977a
+
+Limit: Receipts and the delivery ledger are read on the same store handle because the acp-canonical-ceo binding is an agent:main session in the launch home's state.db; a binding routed to a secondary profile's state.db would not see the launch-home ledger rows its answers were recorded in
+Limit: Ledger rows that answer an /acp update are exempt from the 7-day retention and the 500-row cap and are pruned only after 90 days; a receipt still PENDING after that loses its evidence and stays in doubt rather than being settled
+Warn: A managed /acp turn is never streamed: its answer reaches the chat only through the ledgered final send, because a streamed answer is visible before (or instead of) the ledger row the receipt settles from
+Record-Id: r-6385d1de1a19
+Provenance: inherited 9144d9dc71705a4c9ee00715c212d234bbe77026
+
+Limit: The content/digest contract holds because the ledger stores the whole final text before the adapter splits it on the wire; an adapter that ledgered per-chunk text would break ACP's found check
+Record-Id: r-a00f0d825d1e
+Provenance: inherited 6e0b114b3785fde9f0c88e2ff3cba0e6d6f04bb4
+
+Limit: An /acp answer delivered without platform message ids (an adapter that reports none, or a row delivered before delivered_message_ids existed) never settles COMPLETED and is never aborted: it stays PENDING, in doubt for ACP, because ACP's receipt port rejects a delivery with an empty message_ids list
+Record-Id: r-ec385a6e6633
+Provenance: inherited 5171aa6de9af2e75bd0aed4f23436d7d329595e6
+
+Warn: A text chunk joins an /acp batch only on Telegram's own split evidence: same chat and sender, no explicit reply, the previous chunk at _SPLIT_THRESHOLD or longer, and the next message id in sequence; relaxing any of these lets an ordinary follow-up run inside the managed task under its admission
+Record-Id: r-f3c0dd214b08
+Provenance: inherited 961cf8c17724e5aeda87172b53f69dc1f22e9804
+
+Warn: This repository is public: test fixtures for the /acp lane use invented Telegram ids, never the owner's real chat or user id
+Record-Id: r-790579ac5c55
+Provenance: inherited f711c0a0d14a24079b5853d17d9426c78f5a3195
+
+Limit: Managed /acp rows are excluded from every automatic redelivery sweep: recovery sends without the reply anchor and with decoration, which the receipt's delivery evidence could not truthfully certify, so an undelivered managed answer stays PENDING (in doubt) rather than retried
+Limit: A crash-left managed turn (its user row carries display_metadata.acp_update_id) is cleared, never resumed or ledgered, because no admission covers a second run
+Ruled-out: joining split /acp chunks on length, consecutive ids and same sender | an independent near-limit follow-up matches every signal, so a split-length task is refused at admission instead
+Warn: If the obligation row for a managed answer cannot be recorded the answer is withheld and the receipt aborted HERMES_ANSWER_NOT_RECORDED; do not reintroduce a send-anyway fallback for managed events
+Record-Id: r-b01d9f408a40
+Provenance: inherited e87ddec4ba2d34e8a3bffb1513a6230cff7affb3
+
+Limit: a managed answer withheld after an obligation-recording failure aborts its receipt only when no earlier send of that update was recorded (a missing ledger table counts as none); an earlier attempt that failed after submission, or an unreadable ledger, leaves the receipt PENDING in doubt
+Ruled-out: recognising a crash-left managed turn by comparing the persisted user row's time with the active-turn marker | Telegram's authored time precedes the marker in production, so the turn resumed or was redelivered; recovery binds to a digest of the marker token instead
+Warn: the active-turn marker token itself must stay out of stored state; only its sha256 is written (acp_turn_marker:<digest> in the launch-home store), and an admitted turn whose marker cannot be bound is refused before it runs
+Record-Id: r-91bac7d92141
+Provenance: inherited e8f3ba280481aedf59dec517d003e4eec6fde7ea
+
+Limit: crash recovery decides every marker's managed state before any step that can fail, and holds managed or unreadable markers out of both the ledger step and the resume step, so a failed marker cleanup or an aborted ledger pass cannot turn an admitted /acp task into a resumed ordinary turn
+Warn: the managed identity of a crash-left turn is read from the session's own store, not the current binding config; an ordinary follow-up in a managed chain must release the marker (CAS to 'released') before it runs, or a crash suppresses the follow-up's owed delivery
+Record-Id: r-90b4925d39db
+Provenance: inherited 6145e59e50684595e1105f681eea2dc4205bff17
+
+Limit: the experiment kills a child that runs the real GatewayRunner._handle_message turn path and startup recovery on an isolated home, not the full `hermes gateway` service binary; Telegram is a recording adapter and the ACP lane a local AF_UNIX stand-in
+Record-Id: r-648a7dced780
+Provenance: inherited e1ba104095f2076c49e17c5d4ee3d89d9a11f5da
+
+Ruled-out: handing the marker's managed identity to an ordinary follow-up (CAS to released) before it runs | a failed CAS lost the follow-up's answer, and the window between release and the follow-up's durable prompt let a withheld managed answer be redelivered; recovery now reads the transcript's structure instead
+Warn: a crash-left managed chain never resumes; an ordinary follow-up's reply is ledgered only when it follows the last (non-managed) user row, and an unanswered follow-up is dropped rather than re-run
+Record-Id: r-6823e9c883d9
+Provenance: inherited 5fb302e7fd1f274eb630d104a93a7a7ea90351fd
+
+Limit: a managed answer's ledger row never deduplicates an ordinary crash-left reply with the same text (acp_update_id IS NULL in the NOT EXISTS check)
+Ruled-out: inferring a crash-left managed chain's owed reply from transcript roles and metadata | the gateway fallback writer omits acp_update_id, an earlier completed turn can be the last reply, and content-only dedupe confused same-text managed answers; recovery reads the follow-up position recorded at follow-up start instead
+Warn: if the follow-up position cannot be recorded the follow-up must not run in the managed chain; it is queued as its own turn and the managed answer stays this turn's final
+Record-Id: r-350812663eb9
+Provenance: inherited 3775c2c60c0a96543351d8591416b26b22061cde
+
+Ruled-out: running an ordinary follow-up inside the managed chain with a recorded transcript position | a row-count position breaks under compaction or a session change, and deferring on a failed CAS lost a bare /steer and could overwrite a newer pending arrival; a managed turn now leaves follow-ups to the adapter's end-of-task drain instead
+Warn: a managed /acp turn must never drain a follow-up in-band: crash recovery of a managed marker assumes nothing but the managed answer ran under it, and suppresses everything
+Record-Id: r-df1270914e6e
+Provenance: inherited 986fac11475b1c39b3bbee0665549ad68d5d787d
+
+Limit: a managed turn's deferred follow-up is chosen by the in-band drain's own rules (slot event untouched, else overflow head, else non-control interrupt text, else leftover steer, resolvable slash commands discarded) and runs as the head of its line: the ordinary turn the adapter drain spawns skips orphan rescue for it
+Warn: _acp_deferred_followup marks an event that is older than everything left in the overflow; orphan rescue must not park it, or /queue order becomes Q2, Q3, Q1
+Record-Id: r-561d2e265f7e
+Provenance: inherited 6eeec9770765b53a4e03caeb20593aa0dfac231c
+
+Limit: a managed turn drains its follow-up in-band like any turn; only the follow-up start time is recorded under the managed marker, and recovery owes exactly what an ordinary turn begun at that time owes, never resuming
+Record-Id: r-f8ccd15816e5
+Provenance: inherited 4325953f82f21eccc2d50a7c25dfedf3bdac5c44
+
+Limit: if the managed chain's follow-up start cannot be recorded the follow-up still runs in-band; only its crash recovery degrades (a crash during that follow-up suppresses its reply with the managed turn), because handing it back to the adapter diverged from the drain and erased an undelivered managed answer
+Record-Id: r-57c22d158743
+Provenance: inherited d5de3f4fb786db44f0aeca6bd5bc95b5e3598342
+
+Warn: an error notice from a managed turn (or a follow-up chained after it) must never carry the admission: it is delivered as an ordinary reply, and the receipt is aborted HERMES_TURN_FAILED only when no answer of the update was ever recorded
+Record-Id: r-a680fea965ae
+Provenance: inherited 8955fa246ffa7fa90688238c17fdf1d284c60ba1
+
+Warn: a reply handed off from a managed event (follow-up or error notice) is ledgered under '<message id>#not-acp': sharing the managed answer's obligation id let a same-text reply INSERT OR REPLACE that row and erase its ACP correlation
+Record-Id: r-369b7baff6fb
+Provenance: inherited e2f8adf11c8ae8e812e5b988f93b81665e6aab19
+
+Warn: no notice certifies a managed receipt: a lease-timeout refusal aborts it REFUSED_BEFORE_RUN, and a failed turn (watchdog, timeout, overflow, provider error) or a raised turn aborts it HERMES_TURN_FAILED only when no answer was ever recorded; the notice is still delivered, as an ordinary reply
+Record-Id: r-5a438dedc3b0
+Provenance: inherited b1d41aa96ec150cdffd514e9899bb80c3eda7460
+
+Limit: a managed receipt is certified only by a completed model run (not failed, not interrupted, api_calls > 0) whose own final response is non-empty, not '(empty)' and not a silence marker; anything else goes out as an ordinary notice and settles the receipt by the failed-turn rule
+Record-Id: r-c2551e5729af
+Provenance: inherited a6d0cd9309ecd831db6bae8b1948f625992a5e71
+
+Limit: whether a turn's text is a model answer is decided where the agent produced it (finalize_turn on the raw text before the explainer and file-mutation footer, the codex app-server result) and carried as model_answer; only text_response, recovered stream text, reused earlier text of the turn and a budget summary the model actually wrote (or a preserved verification answer) carry it, and TurnRunner's empty normalisation forces it off
+Ruled-out: requiring completed=True instead of a provenance flag | the empty-response explainer reports completed=True while valid budget summaries and recovered streams report completed=False, so it keeps the escape and drops real answers
+Warn: a new runtime or answer path that returns a result without model_answer=True makes every /acp turn it serves abort HERMES_TURN_FAILED; set the flag where its text is produced, never from the text's shape
+Record-Id: r-51e7e091c0f1
+Provenance: inherited 09ddf4bec344972deb6fbe3c412adcb3dc98c55e
+
+Limit: answer provenance for a text response is judged on agent._turn_model_text, the model's text recorded just before output hooks run, and a silence marker there is never an answer even if a hook or the mutation footer later decorates it
+Warn: _turn_model_text is written only at the single text_response exit in finish_text_response; any new site that sets a text_response exit reason must record it too, or a stale value from an earlier turn decides provenance
+Record-Id: r-b5d0403e0738
+Provenance: inherited f0f75f40dc3e9e026cde0f65467c470c951959ce
+
+Limit: a managed receipt is certified at one boundary, GatewayTurnMixin._acp_is_model_answer: answer_origin (the model text handed to the output hook), answer_body (the text the hook returned, before footer, explainer or media) and the delivered reply must each be an answer — not empty, not (empty), not a silence marker, not a terminal <|eos|> run or the interrupt-wait sentinel
+Ruled-out: recognising generated notices by their wording at the boundary | a hook's legitimate rewrite and a hook-written No reply sentence look alike, so it reopens shape-as-provenance; a hook that rewrites a real answer into notice-like prose therefore still certifies
+Warn: apply_llm_output_transform is the only place provenance is recorded (agent._llm_output_seam, keyed by turn_id); an answer path that bypasses it, like the codex app-server runtime, must set answer_origin and answer_body itself or its /acp turns abort HERMES_TURN_FAILED
+Record-Id: r-433f3f91946f
+Provenance: inherited 8a3d860d3d07ee7802f4088055222943bbc112d0
+
+Limit: a transform_llm_output rewrite certifies a managed receipt only when the hook declares it with {"text", "answer": "preserved"}; a plain-string replacement is undeclared and, like a declared "suppressed", never certifies, though ordinary chat delivers it unchanged
+Ruled-out: telling a hook-written notice from a reformat by its wording | the two read alike, so it reopens shape-as-provenance; only the hook can say which a rewrite was
+Warn: _acp_text_after_attachments mirrors the final send path's extraction order (extract_media, extract_images, _strip_media_directives, extract_local_files); if that path changes, the boundary must follow or a marker plus a media tag can certify again
+Record-Id: r-03e29fb16da6
+Provenance: inherited 360d8e8621c79a94c034fe2f9480450f7d420711
+
+Limit: each delivery path is certified on the text its own send keeps: the queued first response uses _strip_response_attachments_for_direct_send (image references and bare paths stay visible), the final delivery uses the final send extraction; a final answer that is only an attachment sends no text and so never completes its receipt
+Warn: _acp_queued_send_text calls the queued send's own stripper; if _deliver_queued_first_response changes how it strips attachments, the boundary follows only if it keeps calling the same function
+Record-Id: r-68b90361915b
+Provenance: inherited 3188514c4ac83dca34c18f58d46211f0b5948bbe
