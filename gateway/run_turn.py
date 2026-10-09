@@ -2234,7 +2234,7 @@ class GatewayTurnMixin:
                 and not is_intentional_silence_response(body))
 
     @staticmethod
-    def _acp_text_after_attachments(text: Any) -> Any:
+    def _acp_final_send_text(text: Any) -> Any:
         """The text the adapter's final send leaves once attachments are taken out, by the same
         extraction steps in the same order (``BasePlatformAdapter._extract_response_content``): a
         marker followed by a media tag goes out as the marker alone."""
@@ -2245,19 +2245,30 @@ class GatewayTurnMixin:
         _, text = BasePlatformAdapter.extract_images(text)
         return BasePlatformAdapter.extract_local_files(_strip_media_directives(text).strip())[1]
 
+    @staticmethod
+    def _acp_queued_send_text(text: Any) -> Any:
+        """The text the queued first-response send leaves: that send strips only explicit ``MEDIA:``
+        attachments and keeps image references and bare file paths visible, so they are its text."""
+        from gateway.platforms.base import BasePlatformAdapter
+        from gateway.run import _strip_response_attachments_for_direct_send
+        if not isinstance(text, str):
+            return text
+        return _strip_response_attachments_for_direct_send(text, BasePlatformAdapter)
+
     @classmethod
-    def _acp_is_model_answer(cls, agent_result: Any) -> bool:
+    def _acp_is_model_answer(cls, agent_result: Any, sent_text: Optional[Callable[[Any], Any]] = None) -> bool:
         """The certification boundary for a managed receipt: one rule for every producer and both
         delivery paths. A completed model run (not failed, not interrupted, at least one API call)
         certifies only when the output hook left the model's answer in place (``answer_disposition``
         "unchanged", or "preserved" as the hook itself declared), and the text the model produced for
         this turn (``answer_origin``, recorded before any output hook), the text the hook left to
         deliver (``answer_body``, before any footer, explainer or media decoration) and the reply
-        actually delivered are each still an answer once attachments are extracted as the adapter
-        sends them. Decoration cannot create eligibility; a hook can neither turn a non-answer into
-        an answer nor keep a genuine answer eligible after replacing it, and only the hook can say
-        which a rewrite was. Producers that record no provenance (notices, refusals, deferrals,
-        gateway substitutions) never certify."""
+        actually delivered are each still an answer once attachments are extracted the way the
+        delivering path sends them (``sent_text``: the final send by default, or the queued
+        first-response send). Decoration cannot create eligibility; a hook can neither turn a
+        non-answer into an answer nor keep a genuine answer eligible after replacing it, and only the
+        hook can say which a rewrite was. Producers that record no provenance (notices, refusals,
+        deferrals, gateway substitutions) never certify."""
         if not isinstance(agent_result, dict) or agent_result.get("failed") or agent_result.get("interrupted"):
             return False
         try:
@@ -2269,7 +2280,8 @@ class GatewayTurnMixin:
         # reopen shape-as-provenance (a reformat and a hook-written notice read alike).
         if agent_result.get("answer_disposition") not in ("unchanged", "preserved"):
             return False
-        return all(cls._acp_is_answer_text(cls._acp_text_after_attachments(agent_result.get(key)))
+        sent_text = sent_text or cls._acp_final_send_text
+        return all(cls._acp_is_answer_text(sent_text(agent_result.get(key)))
                    for key in ("answer_origin", "answer_body", "final_response"))
 
     async def _acp_first_response_admission(self, turn_ctx: Any, delivery_result: Any) -> Any:
@@ -2278,7 +2290,7 @@ class GatewayTurnMixin:
         settled as a failed turn (the admission stays on turn_ctx for the follow-up's start record)."""
         from gateway import acp_managed_ingress
         admission = getattr(turn_ctx, "acp_admission", None)
-        if admission is None or self._acp_is_model_answer(delivery_result):
+        if admission is None or self._acp_is_model_answer(delivery_result, self._acp_queued_send_text):
             return admission
         with suppress(Exception):
             await asyncio.to_thread(acp_managed_ingress.abort_failed_turn, admission)
@@ -2410,7 +2422,7 @@ class GatewayTurnMixin:
             agent_failed_early, hidden_reasoning_incomplete, is_context_overflow_failure = (
                 self._hmwa_classify_turn_failure(agent_result, history, session_entry)
             )
-            if not self._acp_is_model_answer(agent_result):
+            if not self._acp_is_model_answer(agent_result, self._acp_final_send_text):
                 # No model answer (failure, timeout, overflow, interruption, empty or silent reply):
                 # what goes out is a notice, not the managed task's answer.
                 await self._acp_release_failed_turn(event)

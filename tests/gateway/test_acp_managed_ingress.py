@@ -1245,6 +1245,7 @@ async def _outer_handoff_failed(gw, monkeypatch, event, result):
 
 _HOOK_NOTICE = "No reply: the model produced no usable answer."
 _MISSING_MEDIA = "\nMEDIA:/nonexistent/acp-probe/missing.png"
+_IMAGE_REF = "![chart](https://example.com/chart.png)"
 
 
 class TestOnlyAModelAnswerCertifies:
@@ -1292,6 +1293,24 @@ class TestOnlyAModelAnswerCertifies:
     ])
     def test_the_answer_predicate(self, gw, result, expected):
         assert gw.runner._acp_is_model_answer(result) is expected
+
+    @pytest.mark.parametrize("text,expected", [
+        (_IMAGE_REF, True),                                      # the queued send keeps these as text
+        ('<img src="https://example.com/chart.png">', True),
+        ("{png}", True),
+        ("(empty)" + _MISSING_MEDIA, False),                     # and strips only the MEDIA tag
+        ("[SILENT]" + _MISSING_MEDIA, False),
+        ("<|eos|>" + _MISSING_MEDIA, False),
+    ])
+    def test_the_queued_first_response_is_judged_on_the_text_its_send_keeps(self, gw, tmp_path, text, expected):
+        """SUPP13-R2: each delivery path is judged on the text it actually sends; the queued first
+        response goes out through the direct send, which extracts only explicit MEDIA attachments."""
+        png = tmp_path / "chart.png"
+        png.write_bytes(b"\x89PNG")
+        text = text.format(png=png)
+        result = {"final_response": text, "api_calls": 1, "answer_origin": text, "answer_body": text,
+                  "answer_disposition": "unchanged"}
+        assert gw.runner._acp_is_model_answer(result, gw.runner._acp_queued_send_text) is expected
 
     def test_a_zero_call_result_releases_the_admission(self, gw, monkeypatch):
         event = TestLedgerSettlement()._managed_event(gw, _admitted(gw))
@@ -1423,4 +1442,21 @@ class TestHookProvenanceThroughTheGateway:
         chart.write_bytes(b"\x89PNG")
         receipt = self._receipt(gw, monkeypatch, delivery, "text", f"The answer is 42.\nMEDIA:{chart}",
                                 lambda r: None)
+        assert receipt.status == "COMPLETED"
+
+    @pytest.mark.parametrize("delivery,answer", [
+        ("queued-first", _IMAGE_REF),            # SUPP13-R2: the queued send delivers these as text
+        ("queued-first", "{png}"),
+        ("queued-first", "Here is the chart: " + _IMAGE_REF),
+        ("queued-first", "The chart is saved at {png}"),
+        ("final", "Here is the chart: " + _IMAGE_REF),
+        ("final", "The chart is saved at {png}"),
+    ], ids=["queued-image-ref", "queued-bare-png", "queued-prose-image-ref", "queued-prose-bare-png",
+            "final-prose-image-ref", "final-prose-bare-png"])
+    @pytest.mark.parametrize("producer", PRODUCERS)
+    def test_an_answer_with_an_image_reference_or_bare_path_completes_the_receipt(self, gw, monkeypatch, tmp_path,
+                                                                                  producer, delivery, answer):
+        png = tmp_path / "chart.png"
+        png.write_bytes(b"\x89PNG")
+        receipt = self._receipt(gw, monkeypatch, delivery, producer, answer.format(png=png), lambda r: None)
         assert receipt.status == "COMPLETED"
