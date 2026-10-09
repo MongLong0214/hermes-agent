@@ -2009,7 +2009,7 @@ class TurnRunner:
             "messages": result.get("messages", []), "api_calls": result.get("api_calls", 0),
             "failed": result.get("failed", False), "failure_reason": result.get("failure_reason"),
             "partial": result.get("partial", False), "completed": result.get("completed"),
-            "model_answer": bool(result.get("model_answer")),
+            "answer_origin": result.get("answer_origin"), "answer_body": result.get("answer_body"),
             "interrupted": result.get("interrupted", False), "interrupt_message": result.get("interrupt_message"),
             "error": result.get("error"),
             "compression_exhausted": result.get("compression_exhausted", False),
@@ -2029,7 +2029,7 @@ class TurnRunner:
             # response, and dropping it here let a genuine False get silently overwritten by the
             # caller's session-DB-existence default. Absent key only when nothing ever set it.
             # Whatever text stands here was substituted by the gateway, not answered by the model.
-            empty_result = {"final_response": final_response, **common, "model_answer": False}
+            empty_result = {"final_response": final_response, **common, "answer_origin": None, "answer_body": None}
             if "agent_persisted" in result:
                 empty_result["agent_persisted"] = result["agent_persisted"]
             return empty_result

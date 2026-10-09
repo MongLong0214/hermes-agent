@@ -222,7 +222,7 @@ class TestRunSync:
         def run(self, *a, **k):
             calls.append("run")
             return dict(result) if result is not None else {
-                "final_response": "answer", "messages": [], "api_calls": 1, "model_answer": True}
+                "final_response": "answer", "messages": [], "api_calls": 1, "answer_origin": "answer", "answer_body": "answer"}
 
         monkeypatch.setattr(TurnRunner, "_run_conversation_with_approval", run)
         monkeypatch.setattr(TurnRunner, "_finish_stream_consumer", lambda self, *a, **k: None)
@@ -1247,13 +1247,22 @@ class TestOnlyAModelAnswerCertifies:
     certifies the managed receipt; every other outcome is a notice."""
 
     @pytest.mark.parametrize("result,expected", [
-        ({"final_response": "the answer", "api_calls": 2, "model_answer": True}, True),
+        ({"final_response": "the answer", "api_calls": 2, "answer_origin": "the answer",
+          "answer_body": "the answer"}, True),
         # Eleventh supplementary review (SUPP-18): text the explainer, the runner or a deferral wrote
         # carries no provenance, however answer-like it reads and whatever its call count.
         ({"final_response": "⚠️ No reply: m didn't produce a reply", "api_calls": 2, "completed": True}, False),
-        ({"final_response": "the answer", "api_calls": 2, "model_answer": False}, False),
-        ({"final_response": "the answer", "api_calls": 2, "model_answer": "true"}, False),
-        ({"final_response": "", "api_calls": 2, "model_answer": True}, False),
+        ({"final_response": "the answer", "api_calls": 2}, False),                 # no provenance
+        ({"final_response": "the answer", "api_calls": 2, "answer_origin": "(empty)",
+          "answer_body": "the answer"}, False),                                     # hook-made answer
+        ({"final_response": "the answer\n\n📝 footer", "api_calls": 2, "answer_origin": "the answer",
+          "answer_body": "   "}, False),                                            # hook-emptied answer
+        ({"final_response": "[SILENT] 📎 media", "api_calls": 2, "answer_origin": "[SILENT]",
+          "answer_body": "[SILENT]"}, False),                                       # decorated silence
+        ({"final_response": "<|eos|>", "api_calls": 2, "answer_origin": "<|eos|>",
+          "answer_body": "<|eos|>"}, False),                                        # metadata only
+        ({"final_response": "", "api_calls": 2, "answer_origin": "the answer",
+          "answer_body": "the answer"}, False),
         ({"final_response": "provider error", "api_calls": 0}, False),          # resolution failure
         ({"final_response": "timed out", "api_calls": 3, "failed": True}, False),  # watchdog / overflow
         ({"final_response": "interrupted", "api_calls": 1, "interrupted": True}, False),
@@ -1296,7 +1305,8 @@ class TestOnlyAModelAnswerCertifies:
         assert got is None and ctx.acp_admission is admission  # kept for the follow-up start record
         assert receipts.lookup(gw.db, 901).reason_code == "HERMES_TURN_FAILED"
         assert asyncio.run(gw.runner._acp_first_response_admission(
-            ctx, {"final_response": "real answer", "api_calls": 1, "model_answer": True})) is admission
+            ctx, {"final_response": "real answer", "api_calls": 1, "answer_origin": "real answer",
+                  "answer_body": "real answer"})) is admission
 
 
 class TestAnswerProvenance:
@@ -1305,7 +1315,8 @@ class TestAnswerProvenance:
     notices substituted later never certify the managed receipt, whatever their call count."""
 
     @pytest.mark.parametrize("result,expected", [
-        ({"final_response": "the answer", "messages": [], "api_calls": 1, "model_answer": True}, True),
+        ({"final_response": "the answer", "messages": [], "api_calls": 1, "answer_origin": "the answer",
+          "answer_body": "the answer"}, True),
         # conversation_loop compression deferral: a positive call count, failed=False, no provenance
         ({"final_response": "Context compression is already running for this session.", "messages": [],
           "api_calls": 1, "failed": False, "partial": True, "compression_deferred": True}, False),
@@ -1314,9 +1325,10 @@ class TestAnswerProvenance:
           "api_calls": 1, "completed": False, "failure_reason": "truncated"}, False),
         # the finalizer's explainer replaced an empty terminal
         ({"final_response": "⚠️ No reply: m didn't produce a reply", "messages": [], "api_calls": 2,
-          "completed": True, "failure_reason": "empty_response", "model_answer": False}, False),
+          "completed": True, "failure_reason": "empty_response", "answer_origin": None}, False),
         # TurnRunner's own empty normalisation writes a retry notice; the flag cannot survive it
-        ({"final_response": "", "messages": [], "api_calls": 1, "completed": True, "model_answer": True}, False),
+        ({"final_response": "", "messages": [], "api_calls": 1, "completed": True,
+          "answer_origin": "x", "answer_body": "x"}, False),
     ])
     def test_turn_runner_carries_only_agent_provenance(self, gw, monkeypatch, result, expected):
         shaped, _ = TestRunSync()._run_sync(gw, monkeypatch, _admitted(gw), result=result)

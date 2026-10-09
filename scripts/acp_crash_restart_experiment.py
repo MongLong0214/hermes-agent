@@ -208,8 +208,9 @@ def child(scenario: str, home: Path) -> None:
                 ctx, adapter, "ordinary leftover steer", None, {"final_response": "managed answer"},
                 {"messages": []}, None)
         persist("assistant", "managed answer")
-        # finalize_turn's provenance flag: this stands in for a model-written answer
-        return {"final_response": "managed answer", "messages": [], "api_calls": 1, "model_answer": True}
+        # finalize_turn's provenance: this stands in for a model-written answer
+        return {"final_response": "managed answer", "messages": [], "api_calls": 1,
+                "answer_origin": "managed answer", "answer_body": "managed answer"}
 
     runner._run_agent = run_agent
 

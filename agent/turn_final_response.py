@@ -306,9 +306,6 @@ def finish_text_response(
     # the stored/replayed transcript (#44239). finalize_turn reads the recorded outcome; like
     # there, an interrupted turn keeps the raw text.
     from agent.turn_finalizer import apply_llm_output_transform
-    # The model's own text, before any output hook rewrites it: finalize_turn decides answer
-    # provenance (model_answer) from this, so a hook turning "(empty)" into prose is no answer.
-    agent._turn_model_text = final_response
     _transformed = False
     if not getattr(agent, "_interrupt_requested", False):
         final_response, _transformed, _ = apply_llm_output_transform(

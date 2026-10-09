@@ -2217,28 +2217,41 @@ class GatewayTurnMixin:
         ), _session_env_tokens
 
     @staticmethod
-    def _acp_is_model_answer(agent_result: Any) -> bool:
-        """Positive proof that a turn produced the managed task's answer: a completed model run (not
-        failed, not interrupted, at least one API call) whose own final response is non-empty and not
-        a silence marker. Everything else (provider/resolution failures, watchdog and timeouts,
-        overflow, lease interruptions, zero-call retries, empty or silent responses, refusals before
-        the run) is a notice and must not certify the receipt."""
+    def _acp_is_answer_text(text: Any) -> bool:
+        """Whether ``text`` is an answer at all: not empty, not the "(empty)" sentinel, not a silence
+        marker, not transport metadata (a terminal ``<|eos|>`` run, the interrupt-wait sentinel)."""
+        from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
+        from gateway.platforms.base import _terminal_sentinel_start
         from gateway.response_filters import is_intentional_silence_response
-        if not isinstance(agent_result, dict) or agent_result.get("failed") or agent_result.get("interrupted"):
+        if not isinstance(text, str):
             return False
-        if agent_result.get("model_answer") is not True:
-            # Provenance from the agent's finalizer rather than completed=True: the empty-reply
-            # explainer reports completed=True, a model-written budget summary completed=False.
+        # Only these exact non-answer forms, rather than whether some prose reads like a notice: a
+        # hook's legitimate rewrite and a hook-written "No reply…" sentence look alike, and judging
+        # wording would reopen shape-as-provenance. Origin, not wording, rules out generated notices.
+        start = _terminal_sentinel_start(text)
+        body = (text[:start] if start >= 0 else text).strip()
+        return (bool(body) and body != "(empty)" and not body.startswith(INTERRUPT_WAITING_FOR_MODEL_PREFIX)
+                and not is_intentional_silence_response(body))
+
+    @classmethod
+    def _acp_is_model_answer(cls, agent_result: Any) -> bool:
+        """The certification boundary for a managed receipt: one rule for every producer and both
+        delivery paths. A completed model run (not failed, not interrupted, at least one API call)
+        certifies only when the text the model produced for this turn (``answer_origin``, recorded
+        before any output hook) AND the text the hook left to deliver (``answer_body``, before any
+        footer, explainer or media decoration) are both answers, and the reply actually delivered is
+        too. Decoration cannot create eligibility; a hook can neither turn a non-answer into an answer
+        nor keep a genuine answer eligible after replacing it with a non-answer. Producers that
+        record no provenance (notices, refusals, deferrals, gateway substitutions) never certify."""
+        if not isinstance(agent_result, dict) or agent_result.get("failed") or agent_result.get("interrupted"):
             return False
         try:
             if int(agent_result.get("api_calls") or 0) <= 0:
                 return False
         except (TypeError, ValueError):
             return False
-        text = agent_result.get("final_response")
-        # "(empty)" is the agent's sentinel for a model that produced no visible content.
-        return (isinstance(text, str) and bool(text.strip()) and text.strip() != "(empty)"
-                and not is_intentional_silence_response(text))
+        return all(cls._acp_is_answer_text(agent_result.get(key))
+                   for key in ("answer_origin", "answer_body", "final_response"))
 
     async def _acp_first_response_admission(self, turn_ctx: Any, delivery_result: Any) -> Any:
         """The admission the queued first response may carry: the managed turn's, only when that

@@ -477,6 +477,7 @@ def apply_llm_output_transform(
         return final_response, transformed, pre_transform
     if not final_response:
         return final_response, False, None
+    model_text = final_response
     if platform is None:
         platform = getattr(agent, "platform", None) or ""
     transformed, pre_transform = False, None
@@ -493,6 +494,9 @@ def apply_llm_output_transform(
             pre_transform, final_response, transformed = final_response, _hook_result, True
             break
     agent._llm_output_transform = (turn_id, transformed, pre_transform)
+    # Answer provenance (/acp receipts): the text this turn handed the hook and the text the hook
+    # returned, both before any footer, explainer or media decoration is added.
+    agent._llm_output_seam = (turn_id, model_text, final_response)
     return final_response, transformed, pre_transform
 
 
@@ -584,28 +588,23 @@ def finalize_turn(
         # The streamed partial already reached the user and owns the transcript row, so the
         # reply is only this fixed notice: echoing the partial would deliver it twice.
         final_response = _ACCEPTED_STREAM_FAILURE_NOTICE
-    # Answer provenance, decided on the model's own text before any explainer replaces it: a
-    # completed text response (or a tool-budget summary, recovered stream text, or this turn's earlier
-    # text reused after housekeeping tools) that is neither empty nor a silence marker, judged on the
-    # untransformed text before output hooks and the mutation footer decorate it.
-    # Notices the gateway or the explainer substitute later never carry it (an /acp receipt is
-    # certified only by a model answer).
-    from gateway.response_filters import is_intentional_silence_response
-
+    # Answer provenance for /acp receipts. Only these exits produce the model's own text for this
+    # turn: a text response, recovered stream text, this turn's earlier text reused after housekeeping
+    # tools, or a budget exit whose summary (or preserved verification answer) the model wrote. For
+    # them, carry the text the output hook was given (answer_origin) and the text it returned
+    # (answer_body), both recorded at that one seam before footer, explainer or media decoration.
+    # The gateway judges both at its certification boundary; nothing here decides eligibility.
     _exit = str(_turn_exit_reason)
-    _raw = final_response
-    if _exit.startswith("text_response"):
-        _untransformed = getattr(agent, "_turn_model_text", None)
-        if isinstance(_untransformed, str):
-            _raw = _untransformed  # an output hook may have rewritten the text after the model wrote it
-    _model_answer = bool(
+    _answer_exit = (
         not interrupted and not failed and accepted_stream_failure_error is None
-        and isinstance(_raw, str) and _raw.strip() not in ("", "(empty)")
-        and not is_intentional_silence_response(_raw)
         and (_exit.startswith("text_response")
              or _exit in ("partial_stream_recovery", "fallback_prior_turn_content")
              or (_exit.startswith("max_iterations_reached")
                  and (preserved_verification_fallback or getattr(agent, "_iteration_summary_answered", False) is True))))
+    _seam = getattr(agent, "_llm_output_seam", None)
+    _answer_origin = _answer_body = None
+    if _answer_exit and isinstance(_seam, tuple) and len(_seam) == 3 and _seam[0] == turn_id:
+        _answer_origin, _answer_body = _seam[1], _seam[2]
     # Response transforms apply only to real, uninterrupted responses.
     if final_response and not interrupted:
         final_response = _append_file_mutation_footer(agent, final_response, logger)
@@ -654,7 +653,8 @@ def finalize_turn(
         "api_calls": api_call_count,
         "completed": completed,
         "turn_exit_reason": _turn_exit_reason,
-        "model_answer": _model_answer,
+        "answer_origin": _answer_origin,
+        "answer_body": _answer_body,
         "failed": failed,
         "partial": False,  # True only when stopped due to invalid tool calls
         "interrupted": interrupted,
