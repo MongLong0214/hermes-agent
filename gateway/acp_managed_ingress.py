@@ -55,6 +55,7 @@ TOO_LONG = ("🛑 This /acp task is too long for one Telegram message, so it was
 UNRECORDED = ("⚠️ The answer to this /acp task could not be recorded for delivery, so it was not sent. "
               "It will not be retried; check the task in ACP and resend if needed.")
 DUPLICATE = "This /acp update was already handled and was not run again (receipt: {status})."
+PAUSED = REFUSED.format(reason="managed admission paused")
 
 
 def socket_path() -> Path:
@@ -113,6 +114,25 @@ def launch_home_store(runner: Any) -> Any:
 def is_managed(runner: Any, event: Any, source: Any) -> bool:
     """The single seam predicate: an explicit ``/acp <task>`` on the bound chat."""
     return receipts.is_acp_managed_message(event, source) and bound_binding(runner, source) is not None
+
+
+def admission_enabled(config: Optional[dict] = None) -> bool:
+    """Read the ``gateway.acp_managed_admission`` gate (default on), re-read on every call like
+    ``gateway.delivery_ledger``, so an operator can pause managed admission without a restart."""
+    try:
+        if config is None:
+            from hermes_cli.config import load_config
+            config = load_config()
+        value = (config.get("gateway") or {}).get("acp_managed_admission", True)
+        return value.strip().lower() not in {"false", "0", "no", "off"} if isinstance(value, str) else bool(value)
+    except Exception:
+        return True
+
+
+def paused_reply() -> Optional[str]:
+    """The ordinary refusal for a managed message while the gate is closed, else None. Checked right
+    after classification, before any ACP request, receipt, turn marker or ACP-correlated ledger row."""
+    return None if admission_enabled() else PAUSED
 
 
 def _as_int(value: Any) -> Optional[int]:
@@ -200,6 +220,9 @@ class Outcome:
 async def admit(runner: Any, event: Any, source: Any, session_key: str, *, path: Optional[Path] = None,
                 secret: Optional[str] = None, timeout: float = _ADMISSION_TIMEOUT_S) -> Outcome:
     """Ask ACP to admit this managed message and claim its receipt; never runs the turn itself."""
+    paused = paused_reply()
+    if paused is not None:
+        return Outcome(reply=paused)
     binding = bound_binding(runner, source)
     if session_key != binding.session_key:
         # The bound chat routed to another session (a profile route, a topic): the lineage ACP

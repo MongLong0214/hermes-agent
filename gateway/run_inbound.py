@@ -1305,6 +1305,13 @@ class GatewayInboundMixin:
         # (a queued message would later run without admission) and never dispatches as a command.
         from gateway import acp_managed_ingress
         _acp_managed = not is_internal and acp_managed_ingress.is_managed(self, event, source)
+        if _acp_managed:
+            # ``gateway.acp_managed_admission`` closed: refuse here, before the ACP request, the
+            # receipt, the turn marker or any ACP-correlated ledger row. The event stays unadmitted,
+            # so the refusal goes out as an ordinary reply.
+            _paused = acp_managed_ingress.paused_reply()
+            if _paused is not None:
+                return _paused
         if not _acp_managed:
             _reply = await self._hm_pending_reply_intercepts(event, source, _quick_key)
             if _reply is not None:
