@@ -254,7 +254,14 @@ async def handle_telegram_receipt_lookup(self, request: "web.Request") -> "web.R
 
     reader = SessionDB(db_path, read_only=True)
     try:
-        receipt = acp_turn_receipts.lookup(reader, update_id)
+        receipt = acp_turn_receipts.served(reader, update_id)
+    except acp_turn_receipts.ReceiptContractError as exc:
+        # Stated in the contract only by inventing a value: an explicit error, so ACP keeps the turn
+        # in doubt rather than settling it on a guess.
+        logger.warning("Telegram receipt for update %s cannot be served in the receipt contract: %s",
+                       update_id, exc)
+        return _refusal("canonical_receipt_unprovable", 409, "This receipt cannot be stated in the receipt "
+                        "contract; its outcome stays in doubt.")
     except Exception:
         logger.exception("Telegram receipt lookup failed for update %s; reporting uncertainty", update_id)
         return _refusal("canonical_event_uncertain", 409)

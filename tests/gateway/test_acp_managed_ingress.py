@@ -1812,7 +1812,14 @@ class TestReceiptWireAgainstAcp:
         return admission
 
     def _served(self, gw, update_id=901):
-        """The bytes the real GET handler answers with."""
+        """The bytes the real GET handler answers with, which must be a 200 receipt."""
+        response = self._get(gw, update_id)
+        assert response.status == 200 and response.content_type == "application/json"
+        return response.body
+
+    @staticmethod
+    def _get(gw, update_id=901):
+        """The real GET handler's response."""
         from gateway.config import PlatformConfig
         from gateway.platforms.api_server import APIServerAdapter
 
@@ -1827,15 +1834,13 @@ class TestReceiptWireAgainstAcp:
                                   path_qs=route.format(update_id=update_id), transport=None,
                                   match_info={"update_id": str(update_id)})
         try:
-            response = asyncio.run(handler(request))
+            return asyncio.run(handler(request))
         finally:
             adapter._response_store.close()
-        assert response.status == 200 and response.content_type == "application/json"
-        return response.body
 
     @staticmethod
     def _acp_reads(cases):
-        """[(body bytes, update id ACP asks about)] → ACP's lookup result for each."""
+        """[(body bytes, update id ACP asks about[, HTTP status])] → ACP's lookup result for each."""
         import http.server
         import subprocess
         import threading
@@ -1844,12 +1849,12 @@ class TestReceiptWireAgainstAcp:
             pytest.skip(f"ACP receipt port module or node not available ({_ACP_RECEIPT_PORT_JS}, {_NODE})")
         servers = []
         try:
-            for body, _ in cases:
+            for body, *rest in cases:
                 class Handler(http.server.BaseHTTPRequestHandler):
-                    payload = body
+                    payload, status = body, (rest[1] if len(rest) > 1 else 200)
 
                     def do_GET(self):
-                        self.send_response(200)
+                        self.send_response(self.status)
                         self.send_header("Content-Type", "application/json; charset=utf-8")
                         self.send_header("Content-Length", str(len(self.payload)))
                         self.end_headers()
@@ -1863,7 +1868,7 @@ class TestReceiptWireAgainstAcp:
                 servers.append(server)
             spec = {"module": str(_ACP_RECEIPT_PORT_JS), "cases": [
                 {"port": server.server_address[1], "updateId": update_id, "turnRequestId": _WIRE_TURN["turnRequestId"]}
-                for server, (_, update_id) in zip(servers, cases)]}
+                for server, (_, update_id, *_) in zip(servers, cases)]}
             done = subprocess.run([_NODE, "--input-type=module", "-e", _PARSE_WITH_ACP], input=json.dumps(spec),
                                   capture_output=True, text=True, timeout=60)
         finally:
@@ -1920,36 +1925,132 @@ class TestReceiptWireAgainstAcp:
                                    (unproven_message, 901), (unproven_update, 901)])
         assert results == [{"found": False}] * 4
 
-    def _aborted(self, gw):
+    def _admitted_wire(self, gw, update_id=901):
         def answer(envelope):
             return {**_allowed(gw)(envelope), "turn": dict(_WIRE_TURN)}
 
         async def exercise():
             async with _Lane(gw.sock, answer):
-                return await _admit(gw, _event("/acp deploy the fix"))
-        ingress.abort_claimed(asyncio.run(exercise()).admission)
-        assert receipts.lookup(gw.db, 901).reason_code == "REFUSED_BEFORE_RUN"
+                return await _admit(gw, _event("/acp deploy the fix", update_id=update_id))
+        return asyncio.run(exercise()).admission
 
-    @pytest.mark.xfail(strict=True, reason=(
-        "an ABORTED receipt carries no receiptId and no evidenceDigest (settle_aborted stores neither), and "
-        "ACP's terminalReceipt requires both; what an aborted receipt should name there is undecided"))
-    def test_acp_accepts_the_aborted_receipt_hermes_serves(self, gw):
-        self._aborted(gw)
-        [result] = self._acp_reads([(self._served(gw), 901)])
-        assert result["found"] is True and result["outcome"] == "ABORTED"
+    @staticmethod
+    def _ledger_row(gw, obligation_id, update_id, state):
+        from gateway import delivery_ledger
 
-    def test_an_aborted_receipt_is_refused_only_for_its_missing_receipt_id_and_digest(self, gw):
-        """Diagnostic for the xfail above: the served ABORTED body with those two fields filled in is
-        accepted with its code, so the id and reasonCode wire changes are not what blocks it."""
-        self._aborted(gw)
-        served = json.loads(self._served(gw))
-        assert served["receiptId"] is None and served["evidenceDigest"] is None
-        assert served["update_id"] == 901 and served["message_id"] == 55 and served["delivery"] is None
-        filled = {**served, "receiptId": "hermes-tg:aborted-901", "evidenceDigest": "sha256:" + "cd" * 32}
-        refused, accepted = self._acp_reads([(json.dumps(served).encode(), 901), (json.dumps(filled).encode(), 901)])
-        assert refused == {"found": False}
-        assert accepted["found"] is True and accepted["outcome"] == "ABORTED"
-        assert accepted["reasonCode"] == "REFUSED_BEFORE_RUN"
+        delivery_ledger.record_obligation(obligation_id=obligation_id, session_key=gw.entry.session_key,
+                                          platform="telegram", chat_id="100200300", thread_id=None,
+                                          content="an answer", acp_update_id=str(update_id))
+        conn = delivery_ledger._connect()
+        try:
+            conn.execute("UPDATE delivery_obligations SET state = ? WHERE obligation_id = ?", (state, obligation_id))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _abort(self, gw, code, update_id=901):
+        """Settle one admitted update ABORTED through the real path that records *code*."""
+        admission = self._admitted_wire(gw, update_id)
+        if code == "REFUSED_BEFORE_RUN":
+            ingress.abort_claimed(admission)
+        elif code == "HERMES_TURN_FAILED":
+            assert ingress.abort_failed_turn(admission)
+        elif code == "HERMES_ANSWER_NOT_RECORDED":
+            assert ingress.abort_unrecorded(admission)
+        else:  # the startup sweep: the claiming process died
+            if code == "HERMES_ANSWER_UNDELIVERABLE":  # an answer recorded, then abandoned undelivered
+                self._ledger_row(gw, f"abandoned-{update_id}", update_id, "abandoned")
+            assert receipts.sweep_dead_owner_receipts(
+                gw.db, resuming_owners=(), proven_db_path=gw.db.db_path,
+                proven_db_identity=gw.db._db_file_identity) == [str(update_id)]
+        receipt = receipts.lookup(gw.db, update_id)
+        assert receipt.status == "ABORTED" and receipt.reason_code == code
+
+    ABORT_CODES = ["REFUSED_BEFORE_RUN", "HERMES_TURN_FAILED", "HERMES_ANSWER_NOT_RECORDED",
+                   "HERMES_PROCESS_DIED_BEFORE_ANSWER", "HERMES_ANSWER_UNDELIVERABLE"]
+
+    @pytest.mark.parametrize("code", ABORT_CODES)
+    def test_acp_accepts_the_aborted_receipt_hermes_serves(self, gw, code):
+        self._abort(gw, code)
+        stored = gw.db.get_meta(receipts.receipt_key(901))
+        first, second = self._served(gw), self._served(gw)
+        assert first == second  # stable: no clock, no randomness
+        assert gw.db.get_meta(receipts.receipt_key(901)) == stored  # served from storage, never rewritten
+        body = json.loads(first)
+        assert body["receiptId"] == "hermes-tg:aborted:901" and body["delivery"] is None
+        assert body["update_id"] == 901 and body["message_id"] == 55 and body["reasonCode"] == code
+        [result] = self._acp_reads([(first, 901)])
+        assert result["found"] is True and result["outcome"] == "ABORTED" and result["reasonCode"] == code
+        assert result["receiptId"] == body["receiptId"] and result["evidenceDigest"] == body["evidenceDigest"]
+        assert {k: result[k] for k in _WIRE_TURN} == _WIRE_TURN and "delivery" not in result
+
+    def test_the_evidence_digest_binds_exactly_the_preserved_fields(self, gw):
+        import dataclasses
+        import hashlib
+
+        self._abort(gw, "HERMES_TURN_FAILED")
+        receipt = receipts.lookup(gw.db, 901)
+        wire = receipts.aborted_on_the_wire(gw.db, receipt)
+        preserved = {"schema": "hermes.gateway-turn-receipt.aborted-evidence/v1", "update_id": 901,
+                     "message_id": "55", "turnRequestId": "turn-wire-1", "receiptIdentity": _WIRE_TURN,
+                     "reasonCode": "HERMES_TURN_FAILED", "deliveredAnswer": False}
+        canonical = json.dumps(preserved, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        assert wire.evidence_digest == "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        assert wire.receipt_id == "hermes-tg:aborted:901" and wire.delivery is None
+        changed = [
+            dataclasses.replace(receipt, reason_code="REFUSED_BEFORE_RUN"),
+            dataclasses.replace(receipt, message_id="56"),
+            dataclasses.replace(receipt, receipt_identity={**_WIRE_TURN, "executorSessionIncarnation": "inc-2"}),
+            dataclasses.replace(receipt, turn_request_id="turn-wire-2"),
+            dataclasses.replace(receipt, completed_at=1.0),  # not preserved evidence: no effect
+        ]
+        digests = [receipts.aborted_on_the_wire(gw.db, r).evidence_digest for r in changed]
+        assert len(set(digests[:4]) | {wire.evidence_digest}) == 5 and digests[4] == wire.evidence_digest
+
+    def test_acp_refuses_an_aborted_receipt_for_another_update_or_another_turn(self, gw):
+        self._abort(gw, "REFUSED_BEFORE_RUN")
+        served = self._served(gw)
+        split = json.loads(served)
+        split["receiptIdentity"]["turnRequestId"] = "turn-wire-2"
+        delivered = {**json.loads(served), "delivery": {}}  # an ABORTED body never names a delivery
+        results = self._acp_reads([(served, 902), (json.dumps(split).encode(), 901),
+                                   (json.dumps(delivered).encode(), 901)])
+        assert results == [{"found": False}] * 3
+
+    def _unprovable(self, gw, case):
+        proof = {"proven_db_path": gw.db.db_path, "proven_db_identity": gw.db._db_file_identity}
+        key = receipts.receipt_key(901)
+        if case == "unreadable":  # RECEIPT_UNREADABLE: no turn identity survives to attest
+            assert gw.db.claim_meta_once(key, "{not json", **proof)
+        elif case == "no_identity":  # a claim that preserved no turn identity, later aborted
+            assert gw.db.claim_meta_once(key, json.dumps({"v": 1, "state": "pending", "message_id": "55"}), **proof)
+            assert receipts.settle_aborted(gw.db, 901, reason_code="REFUSED_BEFORE_RUN", **proof)
+        else:
+            self._abort(gw, "HERMES_PROCESS_DIED_BEFORE_ANSWER")
+            if case == "delivered_answer":
+                self._ledger_row(gw, "delivered-901", 901, "delivered")
+
+    @pytest.mark.parametrize("case", ["unreadable", "no_identity", "delivered_answer", "ledger_unreadable"])
+    def test_an_unprovable_aborted_receipt_is_an_explicit_error_never_a_guess(self, gw, monkeypatch, case):
+        import sqlite3
+        from hermes_state import SessionDB
+
+        self._unprovable(gw, case)
+        if case == "ledger_unreadable":
+            real = SessionDB._read_all
+
+            def read_all(self, sql, *a, **k):
+                if "delivery_obligations" in sql:
+                    raise sqlite3.OperationalError("disk I/O error")
+                return real(self, sql, *a, **k)
+            monkeypatch.setattr(SessionDB, "_read_all", read_all)
+        response = self._get(gw)
+        assert response.status == 409
+        assert json.loads(response.body)["error"]["code"] == "canonical_receipt_unprovable"
+        with pytest.raises(receipts.ReceiptContractError):
+            receipts.served(gw.db, 901)
+        [result] = self._acp_reads([(response.body, 901, 409)])
+        assert result == {"found": False}  # ACP keeps the turn in doubt
 
 
 class TestManagedTurnNote:

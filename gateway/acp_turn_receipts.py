@@ -289,6 +289,85 @@ def lookup(db: Any, update_id: Any) -> TelegramTurnReceipt:
         content=terminal["content"], delivery=terminal["delivery"])
 
 
+class ReceiptContractError(Exception):
+    """A receipt this store holds that cannot be stated in ACP's receipt contract without inventing a
+    value. The GET answers an explicit error for it, so ACP keeps the turn in doubt."""
+
+
+_ABORTED_EVIDENCE_SCHEMA = "hermes.gateway-turn-receipt.aborted-evidence/v1"
+_ABORTED_RECEIPT_PREFIX = "hermes-tg:aborted:"
+
+
+def served(db: Any, update_id: Any) -> TelegramTurnReceipt:
+    """The receipt the GET route serves: ``lookup``, with an ABORTED receipt given its receipt id and
+    evidence digest (``aborted_on_the_wire``). Raises ``ReceiptContractError`` instead of serving one
+    it cannot state. Read-only, like ``lookup``."""
+    receipt = lookup(db, update_id)
+    return aborted_on_the_wire(db, receipt) if receipt.status == "ABORTED" else receipt
+
+
+def aborted_on_the_wire(db: Any, receipt: TelegramTurnReceipt) -> TelegramTurnReceipt:
+    """An ABORTED receipt with the ``receiptId`` and ``evidenceDigest`` ACP requires, computed on every
+    read from what the store preserves, so receipts stored before this existed are served unchanged
+    on disk and every read of one answers the same two values (no clock, no randomness).
+
+    receiptId = ``hermes-tg:aborted:<update_id>``. The store holds exactly one receipt per update id
+    (claimed once), ACP admits at most one turn per update (nonce ``update:<id>``) and asks by that id,
+    so it names exactly this receipt; it cannot collide with a COMPLETED id (``hermes-tg:<obligation
+    hex>``), and it stays short and printable whatever the turn id holds.
+
+    evidenceDigest = ``sha256:`` + hex SHA-256 of the UTF-8, sorted-key, compact JSON of exactly
+    {"schema": "hermes.gateway-turn-receipt.aborted-evidence/v1", "update_id": <int>, "message_id":
+    <as stored>, "turnRequestId": <as stored>, "receiptIdentity": <as stored>, "reasonCode": <as
+    stored>, "deliveredAnswer": false}. ``deliveredAnswer`` is the ledger part: re-checked on every
+    read, and a delivered row for the update is a contradiction refused below, never served. The
+    undelivered rows themselves are not bound: their story is the reason code, and the ledger prunes
+    them, which would change the digest on a later read.
+
+    Raises ``ReceiptContractError`` — never a guessed value — when the update id is not a positive
+    safe integer, the turn identity or the reason code was not preserved (``RECEIPT_UNREADABLE`` has
+    neither), a delivery is recorded on the receipt, or the ledger cannot say no answer was delivered."""
+    import dataclasses
+    import hashlib
+
+    update_id = _wire_id(receipt.update_id)
+    if not isinstance(update_id, int) or isinstance(update_id, bool):
+        raise ReceiptContractError("the update id is not a positive safe integer")
+    identity, turn, reason = receipt.receipt_identity, receipt.turn_request_id, receipt.reason_code
+    if (not isinstance(identity, dict) or not isinstance(turn, str) or not turn
+            or not isinstance(reason, str) or not reason):
+        raise ReceiptContractError("the aborted receipt did not preserve its turn identity and reason code")
+    if receipt.delivery is not None:
+        raise ReceiptContractError("an aborted receipt records a delivery")
+    delivered = _delivered_answer_recorded(db, receipt.update_id)
+    if delivered is None:
+        raise ReceiptContractError("the delivery ledger cannot be read")
+    if delivered:
+        raise ReceiptContractError("an answer to this update was delivered")
+    evidence = {"schema": _ABORTED_EVIDENCE_SCHEMA, "update_id": update_id, "message_id": receipt.message_id,
+                "turnRequestId": turn, "receiptIdentity": identity, "reasonCode": reason,
+                "deliveredAnswer": False}
+    encoded = json.dumps(evidence, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return dataclasses.replace(receipt, receipt_id=f"{_ABORTED_RECEIPT_PREFIX}{update_id}",
+                               evidence_digest="sha256:" + hashlib.sha256(encoded).hexdigest())
+
+
+def _delivered_answer_recorded(db: Any, update_id: Any) -> Optional[bool]:
+    """Whether the ledger records a delivered answer to this update; None when it cannot be read. A
+    store without the ledger table (or an older one without ``acp_update_id``) has recorded none."""
+    import sqlite3
+
+    try:
+        rows = db._read_all(
+            "SELECT 1 FROM delivery_obligations WHERE acp_update_id = ? AND state = 'delivered' LIMIT 1",
+            (str(update_id),))
+    except sqlite3.OperationalError as exc:
+        return False if ("no such table" in str(exc) or "no such column" in str(exc)) else None
+    except Exception:
+        return None
+    return bool(rows)
+
+
 def settle_from_ledger(
     db: Any, update_id: Any, *, obligation_id: Optional[str] = None, proven_db_path: Path,
     proven_db_identity: Optional[tuple],
