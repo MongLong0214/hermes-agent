@@ -1636,6 +1636,18 @@ class ExecApprovalPrompt:
         return [choice for _, choice, _ in self.actions]
 
 
+def sent_message_ids(result: Any) -> List[str]:
+    """Every platform message id a successful send occupies, in send order: the adapter's full list
+    (``raw_response["message_ids"]``) when it reports one, else the head id plus its continuations."""
+    raw = getattr(result, "raw_response", None)
+    listed = raw.get("message_ids") if isinstance(raw, dict) else None
+    if isinstance(listed, (list, tuple)) and listed:
+        return [str(m) for m in listed if m is not None and str(m)]
+    head = getattr(result, "message_id", None)
+    ids = [str(head)] if head else []
+    return ids + [str(m) for m in (getattr(result, "continuation_message_ids", ()) or ()) if m]
+
+
 @dataclass
 class SendResult:
     """Result of sending a message."""
@@ -2502,11 +2514,56 @@ class BasePlatformAdapter(ABC):
         """Session-scoped key for text batching (subclasses may override)."""
         return self._event_session_key(event)
 
+    async def _withhold_unrecorded_acp_answer(self, event, delivery_adapter, reply_to, metadata):
+        from gateway.acp_managed_ingress import UNRECORDED, abort_unrecorded
+        logger.error("ACP managed answer for update %s withheld: its delivery obligation was not recorded",
+                     event._acp_admission.update_id)
+        try:
+            await asyncio.to_thread(abort_unrecorded, event._acp_admission)
+        except Exception:
+            logger.warning("ACP receipt abort after an unrecorded answer failed", exc_info=True)
+        await delivery_adapter._send_with_retry(
+            chat_id=event.source.chat_id, content=UNRECORDED, reply_to=reply_to, metadata=metadata)
+        return SendResult(success=False, error="acp_obligation_unrecorded"), delivery_adapter
+
+    async def _settle_acp_delivered(self, obligation_id: str) -> None:
+        """U4: the ledgered /acp answer reached the chat — settle its receipt from the ledger row.
+        A failed settlement leaves the receipt PENDING; GET and the startup sweep read the row."""
+        try:
+            from gateway.acp_managed_ingress import settle_delivered
+            await asyncio.to_thread(settle_delivered, self.gateway_runner, obligation_id)
+        except Exception:
+            logger.warning("ACP receipt settlement after delivery failed for %s", obligation_id, exc_info=True)
+
+    def _is_acp_managed(self, event: "MessageEvent") -> bool:
+        """U4 H2: an explicit /acp task on the ACP-bound chat (gateway.acp_managed_ingress)."""
+        runner = getattr(self, "gateway_runner", None)
+        if runner is None or not (event.text or "").startswith("/acp"):
+            return False
+        try:
+            from gateway.acp_managed_ingress import is_managed
+            return is_managed(runner, event, event.source)
+        except Exception:
+            logger.debug("ACP managed check failed", exc_info=True)
+            return False
+
     def _enqueue_text_event(self, event: "MessageEvent") -> None:
         """Buffer a text event (merging into a pending one) and restart the flush timer."""
         if self._drop_unresolved(event):
             return
         key = self._text_batch_key(event)
+        if self._is_acp_managed(event):
+            # U4 H2: an /acp task is its own update, never batched. Text batched before it goes out on
+            # its own, and nothing after it can join: Telegram gives no evidence that tells a client
+            # split from a separate message, so a split-length /acp is refused at admission instead.
+            prior = self._pop_text_batch(key)
+            prior_task = self._pending_text_batch_tasks.pop(key, None)
+            if prior_task is not None and not prior_task.done():
+                prior_task.cancel()
+            if prior is not None:
+                self._dispatch_text_batch_detached(prior)
+            self._dispatch_text_batch_detached(event)
+            return
         existing = self._pending_text_batches.get(key)
         if existing is None:
             existing = self._pending_text_batches[key] = event
@@ -2521,6 +2578,11 @@ class BasePlatformAdapter(ABC):
         if prior_task and not prior_task.done():
             prior_task.cancel()
         self._pending_text_batch_tasks[key] = asyncio.create_task(self._flush_text_batch(key))
+
+    def _dispatch_text_batch_detached(self, event: "MessageEvent") -> None:
+        task = asyncio.create_task(self._dispatch_text_batch(event))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     def _text_batch_delay_for(self, pending: Optional["MessageEvent"]) -> float:
         """Quiet period before ``pending`` is dispatched; near-split chunks wait longer."""
@@ -4002,6 +4064,15 @@ class BasePlatformAdapter(ABC):
         # Certain commands must bypass the active-session guard and be dispatched directly to the gateway
         # runner. Without this, they are queued as pending messages and either: See #4926.
         self._canonicalize(event.source)  # identity FIRST (direct callers may skip handle_message)
+        if self._is_acp_managed(event):
+            # U4 H2: an /acp task never queues, steers or batches behind a busy turn — a queued one
+            # would later drain as an ordinary turn with no ACP admission. It is refused here.
+            from gateway.acp_managed_ingress import BUSY
+            await self._send_with_retry(chat_id=event.source.chat_id, content=BUSY,
+                                        reply_to=_reply_anchor_for_event(event),
+                                        metadata=_mark_notify_metadata(_thread_metadata_for_event(event)))
+            event._gateway_accepted = True
+            return
         cmd = event.get_command()
         from hermes_cli.commands import (is_interrupt_then_dispatch, should_bypass_active_session)
         if should_bypass_active_session(cmd):
@@ -4126,8 +4197,11 @@ class BasePlatformAdapter(ABC):
         """Ledger the final response BEFORE the send so a crash before platform ACK redelivers on
         next boot; best-effort, skips slash-command and ephemeral replies. Returns the obligation id
         or None."""
-        if is_ephemeral_response or str(event.text or "").lstrip().startswith(
-            ("/", self.typed_command_prefix or "!")):
+        _acp = getattr(event, "_acp_admission", None)
+        # A managed /acp answer is always ledgered: its ledger row is the receipt's evidence.
+        _handed_off = getattr(event, "_acp_handed_off", False)  # answers a chained follow-up instead
+        if is_ephemeral_response or (_acp is None and not _handed_off and str(event.text or "").lstrip().startswith(
+                ("/", self.typed_command_prefix or "!"))):
             return None
         try:
             from gateway.delivery_ledger import (
@@ -4140,6 +4214,11 @@ class BasePlatformAdapter(ABC):
             _ledger_id = getattr(event, "ledger_message_id", None)
             if _ledger_id is None:
                 _ledger_id = getattr(event, "message_id", "")
+            if _handed_off:
+                # This reply answers something other than the managed task the event opened (a
+                # follow-up, an error notice). It must never share the managed answer's obligation id,
+                # or a same-text reply would overwrite that row and erase its ACP correlation.
+                _ledger_id = f"{_ledger_id or ''}#not-acp"
             obligation_id = compute_obligation_id(
                 session_key, str(_ledger_id or ""), text_content)
             await asyncio.to_thread(
@@ -4147,7 +4226,8 @@ class BasePlatformAdapter(ABC):
                 platform=str(getattr(source.platform, "value", source.platform)),
                 chat_id=source.chat_id, thread_id=getattr(source, "thread_id", None),
                 content=text_content,
-                adapter_profile=getattr(delivery_adapter, "_owner_profile", None))
+                adapter_profile=getattr(delivery_adapter, "_owner_profile", None),
+                acp_update_id=_acp.update_id if _acp is not None else None)
             await asyncio.to_thread(mark_attempting, obligation_id)
             return obligation_id
         except Exception:
@@ -4167,7 +4247,11 @@ class BasePlatformAdapter(ABC):
             from gateway.delivery_ledger import is_reconnect_only, mark_delivered, mark_failed
             # attempt=0: the producer's own send settles only while no redelivery has claimed the row.
             if getattr(result, "success", False):
-                await asyncio.to_thread(mark_delivered, obligation_id, attempt=0)
+                _acp = getattr(event, "_acp_admission", None) is not None
+                if await asyncio.to_thread(
+                        mark_delivered, obligation_id, attempt=0,
+                        message_ids=sent_message_ids(result) if _acp else None) and _acp:
+                    await self._settle_acp_delivered(obligation_id)
                 return
             error = str(getattr(result, "error", "") or "")
             await asyncio.to_thread(mark_failed, obligation_id, error, attempt=0)
@@ -4270,6 +4354,11 @@ class BasePlatformAdapter(ABC):
                     len(text_content), event.source.chat_id)
         obligation_id = await self._record_delivery_obligation(
             event, session_key, text_content, delivery_adapter, is_ephemeral_response)
+        if obligation_id is None and getattr(event, "_acp_admission", None) is not None:
+            # A managed /acp answer is sent only with its ledger row (its receipt's only evidence): with
+            # the row unrecorded, the answer is withheld, the receipt is aborted as a definite
+            # non-delivery, and the owner is told plainly — no unaccounted managed delivery.
+            return await self._withhold_unrecorded_acp_answer(event, delivery_adapter, reply_to, metadata)
         if obligation_id is not None:
             await self._release_turn_marker(event)  # the ledger now owns the crash recovery
         result = await delivery_adapter._send_with_retry(
