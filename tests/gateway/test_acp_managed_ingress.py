@@ -1239,3 +1239,54 @@ async def _outer_handoff_failed(gw, monkeypatch, event, result):
     monkeypatch.setattr(gw.runner, "_hmwa_deliver_turn_response",
                         AsyncMock(return_value=result["final_response"]))
     return await gw.runner._handle_message_with_agent(event, gw.source, gw.entry.session_key, 1)
+
+
+class TestOnlyAModelAnswerCertifies:
+    """Tenth supplementary review (SUPP-17 queued site, SUPP-18): only positive proof of a model answer
+    certifies the managed receipt; every other outcome is a notice."""
+
+    @pytest.mark.parametrize("result,expected", [
+        ({"final_response": "the answer", "api_calls": 2}, True),
+        ({"final_response": "provider error", "api_calls": 0}, False),          # resolution failure
+        ({"final_response": "timed out", "api_calls": 3, "failed": True}, False),  # watchdog / overflow
+        ({"final_response": "interrupted", "api_calls": 1, "interrupted": True}, False),
+        ({"final_response": "   ", "api_calls": 1}, False),                       # empty response
+        ({"final_response": "[SILENT]", "api_calls": 1}, False),                  # silence marker
+        ({"final_response": "(empty)", "api_calls": 1}, False),                   # empty-content sentinel
+        ("a bare refusal string", False),
+    ])
+    def test_the_answer_predicate(self, gw, result, expected):
+        assert gw.runner._acp_is_model_answer(result) is expected
+
+    def test_a_zero_call_result_releases_the_admission(self, gw, monkeypatch):
+        event = TestLedgerSettlement()._managed_event(gw, _admitted(gw))
+        asyncio.run(_outer_handoff(gw, monkeypatch, event,
+                                   {"final_response": "provider error", "api_calls": 0, "messages": []}))
+        assert event._acp_admission is None
+        receipt = receipts.lookup(gw.db, 901)
+        assert receipt.status == "ABORTED" and receipt.reason_code == "HERMES_TURN_FAILED"
+
+    def test_a_refusal_before_the_run_releases_the_admission(self, gw, monkeypatch):
+        from unittest.mock import AsyncMock
+
+        event = TestLedgerSettlement()._managed_event(gw, _admitted(gw))
+        monkeypatch.setattr(gw.runner, "_hmwa_resolve_session",
+                            AsyncMock(return_value=(gw.source, gw.entry, gw.entry.session_key)))
+        monkeypatch.setattr(gw.runner, "_hmwa_prepare_turn",
+                            AsyncMock(return_value=("history temporarily unavailable", None)))
+        reply = asyncio.run(gw.runner._handle_message_with_agent(event, gw.source, gw.entry.session_key, 1))
+        assert reply == "history temporarily unavailable" and event._acp_admission is None
+        assert receipts.lookup(gw.db, 901).reason_code == "HERMES_TURN_FAILED"
+
+    def test_a_queued_first_response_notice_goes_out_without_the_admission(self, gw):
+        from gateway.turn_context import TurnContext
+
+        admission = _admitted(gw)
+        ctx = TurnContext(source=gw.source, session_key=gw.entry.session_key, session_id=gw.entry.session_id,
+                          history=[], acp_admission=admission, inbound_message_id="55", event_message_id="55")
+        got = asyncio.run(gw.runner._acp_first_response_admission(
+            ctx, {"final_response": "context overflow", "failed": True, "api_calls": 1}))
+        assert got is None and ctx.acp_admission is admission  # kept for the follow-up start record
+        assert receipts.lookup(gw.db, 901).reason_code == "HERMES_TURN_FAILED"
+        assert asyncio.run(gw.runner._acp_first_response_admission(
+            ctx, {"final_response": "real answer", "api_calls": 1})) is admission

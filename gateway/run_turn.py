@@ -2216,6 +2216,38 @@ class GatewayTurnMixin:
             persist_user_display_kind, session_entry.session_id, owner,
         ), _session_env_tokens
 
+    @staticmethod
+    def _acp_is_model_answer(agent_result: Any) -> bool:
+        """Positive proof that a turn produced the managed task's answer: a completed model run (not
+        failed, not interrupted, at least one API call) whose own final response is non-empty and not
+        a silence marker. Everything else (provider/resolution failures, watchdog and timeouts,
+        overflow, lease interruptions, zero-call retries, empty or silent responses, refusals before
+        the run) is a notice and must not certify the receipt."""
+        from gateway.response_filters import is_intentional_silence_response
+        if not isinstance(agent_result, dict) or agent_result.get("failed") or agent_result.get("interrupted"):
+            return False
+        try:
+            if int(agent_result.get("api_calls") or 0) <= 0:
+                return False
+        except (TypeError, ValueError):
+            return False
+        text = agent_result.get("final_response")
+        # "(empty)" is the agent's sentinel for a model that produced no visible content.
+        return (isinstance(text, str) and bool(text.strip()) and text.strip() != "(empty)"
+                and not is_intentional_silence_response(text))
+
+    async def _acp_first_response_admission(self, turn_ctx: Any, delivery_result: Any) -> Any:
+        """The admission the queued first response may carry: the managed turn's, only when that
+        response is its model answer. Otherwise the notice goes out ordinarily and the receipt is
+        settled as a failed turn (the admission stays on turn_ctx for the follow-up's start record)."""
+        from gateway import acp_managed_ingress
+        admission = getattr(turn_ctx, "acp_admission", None)
+        if admission is None or self._acp_is_model_answer(delivery_result):
+            return admission
+        with suppress(Exception):
+            await asyncio.to_thread(acp_managed_ingress.abort_failed_turn, admission)
+        return None
+
     async def _acp_release_failed_turn(self, event) -> None:
         """A managed turn ended without an answer: what goes out is a notice, so it must not carry or
         certify the admission. With no answer of the update ever recorded the receipt is a definite
@@ -2272,6 +2304,7 @@ class GatewayTurnMixin:
             event, source, session_entry, session_key, _quick_key, run_generation,
         )
         if not isinstance(prepared, self._PreparedTurn):
+            await self._acp_release_failed_turn(event)  # a refusal before the run is never the answer
             return prepared
         history, message_text = prepared.history, prepared.message_text
 
@@ -2341,9 +2374,9 @@ class GatewayTurnMixin:
             agent_failed_early, hidden_reasoning_incomplete, is_context_overflow_failure = (
                 self._hmwa_classify_turn_failure(agent_result, history, session_entry)
             )
-            if agent_failed_early:
-                # A failed turn (provider error, watchdog/timeout, context overflow) produced a notice,
-                # not the managed task's answer.
+            if not self._acp_is_model_answer(agent_result):
+                # No model answer (failure, timeout, overflow, interruption, empty or silent reply):
+                # what goes out is a notice, not the managed task's answer.
                 await self._acp_release_failed_turn(event)
             if agent_failed_early and not is_context_overflow_failure:
                 response = self._hmwa_add_failed_turn_notice(response, self._hmwa_failed_turn_notice(agent_result))
@@ -3864,7 +3897,7 @@ class GatewayTurnMixin:
                     # The text send records a delivery-ledger obligation under this key, keyed on
                     # the raw inbound id (the anchor above is only the reply target).
                     session_key=session_key, inbound_message_id=turn_ctx.inbound_message_id,
-                    acp_admission=getattr(turn_ctx, "acp_admission", None),
+                    acp_admission=await self._acp_first_response_admission(turn_ctx, _delivery_result),
                 )
             except Exception as e:
                 logger.warning("Failed to send first response before queued message: %s", e)
