@@ -1119,10 +1119,12 @@ def test_cancelling_the_first_canonical_event_holds_the_lease_until_its_build_fi
     assert factory.built[0][1].calls == ["ordinary hello"]  # the ordinary turn reused that one agent
 
 
-def test_the_build_reads_the_owning_profiles_configuration_a_b_a(tmp_path, monkeypatch):
+@pytest.mark.parametrize("a_mode", ["a_local", "a_proxy"])
+def test_the_build_reads_the_owning_profiles_configuration_a_b_a(tmp_path, monkeypatch, a_mode):
     """Reviewer G4: under multiplexing, profile B's agent was built with profile A's disabled
-    toolsets (read before B's scope was entered) while using B's DB. Every profile-dependent read
-    now happens inside the owning profile's scope: A, then B, then A again each get their own."""
+    toolsets (read before B's scope was entered) while using B's DB; and with A in proxy mode, B's
+    own (local) canonical event was refused by A's proxy setting. Every profile-dependent read now
+    happens inside the owning profile's scope: A, then B, then A again each get their own."""
     from datetime import datetime
 
     from agent import secret_scope
@@ -1132,10 +1134,12 @@ def test_the_build_reads_the_owning_profiles_configuration_a_b_a(tmp_path, monke
     prof_b = default_home / "profiles" / "b"
     prof_b.mkdir(parents=True)
     user_home.mkdir()
-    (default_home / "config.yaml").write_text("agent:\n  disabled_toolsets: [only_in_a]\n")
+    a_proxy = "gateway:\n  proxy_url: http://127.0.0.1:9\n" if a_mode == "a_proxy" else ""
+    (default_home / "config.yaml").write_text(a_proxy + "agent:\n  disabled_toolsets: [only_in_a]\n")
     (prof_b / "config.yaml").write_text("agent:\n  disabled_toolsets: [only_in_b]\n")
     (default_home / ".env").write_text("")
     (prof_b / ".env").write_text("")
+    monkeypatch.delenv("GATEWAY_PROXY_URL", raising=False)
     monkeypatch.setenv("HOME", str(user_home))
     monkeypatch.setattr(Path, "home", lambda: user_home)
     monkeypatch.setenv("HERMES_HOME", str(default_home))
@@ -1146,6 +1150,14 @@ def test_the_build_reads_the_owning_profiles_configuration_a_b_a(tmp_path, monke
     factory = _agent_build_path(monkeypatch, runner)
     factory.probe = lambda: str(get_hermes_home())
     now = datetime.now()
+    outcomes = []
+    from gateway.run import _profile_runtime_scope
+
+    async def arriving_on_a(entry):
+        # The request is handled under the default profile's (A's) scope, as on A's listener.
+        with _profile_runtime_scope(default_home):
+            await runner._build_agent_for_resolved_session(entry)
+
     secret_scope.set_multiplex_active(True)
     try:
         for chat in ("chat-a1", "chat-b", "chat-a2"):
@@ -1153,10 +1165,21 @@ def test_the_build_reads_the_owning_profiles_configuration_a_b_a(tmp_path, monke
                 origin=SessionSource(platform=Platform.TELEGRAM, chat_id=chat, chat_type="dm", user_id="user"),
                 session_key=f"agent:main:telegram:dm:{chat}", session_id=f"sid-{chat}",
                 created_at=now, updated_at=now)
-            asyncio.run(runner._build_agent_for_resolved_session(entry))
+            try:
+                asyncio.run(arriving_on_a(entry))
+                outcomes.append("built")
+            except ValueError as refusal:
+                outcomes.append(str(refusal))
     finally:
         secret_scope.set_multiplex_active(False)
         runner.session_store.close_all_db_handles()
-    assert [kwargs["disabled_toolsets"] for kwargs, _ in factory.built] == [
-        ["only_in_a"], ["only_in_b"], ["only_in_a"]]
-    assert factory.probed == [str(default_home), str(prof_b), str(default_home)]
+    if a_mode == "a_local":
+        assert outcomes == ["built", "built", "built"]
+        assert [kwargs["disabled_toolsets"] for kwargs, _ in factory.built] == [
+            ["only_in_a"], ["only_in_b"], ["only_in_a"]]
+        assert factory.probed == [str(default_home), str(prof_b), str(default_home)]
+    else:
+        # A's turns run on A's proxy; B's own configuration has none, so B's agent is built here.
+        assert outcomes == ["canonical_runtime_refused", "built", "canonical_runtime_refused"]
+        assert [kwargs["disabled_toolsets"] for kwargs, _ in factory.built] == [["only_in_b"]]
+        assert factory.probed == [str(prof_b)]

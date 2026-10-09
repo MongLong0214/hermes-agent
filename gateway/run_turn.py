@@ -2476,10 +2476,15 @@ class GatewayTurnMixin:
         from run_agent import AIAgent
 
         source = getattr(entry, "origin", None)
-        if source is None or self._get_proxy_url():
+        if source is None:
             raise ValueError("canonical_runtime_refused")
         try:
+            # Nothing above reads configuration; everything below reads the owning profile's.
             with self._profile_scope_for_source(source):
+                if self._get_proxy_url():
+                    # This profile's turns run on its proxy (as ``_run_agent_inner`` routes them), where
+                    # no agent of this process can run them.
+                    raise ValueError("canonical_runtime_refused")
                 context_prompt = self._pinned_session_context_prompt(
                     build_session_context(source, self.config, entry), self._redact_pii_enabled(),
                     entry.session_key)
@@ -2504,8 +2509,10 @@ class GatewayTurnMixin:
                     if not worker.cancelled():
                         worker.exception()  # retrieved: the caller is cancelled whatever it returned
                     raise
-        except Exception:
-            logger.warning("Agent for resolved session %s could not be built", entry.session_id, exc_info=True)
+        except Exception as exc:
+            if not (isinstance(exc, ValueError) and str(exc) == "canonical_runtime_refused"):
+                logger.warning("Agent for resolved session %s could not be built", entry.session_id,
+                               exc_info=True)
             raise ValueError("canonical_runtime_refused") from None
 
     def _profile_scope_for_source(self, source: SessionSource):
