@@ -2009,6 +2009,7 @@ class TurnRunner:
             "messages": result.get("messages", []), "api_calls": result.get("api_calls", 0),
             "failed": result.get("failed", False), "failure_reason": result.get("failure_reason"),
             "partial": result.get("partial", False), "completed": result.get("completed"),
+            "model_answer": bool(result.get("model_answer")),
             "interrupted": result.get("interrupted", False), "interrupt_message": result.get("interrupt_message"),
             "error": result.get("error"),
             "compression_exhausted": result.get("compression_exhausted", False),
@@ -2027,7 +2028,8 @@ class TurnRunner:
             # finalizer/truncation/codex paths now report a real flush outcome even on an empty
             # response, and dropping it here let a genuine False get silently overwritten by the
             # caller's session-DB-existence default. Absent key only when nothing ever set it.
-            empty_result = {"final_response": final_response, **common}
+            # Whatever text stands here was substituted by the gateway, not answered by the model.
+            empty_result = {"final_response": final_response, **common, "model_answer": False}
             if "agent_persisted" in result:
                 empty_result["agent_persisted"] = result["agent_persisted"]
             return empty_result

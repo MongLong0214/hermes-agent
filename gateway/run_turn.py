@@ -2226,6 +2226,10 @@ class GatewayTurnMixin:
         from gateway.response_filters import is_intentional_silence_response
         if not isinstance(agent_result, dict) or agent_result.get("failed") or agent_result.get("interrupted"):
             return False
+        if agent_result.get("model_answer") is not True:
+            # Provenance from the agent's finalizer rather than completed=True: the empty-reply
+            # explainer reports completed=True, a model-written budget summary completed=False.
+            return False
         try:
             if int(agent_result.get("api_calls") or 0) <= 0:
                 return False
