@@ -1161,3 +1161,81 @@ class TestTurnErrorReply:
         asyncio.run(settle._adapter(gw).send_final_ledgered(event, gw.entry.session_key, reply, {}, reply_to="55"))
         receipt = receipts.lookup(gw.db, 901)
         assert receipt.status == "ABORTED" and receipt.reason_code == "HERMES_TURN_FAILED"
+
+    def test_a_same_text_handed_off_reply_never_overwrites_the_managed_row(self, gw):
+        """REGRESSION-SUPP-16: same session, same opening message id, same text."""
+        settle = TestLedgerSettlement()
+        event = settle._managed_event(gw, _admitted(gw))
+        asyncio.run(settle._adapter(gw).send_final_ledgered(event, gw.entry.session_key, "X", {}, reply_to="55"))
+        event._acp_admission = None
+        event._acp_handed_off = True
+        asyncio.run(settle._adapter(gw).send_final_ledgered(event, gw.entry.session_key, "X", {}, reply_to="55"))
+        from gateway import delivery_ledger
+        with delivery_ledger._connect() as conn:
+            rows = sorted(conn.execute("SELECT content, acp_update_id FROM delivery_obligations").fetchall(),
+                          key=lambda r: r[1] or "")
+        assert rows == [("X", None), ("X", "901")]
+        assert receipts.lookup(gw.db, 901).status == "COMPLETED"
+
+    def test_a_failed_turn_notice_never_certifies_the_receipt(self, gw, monkeypatch):
+        """Ninth-review scope: watchdog/timeout/overflow results are failed turns, not answers."""
+        settle = TestLedgerSettlement()
+        event = settle._managed_event(gw, _admitted(gw))
+        result = {"final_response": "⏱️ the turn timed out", "failed": True, "messages": []}
+
+        response = asyncio.run(_outer_handoff_failed(gw, monkeypatch, event, result))
+        assert event._acp_admission is None
+        asyncio.run(settle._adapter(gw).send_final_ledgered(event, gw.entry.session_key, response, {}, reply_to="55"))
+        receipt = receipts.lookup(gw.db, 901)
+        assert receipt.status == "ABORTED" and receipt.reason_code == "HERMES_TURN_FAILED"
+
+    def test_a_lease_timeout_is_a_definite_non_run(self, gw, monkeypatch):
+        from gateway.turn_lease import TurnLeaseTimeoutError
+
+        async def admitted(event):
+            return event, event.source, False
+
+        async def lease_timeout(*a, **k):
+            raise TurnLeaseTimeoutError(gw.entry.session_id, owner_key="k", generation=1, wait_seconds=1)
+
+        monkeypatch.setattr(gw.runner, "_hm_admit_event", admitted)
+        monkeypatch.setattr(gw.runner, "_handle_message_with_agent", lease_timeout)
+        monkeypatch.setattr(ingress, "socket_path", lambda: gw.sock)
+        monkeypatch.setattr(ingress, "read_secret", lambda: "lane-secret")
+        from gateway.platforms.event import MessageEvent
+        event = MessageEvent(text="/acp deploy", source=gw.source, message_id="55", platform_update_id=901)
+
+        async def exercise():
+            async with _Lane(gw.sock, _allowed(gw)):
+                return await gw.runner._handle_message(event)
+
+        reply = asyncio.run(exercise())
+        assert "not processed" in reply and getattr(event, "_acp_admission", None) is None
+        receipt = receipts.lookup(gw.db, 901)
+        assert receipt.status == "ABORTED" and receipt.reason_code == "REFUSED_BEFORE_RUN"
+
+
+async def _outer_handoff_failed(gw, monkeypatch, event, result):
+    """_outer_handoff, with the turn classified as failed (agent_failed_early)."""
+    from unittest.mock import AsyncMock
+
+    prepared = gw.runner._PreparedTurn([], "", event.text, event.text, None, None,
+                                        gw.entry.session_id, "probe-owner")
+    monkeypatch.setattr(gw.runner, "_hmwa_resolve_session",
+                        AsyncMock(return_value=(gw.source, gw.entry, gw.entry.session_key)))
+    monkeypatch.setattr(gw.runner, "_hmwa_prepare_turn", AsyncMock(return_value=(prepared, None)))
+    monkeypatch.setattr(gw.runner, "_run_agent", AsyncMock(return_value=result))
+    monkeypatch.setattr(gw.runner, "_is_session_run_current", lambda *a: True)
+    monkeypatch.setattr(gw.runner, "_hmwa_stop_typing_for_turn", AsyncMock())
+    monkeypatch.setattr(gw.runner, "_hmwa_shape_agent_response",
+                        AsyncMock(return_value=(result["final_response"], False, [])))
+    monkeypatch.setattr(gw.runner, "_hmwa_prepend_reasoning", lambda a, r, *args: r)
+    monkeypatch.setattr(gw.runner, "_hmwa_runtime_footer_line", lambda *a: "")
+    monkeypatch.setattr(gw.runner, "_hmwa_post_turn_hooks", AsyncMock())
+    monkeypatch.setattr(gw.runner, "_hmwa_classify_turn_failure", lambda *a: (True, False, False))
+    monkeypatch.setattr(gw.runner, "_hmwa_compression_exhaustion_notice", lambda a, r, *args: r)
+    monkeypatch.setattr(gw.runner, "_hmwa_persist_turn_transcript", AsyncMock())
+    monkeypatch.setattr(gw.runner, "_clear_session_env", lambda *a: None)
+    monkeypatch.setattr(gw.runner, "_hmwa_deliver_turn_response",
+                        AsyncMock(return_value=result["final_response"]))
+    return await gw.runner._handle_message_with_agent(event, gw.source, gw.entry.session_key, 1)

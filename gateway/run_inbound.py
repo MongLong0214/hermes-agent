@@ -1383,6 +1383,12 @@ class GatewayInboundMixin:
             except TurnLeaseTimeoutError as exc:
                 # A rejected message, not a completed turn: return before the /goal judge so it
                 # cannot consume the resend notice and enqueue a synthetic continuation loop.
+                if getattr(event, "_acp_admission", None) is not None:
+                    # The admitted task never ran: a definite non-run, and the resend notice must
+                    # not certify its receipt.
+                    acp_managed_ingress.abort_claimed(event._acp_admission)
+                    event._acp_admission = None
+                    event._acp_handed_off = True
                 logger.error(
                     "Rejecting turn for routing key %s on session %s after "
                     "turn-lease timeout; transcript load was not started and "

@@ -4214,6 +4214,11 @@ class BasePlatformAdapter(ABC):
             _ledger_id = getattr(event, "ledger_message_id", None)
             if _ledger_id is None:
                 _ledger_id = getattr(event, "message_id", "")
+            if _handed_off:
+                # This reply answers something other than the managed task the event opened (a
+                # follow-up, an error notice). It must never share the managed answer's obligation id,
+                # or a same-text reply would overwrite that row and erase its ACP correlation.
+                _ledger_id = f"{_ledger_id or ''}#not-acp"
             obligation_id = compute_obligation_id(
                 session_key, str(_ledger_id or ""), text_content)
             await asyncio.to_thread(
