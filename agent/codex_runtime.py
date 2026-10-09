@@ -677,6 +677,10 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
     )
     return _turn_result(
         interrupt, messages, api_calls=1, completed=not turn.interrupted and turn.error is None, error=turn.error,
+        # Answer provenance (finalize_turn's contract): codex's own text of a completed turn, which
+        # no output hook touched; the gateway's certification boundary judges it.
+        **({"answer_origin": turn.final_text, "answer_body": turn.final_text, "answer_disposition": "unchanged"}
+           if not turn.interrupted and turn.error is None else {}),
         # Honest outcome from the flush above (#L4-2/R67-1): True when we actually flushed the
         # projected rows (or there was nothing to flush), False only when an attempted flush failed
         # — the gateway must then NOT skip its own DB write.

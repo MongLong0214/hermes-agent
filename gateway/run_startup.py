@@ -270,6 +270,12 @@ class GatewayStartupMixin:
         """
         from gateway.run import _startup_restore_drain_timeout_secs
         claimed = await self._claim_pending_obligations()
+        # U4 H3: a managed /acp receipt left PENDING by a process that died is reconciled against the
+        # delivery ledger first: a delivered answer settles COMPLETED, an owed one waits for the
+        # redelivery below, and only an update with no ledgered answer is aborted.
+        with _log_suppressed(logging.WARNING, "ACP receipt startup sweep failed", exc_info=True):
+            from gateway.acp_managed_ingress import sweep_at_startup
+            await asyncio.to_thread(sweep_at_startup, self)
 
         async def _boot_sends() -> None:
             await self._send_restart_notification()
@@ -544,7 +550,14 @@ class GatewayStartupMixin:
             return False
         with _log_suppressed(logging.DEBUG, "delivery ledger update failed", exc_info=True):
             if result is not None and getattr(result, "success", False):
-                await asyncio.to_thread(mark_delivered, row["obligation_id"], attempt=row.get("attempts"))
+                from gateway.platforms.base import sent_message_ids
+                await asyncio.to_thread(mark_delivered, row["obligation_id"], attempt=row.get("attempts"),
+                                        message_ids=sent_message_ids(result))
+                # U4: a redelivered /acp answer settles its receipt from the ledger row. Own guard: a
+                # settlement failure leaves the receipt in doubt, never the redelivery's result.
+                with _log_suppressed(logging.WARNING, "ACP receipt redelivery settlement failed", exc_info=True):
+                    from gateway.acp_managed_ingress import settle_delivered
+                    await asyncio.to_thread(settle_delivered, self, row["obligation_id"])
                 logger.info(
                     "Redelivered recovered final response to %s:%s (obligation %s, attempt %d)",
                     row["platform"], row["chat_id"], row["obligation_id"], row["attempts"],
@@ -822,13 +835,85 @@ class GatewayStartupMixin:
         from gateway.run import _float_env
         resumed = ledgered = 0
         max_age = max(60 * 60, int(max(1.0, _float_env("HERMES_AGENT_TIMEOUT", 1800)) * 2))
+        # Decided first and for every marker, before anything that can fail: a turn that ran an
+        # admitted /acp task (or whose identity cannot be read) is held out of both recovery steps,
+        # even if the ledger step aborts or the managed marker's cleanup cannot be persisted.
+        held = await self._acp_held_turn_markers()
+        for key, token, managed in held.values():
+            if managed is None:
+                logger.warning("Crash-left turn on %s: identity unreadable; held for the next start", key)
+                continue
+            # A managed /acp turn is never re-run (no admission covers a second run) and its answer is
+            # never redelivered (its receipt settles only from that answer's ledger row). If the chain
+            # had started an ordinary follow-up, that follow-up owes exactly what an ordinary turn begun
+            # at its recorded start would owe. A failed recovery keeps the marker (held out of the
+            # resume step) for the next start; otherwise the marker is cleared.
+            try:
+                if await self._ledger_managed_chain_followup(key, token):
+                    ledgered += 1
+            except Exception:
+                logger.warning("Managed chain follow-up recovery failed on %s; marker kept", key, exc_info=True)
+                continue
+            logger.warning("Crash-left managed /acp turn on %s: not resumed, its answer not redelivered", key)
+            with _log_suppressed(logging.WARNING, "Managed marker cleanup failed: %s"):
+                await self.async_session_store.clear_turn_active(key, token)
         with _log_suppressed(logging.WARNING, "Crash-left reply recovery on startup failed: %s"):
-            ledgered = await self._ledger_crash_left_replies(max_age)
+            ledgered += await self._ledger_crash_left_replies(max_age, held=held)
         with _log_suppressed(logging.WARNING, "Exact active-turn recovery on startup failed: %s"):
-            resumed = await self.async_session_store.recover_interrupted_turns(max_age_seconds=max_age)
+            resumed = await self.async_session_store.recover_interrupted_turns(
+                max_age_seconds=max_age, hold_tokens=frozenset(held))
         return resumed, ledgered
 
-    async def _ledger_crash_left_replies(self, max_age_seconds: int) -> int:
+    async def _ledger_managed_chain_followup(self, key: str, token: str) -> bool:
+        """Ledger the reply an ordinary follow-up in a crash-left managed chain owes, judged exactly as
+        ordinary crash-left recovery judges a turn begun at the follow-up's recorded start
+        (_crash_left_reply against that time, deduplicated from it). Nothing without a recorded start.
+        Raises when it cannot be accounted for. True when a reply was ledgered."""
+        from gateway.acp_managed_ingress import followup_start
+        from gateway.delivery_ledger import compute_obligation_id, ledger_enabled, record_crash_left_reply
+
+        started = await asyncio.to_thread(followup_start, self, key, token)
+        if started is None:
+            return False
+        with self.session_store._lock:  # noqa: SLF001
+            entry = self.session_store._entries.get(key)  # noqa: SLF001
+            session_id = getattr(entry, "session_id", None)
+            origin = getattr(entry, "origin", None)
+            profile = getattr(entry, "transport_profile", None)
+        if not session_id or origin is None or not await asyncio.to_thread(ledger_enabled):
+            return False
+        history = await self.async_session_store.load_transcript(session_id)
+        text = self._crash_left_reply(history, started, origin)
+        if not text:
+            return False
+        await asyncio.to_thread(
+            record_crash_left_reply,
+            obligation_id=compute_obligation_id(key, f"crash:{token}", text), session_key=key,
+            platform=str(getattr(origin.platform, "value", origin.platform)), chat_id=origin.chat_id,
+            thread_id=origin.thread_id, content=text, since=started, adapter_profile=profile)
+        return True
+
+    async def _acp_held_turn_markers(self) -> dict:
+        """Marker token -> (session key, token, True) for an admitted /acp turn (cleared, never
+        resumed or redelivered) or (session key, token, None) when its identity could not be read
+        (left in place for the next start, never resumed now)."""
+        from gateway.acp_managed_ingress import crash_left_turn_is_managed
+        with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
+            self.session_store._ensure_loaded_locked()  # noqa: SLF001
+            marked = [(e.session_key, e.active_turn_token)
+                      for e in self.session_store._entries.values()  # noqa: SLF001
+                      if e.active_turn_token]
+        held = {}
+        for key, token in marked:
+            try:
+                state = await asyncio.to_thread(crash_left_turn_is_managed, self, key, token)
+            except Exception:
+                state = None
+            if state is not False:
+                held[token] = (key, token, state)
+        return held
+
+    async def _ledger_crash_left_replies(self, max_age_seconds: int, held: Optional[dict] = None) -> int:
         """Settle every marked turn whose final reply was persisted and clear its marker, so
         auto-resume does not regenerate it: a reply live delivery would have suppressed is owed
         nothing, any other goes to the delivery ledger for the boot sweep. Without the ledger a
@@ -849,8 +934,10 @@ class GatewayStartupMixin:
             started = started_at.timestamp()  # aware UTC marker; a pre-upgrade naive one reads as local
             if started < cutoff:
                 continue
-            text = self._crash_left_reply(await self.async_session_store.load_transcript(session_id),
-                                          started, origin)
+            if held and token in held:
+                continue  # an admitted /acp turn, or unreadable: never ledgered from its transcript
+            history = await self.async_session_store.load_transcript(session_id)
+            text = self._crash_left_reply(history, started, origin)
             if text is None or (text and not ledger_on):
                 continue  # no final reply to deliver: the turn resumes
             if text:

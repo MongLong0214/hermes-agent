@@ -60,6 +60,9 @@ class TurnContext:
     # "internal_notification" for async-delegation/background notifications (#82888).
     persist_user_display_kind: Optional[str] = None
     persist_user_display_metadata: Optional[dict] = None
+    # U4 H2: the ACP admission this turn runs under (an explicit /acp task); None for every other
+    # turn, including follow-ups that drain after it. Settled by this turn only (TurnRunner.run_sync).
+    acp_admission: Any = None
     user_config: Any = None
     mute_notification_reply: bool = False
     enabled_toolsets: Any = None

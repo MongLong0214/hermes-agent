@@ -34,6 +34,7 @@ MAX_ATTEMPTS = 3
 STALE_AFTER_SECONDS = 24 * 60 * 60
 _RETENTION_SECONDS = 7 * 24 * 60 * 60
 _MAX_ROWS = 500
+_ACP_RETENTION_SECONDS = 90 * 24 * 60 * 60
 
 # Visible prefixes for redeliveries that might duplicate an already-received message (crash mid-send /
 # post-rejection retry) — honest at-least-once. Runtime recovery uses a distinct marker: no restart
@@ -210,8 +211,18 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             adapter_profile TEXT
         )"""
     )
-    if "adapter_profile" not in {row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")}:
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")}
+    if "adapter_profile" not in columns:
         add_column_if_missing(conn, "delivery_obligations", "adapter_profile", "adapter_profile TEXT")
+    if "acp_update_id" not in columns:
+        # U4: the Telegram update an /acp task answered, written in the same INSERT as the obligation so
+        # a ledgered answer is never without its receipt correlation (gateway.acp_managed_ingress).
+        add_column_if_missing(conn, "delivery_obligations", "acp_update_id", "acp_update_id TEXT")
+    if "delivered_message_ids" not in columns:
+        # JSON list of the platform message ids the delivered answer occupies (send order), written by
+        # the same UPDATE that marks the row delivered: an /acp receipt's delivery evidence.
+        add_column_if_missing(conn, "delivery_obligations", "delivered_message_ids",
+                              "delivered_message_ids TEXT")
 
 
 def _transaction():
@@ -274,7 +285,8 @@ def compute_obligation_id(session_key: str, message_ref: str, content: str) -> s
 
 
 def record_obligation(*, obligation_id: str, session_key: str, platform: str, chat_id: str,
-                      thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None) -> None:
+                      thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None,
+                      acp_update_id: Optional[str] = None) -> None:
     """Record a final response as owed to the platform (state='pending')."""
     now, (pid, started) = time.time(), _owner_stamp()
     with _DB_LOCK, _transaction() as conn:
@@ -282,10 +294,11 @@ def record_obligation(*, obligation_id: str, session_key: str, platform: str, ch
             """INSERT OR REPLACE INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
                 content, state, attempts, created_at, updated_at,
-                owner_pid, owner_started_at, adapter_profile)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?)""",
+                owner_pid, owner_started_at, adapter_profile, acp_update_id)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?)""",
             (obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
-             content, now, now, pid, started, str(adapter_profile).strip() if adapter_profile else "default"))
+             content, now, now, pid, started, str(adapter_profile).strip() if adapter_profile else "default",
+             str(acp_update_id) if acp_update_id is not None else None))
         # Same transaction, same connection: the cron ledgers prune this way too
         # (cron/delivery_queue._prune_terminal_unlocked, cron/executions._prune_unlocked).
         _prune_unlocked(conn, now)
@@ -297,7 +310,9 @@ def record_crash_left_reply(*, obligation_id: str, session_key: str, platform: s
     """Adopt a reply a killed process persisted but never ledgered. Unowned, so this boot's sweep
     claims it, and 'attempting', because a streamed reply may already be on screen: it is
     redelivered once, with the recovered marker. A no-op when the same reply was already ledgered
-    since *since* (the turn start), and idempotent across boots that die before their sweep."""
+    since *since* (the turn start), and idempotent across boots that die before their sweep. A managed
+    /acp answer's row is never "the same reply": an ordinary reply with identical text is its own
+    delivery."""
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
@@ -307,7 +322,8 @@ def record_crash_left_reply(*, obligation_id: str, session_key: str, platform: s
                 owner_pid, owner_started_at, adapter_profile)
                SELECT ?, ?, ?, ?, ?, ?, 'attempting', 0, ?, ?, NULL, NULL, ?
                WHERE NOT EXISTS (SELECT 1 FROM delivery_obligations
-                                 WHERE session_key = ? AND content = ? AND created_at >= ?)""",
+                                 WHERE session_key = ? AND content = ? AND created_at >= ?
+                                   AND acp_update_id IS NULL)""",
             (obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
              content, now, now, str(adapter_profile).strip() if adapter_profile else "default",
              session_key, content, since))
@@ -317,8 +333,10 @@ def mark_attempting(obligation_id: str) -> None:
     _update_state(obligation_id, "attempting")
 
 
-def mark_delivered(obligation_id: str, *, attempt: Optional[int] = None) -> bool:
-    return _update_state(obligation_id, "delivered", attempt=attempt)
+def mark_delivered(obligation_id: str, *, attempt: Optional[int] = None,
+                   message_ids: Optional[List[str]] = None) -> bool:
+    return _update_state(obligation_id, "delivered", attempt=attempt,
+                         delivered_message_ids=json.dumps([str(m) for m in message_ids]) if message_ids else None)
 
 
 def mark_failed(obligation_id: str, error: str = "", *, attempt: Optional[int] = None) -> bool:
@@ -351,7 +369,8 @@ def release_runtime_claim(obligation_id: str, error: str = "", *, attempt: Optio
     return bool(cursor.rowcount)
 
 
-def _update_state(obligation_id: str, state: str, error: str = "", *, attempt: Optional[int] = None) -> bool:
+def _update_state(obligation_id: str, state: str, error: str = "", *, attempt: Optional[int] = None,
+                  delivered_message_ids: Optional[str] = None) -> bool:
     """Write a checkpoint; False when nothing matched. With ``attempt`` it settles ONE claim: the row must
     still be ``attempting`` under this pid with that ``attempts`` count (every claim bumps it and re-stamps
     the owner). A claimant whose row was claimed since, by another process or by a later claim here,
@@ -362,10 +381,12 @@ def _update_state(obligation_id: str, state: str, error: str = "", *, attempt: O
     with _DB_LOCK, _transaction() as conn:
         cursor = conn.execute(
             """UPDATE delivery_obligations
-               SET state=?, updated_at=?, last_error=?
+               SET state=?, updated_at=?, last_error=?,
+                   delivered_message_ids=COALESCE(?, delivered_message_ids)
                WHERE obligation_id=?
                  AND (? IS NULL OR (state='attempting' AND owner_pid IS ? AND attempts=?))""",
-            (state, time.time(), error[:500] if error else None, obligation_id, attempt, pid, attempt))
+            (state, time.time(), error[:500] if error else None, delivered_message_ids,
+             obligation_id, attempt, pid, attempt))
     return bool(cursor.rowcount)
 
 
@@ -421,7 +442,7 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
                       content, state, attempts, created_at,
                       owner_pid, owner_started_at, adapter_profile, last_error, updated_at
                FROM delivery_obligations
-               WHERE state IN ('pending', 'attempting', 'failed')"""
+               WHERE state IN ('pending', 'attempting', 'failed') AND acp_update_id IS NULL"""
         ).fetchall()
         for (oid, session_key, platform, chat_id, thread_id, content, state, attempts, created_at,
              owner_pid, owner_started_at, adapter_profile, last_error, updated_at) in rows:
@@ -499,7 +520,7 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
                       content, attempts, created_at, owner_pid,
                       owner_started_at, last_error, adapter_profile, updated_at
                FROM delivery_obligations
-               WHERE state='failed' AND platform=?""", (platform,)).fetchall()
+               WHERE state='failed' AND platform=? AND acp_update_id IS NULL""", (platform,)).fetchall()
         for (oid, session_key, row_platform, chat_id, thread_id, content, attempts, created_at,
              owner_pid, owner_started_at, last_error, adapter_profile, updated_at) in rows:
             # Exact process-start matching prevents PID reuse from stealing work.
@@ -548,7 +569,8 @@ def pending_retries(now: Optional[float] = None) -> List[Dict[str, Any]]:
         rows = conn.execute(
             """SELECT platform, adapter_profile, updated_at, last_error, attempts, created_at
                FROM delivery_obligations
-               WHERE state='failed' AND owner_pid IS ? AND owner_started_at IS ?""", (pid, started)).fetchall()
+               WHERE state='failed' AND owner_pid IS ? AND owner_started_at IS ? AND acp_update_id IS NULL""",
+            (pid, started)).fetchall()
     earliest: Dict[tuple, float] = {}
     for platform, adapter_profile, updated_at, last_error, attempts, created_at in rows:
         # Reconnect-only rows (a claim released because the adapter was gone) are re-claimed by the
@@ -567,14 +589,18 @@ def pending_retries(now: Optional[float] = None) -> List[Dict[str, Any]]:
 
 def _prune_unlocked(conn, now: float) -> None:
     """Retention DELETEs on the caller's open connection — must run inside the caller's transaction."""
+    # An /acp answer row is the evidence its receipt settles from (and the startup sweep reads before
+    # declaring a death before answer), so it outlives the ordinary retention and the row cap.
     conn.execute(
         """DELETE FROM delivery_obligations
-           WHERE state IN ('delivered', 'abandoned') AND updated_at < ?""", (now - _RETENTION_SECONDS,))
-    total = conn.execute("SELECT COUNT(*) FROM delivery_obligations").fetchone()[0]
+           WHERE state IN ('delivered', 'abandoned') AND updated_at < ?
+             AND (acp_update_id IS NULL OR updated_at < ?)""",
+        (now - _RETENTION_SECONDS, now - _ACP_RETENTION_SECONDS))
+    total = conn.execute("SELECT COUNT(*) FROM delivery_obligations WHERE acp_update_id IS NULL").fetchone()[0]
     if total > _MAX_ROWS:
         conn.execute(
             """DELETE FROM delivery_obligations WHERE obligation_id IN (
-                 SELECT obligation_id FROM delivery_obligations
+                 SELECT obligation_id FROM delivery_obligations WHERE acp_update_id IS NULL
                  ORDER BY CASE state
                             WHEN 'delivered' THEN 0
                             WHEN 'abandoned' THEN 1
