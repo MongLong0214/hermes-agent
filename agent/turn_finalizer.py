@@ -157,6 +157,7 @@ def _resolve_budget_fallback(
                     f"\n⚠️  Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
                     "— requesting summary...", diagnostic=True,
                 )
+            agent._iteration_summary_answered = False
             final_response = agent._handle_max_iterations(messages, api_call_count)
 
     # A kanban worker must record a terminal outcome whether or not a fallback path
@@ -583,6 +584,19 @@ def finalize_turn(
         # The streamed partial already reached the user and owns the transcript row, so the
         # reply is only this fixed notice: echoing the partial would deliver it twice.
         final_response = _ACCEPTED_STREAM_FAILURE_NOTICE
+    # Answer provenance, decided on the model's own text before any explainer replaces it: a
+    # completed text response (or a tool-budget summary, recovered stream text, or this turn's earlier
+    # text reused after housekeeping tools) that is not empty, taken before the mutation footer.
+    # Notices the gateway or the explainer substitute later never carry it (an /acp receipt is
+    # certified only by a model answer).
+    _exit = str(_turn_exit_reason)
+    _model_answer = bool(
+        not interrupted and not failed and accepted_stream_failure_error is None
+        and (final_response or "").strip() not in ("", "(empty)")
+        and (_exit.startswith("text_response")
+             or _exit in ("partial_stream_recovery", "fallback_prior_turn_content")
+             or (_exit.startswith("max_iterations_reached")
+                 and (preserved_verification_fallback or getattr(agent, "_iteration_summary_answered", False) is True))))
     # Response transforms apply only to real, uninterrupted responses.
     if final_response and not interrupted:
         final_response = _append_file_mutation_footer(agent, final_response, logger)
@@ -631,6 +645,7 @@ def finalize_turn(
         "api_calls": api_call_count,
         "completed": completed,
         "turn_exit_reason": _turn_exit_reason,
+        "model_answer": _model_answer,
         "failed": failed,
         "partial": False,  # True only when stopped due to invalid tool calls
         "interrupted": interrupted,

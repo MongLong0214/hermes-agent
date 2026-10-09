@@ -2402,6 +2402,9 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     finally:
         from agent import relay_llm
         relay_llm.complete_logical_call(summary_api_request_id, outcome=summary_call_outcome)
+        # Provenance for finalize_turn: only a model-written summary is an answer; the fallback
+        # strings above are notices.
+        agent._iteration_summary_answered = summary_call_outcome == "success"
 
     return final_response
 

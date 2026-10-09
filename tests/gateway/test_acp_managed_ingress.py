@@ -199,7 +199,7 @@ class TestRunSync:
     """A managed turn is not streamed (its answer must go out through the ledgered send) and runs
     only on the session ACP approved; settlement is no longer the turn's job."""
 
-    def _run_sync(self, gw, monkeypatch, admission, *, agent=None):
+    def _run_sync(self, gw, monkeypatch, admission, *, agent=None, result=None):
         from gateway.run_turn_runner import TurnRunner
         from gateway.turn_context import TurnContext
         import gateway.run as gateway_run
@@ -221,7 +221,8 @@ class TestRunSync:
 
         def run(self, *a, **k):
             calls.append("run")
-            return {"final_response": "answer", "messages": [], "api_calls": 1}
+            return dict(result) if result is not None else {
+                "final_response": "answer", "messages": [], "api_calls": 1, "model_answer": True}
 
         monkeypatch.setattr(TurnRunner, "_run_conversation_with_approval", run)
         monkeypatch.setattr(TurnRunner, "_finish_stream_consumer", lambda self, *a, **k: None)
@@ -1246,7 +1247,13 @@ class TestOnlyAModelAnswerCertifies:
     certifies the managed receipt; every other outcome is a notice."""
 
     @pytest.mark.parametrize("result,expected", [
-        ({"final_response": "the answer", "api_calls": 2}, True),
+        ({"final_response": "the answer", "api_calls": 2, "model_answer": True}, True),
+        # Eleventh supplementary review (SUPP-18): text the explainer, the runner or a deferral wrote
+        # carries no provenance, however answer-like it reads and whatever its call count.
+        ({"final_response": "⚠️ No reply: m didn't produce a reply", "api_calls": 2, "completed": True}, False),
+        ({"final_response": "the answer", "api_calls": 2, "model_answer": False}, False),
+        ({"final_response": "the answer", "api_calls": 2, "model_answer": "true"}, False),
+        ({"final_response": "", "api_calls": 2, "model_answer": True}, False),
         ({"final_response": "provider error", "api_calls": 0}, False),          # resolution failure
         ({"final_response": "timed out", "api_calls": 3, "failed": True}, False),  # watchdog / overflow
         ({"final_response": "interrupted", "api_calls": 1, "interrupted": True}, False),
@@ -1289,4 +1296,29 @@ class TestOnlyAModelAnswerCertifies:
         assert got is None and ctx.acp_admission is admission  # kept for the follow-up start record
         assert receipts.lookup(gw.db, 901).reason_code == "HERMES_TURN_FAILED"
         assert asyncio.run(gw.runner._acp_first_response_admission(
-            ctx, {"final_response": "real answer", "api_calls": 1})) is admission
+            ctx, {"final_response": "real answer", "api_calls": 1, "model_answer": True})) is admission
+
+
+class TestAnswerProvenance:
+    """Eleventh supplementary review (ESCAPE-SUPP-18): whether a turn's text is a model answer is decided
+    where the agent produced it (finalize_turn / the codex runtime) and carried through TurnRunner;
+    notices substituted later never certify the managed receipt, whatever their call count."""
+
+    @pytest.mark.parametrize("result,expected", [
+        ({"final_response": "the answer", "messages": [], "api_calls": 1, "model_answer": True}, True),
+        # conversation_loop compression deferral: a positive call count, failed=False, no provenance
+        ({"final_response": "Context compression is already running for this session.", "messages": [],
+          "api_calls": 1, "failed": False, "partial": True, "compression_deferred": True}, False),
+        # refused truncated tool call (failed unset)
+        ({"final_response": "The model's reply was cut off before it finished.", "messages": [],
+          "api_calls": 1, "completed": False, "failure_reason": "truncated"}, False),
+        # the finalizer's explainer replaced an empty terminal
+        ({"final_response": "⚠️ No reply: m didn't produce a reply", "messages": [], "api_calls": 2,
+          "completed": True, "failure_reason": "empty_response", "model_answer": False}, False),
+        # TurnRunner's own empty normalisation writes a retry notice; the flag cannot survive it
+        ({"final_response": "", "messages": [], "api_calls": 1, "completed": True, "model_answer": True}, False),
+    ])
+    def test_turn_runner_carries_only_agent_provenance(self, gw, monkeypatch, result, expected):
+        shaped, _ = TestRunSync()._run_sync(gw, monkeypatch, _admitted(gw), result=result)
+        assert shaped["final_response"].strip()
+        assert gw.runner._acp_is_model_answer(shaped) is expected
