@@ -2,10 +2,10 @@
 
 Producers record two texts at the one output-hook seam, before any footer, explainer or media
 decoration: ``answer_origin`` (the text the model produced, handed to the hook) and ``answer_body``
-(the text the hook returned), and only for exits that produce the model's own text. The gateway's
-certification boundary (``GatewayTurnMixin._acp_is_model_answer``) judges both and the delivered
-reply with one rule. These tests drive the real finalizer and conversation loop and judge their
-results at that boundary.
+(the text the hook returned), plus ``answer_disposition`` (what the hook declared it did to the
+answer), and only for exits that produce the model's own text. The gateway's certification boundary
+(``GatewayTurnMixin._acp_is_model_answer``) judges them and the delivered reply with one rule. These
+tests drive the real finalizer and conversation loop and judge their results at that boundary.
 """
 
 from unittest.mock import patch
@@ -18,6 +18,9 @@ from tests.agent.test_turn_finalizer_iteration_limit_exit import _finalize, _Lim
 
 NON_ANSWERS = ["(empty)", "[SILENT]", "NO_REPLY", "<|eos|>", "   "]
 NOTICE = "⚠️ No reply: the model produced nothing. Send `continue` to try again."
+HOOK_NOTICE = "No reply: the model produced no usable answer."
+MARKERS = ["(empty)", "[SILENT]", "NO_REPLY", "<|eos|>"]
+MISSING_MEDIA = "\nMEDIA:/nonexistent/acp-probe/missing.png"
 FOOTER = "\n\n📝 Files changed: a.py (patch failed)"
 
 
@@ -25,8 +28,13 @@ def _certifies(result):
     return GatewayTurnMixin._acp_is_model_answer(result)
 
 
+def _preserved(text):
+    return {"text": text, "answer": "preserved"}
+
+
 def _hook(rewrite):
-    """A transform_llm_output plugin returning ``rewrite(text)`` (None leaves the text unchanged)."""
+    """A transform_llm_output plugin returning ``rewrite(text)`` (None leaves the text unchanged); a
+    rewrite may return a plain string or a ``{"text", "answer"}`` declaration."""
     def invoke(name, logger, **kwargs):
         if name != "transform_llm_output":
             return []
@@ -58,6 +66,7 @@ def test_a_plain_answer_certifies():
     agent.client.chat.completions.create.side_effect = [_mock_response(content="The answer is 42.")]
     result = _run(agent)
     assert result["answer_origin"] == result["answer_body"] == "The answer is 42."
+    assert result["answer_disposition"] == "unchanged"
     assert _certifies(result)
 
 
@@ -92,7 +101,9 @@ def test_recovered_stream_text_certifies():
     ("<|eos|>", lambda r: None, False),
     ("The answer is 42.", lambda r: "(empty)", False),    # nor keep one it replaced (SUPP13-R1)
     ("The answer is 42.", lambda r: "   ", False),
-    ("The answer is 42.", lambda r: r.upper(), True),     # control: reshaping a real answer
+    ("The answer is 42.", lambda r: _preserved(r.upper()), True),  # control: a declared reformat
+    ("The answer is 42.", lambda r: r.upper(), False),    # an undeclared rewrite proves nothing
+    ("The answer is 42.", lambda r: HOOK_NOTICE, False),  # SUPP13-R1 ①: a hook-written notice
 ])
 def test_a_text_response_is_judged_at_both_sides_of_the_hook(model_text, rewrite, expected):
     agent = _make_agent()
@@ -145,7 +156,8 @@ def test_each_producer_certifies_a_genuine_answer(producer, decorated):
 
 @pytest.mark.parametrize("producer", PRODUCERS)
 @pytest.mark.parametrize("model_text", NON_ANSWERS)
-@pytest.mark.parametrize("rewrite", [lambda r: None, lambda r: NOTICE], ids=["unchanged", "hook-notice"])
+@pytest.mark.parametrize("rewrite", [lambda r: None, lambda r: NOTICE, lambda r: _preserved(NOTICE)],
+                         ids=["unchanged", "hook-notice", "hook-declared-notice"])
 @pytest.mark.parametrize("decorated", [False, True])
 def test_no_producer_certifies_a_non_answer_however_it_is_shaped(producer, model_text, rewrite, decorated):
     with _hook(rewrite), _decorate(FOOTER if decorated else ""):
@@ -178,7 +190,7 @@ def test_a_stale_summary_flag_does_not_leak_into_the_next_budget_exit():
 
 def test_a_seam_record_from_another_turn_is_not_provenance():
     agent = _ProducerAgent()
-    agent._llm_output_seam = ("an-earlier-turn", "The answer is 42.", "The answer is 42.")
+    agent._llm_output_seam = ("an-earlier-turn", "The answer is 42.", "The answer is 42.", "unchanged")
     agent._llm_output_transform = ("turn", False, None)  # this turn's hook already fired, on nothing
     result = _finalize(agent, final_response="⚠️ notice", exit_reason="text_response(finish_reason=stop)")
     assert result["answer_origin"] is None and not _certifies(result)
@@ -201,3 +213,81 @@ def test_handle_max_iterations_reports_whether_the_model_wrote_the_summary(outco
         text = helpers.handle_max_iterations(agent, [{"role": "user", "content": "task"}], 10)
     assert bool(text.strip())
     assert agent._iteration_summary_answered is expected
+
+
+# --- hook provenance (SUPP13-R1) ---------------------------------------------------------------
+
+
+@pytest.mark.parametrize("producer", PRODUCERS)
+@pytest.mark.parametrize("rewrite,disposition", [
+    (lambda r: HOOK_NOTICE, "undeclared"),                                    # ① plain string
+    (lambda r: {"text": HOOK_NOTICE}, "undeclared"),                          # no declaration
+    (lambda r: {"text": HOOK_NOTICE, "answer": "kept"}, "undeclared"),        # invalid declaration
+    (lambda r: {"text": HOOK_NOTICE, "answer": "suppressed"}, "suppressed"),
+    (lambda r: {"text": "The answer is 42 (reformatted).", "answer": "suppressed"}, "suppressed"),
+], ids=["plain-notice", "mapping-undeclared", "mapping-invalid", "suppressed-notice", "suppressed-answerlike"])
+@pytest.mark.parametrize("decorated", [False, True])
+def test_no_producer_certifies_an_answer_the_hook_did_not_declare_preserved(producer, rewrite, disposition,
+                                                                          decorated):
+    with _hook(rewrite), _decorate(FOOTER if decorated else ""):
+        result = _produce(producer, "The answer is 42.")
+    assert result["answer_disposition"] == disposition
+    assert result["answer_origin"] == "The answer is 42." and not _certifies(result)
+
+
+@pytest.mark.parametrize("producer", PRODUCERS)
+@pytest.mark.parametrize("model_text", ["42", '{"answer":42}', "The answer is 42."])
+@pytest.mark.parametrize("decorated", [False, True])
+def test_each_producer_certifies_a_declared_preserving_rewrite(producer, model_text, decorated):
+    with _hook(lambda r: _preserved("The answer is 42.")), _decorate(FOOTER if decorated else ""):
+        result = _produce(producer, model_text)
+    assert result["answer_disposition"] == "preserved"
+    assert result["answer_body"] == "The answer is 42." and _certifies(result)
+
+
+@pytest.mark.parametrize("producer", PRODUCERS)
+@pytest.mark.parametrize("marker", MARKERS)
+@pytest.mark.parametrize("declare", [_preserved, lambda t: t], ids=["preserved", "plain"])
+@pytest.mark.parametrize("decorated", [False, True])
+def test_no_producer_certifies_a_marker_left_once_attachments_are_extracted(producer, marker, declare, decorated):
+    """SUPP13-R1 ②: what the adapter sends of ``marker + MEDIA:<missing>`` is the marker alone, so a
+    declared "preserved" cannot carry it, with or without the footer behind it."""
+    with _hook(lambda r: declare(marker + MISSING_MEDIA)), _decorate(FOOTER if decorated else ""):
+        assert not _certifies(_produce(producer, "The answer is 42."))
+
+
+@pytest.mark.parametrize("producer", PRODUCERS)
+@pytest.mark.parametrize("hooked", [False, True])
+def test_a_genuine_answer_with_a_real_attachment_certifies(producer, hooked, tmp_path):
+    chart = tmp_path / "chart.png"
+    chart.write_bytes(b"\x89PNG")
+    answer = f"The answer is 42.\nMEDIA:{chart}"
+    with _hook((lambda r: _preserved(r)) if hooked else (lambda r: None)), _decorate(FOOTER):
+        assert _certifies(_produce(producer, answer))
+
+
+def test_the_first_declared_text_wins_and_an_empty_one_passes_the_turn_on():
+    """The mapping's text is consumed exactly as a plain string: an empty one leaves the response
+    for the next plugin, and the winner's declaration is the turn's."""
+    from agent.turn_finalizer import apply_llm_output_transform
+
+    agent = _ProducerAgent()
+    results = [{"text": "", "answer": "suppressed"}, _preserved("The answer is 42."), "ignored"]
+    with patch("agent.turn_finalizer._invoke_hook_safely", return_value=results):
+        text, transformed, pre = apply_llm_output_transform(agent, "42", turn_id="t1", logger=None)
+    assert (text, transformed, pre) == ("The answer is 42.", True, "42")
+    assert agent._llm_output_seam == ("t1", "42", "The answer is 42.", "preserved")
+
+
+@pytest.mark.parametrize("rewrite,expected", [
+    (lambda r: HOOK_NOTICE, False),
+    (lambda r: {"text": HOOK_NOTICE, "answer": "suppressed"}, False),
+    (lambda r: _preserved("The answer is 42."), True),
+])
+def test_the_conversation_loop_carries_the_hooks_declaration(rewrite, expected):
+    agent = _make_agent()
+    agent.client.chat.completions.create.side_effect = [_mock_response(content="42")]
+    with _hook(rewrite):
+        result = _run(agent)
+    assert result["turn_exit_reason"].startswith("text_response")
+    assert _certifies(result) is expected

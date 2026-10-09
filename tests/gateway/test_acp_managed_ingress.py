@@ -222,7 +222,8 @@ class TestRunSync:
         def run(self, *a, **k):
             calls.append("run")
             return dict(result) if result is not None else {
-                "final_response": "answer", "messages": [], "api_calls": 1, "answer_origin": "answer", "answer_body": "answer"}
+                "final_response": "answer", "messages": [], "api_calls": 1, "answer_origin": "answer", "answer_body": "answer",
+                "answer_disposition": "unchanged"}
 
         monkeypatch.setattr(TurnRunner, "_run_conversation_with_approval", run)
         monkeypatch.setattr(TurnRunner, "_finish_stream_consumer", lambda self, *a, **k: None)
@@ -1242,13 +1243,17 @@ async def _outer_handoff_failed(gw, monkeypatch, event, result):
     return await gw.runner._handle_message_with_agent(event, gw.source, gw.entry.session_key, 1)
 
 
+_HOOK_NOTICE = "No reply: the model produced no usable answer."
+_MISSING_MEDIA = "\nMEDIA:/nonexistent/acp-probe/missing.png"
+
+
 class TestOnlyAModelAnswerCertifies:
     """Tenth supplementary review (SUPP-17 queued site, SUPP-18): only positive proof of a model answer
     certifies the managed receipt; every other outcome is a notice."""
 
     @pytest.mark.parametrize("result,expected", [
         ({"final_response": "the answer", "api_calls": 2, "answer_origin": "the answer",
-          "answer_body": "the answer"}, True),
+          "answer_body": "the answer", "answer_disposition": "unchanged"}, True),
         # Eleventh supplementary review (SUPP-18): text the explainer, the runner or a deferral wrote
         # carries no provenance, however answer-like it reads and whatever its call count.
         ({"final_response": "⚠️ No reply: m didn't produce a reply", "api_calls": 2, "completed": True}, False),
@@ -1263,6 +1268,20 @@ class TestOnlyAModelAnswerCertifies:
           "answer_body": "<|eos|>"}, False),                                        # metadata only
         ({"final_response": "", "api_calls": 2, "answer_origin": "the answer",
           "answer_body": "the answer"}, False),
+        # SUPP13-R1: only the hook can say a rewrite kept the answer; the predicate never reads wording.
+        *[({"final_response": _HOOK_NOTICE, "api_calls": 2, "answer_origin": "the answer",
+            "answer_body": _HOOK_NOTICE, **disposition}, expected)
+          for disposition, expected in (({"answer_disposition": "undeclared"}, False),
+                                        ({"answer_disposition": "suppressed"}, False),
+                                        ({"answer_disposition": "bogus"}, False),
+                                        ({}, False),
+                                        ({"answer_disposition": "preserved"}, True))],
+        # SUPP13-R1 ②: judged on what the adapter sends once attachments are extracted
+        *[({"final_response": marker + _MISSING_MEDIA + footer, "api_calls": 2, "answer_origin": "the answer",
+            "answer_body": marker + _MISSING_MEDIA, "answer_disposition": "preserved"}, False)
+          for marker in ("(empty)", "[SILENT]", "NO_REPLY", "<|eos|>") for footer in ("", "\n\n📝 footer")],
+        ({"final_response": "the answer\n\n📝 footer", "api_calls": 2, "answer_origin": "the answer",
+          "answer_body": "the answer", "answer_disposition": "unchanged"}, True),              # footer
         ({"final_response": "provider error", "api_calls": 0}, False),          # resolution failure
         ({"final_response": "timed out", "api_calls": 3, "failed": True}, False),  # watchdog / overflow
         ({"final_response": "interrupted", "api_calls": 1, "interrupted": True}, False),
@@ -1306,7 +1325,7 @@ class TestOnlyAModelAnswerCertifies:
         assert receipts.lookup(gw.db, 901).reason_code == "HERMES_TURN_FAILED"
         assert asyncio.run(gw.runner._acp_first_response_admission(
             ctx, {"final_response": "real answer", "api_calls": 1, "answer_origin": "real answer",
-                  "answer_body": "real answer"})) is admission
+                  "answer_body": "real answer", "answer_disposition": "unchanged"})) is admission
 
 
 class TestAnswerProvenance:
@@ -1316,7 +1335,10 @@ class TestAnswerProvenance:
 
     @pytest.mark.parametrize("result,expected", [
         ({"final_response": "the answer", "messages": [], "api_calls": 1, "answer_origin": "the answer",
-          "answer_body": "the answer"}, True),
+          "answer_body": "the answer", "answer_disposition": "unchanged"}, True),
+        # a hook's undeclared rewrite reaches the gateway as such
+        ({"final_response": "the answer", "messages": [], "api_calls": 1, "answer_origin": "the answer",
+          "answer_body": "the answer", "answer_disposition": "undeclared"}, False),
         # conversation_loop compression deferral: a positive call count, failed=False, no provenance
         ({"final_response": "Context compression is already running for this session.", "messages": [],
           "api_calls": 1, "failed": False, "partial": True, "compression_deferred": True}, False),
@@ -1334,3 +1356,71 @@ class TestAnswerProvenance:
         shaped, _ = TestRunSync()._run_sync(gw, monkeypatch, _admitted(gw), result=result)
         assert shaped["final_response"].strip()
         assert gw.runner._acp_is_model_answer(shaped) is expected
+
+
+class TestHookProvenanceThroughTheGateway:
+    """SUPP13-R1 end to end: a real finalizer result for each producer, shaped by TurnRunner, then
+    delivered on the final path or as the queued first response. Only a response the output hook left
+    unchanged, or declared it preserved, and that is still an answer once the adapter extracts its
+    attachments, settles the receipt COMPLETED; everything else aborts it HERMES_TURN_FAILED."""
+
+    PRODUCERS = ["text", "stream-recovery", "housekeeping", "budget-summary", "verification-candidate"]
+
+    def _receipt(self, gw, monkeypatch, delivery, producer, model_text, rewrite, footer=""):
+        from unittest.mock import AsyncMock
+        from gateway.turn_context import TurnContext
+        from tests.agent.test_turn_answer_provenance import _decorate, _hook, _produce
+
+        with _hook(rewrite), _decorate(footer):
+            result = _produce(producer, model_text)
+        admission = _admitted(gw)
+        shaped, _ = TestRunSync()._run_sync(gw, monkeypatch, admission, result=result)
+        settle = TestLedgerSettlement()
+        if delivery == "final":
+            event = settle._managed_event(gw, admission)
+            response = asyncio.run(_outer_handoff(gw, monkeypatch, event, shaped))
+            asyncio.run(settle._adapter(gw).send_final_ledgered(event, gw.entry.session_key, response, {},
+                                                                reply_to="55"))
+        else:
+            monkeypatch.setattr(gw.runner, "_run_agent", AsyncMock(return_value={
+                "final_response": "follow-up failed", "failed": True, "api_calls": 0, "messages": []}))
+            ctx = TurnContext(source=gw.source, session_key=gw.entry.session_key, session_id=gw.entry.session_id,
+                              history=[], acp_admission=admission, inbound_message_id="55", event_message_id="55")
+            asyncio.run(gw.runner._run_agent_queued_followup(ctx, settle._adapter(gw), "ordinary follow-up", None,
+                                                             shaped, shaped, None))
+        return receipts.lookup(gw.db, 901)
+
+    @pytest.mark.parametrize("delivery", ["final", "queued-first"])
+    @pytest.mark.parametrize("producer", PRODUCERS)
+    @pytest.mark.parametrize("rewrite,footer", [
+        (lambda r: _HOOK_NOTICE, ""),                                                   # ① undeclared
+        (lambda r: {"text": _HOOK_NOTICE, "answer": "suppressed"}, ""),
+        (lambda r: {"text": "(empty)" + _MISSING_MEDIA, "answer": "preserved"}, ""),     # ② marker + media
+        (lambda r: {"text": "[SILENT]" + _MISSING_MEDIA, "answer": "preserved"}, "\n\n📝 footer"),
+        (lambda r: "NO_REPLY" + _MISSING_MEDIA, ""),
+        (lambda r: {"text": "<|eos|>" + _MISSING_MEDIA, "answer": "preserved"}, "\n\n📝 footer"),
+    ], ids=["plain-notice", "suppressed", "empty-media", "silent-media-footer", "noreply-media", "eos-media-footer"])
+    def test_a_replaced_answer_aborts_the_receipt(self, gw, monkeypatch, delivery, producer, rewrite, footer):
+        receipt = self._receipt(gw, monkeypatch, delivery, producer, "The answer is 42.", rewrite, footer)
+        assert receipt.status == "ABORTED" and receipt.reason_code == "HERMES_TURN_FAILED"
+
+    @pytest.mark.parametrize("delivery", ["final", "queued-first"])
+    @pytest.mark.parametrize("producer", PRODUCERS)
+    @pytest.mark.parametrize("model_text,rewrite,footer", [
+        ("The answer is 42.", lambda r: None, ""),                                     # no hook
+        ("42", lambda r: {"text": "The answer is 42.", "answer": "preserved"}, ""),
+        ('{"answer":42}', lambda r: {"text": "The answer is 42.", "answer": "preserved"}, ""),
+        ("The answer is 42.", lambda r: None, "\n\n📝 footer"),                         # answer + footer
+    ], ids=["no-hook", "preserved-reformat", "preserved-structured", "footer"])
+    def test_a_kept_answer_completes_the_receipt(self, gw, monkeypatch, delivery, producer, model_text, rewrite,
+                                                 footer):
+        receipt = self._receipt(gw, monkeypatch, delivery, producer, model_text, rewrite, footer)
+        assert receipt.status == "COMPLETED"
+
+    @pytest.mark.parametrize("delivery", ["final", "queued-first"])
+    def test_an_answer_with_a_real_attachment_completes_the_receipt(self, gw, monkeypatch, tmp_path, delivery):
+        chart = tmp_path / "chart.png"
+        chart.write_bytes(b"\x89PNG")
+        receipt = self._receipt(gw, monkeypatch, delivery, "text", f"The answer is 42.\nMEDIA:{chart}",
+                                lambda r: None)
+        assert receipt.status == "COMPLETED"

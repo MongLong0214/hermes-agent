@@ -2233,16 +2233,31 @@ class GatewayTurnMixin:
         return (bool(body) and body != "(empty)" and not body.startswith(INTERRUPT_WAITING_FOR_MODEL_PREFIX)
                 and not is_intentional_silence_response(body))
 
+    @staticmethod
+    def _acp_text_after_attachments(text: Any) -> Any:
+        """The text the adapter's final send leaves once attachments are taken out, by the same
+        extraction steps in the same order (``BasePlatformAdapter._extract_response_content``): a
+        marker followed by a media tag goes out as the marker alone."""
+        from gateway.platforms.base import BasePlatformAdapter, _strip_media_directives
+        if not isinstance(text, str):
+            return text
+        _, text = BasePlatformAdapter.extract_media(text)
+        _, text = BasePlatformAdapter.extract_images(text)
+        return BasePlatformAdapter.extract_local_files(_strip_media_directives(text).strip())[1]
+
     @classmethod
     def _acp_is_model_answer(cls, agent_result: Any) -> bool:
         """The certification boundary for a managed receipt: one rule for every producer and both
         delivery paths. A completed model run (not failed, not interrupted, at least one API call)
-        certifies only when the text the model produced for this turn (``answer_origin``, recorded
-        before any output hook) AND the text the hook left to deliver (``answer_body``, before any
-        footer, explainer or media decoration) are both answers, and the reply actually delivered is
-        too. Decoration cannot create eligibility; a hook can neither turn a non-answer into an answer
-        nor keep a genuine answer eligible after replacing it with a non-answer. Producers that
-        record no provenance (notices, refusals, deferrals, gateway substitutions) never certify."""
+        certifies only when the output hook left the model's answer in place (``answer_disposition``
+        "unchanged", or "preserved" as the hook itself declared), and the text the model produced for
+        this turn (``answer_origin``, recorded before any output hook), the text the hook left to
+        deliver (``answer_body``, before any footer, explainer or media decoration) and the reply
+        actually delivered are each still an answer once attachments are extracted as the adapter
+        sends them. Decoration cannot create eligibility; a hook can neither turn a non-answer into
+        an answer nor keep a genuine answer eligible after replacing it, and only the hook can say
+        which a rewrite was. Producers that record no provenance (notices, refusals, deferrals,
+        gateway substitutions) never certify."""
         if not isinstance(agent_result, dict) or agent_result.get("failed") or agent_result.get("interrupted"):
             return False
         try:
@@ -2250,7 +2265,11 @@ class GatewayTurnMixin:
                 return False
         except (TypeError, ValueError):
             return False
-        return all(cls._acp_is_answer_text(agent_result.get(key))
+        # An undeclared or suppressing rewrite never certifies: judging its wording instead would
+        # reopen shape-as-provenance (a reformat and a hook-written notice read alike).
+        if agent_result.get("answer_disposition") not in ("unchanged", "preserved"):
+            return False
+        return all(cls._acp_is_answer_text(cls._acp_text_after_attachments(agent_result.get(key)))
                    for key in ("answer_origin", "answer_body", "final_response"))
 
     async def _acp_first_response_admission(self, turn_ctx: Any, delivery_result: Any) -> Any:

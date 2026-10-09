@@ -107,7 +107,9 @@ _install_plugin_debug_handler()
 
 VALID_HOOKS: Set[str] = {
     "pre_tool_call", "post_tool_call", "transform_terminal_output", "transform_tool_result",
-    # transform_llm_output: return a replacement string (first non-None wins) or None.
+    # transform_llm_output: return a replacement string (first non-None wins) or None, or
+    # {"text": str, "answer": "preserved" | "suppressed"} to declare whether the text still carries
+    # the model's answer (an undeclared replacement never certifies a managed /acp receipt).
     "transform_llm_output", "pre_llm_call", "post_llm_call",
     # Streaming observers (agent.plugin_stream_hooks), off the token path; payloads are immutable
     # normalized text/lifecycle and cannot transform the stream.

@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import os
 from contextlib import suppress
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, List, Mapping, Optional, Tuple
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.delegation_context import is_dispatcher_owned_worker_context
@@ -481,7 +481,10 @@ def apply_llm_output_transform(
     if platform is None:
         platform = getattr(agent, "platform", None) or ""
     transformed, pre_transform = False, None
-    # First hook to return a string wins; None/empty leaves the text unchanged.
+    disposition = "unchanged"
+    # First hook to return a non-empty text wins; None/empty leaves the text unchanged. A hook may
+    # return {"text": ..., "answer": "preserved" | "suppressed"} to say whether its text still
+    # carries the model's answer; the text itself is used exactly as a plain string would be.
     for _hook_result in _invoke_hook_safely(
         "transform_llm_output", logger,
         response_text=final_response,
@@ -490,13 +493,20 @@ def apply_llm_output_transform(
         platform=platform,
         turn_id=turn_id,  # per-turn identity for the hook callback gate
     ):
+        _declared = None
+        if isinstance(_hook_result, Mapping):
+            _hook_result, _declared = _hook_result.get("text"), _hook_result.get("answer")
         if isinstance(_hook_result, str) and _hook_result:
             pre_transform, final_response, transformed = final_response, _hook_result, True
+            # A plain string (or an unclear declaration) cannot say whether the model's answer
+            # survived: a reformat and a hook-written notice look alike, so only the hook knows.
+            disposition = _declared if _declared in ("preserved", "suppressed") else "undeclared"
             break
     agent._llm_output_transform = (turn_id, transformed, pre_transform)
-    # Answer provenance (/acp receipts): the text this turn handed the hook and the text the hook
-    # returned, both before any footer, explainer or media decoration is added.
-    agent._llm_output_seam = (turn_id, model_text, final_response)
+    # Answer provenance (/acp receipts): the text this turn handed the hook, the text the hook
+    # returned (both before any footer, explainer or media decoration is added) and what the hook
+    # said it did to the answer.
+    agent._llm_output_seam = (turn_id, model_text, final_response, disposition)
     return final_response, transformed, pre_transform
 
 
@@ -591,9 +601,10 @@ def finalize_turn(
     # Answer provenance for /acp receipts. Only these exits produce the model's own text for this
     # turn: a text response, recovered stream text, this turn's earlier text reused after housekeeping
     # tools, or a budget exit whose summary (or preserved verification answer) the model wrote. For
-    # them, carry the text the output hook was given (answer_origin) and the text it returned
-    # (answer_body), both recorded at that one seam before footer, explainer or media decoration.
-    # The gateway judges both at its certification boundary; nothing here decides eligibility.
+    # them, carry the text the output hook was given (answer_origin), the text it returned
+    # (answer_body), both recorded at that one seam before footer, explainer or media decoration,
+    # and what the hook declared it did to the answer (answer_disposition). The gateway judges all
+    # three at its certification boundary; nothing here decides eligibility.
     _exit = str(_turn_exit_reason)
     _answer_exit = (
         not interrupted and not failed and accepted_stream_failure_error is None
@@ -602,9 +613,9 @@ def finalize_turn(
              or (_exit.startswith("max_iterations_reached")
                  and (preserved_verification_fallback or getattr(agent, "_iteration_summary_answered", False) is True))))
     _seam = getattr(agent, "_llm_output_seam", None)
-    _answer_origin = _answer_body = None
-    if _answer_exit and isinstance(_seam, tuple) and len(_seam) == 3 and _seam[0] == turn_id:
-        _answer_origin, _answer_body = _seam[1], _seam[2]
+    _answer_origin = _answer_body = _answer_disposition = None
+    if _answer_exit and isinstance(_seam, tuple) and len(_seam) == 4 and _seam[0] == turn_id:
+        _, _answer_origin, _answer_body, _answer_disposition = _seam
     # Response transforms apply only to real, uninterrupted responses.
     if final_response and not interrupted:
         final_response = _append_file_mutation_footer(agent, final_response, logger)
@@ -655,6 +666,7 @@ def finalize_turn(
         "turn_exit_reason": _turn_exit_reason,
         "answer_origin": _answer_origin,
         "answer_body": _answer_body,
+        "answer_disposition": _answer_disposition,
         "failed": failed,
         "partial": False,  # True only when stopped due to invalid tool calls
         "interrupted": interrupted,
