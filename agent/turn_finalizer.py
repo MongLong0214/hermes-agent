@@ -586,13 +586,22 @@ def finalize_turn(
         final_response = _ACCEPTED_STREAM_FAILURE_NOTICE
     # Answer provenance, decided on the model's own text before any explainer replaces it: a
     # completed text response (or a tool-budget summary, recovered stream text, or this turn's earlier
-    # text reused after housekeeping tools) that is not empty, taken before the mutation footer.
+    # text reused after housekeeping tools) that is neither empty nor a silence marker, judged on the
+    # untransformed text before output hooks and the mutation footer decorate it.
     # Notices the gateway or the explainer substitute later never carry it (an /acp receipt is
     # certified only by a model answer).
+    from gateway.response_filters import is_intentional_silence_response
+
     _exit = str(_turn_exit_reason)
+    _raw = final_response
+    if _exit.startswith("text_response"):
+        _untransformed = getattr(agent, "_turn_model_text", None)
+        if isinstance(_untransformed, str):
+            _raw = _untransformed  # an output hook may have rewritten the text after the model wrote it
     _model_answer = bool(
         not interrupted and not failed and accepted_stream_failure_error is None
-        and (final_response or "").strip() not in ("", "(empty)")
+        and isinstance(_raw, str) and _raw.strip() not in ("", "(empty)")
+        and not is_intentional_silence_response(_raw)
         and (_exit.startswith("text_response")
              or _exit in ("partial_stream_recovery", "fallback_prior_turn_content")
              or (_exit.startswith("max_iterations_reached")
