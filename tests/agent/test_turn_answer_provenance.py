@@ -111,3 +111,27 @@ def test_handle_max_iterations_reports_whether_the_model_wrote_the_summary(outco
         text = helpers.handle_max_iterations(agent, [{"role": "user", "content": "task"}], 10)
     assert bool(text.strip())
     assert agent._iteration_summary_answered is expected
+
+
+def _rewriting_hook(rewrite):
+    def transform(agent, response, **_kwargs):
+        return rewrite(response), True, response
+    return transform
+
+
+@pytest.mark.parametrize("model_text,rewrite,expected", [
+    # Twelfth supplementary review: an output hook turning the empty sentinel into prose.
+    ("(empty)", lambda r: "⚠️ No reply: the model produced nothing.", False),
+    # A silence marker stays silence even when later decoration defeats the gateway's exact match.
+    ("[SILENT]", lambda r: r, False),
+    ("[SILENT]", lambda r: r + "\n\n📝 Files changed: a.py", False),
+    # Control: a hook reshaping a real answer leaves it an answer.
+    ("The answer is 42.", lambda r: r.upper(), True),
+])
+def test_provenance_is_judged_on_the_untransformed_model_text(model_text, rewrite, expected):
+    agent = _make_agent()
+    agent.client.chat.completions.create.side_effect = [_mock_response(content=model_text)]
+    with patch("agent.turn_finalizer.apply_llm_output_transform", _rewriting_hook(rewrite)):
+        result = _run(agent)
+    assert result["turn_exit_reason"].startswith("text_response")
+    assert result["model_answer"] is expected
