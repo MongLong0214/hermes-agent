@@ -2118,7 +2118,6 @@ class GatewayTurnMixin:
         context prompt, sidecar notes, turn lease, transcript load + hygiene, inbound text. Returns
         ``(_PreparedTurn, env_tokens)``; a ``str`` first element is a reply to send instead of
         running (history unreadable); ``None`` drops the turn (inbound text rejected)."""
-        from gateway.run import _load_gateway_config
         _was_auto_reset, _is_new_session = await self._hmwa_open_session(session_entry, session_key, source)
         context = build_session_context(source, self.config, session_entry)
         # Session context variables for tools (task-local, concurrency-safe)
@@ -2126,9 +2125,7 @@ class GatewayTurnMixin:
         # Self-injected turns (MessageEvent(internal=True)) persist with a DB-only display_kind so
         # UIs render timeline notices, not user bubbles; role/content untouched.
         persist_user_display_kind = display_kind_for_event(event)
-        _redact_pii = False  # privacy.redact_pii, re-read per message
-        with suppress(Exception):
-            _redact_pii = bool((_load_gateway_config().get("privacy") or {}).get("redact_pii", False))
+        _redact_pii = self._redact_pii_enabled()  # privacy.redact_pii, re-read per message
 
         # The context prompt render is pinned per session, keyed by a hash of the renderer inputs, so
         # the system prompt cannot drift turn-over-turn; a miss (thread rename, /sethome) re-renders.
@@ -2446,6 +2443,55 @@ class GatewayTurnMixin:
         finally:
             # Restore session context variables to their pre-handler state
             self._clear_session_env(_session_env_tokens)
+
+    @staticmethod
+    def _redact_pii_enabled() -> bool:
+        """``privacy.redact_pii``, read fresh: the session context prompt's PII setting."""
+        from gateway.run import _load_gateway_config
+        with suppress(Exception):
+            return bool((_load_gateway_config().get("privacy") or {}).get("redact_pii", False))
+        return False
+
+    async def _build_agent_for_resolved_session(self, entry: Any) -> None:
+        """Build and cache the agent for an existing, fully resolved live session, the way an
+        ordinary turn on it would: the same session context prompt (pinned per session), channel
+        prompt, display/toolset settings and ``TurnRunner`` resolution, under the source profile's
+        scope, on a worker thread. For a canonical event that found no agent cached (a clean
+        restart): it opens, creates, routes and persists nothing, and its caller holds the session's
+        turn lease, which every ordinary turn also holds while it resolves its agent, so the two never
+        build one each. Raises ``ValueError("canonical_runtime_refused")`` when no agent can be built
+        here (proxy mode, unresolvable model runtime).
+
+        Every piece is the ordinary turn's own builder, none reimplemented: ``build_session_context`` +
+        ``_redact_pii_enabled`` + ``_pinned_session_context_prompt`` (as ``_hmwa_prepare_turn``),
+        ``resolve_channel_prompt`` (as the Telegram adapter fills ``event.channel_prompt``),
+        ``_run_agent_display_settings`` + ``_run_agent_build_turn_context`` (as ``_run_agent_inner``),
+        ``_profile_scope_for_source`` (as ``_run_agent``) and ``TurnRunner.resolve_turn_agent`` (as
+        ``run_sync``)."""
+        from gateway.platforms.base import resolve_channel_prompt
+        from run_agent import AIAgent
+
+        source = getattr(entry, "origin", None)
+        if source is None or self._get_proxy_url():
+            raise ValueError("canonical_runtime_refused")
+        context_prompt = self._pinned_session_context_prompt(
+            build_session_context(source, self.config, entry), self._redact_pii_enabled(), entry.session_key)
+        adapter = self._intake_adapter_for(source) or self._delivery_adapter_for(source)
+        thread_id = str(source.thread_id) if source.thread_id else None
+        channel_prompt = resolve_channel_prompt(
+            getattr(getattr(adapter, "config", None), "extra", None) or {}, thread_id or str(source.chat_id),
+            str(source.chat_id) if thread_id else None)
+        _ctx, turn_runner, _ = self._run_agent_build_turn_context(
+            self._run_agent_display_settings(source), AIAgent, message="", source=source,
+            session_key=entry.session_key, run_generation=None, context_prompt=context_prompt,
+            history=[], session_id=entry.session_id, channel_prompt=channel_prompt,
+        )
+        try:
+            with self._profile_scope_for_source(source):
+                await asyncio.to_thread(turn_runner.resolve_turn_agent)
+        except Exception:
+            logger.warning("Agent for resolved session %s could not be built", entry.session_id, exc_info=True)
+            raise ValueError("canonical_runtime_refused") from None
 
     def _profile_scope_for_source(self, source: SessionSource):
         """``_profile_runtime_scope`` for ``source``'s profile when a secret scope is required.

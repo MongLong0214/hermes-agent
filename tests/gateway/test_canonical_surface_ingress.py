@@ -110,7 +110,10 @@ def ingress(tmp_path, monkeypatch):
     with runner._agent_cache_lock:
         runner._agent_cache[entry.session_key] = (actor, "exact", 0, entry.session_id)
     import run_agent
-    monkeypatch.setattr(run_agent, "AIAgent", lambda *a, **kw: pytest.fail("canonical ingress built an actor"))
+    # Canonical ingress may build an agent only for an existing, fully resolved live session that has
+    # none cached (a clean restart: see _AgentFactory below). With this actor cached, any build is a bug.
+    monkeypatch.setattr(run_agent, "AIAgent", lambda *a, **kw: pytest.fail(
+        "canonical ingress built an agent while one was cached for the session"))
     key = secrets.token_hex(32)
 
     def receipts():
@@ -570,10 +573,11 @@ def test_terminal_recorded_before_a_stop_is_the_first_answer_and_the_replay(ingr
 
 
 @pytest.mark.parametrize("actor_gone", ["stop_evicts", "reopened_db", "restart"])
-def test_replay_without_the_cached_actor_answers_from_the_recorded_receipt(ingress, send, actor_gone):
+def test_replay_without_the_cached_actor_answers_from_the_recorded_receipt(ingress, send, monkeypatch, actor_gone):
     """Regression: a replay that found no cached actor answered 409 canonical_binding_stale, which
     reads as "not run"; a client resending under a new event id then ran the event a second time
-    once an ordinary turn rebuilt the actor. A recorded event answers from its receipt instead."""
+    once an ordinary turn rebuilt the actor. A recorded event answers from its receipt instead, and
+    never builds an agent; only an event nothing was recorded for has the session's agent built."""
     runner, session_key = ingress.runner, ingress.entry.session_key
 
     async def lose_the_actor():
@@ -607,13 +611,17 @@ def test_replay_without_the_cached_actor_answers_from_the_recorded_receipt(ingre
         ingress.actor.fail_with = None
 
         await lose_the_actor()
+        factory = _agent_build_path(monkeypatch, send.adapter.gateway_runner)
         assert await send() == first
         assert await send(event_id="event-2") == uncertain
         assert _code(await send(text="changed payload")) == (409, "canonical_event_conflict")
-        # Only an event nothing was recorded for is refused, and the refusal claims nothing.
-        assert _code(await send(event_id="never-seen")) == (409, "canonical_binding_stale")
+        assert factory.built == []  # a recorded event never needs an agent
+        # Only an event nothing was recorded for runs, on the session's agent built for it.
+        assert await send(event_id="never-seen") == (200, {"event_id": "never-seen", "text": _TERMINAL})
+        [(kwargs, built)] = factory.built
+        assert kwargs["session_id"] == ingress.entry.session_id and built.calls == ["hello"]
         assert ingress.actor.calls == ["hello", "hello"]
-        assert sorted(receipt["state"] for receipt in ingress.receipts()) == ["pending", "terminal"]
+        assert sorted(receipt["state"] for receipt in ingress.receipts()) == ["pending", "terminal", "terminal"]
 
     asyncio.run(exercise())
 
@@ -697,3 +705,282 @@ def test_loopback_http_identity_fences_flat_event_before_claim(ingress):
             await adapter.disconnect()
 
     asyncio.run(exercise())
+
+
+def _clean_restart(ingress, send):
+    """A clean restart (bootout): a new runner over the same home, whose session index nothing has
+    loaded yet — no ordinary inbound and no crash recovery ran — and whose agent cache is empty."""
+    ingress.runner.session_store.close_all_db_handles()
+    restarted = GatewayRunner(GatewayConfig(sessions_dir=ingress.home / "sessions"))
+    restarted.config.canonical_surface_bindings = {ingress.binding.name: ingress.binding}
+    ingress.runners.append(restarted)
+    send.adapter.gateway_runner = restarted
+    assert restarted.session_store._loaded is False
+    return restarted
+
+
+def _routing_and_sessions(ingress):
+    db_path = ingress.home / "state.db"
+    with contextlib.closing(sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)) as conn:
+        return (sorted(conn.execute("SELECT scope, session_key, entry_json FROM gateway_routing").fetchall()),
+                sorted(conn.execute("SELECT id, ended_at FROM sessions").fetchall()))
+
+
+def _principal(ingress):
+    return SimpleNamespace(author_id="author", channel_id="channel")
+
+
+def test_a_canonical_event_first_after_a_clean_restart_resolves_its_existing_session(ingress, send):
+    """Production 2026-10-09 12:24Z: after a clean restart the CEO's canonical POST came before any
+    ordinary inbound, and the never-loaded session index answered every binding stale."""
+    from gateway.canonical_surface import ExistingCanonicalBindingResolver
+
+    restarted = _clean_restart(ingress, send)
+    before = _routing_and_sessions(ingress)
+    entry, proof = ExistingCanonicalBindingResolver(restarted.session_store).resolve_with_proof(
+        ingress.binding, _principal(ingress))
+    assert entry.session_id == proof.session_id == ingress.entry.session_id
+    assert entry.session_key == ingress.entry.session_key
+    # The identity re-check holds: the same key answers the same entry object once loaded.
+    assert restarted.session_store.lookup_by_session_key_existing(ingress.entry.session_key) is entry
+    assert _routing_and_sessions(ingress) == before  # loading the index wrote no route and no session
+
+    async def identity():
+        [handler] = [h for method, path, h in send.adapter._http_route_table()
+                     if (method, path) == ("GET", _IDENTITY_ROUTE)]
+        response = await handler(SimpleNamespace(headers={"Authorization": f"Bearer {ingress.key}"},
+                                                 method="GET", path_qs=_IDENTITY_ROUTE,
+                                                 raw_path=_IDENTITY_ROUTE, transport=None))
+        return response.status, json.loads(response.text)
+
+    _clean_restart(ingress, send)  # again, now through the HTTP identity route the bridge reads
+    status, body = asyncio.run(identity())
+    assert status == 200 and body["session_id"] == ingress.entry.session_id
+
+
+@pytest.mark.parametrize("case", ["no_such_session", "suspended"])
+def test_loading_the_index_never_makes_a_stale_binding_resolve(ingress, send, case):
+    from gateway.canonical_surface import ExistingCanonicalBindingResolver
+
+    binding = ingress.binding
+    if case == "no_such_session":
+        import dataclasses
+        binding = dataclasses.replace(binding, session_key=binding.session_key + ":ghost")
+    else:
+        assert ingress.runner.session_store.suspend_session(binding.session_key)
+    restarted = _clean_restart(ingress, send)
+    restarted.config.canonical_surface_bindings = {binding.name: binding}
+    before = _routing_and_sessions(ingress)
+    with pytest.raises(ValueError, match="canonical_binding_stale"):
+        ExistingCanonicalBindingResolver(restarted.session_store).resolve_with_proof(binding, _principal(ingress))
+    assert asyncio.run(send())[1]["error"]["code"] == "canonical_binding_stale"
+    store = restarted.session_store
+    if case == "no_such_session":
+        assert store.lookup_by_session_key_existing(binding.session_key) is None
+        assert binding.session_key not in store._entries  # nothing created for the absent key
+    assert _routing_and_sessions(ingress) == before  # no route, session or reopen written
+
+
+class _AgentFactory:
+    """Stands in for ``run_agent.AIAgent`` on the ordinary agent-build path: records every build (its
+    constructor keywords) and returns a deterministic actor bound to the session DB it was given."""
+
+    def __init__(self, gate=None):
+        self.built = []
+        self.gate = gate
+        self.probe = None  # optional: what to record about the moment of each build
+        self.probed = []
+
+    def __call__(self, **kwargs):
+        if self.probe is not None:
+            self.probed.append(self.probe())
+        if self.gate is not None:
+            assert self.gate.wait(10)
+        actor = _CachedActor(kwargs["session_id"], kwargs["session_db"])
+        self.built.append((kwargs, actor))
+        return actor
+
+
+def _agent_build_path(monkeypatch, runner, gate=None):
+    """The real build path with a stand-in model runtime (no credentials in a test home) and agent."""
+    import run_agent
+
+    factory = _AgentFactory(gate)
+    monkeypatch.setattr(run_agent, "AIAgent", factory)
+    monkeypatch.setattr(runner, "_resolve_session_agent_runtime", lambda **kw: (
+        "test-model", {"provider": "openrouter", "api_key": "test-key", "base_url": "http://127.0.0.1:9"}))
+    return factory
+
+
+def test_a_canonical_event_first_after_a_clean_restart_builds_the_agent_for_its_session(
+        ingress, send, monkeypatch):
+    """Production 2026-10-09 12:24Z, second half: after a clean restart nothing has cached the bound
+    session's agent until an ordinary turn runs, so the CEO's canonical POST was refused stale even
+    with the session resolved. It now builds that session's agent the way an ordinary turn does."""
+    restarted = _clean_restart(ingress, send)
+    factory = _agent_build_path(monkeypatch, restarted)
+    before = _routing_and_sessions(ingress)
+    assert asyncio.run(send()) == (200, {"event_id": "event", "text": _TERMINAL})
+    [(kwargs, actor)] = factory.built
+    assert kwargs["session_id"] == ingress.entry.session_id
+    assert kwargs["gateway_session_key"] == ingress.entry.session_key
+    assert actor.calls == ["hello"]  # the turn ran on the built agent, on the existing session
+    with restarted._agent_cache_lock:
+        cached = restarted._agent_cache[ingress.entry.session_key]
+    assert cached[0] is actor and cached[3] == ingress.entry.session_id
+    assert _routing_and_sessions(ingress) == before  # no session, route or binding created
+    # A second event borrows the agent it cached; nothing is built again.
+    assert asyncio.run(send(event_id="event-2"))[0] == 200
+    assert len(factory.built) == 1 and actor.calls == ["hello", "hello"]
+
+
+def test_a_cached_agent_is_borrowed_never_rebuilt(ingress, send, monkeypatch):
+    factory = _agent_build_path(monkeypatch, ingress.runner)
+    assert asyncio.run(send()) == (200, {"event_id": "event", "text": _TERMINAL})
+    assert factory.built == [] and ingress.actor.calls == ["hello"]
+
+
+@pytest.mark.parametrize("case", ["no_such_session", "suspended", "ended", "other_chat"])
+def test_no_agent_is_built_for_a_binding_that_does_not_resolve(ingress, send, monkeypatch, case):
+    import dataclasses
+
+    binding = ingress.binding
+    if case == "no_such_session":
+        binding = dataclasses.replace(binding, session_key=binding.session_key + ":ghost")
+    elif case == "suspended":
+        assert ingress.runner.session_store.suspend_session(binding.session_key)
+    elif case == "ended":
+        ingress.runner.session_store._db.end_session(ingress.entry.session_id, "test_ended")
+    else:
+        binding = dataclasses.replace(binding, telegram_chat_id="another-chat")
+    restarted = _clean_restart(ingress, send)
+    restarted.config.canonical_surface_bindings = {binding.name: binding}
+    factory = _agent_build_path(monkeypatch, restarted)
+    before = _routing_and_sessions(ingress)
+    assert _code(asyncio.run(send())) == (409, "canonical_binding_stale")
+    assert factory.built == []
+    with restarted._agent_cache_lock:
+        assert restarted._agent_cache == {}
+    (routes, sessions), (routes_before, sessions_before) = _routing_and_sessions(ingress), before
+    assert sessions == sessions_before  # no session created or reopened
+    if case == "ended":
+        # The lazy index load prunes the ended session's route, as the first ordinary inbound's would.
+        assert routes == []
+    else:
+        assert routes == routes_before
+
+
+def test_an_ordinary_turn_racing_the_first_canonical_event_shares_one_agent(ingress, send, monkeypatch):
+    """The two meet on the session's turn lease: the canonical event builds under it, the ordinary
+    turn resolves its agent only once it holds it, finds the one just cached with the same signature
+    and reuses it. The canonical event, seeing the ordinary turn now running, is refused busy before
+    any claim, exactly as it is today when an ordinary turn is running."""
+    import threading
+    from gateway.platforms.event import MessageEvent
+
+    restarted = _clean_restart(ingress, send)
+    gate = threading.Event()
+    factory = _agent_build_path(monkeypatch, restarted, gate)
+    lease = restarted._turn_leases._get_or_create(ingress.entry.session_id)
+    factory.probe = lambda: (lease.lock.locked(), getattr(lease.holder, "owner_key", None))
+
+    async def admitted(event):
+        return event, event.source, False
+    monkeypatch.setattr(restarted, "_hm_admit_event", admitted)
+
+    async def exercise():
+        canonical = asyncio.ensure_future(send())
+        for _ in range(200):  # until the canonical build is under way (it holds the lease)
+            await asyncio.sleep(0.01)
+            if restarted._turn_leases._get_or_create(ingress.entry.session_id).lock.locked():
+                break
+        ordinary = asyncio.ensure_future(restarted._handle_message(MessageEvent(
+            text="ordinary hello", source=ingress.source, message_id="77")))
+        for _ in range(500):  # until the ordinary turn holds its session slot, waiting on the lease
+            await asyncio.sleep(0.01)
+            if restarted._is_session_running(ingress.entry.session_key):
+                break
+        assert restarted._is_session_running(ingress.entry.session_key) and factory.built == []
+        gate.set()
+        return await canonical, await ordinary
+
+    canonical, ordinary = asyncio.run(exercise())
+    assert len(factory.built) == 1  # one agent for the session, built once
+    [(locked, holder)] = factory.probed
+    assert locked and holder.startswith("canonical:")  # built by the canonical event, under its lease
+    [(kwargs, actor)] = factory.built
+    assert kwargs["session_id"] == ingress.entry.session_id
+    assert _code(canonical) == (409, "canonical_turn_busy") and actor.calls == ["ordinary hello"]
+    assert ordinary == _TERMINAL
+
+
+_PREVIOUS_PROCESS = r"""
+import json, sys
+from pathlib import Path
+from gateway.config import GatewayConfig, Platform
+from gateway.run import GatewayRunner
+from gateway.session import SessionSource
+
+home = Path(sys.argv[1])
+runner = GatewayRunner(GatewayConfig(sessions_dir=home / "sessions"))
+entry = runner.session_store.get_or_create_session(
+    SessionSource(platform=Platform.TELEGRAM, chat_id="chat", chat_type="dm", user_id="user"))
+runner.session_store.close_all_db_handles()
+print(json.dumps({"session_key": entry.session_key, "session_id": entry.session_id}))
+"""
+
+
+def test_the_first_request_after_a_process_restart_is_a_canonical_event_and_it_runs(tmp_path, monkeypatch):
+    """Production 2026-10-09 12:24Z end to end: a previous gateway *process* left the bound session
+    and its route on disk and exited; a new process starts (fresh runner, unloaded session index,
+    empty agent cache) and its first request is the CEO's canonical POST. It needs both halves of
+    the fix — the index loaded on demand and the session's agent built — and runs on the existing
+    session, creating none."""
+    home, user_home = tmp_path / "hermes-home", tmp_path / "user"
+    home.mkdir()
+    user_home.mkdir()
+    env = {**os.environ, "HERMES_HOME": str(home), "HOME": str(user_home)}
+    previous = subprocess.run([sys.executable, "-c", _PREVIOUS_PROCESS, str(home)], env=env,
+                              capture_output=True, text=True, timeout=120, cwd=Path(__file__).parents[2])
+    assert previous.returncode == 0, previous.stderr[-2000:]
+    prior = json.loads(previous.stdout.strip().splitlines()[-1])
+
+    monkeypatch.setenv("HOME", str(user_home))
+    monkeypatch.setattr(Path, "home", lambda: user_home)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr("hermes_state.DEFAULT_DB_PATH", home / "state.db")
+    runner = GatewayRunner(GatewayConfig(sessions_dir=home / "sessions"))
+    binding = CanonicalSurfaceBinding(
+        name="canonical", session_key=prior["session_key"], session_id=prior["session_id"],
+        telegram_chat_id="chat", telegram_chat_type="dm", telegram_user_id="user",
+        telegram_thread_id=None, allowed_author_ids=("author",), allowed_channel_ids=("channel",),
+    )
+    runner.config.canonical_surface_bindings = {binding.name: binding}
+    factory = _agent_build_path(monkeypatch, runner)
+    key = secrets.token_hex(32)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": key}))
+    adapter.gateway_runner = runner
+    [handler] = [h for method, path, h in adapter._http_route_table() if (method, path) == ("POST", _ROUTE)]
+    on_disk = SimpleNamespace(home=home)
+    before = _routing_and_sessions(on_disk)
+    assert [row[1] for row in before[0]] == [prior["session_key"]]
+    assert [row[0] for row in before[1]] == [prior["session_id"]]
+    assert runner.session_store._loaded is False and runner._agent_cache == {}
+
+    async def first_request():
+        raw = json.dumps(_payload()).encode()
+
+        async def read():
+            return raw
+        response = await handler(SimpleNamespace(headers={"Authorization": f"Bearer {key}"}, read=read,
+                                                 method="POST", path_qs=_ROUTE, transport=None))
+        return response.status, json.loads(response.text)
+
+    try:
+        assert asyncio.run(first_request()) == (200, {"event_id": "event", "text": _TERMINAL})
+        [(kwargs, actor)] = factory.built
+        assert kwargs["session_id"] == prior["session_id"] and actor.calls == ["hello"]
+        assert _routing_and_sessions(on_disk) == before  # the existing session and route, nothing new
+    finally:
+        adapter._response_store.close()
+        runner.session_store.close_all_db_handles()

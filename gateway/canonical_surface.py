@@ -396,6 +396,9 @@ class CanonicalReceiptResult:
     terminal_text: str | None = None
 
 
+_UNRECORDED = "canonical_event_unrecorded"  # internal: no receipt yet; never answered to a caller
+
+
 class CanonicalReceiptCoordinator:
     """Claim one canonical event on the already-open DB owned by its cached actor.
 
@@ -484,6 +487,20 @@ class CanonicalReceiptCoordinator:
         ):
             raise ValueError("canonical_binding_stale")
         return bound
+
+    async def _build_actor_db(self, proof: CanonicalBindingProof, entry: Any) -> tuple[Any, Any]:
+        """The agent for a resolved live session that had none cached, built the way an ordinary turn
+        builds it and then borrowed exactly as a cached one. Called holding the session's turn lease,
+        which ordinary turns hold while they resolve their agent: one cached meanwhile by such a turn
+        is borrowed, never built a second time. The resolver already proved the session exists, is
+        live and matches the binding; nothing here creates a session, route or binding, and an agent
+        that is not bound to the proven session and DB file is refused as stale."""
+        if cached_actor(self._runner, proof.session_key)[0] is None:
+            await self._runner._build_agent_for_resolved_session(entry)
+        actor, db = self._borrow_actor_db(self._runner, proof)
+        if _runs_tools_outside_hermes(actor):
+            raise ValueError("canonical_runtime_refused")
+        return actor, db
 
     def _recorded_or_refuse(
         self, binding: CanonicalSurfaceBinding, key: str, fingerprint: str, code: str,
@@ -580,11 +597,23 @@ class CanonicalReceiptCoordinator:
             if str(refusal) == "canonical_principal_rejected":
                 raise
             return self._recorded_or_refuse(binding, key, fingerprint, str(refusal))
+        if cached_actor(self._runner, proof.session_key)[0] is None:
+            # No agent cached (a clean restart, before any ordinary turn). An event already recorded
+            # answers from its receipt here, as it always has; only an unrecorded one goes on to have
+            # this resolved session's agent built, under the turn lease, below.
+            try:
+                return self._recorded_or_refuse(binding, key, fingerprint, _UNRECORDED, proof)
+            except ValueError as refusal:
+                if str(refusal) != _UNRECORDED:
+                    raise
+        actor = db = None
         try:
-            actor, db = self._borrow_actor_db(self._runner, proof)
+            # A cached agent is borrowed as always.
+            if cached_actor(self._runner, proof.session_key)[0] is not None:
+                actor, db = self._borrow_actor_db(self._runner, proof)
             if self._runner._is_session_running(proof.session_key):
                 raise ValueError("canonical_turn_busy")
-            if _runs_tools_outside_hermes(actor):
+            if actor is not None and _runs_tools_outside_hermes(actor):
                 raise ValueError("canonical_runtime_refused")
             # The event runs as a peer: its verified signer is structured provenance beside the body,
             # and the model sees the body only quoted under a fresh per-turn nonce. A body that
@@ -608,6 +637,8 @@ class CanonicalReceiptCoordinator:
         try:
             # Waiting for the turn lease may have exposed a new head, actor, or DB generation.
             try:
+                if actor is None:
+                    actor, db = await self._build_actor_db(proof, entry)
                 self._require_current_claim_target(proof, actor, db)
                 if event.expected_identity is not None:
                     self._require_expected_identity(proof, event.expected_identity)

@@ -34,6 +34,27 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 
+
+class TurnRuntimeUnavailable(Exception):
+    """The turn's model runtime could not be resolved (``TurnRunner.resolve_turn_agent``); ``error``
+    is the original exception, which ``run_sync`` reports exactly as before."""
+
+    def __init__(self, error: BaseException):
+        super().__init__(str(error))
+        self.error = error
+
+
+@dataclasses.dataclass(frozen=True)
+class ResolvedTurnAgent:
+    """What ``TurnRunner.resolve_turn_agent`` resolved for one turn."""
+
+    agent: Any
+    reused: bool
+    turn_route: Any
+    reasoning_config: Any
+    pending_fallback_notice: Any
+    before_route: Any
+
 # Consecutive turns a session's persisted transcript may lag its live cached history before
 # _load_turn_history escalates the lag line from WARNING to ERROR (#114266: 11 days of WARNING).
 _TRANSCRIPT_LAG_ESCALATION_TURNS = 3
@@ -1180,6 +1201,51 @@ class TurnRunner:
             logger.debug("Created new agent for session %s (sig=%s)", ctx.session_key, sig)
         return agent, found.reused
 
+    def resolve_turn_agent(self, before_route=None) -> "ResolvedTurnAgent":
+        """The one path that resolves the agent a turn on this context's session runs on: runtime
+        (model, credentials, the pre-agent fallback notice), reasoning, service tier, turn route and
+        ephemeral prompt, then ``_resolve_turn_agent`` (the cached agent, or a fresh one built and
+        cached). ``run_sync`` resolves every ordinary turn's agent through it, and a canonical event
+        that found none cached builds its session's agent through it (``_build_agent_for_resolved_
+        session``), so both construct the identical agent with the identical cache signature.
+
+        ``before_route`` runs where ``run_sync`` sets up its stream consumer (after the service tier,
+        before the route); its result is returned as ``before_route``. A runtime that cannot be
+        resolved raises ``TurnRuntimeUnavailable`` carrying the original error; nothing else is caught."""
+        from gateway.run import _current_max_iterations
+        ctx = self._ctx
+        runner = self._runner
+        platform_key = "cli" if ctx.source.platform == Platform.LOCAL else ctx.source.platform.value
+        combined_ephemeral = self._combined_ephemeral_prompt()
+        max_iterations = _current_max_iterations()
+        try:
+            model, runtime_kwargs = runner._resolve_session_agent_runtime(
+                source=ctx.source, session_key=ctx.session_key, user_config=ctx.user_config,
+            )
+            # Stashed by _resolve_session_agent_runtime when the primary's credentials failed and a
+            # fallback was resolved before any agent exists (#74349); one-shot per turn.
+            pending_fallback_notice = getattr(runner, "_pre_agent_fallback_notice", None)
+            runner._pre_agent_fallback_notice = None
+            logger.debug(
+                "run_agent resolved: model=%s provider=%s session=%s",
+                model, runtime_kwargs.get("provider"), ctx.session_key or "",
+            )
+        except Exception as exc:
+            raise TurnRuntimeUnavailable(exc) from exc
+        pr = runner._provider_routing
+        reasoning_config = runner._resolve_session_reasoning_config(source=ctx.source, session_key=ctx.session_key, model=model)
+        runner._reasoning_config = reasoning_config
+        runner._service_tier = runner._resolve_session_service_tier(source=ctx.source, session_key=ctx.session_key)
+        before_route_result = before_route() if before_route is not None else None
+        turn_route = runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
+        agent, reused = self._resolve_turn_agent(
+            turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr,
+        )
+        return ResolvedTurnAgent(agent=agent, reused=reused, turn_route=turn_route,
+                                 reasoning_config=reasoning_config,
+                                 pending_fallback_notice=pending_fallback_notice,
+                                 before_route=before_route_result)
+
     # ── per-turn agent wiring ───────────────────────────────────────────────────────────────
 
     def _notice_callback_sync(self, notice) -> None:
@@ -1915,9 +1981,8 @@ class TurnRunner:
         every rebind. session_key propagates via contextvars (_set_session_env / set_current_session_key)
         — never os.environ["HERMES_SESSION_KEY"], which would misroute approvals across sessions.
         """
-        from gateway.run import _current_max_iterations, _normalize_empty_agent_response, _sanitize_gateway_final_response
+        from gateway.run import _normalize_empty_agent_response, _sanitize_gateway_final_response
         ctx = self._ctx
-        runner = self._runner
         # Platform.LOCAL ("local") maps to the "cli" hint key the agent understands.
         # session_key is propagated via contextvars in _set_session_env() (_SESSION_KEY) and via
         # set_current_session_key() (_approval_session_key) below — both concurrency-safe and inherited by
@@ -1930,21 +1995,18 @@ class TurnRunner:
         # *subprocess* exports HERMES_SESSION_KEY (from its own --session-key argv, a separate process) — so
         # removing this in-process gateway write does not affect any of them.
         platform_key = "cli" if ctx.source.platform == Platform.LOCAL else ctx.source.platform.value
-        combined_ephemeral = self._combined_ephemeral_prompt()
-        max_iterations = _current_max_iterations()
+
+        def setup_stream():
+            if ctx.acp_admission is not None:
+                # A managed /acp answer is delivered only through the ledgered final send, whose row is
+                # the receipt's evidence: a stream would deliver it before (or instead of) that row.
+                return None, None, None, False
+            return self._setup_stream_consumer(platform_key)
+
         try:
-            model, runtime_kwargs = runner._resolve_session_agent_runtime(
-                source=ctx.source, session_key=ctx.session_key, user_config=ctx.user_config,
-            )
-            # Stashed by _resolve_session_agent_runtime when the primary's credentials failed and a
-            # fallback was resolved before any agent exists (#74349); one-shot per turn.
-            pending_fallback_notice = getattr(runner, "_pre_agent_fallback_notice", None)
-            runner._pre_agent_fallback_notice = None
-            logger.debug(
-                "run_agent resolved: model=%s provider=%s session=%s",
-                model, runtime_kwargs.get("provider"), ctx.session_key or "",
-            )
-        except Exception as exc:
+            resolved = self.resolve_turn_agent(before_route=setup_stream)
+        except TurnRuntimeUnavailable as unavailable:
+            exc = unavailable.error
             # Model/credential resolution failed before the turn began; the raw text (URLs, status
             # codes) belongs in the log, and the chat gets the commands that fix it.
             logger.warning("Model resolution failed for session %s: %s", ctx.session_key or "", exc)
@@ -1961,20 +2023,10 @@ class TurnRunner:
                     "failing, run `hermes doctor` on the host."),
                 "messages": [], "api_calls": 0, "tools": [],
             }
-        pr = runner._provider_routing
-        reasoning_config = runner._resolve_session_reasoning_config(source=ctx.source, session_key=ctx.session_key, model=model)
-        runner._reasoning_config = reasoning_config
-        runner._service_tier = runner._resolve_session_service_tier(source=ctx.source, session_key=ctx.session_key)
-        if ctx.acp_admission is not None:
-            # A managed /acp answer is delivered only through the ledgered final send, whose row is
-            # the receipt's evidence: a stream would deliver it before (or instead of) that row.
-            stream_consumer, stream_delta_cb, interim_cb, want_interim = None, None, None, False
-        else:
-            stream_consumer, stream_delta_cb, interim_cb, want_interim = self._setup_stream_consumer(platform_key)
-        turn_route = runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
-        agent, reused_cached_agent = self._resolve_turn_agent(
-            turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr,
-        )
+        stream_consumer, stream_delta_cb, interim_cb, want_interim = resolved.before_route
+        agent, reused_cached_agent = resolved.agent, resolved.reused
+        turn_route, reasoning_config = resolved.turn_route, resolved.reasoning_config
+        pending_fallback_notice = resolved.pending_fallback_notice
         _acp = ctx.acp_admission
         if _acp is not None:
             from gateway import acp_managed_ingress
