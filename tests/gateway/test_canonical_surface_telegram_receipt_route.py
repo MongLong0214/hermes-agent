@@ -125,16 +125,41 @@ def test_a_completed_receipt_answers_with_its_digest_and_content(get_receipt, in
     asyncio.run(exercise())
 
 
+_TURN = {
+    "turnRequestId": "t1", "targetActorId": "actor-1", "promptDigest": "sha256:" + "ab" * 32,
+    "bindingGeneration": 4, "targetBindingId": "bind-1", "targetAttestationId": "att-1",
+    "executorSessionId": "ses-1", "executorSessionIncarnation": "inc-1",
+}
+
+
 def test_an_aborted_receipt_answers_aborted_with_its_reason(get_receipt, ingress):
+    # An ABORTED receipt is served only with the evidence ACP compares preserved whole (the eight
+    # identity fields, a numeric message id) and a ledger that can show no answer was delivered.
+    from gateway import delivery_ledger
+
+    delivery_ledger.sweep_recoverable(deliverable_platforms=set())  # the startup sweep opens the ledger
+
+    async def exercise():
+        receipts.claim_pending(
+            ingress.db, "42", message_id="55", turn_request_id="t1", receipt_identity=dict(_TURN),
+            **ingress.proof(),
+        )
+        receipts.settle_aborted(ingress.db, "42", reason_code="HERMES_PROCESS_DIED_BEFORE_ANSWER", **ingress.proof())
+        status, body = await get_receipt("42")
+        assert status == 200
+        assert body["status"] == "ABORTED" and body["receiptId"] == "hermes-tg:aborted:42"
+        assert body["reasonCode"] == "HERMES_PROCESS_DIED_BEFORE_ANSWER"
+    asyncio.run(exercise())
+
+
+def test_an_aborted_receipt_without_its_identity_is_refused_not_guessed(get_receipt, ingress):
     async def exercise():
         receipts.claim_pending(
             ingress.db, "42", message_id="m1", turn_request_id="t1", receipt_identity={}, **ingress.proof(),
         )
         receipts.settle_aborted(ingress.db, "42", reason_code="HERMES_PROCESS_DIED_BEFORE_ANSWER", **ingress.proof())
         status, body = await get_receipt("42")
-        assert status == 200
-        assert body["status"] == "ABORTED"
-        assert body["reasonCode"] == "HERMES_PROCESS_DIED_BEFORE_ANSWER"
+        assert status == 409 and body["error"]["code"] == "canonical_receipt_unprovable"
     asyncio.run(exercise())
 
 

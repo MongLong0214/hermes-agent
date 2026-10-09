@@ -1902,8 +1902,16 @@ class TestReceiptWireAgainstAcp:
         assert receipts.TelegramTurnReceipt(status="PENDING", update_id="901").to_response()["reasonCode"] is None
         assert receipts.not_found("901").to_response()["reasonCode"] is None
 
-    def test_acp_accepts_the_completed_receipt_hermes_serves(self, gw):
+    @pytest.mark.parametrize("settlement_write_fails", [False, True], ids=["settled", "settle_write_failed"])
+    def test_acp_accepts_the_completed_receipt_hermes_serves(self, gw, monkeypatch, settlement_write_fails):
+        if settlement_write_fails:
+            monkeypatch.setattr(receipts, "_settle", lambda *a, **k: (_ for _ in ()).throw(OSError("disk")))
         self._completed(gw)
+        stored = json.loads(gw.db.get_meta(receipts.receipt_key(901)))
+        # Production shape: the stored receipt (terminal COMPLETED, or still PENDING when the settlement
+        # write failed) beside the delivered ledger row that answers this update.
+        assert stored["state"] == ("pending" if settlement_write_fails else "terminal")
+        assert [a["state"] for a in receipts.ledger_answers(gw.db, 901)] == ["delivered"]
         [result] = self._acp_reads([(self._served(gw), 901)])
         assert result["found"] is True and result["outcome"] == "COMPLETED" and result["reasonCode"] == "OK"
         assert {k: result[k] for k in _WIRE_TURN} == _WIRE_TURN
@@ -1925,7 +1933,17 @@ class TestReceiptWireAgainstAcp:
                                    (unproven_message, 901), (unproven_update, 901)])
         assert results == [{"found": False}] * 4
 
+    @staticmethod
+    def _ledger_ready():
+        """The gateway's startup ledger sweep opens the ledger (creating and migrating its schema)
+        before any admission; a test home has to do the same."""
+        from gateway import delivery_ledger
+
+        assert delivery_ledger.sweep_recoverable(deliverable_platforms=set()) == []
+
     def _admitted_wire(self, gw, update_id=901):
+        self._ledger_ready()
+
         def answer(envelope):
             return {**_allowed(gw)(envelope), "turn": dict(_WIRE_TURN)}
 
@@ -2001,7 +2019,8 @@ class TestReceiptWireAgainstAcp:
             dataclasses.replace(receipt, reason_code="REFUSED_BEFORE_RUN"),
             dataclasses.replace(receipt, message_id="56"),
             dataclasses.replace(receipt, receipt_identity={**_WIRE_TURN, "executorSessionIncarnation": "inc-2"}),
-            dataclasses.replace(receipt, turn_request_id="turn-wire-2"),
+            dataclasses.replace(receipt, turn_request_id="turn-wire-2",
+                                receipt_identity={**_WIRE_TURN, "turnRequestId": "turn-wire-2"}),
             dataclasses.replace(receipt, completed_at=1.0),  # not preserved evidence: no effect
         ]
         digests = [receipts.aborted_on_the_wire(gw.db, r).evidence_digest for r in changed]
@@ -2023,14 +2042,29 @@ class TestReceiptWireAgainstAcp:
         if case == "unreadable":  # RECEIPT_UNREADABLE: no turn identity survives to attest
             assert gw.db.claim_meta_once(key, "{not json", **proof)
         elif case == "no_identity":  # a claim that preserved no turn identity, later aborted
+            self._ledger_ready()
             assert gw.db.claim_meta_once(key, json.dumps({"v": 1, "state": "pending", "message_id": "55"}), **proof)
             assert receipts.settle_aborted(gw.db, 901, reason_code="REFUSED_BEFORE_RUN", **proof)
+        elif case == "ledger_never_created":  # a claimed receipt where the ledger schema never existed
+            self._stored_aborted(gw)
         else:
             self._abort(gw, "HERMES_PROCESS_DIED_BEFORE_ANSWER")
-            if case == "delivered_answer":
+            if case != "ledger_unreadable":
                 self._ledger_row(gw, "delivered-901", 901, "delivered")
+            if case in ("ledger_table_dropped", "ledger_column_renamed"):
+                # Reviewer probe: a delivery recorded, then the ledger schema that recorded it is gone.
+                from gateway import delivery_ledger
 
-    @pytest.mark.parametrize("case", ["unreadable", "no_identity", "delivered_answer", "ledger_unreadable"])
+                conn = delivery_ledger._connect()
+                try:
+                    conn.execute("DROP TABLE delivery_obligations" if case == "ledger_table_dropped" else
+                                 "ALTER TABLE delivery_obligations RENAME COLUMN acp_update_id TO acp_update_id_old")
+                    conn.commit()
+                finally:
+                    conn.close()
+
+    @pytest.mark.parametrize("case", ["unreadable", "no_identity", "delivered_answer", "ledger_unreadable",
+                                      "ledger_table_dropped", "ledger_column_renamed", "ledger_never_created"])
     def test_an_unprovable_aborted_receipt_is_an_explicit_error_never_a_guess(self, gw, monkeypatch, case):
         import sqlite3
         from hermes_state import SessionDB
@@ -2051,6 +2085,57 @@ class TestReceiptWireAgainstAcp:
             receipts.served(gw.db, 901)
         [result] = self._acp_reads([(response.body, 901, 409)])
         assert result == {"found": False}  # ACP keeps the turn in doubt
+
+
+    _MISSING = object()
+
+    def _stored_aborted(self, gw, *, message_id="55", turn="turn-wire-1", identity=_MISSING):
+        """An ABORTED receipt as a claim with exactly these preserved fields, settled by the real
+        ``settle_aborted`` (a field left out is absent from the stored record)."""
+        identity = dict(_WIRE_TURN) if identity is self._MISSING else identity
+        record = {"v": 1, "state": "pending", "owner": "dead-owner"}
+        for name, value in (("message_id", message_id), ("turn_request_id", turn), ("receipt_identity", identity)):
+            if value is not self._MISSING:
+                record[name] = value
+        proof = {"proven_db_path": gw.db.db_path, "proven_db_identity": gw.db._db_file_identity}
+        assert gw.db.claim_meta_once(receipts.receipt_key(901), json.dumps(record), **proof)
+        assert receipts.settle_aborted(gw.db, 901, reason_code="REFUSED_BEFORE_RUN", **proof)
+
+    @pytest.mark.parametrize("field,value", [
+        ("identity", {}),  # reviewer probe
+        ("identity", {k: v for k, v in _WIRE_TURN.items() if k != "executorSessionIncarnation"}),  # reviewer probe
+        ("message_id", _MISSING),  # reviewer probe
+        ("message_id", None), ("message_id", "m1"), ("message_id", "0055"), ("message_id", "-55"),
+        ("turn", _MISSING), ("turn", "turn-wire-2"),
+        ("identity", {**_WIRE_TURN, "extra": "x"}),
+        ("identity", {**_WIRE_TURN, "targetActorId": ""}),
+        ("identity", {**_WIRE_TURN, "executorSessionId": "ses\n1"}),
+        ("identity", {**_WIRE_TURN, "targetBindingId": "b" * 513}),
+        ("identity", {**_WIRE_TURN, "promptDigest": "sha256:" + "AB" * 32}),
+        ("identity", {**_WIRE_TURN, "bindingGeneration": 0}),
+        ("identity", {**_WIRE_TURN, "bindingGeneration": True}),
+        ("identity", {**_WIRE_TURN, "bindingGeneration": 4.0}),
+        ("identity", {**_WIRE_TURN, "bindingGeneration": "4"}),
+        ("identity", {**_WIRE_TURN, "turnRequestId": None}),
+    ], ids=lambda v: "missing" if v is TestReceiptWireAgainstAcp._MISSING else repr(v)[:40])
+    def test_an_aborted_receipt_without_the_evidence_acp_compares_is_refused(self, gw, field, value):
+        self._ledger_ready()
+        self._stored_aborted(gw, **{field: value})
+        response = self._get(gw)
+        assert response.status == 409
+        assert json.loads(response.body)["error"]["code"] == "canonical_receipt_unprovable"
+        with pytest.raises(receipts.ReceiptContractError):
+            receipts.served(gw.db, 901)
+        [result] = self._acp_reads([(response.body, 901, 409)])
+        assert result == {"found": False}
+
+    def test_the_same_stored_shape_with_its_evidence_whole_is_accepted(self, gw):
+        """Control for the refusals above: the identical helper with every field preserved."""
+        self._ledger_ready()
+        self._stored_aborted(gw)
+        [result] = self._acp_reads([(self._served(gw), 901)])
+        assert result["found"] is True and result["outcome"] == "ABORTED"
+        assert result["reasonCode"] == "REFUSED_BEFORE_RUN" and result["receiptId"] == "hermes-tg:aborted:901"
 
 
 class TestManagedTurnNote:

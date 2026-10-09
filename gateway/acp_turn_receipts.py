@@ -324,19 +324,23 @@ def aborted_on_the_wire(db: Any, receipt: TelegramTurnReceipt) -> TelegramTurnRe
     undelivered rows themselves are not bound: their story is the reason code, and the ledger prunes
     them, which would change the digest on a later read.
 
-    Raises ``ReceiptContractError`` — never a guessed value — when the update id is not a positive
-    safe integer, the turn identity or the reason code was not preserved (``RECEIPT_UNREADABLE`` has
-    neither), a delivery is recorded on the receipt, or the ledger cannot say no answer was delivered."""
+    Raises ``ReceiptContractError`` — never a guessed value — when the evidence ACP compares was not
+    preserved whole: the update id or message id is not a positive safe integer, the identity is not
+    exactly ACP's eight fields each valid by its parser, its turnRequestId is not the receipt's, or
+    the reason code is not one ACP reads (``RECEIPT_UNREADABLE`` preserves no identity at all); or when
+    a delivery is recorded on the receipt, or the ledger cannot show that no answer was delivered."""
     import dataclasses
     import hashlib
 
-    update_id = _wire_id(receipt.update_id)
-    if not isinstance(update_id, int) or isinstance(update_id, bool):
-        raise ReceiptContractError("the update id is not a positive safe integer")
+    update_id, message_id = _wire_id(receipt.update_id), _wire_id(receipt.message_id)
+    for name, value in (("update id", update_id), ("message id", message_id)):
+        if type(value) is not int or not 0 < value <= _MAX_SAFE_INTEGER:  # _wire_id passes bad ints through
+            raise ReceiptContractError(f"the {name} is not a positive safe integer")
     identity, turn, reason = receipt.receipt_identity, receipt.turn_request_id, receipt.reason_code
-    if (not isinstance(identity, dict) or not isinstance(turn, str) or not turn
-            or not isinstance(reason, str) or not reason):
-        raise ReceiptContractError("the aborted receipt did not preserve its turn identity and reason code")
+    if not _attested_identity(identity, turn):
+        raise ReceiptContractError("the aborted receipt did not preserve the turn identity ACP compares")
+    if not _bounded_text(reason, 128):
+        raise ReceiptContractError("the aborted receipt did not preserve a reason code")
     if receipt.delivery is not None:
         raise ReceiptContractError("an aborted receipt records a delivery")
     delivered = _delivered_answer_recorded(db, receipt.update_id)
@@ -352,17 +356,46 @@ def aborted_on_the_wire(db: Any, receipt: TelegramTurnReceipt) -> TelegramTurnRe
                                evidence_digest="sha256:" + hashlib.sha256(encoded).hexdigest())
 
 
-def _delivered_answer_recorded(db: Any, update_id: Any) -> Optional[bool]:
-    """Whether the ledger records a delivered answer to this update; None when it cannot be read. A
-    store without the ledger table (or an older one without ``acp_update_id``) has recorded none."""
-    import sqlite3
+# ACP's terminalReceipt (src/runtime/hermes-gateway-receipt-port.ts): IDENTITY_KEYS, and each field's
+# check — boundedText for the six names, isDigest for promptDigest, a safe integer >= 1 for the generation.
+_IDENTITY_TEXT_KEYS = ("turnRequestId", "targetActorId", "targetBindingId", "targetAttestationId",
+                       "executorSessionId", "executorSessionIncarnation")
+_IDENTITY_KEYS = frozenset(_IDENTITY_TEXT_KEYS + ("promptDigest", "bindingGeneration"))
+_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 
+
+def _bounded_text(value: Any, limit: int = 512) -> bool:
+    """ACP's ``boundedText``: a string of 1..limit UTF-16 code units with no C0 control or DEL."""
+    return (isinstance(value, str) and 0 < len(value.encode("utf-16-le")) // 2 <= limit
+            and _CONTROL.search(value) is None)
+
+
+def _attested_identity(identity: Any, turn_request_id: Any) -> bool:
+    """The stored identity is exactly ACP's eight fields, each valid by ACP's parser, and names the
+    receipt's own turn."""
+    if not isinstance(identity, dict) or set(identity) != _IDENTITY_KEYS:
+        return False
+    if not all(_bounded_text(identity[key]) for key in _IDENTITY_TEXT_KEYS):
+        return False
+    digest, generation = identity["promptDigest"], identity["bindingGeneration"]
+    if not isinstance(digest, str) or _DIGEST.fullmatch(digest) is None:
+        return False
+    if type(generation) is not int or not 1 <= generation <= _MAX_SAFE_INTEGER:
+        return False
+    return identity["turnRequestId"] == turn_request_id
+
+
+def _delivered_answer_recorded(db: Any, update_id: Any) -> Optional[bool]:
+    """Whether the ledger records a delivered answer to this update; None when that cannot be read.
+    A missing ``delivery_obligations`` table or column is None too, never "none delivered": a claimed
+    receipt only exists where the ledger is on (admission refuses otherwise), and the gateway's startup
+    ledger sweep creates and migrates that schema before any admission, so its absence means the
+    evidence is gone, not that there never was any."""
     try:
         rows = db._read_all(
             "SELECT 1 FROM delivery_obligations WHERE acp_update_id = ? AND state = 'delivered' LIMIT 1",
             (str(update_id),))
-    except sqlite3.OperationalError as exc:
-        return False if ("no such table" in str(exc) or "no such column" in str(exc)) else None
     except Exception:
         return None
     return bool(rows)
