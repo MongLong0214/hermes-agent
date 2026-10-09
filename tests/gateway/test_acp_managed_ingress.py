@@ -1161,3 +1161,18 @@ class TestTurnErrorReply:
         asyncio.run(settle._adapter(gw).send_final_ledgered(event, gw.entry.session_key, reply, {}, reply_to="55"))
         receipt = receipts.lookup(gw.db, 901)
         assert receipt.status == "ABORTED" and receipt.reason_code == "HERMES_TURN_FAILED"
+
+    def test_a_same_text_handed_off_reply_never_overwrites_the_managed_row(self, gw):
+        """REGRESSION-SUPP-16: same session, same opening message id, same text."""
+        settle = TestLedgerSettlement()
+        event = settle._managed_event(gw, _admitted(gw))
+        asyncio.run(settle._adapter(gw).send_final_ledgered(event, gw.entry.session_key, "X", {}, reply_to="55"))
+        event._acp_admission = None
+        event._acp_handed_off = True
+        asyncio.run(settle._adapter(gw).send_final_ledgered(event, gw.entry.session_key, "X", {}, reply_to="55"))
+        from gateway import delivery_ledger
+        with delivery_ledger._connect() as conn:
+            rows = sorted(conn.execute("SELECT content, acp_update_id FROM delivery_obligations").fetchall(),
+                          key=lambda r: r[1] or "")
+        assert rows == [("X", None), ("X", "901")]
+        assert receipts.lookup(gw.db, 901).status == "COMPLETED"
