@@ -6139,7 +6139,14 @@ class TelegramAdapter(BasePlatformAdapter):
         bot_username = self._current_bot_username()
         if not text or not bot_username:
             return text
-        cleaned = re.sub(rf"(?i)@{re.escape(bot_username)}\b[,:\-]*\s*", "", text).strip()
+        mention = rf"@{re.escape(bot_username)}\b[,:\-]*"
+        # A leading ``/command@ourbot`` keeps one space before its arguments: stripping the handle
+        # with the whitespace after it would glue ``/acp@ourbot task`` into the command ``/acptask``.
+        command = re.match(rf"\s*(/[A-Za-z0-9_]+){mention}(?=$|\s)", text, re.IGNORECASE)
+        if command is not None:
+            args = re.sub(rf"{mention}\s*", "", text[command.end():], flags=re.IGNORECASE).strip()
+            return f"{command.group(1)} {args}" if args else command.group(1)
+        cleaned = re.sub(rf"{mention}\s*", "", text, flags=re.IGNORECASE).strip()
         return cleaned or text
 
     def _topic_gates_pass(self, thread_id, *, warn_non_numeric: bool) -> Optional[bool]:

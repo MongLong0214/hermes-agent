@@ -56,6 +56,11 @@ UNRECORDED = ("⚠️ The answer to this /acp task could not be recorded for del
               "It will not be retried; check the task in ACP and resend if needed.")
 DUPLICATE = "This /acp update was already handled and was not run again (receipt: {status})."
 PAUSED = REFUSED.format(reason="managed admission paused")
+EMPTY_TASK = REFUSED.format(reason="empty task")
+# Given to the model, API-only, on a turn that runs under a server-confirmed ACP admission.
+MANAGED_TURN_NOTE = ("[System note: The owner sent this with the /acp command on the bound Telegram chat, and "
+                     "ACP admitted it as a managed task. The server removed the /acp command before this turn; "
+                     "the text below is the admitted task.]")
 
 
 def socket_path() -> Path:
@@ -111,9 +116,35 @@ def launch_home_store(runner: Any) -> Any:
     return db if same else None
 
 
-def is_managed(runner: Any, event: Any, source: Any) -> bool:
-    """The single seam predicate: an explicit ``/acp <task>`` on the bound chat."""
-    return receipts.is_acp_managed_message(event, source) and bound_binding(runner, source) is not None
+def bot_username(runner: Any, source: Any, adapter: Any = None) -> Optional[str]:
+    """The live @username of the bot that received *source*'s message (the Telegram adapter's
+    ``_current_bot_username``), or None when it is not known — then no ``/acp@handle`` form is ours."""
+    try:
+        if adapter is None:
+            adapter = runner._intake_adapter_for(source)
+        current = getattr(adapter, "_current_bot_username", None)
+        return (current() or None) if callable(current) else None
+    except Exception:
+        logger.debug("ACP managed check: bot username unavailable", exc_info=True)
+        return None
+
+
+def _username_for(runner: Any, event: Any, source: Any, adapter: Any = None) -> Optional[str]:
+    # Only the ``/acp@handle`` form needs the bot's own handle.
+    return bot_username(runner, source, adapter) if (getattr(event, "text", None) or "").startswith("/acp@") else None
+
+
+def is_managed(runner: Any, event: Any, source: Any, adapter: Any = None) -> bool:
+    """The single seam predicate: a message whose command token is ``/acp`` (with or without a task)
+    from the bound owner on the bound chat. Such a message is the managed path's alone — admitted,
+    or refused as an ordinary reply — and never reaches the generic slash dispatch."""
+    return (receipts.is_acp_managed_message(event, source, _username_for(runner, event, source, adapter))
+            and bound_binding(runner, source) is not None)
+
+
+def managed_task_text(runner: Any, event: Any, source: Any, adapter: Any = None) -> Optional[str]:
+    """The managed message's task text (``""`` when it carries none), by the same rule as is_managed."""
+    return receipts.acp_command_task(getattr(event, "text", None), _username_for(runner, event, source, adapter))
 
 
 def admission_enabled(config: Optional[dict] = None) -> bool:
@@ -133,6 +164,15 @@ def paused_reply() -> Optional[str]:
     """The ordinary refusal for a managed message while the gate is closed, else None. Checked right
     after classification, before any ACP request, receipt, turn marker or ACP-correlated ledger row."""
     return None if admission_enabled() else PAUSED
+
+
+def refusal_before_admission(runner: Any, event: Any, source: Any, adapter: Any = None) -> Optional[str]:
+    """The ordinary refusal owed to a managed message before anything else happens to it: the closed
+    gate first, then an ``/acp`` with no task. None when it may go on to admission."""
+    paused = paused_reply()
+    if paused is not None:
+        return paused
+    return EMPTY_TASK if not managed_task_text(runner, event, source, adapter) else None
 
 
 def _as_int(value: Any) -> Optional[int]:
@@ -220,15 +260,15 @@ class Outcome:
 async def admit(runner: Any, event: Any, source: Any, session_key: str, *, path: Optional[Path] = None,
                 secret: Optional[str] = None, timeout: float = _ADMISSION_TIMEOUT_S) -> Outcome:
     """Ask ACP to admit this managed message and claim its receipt; never runs the turn itself."""
-    paused = paused_reply()
-    if paused is not None:
-        return Outcome(reply=paused)
+    refusal = refusal_before_admission(runner, event, source)
+    if refusal is not None:
+        return Outcome(reply=refusal)
     binding = bound_binding(runner, source)
     if session_key != binding.session_key:
         # The bound chat routed to another session (a profile route, a topic): the lineage ACP
         # would approve is not the session that would run, so the task is refused unasked.
         return Outcome(reply=REFUSED.format(reason="target mismatch"))
-    task_text = receipts.acp_managed_task_text(event.text)
+    task = managed_task_text(runner, event, source)
     if len(event.text or "") >= _MAX_TASK_MESSAGE_CHARS:
         return Outcome(reply=TOO_LONG)
     if launch_home_store(runner) is None:
@@ -238,7 +278,7 @@ async def admit(runner: Any, event: Any, source: Any, session_key: str, *, path:
         # The ledger row is the receipt's only evidence of an answer: without it, refuse unasked.
         return Outcome(reply=REFUSED.format(reason="delivery ledger disabled"))
     secret = secret if secret is not None else read_secret()
-    envelope = build_envelope(event, source, secret) if secret and task_text else None
+    envelope = build_envelope(event, source, secret) if secret and task else None
     if envelope is None:
         logger.warning("ACP managed message not admitted: lane secret or Telegram ids unavailable")
         return Outcome(reply=UNKNOWN)
@@ -278,7 +318,7 @@ async def admit(runner: Any, event: Any, source: Any, session_key: str, *, path:
     if not claimed:
         # An earlier delivery of this update already claimed (and ran) it: zero duplicate execution.
         return Outcome(reply=DUPLICATE.format(status=receipts.lookup(db, update_id).status))
-    return Outcome(admission=Admission(update_id=update_id, db=db, proof=proof, task_text=task_text,
+    return Outcome(admission=Admission(update_id=update_id, db=db, proof=proof, task_text=task,
                                        turn=turn, session_key=binding.session_key,
                                        lineage_root_digest=expected_lineage))
 

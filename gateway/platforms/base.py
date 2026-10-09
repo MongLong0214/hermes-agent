@@ -2542,7 +2542,7 @@ class BasePlatformAdapter(ABC):
             return False
         try:
             from gateway.acp_managed_ingress import is_managed
-            return is_managed(runner, event, event.source)
+            return is_managed(runner, event, event.source, adapter=self)
         except Exception:
             logger.debug("ACP managed check failed", exc_info=True)
             return False
@@ -4067,8 +4067,9 @@ class BasePlatformAdapter(ABC):
         if self._is_acp_managed(event):
             # U4 H2: an /acp task never queues, steers or batches behind a busy turn — a queued one
             # would later drain as an ordinary turn with no ACP admission. It is refused here.
-            from gateway.acp_managed_ingress import BUSY, paused_reply
-            await self._send_with_retry(chat_id=event.source.chat_id, content=paused_reply() or BUSY,
+            from gateway.acp_managed_ingress import BUSY, refusal_before_admission
+            refusal = refusal_before_admission(self.gateway_runner, event, event.source, adapter=self)
+            await self._send_with_retry(chat_id=event.source.chat_id, content=refusal or BUSY,
                                         reply_to=_reply_anchor_for_event(event),
                                         metadata=_mark_notify_metadata(_thread_metadata_for_event(event)))
             event._gateway_accepted = True

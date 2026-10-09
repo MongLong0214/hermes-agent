@@ -242,6 +242,27 @@ def test_observed_group_context_uses_shared_source_and_prompt_for_later_mentions
     asyncio.run(_run())
 
 
+@pytest.mark.parametrize("text,cleaned", [
+    # A leading /command@<this bot> keeps one space before its arguments (it used to glue them on).
+    ("/acp@hermes_bot deploy the fix", "/acp deploy the fix"),
+    ("/acp@Hermes_Bot\ndeploy\nnow", "/acp deploy\nnow"),
+    ("/model@hermes_bot gpt x", "/model gpt x"),
+    ("/acp@hermes_bot: task", "/acp task"),
+    ("/acp@hermes_bot ask @hermes_bot again", "/acp ask again"),
+    ("/new@hermes_bot", "/new"),
+    ("/acp@hermes_bot   ", "/acp"),
+    # Every other mention cleanup is unchanged.
+    ("@hermes_bot what did Alice say?", "what did Alice say?"),
+    ("hey @hermes_bot, look", "hey look"),
+    ("/acp@other_bot task", "/acp@other_bot task"),
+    ("/acp@hermes_botx task", "/acp@hermes_botx task"),
+    ("/acp@hermes_bot.task", "/acp.task"),
+    ("@hermes_bot", "@hermes_bot"),
+])
+def test_a_command_addressed_to_this_bot_keeps_its_arguments_apart(text, cleaned):
+    assert _make_adapter()._clean_bot_trigger_text(text) == cleaned
+
+
 def test_observed_group_context_preserves_slash_command_text_for_dispatch():
     from gateway.platforms.base import Platform, SessionSource
     from gateway.platforms.event import MessageEvent, MessageType

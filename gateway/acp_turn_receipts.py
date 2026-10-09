@@ -36,6 +36,7 @@ resumed is left ``PENDING``: the turn may still answer it.
 from __future__ import annotations
 
 import json
+import re
 import secrets
 import time
 from dataclasses import dataclass
@@ -51,43 +52,74 @@ _ABORT_REFUSED_BEFORE_RUN = "REFUSED_BEFORE_RUN"
 _ABORT_UNDELIVERABLE = "HERMES_ANSWER_UNDELIVERABLE"
 
 
-_MANAGED_PREFIX = "/acp "
-_MANAGED_PREFIX_BARE = "/acp"  # the bare command with no task text is not managed — nothing to admit
+_MANAGED_COMMAND = "/acp"
+_COMMAND_MENTION = re.compile(r"@([A-Za-z0-9_]+)")
 
 
-def acp_managed_task_text(event_text: Optional[str]) -> Optional[str]:
-    """The task text after an explicit ``/acp `` prefix, or None when this message is not a
-    managed-ingress candidate. CEO 3c058be8's ruling (2026-10-03, Buzz event 36ade192): only this
-    explicit prefix is the admission boundary — never a config opt-in flag or body classification,
-    which would risk pulling ordinary DM traffic into ACP admission. Whitespace around the prefix
-    is not trimmed first: a message must *start* with it, so quoting or discussing ``/acp`` text
-    elsewhere in a sentence is not managed."""
+def acp_command_task(event_text: Optional[str], bot_username: Optional[str] = None) -> Optional[str]:
+    """The task text of a message whose command token is ``/acp`` (``""`` when it carries none), or
+    None when it is not one. CEO 3c058be8's ruling (2026-10-03, Buzz event 36ade192): only this
+    explicit command is the admission boundary — never a config opt-in flag or body classification,
+    which would risk pulling ordinary DM traffic into ACP admission.
+
+    The token is ``/acp`` at the very start of the text (nothing is trimmed first, so quoting or
+    discussing ``/acp`` elsewhere in a sentence is not managed), followed by whitespace (space, tab,
+    newline) or the end of the text, or by ``@<bot_username>`` — this bot's own handle, compared
+    case-insensitively — and then whitespace or the end. ``/acpx``, ``/acp@other_bot`` and an
+    ``@`` form with no known own handle are not the token. The task is everything after the token,
+    stripped."""
     text = event_text or ""
-    if text.startswith(_MANAGED_PREFIX):
-        task = text[len(_MANAGED_PREFIX):].strip()
-        return task or None
-    return None
+    if not text.startswith(_MANAGED_COMMAND):
+        return None
+    rest = text[len(_MANAGED_COMMAND):]
+    if rest.startswith("@"):
+        mention = _COMMAND_MENTION.match(rest)
+        own = (bot_username or "").lstrip("@").lower()
+        if mention is None or not own or mention.group(1).lower() != own:
+            return None
+        rest = rest[mention.end():]
+    if rest and not rest[0].isspace():
+        return None
+    return rest.strip()
 
 
-def is_acp_managed_message(event: Any, source: Any) -> bool:
+def acp_managed_task_text(event_text: Optional[str], bot_username: Optional[str] = None) -> Optional[str]:
+    """The non-empty task text of an ``/acp`` command (``acp_command_task``), or None when the
+    message is not one or carries no task."""
+    return acp_command_task(event_text, bot_username) or None
+
+
+def is_acp_managed_message(event: Any, source: Any, bot_username: Optional[str] = None) -> bool:
     """H2's single admission-boundary predicate: is this inbound message a candidate for ACP
-    claim/dispatch at all? True only for an explicit ``/acp <task>`` prefix on the Telegram
-    origin a canonical binding is bound to — ordinary chat and status/recovery requests always
-    take today's path, never routed through ACP by body classification or a config flag.
-
-    The seam call site in ``run_inbound.py`` is not wired to the actual ACP admission call in
-    this slice: even though this predicate can now return True, nothing yet dispatches the
-    ``telegram-update.ingress.sock`` call, writes the pending receipt, or runs the turn through
-    ACP — that integration needs ACP's A1/A2 contract (PR #1062) settled first; wiring a call
-    against a still-repairing contract would be untested. Until then a ``/acp`` message takes
-    the ordinary path like any other text, unrouted."""
+    claim/dispatch at all? True for any message whose command token is ``/acp``
+    (``acp_command_task``), including one with no task — on the bound chat that message is the
+    managed path's to refuse, never the generic slash dispatch's. Ordinary chat and status/recovery
+    requests always take today's path, never routed through ACP by body classification or a config
+    flag; the bound-chat check is ``gateway.acp_managed_ingress.is_managed``'s."""
     text = getattr(event, "text", None)
-    return acp_managed_task_text(text) is not None
+    return acp_command_task(text, bot_username) is not None
 
 
 def receipt_key(update_id: Any) -> str:
     """The ``state_meta`` key one Telegram update's receipt lives under."""
     return f"{_RECEIPT_NAMESPACE}:{update_id}"
+
+
+_COMPLETED_REASON = "OK"
+_MAX_SAFE_INTEGER = 2**53 - 1  # JavaScript's Number.MAX_SAFE_INTEGER
+_CANONICAL_ID = re.compile(r"[1-9][0-9]*")
+
+
+def _wire_id(value: Any) -> Any:
+    """A Telegram id as the JSON integer ACP reads when it is a positive safe integer, else the
+    stored value unchanged (see ``TelegramTurnReceipt.to_response``)."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        number = value
+    elif isinstance(value, str) and _CANONICAL_ID.fullmatch(value):
+        number = int(value)
+    else:
+        return value
+    return number if 0 < number <= _MAX_SAFE_INTEGER else value
 
 
 @dataclass(frozen=True)
@@ -113,11 +145,20 @@ class TelegramTurnReceipt:
     completed_at: Optional[float] = None
 
     def to_response(self) -> dict:
+        # Wire contract read by ACP's HermesGatewayReceiptPort (terminalReceipt): ``update_id`` is the
+        # JSON number of the update asked about and ``message_id`` a positive safe integer, so each is
+        # sent as an integer when it is one (canonical decimal, 1..2**53-1). Any other stored value is
+        # sent exactly as stored, never coerced, and ACP refuses that body rather than read it under an
+        # id Hermes cannot vouch for. ``reasonCode`` is a non-empty string on every terminal receipt:
+        # "OK" for COMPLETED, the recorded failure code for ABORTED. Stored values are not rewritten.
+        reason_code = self.reason_code
+        if self.status == "COMPLETED" and not reason_code:
+            reason_code = _COMPLETED_REASON
         out = {
-            "schema": _SCHEMA, "update_id": self.update_id, "message_id": self.message_id,
+            "schema": _SCHEMA, "update_id": _wire_id(self.update_id), "message_id": _wire_id(self.message_id),
             "status": self.status, "turnRequestId": self.turn_request_id,
             "receiptIdentity": self.receipt_identity, "receiptId": self.receipt_id,
-            "evidenceDigest": self.evidence_digest, "reasonCode": self.reason_code,
+            "evidenceDigest": self.evidence_digest, "reasonCode": reason_code,
             "delivery": self.delivery,
         }
         if self.content is not None:

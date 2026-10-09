@@ -1302,16 +1302,17 @@ class GatewayInboundMixin:
         _quick_key = self._session_key_for_source(source)
         # U4 H2 (CEO 36ade192): an explicit ``/acp <task>`` on the bound Telegram chat runs only
         # after ACP admits it. It never answers a pending prompt, never queues behind a busy turn
-        # (a queued message would later run without admission) and never dispatches as a command.
+        # (a queued message would later run without admission) and never dispatches as a command —
+        # whatever follows the ``/acp`` token (newline, tab, ``@this_bot``, nothing at all).
         from gateway import acp_managed_ingress
         _acp_managed = not is_internal and acp_managed_ingress.is_managed(self, event, source)
         if _acp_managed:
-            # ``gateway.acp_managed_admission`` closed: refuse here, before the ACP request, the
-            # receipt, the turn marker or any ACP-correlated ledger row. The event stays unadmitted,
-            # so the refusal goes out as an ordinary reply.
-            _paused = acp_managed_ingress.paused_reply()
-            if _paused is not None:
-                return _paused
+            # ``gateway.acp_managed_admission`` closed, or an ``/acp`` with no task: refuse here,
+            # before the ACP request, the receipt, the turn marker or any ACP-correlated ledger row.
+            # The event stays unadmitted, so the refusal goes out as an ordinary reply.
+            _refusal = acp_managed_ingress.refusal_before_admission(self, event, source)
+            if _refusal is not None:
+                return _refusal
         if not _acp_managed:
             _reply = await self._hm_pending_reply_intercepts(event, source, _quick_key)
             if _reply is not None:

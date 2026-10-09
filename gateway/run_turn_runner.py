@@ -1671,6 +1671,14 @@ class TurnRunner:
                 + ctx.message
             )
         self._prepend_pending_note("_pending_skills_reload_notes")
+        if ctx.acp_admission is not None and isinstance(ctx.message, str):
+            # The server admitted this turn through ACP and stripped its ``/acp`` command, so the model
+            # would otherwise see a bare task. The note comes only from the admission object, never from
+            # message text, and is API-only: the transcript keeps the task as the user's turn.
+            from gateway.acp_managed_ingress import MANAGED_TURN_NOTE
+            if persist_override is None:
+                persist_override = ctx.message
+            ctx.message = MANAGED_TURN_NOTE + "\n\n" + ctx.message
         # Safety net: a startup auto-resume event carries empty text; if the resume_pending branch
         # did not fire (freshness signals disagreed, marker cleared) we must NOT hand the model a blank
         # user turn. Restricted to resume_pending sessions so caption-less image turns are untouched.
