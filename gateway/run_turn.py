@@ -1819,6 +1819,9 @@ class GatewayTurnMixin:
             _user_entry["display_kind"] = prepared.persist_user_display_kind
         if prepared.persistence_owner:
             _user_entry["display_metadata"] = {"gateway_input_owner": prepared.persistence_owner}
+        _acp = getattr(event, "_acp_admission", None)
+        if _acp is not None:  # diagnostic, as on the agent's own writer (recovery does not read it)
+            _user_entry.setdefault("display_metadata", {})["acp_update_id"] = str(_acp.update_id)
         if getattr(event, "message_id", None):
             _user_entry["message_id"] = str(event.message_id)
         return _user_entry
@@ -2028,6 +2031,9 @@ class GatewayTurnMixin:
         # Retain Slack thread/workspace routing so a failed turn cannot leave its status visible.
         await self._hmwa_stop_typing_for_turn(event, source)
         logger.exception("Agent error in session %s", session_key)
+        # An error notice is never the managed task's answer (the turn, or a follow-up chained after
+        # it, raised).
+        await self._acp_release_failed_turn(event)
         status_code = getattr(e, "status_code", None)
         if status_code in {400, 500} and len(prepared.history) > 50:
             # Context overflow / payload too large: a deterministic rejection (#107567), and the same
@@ -2144,6 +2150,17 @@ class GatewayTurnMixin:
         # A turn becomes durable recovery work only after it owns the per-session lease; marking
         # earlier would falsely recover a message that never began processing.
         await self._mark_durable_active_turn(event, session_entry.session_key)
+        if getattr(event, "_acp_admission", None) is not None:
+            # An admitted /acp task runs only once its crash identity is durable: startup recovery
+            # recognises it by this marker, never re-runs or redelivers it (acp_managed_ingress).
+            from gateway import acp_managed_ingress
+            if not await asyncio.to_thread(acp_managed_ingress.bind_turn_marker, event._acp_admission,
+                                           getattr(event, "_gateway_active_turn_token", None)):
+                acp_managed_ingress.abort_claimed(event._acp_admission)
+                event._acp_admission = None
+                self._clear_session_env(_session_env_tokens)
+                return (acp_managed_ingress.REFUSED.format(reason="turn identity could not be recorded"),
+                        _session_env_tokens)
 
         # An unreadable store is not an empty conversation: stop before the agent invents continuity
         # from []. Restore task-local context here (before the broad cleanup finally).
@@ -2199,6 +2216,121 @@ class GatewayTurnMixin:
             persist_user_display_kind, session_entry.session_id, owner,
         ), _session_env_tokens
 
+    @staticmethod
+    def _acp_is_answer_text(text: Any) -> bool:
+        """Whether ``text`` is an answer at all: not empty, not the "(empty)" sentinel, not a silence
+        marker, not transport metadata (a terminal ``<|eos|>`` run, the interrupt-wait sentinel)."""
+        from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
+        from gateway.platforms.base import _terminal_sentinel_start
+        from gateway.response_filters import is_intentional_silence_response
+        if not isinstance(text, str):
+            return False
+        # Only these exact non-answer forms, rather than whether some prose reads like a notice: a
+        # hook's legitimate rewrite and a hook-written "No reply…" sentence look alike, and judging
+        # wording would reopen shape-as-provenance. Origin, not wording, rules out generated notices.
+        start = _terminal_sentinel_start(text)
+        body = (text[:start] if start >= 0 else text).strip()
+        return (bool(body) and body != "(empty)" and not body.startswith(INTERRUPT_WAITING_FOR_MODEL_PREFIX)
+                and not is_intentional_silence_response(body))
+
+    @staticmethod
+    def _acp_final_send_text(text: Any) -> Any:
+        """The text the adapter's final send leaves once attachments are taken out, by the same
+        extraction steps in the same order (``BasePlatformAdapter._extract_response_content``): a
+        marker followed by a media tag goes out as the marker alone."""
+        from gateway.platforms.base import BasePlatformAdapter, _strip_media_directives
+        if not isinstance(text, str):
+            return text
+        _, text = BasePlatformAdapter.extract_media(text)
+        _, text = BasePlatformAdapter.extract_images(text)
+        return BasePlatformAdapter.extract_local_files(_strip_media_directives(text).strip())[1]
+
+    @staticmethod
+    def _acp_queued_send_text(text: Any) -> Any:
+        """The text the queued first-response send leaves: that send strips only explicit ``MEDIA:``
+        attachments and keeps image references and bare file paths visible, so they are its text."""
+        from gateway.platforms.base import BasePlatformAdapter
+        from gateway.run import _strip_response_attachments_for_direct_send
+        if not isinstance(text, str):
+            return text
+        return _strip_response_attachments_for_direct_send(text, BasePlatformAdapter)
+
+    @classmethod
+    def _acp_is_model_answer(cls, agent_result: Any, sent_text: Optional[Callable[[Any], Any]] = None) -> bool:
+        """The certification boundary for a managed receipt: one rule for every producer and both
+        delivery paths. A completed model run (not failed, not interrupted, at least one API call)
+        certifies only when the output hook left the model's answer in place (``answer_disposition``
+        "unchanged", or "preserved" as the hook itself declared), and the text the model produced for
+        this turn (``answer_origin``, recorded before any output hook), the text the hook left to
+        deliver (``answer_body``, before any footer, explainer or media decoration) and the reply
+        actually delivered are each still an answer once attachments are extracted the way the
+        delivering path sends them (``sent_text``: the final send by default, or the queued
+        first-response send). Decoration cannot create eligibility; a hook can neither turn a
+        non-answer into an answer nor keep a genuine answer eligible after replacing it, and only the
+        hook can say which a rewrite was. Producers that record no provenance (notices, refusals,
+        deferrals, gateway substitutions) never certify."""
+        if not isinstance(agent_result, dict) or agent_result.get("failed") or agent_result.get("interrupted"):
+            return False
+        try:
+            if int(agent_result.get("api_calls") or 0) <= 0:
+                return False
+        except (TypeError, ValueError):
+            return False
+        # An undeclared or suppressing rewrite never certifies: judging its wording instead would
+        # reopen shape-as-provenance (a reformat and a hook-written notice read alike).
+        if agent_result.get("answer_disposition") not in ("unchanged", "preserved"):
+            return False
+        sent_text = sent_text or cls._acp_final_send_text
+        return all(cls._acp_is_answer_text(sent_text(agent_result.get(key)))
+                   for key in ("answer_origin", "answer_body", "final_response"))
+
+    async def _acp_first_response_admission(self, turn_ctx: Any, delivery_result: Any) -> Any:
+        """The admission the queued first response may carry: the managed turn's, only when that
+        response is its model answer. Otherwise the notice goes out ordinarily and the receipt is
+        settled as a failed turn (the admission stays on turn_ctx for the follow-up's start record)."""
+        from gateway import acp_managed_ingress
+        admission = getattr(turn_ctx, "acp_admission", None)
+        if admission is None or self._acp_is_model_answer(delivery_result, self._acp_queued_send_text):
+            return admission
+        with suppress(Exception):
+            await asyncio.to_thread(acp_managed_ingress.abort_failed_turn, admission)
+        return None
+
+    async def _acp_release_failed_turn(self, event) -> None:
+        """A managed turn ended without an answer: what goes out is a notice, so it must not carry or
+        certify the admission. With no answer of the update ever recorded the receipt is a definite
+        non-delivery (HERMES_TURN_FAILED); otherwise that answer's own ledger row decides it."""
+        if getattr(event, "_acp_admission", None) is None:
+            return
+        from gateway import acp_managed_ingress
+        with suppress(Exception):
+            await asyncio.to_thread(acp_managed_ingress.abort_failed_turn, event._acp_admission)
+        event._acp_admission = None
+        event._acp_handed_off = True
+
+    @staticmethod
+    def _adopt_queued_terminal(event, agent_result) -> None:
+        """A queued (/queue) chain answered the LAST message of the chain, so the outer final send
+        (bracketed by the adapter against this event) must be ledgered under that message's id or
+        it collides with an earlier turn's row carrying the same text. Reply routing is untouched:
+        the anchor still comes from this event."""
+        if not isinstance(agent_result, dict):
+            return
+        _terminal_inbound = agent_result.get("queued_terminal_inbound_id")
+        if _terminal_inbound:
+            event.ledger_message_id = str(_terminal_inbound)
+        if "queued_terminal_inbound_id" in agent_result and getattr(event, "_acp_admission", None) is not None:
+            # A follow-up ran (with or without a platform id: a leftover steer has none), so the outer
+            # final answers that follow-up, not the managed /acp task. It must never carry, and so
+            # certify, the task's admission (U4-02), and it is ledgered as the ordinary answer it is,
+            # not skipped because the task text it no longer answers began with "/".
+            event._acp_admission = None
+            event._acp_handed_off = True
+        if "queued_terminal_notification_category" in agent_result:
+            event.metadata["notification_category"] = agent_result["queued_terminal_notification_category"]
+        if isinstance(agent_result.get("_notification_reply_muted"), bool):
+            event._notification_reply_muted = agent_result["_notification_reply_muted"]
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -2220,6 +2352,7 @@ class GatewayTurnMixin:
             event, source, session_entry, session_key, _quick_key, run_generation,
         )
         if not isinstance(prepared, self._PreparedTurn):
+            await self._acp_release_failed_turn(event)  # a refusal before the run is never the answer
             return prepared
         history, message_text = prepared.history, prepared.message_text
 
@@ -2255,24 +2388,18 @@ class GatewayTurnMixin:
                 persist_user_timestamp=prepared.persist_user_timestamp,
                 persist_user_display_kind=prepared.persist_user_display_kind,
                 persist_user_display_metadata={
-                    "gateway_input_owner": prepared.persistence_owner, **diagnostic_metadata(event)},
+                    "gateway_input_owner": prepared.persistence_owner, **diagnostic_metadata(event),
+                    # Diagnostic only: crash recovery identifies a managed turn by its bound
+                    # active-turn marker (acp_managed_ingress.bind_turn_marker), not by this row.
+                    **({"acp_update_id": str(event._acp_admission.update_id)}
+                       if getattr(event, "_acp_admission", None) is not None else {})},
                 message_type=event.message_type,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
+                acp_admission=getattr(event, "_acp_admission", None),
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
-            # A queued (/queue) chain answered the LAST message of the chain, so the outer final
-            # send (bracketed by the adapter against this event) must be ledgered under that
-            # message's id or it collides with an earlier turn's row carrying the same text. Reply
-            # routing is untouched: the anchor still comes from this event.
-            if isinstance(agent_result, dict):
-                _terminal_inbound = agent_result.get("queued_terminal_inbound_id")
-                if _terminal_inbound:
-                    event.ledger_message_id = str(_terminal_inbound)
-                if "queued_terminal_notification_category" in agent_result:
-                    event.metadata["notification_category"] = agent_result["queued_terminal_notification_category"]
-                if isinstance(agent_result.get("_notification_reply_muted"), bool):
-                    event._notification_reply_muted = agent_result["_notification_reply_muted"]
+            self._adopt_queued_terminal(event, agent_result)
 
             await self._hmwa_stop_typing_for_turn(event, source)
 
@@ -2295,6 +2422,10 @@ class GatewayTurnMixin:
             agent_failed_early, hidden_reasoning_incomplete, is_context_overflow_failure = (
                 self._hmwa_classify_turn_failure(agent_result, history, session_entry)
             )
+            if not self._acp_is_model_answer(agent_result, self._acp_final_send_text):
+                # No model answer (failure, timeout, overflow, interruption, empty or silent reply):
+                # what goes out is a notice, not the managed task's answer.
+                await self._acp_release_failed_turn(event)
             if agent_failed_early and not is_context_overflow_failure:
                 response = self._hmwa_add_failed_turn_notice(response, self._hmwa_failed_turn_notice(agent_result))
             response = self._hmwa_compression_exhaustion_notice(agent_result, response, session_entry, event)
@@ -3814,6 +3945,7 @@ class GatewayTurnMixin:
                     # The text send records a delivery-ledger obligation under this key, keyed on
                     # the raw inbound id (the anchor above is only the reply target).
                     session_key=session_key, inbound_message_id=turn_ctx.inbound_message_id,
+                    acp_admission=await self._acp_first_response_admission(turn_ctx, _delivery_result),
                 )
             except Exception as e:
                 logger.warning("Failed to send first response before queued message: %s", e)
@@ -3951,6 +4083,13 @@ class GatewayTurnMixin:
         await _run_followup_processing_hook(_hook_adapter, pending_event, "on_processing_start")
         # The re-baseline sits inside the try: a /stop landing on its DB await must still close the marker
         # (the helper's own ``except Exception`` does not catch cancellation).
+        _chain_admission = getattr(turn_ctx, "acp_admission", None)
+        if _chain_admission is not None and not await self._acp_mark_followup_start(_chain_admission, session_key):
+            # The follow-up still runs in-band (the drain's order, hooks and commands stay intact, and
+            # the managed answer keeps its own delivery). Only crash recovery degrades: without a
+            # recorded start, a crash during this follow-up suppresses its reply with the managed turn.
+            logger.warning("Managed chain follow-up start not recorded for %s; a crash during it will not "
+                           "recover its reply", session_key)
         try:
             await self._refresh_agent_cache_message_count(session_key, session_id)
 
@@ -3991,6 +4130,22 @@ class GatewayTurnMixin:
                     if pending_event is not None and pending_event.internal else "result"),
             }
         return merged
+
+    async def _run_agent_next_followup(self, turn_ctx: Any, result: Any, adapter: Any, source: SessionSource,
+                                       session_key: Optional[str]) -> Tuple[Any, Optional[str]]:
+        """The follow-up this turn runs in-band, as ``(pending_event, pending)``: the same drain for
+        managed and ordinary turns (order, hooks and command handling are the drain's own)."""
+        return await self._run_agent_drain_pending(result, adapter, source, session_key)
+
+    async def _acp_mark_followup_start(self, admission: Any, session_key: str) -> bool:
+        """Before an ordinary follow-up runs in a managed chain, record its start time under the
+        managed marker; crash recovery then owes exactly the reply an ordinary turn begun at that time
+        would owe. False when it could not be recorded."""
+        from gateway import acp_managed_ingress
+        with self.session_store._lock:  # noqa: SLF001 — this turn's own marker token
+            _entry = self.session_store._entries.get(session_key)  # noqa: SLF001
+            token = getattr(_entry, "active_turn_token", None)
+        return await asyncio.to_thread(acp_managed_ingress.mark_followup_start, admission, token, time.time())
 
     async def _run_agent_cleanup_turn_tasks(
         self, turn_ctx: TurnContext, *, progress_task: Any, log_task: Any, interrupt_monitor: "asyncio.Task",
@@ -4285,11 +4440,17 @@ class GatewayTurnMixin:
         persist_user_message: Optional[Any] = None, persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None, message_type: Optional[str] = None,
         persist_user_display_metadata: Optional[dict] = None,
-        scheduled_heartbeat: bool = False,
+        scheduled_heartbeat: bool = False, acp_admission: Any = None,
     ) -> Dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
         Keys: "final_response", "messages", "api_calls", "completed"."""
+        if acp_admission is not None and self._get_proxy_url():
+            # The proxy runs the turn elsewhere, where this turn's receipt cannot be settled.
+            from gateway import acp_managed_ingress
+            acp_managed_ingress.abort_claimed(acp_admission)
+            return {"final_response": acp_managed_ingress.REFUSED.format(reason="proxy mode"),
+                    "messages": [], "api_calls": 0, "tools": []}
         if self._get_proxy_url():
             return await self._run_agent_via_proxy(
                 message=message, context_prompt=context_prompt, history=history, source=source,
@@ -4322,7 +4483,7 @@ class GatewayTurnMixin:
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,
             persist_user_display_metadata=persist_user_display_metadata,
-            scheduled_heartbeat=scheduled_heartbeat,
+            scheduled_heartbeat=scheduled_heartbeat, acp_admission=acp_admission,
         )
         _status_thread_metadata = self._run_agent_bind_turn_wiring(
             turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards,
@@ -4362,7 +4523,7 @@ class GatewayTurnMixin:
             result = turn_ctx.result_holder[0]
             adapter = self._delivery_adapter_for(source)
             await self._run_agent_finalize_streaming_tts(turn_ctx, adapter)
-            pending_event, pending = await self._run_agent_drain_pending(result, adapter, source, session_key)
+            pending_event, pending = await self._run_agent_next_followup(turn_ctx, result, adapter, source, session_key)
             if pending_event or pending:
                 return await self._run_agent_queued_followup(
                     turn_ctx, adapter, pending, pending_event, response, result, stream_task,
