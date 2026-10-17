@@ -352,15 +352,17 @@ _PEER_TOOL_REFUSAL = ("[Tool call not executed — {name} was requested during a
                       "batch holding any other call runs nothing. A peer has no approval authority.]")
 
 
-def _refuse_peer_tool_calls(agent, tool_calls, messages: list) -> bool:
-    """A canonical peer turn asks for no approval and runs a batch only when EVERY call in it is an
-    allowed ACP CEO call under the grant its verified ingress bound (agent.canonical_peer_tools);
-    otherwise every call gets a refusal result (so the assistant turn keeps its matching results)
-    and nothing runs. Authority follows the turn principal and grant, never message text."""
+def peer_batch_refused(agent, tool_calls, emitted_names=None) -> bool:
+    """True in a canonical peer turn whose batch may not run: it runs only when EVERY call is an
+    allowed ACP CEO call under the grant its verified ingress bound (agent.canonical_peer_tools)
+    and, given ``emitted_names``, every name is still exactly as the model emitted it. Authority
+    follows the turn principal and grant, never message text."""
     from tools.approval_context import is_peer_turn
 
     if getattr(agent, "_turn_principal", None) != "peer" and not is_peer_turn():
         return False
+    if emitted_names is not None and [_tc_name(tc) for tc in tool_calls] != list(emitted_names):
+        return True
     from agent.canonical_peer_tools import batch_allowed
 
     calls = []
@@ -369,9 +371,20 @@ def _refuse_peer_tool_calls(agent, tool_calls, messages: list) -> bool:
         args, parse_error = _parse_tool_arguments(getattr(getattr(tc, "function", None), "arguments", None))
         # An alias would dispatch as a different tool than the one the policy names.
         calls.append((raw_name if _canonical_tool_name(raw_name) == raw_name else "", None if parse_error else args))
-    if batch_allowed(agent, calls):
-        return False
+    return not batch_allowed(agent, calls)
+
+
+def append_peer_refusals(agent, tool_calls, messages: list) -> None:
+    """One refusal result per call, so the assistant turn keeps its matching results."""
     _append_skipped_tool_results(agent, messages, tool_calls, "", content=_PEER_TOOL_REFUSAL)
+
+
+def _refuse_peer_tool_calls(agent, tool_calls, messages: list) -> bool:
+    """A canonical peer turn asks for no approval and runs nothing of a batch it may not run as a
+    whole (:func:`peer_batch_refused`); every call then gets a refusal result."""
+    if not peer_batch_refused(agent, tool_calls):
+        return False
+    append_peer_refusals(agent, tool_calls, messages)
     return True
 
 

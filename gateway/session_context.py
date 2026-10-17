@@ -144,6 +144,12 @@ def set_session_vars(
     return tokens
 
 
+def current_cron_session() -> Any:
+    """The cron var exactly as bound in this context (tri-state, ``_UNSET`` included), for a caller
+    that rebinds the session vars and must carry the live value over instead of resetting it."""
+    return _CRON_SESSION.get()
+
+
 def clear_session_vars(tokens: list) -> None:
     """Mark session context variables as explicitly cleared (``""``, not ``_UNSET``), so
     ``get_session_env`` returns empty instead of stale ``os.environ`` values.  Async-delivery

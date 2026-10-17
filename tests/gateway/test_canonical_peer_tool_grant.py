@@ -6,18 +6,50 @@ real MCP tool handler to a fake transport. Only the configured CEO binding, on t
 still its binding's current one, gets a yes; every refusal is checked next to an allowed turn so it
 cannot pass merely because peer turns run nothing."""
 
-import asyncio
-import hashlib
-import json
-from types import SimpleNamespace
+import atexit
+import os
+import pwd
+import shutil
+import tempfile
+from pathlib import Path
 
 import pytest
-import yaml
 
-from gateway.canonical_surface import CanonicalIngressEvent, CanonicalReceiptCoordinator, CanonicalSurfaceBinding
-from gateway.config import GatewayConfig, Platform
-from gateway.run import GatewayRunner
-from gateway.session import SessionSource
+# Pinned BEFORE any Hermes import, for every resolver, import-time path, cache and subprocess of
+# this module: HOME and HERMES_HOME name a fresh tmp dir, so even a run outside tests/ (no hermetic
+# conftest), which once let these helpers replace the user's live config, resolves nothing in the
+# real home. _LIVE_CONFIG comes from the account database, never from HOME.
+_LIVE_CONFIG = (Path(pwd.getpwuid(os.getuid()).pw_dir) / ".hermes" / "config.yaml").resolve()
+_PINNED_ROOT = Path(tempfile.mkdtemp(prefix="hermes-peer-tools-")).resolve()
+if _PINNED_ROOT.is_relative_to(_LIVE_CONFIG.parent) or _LIVE_CONFIG.is_relative_to(_PINNED_ROOT):
+    raise RuntimeError(f"the pinned test home {_PINNED_ROOT} overlaps the real home")
+atexit.register(shutil.rmtree, _PINNED_ROOT, True)
+os.environ["HOME"] = str(_PINNED_ROOT)
+os.environ["HERMES_HOME"] = str(_PINNED_ROOT / ".hermes")
+
+
+@pytest.fixture(autouse=True)
+def _never_the_live_config():
+    """Fail before the test body when the resolver names the live config, whatever bound it."""
+    from hermes_cli.config import get_config_path
+
+    if get_config_path().resolve() == _LIVE_CONFIG:
+        pytest.fail("the config resolver names the live config")
+
+
+import asyncio  # noqa: E402
+import hashlib  # noqa: E402
+import json  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+
+import yaml  # noqa: E402
+
+from gateway.canonical_surface import (  # noqa: E402
+    CanonicalIngressEvent, CanonicalReceiptCoordinator, CanonicalSurfaceBinding,
+)
+from gateway.config import GatewayConfig, Platform  # noqa: E402
+from gateway.run import GatewayRunner  # noqa: E402
+from gateway.session import SessionSource  # noqa: E402
 
 CEO = "acp-canonical-ceo"
 TOOL = "mcp__acp_ceo__run_get"
@@ -37,9 +69,13 @@ def target(tmp_path, monkeypatch):
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
     monkeypatch.setattr("hermes_state.DEFAULT_DB_PATH", home / "state.db")
-    get_config_path().write_text(yaml.safe_dump({"gateway": {"canonical_peer_tools": {
+    config = get_config_path().resolve()
+    if config == _LIVE_CONFIG or not config.is_relative_to(home.resolve()):
+        pytest.fail(f"refusing to write a config outside the test's tmp HERMES_HOME: {config}")
+    config.write_text(yaml.safe_dump({"gateway": {"canonical_peer_tools": {
         "binding": CEO, "mcp_server": "acp-ceo", "read": [TOOL], "mutate": {}}}}), encoding="utf-8")
     metas = []
     server = MCPServerTask("acp-ceo")
@@ -177,3 +213,123 @@ def test_an_allowed_peer_call_sends_its_real_session_and_the_context_it_runs_in_
     }
     assert expected["lineage_root_digest"] and actor.allowed == [True, True]
     assert metas == [{**expected, "cron": False, "delegation_depth": 0}, {**expected, "cron": True, "delegation_depth": 1}]
+
+
+def call(name, args, call_id):
+    return SimpleNamespace(id=call_id, type="function", function=SimpleNamespace(name=name, arguments=json.dumps(args)))
+
+
+@pytest.mark.parametrize("cron_context, process_cron", [("1", ""), ("", "1")])
+def test_canonical_ingress_preserves_live_cron_context(target, monkeypatch, cron_context, process_cron):
+    from gateway.session_context import clear_session_vars, get_session_env, set_session_vars
+
+    runner, actor, db, entry, binding, metas = target
+    monkeypatch.setenv("HERMES_CRON_SESSION", process_cron)
+    token = set_session_vars(cron_session=cron_context)
+    try:
+        assert get_session_env("HERMES_CRON_SESSION") == cron_context
+        submit(runner, binding(CEO), "cron-context")
+    finally:
+        clear_session_vars(token)
+    assert actor.allowed == [True] and len(metas) == 1
+    assert metas[0]["cron"] is (cron_context == "1"), metas
+
+
+@pytest.mark.parametrize("invalidate", ["routing_head", "run_generation"])
+def test_identity_invalidated_after_batch_check_sends_nothing(target, monkeypatch, invalidate):
+    runner, actor, db, entry, binding, metas = target
+    submit(runner, binding(CEO), "valid-control")
+    assert actor.allowed == [True] and len(metas) == 1
+    metas.clear()
+
+    def hook(name, args, **kwargs):
+        if invalidate == "routing_head":
+            entry.session_id = "another-session"
+        else:
+            runner._begin_session_run_generation(entry.session_key)
+        return None, args
+
+    monkeypatch.setattr("hermes_cli.plugins._dispatch_pre_tool_call_hooks", hook)
+    submit(runner, binding(CEO), "invalidated-after-check")
+    assert actor.allowed == [True, True]
+    assert metas == [], f"Call reached MCP after {invalidate} changed: {metas}"
+
+
+def test_identity_invalidated_while_the_send_waits_for_transport_sends_nothing(target, monkeypatch):
+    """The send re-proves the fence after its pin was claimed (a queue wait or a retry)."""
+    import tools.mcp_tool_handlers as handlers
+    from tools.mcp_tool_common import _core
+
+    runner, actor, db, entry, binding, metas = target
+    submit(runner, binding(CEO), "valid-control")
+    assert actor.allowed == [True] and len(metas) == 1
+    metas.clear()
+    acquire = handlers._acquire_call_server
+
+    def delayed(server_name, timeout):
+        runner._begin_session_run_generation(entry.session_key)
+        return acquire(server_name, timeout)
+
+    monkeypatch.setattr(handlers, "_acquire_call_server", delayed)
+    submit(runner, binding(CEO), "invalidated-in-transport")
+    assert actor.allowed == [True, True] and metas == []
+    assert _core._server_error_counts.get("acp-ceo", 0) == 0, "a refusal is not a server failure"
+
+
+@pytest.mark.parametrize("invalidate", ["suspended", "origin"])
+def test_existing_identity_fence_is_rechecked_before_batch(target, invalidate):
+    runner, actor, db, entry, binding, metas = target
+    submit(runner, binding(CEO), "valid-control")
+    assert actor.allowed == [True] and len(metas) == 1
+    metas.clear()
+
+    def change():
+        if invalidate == "suspended":
+            entry.suspended = True
+        else:
+            entry.origin.user_id = "another-owner"
+
+    actor.during = change
+    submit(runner, binding(CEO), "invalidated-before-check")
+    assert actor.allowed[-1] is False and metas == [], (actor.allowed, metas)
+
+
+def test_completed_multi_tool_turn_terminalizes_its_receipt(target, monkeypatch):
+    import model_tools
+    from tools.approval_context import get_turn_principal
+
+    runner, actor, db, entry, binding, metas = target
+    send = model_tools.handle_function_call
+
+    def conversation(text, *, conversation_history, task_id, **kwargs):
+        from agent.tool_executor import _refuse_peer_tool_calls
+
+        calls = [call(TOOL, {"runId": "r1"}, "c1"), call(TOOL, {"runId": "r2"}, "c2")]
+        assert get_turn_principal() == "peer"
+        assert not _refuse_peer_tool_calls(actor, calls, [])
+        results = [send(c.function.name, json.loads(c.function.arguments)) for c in calls]
+        assert len(metas) == 2
+        actor._persist_user_message_idx = len(conversation_history)
+        return {"completed": True, "session_id": task_id, "final_response": "done", "messages": [
+            *conversation_history, {"role": "user", "content": text},
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": c.id, "type": "function", "function": {"name": c.function.name,
+                                                              "arguments": c.function.arguments}} for c in calls]},
+            *[{"role": "tool", "tool_call_id": c.id, "content": result} for c, result in zip(calls, results)],
+            {"role": "assistant", "content": "done"}]}
+
+    monkeypatch.setattr(actor, "run_conversation", conversation)
+    event = CanonicalIngressEvent.from_json_bytes(json.dumps({
+        "binding": CEO, "event_id": "two-tools", "author_id": "author", "channel_id": "channel",
+        "text": "act"}).encode())
+    coordinator = CanonicalReceiptCoordinator(runner)
+    try:
+        result = asyncio.run(coordinator.submit(binding(CEO), event))
+    except ValueError as exc:
+        recorded = json.loads(db.get_meta(coordinator._key(binding(CEO), event)))
+        replay = asyncio.run(coordinator.submit(binding(CEO), event))
+        pytest.fail(f"{len(metas)} MCP sends completed; {exc}; durable receipt={recorded['state']}; "
+                    f"replay={replay.status}")
+    assert result.status == "terminal" and result.terminal_text == "done"
+    assert asyncio.run(coordinator.submit(binding(CEO), event)) == result
+    assert len(metas) == 2

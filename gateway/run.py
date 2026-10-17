@@ -3529,7 +3529,8 @@ class GatewayRunner(
         history_boundary: int,
         expected_session_id: str,
     ) -> Any:
-        """Select exactly one terminal assistant message from the current turn."""
+        """Select exactly one terminal assistant message from the current turn, after complete
+        tool-call rows each answered by exactly one result per call."""
         from gateway.canonical_surface import CanonicalTurnResult
 
         if (
@@ -3559,38 +3560,37 @@ class GatewayRunner(
         ):
             raise ValueError("canonical_turn_refused")
 
-        expecting_tool = False
-        expected_tool_call_id: Optional[str] = None
+        # Ids of the open tool-call row still owed a result: one tool row per id, each exactly once,
+        # before anything else (executors may answer a batch out of call order).
+        owed: set[str] = set()
         terminal: Optional[str] = None
         for index, row in enumerate(suffix[1:], start=1):
             if not isinstance(row, dict) or not isinstance(row.get("role"), str):
                 raise ValueError("canonical_turn_refused")
             role = row["role"]
-            if expecting_tool:
+            if owed:
                 if (
                     role != "tool"
-                    or row.get("tool_call_id") != expected_tool_call_id
+                    or row.get("tool_call_id") not in owed
                     or not isinstance(row.get("content"), str)
                     or not row["content"].strip()
                 ):
                     raise ValueError("canonical_turn_refused")
-                expecting_tool = False
-                expected_tool_call_id = None
+                owed.discard(row["tool_call_id"])
                 continue
             if role != "assistant":
                 raise ValueError("canonical_turn_refused")
             if "tool_calls" in row:
                 tool_calls = row["tool_calls"]
+                ids = [call.get("id") if isinstance(call, dict) else None
+                       for call in (tool_calls if isinstance(tool_calls, list) else ())]
                 if (
-                    not isinstance(tool_calls, list)
-                    or len(tool_calls) != 1
-                    or not isinstance(tool_calls[0], dict)
-                    or not isinstance(tool_calls[0].get("id"), str)
-                    or not tool_calls[0]["id"].strip()
+                    not ids
+                    or any(not isinstance(call_id, str) or not call_id.strip() for call_id in ids)
+                    or len(set(ids)) != len(ids)
                 ):
                     raise ValueError("canonical_turn_refused")
-                expected_tool_call_id = tool_calls[0]["id"]
-                expecting_tool = True
+                owed = set(ids)
                 continue
             content = row.get("content")
             if (
@@ -3601,7 +3601,7 @@ class GatewayRunner(
             ):
                 raise ValueError("canonical_turn_refused")
             terminal = content
-        if expecting_tool or terminal is None:
+        if owed or terminal is None:
             raise ValueError("canonical_turn_refused")
         return CanonicalTurnResult(binding_name=binding_name, terminal_text=terminal)
 
@@ -3706,8 +3706,17 @@ class GatewayRunner(
                 raise ValueError("canonical_turn_refused")
             from agent.canonical_peer import render_peer_turn, validate_peer_metadata
             from agent.canonical_peer_tools import PeerToolGrant, bind_grant, reset_grant
-            from gateway.canonical_surface import _runs_tools_outside_hermes
-            from gateway.session_context import clear_session_vars, scoped_current_session_id, set_session_vars
+            from gateway.canonical_surface import (
+                CanonicalBindingProof,
+                CanonicalReceiptCoordinator,
+                _runs_tools_outside_hermes,
+            )
+            from gateway.session_context import (
+                clear_session_vars,
+                current_cron_session,
+                scoped_current_session_id,
+                set_session_vars,
+            )
             from tools.approval_context import reset_turn_principal, set_turn_principal
 
             peer = validate_peer_metadata(peer)
@@ -3717,17 +3726,21 @@ class GatewayRunner(
                 raise ValueError("canonical_peer_provenance_invalid")
             peer_prompt = render_peer_turn(peer, event.text)
 
+            admitted = CanonicalBindingProof(
+                entry=entry, session_key=binding.session_key, session_id=session_id,
+                db_path=expected_db_path, db_identity=expected_db_identity)
+
             def require_peer_fence() -> None:
-                # Re-run before every peer tool batch: the same routing head and run generation,
-                # the same actor on the same DB file, still serving this session, which is still
-                # open at its own compression tip with this event's receipt claimed.
+                # Re-run before every peer tool batch and every MCP send: the same run generation and
+                # actor on the same DB file, still serving this session with this event's receipt
+                # claimed, and the COMPLETE binding resolution the event was admitted under
+                # (principal, route entry, Telegram origin, not suspended, session open at its own
+                # compression tip, same entry, session and DB file).
                 require_current_head()
                 require_expected_actor()
+                CanonicalReceiptCoordinator(self)._require_same_resolution(binding, event, admitted)
                 db = getattr(agent, "_session_db", None)
-                row = db.get_session(session_id) if db is not None else None
-                if (getattr(agent, "session_id", None) != session_id or not row
-                        or row.get("ended_at") is not None
-                        or db.get_compression_tip(session_id) != session_id
+                if (getattr(agent, "session_id", None) != session_id or db is None
                         or db.get_meta(peer["receipt"]) is None):
                     raise ValueError("canonical_binding_stale")
             if _runs_tools_outside_hermes(agent):
@@ -3759,12 +3772,14 @@ class GatewayRunner(
                     agent.skip_background_review = True
                     # MCP call provenance names this turn's real session the way an owner turn's
                     # does (route, key, session id). No user identity is bound, since the peer is
-                    # not the owner; cron and delegation depth stay whatever the context says.
+                    # not the owner; the live cron value is carried over as bound (delegation depth
+                    # has its own context), never reset to fall back on the process environment.
                     session_tokens = set_session_vars(
                         platform=str(getattr(getattr(origin, "platform", None), "value", "") or ""),
                         chat_id=str(getattr(origin, "chat_id", "") or ""),
                         session_key=entry.session_key,
-                        parent_chat_id=str(getattr(origin, "parent_chat_id", "") or ""))
+                        parent_chat_id=str(getattr(origin, "parent_chat_id", "") or ""),
+                        cron_session=current_cron_session())
                     try:
                         with scoped_current_session_id(session_id):
                             return agent.run_conversation(

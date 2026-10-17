@@ -17,10 +17,11 @@ so a later id needs no restart):
   ``tool_call`` is allowed only when every call it wraps is.
 
 Anything else refuses the whole batch. An allowed batch PINS each MCP call it checked: the exact
-tool and final arguments, with ``peer_grant``, the digest of the policy entry this decision read.
-The MCP handler sends a peer-turn call only by claiming its pin (:func:`claim_pinned_call`), so a
-hook or wrapper that changes the call after the check, or a policy edited since, sends nothing.
-Message text never grants anything.
+tool, its current native handler and final arguments, with ``peer_grant``, the digest of the policy
+entry this decision read. The MCP handler sends a peer-turn call only by claiming its pin
+(:func:`claim_pinned_call`), which re-proves the identity fence, so a hook or wrapper that changes
+the call after the check, a handler replaced by a refresh, a policy edited since or a binding that
+went stale sends nothing. Message text never grants anything.
 """
 
 from __future__ import annotations
@@ -40,7 +41,7 @@ CONFIG_KEY = "canonical_peer_tools"
 class PeerToolGrant:
     """What the verified ingress proved for one peer turn. ``verify`` raises once the binding's
     session is no longer the one the turn was admitted on. ``pins`` holds the calls the latest
-    allowed batch checked: ``(tool, canonical arguments) -> [peer_grant, ...]``."""
+    allowed batch checked: ``(tool, canonical arguments, handler) -> [peer_grant, ...]``."""
 
     binding: str
     agent: Any = field(repr=False, compare=False)
@@ -129,22 +130,24 @@ def _active_policy(agent: Any = None) -> Optional[_Policy]:
     if grant is None or (agent is not None and agent is not grant.agent):
         return None
     policy = _load_policy()
-    if policy is None or grant.binding != policy.binding:
-        return None
+    return policy if policy is not None and grant.binding == policy.binding and _fence_holds(grant) else None
+
+
+def _native_handler(policy: _Policy, name: str) -> Any:
+    """The handler registered for ``name`` now, when it is a native tool handler of the configured
+    MCP server that runs without approval; else None."""
+    from tools.mcp_tool_handlers import mcp_tool_origin
+
+    origin = mcp_tool_origin(name)
+    return origin[2] if origin is not None and origin[0] == policy.server and not origin[1] else None
+
+
+def _fence_holds(grant: PeerToolGrant) -> bool:
     try:
         grant.verify()
     except Exception:
-        return None
-    return policy
-
-
-def _server_tool(policy: _Policy, name: str) -> bool:
-    """A native tool of the configured MCP server in this profile, runnable without approval."""
-    from tools.mcp_tool_handlers import mcp_tool_origin
-    from tools.registry import registry
-
-    origin = mcp_tool_origin(name) if registry.get_entry(name) is not None else None
-    return origin is not None and origin[0] == policy.server and not origin[1]
+        return False
+    return True
 
 
 def _check(policy: _Policy, name: str, args: Any) -> Optional[list]:
@@ -161,7 +164,7 @@ def _check(policy: _Policy, name: str, args: Any) -> Optional[list]:
         names = [str(n or "").strip() for n in ([raw] if isinstance(raw, str) else raw)] if isinstance(
             raw, (str, list)) else []
         names = [n for n in names if n]
-        allowed = bool(names) and all(n in policy.names() and _server_tool(policy, n) for n in names)
+        allowed = bool(names) and all(n in policy.names() and _native_handler(policy, n) is not None for n in names)
         return [] if allowed else None
     if name == TOOL_CALL_NAME:
         entries, error = normalize_tool_call_entries(dict(args))
@@ -174,7 +177,8 @@ def _check(policy: _Policy, name: str, args: Any) -> Optional[list]:
                 return None
             pins.extend(inner)
         return pins
-    if not _server_tool(policy, name):
+    handler = _native_handler(policy, name)
+    if handler is None:
         return None
     # Checked and pinned as dispatch will send them (handle_function_call coerces first).
     final = coerce_tool_args(name, copy.deepcopy(dict(args)))
@@ -189,7 +193,7 @@ def _check(policy: _Policy, name: str, args: Any) -> Optional[list]:
     else:
         return None
     canonical = _canonical(final)
-    return None if canonical is None else [(name, canonical, peer_grant_digest(entry))]
+    return None if canonical is None else [(name, canonical, handler, peer_grant_digest(entry))]
 
 
 def batch_allowed(agent: Any, calls: Sequence[tuple[str, Any]]) -> bool:
@@ -208,20 +212,24 @@ def batch_allowed(agent: Any, calls: Sequence[tuple[str, Any]]) -> bool:
     if grant is not None:
         with _pins_lock:
             grant.pins.clear()
-            for tool, canonical, digest in pins or ():
-                grant.pins.setdefault((tool, canonical), []).append(digest)
+            for tool, canonical, handler, digest in pins or ():
+                grant.pins.setdefault((tool, canonical, handler), []).append(digest)
     return pins is not None
 
 
-def claim_pinned_call(tool: str, args: Any) -> Optional[str]:
-    """Consume the pin for exactly this call and return its ``peer_grant``; None when the
-    current batch's check did not pin this tool with these final arguments (it must not be sent)."""
+def claim_pinned_call(tool: str, args: Any, handler: Any) -> Optional[tuple[str, Callable[[], bool]]]:
+    """Consume the pin for exactly this call through exactly this handler and return its
+    ``peer_grant`` with a re-check of the identity fence for each send attempt; None when the
+    current batch's check did not pin it or the fence no longer holds (it must not be sent)."""
     grant, canonical = _grant.get(), _canonical(args)
     if grant is None or canonical is None:
         return None
     with _pins_lock:
-        digests = grant.pins.get((tool, canonical))
-        return digests.pop(0) if digests else None
+        digests = grant.pins.get((tool, canonical, handler))
+        digest = digests.pop(0) if digests else None
+    if digest is None or not _fence_holds(grant):
+        return None
+    return digest, lambda: _fence_holds(grant)
 
 
 def scope_discovery_defs(tool_defs: Iterable[dict]) -> list:
@@ -239,4 +247,4 @@ def scope_discovery_defs(tool_defs: Iterable[dict]) -> list:
     def name(tool_def: Any) -> Any:
         return ((tool_def or {}).get("function") or {}).get("name") if isinstance(tool_def, dict) else None
 
-    return [d for d in tool_defs if name(d) in allowed and _server_tool(policy, name(d))]
+    return [d for d in tool_defs if name(d) in allowed and _native_handler(policy, name(d)) is not None]

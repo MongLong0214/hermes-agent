@@ -6,16 +6,46 @@ reached and every call in the batch gets the peer refusal result."""
 
 from __future__ import annotations
 
-import asyncio
-import hashlib
-import json
+import atexit
 import os
-from contextlib import contextmanager
-from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+import pwd
+import shutil
+import tempfile
+from pathlib import Path
 
 import pytest
-import yaml
+
+# Pinned BEFORE any Hermes import, for every resolver, import-time path, cache and subprocess of
+# this module: HOME and HERMES_HOME name a fresh tmp dir, so even a run outside tests/ (no hermetic
+# conftest), which once let these helpers replace the user's live config, resolves nothing in the
+# real home. _LIVE_CONFIG comes from the account database, never from HOME.
+_LIVE_CONFIG = (Path(pwd.getpwuid(os.getuid()).pw_dir) / ".hermes" / "config.yaml").resolve()
+_PINNED_ROOT = Path(tempfile.mkdtemp(prefix="hermes-peer-tools-")).resolve()
+if _PINNED_ROOT.is_relative_to(_LIVE_CONFIG.parent) or _LIVE_CONFIG.is_relative_to(_PINNED_ROOT):
+    raise RuntimeError(f"the pinned test home {_PINNED_ROOT} overlaps the real home")
+atexit.register(shutil.rmtree, _PINNED_ROOT, True)
+os.environ["HOME"] = str(_PINNED_ROOT)
+os.environ["HERMES_HOME"] = str(_PINNED_ROOT / ".hermes")
+
+
+@pytest.fixture(autouse=True)
+def _never_the_live_config():
+    """Fail before the test body when the resolver names the live config, whatever bound it."""
+    from hermes_cli.config import get_config_path
+
+    if get_config_path().resolve() == _LIVE_CONFIG:
+        pytest.fail("the config resolver names the live config")
+
+
+import asyncio  # noqa: E402
+import hashlib  # noqa: E402
+import json  # noqa: E402
+import threading  # noqa: E402
+from contextlib import contextmanager  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+from unittest.mock import MagicMock, patch  # noqa: E402
+
+import yaml  # noqa: E402
 
 SERVER = "acp-ceo"
 BINDING = "acp-canonical-ceo"
@@ -51,10 +81,23 @@ def _policy(**changes) -> dict:
     return policy
 
 
-def _write_config(policy: dict) -> None:
+_isolated_home: list = []  # the tmp HERMES_HOME ceo_tools bound; empty outside it
+
+
+def _isolated_config_path() -> Path:
+    """config.yaml of the tmp HERMES_HOME ``ceo_tools`` bound. Fails the test rather than return any
+    path outside that pytest tmp dir, above all the live config."""
     from hermes_cli.config import get_config_path
 
-    path = get_config_path()
+    path = get_config_path().resolve()
+    root = _isolated_home[-1].resolve() if _isolated_home else None
+    if root is None or path == _LIVE_CONFIG or not path.is_relative_to(root):
+        pytest.fail(f"refusing to write a config outside the test's tmp HERMES_HOME: {path}")
+    return path
+
+
+def _write_config(policy: dict) -> None:
+    path = _isolated_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     staged = path.with_name("config.yaml.staged")
     staged.write_text(yaml.safe_dump({"gateway": {"canonical_peer_tools": policy}}), encoding="utf-8")
@@ -82,8 +125,22 @@ class Sent(list):
 
 
 @pytest.fixture
-def ceo_tools(monkeypatch):
-    """The tools as REAL MCP tool handlers (``_make_tool_handler``) over a fake transport."""
+def ceo_tools(monkeypatch, tmp_path):
+    """The tools as REAL MCP tool handlers (``_make_tool_handler``) over a fake transport, with
+    HERMES_HOME and HOME bound to this test's own tmp dir whatever conftest did."""
+    home = tmp_path / "hermes-home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _isolated_home.append(home)
+    try:
+        _isolated_config_path()  # fail before any setup when the isolation did not take
+        yield from _ceo_tools(monkeypatch)
+    finally:
+        _isolated_home.remove(home)
+
+
+def _ceo_tools(monkeypatch):
     import model_tools
     from tools.mcp_call_provenance import PROVENANCE_META_KEY
     from tools.mcp_tool import MCPServerTask
@@ -111,14 +168,18 @@ def ceo_tools(monkeypatch):
             name = f"mcp__{server.replace('-', '_')}__{tool}"
             registry.register(name, f"mcp-{server}", _defs(name)[0]["function"], _make_tool_handler(server, tool, 30))
             _track_mcp_tool_server(name, server)
-    monkeypatch.setattr("tools.mcp_tool_loop._run_on_mcp_loop",
-                        lambda call, timeout=30: asyncio.run(call() if callable(call) else call))
+    # One MCP loop thread, as in production: concurrent sends share each server's asyncio lock.
+    loop = asyncio.new_event_loop()
+    threading.Thread(target=loop.run_forever, daemon=True).start()
+    monkeypatch.setattr("tools.mcp_tool_loop._run_on_mcp_loop", lambda call, timeout=30: asyncio.run_coroutine_threadsafe(
+        call() if callable(call) else call, loop).result(timeout))
     # The tool_call unwrap scopes the bridge to the session's own (pre-assembly) tool defs.
     monkeypatch.setattr(model_tools, "get_tool_definitions", lambda *a, **k: _defs(*REGISTERED))
     _write_config(_policy())
     try:
         yield sent
     finally:
+        loop.call_soon_threadsafe(loop.stop)
         for name in REGISTERED:
             registry.deregister(name)
             _forget_mcp_tool_server(name)
@@ -447,3 +508,148 @@ def test_a_pin_lives_only_until_the_next_check(agent, ceo_tools, monkeypatch):
         run(agent, [call("terminal", {"command": "id"})])  # a refused batch leaves no pin behind
         unchecked = registry.get_entry(ceo("run_get")).handler({})
     assert "NOT run" in unchecked and ceo_tools == []
+
+
+def _tool_round(agent, calls):
+    from agent.turn_tool_round import run_tool_round
+
+    messages = [{"role": "user", "content": "act"}]
+    run_tool_round(agent, assistant_message=SimpleNamespace(content=None, tool_calls=calls),
+                   finish_reason="tool_calls", messages=messages, conversation_history=[], api_call_count=1,
+                   effective_task_id="task", user_message="act", system_message=None, active_system_prompt="SYSTEM",
+                   compression_attempts=0, max_compression_attempts=2, final_response=None, failed=False,
+                   _turn_exit_reason=None, truncated_tool_call_retries=0, current_turn_user_idx=0)
+    return messages
+
+
+UNKNOWN = "unavailable_zqxv_unrelated"
+
+
+def test_the_real_tool_round_refuses_a_mixed_unknown_peer_batch(agent, ceo_tools):
+    assert UNKNOWN not in agent.valid_tool_names and agent._repair_tool_call(UNKNOWN) is None
+    with peer_turn(agent):
+        # The same real round first establishes an allowed execution control.
+        for suffix, calls in [("control", [call(ceo("run_get"))]),
+                              ("mixed", [call(ceo("run_get"), {}, "r"), call(UNKNOWN, {}, "unknown")])]:
+            _tool_round(agent, calls)
+            if suffix == "control":
+                assert ceo_tools == [(ceo("run_get"), {})]
+                ceo_tools.clear()
+    assert ceo_tools == [], f"Part of a disallowed peer batch executed: {ceo_tools}"
+
+
+@pytest.mark.parametrize("plan", ["sequential", "parallel", "segmented"])
+def test_every_executor_behind_the_tool_round_runs_nothing_of_a_peer_batch_with_an_unknown_call(
+        agent, ceo_tools, monkeypatch, plan):
+    """Two listed calls survive the round's unknown-call filter, so each executor would run them."""
+    plans = {"sequential": lambda calls: [("sequential", calls)], "parallel": lambda calls: [("parallel", calls)],
+             "segmented": lambda calls: [("parallel", calls[:1]), ("sequential", calls[1:])]}
+    monkeypatch.setattr("agent.tool_dispatch_helpers._plan_tool_batch_segments",
+                        lambda calls, **kw: plans[plan](list(calls)))
+    listed = [call(ceo("run_get"), {"runId": "r1"}, "a"), call(ceo("run_get"), {"runId": "r2"}, "b")]
+    with peer_turn(agent):
+        _tool_round(agent, listed)
+        assert len(ceo_tools) == 2, "control: the executor runs an allowed batch"
+        ceo_tools.clear()
+        messages = _tool_round(agent, [*listed, call(UNKNOWN, {}, "u")])
+    results = [m for m in messages if m.get("role") == "tool"]
+    assert ceo_tools == [] and sorted(m["tool_call_id"] for m in results) == ["a", "b", "u"]
+    assert all("not executed" in m["content"] for m in results)
+
+
+def _native_then_utility(server, name):
+    """Register ``name`` as the server's NATIVE tool through the real registration path."""
+    from tools.mcp_tool_registration import _register_server_tools
+
+    async def list_tools():
+        return SimpleNamespace(tools=[], nextCursor=None)
+
+    server.session.list_tools = list_tools
+    server.initialize_result = SimpleNamespace(capabilities=SimpleNamespace(
+        tools=SimpleNamespace(), resources=SimpleNamespace(), prompts=SimpleNamespace()))
+    server._tools = [SimpleNamespace(name=name.rsplit("__", 1)[1], description="native tool",
+                                     inputSchema={"type": "object", "properties": {"uri": {"type": "string"},
+                                                                                   "name": {"type": "string"}}},
+                                     annotations=None)]
+    server._registered_tool_names = _register_server_tools(SERVER, server, {})
+
+
+def _forget(server):
+    from tools.mcp_tool_registration import _forget_mcp_tool_server
+    from tools.registry import registry
+
+    for tool_name in server._registered_tool_names:
+        registry.deregister(tool_name)
+        _forget_mcp_tool_server(tool_name)
+
+
+def test_native_tool_replaced_by_utility_does_not_inherit_peer_authority(agent, ceo_tools, monkeypatch):
+    from tools.mcp_tool_common import _core
+    from tools.mcp_tool_handlers import mcp_tool_origin
+
+    server = _core._servers[SERVER]
+    name = ceo("read_resource")
+    resource_calls = []
+
+    async def read_resource(uri):
+        resource_calls.append(uri)
+        return SimpleNamespace(contents=[SimpleNamespace(text="resource bytes")])
+
+    server.session.read_resource = read_resource
+    _native_then_utility(server, name)
+    _write_config(_policy(read=[], mutate={name: {"uri": ["test://native"]}}))
+    try:
+        with peer_turn(agent):
+            run(agent, [call(name, {"uri": "test://native"})])
+            assert ceo_tools == [(name, {"uri": "test://native"})] and resource_calls == []
+            # Production tools/list_changed path removes the native tool, then adds the
+            # generated resources/read utility under the same registry spelling.
+            asyncio.run(server._refresh_tools())
+            assert server._tools == []
+            monkeypatch.setattr("hermes_cli.plugins._dispatch_pre_tool_call_hooks",
+                                lambda name, args, **kw: (None, {**args, "uri": "test://utility"}))
+            run(agent, [call(name, {"uri": "test://native"})])
+        assert resource_calls == [], (mcp_tool_origin(name), resource_calls)
+    finally:
+        _forget(server)
+
+
+@pytest.mark.parametrize("tool, method, args", [
+    ("list_resources", "list_resources", {}),
+    ("list_prompts", "list_prompts", {}),
+    ("get_prompt", "get_prompt", {"name": "p"}),
+])
+def test_every_generated_utility_substituted_by_a_refresh_is_refused_in_a_peer_turn(
+        agent, ceo_tools, tool, method, args):
+    from tools.mcp_tool_common import _core
+    from tools.registry import registry
+
+    server = _core._servers[SERVER]
+    name, rpc_calls = ceo(tool), []
+
+    async def rpc(*a, **kw):
+        rpc_calls.append(a)
+        return SimpleNamespace(resources=[], prompts=[], nextCursor=None, messages=[], description="")
+
+    setattr(server.session, method, rpc)
+    _native_then_utility(server, name)
+    _write_config(_policy(read=[name], mutate={}))
+    try:
+        with peer_turn(agent):
+            run(agent, [call(name, args)])
+            assert ceo_tools == [(name, args)] and rpc_calls == []
+            asyncio.run(server._refresh_tools())
+            assert registry.get_entry(name) is not None, "the refresh registered the generated utility"
+            refused_batch = run(agent, [call(name, args)])
+            direct = registry.get_entry(name).handler(dict(args))
+        assert refused(refused_batch, [1]) and "NOT run" in direct and rpc_calls == []
+    finally:
+        _forget(server)
+
+
+def test_config_writes_refuse_any_home_but_the_tests_own(ceo_tools, tmp_path, monkeypatch):
+    elsewhere = tmp_path.parent / f"{tmp_path.name}-elsewhere"
+    monkeypatch.setenv("HERMES_HOME", str(elsewhere))
+    with pytest.raises(pytest.fail.Exception, match="refusing to write"):
+        _write_config(_policy())
+    assert not elsewhere.exists()
