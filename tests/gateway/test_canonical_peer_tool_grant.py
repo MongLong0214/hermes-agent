@@ -595,3 +595,120 @@ def test_real_rpc_lock_queue_rechecks_the_complete_live_identity(target, monkeyp
         if server._rpc_lock.locked():
             _mcp_loop._run_on_mcp_loop(release, timeout=5)
         _mcp_loop._stop_mcp_loop()
+
+
+def _event(event_id):
+    return CanonicalIngressEvent.from_json_bytes(json.dumps({
+        "binding": CEO, "event_id": event_id, "author_id": "author", "channel_id": "channel",
+        "text": "act"}).encode())
+
+
+def _two_sends_then(actor, runs, terminal):
+    """A conversation that sends two listed calls, then returns ``terminal`` as its final reply."""
+    from agent.tool_executor import _refuse_peer_tool_calls
+    from model_tools import handle_function_call
+
+    def conversation(text, *, conversation_history, task_id, **kwargs):
+        runs.append(text)
+        calls = [call(TOOL, {}, "c1"), call(TOOL, {}, "c2")]
+        assert not _refuse_peer_tool_calls(actor, calls, [])
+        results = [handle_function_call(c.function.name, {}) for c in calls]
+        actor._persist_user_message_idx = len(conversation_history)
+        return {"completed": True, "session_id": task_id, "final_response": terminal, "messages": [
+            *conversation_history, {"role": "user", "content": text},
+            {"role": "assistant", "tool_calls": [{"id": c.id, "function": {
+                "name": c.function.name, "arguments": c.function.arguments}} for c in calls]},
+            *[{"role": "tool", "tool_call_id": c.id, "content": result} for c, result in zip(calls, results)],
+            {"role": "assistant", "content": terminal}]}
+    return conversation
+
+
+def test_oversize_terminal_result_durably_records_failure_after_effect(target, monkeypatch):
+    from gateway.canonical_surface import _MAX_TEXT_CHARS
+
+    runner, actor, db, entry, binding, metas = target
+    runs = []
+    monkeypatch.setattr(actor, "run_conversation", _two_sends_then(actor, runs, "x" * (_MAX_TEXT_CHARS + 1)))
+    submission = _event("oversize")
+    coordinator = CanonicalReceiptCoordinator(runner)
+    try:
+        asyncio.run(coordinator.submit(binding(CEO), submission))
+    except ValueError:
+        pass
+    recorded = json.loads(db.get_meta(coordinator._key(binding(CEO), submission)))
+    replay = asyncio.run(coordinator.submit(binding(CEO), submission))
+    assert len(metas) == 2 and len(runs) == 1
+    assert recorded["state"] == "terminal" and replay.failure is not None, (recorded, replay)
+    assert replay.failure["side_effects"] == "attempted"
+
+
+@pytest.mark.parametrize("text", ["x" * 16_384, '"' * 16_384, "\x01" * 16_384, "x" * 16_385],
+                         ids=["16384-plain", "16384-quotes", "16384-control", "16385"])
+def test_the_result_length_boundary_always_stores_a_terminal_receipt(target, monkeypatch, text):
+    """16,384 characters, however escaped, are recorded as the answer; 16,385 record a sized failure
+    summary that keeps the sends and identifies the full reply. Never pending, never re-run."""
+    import hashlib as _hashlib
+
+    from gateway.canonical_surface import _MAX_RECEIPT_CHARS
+
+    runner, actor, db, entry, binding, metas = target
+    runs = []
+    monkeypatch.setattr(actor, "run_conversation", _two_sends_then(actor, runs, text))
+    submission = _event(f"length-{len(text)}-{ord(text[0])}")
+    coordinator = CanonicalReceiptCoordinator(runner)
+    first = asyncio.run(coordinator.submit(binding(CEO), submission))
+    stored = db.get_meta(coordinator._key(binding(CEO), submission))
+    replay = asyncio.run(coordinator.submit(binding(CEO), submission))
+    assert json.loads(stored)["state"] == "terminal" and len(stored) <= _MAX_RECEIPT_CHARS
+    assert replay == first and len(runs) == 1 and len(metas) == 2
+    if len(text) <= 16_384:
+        assert first.terminal_text == text and first.failure is None
+    else:
+        assert first.terminal_text is None and first.failure["code"] == "canonical_result_too_large"
+        assert first.failure["side_effects"] == "attempted" and first.failure["attempted_count"] == 2
+        assert first.failure["result_chars"] == len(text)
+        assert first.failure["result_sha256"] == _hashlib.sha256(text.encode()).hexdigest()
+
+
+def test_request_cancellation_terminalizes_observed_effect(target, monkeypatch):
+    import threading
+
+    from agent.tool_executor import _refuse_peer_tool_calls
+    from model_tools import handle_function_call
+
+    runner, actor, db, entry, binding, metas = target
+    sent, stop = threading.Event(), threading.Event()
+    runs = []
+
+    def conversation(text, *, conversation_history, task_id, **kwargs):
+        runs.append(text)
+        assert not _refuse_peer_tool_calls(actor, [call(TOOL, {}, "c1")], [])
+        handle_function_call(TOOL, {})
+        sent.set()
+        assert stop.wait(5), "cancellation did not interrupt the actor"
+        actor._persist_user_message_idx = len(conversation_history)
+        return {"completed": False, "partial": True, "session_id": task_id, "final_response": "", "messages": []}
+
+    monkeypatch.setattr(actor, "run_conversation", conversation)
+    monkeypatch.setattr(actor, "interrupt", lambda *a, **kw: stop.set())
+    coordinator = CanonicalReceiptCoordinator(runner)
+    submission = _event("cancel-after-send")
+
+    async def exercise():
+        task = asyncio.create_task(coordinator.submit(binding(CEO), submission))
+        try:
+            assert await asyncio.to_thread(sent.wait, 5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            stop.set()
+        recorded = json.loads(db.get_meta(coordinator._key(binding(CEO), submission)))
+        replay = await coordinator.submit(binding(CEO), submission)
+        assert len(metas) == 1 and len(runs) == 1
+        assert recorded["state"] == "terminal" and replay.failure is not None, (recorded, replay)
+        assert replay.failure["side_effects"] == "attempted"
+        assert replay.failure["code"] == "canonical_turn_cancelled" and replay.failure["settled"] is True
+        assert replay.failure["attempted"] == [{"tool": TOOL, "peer_grant": _peer_digest({"read": TOOL})}]
+
+    asyncio.run(exercise())

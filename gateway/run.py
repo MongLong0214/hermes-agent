@@ -3800,6 +3800,8 @@ class GatewayRunner(
                             observation.actor_failed = True
                         raise
                     finally:
+                        if observation is not None:
+                            observation.actor_finished = True
                         clear_session_vars(session_tokens)
                         agent._turn_principal = prior_principal
                         agent.skip_background_review = prior_skip_review

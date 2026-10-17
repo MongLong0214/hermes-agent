@@ -363,8 +363,8 @@ def peer_batch_refused(agent, tool_calls, emitted_names=None) -> bool:
         return True
     from agent.canonical_peer_tools import batch_allowed, batch_resolved
 
-    if batch_resolved(agent, [_pairing_tool_call_id(tc) for tc in tool_calls]):
-        return False  # part of a batch already resolved and pinned as a whole (a segment)
+    if batch_resolved(agent, tool_calls, _pairing_tool_call_id):
+        return False  # part of a batch already prepared and pinned as a whole (a segment)
 
     calls = []
     for tc in tool_calls:
@@ -382,28 +382,37 @@ def _peer_turn(agent) -> bool:
 
 
 def _resolve_peer_batch(agent, tool_calls, messages: list, effective_task_id: str) -> bool:
-    """In a canonical peer turn, fix the WHOLE batch before its first call runs: each call's request
-    middleware, ``pre_tool_call`` hooks and guardrail verdict first, then (after any registry refresh
-    they caused) each native handler and the policy on the final arguments, pinned as one batch that
-    dispatch then uses unchanged (:func:`_pre_tool_block`). True, with a refusal per call, when any
-    call is refused; nothing has run."""
+    """In a canonical peer turn, prepare the WHOLE batch before its first call runs: each call's
+    unwrap, request middleware, ``pre_tool_call`` hooks, coercion and guardrail verdict first, then
+    (after any registry refresh they caused) each native handler and the policy on the final
+    arguments. Every executor then dispatches exactly the prepared name, handler and arguments
+    (:func:`_parse_tool_call`, :func:`_pre_tool_block`, ``model_tools._execute_tool``). True, with a
+    refusal per call, when any call is refused or an emitted call changed while it was prepared;
+    nothing has run."""
     if not _peer_turn(agent):
         return False
     from agent.canonical_peer_tools import batch_allowed, batch_resolved
+    from tools.arg_coercion import coerce_tool_args
+    from tools.tool_search import TOOL_CALL_NAME
 
-    if batch_resolved(agent, [_pairing_tool_call_id(tc) for tc in tool_calls]):
+    if batch_resolved(agent, tool_calls, _pairing_tool_call_id):
         return False
+    as_emitted = [(_tc_name(tc), getattr(getattr(tc, "function", None), "arguments", None)) for tc in tool_calls]
     finals = []
     for tc in tool_calls:
-        pc = _parse_tool_call(agent, tc)
+        pc = _parse_emitted_call(agent, tc)
         final = None
-        if pc.parse_error is None and pc.scope_block is None and _canonical_tool_name(_tc_name(tc)) == _tc_name(tc):
+        if (pc.parse_error is None and pc.scope_block is None and pc.name != TOOL_CALL_NAME
+                and _canonical_tool_name(_tc_name(tc)) == _tc_name(tc)):
             block, final = _peer_final_args(agent, pc.ref(effective_task_id))
-            final = None if block is not None else final
-        finals.append((_pairing_tool_call_id(tc), pc.name, final))
-    if batch_allowed(agent, [(name, final) for _id, name, final in finals],
-                     resolved={call_id: final for call_id, _name, final in finals}):
+            final = coerce_tool_args(pc.name, final) if block is None else None
+        finals.append((pc.name, final))
+    unchanged = as_emitted == [(_tc_name(tc), getattr(getattr(tc, "function", None), "arguments", None))
+                               for tc in tool_calls]
+    if unchanged and batch_allowed(agent, finals, emitted=[(_pairing_tool_call_id(tc), tc) for tc in tool_calls]):
         return False
+    if not unchanged:
+        batch_allowed(agent, [])  # an emitted call was changed while it was prepared: clear everything
     append_peer_refusals(agent, tool_calls, messages)
     return True
 
@@ -539,6 +548,21 @@ class _ParsedCall:
 
 
 def _parse_tool_call(agent, tool_call, *, flatten_probe: bool = False) -> _ParsedCall:
+    """The call an executor dispatches. In a canonical peer turn that is ONLY the prepared name and
+    arguments of this very emitted call (never reparsed, unwrapped or validated again); a call with
+    no prepared entry is blocked, never looked up."""
+    if _peer_turn(agent):
+        from agent.canonical_peer_tools import prepared_call
+
+        prepared = prepared_call(_pairing_tool_call_id(tool_call), tool_call)
+        if prepared is None:
+            return _ParsedCall(tool_call, _tc_name(tool_call), {}, [], None,
+                               _PEER_TOOL_REFUSAL.format(name=_tc_name(tool_call)))
+        return _ParsedCall(tool_call, prepared.name, prepared.args, [], None, None)
+    return _parse_emitted_call(agent, tool_call, flatten_probe=flatten_probe)
+
+
+def _parse_emitted_call(agent, tool_call, *, flatten_probe: bool = False) -> _ParsedCall:
     name = _canonical_tool_name(tool_call.function.name)
     args, parse_error = _parse_tool_arguments(tool_call.function.arguments)
     scope_block = None
@@ -739,12 +763,12 @@ def _blocked_tool_result(agent, ref: _ToolCallRef, *, block_message: Optional[st
 
 
 def _pre_tool_block(agent, ref: _ToolCallRef):
-    """``(block_message, final_args)``: a resolved peer batch's fixed arguments (its hooks already ran
+    """``(block_message, final_args)``: a prepared peer call's fixed arguments (its hooks already ran
     once, before the batch's first call), else the ``pre_tool_call`` hooks run now."""
-    from agent.canonical_peer_tools import UNRESOLVED, take_resolved_args
+    from agent.canonical_peer_tools import prepared_call
 
-    resolved = take_resolved_args(ref.call_id)
-    return (None, resolved) if resolved is not UNRESOLVED else _run_pre_tool_hooks(agent, ref)
+    prepared = prepared_call(ref.call_id)
+    return (None, prepared.args) if prepared is not None else _run_pre_tool_hooks(agent, ref)
 
 
 def _run_pre_tool_hooks(agent, ref: _ToolCallRef):
@@ -866,9 +890,9 @@ def _run_agent_tool_execution_middleware(
     _authorized_dispatch = bind_prepared_dispatch(_authorized_dispatch)
 
     def _hermes_pipeline(relay_args: dict[str, Any]) -> Any:
-        from agent.canonical_peer_tools import is_resolved
+        from agent.canonical_peer_tools import prepared_call
 
-        if is_resolved(tool_call_id):  # a peer batch ran its request middleware once, up front
+        if prepared_call(tool_call_id) is not None:  # a peer batch ran its request middleware once, up front
             request_args = relay_args
         else:
             request_result = apply_tool_request_middleware(

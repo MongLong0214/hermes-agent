@@ -818,3 +818,68 @@ def test_the_send_carries_the_pinned_snapshot_not_an_alias_mutated_after_the_che
     with peer_turn(agent):
         run(agent, [call(ceo("run_get"), {"payload": {"scope": "checked"}})])
     assert ceo_tools == [(ceo("run_get"), {"payload": {"scope": "checked"}})]
+
+
+@pytest.mark.parametrize("dispatcher", DISPATCHERS)
+def test_final_batch_pins_the_tool_name_as_well_as_arguments(agent, ceo_tools, monkeypatch, dispatcher):
+    from tools.registry import registry
+
+    tool = ceo("run_get")
+    emitted = call(tool, {"scope": "checked"})
+    effects = []
+    unlisted = "unlisted_peer_effect"
+    registry.register(unlisted, "review-observer", {"name": unlisted, "parameters": {"type": "object"}},
+                      lambda args, **kw: (effects.append(dict(args)), json.dumps({"result": "effect"}))[1])
+
+    def hook(name, args, **kwargs):
+        emitted.function.name = unlisted
+        return None, args
+
+    monkeypatch.setattr("hermes_cli.plugins._dispatch_pre_tool_call_hooks", hook)
+    try:
+        with peer_turn(agent):
+            messages = run(agent, [emitted], dispatcher)
+        assert effects == [], (effects, ceo_tools, messages)
+        assert refused(messages, [emitted]) and ceo_tools == [], "a call renamed while prepared refuses the batch"
+    finally:
+        registry.deregister(unlisted)
+
+
+def test_wrapped_call_uses_its_pinned_handler_after_registry_refresh(agent, ceo_tools, monkeypatch):
+    from tools.registry import registry
+
+    tool = ceo("run_get")
+    first = call(tool, {"step": "first"}, "c1")
+    second = call("tool_call", {"name": tool, "arguments": {"step": "second"}}, "c2")
+    entry = registry.get_entry(tool)
+
+    def refresh(call_id, name, args):
+        if call_id == "c1":
+            registry.register(tool, "mcp-acp-ceo", {"name": tool, "parameters": {
+                "type": "object", "properties": {"new_required": {"type": "string"}}, "required": ["new_required"]}},
+                entry.handler)
+
+    agent.tool_start_callback = refresh
+    with peer_turn(agent):
+        messages = run(agent, [first, second])
+    assert ceo_tools == [(tool, {"step": "first"}), (tool, {"step": "second"})], (ceo_tools, messages)
+
+
+def test_a_peer_call_without_a_prepared_entry_never_reaches_a_registry_handler(agent, ceo_tools):
+    import model_tools
+    from tools.registry import registry
+
+    effects = []
+    unlisted = "unlisted_peer_effect"
+    registry.register(unlisted, "review-observer", {"name": unlisted, "parameters": {"type": "object"}},
+                      lambda args, **kw: (effects.append(dict(args)), json.dumps({"result": "effect"}))[1])
+    try:
+        with peer_turn(agent):
+            run(agent, [call(ceo("run_get"), {}, "c1")])  # an allowed, prepared batch exists
+            unprepared = model_tools.handle_function_call(unlisted, {}, tool_call_id="not-prepared")
+            listed_but_unprepared = model_tools.handle_function_call(ceo("run_get"), {"other": 1},
+                                                                     tool_call_id="not-prepared")
+    finally:
+        registry.deregister(unlisted)
+    assert effects == [] and "NOT run" in unprepared and "NOT run" in listed_but_unprepared
+    assert ceo_tools == [(ceo("run_get"), {})]

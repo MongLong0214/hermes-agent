@@ -52,18 +52,30 @@ class PinnedCall:
 
 
 @dataclass(frozen=True)
+class PreparedCall:
+    """One call of a batch the executor prepared as a whole: the emitted tool call it stands for and
+    the name, final arguments and pinned handler (None for a discovery meta tool) dispatch uses,
+    with nothing parsed, unwrapped, validated or looked up again."""
+
+    emitted: Any = field(repr=False, compare=False)
+    name: str = ""
+    args: Any = field(default=None, repr=False, compare=False)
+    handler: Any = field(default=None, repr=False, compare=False)
+
+
+@dataclass(frozen=True)
 class PeerToolGrant:
     """What the verified ingress proved for one peer turn. ``verify`` raises once the binding's
     session is no longer the one the turn was admitted on. The latest allowed batch leaves
-    ``pins`` (``(tool, canonical arguments) -> [PinnedCall]``) and, once the executor resolved it as
-    a whole, ``resolved`` (tool call id -> the final arguments it dispatches). ``attempted`` records
-    every send that reached the transport, the side-effect scope a failed turn reports."""
+    ``pins`` (``(tool, canonical arguments) -> [PinnedCall]``) and, once the executor prepared it as
+    a whole, ``prepared`` (tool call id -> :class:`PreparedCall`). ``attempted`` records every send
+    that reached the transport, the side-effect scope a failed turn reports."""
 
     binding: str
     agent: Any = field(repr=False, compare=False)
     verify: Callable[[], None] = field(repr=False, compare=False)
     pins: dict = field(default_factory=dict, repr=False, compare=False)
-    resolved: dict = field(default_factory=dict, repr=False, compare=False)
+    prepared: dict = field(default_factory=dict, repr=False, compare=False)
     attempted: list = field(default_factory=list, repr=False, compare=False)
 
 
@@ -214,65 +226,69 @@ def _check(policy: _Policy, name: str, args: Any) -> Optional[list]:
     return None if canonical is None else [PinnedCall(name, handler, final, canonical, peer_grant_digest(entry))]
 
 
-def batch_allowed(agent: Any, calls: Sequence[tuple[str, Any]], resolved: Optional[dict] = None) -> bool:
+def batch_allowed(agent: Any, calls: Sequence[tuple[str, Any]], emitted: Optional[Sequence[tuple[str, Any]]] = None) -> bool:
     """Whether EVERY ``(tool name, arguments)`` of a peer turn's batch may run (arguments that did
-    not parse are None and refuse it). An allowed batch replaces the grant's pins, and its resolved
-    final arguments when given, with exactly its own; a refused one clears both."""
+    not parse are None and refuse it). An allowed batch replaces the grant's pins with exactly its
+    own; given ``emitted`` (``(call id, tool call)`` per call), it also replaces the prepared calls
+    dispatch consumes. A refused batch clears both."""
     policy = _active_policy(agent)
-    pins: Optional[list] = [] if policy is not None and calls else None
-    for name, args in calls if pins is not None else ():
-        checked = _check(policy, name, args)
-        if checked is None:
-            pins = None
+    checked: Optional[list] = [] if policy is not None and calls else None
+    for name, args in calls if checked is not None else ():
+        pins = _check(policy, name, args)
+        if pins is None:
+            checked = None
             break
-        pins.extend(checked)
+        checked.append(pins)
     grant = _grant.get()
     if grant is not None:
         with _pins_lock:
             grant.pins.clear()
-            grant.resolved.clear()
-            for pin in pins or ():
+            grant.prepared.clear()
+            for pin in (p for pins in checked or () for p in pins):
                 grant.pins.setdefault((pin.tool, pin.canonical), []).append(pin)
-            if pins is not None:
-                grant.resolved.update(resolved or {})
-    return pins is not None
+            for (call_id, tool_call), (name, args), pins in zip((emitted or ()) if checked is not None else (),
+                                                                 calls, checked or ()):
+                grant.prepared[call_id] = PreparedCall(tool_call, name, args, pins[0].handler if pins else None)
+    return checked is not None
 
 
-def batch_resolved(agent: Any, call_ids: Sequence[str]) -> bool:
-    """Whether the executor already resolved and pinned exactly these calls as one final batch."""
+def batch_resolved(agent: Any, tool_calls: Sequence[Any], call_id: Callable[[Any], str]) -> bool:
+    """Whether the executor already prepared exactly these emitted calls as part of one batch."""
     grant = _grant.get()
-    if grant is None or grant.agent is not agent or not call_ids:
+    if grant is None or grant.agent is not agent or not tool_calls:
         return False
     with _pins_lock:
-        return all(call_id in grant.resolved for call_id in call_ids)
+        return all(getattr(grant.prepared.get(call_id(tc)), "emitted", None) is tc for tc in tool_calls)
 
 
-UNRESOLVED = object()
-
-
-def is_resolved(call_id: str) -> bool:
-    grant = _grant.get()
-    with _pins_lock:
-        return grant is not None and call_id in grant.resolved
-
-
-def take_resolved_args(call_id: str) -> Any:
-    """The final arguments the resolved batch fixed for this call (once), else ``UNRESOLVED``."""
-    grant = _grant.get()
-    if grant is None:
-        return UNRESOLVED
-    with _pins_lock:
-        return grant.resolved.pop(call_id, UNRESOLVED)
-
-
-def pinned_handler(tool: str) -> Any:
-    """The native handler the current batch pinned for ``tool``: dispatch uses it, never a handler
-    resolved again from the registry. None outside a pinned peer batch."""
+def prepared_call(call_id: str, tool_call: Any = None) -> Optional[PreparedCall]:
+    """The prepared call for this id (for this very emitted call, when given), else None."""
     grant = _grant.get()
     if grant is None:
         return None
     with _pins_lock:
-        return next((pins[0].handler for (name, _c), pins in grant.pins.items() if name == tool and pins), None)
+        entry = grant.prepared.get(call_id)
+    return entry if entry is not None and (tool_call is None or entry.emitted is tool_call) else None
+
+
+REFUSED = object()
+
+
+def dispatch_handler(tool: str, args: Any, call_id: str) -> Any:
+    """The handler a peer-turn dispatch must run, never one looked up by name: the prepared call's
+    (consumed once), else the handler the batch check pinned for exactly this call (a caller
+    dispatching outside the executors); ``REFUSED`` when neither exists. None outside a peer turn."""
+    grant = _grant.get()
+    if grant is None:
+        return None
+    canonical = _canonical(args)
+    with _pins_lock:
+        entry = grant.prepared.get(call_id) if call_id else None
+        if entry is not None and entry.name == tool and entry.handler is not None:
+            del grant.prepared[call_id]
+            return entry.handler
+        pins = grant.pins.get((tool, canonical)) if entry is None and canonical is not None else None
+    return pins[0].handler if pins else REFUSED
 
 
 @dataclass(frozen=True)
