@@ -56,13 +56,34 @@ def _tool_is_read_only(server_name: str, tool_name: str) -> bool:
     return _core._tool_read_only_hints.get(_resolve_server_key(server_name), {}).get(tool_name) is True
 
 
-def _trust_gate_check(server_name: str, tool_name: str) -> Optional[str]:
-    """Approval gate for write-capable tools on ``trust: untrusted`` servers. None to proceed,
-    else a ``tool_error``. Fail-closed: approval-system errors block."""
+def _trust_gate_asks(server_name: str, tool_name: Optional[str]) -> bool:
+    """Whether :func:`_trust_gate_check` must ask a human before running ``tool_name`` (None: a
+    tool whose discovery name is unknown, never read-only)."""
     from tools.mcp_tool_scope import _server_key
     # Trust is the calling profile's own policy (an adopter of a shared connection keeps its own tier).
     trust = _core._server_trust_levels.get(_server_key(server_name), _core._TRUST_FULL)
-    if trust != _core._TRUST_UNTRUSTED or _tool_is_read_only(server_name, tool_name):
+    return trust == _core._TRUST_UNTRUSTED and not (tool_name is not None and _tool_is_read_only(server_name, tool_name))
+
+
+def mcp_tool_origin(registry_name: str) -> Optional[Tuple[str, bool]]:
+    """``(raw server name, trust gate would ask)`` for a registry name that is a NATIVE tool of an
+    MCP server (one ``_make_tool_handler`` serves), else None. Read from discovery-time provenance,
+    never parsed from the name."""
+    from tools.mcp_tool_schema import mcp_prefixed_tool_name
+    from tools.mcp_tool_scope import _resolve_server_key
+    with _core._lock:
+        server_name = _core._mcp_tool_server_names.get(registry_name)
+    if not server_name:
+        return None
+    hints = _core._tool_read_only_hints.get(_resolve_server_key(server_name), {})
+    tool_name = next((raw for raw in hints if mcp_prefixed_tool_name(server_name, raw) == registry_name), None)
+    return None if tool_name is None else (server_name, _trust_gate_asks(server_name, tool_name))
+
+
+def _trust_gate_check(server_name: str, tool_name: str) -> Optional[str]:
+    """Approval gate for write-capable tools on ``trust: untrusted`` servers. None to proceed,
+    else a ``tool_error``. Fail-closed: approval-system errors block."""
+    if not _trust_gate_asks(server_name, tool_name):
         return None
     try:  # lazy: tools.approval routes the prompt to whichever surface owns the session
         from tools.approval_prompt import request_elicitation_consent
@@ -559,13 +580,24 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     op = f"tools/call {tool_name}"
 
     def _handler(args: dict, **kwargs) -> str:
+        from tools.approval_context import is_peer_turn
         from tools.mcp_call_provenance import build_call_provenance, strip_caller_provenance
+        from tools.mcp_tool_schema import mcp_prefixed_tool_name
         # Host-derived call provenance (session/principal/delegation/lineage), never trusting
         # caller- or model-supplied arguments: a server-side guard distinguishes this call's real
         # origin from a request a model could otherwise forge by stuffing a convincing-looking
         # "_meta" into its own tool call.
         args = strip_caller_provenance(args)
         call_provenance = build_call_provenance()
+        if is_peer_turn():
+            # A canonical peer turn sends only the exact call its tool check pinned, with the digest
+            # of the policy entry that check applied (agent.canonical_peer_tools); nothing else.
+            from agent.canonical_peer_tools import claim_pinned_call
+            peer_grant = claim_pinned_call(mcp_prefixed_tool_name(server_name, tool_name), args)
+            if peer_grant is None:
+                return tool_error(f"MCP tool '{tool_name}' was NOT run: in a canonical peer turn only the exact "
+                                  f"call the peer tool check approved may be sent, and this one differs from it.")
+            call_provenance["peer_grant"] = peer_grant
         # Security boundary: untrusted-server write tools need approval before ANY transport work (incl. lazy spawn).
         error = _trust_gate_check(server_name, tool_name) or _check_circuit_breaker(server_name)
         if error is not None:

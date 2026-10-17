@@ -347,17 +347,29 @@ def _append_skipped_tool_results(
     return True
 
 
-_PEER_TOOL_REFUSAL = ("[Tool call not executed — {name} was requested during a canonical peer turn. A peer has no "
-                      "tool or approval authority; answer in text only.]")
+_PEER_TOOL_REFUSAL = ("[Tool call not executed — {name} was requested during a canonical peer turn. Only the "
+                      "configured ACP CEO tools, with in-scope arguments, may run in a canonical peer turn, and a "
+                      "batch holding any other call runs nothing. A peer has no approval authority.]")
 
 
 def _refuse_peer_tool_calls(agent, tool_calls, messages: list) -> bool:
-    """A canonical peer turn executes no tool and asks for no approval on Hermes' own loop: every
-    call gets a refusal result (so the assistant turn keeps its matching results) and nothing runs.
-    Authority follows the turn principal set by the canonical ingress, never message text."""
+    """A canonical peer turn asks for no approval and runs a batch only when EVERY call in it is an
+    allowed ACP CEO call under the grant its verified ingress bound (agent.canonical_peer_tools);
+    otherwise every call gets a refusal result (so the assistant turn keeps its matching results)
+    and nothing runs. Authority follows the turn principal and grant, never message text."""
     from tools.approval_context import is_peer_turn
 
     if getattr(agent, "_turn_principal", None) != "peer" and not is_peer_turn():
+        return False
+    from agent.canonical_peer_tools import batch_allowed
+
+    calls = []
+    for tc in tool_calls:
+        raw_name = _tc_name(tc)
+        args, parse_error = _parse_tool_arguments(getattr(getattr(tc, "function", None), "arguments", None))
+        # An alias would dispatch as a different tool than the one the policy names.
+        calls.append((raw_name if _canonical_tool_name(raw_name) == raw_name else "", None if parse_error else args))
+    if batch_allowed(agent, calls):
         return False
     _append_skipped_tool_results(agent, messages, tool_calls, "", content=_PEER_TOOL_REFUSAL)
     return True

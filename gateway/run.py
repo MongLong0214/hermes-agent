@@ -3616,8 +3616,9 @@ class GatewayRunner(
 
         The turn runs as a canonical *peer*: ``peer`` is the server-owned provenance the receipt
         coordinator minted for this event. The model gets only its rendering, the body is stored
-        clean beside that metadata, and the turn's principal denies tools, approvals and the
-        background review whatever the owner's own settings are."""
+        clean beside that metadata, and the turn's principal denies approvals, the background review
+        and every tool but the configured CEO tools its grant allows (agent.canonical_peer_tools),
+        whatever the owner's own settings are."""
         from gateway.canonical_surface import (
             bound_actor_db,
             cached_actor,
@@ -3704,7 +3705,9 @@ class GatewayRunner(
             if not bool(getattr(agent, "compression_in_place", True)):
                 raise ValueError("canonical_turn_refused")
             from agent.canonical_peer import render_peer_turn, validate_peer_metadata
+            from agent.canonical_peer_tools import PeerToolGrant, bind_grant, reset_grant
             from gateway.canonical_surface import _runs_tools_outside_hermes
+            from gateway.session_context import clear_session_vars, scoped_current_session_id, set_session_vars
             from tools.approval_context import reset_turn_principal, set_turn_principal
 
             peer = validate_peer_metadata(peer)
@@ -3713,6 +3716,20 @@ class GatewayRunner(
                     getattr(event, "channel_id", None), getattr(event, "event_id", None)):
                 raise ValueError("canonical_peer_provenance_invalid")
             peer_prompt = render_peer_turn(peer, event.text)
+
+            def require_peer_fence() -> None:
+                # Re-run before every peer tool batch: the same routing head and run generation,
+                # the same actor on the same DB file, still serving this session, which is still
+                # open at its own compression tip with this event's receipt claimed.
+                require_current_head()
+                require_expected_actor()
+                db = getattr(agent, "_session_db", None)
+                row = db.get_session(session_id) if db is not None else None
+                if (getattr(agent, "session_id", None) != session_id or not row
+                        or row.get("ended_at") is not None
+                        or db.get_compression_tip(session_id) != session_id
+                        or db.get_meta(peer["receipt"]) is None):
+                    raise ValueError("canonical_binding_stale")
             if _runs_tools_outside_hermes(agent):
                 raise ValueError("canonical_runtime_refused")
             outward_callbacks = {
@@ -3733,20 +3750,34 @@ class GatewayRunner(
                     # tool dispatchers and the Codex runtime guard, the context variable the
                     # approval gates. Both are restored only once the turn has actually returned.
                     principal_token = set_turn_principal("peer")
+                    # The only grant a peer tool batch can run under: this verified binding, this
+                    # actor, while the fence above still holds (agent.canonical_peer_tools).
+                    grant_token = bind_grant(PeerToolGrant(binding.name, agent, require_peer_fence))
                     prior_principal = getattr(agent, "_turn_principal", None)
                     prior_skip_review = getattr(agent, "skip_background_review", False)
                     agent._turn_principal = "peer"
                     agent.skip_background_review = True
+                    # MCP call provenance names this turn's real session the way an owner turn's
+                    # does (route, key, session id). No user identity is bound, since the peer is
+                    # not the owner; cron and delegation depth stay whatever the context says.
+                    session_tokens = set_session_vars(
+                        platform=str(getattr(getattr(origin, "platform", None), "value", "") or ""),
+                        chat_id=str(getattr(origin, "chat_id", "") or ""),
+                        session_key=entry.session_key,
+                        parent_chat_id=str(getattr(origin, "parent_chat_id", "") or ""))
                     try:
-                        return agent.run_conversation(
-                            peer_prompt, conversation_history=agent_history, task_id=session_id,
-                            persist_user_message=event.text,
-                            persist_user_display_kind="canonical_peer",
-                            persist_user_display_metadata={"canonical_peer": peer},
-                        )
+                        with scoped_current_session_id(session_id):
+                            return agent.run_conversation(
+                                peer_prompt, conversation_history=agent_history, task_id=session_id,
+                                persist_user_message=event.text,
+                                persist_user_display_kind="canonical_peer",
+                                persist_user_display_metadata={"canonical_peer": peer},
+                            )
                     finally:
+                        clear_session_vars(session_tokens)
                         agent._turn_principal = prior_principal
                         agent.skip_background_review = prior_skip_review
+                        reset_grant(grant_token)
                         reset_turn_principal(principal_token)
 
                 result = await run_owned_turn(

@@ -724,6 +724,9 @@ def _dispatch_bridge_tool(function_name: str, function_args: Dict[str, Any],
                                             quiet_mode=True, skip_tool_search_assembly=True) or []
     except Exception:
         current_defs = []
+    # A canonical peer turn discovers and calls only the tools its grant allows.
+    from agent.canonical_peer_tools import scope_discovery_defs
+    current_defs = scope_discovery_defs(current_defs)
     args = function_args or {}
     if function_name == ts.TOOL_SEARCH_NAME:
         return ts.dispatch_tool_search(args, current_tool_defs=current_defs), None
