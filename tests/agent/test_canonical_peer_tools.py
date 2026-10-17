@@ -8,18 +8,24 @@ from __future__ import annotations
 
 import atexit
 import os
-import pwd
 import shutil
 import tempfile
 from pathlib import Path
 
 import pytest
 
-# Pinned BEFORE any Hermes import, for every resolver, import-time path, cache and subprocess of
-# this module: HOME and HERMES_HOME name a fresh tmp dir, so even a run outside tests/ (no hermetic
-# conftest), which once let these helpers replace the user's live config, resolves nothing in the
-# real home. _LIVE_CONFIG comes from the account database, never from HOME.
-_LIVE_CONFIG = (Path(pwd.getpwuid(os.getuid()).pw_dir) / ".hermes" / "config.yaml").resolve()
+try:
+    import pwd  # the account database names the real home even when HOME is redirected
+except ImportError:  # not POSIX
+    pwd = None
+
+# Pinned BEFORE any dependent Hermes import, for every resolver, import-time path, cache and
+# subprocess of this module: HOME and HERMES_HOME name a fresh tmp dir, and the context-local home
+# override, which wins over both, is replaced by that same tmp home, so a caller's existing override
+# (a profile scope) cannot aim this module at a real home either. A run outside tests/ (no hermetic
+# conftest) once let these helpers replace the user's live config.
+_REAL_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir) if pwd is not None else Path.home()
+_LIVE_CONFIG = (_REAL_HOME / ".hermes" / "config.yaml").resolve()
 _PINNED_ROOT = Path(tempfile.mkdtemp(prefix="hermes-peer-tools-")).resolve()
 if _PINNED_ROOT.is_relative_to(_LIVE_CONFIG.parent) or _LIVE_CONFIG.is_relative_to(_PINNED_ROOT):
     raise RuntimeError(f"the pinned test home {_PINNED_ROOT} overlaps the real home")
@@ -27,14 +33,24 @@ atexit.register(shutil.rmtree, _PINNED_ROOT, True)
 os.environ["HOME"] = str(_PINNED_ROOT)
 os.environ["HERMES_HOME"] = str(_PINNED_ROOT / ".hermes")
 
+from hermes_constants import reset_hermes_home_override, set_hermes_home_override  # noqa: E402
+
+_MODULE_PIN = set_hermes_home_override(_PINNED_ROOT / ".hermes")
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _release_the_module_pin():
+    yield
+    reset_hermes_home_override(_MODULE_PIN)
+
 
 @pytest.fixture(autouse=True)
 def _never_the_live_config():
-    """Fail before the test body when the resolver names the live config, whatever bound it."""
+    """Fail before the test body when the resolver names anything in the real Hermes home."""
     from hermes_cli.config import get_config_path
 
-    if get_config_path().resolve() == _LIVE_CONFIG:
-        pytest.fail("the config resolver names the live config")
+    if get_config_path().resolve().is_relative_to(_LIVE_CONFIG.parent):
+        pytest.fail("the config resolver names the live Hermes home")
 
 
 import asyncio  # noqa: E402
@@ -132,12 +148,14 @@ def ceo_tools(monkeypatch, tmp_path):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HOME", str(tmp_path))
+    override = set_hermes_home_override(home)
     _isolated_home.append(home)
     try:
         _isolated_config_path()  # fail before any setup when the isolation did not take
         yield from _ceo_tools(monkeypatch)
     finally:
         _isolated_home.remove(home)
+        reset_hermes_home_override(override)
 
 
 def _ceo_tools(monkeypatch):
@@ -443,16 +461,19 @@ def test_an_allowed_peer_call_carries_principal_peer_computed_depth_and_its_entr
     assert set(read_meta) == OWNER_META_KEYS | {"peer_grant"}
 
 
-def _rewrite_after_check(monkeypatch, how: str, rewrite):
-    """Change the call between the peer check and the MCP send, the way a plugin hook or a wrapper
-    re-interpretation would."""
+from tools.tool_search import resolve_underlying_call as _REAL_RESOLVE_UNDERLYING  # noqa: E402
+
+
+def _rewrite_before_the_final_check(monkeypatch, how: str, rewrite):
+    """Rewrite the call the way a plugin hook or a wrapper re-interpretation would: both run for the
+    whole batch before its final check."""
     if how == "hook":
         monkeypatch.setattr("hermes_cli.plugins._dispatch_pre_tool_call_hooks",
                             lambda name, args, **kw: (None, rewrite(name, dict(args))))
     else:
         import tools.tool_search as tool_search
 
-        real = tool_search.resolve_underlying_call
+        real = _REAL_RESOLVE_UNDERLYING  # never a previous rewrite: they must not stack
 
         def reinterpret(args):
             name, inner, error = real(args)
@@ -461,38 +482,56 @@ def _rewrite_after_check(monkeypatch, how: str, rewrite):
 
 
 @pytest.mark.parametrize("how", ["hook", "wrapper"])
-def test_arguments_changed_after_the_check_are_never_sent(agent, ceo_tools, monkeypatch, how):
+def test_hook_and_wrapper_rewrites_are_checked_as_the_final_arguments(agent, ceo_tools, monkeypatch, how):
     tool = ceo("escalation_resolve")
     batch = [call("tool_call", {"name": tool, "arguments": {"runId": RUN}}) if how == "wrapper"
              else call(tool, {"runId": RUN})]
     with peer_turn(agent):
-        run(agent, batch)
-        assert ceo_tools == [(tool, {"runId": RUN})]
-        for rewrite in (lambda n, a: {**a, "runId": "run_other"}, lambda n, a: {**a, "extra": "added"},
-                        lambda n, a: {k: v for k, v in a.items() if k != "runId"}):
-            _rewrite_after_check(monkeypatch, how, rewrite)
-            messages = run(agent, batch)
-            assert "NOT run" in messages[0]["content"], messages[0]["content"]
-    assert ceo_tools == [(tool, {"runId": RUN})]
+        for rewrite in (lambda n, a: {**a, "runId": "run_other"}, lambda n, a: {k: v for k, v in a.items() if k != "runId"}):
+            _rewrite_before_the_final_check(monkeypatch, how, rewrite)
+            assert refused(run(agent, batch), batch)
+        assert ceo_tools == []
+        # The emitted call and its rewrite both in scope: what is sent is the rewrite, as finally checked.
+        decide, emitted = ceo("ceo_decision_submit"), {"runId": RUN, "decision": "CONFIRM"}
+        _rewrite_before_the_final_check(monkeypatch, how, lambda n, a: {**a, "decision": "FINAL_REVISE"})
+        run(agent, [call("tool_call", {"name": decide, "arguments": emitted}) if how == "wrapper"
+                    else call(decide, emitted)])
+    assert ceo_tools == [(decide, {"runId": RUN, "decision": "FINAL_REVISE"})]
 
 
-def test_a_policy_swapped_on_disk_between_check_and_send_lets_no_other_call_through(agent, ceo_tools, monkeypatch):
+def _change_after_the_pin(monkeypatch, change):
+    """Change the call after its batch was resolved and pinned: tool-execution middleware runs then."""
+    import hermes_cli.middleware as middleware
+
+    real = middleware.run_tool_execution_middleware
+
+    def changing(name, args, terminal_call, **kwargs):
+        return real(name, args, lambda next_args: terminal_call(change(dict(next_args))), **kwargs)
+    monkeypatch.setattr(middleware, "run_tool_execution_middleware", changing)
+
+
+@pytest.mark.parametrize("change", [
+    lambda a: {**a, "runId": "run_other"}, lambda a: {**a, "extra": "added"},
+    lambda a: {k: v for k, v in a.items() if k != "runId"}])
+def test_changes_after_the_batch_is_pinned_never_reach_the_wire(agent, ceo_tools, monkeypatch, change):
+    tool = ceo("escalation_resolve")
+    _change_after_the_pin(monkeypatch, change)
+    with peer_turn(agent):
+        run(agent, [call(tool, {"runId": RUN})])
+    assert ceo_tools == [(tool, {"runId": RUN})], "exactly the pinned arguments went out"
+
+
+def test_a_policy_swapped_on_disk_after_the_pin_lets_no_other_call_through(agent, ceo_tools, monkeypatch):
     tool = ceo("escalation_resolve")
     widened = _policy()
     widened["mutate"][tool] = {"runId": [RUN, "run_other"]}
 
-    def swap_policy_then(rewrite):
-        def hook(name, args, **_kw):
-            _write_config(widened)
-            return None, rewrite(dict(args))
-        monkeypatch.setattr("hermes_cli.plugins._dispatch_pre_tool_call_hooks", hook)
+    def swap_policy_and_retarget(args):
+        _write_config(widened)
+        return {**args, "runId": "run_other"}
 
+    _change_after_the_pin(monkeypatch, swap_policy_and_retarget)
     with peer_turn(agent):
-        swap_policy_then(lambda a: {**a, "runId": "run_other"})
-        assert "NOT run" in run(agent, [call(tool, {"runId": RUN})])[0]["content"]
-        assert ceo_tools == []
-        _write_config(_policy())
-        swap_policy_then(lambda a: a)
         run(agent, [call(tool, {"runId": RUN})])
     # The call that was checked went out, under the entry its check read, not the swapped one.
     assert ceo_tools == [(tool, {"runId": RUN})]
@@ -647,9 +686,135 @@ def test_every_generated_utility_substituted_by_a_refresh_is_refused_in_a_peer_t
         _forget(server)
 
 
-def test_config_writes_refuse_any_home_but_the_tests_own(ceo_tools, tmp_path, monkeypatch):
+def test_config_writes_refuse_any_home_but_the_tests_own(ceo_tools, tmp_path):
     elsewhere = tmp_path.parent / f"{tmp_path.name}-elsewhere"
-    monkeypatch.setenv("HERMES_HOME", str(elsewhere))
-    with pytest.raises(pytest.fail.Exception, match="refusing to write"):
-        _write_config(_policy())
+    token = set_hermes_home_override(elsewhere)  # the binding that wins over HERMES_HOME
+    try:
+        with pytest.raises(pytest.fail.Exception, match="refusing to write"):
+            _write_config(_policy())
+    finally:
+        reset_hermes_home_override(token)
     assert not elsewhere.exists()
+
+
+def test_two_profile_policies_and_registrations_remain_separate(agent, ceo_tools, tmp_path):
+    from agent.canonical_peer_tools import batch_allowed
+    from agent.secret_scope import set_multiplex_active
+    from tools.mcp_tool_common import _core
+    from tools.mcp_tool_handlers import _make_tool_handler
+    from tools.mcp_tool_registration import _track_mcp_tool_server
+    from tools.mcp_tool_scope import _server_key
+    from tools.registry import registry
+
+    name = ceo("run_get")
+    a, b = tmp_path / "A", tmp_path / "B"
+    for home, read in [(a, [name]), (b, [])]:
+        home.mkdir()
+        (home / "config.yaml").write_text(
+            yaml.safe_dump({"gateway": {"canonical_peer_tools": _policy(read=read, mutate={})}}), encoding="utf-8")
+    results = []
+    set_multiplex_active(True)
+    try:
+        for home in (a, b, a):
+            token = set_hermes_home_override(home)
+            try:
+                registry.register(name, "mcp-acp-ceo", _defs(name)[0]["function"],
+                                  _make_tool_handler("acp-ceo", "run_get", 30))
+                _track_mcp_tool_server(name, "acp-ceo")
+                _core._server_trust_levels[_server_key("acp-ceo")] = _core._TRUST_FULL
+                with peer_turn(agent):
+                    results.append(batch_allowed(agent, [(name, {})]))
+                registry.deregister(name)
+            finally:
+                reset_hermes_home_override(token)
+    finally:
+        set_multiplex_active(False)
+    assert results == [True, False, True]
+
+
+def test_refresh_refusal_is_decided_before_any_sibling_executes(agent, ceo_tools, monkeypatch):
+    from tools.mcp_tool_common import _core
+    from tools.mcp_tool_registration import _forget_mcp_tool_server, _register_server_tools
+    from tools.registry import registry
+
+    server = _core._servers[SERVER]
+    second = ceo("read_resource")
+    resource_calls = []
+
+    async def read_resource(uri):
+        resource_calls.append(uri)
+        return SimpleNamespace(contents=[SimpleNamespace(text="bytes")])
+
+    async def list_tools():
+        return SimpleNamespace(tools=[], nextCursor=None)
+
+    server.session.read_resource = read_resource
+    server.session.list_tools = list_tools
+    server.initialize_result = SimpleNamespace(capabilities=SimpleNamespace(
+        tools=SimpleNamespace(), resources=SimpleNamespace(), prompts=None))
+    server._tools = [SimpleNamespace(name="read_resource", description="native",
+                                     inputSchema={"type": "object", "properties": {"uri": {"type": "string"}}},
+                                     annotations=None)]
+    server._registered_tool_names = _register_server_tools(SERVER, server, {})
+    _write_config(_policy(read=[ceo("run_get")], mutate={second: {"uri": ["test://native"]}}))
+
+    def hook(name, args, **kwargs):
+        if name == second:
+            asyncio.run(server._refresh_tools())
+            return None, {**args, "uri": "test://utility"}
+        return None, args
+
+    monkeypatch.setattr("hermes_cli.plugins._dispatch_pre_tool_call_hooks", hook)
+    try:
+        with peer_turn(agent):
+            messages = run(agent, [call(ceo("run_get"), {}, "c1"), call(second, {"uri": "test://native"}, "c2")])
+        assert ceo_tools == [] and resource_calls == [], (ceo_tools, resource_calls, messages)
+    finally:
+        for name in server._registered_tool_names:
+            registry.deregister(name)
+            _forget_mcp_tool_server(name)
+
+
+def test_pinned_arguments_cannot_change_after_claim_while_waiting_for_transport(agent, ceo_tools, monkeypatch):
+    import tools.mcp_tool_handlers as handlers
+
+    kept = {}
+
+    def hook(name, args, **kwargs):
+        kept["args"] = args
+        return None, args
+
+    acquire = handlers._acquire_call_server
+
+    def delayed(server_name, timeout):
+        kept["args"]["payload"]["scope"] = "rewritten-after-claim"
+        return acquire(server_name, timeout)
+
+    with peer_turn(agent):
+        run(agent, [call(ceo("run_get"), {"payload": {"scope": "checked"}})])
+        assert ceo_tools == [(ceo("run_get"), {"payload": {"scope": "checked"}})]
+        ceo_tools.clear()
+        monkeypatch.setattr("hermes_cli.plugins._dispatch_pre_tool_call_hooks", hook)
+        monkeypatch.setattr(handlers, "_acquire_call_server", delayed)
+        run(agent, [call(ceo("run_get"), {"payload": {"scope": "checked"}})])
+    assert ceo_tools == [], f"Arguments changed after pin claim reached MCP: {ceo_tools}"
+
+
+def test_the_send_carries_the_pinned_snapshot_not_an_alias_mutated_after_the_check(agent, ceo_tools, monkeypatch):
+    """The wire gets the owned snapshot: an alias mutated between the last check and the write
+    cannot change the bytes sent."""
+    import tools.mcp_tool_handlers as handlers
+
+    kept = {}
+    monkeypatch.setattr("hermes_cli.plugins._dispatch_pre_tool_call_hooks",
+                        lambda name, args, **kw: (kept.setdefault("args", args), (None, args))[1])
+    racing = handlers._call_tool_racing_stdio_death
+
+    async def mutate_then_send(server, server_name, tool_name, args, **kwargs):
+        kept["args"]["payload"]["scope"] = "rewritten-at-the-wire"
+        return await racing(server, server_name, tool_name, args, **kwargs)
+
+    monkeypatch.setattr(handlers, "_call_tool_racing_stdio_death", mutate_then_send)
+    with peer_turn(agent):
+        run(agent, [call(ceo("run_get"), {"payload": {"scope": "checked"}})])
+    assert ceo_tools == [(ceo("run_get"), {"payload": {"scope": "checked"}})]

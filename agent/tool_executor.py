@@ -357,13 +357,14 @@ def peer_batch_refused(agent, tool_calls, emitted_names=None) -> bool:
     allowed ACP CEO call under the grant its verified ingress bound (agent.canonical_peer_tools)
     and, given ``emitted_names``, every name is still exactly as the model emitted it. Authority
     follows the turn principal and grant, never message text."""
-    from tools.approval_context import is_peer_turn
-
-    if getattr(agent, "_turn_principal", None) != "peer" and not is_peer_turn():
+    if not _peer_turn(agent):
         return False
     if emitted_names is not None and [_tc_name(tc) for tc in tool_calls] != list(emitted_names):
         return True
-    from agent.canonical_peer_tools import batch_allowed
+    from agent.canonical_peer_tools import batch_allowed, batch_resolved
+
+    if batch_resolved(agent, [_pairing_tool_call_id(tc) for tc in tool_calls]):
+        return False  # part of a batch already resolved and pinned as a whole (a segment)
 
     calls = []
     for tc in tool_calls:
@@ -372,6 +373,54 @@ def peer_batch_refused(agent, tool_calls, emitted_names=None) -> bool:
         # An alias would dispatch as a different tool than the one the policy names.
         calls.append((raw_name if _canonical_tool_name(raw_name) == raw_name else "", None if parse_error else args))
     return not batch_allowed(agent, calls)
+
+
+def _peer_turn(agent) -> bool:
+    from tools.approval_context import is_peer_turn
+
+    return getattr(agent, "_turn_principal", None) == "peer" or is_peer_turn()
+
+
+def _resolve_peer_batch(agent, tool_calls, messages: list, effective_task_id: str) -> bool:
+    """In a canonical peer turn, fix the WHOLE batch before its first call runs: each call's request
+    middleware, ``pre_tool_call`` hooks and guardrail verdict first, then (after any registry refresh
+    they caused) each native handler and the policy on the final arguments, pinned as one batch that
+    dispatch then uses unchanged (:func:`_pre_tool_block`). True, with a refusal per call, when any
+    call is refused; nothing has run."""
+    if not _peer_turn(agent):
+        return False
+    from agent.canonical_peer_tools import batch_allowed, batch_resolved
+
+    if batch_resolved(agent, [_pairing_tool_call_id(tc) for tc in tool_calls]):
+        return False
+    finals = []
+    for tc in tool_calls:
+        pc = _parse_tool_call(agent, tc)
+        final = None
+        if pc.parse_error is None and pc.scope_block is None and _canonical_tool_name(_tc_name(tc)) == _tc_name(tc):
+            block, final = _peer_final_args(agent, pc.ref(effective_task_id))
+            final = None if block is not None else final
+        finals.append((_pairing_tool_call_id(tc), pc.name, final))
+    if batch_allowed(agent, [(name, final) for _id, name, final in finals],
+                     resolved={call_id: final for call_id, _name, final in finals}):
+        return False
+    append_peer_refusals(agent, tool_calls, messages)
+    return True
+
+
+def _peer_final_args(agent, ref: "_ToolCallRef"):
+    """``(block, final arguments)`` for one call of a peer batch, through the same request
+    middleware, ``pre_tool_call`` hooks and guardrail check its dispatch would run."""
+    from hermes_cli.middleware import apply_tool_request_middleware
+
+    request = apply_tool_request_middleware(ref.name, ref.args, skip_relay=True,
+                                            **tool_hook_ids(agent, ref.task_id, ref.call_id))
+    args = request.payload if isinstance(request.payload, dict) else ref.args
+    block, final = _run_pre_tool_hooks(agent, _ToolCallRef(ref.name, args, ref.task_id, ref.call_id, ref.trace))
+    guardrails = getattr(agent, "_tool_guardrails", None)
+    if block is None and guardrails is not None and not guardrails.before_call(ref.name, final).allows_execution:
+        block = "guardrail"
+    return block, final
 
 
 def append_peer_refusals(agent, tool_calls, messages: list) -> None:
@@ -690,6 +739,15 @@ def _blocked_tool_result(agent, ref: _ToolCallRef, *, block_message: Optional[st
 
 
 def _pre_tool_block(agent, ref: _ToolCallRef):
+    """``(block_message, final_args)``: a resolved peer batch's fixed arguments (its hooks already ran
+    once, before the batch's first call), else the ``pre_tool_call`` hooks run now."""
+    from agent.canonical_peer_tools import UNRESOLVED, take_resolved_args
+
+    resolved = take_resolved_args(ref.call_id)
+    return (None, resolved) if resolved is not UNRESOLVED else _run_pre_tool_hooks(agent, ref)
+
+
+def _run_pre_tool_hooks(agent, ref: _ToolCallRef):
     """Run ``pre_tool_call`` plugin hooks; returns ``(block_message, final_args)`` with any
     hook-modified args applied. Hook failures never block."""
     try:
@@ -808,15 +866,20 @@ def _run_agent_tool_execution_middleware(
     _authorized_dispatch = bind_prepared_dispatch(_authorized_dispatch)
 
     def _hermes_pipeline(relay_args: dict[str, Any]) -> Any:
-        request_result = apply_tool_request_middleware(
-            function_name,
-            relay_args,
-            skip_relay=True,
-            **tool_hook_ids(agent, effective_task_id, tool_call_id),
-        )
-        request_args = request_result.payload if isinstance(request_result.payload, dict) else relay_args
-        trace.clear()
-        trace.extend(request_result.trace)
+        from agent.canonical_peer_tools import is_resolved
+
+        if is_resolved(tool_call_id):  # a peer batch ran its request middleware once, up front
+            request_args = relay_args
+        else:
+            request_result = apply_tool_request_middleware(
+                function_name,
+                relay_args,
+                skip_relay=True,
+                **tool_hook_ids(agent, effective_task_id, tool_call_id),
+            )
+            request_args = request_result.payload if isinstance(request_result.payload, dict) else relay_args
+            trace.clear()
+            trace.extend(request_result.trace)
         return run_tool_execution_middleware(
             function_name,
             request_args,
@@ -1558,7 +1621,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     ``finalize=False`` skips end-of-batch budget enforcement and /steer injection (the
     segmented dispatcher owns turn-end work)."""
     tool_calls = assistant_message.tool_calls
-    if _refuse_peer_tool_calls(agent, tool_calls, messages):
+    if (_refuse_peer_tool_calls(agent, tool_calls, messages)
+            or _resolve_peer_batch(agent, tool_calls, messages, effective_task_id)):
         return
     num_tools = len(tool_calls)
     _tool_budget = _budget_for_agent(agent)  # once per turn, not per result
@@ -1827,7 +1891,8 @@ def _publish_sequential_result(agent, messages: list, ref: _ToolCallRef, managed
 def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
     from types import SimpleNamespace
     from agent.terminal_approval_batch import terminal_approval_batch, terminal_approval_runs
-    if _refuse_peer_tool_calls(agent, assistant_message.tool_calls, messages):
+    if (_refuse_peer_tool_calls(agent, assistant_message.tool_calls, messages)
+            or _resolve_peer_batch(agent, assistant_message.tool_calls, messages, effective_task_id)):
         return
     for calls in terminal_approval_runs(agent, assistant_message.tool_calls):
         with terminal_approval_batch(agent, calls, messages, effective_task_id):
@@ -1904,7 +1969,8 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
     interrupt flag up front, so an interrupt drains later segments with one result per call."""
     from types import SimpleNamespace
 
-    if _refuse_peer_tool_calls(agent, assistant_message.tool_calls, messages):
+    if (_refuse_peer_tool_calls(agent, assistant_message.tool_calls, messages)
+            or _resolve_peer_batch(agent, assistant_message.tool_calls, messages, effective_task_id)):
         return
     if segments is None:
         _active_env = get_active_env(effective_task_id)

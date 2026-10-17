@@ -835,10 +835,12 @@ def _execute_tool(function_name: str, function_args: Dict[str, Any], original_ar
         dispatch_kwargs["user_task"] = user_task
 
     def _dispatch(next_args: Dict[str, Any]) -> Any:
+        from agent.canonical_peer_tools import pinned_handler
         from tools.connectors import dispatch_connector_call, is_connector_name
         if is_connector_name(function_name):
             return dispatch_connector_call(function_name, next_args, ids.tool_call_id)
-        return registry.dispatch(function_name, next_args, **dispatch_kwargs)
+        # A canonical peer batch dispatches the handler it pinned, never one re-resolved by name.
+        return registry.dispatch(function_name, next_args, handler=pinned_handler(function_name), **dispatch_kwargs)
 
     with _approval_observability(ids):
         if skip_tool_execution_middleware:

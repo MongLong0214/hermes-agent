@@ -604,15 +604,15 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         # "_meta" into its own tool call.
         args = strip_caller_provenance(args)
         call_provenance = build_call_provenance()
-        peer_fence = None
+        claim = None
         if is_peer_turn():
-            # A canonical peer turn sends only the exact call its tool check pinned to this handler,
-            # with the digest of the policy entry that check applied (agent.canonical_peer_tools).
+            # A canonical peer turn sends only the exact call its batch pinned to this handler: the
+            # pinned deep snapshot, under the digest of the policy entry checked (agent.canonical_peer_tools).
             from agent.canonical_peer_tools import claim_pinned_call
-            claimed = claim_pinned_call(mcp_prefixed_tool_name(server_name, tool_name), args, _handler)
-            if claimed is None:
+            claim = claim_pinned_call(mcp_prefixed_tool_name(server_name, tool_name), args, _handler)
+            if claim is None:
                 return tool_error(_PEER_REFUSAL.format(tool=tool_name))
-            call_provenance["peer_grant"], peer_fence = claimed
+            call_provenance["peer_grant"] = claim.digest
         # Security boundary: untrusted-server write tools need approval before ANY transport work (incl. lazy spawn).
         error = _trust_gate_check(server_name, tool_name) or _check_circuit_breaker(server_name)
         if error is not None:
@@ -626,14 +626,16 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
 
         async def _call():
             async with server._rpc_lock, _track_inflight_rpc(server, server_name, op, retry_safe=read_only):
-                # Every attempt (after a queue wait, or a retry) re-proves a peer turn's binding.
-                if peer_fence is not None and not await asyncio.to_thread(peer_fence):
+                # Every attempt (after a queue wait, or a retry) re-proves a peer turn's binding and
+                # that no alias changed the checked arguments, then sends the owned snapshot itself.
+                if claim is not None and not await asyncio.to_thread(claim.sendable, args):
                     return _NotSent(tool_error(_PEER_REFUSAL.format(tool=tool_name)))
+                sent_args = args if claim is None else claim.snapshot
                 server._pending_call_context = contextvars.copy_context()  # for the elicitation callback
                 try:
                     from tools.mcp_call_provenance import PROVENANCE_META_KEY
                     result = await _call_tool_racing_stdio_death(
-                        server, server_name, tool_name, args, meta={PROVENANCE_META_KEY: call_provenance})
+                        server, server_name, tool_name, sent_args, meta={PROVENANCE_META_KEY: call_provenance})
                 finally:
                     server._pending_call_context = None
             if getattr(server, "_mark_session_proven", None) is not None:  # round-trip done: transport healthy

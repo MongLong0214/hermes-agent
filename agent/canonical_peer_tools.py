@@ -16,12 +16,14 @@ so a later id needs no restart):
 * ``tool_search``/``tool_describe`` only discover allowed tools (:func:`scope_discovery_defs`);
   ``tool_call`` is allowed only when every call it wraps is.
 
-Anything else refuses the whole batch. An allowed batch PINS each MCP call it checked: the exact
-tool, its current native handler and final arguments, with ``peer_grant``, the digest of the policy
-entry this decision read. The MCP handler sends a peer-turn call only by claiming its pin
-(:func:`claim_pinned_call`), which re-proves the identity fence, so a hook or wrapper that changes
-the call after the check, a handler replaced by a refresh, a policy edited since or a binding that
-went stale sends nothing. Message text never grants anything.
+Anything else refuses the whole batch. Before the first call of an allowed batch runs, the
+executor resolves the WHOLE batch (every call's request middleware, ``pre_tool_call`` hooks and
+guardrail verdict, then, after any registry refresh they caused, its native handler and the policy
+on the final arguments) and pins it: per MCP call the handler, an owned deep snapshot of the
+arguments and ``peer_grant``, the digest of the policy entry applied. Dispatch then uses exactly
+those arguments and that handler; the MCP handler sends the snapshot itself, only by claiming its
+pin (:func:`claim_pinned_call`) and only while the identity fence holds and no alias changed the
+arguments. One refusal anywhere refuses every call. Message text never grants anything.
 """
 
 from __future__ import annotations
@@ -38,15 +40,31 @@ CONFIG_KEY = "canonical_peer_tools"
 
 
 @dataclass(frozen=True)
+class PinnedCall:
+    """One checked MCP send: the native handler resolved for it, the owned deep snapshot of the
+    arguments that was checked and is the one sent, its canonical JSON, and ``peer_grant``."""
+
+    tool: str
+    handler: Any = field(repr=False, compare=False)
+    snapshot: Any = field(repr=False, compare=False)
+    canonical: str = ""
+    digest: str = ""
+
+
+@dataclass(frozen=True)
 class PeerToolGrant:
     """What the verified ingress proved for one peer turn. ``verify`` raises once the binding's
-    session is no longer the one the turn was admitted on. ``pins`` holds the calls the latest
-    allowed batch checked: ``(tool, canonical arguments, handler) -> [peer_grant, ...]``."""
+    session is no longer the one the turn was admitted on. The latest allowed batch leaves
+    ``pins`` (``(tool, canonical arguments) -> [PinnedCall]``) and, once the executor resolved it as
+    a whole, ``resolved`` (tool call id -> the final arguments it dispatches). ``attempted`` records
+    every send that reached the transport, the side-effect scope a failed turn reports."""
 
     binding: str
     agent: Any = field(repr=False, compare=False)
     verify: Callable[[], None] = field(repr=False, compare=False)
     pins: dict = field(default_factory=dict, repr=False, compare=False)
+    resolved: dict = field(default_factory=dict, repr=False, compare=False)
+    attempted: list = field(default_factory=list, repr=False, compare=False)
 
 
 _grant: contextvars.ContextVar[Optional[PeerToolGrant]] = contextvars.ContextVar(
@@ -151,7 +169,7 @@ def _fence_holds(grant: PeerToolGrant) -> bool:
 
 
 def _check(policy: _Policy, name: str, args: Any) -> Optional[list]:
-    """The pins an allowed call needs (``[]`` for discovery), or None when it is not allowed."""
+    """The :class:`PinnedCall` list an allowed call needs (``[]`` for discovery), or None."""
     from tools.arg_coercion import coerce_tool_args
     from tools.tool_search import TOOL_CALL_NAME, TOOL_DESCRIBE_NAME, TOOL_SEARCH_NAME, normalize_tool_call_entries
 
@@ -180,7 +198,7 @@ def _check(policy: _Policy, name: str, args: Any) -> Optional[list]:
     handler = _native_handler(policy, name)
     if handler is None:
         return None
-    # Checked and pinned as dispatch will send them (handle_function_call coerces first).
+    # One owned deep snapshot, coerced as dispatch coerces: what is checked, pinned and sent.
     final = coerce_tool_args(name, copy.deepcopy(dict(args)))
     if name in policy.mutate:
         constraints = policy.mutate[name]
@@ -193,13 +211,13 @@ def _check(policy: _Policy, name: str, args: Any) -> Optional[list]:
     else:
         return None
     canonical = _canonical(final)
-    return None if canonical is None else [(name, canonical, handler, peer_grant_digest(entry))]
+    return None if canonical is None else [PinnedCall(name, handler, final, canonical, peer_grant_digest(entry))]
 
 
-def batch_allowed(agent: Any, calls: Sequence[tuple[str, Any]]) -> bool:
-    """Whether EVERY ``(tool name, parsed arguments)`` of a peer turn's batch may run (arguments
-    that did not parse are None and refuse it). An allowed batch replaces the grant's pins with
-    exactly its own calls; a refused one clears them."""
+def batch_allowed(agent: Any, calls: Sequence[tuple[str, Any]], resolved: Optional[dict] = None) -> bool:
+    """Whether EVERY ``(tool name, arguments)`` of a peer turn's batch may run (arguments that did
+    not parse are None and refuse it). An allowed batch replaces the grant's pins, and its resolved
+    final arguments when given, with exactly its own; a refused one clears both."""
     policy = _active_policy(agent)
     pins: Optional[list] = [] if policy is not None and calls else None
     for name, args in calls if pins is not None else ():
@@ -212,24 +230,94 @@ def batch_allowed(agent: Any, calls: Sequence[tuple[str, Any]]) -> bool:
     if grant is not None:
         with _pins_lock:
             grant.pins.clear()
-            for tool, canonical, handler, digest in pins or ():
-                grant.pins.setdefault((tool, canonical, handler), []).append(digest)
+            grant.resolved.clear()
+            for pin in pins or ():
+                grant.pins.setdefault((pin.tool, pin.canonical), []).append(pin)
+            if pins is not None:
+                grant.resolved.update(resolved or {})
     return pins is not None
 
 
-def claim_pinned_call(tool: str, args: Any, handler: Any) -> Optional[tuple[str, Callable[[], bool]]]:
-    """Consume the pin for exactly this call through exactly this handler and return its
-    ``peer_grant`` with a re-check of the identity fence for each send attempt; None when the
-    current batch's check did not pin it or the fence no longer holds (it must not be sent)."""
+def batch_resolved(agent: Any, call_ids: Sequence[str]) -> bool:
+    """Whether the executor already resolved and pinned exactly these calls as one final batch."""
+    grant = _grant.get()
+    if grant is None or grant.agent is not agent or not call_ids:
+        return False
+    with _pins_lock:
+        return all(call_id in grant.resolved for call_id in call_ids)
+
+
+UNRESOLVED = object()
+
+
+def is_resolved(call_id: str) -> bool:
+    grant = _grant.get()
+    with _pins_lock:
+        return grant is not None and call_id in grant.resolved
+
+
+def take_resolved_args(call_id: str) -> Any:
+    """The final arguments the resolved batch fixed for this call (once), else ``UNRESOLVED``."""
+    grant = _grant.get()
+    if grant is None:
+        return UNRESOLVED
+    with _pins_lock:
+        return grant.resolved.pop(call_id, UNRESOLVED)
+
+
+def pinned_handler(tool: str) -> Any:
+    """The native handler the current batch pinned for ``tool``: dispatch uses it, never a handler
+    resolved again from the registry. None outside a pinned peer batch."""
+    grant = _grant.get()
+    if grant is None:
+        return None
+    with _pins_lock:
+        return next((pins[0].handler for (name, _c), pins in grant.pins.items() if name == tool and pins), None)
+
+
+@dataclass(frozen=True)
+class PinClaim:
+    """A claimed pin: send ``snapshot`` (never the caller's objects) only while :meth:`sendable`."""
+
+    pin: PinnedCall
+    grant: PeerToolGrant = field(repr=False)
+
+    @property
+    def digest(self) -> str:
+        return self.pin.digest
+
+    @property
+    def snapshot(self) -> Any:
+        return self.pin.snapshot
+
+    def sendable(self, live_args: Any) -> bool:
+        """The fence still holds and the caller's arguments still equal the checked snapshot (a
+        hook keeping a mutable alias cannot change them after the claim). Records the attempt."""
+        try:
+            unchanged = _canonical(live_args) == self.pin.canonical
+        except Exception:  # mutated while being read
+            unchanged = False
+        if not unchanged or not _fence_holds(self.grant):
+            return False
+        with _pins_lock:
+            self.grant.attempted.append({"tool": self.pin.tool, "peer_grant": self.pin.digest})
+        return True
+
+
+def claim_pinned_call(tool: str, args: Any, handler: Any) -> Optional[PinClaim]:
+    """Consume the pin for exactly this call through exactly this handler; None when the current
+    batch did not pin it or the fence no longer holds (it must not be sent)."""
     grant, canonical = _grant.get(), _canonical(args)
     if grant is None or canonical is None:
         return None
     with _pins_lock:
-        digests = grant.pins.get((tool, canonical, handler))
-        digest = digests.pop(0) if digests else None
-    if digest is None or not _fence_holds(grant):
+        pins = grant.pins.get((tool, canonical)) or []
+        pin = next((p for p in pins if p.handler is handler), None)
+        if pin is not None:
+            pins.remove(pin)
+    if pin is None or not _fence_holds(grant):
         return None
-    return digest, lambda: _fence_holds(grant)
+    return PinClaim(pin, grant)
 
 
 def scope_discovery_defs(tool_defs: Iterable[dict]) -> list:

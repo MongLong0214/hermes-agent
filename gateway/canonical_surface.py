@@ -12,7 +12,7 @@ import secrets
 import sqlite3
 import time
 from contextlib import closing, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol
 
@@ -390,10 +390,52 @@ def _unconfirmed_once_claimed():
 
 @dataclass(frozen=True)
 class CanonicalReceiptResult:
-    """The durable state visible to an internal canonical caller."""
+    """The durable state visible to an internal canonical caller. A terminal ``failure`` (never
+    text) is a turn that did not complete: its code and the side-effect scope observed."""
 
     status: str
     terminal_text: str | None = None
+    failure: dict | None = None
+
+
+_SIDE_EFFECT_SCOPES = frozenset({"none", "attempted", "unknown"})
+_MAX_LISTED_SENDS = 32
+
+
+@dataclass
+class CanonicalTurnObservation:
+    """What one canonical turn was seen to do, for its durable failure record: whether the actor's
+    turn started (and raised) under this observation, and every peer tool send that reached the
+    transport."""
+
+    actor_started: bool = False
+    actor_failed: bool = False
+    attempted: list = field(default_factory=list)
+
+    def failure(self, code: str) -> dict:
+        """``side_effects``: ``attempted`` (with the sends) when any send went out, ``none`` only when
+        the observed turn sent nothing, ``unknown`` when the turn was not observed at all."""
+        if self.attempted:  # the count is exact; the listed sends are capped to fit the receipt
+            return {"code": code, "side_effects": "attempted", "attempted_count": len(self.attempted),
+                    "attempted": list(self.attempted[:_MAX_LISTED_SENDS])}
+        return {"code": code, "side_effects": "none" if self.actor_started else "unknown"}
+
+
+def _valid_failure(failure: Any) -> bool:
+    return (isinstance(failure, dict) and isinstance(failure.get("code"), str)
+            and failure.get("side_effects") in _SIDE_EFFECT_SCOPES
+            and (failure["side_effects"] == "attempted") == bool(failure.get("attempted")))
+
+
+def _turn_failure_code(exc: BaseException, observation: CanonicalTurnObservation) -> str | None:
+    """The terminal failure of a turn whose actor ran: it raised, or it ended partial or failed.
+    None keeps the receipt pending, as before: nothing ran (refused before the actor started), or
+    a binding, actor or DB proof no longer holds and cannot be written to."""
+    if observation.actor_failed:
+        return "canonical_turn_failed"
+    if observation.actor_started and isinstance(exc, ValueError) and str(exc) == "canonical_turn_refused":
+        return "canonical_turn_refused"
+    return None
 
 
 _UNRECORDED = "canonical_event_unrecorded"  # internal: no receipt yet; never answered to a caller
@@ -460,6 +502,8 @@ class CanonicalReceiptCoordinator:
                 raise ValueError("canonical_receipt_conflict")
             if parsed.get("state") == "pending" and isinstance(parsed.get("owner"), str):
                 return CanonicalReceiptResult("pending")
+            if parsed.get("state") == "terminal" and _valid_failure(parsed.get("failure")):
+                return CanonicalReceiptResult("terminal", None, parsed["failure"])
             response = parsed.get("response")
             if (parsed.get("state") == "terminal" and isinstance(response, dict)
                     and isinstance(response.get("terminal_text"), str)):
@@ -688,20 +732,29 @@ class CanonicalReceiptCoordinator:
             async def discard(_result: CanonicalTurnResult) -> None:
                 return None
 
+            observation = CanonicalTurnObservation()
             with _unconfirmed_once_claimed():
-                result = await self._runner.run_bound_existing_turn(
-                    binding, event, entry, reply_sink=request_local_reply_sink(discard),
-                    expected_actor=actor, expected_session_db=db,
-                    expected_db_path=proof.db_path, expected_db_identity=proof.db_identity,
-                    expected_run_generation=run_generation,
-                    held_lease=lease, peer=peer,
-                )
-                if not isinstance(result, CanonicalTurnResult) or len(result.terminal_text) > _MAX_TEXT_CHARS:
-                    raise ValueError("canonical_receipt_invalid")
-                terminal = self._encode({
-                    "v": 1, "state": "terminal", "fingerprint": fingerprint,
-                    "response": {"binding_name": result.binding_name, "terminal_text": result.terminal_text},
-                })
+                try:
+                    result = await self._runner.run_bound_existing_turn(
+                        binding, event, entry, reply_sink=request_local_reply_sink(discard),
+                        expected_actor=actor, expected_session_db=db,
+                        expected_db_path=proof.db_path, expected_db_identity=proof.db_identity,
+                        expected_run_generation=run_generation,
+                        held_lease=lease, peer=peer, observation=observation,
+                    )
+                    if not isinstance(result, CanonicalTurnResult) or len(result.terminal_text) > _MAX_TEXT_CHARS:
+                        raise ValueError("canonical_receipt_invalid")
+                    answer = CanonicalReceiptResult("terminal", result.terminal_text)
+                    outcome = {"response": {"binding_name": result.binding_name, "terminal_text": result.terminal_text}}
+                except Exception as exc:
+                    # The actor raised, or its turn ended partial or failed: a durable terminal failure
+                    # with the side effects actually observed, never success and never a replay.
+                    code = _turn_failure_code(exc, observation)
+                    if code is None:
+                        raise
+                    answer = CanonicalReceiptResult("terminal", None, observation.failure(code))
+                    outcome = {"failure": answer.failure}
+                terminal = self._encode({"v": 1, "state": "terminal", "fingerprint": fingerprint, **outcome})
                 self._require_current_claim_target(proof, actor, db, run_generation)
                 if not db.compare_and_set_meta(
                     key, pending, terminal, proven_db_path=db.db_path, proven_db_identity=proof.db_identity
@@ -709,7 +762,7 @@ class CanonicalReceiptCoordinator:
                     raise ValueError("canonical_receipt_terminal_unconfirmed")
             # The terminal is durable and a replay answers it, so this answer is the same; a head
             # that moves after the compare-and-set cannot change what was recorded.
-            return CanonicalReceiptResult("terminal", result.terminal_text)
+            return answer
         finally:
             if run_generation is not None:
                 self._runner._release_running_agent_state(

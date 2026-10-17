@@ -3610,7 +3610,7 @@ class GatewayRunner(
         expected_actor: Any = None, expected_session_db: Any = None,
         expected_db_path: Any = None, expected_db_identity: Any = None,
         expected_run_generation: int | None = None,
-        held_lease: Any = None, peer: Any = None,
+        held_lease: Any = None, peer: Any = None, observation: Any = None,
     ) -> Any:
         """Run one exact cached actor without creating, routing, or delivering anything.
 
@@ -3765,7 +3765,10 @@ class GatewayRunner(
                     principal_token = set_turn_principal("peer")
                     # The only grant a peer tool batch can run under: this verified binding, this
                     # actor, while the fence above still holds (agent.canonical_peer_tools).
-                    grant_token = bind_grant(PeerToolGrant(binding.name, agent, require_peer_fence))
+                    # Its sends land in the caller's observation: a failed turn records that scope.
+                    grant_token = bind_grant(PeerToolGrant(
+                        binding.name, agent, require_peer_fence,
+                        attempted=observation.attempted if observation is not None else []))
                     prior_principal = getattr(agent, "_turn_principal", None)
                     prior_skip_review = getattr(agent, "skip_background_review", False)
                     agent._turn_principal = "peer"
@@ -3781,6 +3784,8 @@ class GatewayRunner(
                         parent_chat_id=str(getattr(origin, "parent_chat_id", "") or ""),
                         cron_session=current_cron_session())
                     try:
+                        if observation is not None:
+                            observation.actor_started = True
                         with scoped_current_session_id(session_id):
                             return agent.run_conversation(
                                 peer_prompt, conversation_history=agent_history, task_id=session_id,
@@ -3788,6 +3793,12 @@ class GatewayRunner(
                                 persist_user_display_kind="canonical_peer",
                                 persist_user_display_metadata={"canonical_peer": peer},
                             )
+                    except Exception:
+                        # The actor's own failure, whatever its type (even a ValueError that reads
+                        # like a gateway refusal code): its receipt records a terminal failure.
+                        if observation is not None:
+                            observation.actor_failed = True
+                        raise
                     finally:
                         clear_session_vars(session_tokens)
                         agent._turn_principal = prior_principal

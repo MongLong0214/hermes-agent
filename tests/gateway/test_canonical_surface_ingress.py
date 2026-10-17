@@ -301,11 +301,12 @@ def test_refusal_paths_never_reach_the_cached_actor(ingress, send, monkeypatch):
         assert await send() == first
         assert ingress.actor.calls == ["hello"]
 
-        # A turn that fails after its claim leaves the receipt pending: reported as uncertainty
-        # with no detail, and a replay never runs it again.
+        # A turn whose actor fails after its claim records a durable terminal failure, with the
+        # side effects it had (none here) and no detail; a replay answers it and never re-runs.
         ingress.actor.fail_with = RuntimeError("private execution detail")
         failed = await send(event_id="event-2")
-        assert _code(failed) == (409, "canonical_event_uncertain")
+        assert _code(failed) == (409, "canonical_event_failed")
+        assert failed[1]["error"]["side_effects"] == "none"
         assert "private execution detail" not in json.dumps(failed[1])
         ingress.actor.fail_with = None
         assert await send(event_id="event-2") == failed
@@ -607,7 +608,7 @@ def test_replay_without_the_cached_actor_answers_from_the_recorded_receipt(ingre
         assert first == (200, {"event_id": "event", "text": _TERMINAL})
         ingress.actor.fail_with = RuntimeError("private execution detail")
         uncertain = await send(event_id="event-2")
-        assert _code(uncertain) == (409, "canonical_event_uncertain")
+        assert _code(uncertain) == (409, "canonical_event_failed")  # a terminal failure, recorded
         ingress.actor.fail_with = None
 
         await lose_the_actor()
@@ -621,7 +622,7 @@ def test_replay_without_the_cached_actor_answers_from_the_recorded_receipt(ingre
         [(kwargs, built)] = factory.built
         assert kwargs["session_id"] == ingress.entry.session_id and built.calls == ["hello"]
         assert ingress.actor.calls == ["hello", "hello"]
-        assert sorted(receipt["state"] for receipt in ingress.receipts()) == ["pending", "terminal", "terminal"]
+        assert sorted(receipt["state"] for receipt in ingress.receipts()) == ["terminal", "terminal", "terminal"]
 
     asyncio.run(exercise())
 

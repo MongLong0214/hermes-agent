@@ -8,18 +8,24 @@ cannot pass merely because peer turns run nothing."""
 
 import atexit
 import os
-import pwd
 import shutil
 import tempfile
 from pathlib import Path
 
 import pytest
 
-# Pinned BEFORE any Hermes import, for every resolver, import-time path, cache and subprocess of
-# this module: HOME and HERMES_HOME name a fresh tmp dir, so even a run outside tests/ (no hermetic
-# conftest), which once let these helpers replace the user's live config, resolves nothing in the
-# real home. _LIVE_CONFIG comes from the account database, never from HOME.
-_LIVE_CONFIG = (Path(pwd.getpwuid(os.getuid()).pw_dir) / ".hermes" / "config.yaml").resolve()
+try:
+    import pwd  # the account database names the real home even when HOME is redirected
+except ImportError:  # not POSIX
+    pwd = None
+
+# Pinned BEFORE any dependent Hermes import, for every resolver, import-time path, cache and
+# subprocess of this module: HOME and HERMES_HOME name a fresh tmp dir, and the context-local home
+# override, which wins over both, is replaced by that same tmp home, so a caller's existing override
+# (a profile scope) cannot aim this module at a real home either. A run outside tests/ (no hermetic
+# conftest) once let these helpers replace the user's live config.
+_REAL_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir) if pwd is not None else Path.home()
+_LIVE_CONFIG = (_REAL_HOME / ".hermes" / "config.yaml").resolve()
 _PINNED_ROOT = Path(tempfile.mkdtemp(prefix="hermes-peer-tools-")).resolve()
 if _PINNED_ROOT.is_relative_to(_LIVE_CONFIG.parent) or _LIVE_CONFIG.is_relative_to(_PINNED_ROOT):
     raise RuntimeError(f"the pinned test home {_PINNED_ROOT} overlaps the real home")
@@ -27,19 +33,30 @@ atexit.register(shutil.rmtree, _PINNED_ROOT, True)
 os.environ["HOME"] = str(_PINNED_ROOT)
 os.environ["HERMES_HOME"] = str(_PINNED_ROOT / ".hermes")
 
+from hermes_constants import reset_hermes_home_override, set_hermes_home_override  # noqa: E402
+
+_MODULE_PIN = set_hermes_home_override(_PINNED_ROOT / ".hermes")
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _release_the_module_pin():
+    yield
+    reset_hermes_home_override(_MODULE_PIN)
+
 
 @pytest.fixture(autouse=True)
 def _never_the_live_config():
-    """Fail before the test body when the resolver names the live config, whatever bound it."""
+    """Fail before the test body when the resolver names anything in the real Hermes home."""
     from hermes_cli.config import get_config_path
 
-    if get_config_path().resolve() == _LIVE_CONFIG:
-        pytest.fail("the config resolver names the live config")
+    if get_config_path().resolve().is_relative_to(_LIVE_CONFIG.parent):
+        pytest.fail("the config resolver names the live Hermes home")
 
 
 import asyncio  # noqa: E402
 import hashlib  # noqa: E402
 import json  # noqa: E402
+import sys  # noqa: E402
 from types import SimpleNamespace  # noqa: E402
 
 import yaml  # noqa: E402
@@ -50,9 +67,35 @@ from gateway.canonical_surface import (  # noqa: E402
 from gateway.config import GatewayConfig, Platform  # noqa: E402
 from gateway.run import GatewayRunner  # noqa: E402
 from gateway.session import SessionSource  # noqa: E402
+from tools import mcp_tool_loop as _mcp_loop  # noqa: E402
 
 CEO = "acp-canonical-ceo"
 TOOL = "mcp__acp_ceo__run_get"
+_REAL_RUN_ON_MCP_LOOP = _mcp_loop._run_on_mcp_loop  # before any fixture swaps in the in-thread loop
+# A local stdio MCP server that records the exact tools/call request it received.
+_STDIO_PEER_SERVER = """
+import json, sys
+from pathlib import Path
+log = Path(sys.argv[1])
+for line in sys.stdin:
+    request = json.loads(line)
+    if "id" not in request:
+        continue
+    method = request["method"]
+    if method == "initialize":
+        result = {"protocolVersion": request["params"]["protocolVersion"],
+                  "capabilities": {"tools": {}}, "serverInfo": {"name": "peer-local", "version": "1"}}
+    elif method == "tools/list":
+        result = {"tools": [{"name": "run_get", "description": "local test",
+                             "inputSchema": {"type": "object", "properties": {}}}]}
+    elif method == "tools/call":
+        with log.open("a", encoding="utf-8") as output:
+            output.write(json.dumps(request) + "\\n")
+        result = {"content": [{"type": "text", "text": "local result"}], "isError": False}
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+"""
 
 
 @pytest.fixture
@@ -70,6 +113,7 @@ def target(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HOME", str(tmp_path))
+    override = set_hermes_home_override(home)
     monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
     monkeypatch.setattr("hermes_state.DEFAULT_DB_PATH", home / "state.db")
     config = get_config_path().resolve()
@@ -147,6 +191,7 @@ def target(tmp_path, monkeypatch):
     try:
         yield runner, actor, db, entry, binding, metas
     finally:
+        reset_hermes_home_override(override)
         runner.session_store.close_all_db_handles()
         registry.deregister(TOOL)
         _forget_mcp_tool_server(TOOL)
@@ -333,3 +378,220 @@ def test_completed_multi_tool_turn_terminalizes_its_receipt(target, monkeypatch)
     assert result.status == "terminal" and result.terminal_text == "done"
     assert asyncio.run(coordinator.submit(binding(CEO), event)) == result
     assert len(metas) == 2
+
+
+def _peer_digest(entry):
+    canonical = json.dumps(entry, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+@pytest.mark.parametrize("outcome", ["success", "refusal", "exception", "partial"])
+def test_multi_call_receipt_terminalizes_on_unsuccessful_exit(target, monkeypatch, outcome):
+    from agent.tool_executor import _refuse_peer_tool_calls
+
+    runner, actor, db, entry, binding, metas = target
+    calls = [call(TOOL, {}, "c1"), call("terminal" if outcome == "refusal" else TOOL, {}, "c2")]
+
+    def conversation(text, *, conversation_history, task_id, **kwargs):
+        messages = []
+        denied = _refuse_peer_tool_calls(actor, calls, messages)
+        assert denied is (outcome == "refusal")
+        actor._persist_user_message_idx = len(conversation_history)
+        if outcome == "exception":
+            raise RuntimeError("conversation failed after batch authorization")
+        if outcome == "success":
+            from model_tools import handle_function_call
+            messages = [{"role": "tool", "tool_call_id": c.id,
+                         "content": handle_function_call(c.function.name, json.loads(c.function.arguments))}
+                        for c in calls]
+        return {"completed": outcome != "partial", "partial": outcome == "partial", "session_id": task_id,
+                "final_response": "tool batch finished", "messages": [
+                    *conversation_history, {"role": "user", "content": text},
+                    {"role": "assistant", "tool_calls": [
+                        {"id": c.id, "function": {"name": c.function.name,
+                                                  "arguments": c.function.arguments}} for c in calls]},
+                    *messages, {"role": "assistant", "content": "tool batch finished"}]}
+
+    monkeypatch.setattr(actor, "run_conversation", conversation)
+    event = CanonicalIngressEvent.from_json_bytes(json.dumps({
+        "binding": CEO, "event_id": outcome, "author_id": "author", "channel_id": "channel", "text": "act"}).encode())
+    coordinator = CanonicalReceiptCoordinator(runner)
+    error = None
+    try:
+        asyncio.run(coordinator.submit(binding(CEO), event))
+    except Exception as exc:
+        error = repr(exc)
+    receipt = json.loads(db.get_meta(coordinator._key(binding(CEO), event)))
+    replay = asyncio.run(coordinator.submit(binding(CEO), event))
+    assert receipt["state"] == "terminal" and replay.status == "terminal", (error, receipt, replay, metas)
+
+
+@pytest.mark.parametrize("sent_before_failing", [0, 1])
+def test_a_failed_turn_records_the_side_effects_it_had_and_is_never_re_run(target, monkeypatch, sent_before_failing):
+    """A terminal failure, never success; ``none`` only when nothing was sent, else every send."""
+    import model_tools
+    from agent.tool_executor import _refuse_peer_tool_calls
+
+    runner, actor, db, entry, binding, metas = target
+    runs = []
+
+    def conversation(text, *, conversation_history, task_id, **kwargs):
+        runs.append(text)
+        actor._persist_user_message_idx = len(conversation_history)
+        assert not _refuse_peer_tool_calls(actor, [call(TOOL, {}, "c1")], [])
+        if sent_before_failing:
+            model_tools.handle_function_call(TOOL, {})
+        raise RuntimeError("the actor failed")
+
+    monkeypatch.setattr(actor, "run_conversation", conversation)
+    event = CanonicalIngressEvent.from_json_bytes(json.dumps({
+        "binding": CEO, "event_id": f"failed-{sent_before_failing}", "author_id": "author",
+        "channel_id": "channel", "text": "act"}).encode())
+    coordinator = CanonicalReceiptCoordinator(runner)
+    first = asyncio.run(coordinator.submit(binding(CEO), event))
+    replay = asyncio.run(coordinator.submit(binding(CEO), event))
+    assert len(runs) == 1 and len(metas) == sent_before_failing and replay == first
+    assert first.status == "terminal" and first.terminal_text is None
+    if sent_before_failing:
+        assert first.failure["side_effects"] == "attempted" and first.failure["attempted"] == [
+            {"tool": TOOL, "peer_grant": _peer_digest({"read": TOOL})}]
+    else:
+        assert first.failure["side_effects"] == "none"
+
+
+def test_retry_rechecks_identity_after_recovery(target, monkeypatch):
+    import tools.mcp_tool_handlers as handlers
+    from tools.mcp_tool_common import _core
+
+    runner, actor, db, entry, binding, metas = target
+    submit(runner, binding(CEO), "control")
+    assert len(metas) == 1
+    metas.clear()
+    server = _core._servers["acp-ceo"]
+    real_call = server.session.call_tool
+    attempts = []
+
+    def first_dead(tool, arguments=None, meta=None):
+        attempts.append(tool)
+        raise handlers._StdioChildExited("dead before request", in_flight=False)
+
+    server.session.call_tool = first_dead
+    monkeypatch.setattr(handlers, "_mcp_loop_running", lambda: True)
+
+    def recovered(*args, **kwargs):
+        server.session.call_tool = real_call
+        runner._begin_session_run_generation(entry.session_key)
+        return True
+
+    monkeypatch.setattr(handlers._loop, "_signal_reconnect_and_wait", recovered)
+    submit(runner, binding(CEO), "retry")
+    assert len(attempts) == 1 and metas == []
+
+
+def test_real_stdio_sdk_dispatch_preserves_peer_provenance(target, monkeypatch, tmp_path):
+    import threading
+
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+
+    from tools.mcp_call_provenance import PROVENANCE_META_KEY
+    from tools.mcp_tool_common import _core
+
+    runner, actor, db, entry, binding, metas = target
+    server = _core._servers["acp-ceo"]
+    monkeypatch.setattr(_mcp_loop, "_run_on_mcp_loop", _REAL_RUN_ON_MCP_LOOP)
+    _mcp_loop._ensure_mcp_loop()
+    ready = threading.Event()
+    runtime = {}
+    script, wire_log = tmp_path / "stdio_peer_server.py", tmp_path / "wire.jsonl"
+    script.write_text(_STDIO_PEER_SERVER, encoding="utf-8")
+
+    async def serve():
+        async with stdio_client(StdioServerParameters(command=sys.executable, args=[str(script), str(wire_log)],
+                                                      env={"PATH": os.environ.get("PATH", ""),
+                                                           "HOME": os.environ["HOME"],
+                                                           "HERMES_HOME": os.environ["HERMES_HOME"]})) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                server.session = session
+                runtime["stop"] = asyncio.Event()
+                ready.set()
+                await runtime["stop"].wait()
+
+    async def start():
+        runtime["task"] = asyncio.create_task(serve())
+
+    _mcp_loop._run_on_mcp_loop(start, timeout=10)
+    assert ready.wait(10), "local stdio MCP did not initialize"
+    try:
+        submit(runner, binding(CEO), "real-sdk")
+        assert actor.allowed == [True]
+        request = json.loads(wire_log.read_text(encoding="utf-8").strip())
+        meta = request["params"]["_meta"][PROVENANCE_META_KEY]
+        assert request["params"]["name"] == "run_get" and request["params"]["arguments"] == {}
+        assert meta["principal"] == "peer" and meta["session_id"] == entry.session_id
+        assert meta["peer_grant"] == _peer_digest({"read": TOOL})
+    finally:
+        async def stop():
+            runtime["stop"].set()
+            await runtime["task"]
+        _mcp_loop._run_on_mcp_loop(stop, timeout=10)
+        _mcp_loop._stop_mcp_loop()
+
+
+@pytest.mark.parametrize("invalidate", ["suspended", "origin", "routing_head", "run_generation"])
+def test_real_rpc_lock_queue_rechecks_the_complete_live_identity(target, monkeypatch, invalidate):
+    import time
+
+    from tools.mcp_tool_common import _core
+
+    runner, actor, db, entry, binding, metas = target
+    server = _core._servers["acp-ceo"]
+    monkeypatch.setattr(_mcp_loop, "_run_on_mcp_loop", _REAL_RUN_ON_MCP_LOOP)
+    _mcp_loop._ensure_mcp_loop()
+
+    async def acquire():
+        await server._rpc_lock.acquire()
+
+    async def waiting():
+        return bool(server._rpc_lock._waiters)
+
+    async def release():
+        server._rpc_lock.release()
+
+    _mcp_loop._run_on_mcp_loop(acquire, timeout=5)
+    event = CanonicalIngressEvent.from_json_bytes(json.dumps({
+        "binding": CEO, "event_id": "queued-" + invalidate, "author_id": "author", "channel_id": "channel",
+        "text": "act"}).encode())
+
+    async def exercise():
+        submission = asyncio.create_task(CanonicalReceiptCoordinator(runner).submit(binding(CEO), event))
+        deadline = time.monotonic() + 5
+        queued = False
+        while time.monotonic() < deadline:
+            if await asyncio.to_thread(_mcp_loop._run_on_mcp_loop, waiting, 5):
+                queued = True
+                break
+            await asyncio.sleep(0.01)
+        assert queued, "call never reached the held real RPC lock"
+        if invalidate == "suspended":
+            entry.suspended = True
+        elif invalidate == "origin":
+            entry.origin.user_id = "another-owner"
+        elif invalidate == "routing_head":
+            entry.session_id = "another-session"
+        else:
+            runner._begin_session_run_generation(entry.session_key)
+        await asyncio.to_thread(_mcp_loop._run_on_mcp_loop, release, 5)
+        try:
+            await submission
+        except ValueError:
+            pass
+
+    try:
+        asyncio.run(exercise())
+        assert actor.allowed == [True] and metas == []
+    finally:
+        if server._rpc_lock.locked():
+            _mcp_loop._run_on_mcp_loop(release, timeout=5)
+        _mcp_loop._stop_mcp_loop()
