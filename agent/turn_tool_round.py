@@ -74,6 +74,7 @@ def run_tool_round(
             args_preview = raw_args[:200] if isinstance(raw_args, str) else repr(raw_args)[:200]
             logging.debug("Tool call: %s with args: %s...", tc.function.name, args_preview)
 
+    emitted_names = [tc.function.name for tc in assistant_message.tool_calls]
     _tvv = validate_tool_calls(
         agent, assistant_message, finish_reason, messages=messages,
         conversation_history=conversation_history, api_call_count=api_call_count,
@@ -84,16 +85,23 @@ def run_tool_round(
     if _tvv.action == "continue":
         return _verdict("continue")
 
+    # A canonical peer turn decides on the COMPLETE emitted batch, every name as emitted, before
+    # any call is deduped, capped or dropped as unknown: one unknown, repaired or disallowed call
+    # runs none of them, and every call keeps a matching refusal result.
+    from agent.tool_executor import append_peer_refusals, peer_batch_refused
+    peer_refused = peer_batch_refused(agent, assistant_message.tool_calls, emitted_names)
+
     # Post-call guardrails.
-    assistant_message.tool_calls = agent._deduplicate_tool_calls(
-        agent._cap_delegate_task_calls(assistant_message.tool_calls)
-    )
+    if not peer_refused:
+        assistant_message.tool_calls = agent._deduplicate_tool_calls(
+            agent._cap_delegate_task_calls(assistant_message.tool_calls)
+        )
 
     # Mixed batch: the assistant message keeps EVERY emitted call (each tool_call needs a
     # matching result) while only valid ones dispatch.
     _invalid_batch_calls = [
         tc for tc in assistant_message.tool_calls if tc.function.name not in agent.valid_tool_names
-    ] if _tvv.mixed_invalid_batch else []
+    ] if _tvv.mixed_invalid_batch and not peer_refused else []
 
     assistant_msg, duplicate_previous_interim = stage_tool_call_message(
         agent, assistant_message=assistant_message, finish_reason=finish_reason, messages=messages
@@ -151,7 +159,10 @@ def run_tool_round(
         with suppress(Exception):
             agent.stream_delta_callback(None)
 
-    agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+    if peer_refused:
+        append_peer_refusals(agent, assistant_message.tool_calls, messages)
+    else:
+        agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
 
     if getattr(agent, "_incremental_persistence_failed", False):
         # Tool result could not be made canonical: never send the in-memory result to

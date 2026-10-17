@@ -724,6 +724,9 @@ def _dispatch_bridge_tool(function_name: str, function_args: Dict[str, Any],
                                             quiet_mode=True, skip_tool_search_assembly=True) or []
     except Exception:
         current_defs = []
+    # A canonical peer turn discovers and calls only the tools its grant allows.
+    from agent.canonical_peer_tools import scope_discovery_defs
+    current_defs = scope_discovery_defs(current_defs)
     args = function_args or {}
     if function_name == ts.TOOL_SEARCH_NAME:
         return ts.dispatch_tool_search(args, current_tool_defs=current_defs), None
@@ -832,10 +835,17 @@ def _execute_tool(function_name: str, function_args: Dict[str, Any], original_ar
         dispatch_kwargs["user_task"] = user_task
 
     def _dispatch(next_args: Dict[str, Any]) -> Any:
+        from agent.canonical_peer_tools import REFUSED, dispatch_handler
         from tools.connectors import dispatch_connector_call, is_connector_name
+        # A canonical peer turn runs only the handler its batch prepared or pinned for this exact
+        # call: never one looked up by name, never a connector, never the registry's.
+        handler = dispatch_handler(function_name, next_args, ids.tool_call_id)
+        if handler is REFUSED:
+            return tool_error(f"'{function_name}' was NOT run: a canonical peer turn dispatches only the calls "
+                              "its batch prepared.")
         if is_connector_name(function_name):
             return dispatch_connector_call(function_name, next_args, ids.tool_call_id)
-        return registry.dispatch(function_name, next_args, **dispatch_kwargs)
+        return registry.dispatch(function_name, next_args, handler=handler, **dispatch_kwargs)
 
     with _approval_observability(ids):
         if skip_tool_execution_middleware:
@@ -885,7 +895,9 @@ def handle_function_call(
     it (single-fire contract). enabled/disabled_toolsets scope the Tool Search
     bridge catalog to this session's grant (None = unrestricted).
     """
-    function_args = coerce_tool_args(function_name, function_args)
+    from agent.canonical_peer_tools import prepared_call
+    if prepared_call(tool_call_id) is None:  # a prepared peer call was coerced once, at preparation
+        function_args = coerce_tool_args(function_name, function_args)
     if not isinstance(function_args, dict):
         function_args = {}
     trace = list(tool_request_middleware_trace or [])

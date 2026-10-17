@@ -885,22 +885,26 @@ class ToolRegistry:
             error_type="tool_result_contract", tool=name, result_type=result_type)
 
     def dispatch(
-        self, name: str, args: dict, *, scope: Optional[str] = None, **kwargs) -> str | dict:
+        self, name: str, args: dict, *, scope: Optional[str] = None, handler: Optional[Callable] = None,
+        **kwargs) -> str | dict:
         """Execute a tool handler by name: async handlers bridged via ``_run_async()``,
-        results normalized, every exception returned as ``{"error": ...}``."""
+        results normalized, every exception returned as ``{"error": ...}``. ``handler`` (a sync
+        handler resolved earlier, e.g. a canonical peer batch's pinned one) runs instead of the
+        handler registered under ``name`` now."""
         entry = self.get_entry(name, scope=scope)
-        if not entry:
+        if handler is None and not entry:
             return tool_error(f"Unknown tool: {name}")
+        run, is_async = (handler, False) if handler is not None else (entry.handler, entry.is_async)
         try:
             # Plugin contract (plugins/AGENTS.md): optional context kwargs (task_id, session_id, user_task,
             # parent_agent, ...) are signature-inspected like hook payloads, so a narrow ``handle(args)``
             # plugin handler is not broken by every field the dispatcher injects (#68318).
-            kwargs = _kwargs_accepted_by(entry.handler, kwargs)
-            if entry.is_async:
+            kwargs = _kwargs_accepted_by(run, kwargs)
+            if is_async:
                 from model_tools import _run_async
-                result = _run_async(entry.handler(args, **kwargs))
+                result = _run_async(run(args, **kwargs))
             else:
-                result = entry.handler(args, **kwargs)
+                result = run(args, **kwargs)
             return self._normalize_handler_result(name, result)
         except Exception as e:
             # exc_info already renders the exception, so keep the message copy bounded.

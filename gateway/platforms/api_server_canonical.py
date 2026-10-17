@@ -202,6 +202,11 @@ async def handle_canonical_surface_event(self, request: "web.Request") -> "web.R
         # turn did not run; report uncertainty, never detail, and never invite a re-execution.
         logger.exception("Canonical surface event failed; reporting uncertainty")
         return _refusal("canonical_event_uncertain", 409)
+    if receipt.status == "terminal" and receipt.failure is not None:
+        # A durable failure, never answered as text: its side-effect scope says what already ran.
+        return web.json_response({"error": {
+            "code": "canonical_event_failed", "message": "The canonical turn failed; it is never re-run.",
+            "side_effects": receipt.failure["side_effects"]}}, status=409)
     if receipt.status != "terminal" or receipt.terminal_text is None:
         return _refusal("canonical_event_uncertain", 409)
     return web.json_response({"event_id": event.event_id, "text": receipt.terminal_text})
