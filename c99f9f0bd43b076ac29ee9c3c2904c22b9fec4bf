@@ -1,0 +1,22 @@
+Limit: a plugin hook or a model-supplied _meta that changes the arguments gets the peer call refused, not sent; the default config allows nothing, so the owner must configure the lists for peer turns to act
+Warn: a canonical peer turn of the configured CEO binding may run only the exact tools in gateway.canonical_peer_tools (read names, mutate tool to argument value lists), re-read per batch after validate_peer_metadata and the identity fence; each allowed batch pins the exact tool and final arguments and the MCP handler sends only a pinned call; the provenance _meta is truthful (principal peer, the real session, cron and delegation depth from the live context) with peer_grant = sha256 of the canonical JSON of the applied policy entry; approval prompts are never raised in a peer turn
+Record-Id: r-ceopeerturnacptools
+Provenance: inherited 19bdad9b6a2776bbc754e0496b630490a0a8e87f
+
+Limit: retry resend, real MCP/ACP and two-home profiles are not exercised by these tests; a test run outside tests/ bypasses conftest isolation, which is how the live config was overwritten once
+Warn: in a canonical peer turn the tool round checks the whole emitted batch before any pruning, across all three executors; the full binding fence is rechecked at claim and at each send; MCP origin is bound to the current handler and generated utilities are refused; the live cron context is kept across session binding; multi-call result groups terminalize their receipts. The peer test modules pin HOME and HERMES_HOME to a tmp dir before any Hermes import and fail before writing if the resolver names the live config
+Record-Id: r-ceopeerturnfencebatch
+Follows: r-ceopeerturnacptools
+Provenance: inherited d2b2124bd027575582b04c865486cf1e282526c1
+
+Limit: refusals before the actor starts still stay pending, as the existing receipt design records
+Warn: in a canonical peer turn each executor settles the whole batch (middleware, hooks, guardrails, then handler and policy on the final arguments) before the first call runs and dispatches the pinned handler; one deep copy of the arguments is checked, pinned and sent, and a send refuses if a mutable alias changed; an actor exception or partial exit makes the canonical receipt a durable terminal failure recording the observed side-effect scope (none, the sends made, or unknown), never success and never re-run (HTTP 409 canonical_event_failed)
+Record-Id: r-ceopeerturnpinnedbatch
+Follows: r-ceopeerturnfencebatch
+Provenance: inherited 00933ed79db34f921a52c44f6da5b5d7016238d0
+
+Limit: the cancellation write checks only head, actor and DB because the cancel retires the run's generation; an oversize reply is summarised in the receipt by length and SHA-256 while the full reply stays in the session transcript; refusals before the actor starts still stay pending
+Warn: in a canonical peer turn all three executors run only each call's prepared name, handler and args and the wrapper uses its prepared inner call, with no reparse, schema check or registry fallback; a call without a prepared entry, or renamed during preparation, refuses the whole batch; one deep copy of the arguments is checked, pinned and sent; an actor exception, partial exit, cancellation or oversize result makes the canonical receipt a durable terminal failure recording the observed sends (cancellation re-raises after the write), never success and never re-run
+Record-Id: r-ceopeerturnpreparedtuple
+Supersedes: r-ceopeerturnpinnedbatch
+Provenance: inherited 5ffd6a16182d8f8b314a8aea062b3805cadc40f4
