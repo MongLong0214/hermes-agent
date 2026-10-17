@@ -196,18 +196,40 @@ async def handle_canonical_surface_event(self, request: "web.Request") -> "web.R
     try:
         receipt = await CanonicalReceiptCoordinator(runner).submit(binding, event)
     except ValueError as exc:
-        return _refusal_for(str(exc))
+        code = str(exc)
+        if code not in _PRE_CLAIM_CODES | {"canonical_principal_rejected", "canonical_receipt_conflict"}:
+            # Answered as uncertainty below: log the raising path and its cause, never the turn's text.
+            cause = exc.__cause__
+            logger.warning("Canonical event %r answered canonical_event_uncertain: stage=%s cause=%s",
+                           event.event_id[:96], code[:96], str(cause)[:96] if isinstance(cause, ValueError)
+                           else type(cause).__name__ if cause is not None else None)
+        return _refusal_for(code)
     except Exception:
         # The coordinator exposes no claim boundary, so an unexpected failure cannot prove the
         # turn did not run; report uncertainty, never detail, and never invite a re-execution.
-        logger.exception("Canonical surface event failed; reporting uncertainty")
+        logger.exception("Canonical surface event %r failed; reporting uncertainty", event.event_id[:96])
         return _refusal("canonical_event_uncertain", 409)
     if receipt.status == "terminal" and receipt.failure is not None:
         # A durable failure, never answered as text: its side-effect scope says what already ran.
         return web.json_response({"error": {
             "code": "canonical_event_failed", "message": "The canonical turn failed; it is never re-run.",
             "side_effects": receipt.failure["side_effects"]}}, status=409)
+    if receipt.status == "unrecorded" and receipt.failure is not None:
+        # The turn ran and produced an answer whose record did not land: it is not delivered (no
+        # receipt binds it), it is kept (beside the receipt or in the local fallback) when
+        # ``answer_kept``, and never re-run. Kept is not delivered, and nothing is resent from it.
+        kept = receipt.failure.get("answer_kept") is True
+        return web.json_response({"error": {
+            "code": "canonical_answer_unrecorded",
+            "message": "The canonical turn ran but its answer could not be recorded, so it was not "
+                       "delivered; it is never re-run." if kept else
+                       "The canonical turn ran but its answer could be neither recorded nor preserved, so "
+                       "it was not delivered and is not kept; it is never re-run.",
+            "side_effects": receipt.failure["side_effects"], "delivery": "not_delivered",
+            "answer_kept": kept}}, status=409)
     if receipt.status != "terminal" or receipt.terminal_text is None:
+        logger.warning("Canonical event %r answered canonical_event_uncertain: receipt %s",
+                       event.event_id[:96], receipt.status)
         return _refusal("canonical_event_uncertain", 409)
     return web.json_response({"event_id": event.event_id, "text": receipt.terminal_text})
 

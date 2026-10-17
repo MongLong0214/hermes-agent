@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import json
 import os
 import threading
 
@@ -160,7 +161,7 @@ def test_busy_lease_refuses_before_claim_and_later_retry_claims(tmp_path, monkey
             monkeypatch.setattr(runner._turn_leases, "acquire", original_acquire)
             result = await coordinator.submit(_binding(entry, source), _event())
             assert result.status == "terminal"
-            assert claims == 1
+            assert claims == 2  # the event's claim record, then its receipt
             assert agent.calls == 1
         finally:
             runner.session_store.close_all_db_handles()
@@ -540,7 +541,10 @@ def test_foreign_held_lease_refuses_before_actor_invocation(tmp_path, monkeypatc
     asyncio.run(exercise())
 
 
-def test_actor_swapped_during_run_leaves_receipt_pending_without_terminal_cas(tmp_path, monkeypatch):
+def test_actor_swapped_during_run_keeps_the_answer_and_leaves_receipt_pending_without_terminal_cas(
+        tmp_path, monkeypatch):
+    """The actor returned its answer and was then replaced: the answer is kept and the event ends in
+    an explicit failure, with no terminal compare-and-set, the receipt left pending and no rerun (#1110)."""
     async def exercise():
         runner, entry, source, db, agent = _runner(tmp_path, monkeypatch)
         try:
@@ -573,14 +577,15 @@ def test_actor_swapped_during_run_leaves_receipt_pending_without_terminal_cas(tm
             monkeypatch.setattr(agent, "run_conversation", swap_during_run)
             monkeypatch.setattr(db, "compare_and_set_meta", count_terminal_cas)
             coordinator = CanonicalReceiptCoordinator(runner)
-            with pytest.raises(ValueError, match="^canonical_receipt_terminal_unconfirmed$") as refused:
-                await coordinator.submit(_binding(entry, source), _event())
-            assert str(refused.value.__cause__) == "canonical_agent_replaced"
+            first = await coordinator.submit(_binding(entry, source), _event())
+            assert (first.status, first.terminal_text, first.failure["stage"], first.failure["answer_kept"]) == (
+                "unrecorded", None, "turn.rejected_after_return", True)
             assert agent.calls == 1
             assert cas_calls == 0
-            pending = await coordinator.submit(_binding(entry, source), _event())
-            assert pending.status == "pending"
-            assert cas_calls == 0
+            key = coordinator._key(_binding(entry, source), _event())
+            assert json.loads(db.get_meta(key))["state"] == "pending"
+            assert await coordinator.submit(_binding(entry, source), _event()) == first
+            assert cas_calls == 0 and agent.calls == 1
         finally:
             runner.session_store.close_all_db_handles()
     asyncio.run(exercise())
@@ -624,16 +629,15 @@ def test_stale_cached_tuple_session_refuses_before_receipt_claim(tmp_path, monke
     asyncio.run(exercise())
 
 
-def test_terminal_cas_failure_leaves_pending(tmp_path, monkeypatch):
+def test_terminal_cas_failure_keeps_the_answer_unrecorded_and_never_reruns(tmp_path, monkeypatch):
     async def exercise():
         runner, entry, source, db, agent = _runner(tmp_path, monkeypatch)
         try:
             monkeypatch.setattr(db, "compare_and_set_meta", lambda *_args, **_kwargs: False)
             coordinator = CanonicalReceiptCoordinator(runner)
-            with pytest.raises(ValueError, match="^canonical_receipt_terminal_unconfirmed$"):
-                await coordinator.submit(_binding(entry, source), _event())
-            pending = await coordinator.submit(_binding(entry, source), _event())
-            assert pending.status == "pending"
+            first = await coordinator.submit(_binding(entry, source), _event())
+            assert (first.status, first.terminal_text, first.failure["answer_kept"]) == ("unrecorded", None, True)
+            assert await coordinator.submit(_binding(entry, source), _event()) == first
             assert agent.calls == 1
         finally:
             runner.session_store.close_all_db_handles()

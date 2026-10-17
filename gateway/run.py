@@ -3813,6 +3813,9 @@ class GatewayRunner(
                     session_key=binding.session_key, task_id=session_id,
                     run_generation=expected_run_generation,
                 )
+                if observation is not None:
+                    # Before any check can reject the turn: the caller keeps what the actor returned.
+                    observation.returned = result
                 require_current_head()
                 require_expected_actor()
                 boundary = getattr(agent, "_persist_user_message_idx", None)

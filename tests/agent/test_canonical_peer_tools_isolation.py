@@ -20,6 +20,7 @@ _REPO = Path(__file__).resolve().parents[2]
 @pytest.mark.parametrize("module, selector", [
     ("tests/agent/test_canonical_peer_tools.py", "owner_turns_ignore_the_peer_policy"),
     ("tests/gateway/test_canonical_peer_tool_grant.py", "sends_its_real_session"),
+    ("tests/gateway/test_canonical_record_cas.py", "control_a_normal_record"),
 ])
 def test_a_run_outside_the_hermetic_conftest_writes_nothing_in_the_real_home(tmp_path, module, selector):
     real_home, outside = tmp_path / "real-home", tmp_path / "outside-tests"
@@ -58,7 +59,8 @@ assert Path(child.stdout.strip()).is_relative_to(module._PINNED_ROOT), ("subproc
 
 
 @pytest.mark.parametrize("module", ["tests/agent/test_canonical_peer_tools.py",
-                                    "tests/gateway/test_canonical_peer_tool_grant.py"])
+                                    "tests/gateway/test_canonical_peer_tool_grant.py",
+                                    "tests/gateway/test_canonical_record_cas.py"])
 def test_test_module_pins_the_resolver_even_with_a_cached_profile_scope(tmp_path, module):
     """An override already bound to a (stand-in) live profile before the module loads is replaced:
     the override, the real resolver and a subprocess it spawns all name the module's tmp root."""
@@ -75,7 +77,8 @@ def test_test_module_pins_the_resolver_even_with_a_cached_profile_scope(tmp_path
 
 
 @pytest.mark.parametrize("module", ["tests/agent/test_canonical_peer_tools.py",
-                                    "tests/gateway/test_canonical_peer_tool_grant.py"])
+                                    "tests/gateway/test_canonical_peer_tool_grant.py",
+                                    "tests/gateway/test_canonical_record_cas.py"])
 def test_test_module_loads_without_the_posix_account_database(tmp_path, module):
     """No unconditional ``pwd``: the module still loads (and pins) where it does not exist."""
     code = ("import importlib.util, sys; sys.modules['pwd'] = None; "
