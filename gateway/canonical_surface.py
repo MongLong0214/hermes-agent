@@ -235,12 +235,23 @@ class CanonicalIngressEvent:
         if (duplicate or not isinstance(payload, dict)
                 or set(payload) not in (_EVENT_FIELDS, _EVENT_FIELDS | _IDENTITY_FIELDS)):
             raise ValueError("canonical_invalid_request")
+        binding = _required_text(payload["binding"], limit=_MAX_ID_CHARS)
+        event_id = _required_text(payload["event_id"], limit=_MAX_ID_CHARS)
+        author_id = _required_text(payload["author_id"], limit=_MAX_ID_CHARS)
+        channel_id = _required_text(payload["channel_id"], limit=_MAX_ID_CHARS)
+        text = payload["text"]
+        if isinstance(text, str) and len(text) > _MAX_TEXT_CHARS:
+            # Refused before any claim, so nothing ran. The answer stays the plain 400 the bridge tells
+            # the sender from; this line makes the refusal visible here too, by correlation, never text.
+            logger.warning("Canonical event refused at ingress: reason=text_over_limit binding=%r "
+                           "event_id=%r chars=%d limit=%d", binding[:96], event_id[:96], len(text),
+                           _MAX_TEXT_CHARS)
         return cls(
-            binding=_required_text(payload["binding"], limit=_MAX_ID_CHARS),
-            event_id=_required_text(payload["event_id"], limit=_MAX_ID_CHARS),
-            author_id=_required_text(payload["author_id"], limit=_MAX_ID_CHARS),
-            channel_id=_required_text(payload["channel_id"], limit=_MAX_ID_CHARS),
-            text=_required_text(payload["text"], limit=_MAX_TEXT_CHARS),
+            binding=binding,
+            event_id=event_id,
+            author_id=author_id,
+            channel_id=channel_id,
+            text=_required_text(text, limit=_MAX_TEXT_CHARS),
             expected_identity=(
                 _expected_identity({key: payload[key] for key in _IDENTITY_FIELDS})
                 if _IDENTITY_FIELDS <= payload.keys() else None
