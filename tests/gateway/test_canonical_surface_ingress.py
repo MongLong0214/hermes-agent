@@ -512,11 +512,14 @@ def test_owner_text_that_imitates_a_peer_rendering_stays_an_owner_turn(ingress, 
 
 
 @pytest.mark.parametrize("mid_turn", ["new_command", "actor_replaced"])
-def test_head_check_failing_after_the_claim_is_uncertain_on_first_answer_and_replay(ingress, send, mid_turn):
+def test_head_check_failing_after_the_claim_keeps_the_answer_and_fails_explicitly_on_first_answer_and_replay(
+        ingress, send, mid_turn):
     """Regression: a claimed turn whose head check failed answered its refusal code (409
     canonical_turn_interrupted after /new, canonical_agent_replaced after an actor swap), which reads
     as "not run"; a client resending under a new event id then ran the turn a second time. The same
-    codes are exact before a claim, so only the coordinator can tell the two apart."""
+    codes are exact before a claim, so only the coordinator can tell the two apart. The check fails
+    after the actor returned its answer, so that answer is kept and the event ends in the explicit
+    canonical_answer_unrecorded failure (#1110 r1), never a refusal, a delivery or a rerun."""
     replacement = _CachedActor(ingress.entry.session_id, ingress.actor._session_db)
 
     async def exercise():
@@ -539,7 +542,8 @@ def test_head_check_failing_after_the_claim_is_uncertain_on_first_answer_and_rep
         ingress.actor.during_turn = None
         if mid_turn == "new_command":
             _rebuild_evicted_actor(ingress)
-        assert _code(first) == (409, "canonical_event_uncertain")
+        assert _code(first) == (409, "canonical_answer_unrecorded")
+        assert (first[1]["error"]["answer_kept"], first[1]["error"]["delivery"]) == (True, "not_delivered")
         assert await send() == first
         assert ingress.actor.calls == ["hello"] and replacement.calls == []
         assert [receipt["state"] for receipt in ingress.receipts()] == ["pending"]

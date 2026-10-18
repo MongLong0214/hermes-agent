@@ -6,42 +6,51 @@ reached and every call in the batch gets the peer refusal result."""
 
 from __future__ import annotations
 
-import atexit
+import asyncio
+import hashlib
+import json
 import os
-import shutil
-import tempfile
+import threading
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
+import yaml
+
+from tests.hermes_home_pin import import_home, pinned_hermes_home, tmp_root
 
 try:
     import pwd  # the account database names the real home even when HOME is redirected
 except ImportError:  # not POSIX
     pwd = None
 
-# Pinned BEFORE any dependent Hermes import, for every resolver, import-time path, cache and
-# subprocess of this module: HOME and HERMES_HOME name a fresh tmp dir, and the context-local home
-# override, which wins over both, is replaced by that same tmp home, so a caller's existing override
-# (a profile scope) cannot aim this module at a real home either. A run outside tests/ (no hermetic
-# conftest) once let these helpers replace the user's live config.
+# Pinned for every Hermes import of this module (its import-time paths and caches) and, by a module
+# fixture, for every resolver and subprocess of its tests: HOME and HERMES_HOME name a fresh tmp dir,
+# and the context-local home override, which wins over both, is replaced by that same tmp home, so a
+# caller's existing override (a profile scope) cannot aim this module at a real home either. A run
+# outside tests/ (no hermetic conftest) once let these helpers replace the user's live config.
 _REAL_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir) if pwd is not None else Path.home()
 _LIVE_CONFIG = (_REAL_HOME / ".hermes" / "config.yaml").resolve()
-_PINNED_ROOT = Path(tempfile.mkdtemp(prefix="hermes-peer-tools-")).resolve()
+_PINNED_ROOT = tmp_root("hermes-peer-tools-")  # removed at exit by this process only
 if _PINNED_ROOT.is_relative_to(_LIVE_CONFIG.parent) or _LIVE_CONFIG.is_relative_to(_PINNED_ROOT):
     raise RuntimeError(f"the pinned test home {_PINNED_ROOT} overlaps the real home")
-atexit.register(shutil.rmtree, _PINNED_ROOT, True)
-os.environ["HOME"] = str(_PINNED_ROOT)
-os.environ["HERMES_HOME"] = str(_PINNED_ROOT / ".hermes")
 
-from hermes_constants import reset_hermes_home_override, set_hermes_home_override  # noqa: E402
+# The imports run pinned to the tmp home all pinned modules import under, so a path they cache names
+# no module's test home; the pin is put back (in ``finally``) as soon as they have run: collecting
+# this module leaves no home, override or home cache behind for the modules collected after it.
+with pinned_hermes_home(import_home(), importer=__name__):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
-_MODULE_PIN = set_hermes_home_override(_PINNED_ROOT / ".hermes")
+    from tools.tool_search import resolve_underlying_call as _REAL_RESOLVE_UNDERLYING
 
 
 @pytest.fixture(autouse=True, scope="module")
-def _release_the_module_pin():
-    yield
-    reset_hermes_home_override(_MODULE_PIN)
+def _pin_the_module_home():
+    """The same pin while this module's tests run, owned by this fixture and put back on teardown."""
+    with pinned_hermes_home(_PINNED_ROOT):
+        yield
 
 
 @pytest.fixture(autouse=True)
@@ -52,16 +61,6 @@ def _never_the_live_config():
     if get_config_path().resolve().is_relative_to(_LIVE_CONFIG.parent):
         pytest.fail("the config resolver names the live Hermes home")
 
-
-import asyncio  # noqa: E402
-import hashlib  # noqa: E402
-import json  # noqa: E402
-import threading  # noqa: E402
-from contextlib import contextmanager  # noqa: E402
-from types import SimpleNamespace  # noqa: E402
-from unittest.mock import MagicMock, patch  # noqa: E402
-
-import yaml  # noqa: E402
 
 SERVER = "acp-ceo"
 BINDING = "acp-canonical-ceo"
@@ -459,9 +458,6 @@ def test_an_allowed_peer_call_carries_principal_peer_computed_depth_and_its_entr
     assert read_meta["peer_grant"] == digest({"read": ceo("run_get")})
     assert mutate_meta["peer_grant"] == digest({"mutate": {ceo("escalation_resolve"): {"runId": [RUN]}}})
     assert set(read_meta) == OWNER_META_KEYS | {"peer_grant"}
-
-
-from tools.tool_search import resolve_underlying_call as _REAL_RESOLVE_UNDERLYING  # noqa: E402
 
 
 def _rewrite_before_the_final_check(monkeypatch, how: str, rewrite):

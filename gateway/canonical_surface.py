@@ -6,6 +6,7 @@ This module deliberately does not receive ingress, create sessions, or deliver r
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import secrets
@@ -28,7 +29,22 @@ _MAX_ID_CHARS = 256
 _MAX_TEXT_CHARS = 16_384
 # A terminal record holds any accepted text: JSON escapes one character into at most six (\uXXXX).
 _MAX_RECEIPT_CHARS = 6 * _MAX_TEXT_CHARS + 4_096
+# A kept answer is the whole reply the actor returned, never the receipt's summary of an over-cap one,
+# plus the failure that explains it (at most 32 listed sends). Any reply up to the answer bound fits
+# however it escapes; a record past the kept bound is reported as not kept, never as kept.
+_MAX_KEPT_ANSWER_CHARS = 1 << 20
+_MAX_KEPT_CHARS = 6 * _MAX_KEPT_ANSWER_CHARS + 4_096 + 16_384
+_RESULT_TOO_LARGE = "canonical_result_too_large"
+_REFUSAL_CODE = re.compile(r"canonical_[a-z_]{1,64}")
 _RECEIPT_NAMESPACE = "canonical-receipt:v2"
+# Beside each receipt row, never instead of it: the event's claim record (written before the receipt
+# claim, so a receipt row that later goes missing never reads as an unclaimed event), and the answer a
+# claimed turn produced whose terminal record did not land (kept, not delivered, never re-run).
+_CLAIM_NAMESPACE = "canonical-claim:v1"
+_KEPT_NAMESPACE = "canonical-answer-kept:v1"
+ANSWER_UNRECORDED = "canonical_answer_unrecorded"
+
+logger = logging.getLogger(__name__)
 
 
 def _required_text(value: Any, *, limit: int) -> str:
@@ -219,12 +235,23 @@ class CanonicalIngressEvent:
         if (duplicate or not isinstance(payload, dict)
                 or set(payload) not in (_EVENT_FIELDS, _EVENT_FIELDS | _IDENTITY_FIELDS)):
             raise ValueError("canonical_invalid_request")
+        binding = _required_text(payload["binding"], limit=_MAX_ID_CHARS)
+        event_id = _required_text(payload["event_id"], limit=_MAX_ID_CHARS)
+        author_id = _required_text(payload["author_id"], limit=_MAX_ID_CHARS)
+        channel_id = _required_text(payload["channel_id"], limit=_MAX_ID_CHARS)
+        text = payload["text"]
+        if isinstance(text, str) and len(text) > _MAX_TEXT_CHARS:
+            # Refused before any claim, so nothing ran. The answer stays the plain 400 the bridge tells
+            # the sender from; this line makes the refusal visible here too, by correlation, never text.
+            logger.warning("Canonical event refused at ingress: reason=text_over_limit binding=%r "
+                           "event_id=%r chars=%d limit=%d", binding[:96], event_id[:96], len(text),
+                           _MAX_TEXT_CHARS)
         return cls(
-            binding=_required_text(payload["binding"], limit=_MAX_ID_CHARS),
-            event_id=_required_text(payload["event_id"], limit=_MAX_ID_CHARS),
-            author_id=_required_text(payload["author_id"], limit=_MAX_ID_CHARS),
-            channel_id=_required_text(payload["channel_id"], limit=_MAX_ID_CHARS),
-            text=_required_text(payload["text"], limit=_MAX_TEXT_CHARS),
+            binding=binding,
+            event_id=event_id,
+            author_id=author_id,
+            channel_id=channel_id,
+            text=_required_text(text, limit=_MAX_TEXT_CHARS),
             expected_identity=(
                 _expected_identity({key: payload[key] for key in _IDENTITY_FIELDS})
                 if _IDENTITY_FIELDS <= payload.keys() else None
@@ -392,11 +419,26 @@ def _unconfirmed_once_claimed():
 @dataclass(frozen=True)
 class CanonicalReceiptResult:
     """The durable state visible to an internal canonical caller. A terminal ``failure`` (never
-    text) is a turn that did not complete: its code and the side-effect scope observed."""
+    text) is a turn that did not complete: its code and the side-effect scope observed.
+
+    ``unrecorded``: the turn ran and its answer exists, but its terminal record did not land (or the
+    turn was rejected after the actor returned it); the answer is kept beside the receipt or in the
+    local fallback beside the state.db (``failure['answer_kept']``, False when neither could hold
+    it), never delivered, never re-run.
+    ``uncertain``: the event was claimed before and nothing left can say what happened to it."""
 
     status: str
     terminal_text: str | None = None
     failure: dict | None = None
+
+
+def _log_record_state(level: int, what: str, *, stage: str, binding: Any, event: Any, key: str,
+                      observed: str, delivery: str, **detail: Any) -> None:
+    """One log line naming the failing stage, the event correlation (binding, event id, receipt key)
+    and the delivery state observed. Never the answer or the event text."""
+    logger.log(level, "Canonical event %s: stage=%s binding=%s event_id=%r receipt=%s observed=%s delivery=%s%s",
+               what, stage, getattr(binding, "name", None), str(getattr(event, "event_id", ""))[:96], key,
+               observed, delivery, "".join(f" {name}={value}" for name, value in detail.items()))
 
 
 _SIDE_EFFECT_SCOPES = frozenset({"none", "attempted", "unknown"})
@@ -413,6 +455,9 @@ class CanonicalTurnObservation:
     actor_failed: bool = False
     actor_finished: bool = False
     attempted: list = field(default_factory=list)
+    # What the actor's turn returned, set as soon as it returns: a rejection raised after that point
+    # (head, actor or generation no longer current) must not discard the answer it holds.
+    returned: Any = None
 
     def failure(self, code: str, **detail: Any) -> dict:
         """``side_effects``: ``attempted`` (with the sends, ``settled`` once the actor finished so the
@@ -427,16 +472,25 @@ class CanonicalTurnObservation:
 
 
 def _result_answer(result: Any, observation: CanonicalTurnObservation) -> CanonicalReceiptResult:
-    """A completed turn's answer, or, for a result no receipt may carry, a terminal failure summary
-    that fits: its length and digest tie it to the full reply kept in the session transcript."""
+    """A completed turn's answer as its receipt states it, or, for a result no receipt may carry, a
+    terminal failure summary that fits: its length and digest tie it to the full reply. The summary
+    is the receipt's only; an answer that is kept is kept whole (see ``submit``'s ``keep``)."""
     if not isinstance(result, CanonicalTurnResult):
         return CanonicalReceiptResult("terminal", None, observation.failure("canonical_result_invalid"))
     text = result.terminal_text
     if len(text) > _MAX_TEXT_CHARS:
         return CanonicalReceiptResult("terminal", None, observation.failure(
-            "canonical_result_too_large", result_chars=len(text),
+            _RESULT_TOO_LARGE, result_chars=len(text),
             result_sha256=hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()))
     return CanonicalReceiptResult("terminal", text)
+
+
+def _returned_text(observation: CanonicalTurnObservation) -> str | None:
+    """The whole answer text the actor returned before its turn was rejected, or None when it
+    returned none."""
+    returned = observation.returned
+    text = returned.get("final_response") if isinstance(returned, dict) else None
+    return text if isinstance(text, str) and text.strip() else None
 
 
 def _valid_failure(failure: Any) -> bool:
@@ -504,9 +558,132 @@ class CanonicalReceiptCoordinator:
         return f"{_RECEIPT_NAMESPACE}:{hashlib.sha256(framed).hexdigest()}"
 
     @staticmethod
-    def _encode(value: dict[str, Any]) -> str:
+    def _beside(namespace: str, key: str) -> str:
+        """A record kept beside the receipt ``key``: same event digest, its own namespace."""
+        return f"{namespace}:{key.rsplit(':', 1)[1]}"
+
+    def _read_records(self, reader: Any, key: str, home: Path) -> tuple[Any, Any, Any]:
+        """(kept answer, receipt, claim record) for the event, read on ``reader``. The kept answer is
+        the one beside the receipt or, when the state.db holds none, the one the local fallback in
+        ``home`` (the state.db's directory) holds."""
+        kept = reader.get_meta(self._beside(_KEPT_NAMESPACE, key))
+        if kept is None:
+            kept = self._fallback_kept(home, key)
+        return kept, reader.get_meta(key), reader.get_meta(self._beside(_CLAIM_NAMESPACE, key))
+
+    @staticmethod
+    def _fallback_kept(home: Path, key: str) -> str | None:
+        """The kept record the local fallback holds for the event, bound to the claim its name
+        carries; unreadable is never read as nothing kept."""
+        from gateway.canonical_answer_fallback import kept_for
+
+        try:
+            kept = kept_for(home, key.rsplit(":", 1)[1])
+        except OSError as exc:
+            logger.warning("Canonical answer fallback unreadable: receipt=%s error=%s", key, type(exc).__name__)
+            raise ValueError("canonical_receipt_unreadable") from None
+        for owner, raw in kept:
+            try:
+                value = raw.decode("utf-8", "surrogatepass")
+                parsed = json.loads(value)
+            except Exception:
+                parsed = None
+            if not isinstance(parsed, dict) or parsed.get("owner") != owner or parsed.get("receipt") != key:
+                raise ValueError("canonical_receipt_conflict")
+            return value
+        return None
+
+    def _answer_records(
+        self, binding: CanonicalSurfaceBinding, event: Any, key: str, fingerprint: str,
+        records: tuple[Any, Any, Any],
+    ) -> CanonicalReceiptResult | None:
+        """What a claimed event answers, or None when nothing was ever recorded for it.
+
+        A kept answer comes first, so a replay gives the first request's explicit failure whatever
+        became of the receipt row. A receipt answers as always, once its terminal is bound to the
+        claim that ran the event: a terminal another holder wrote, or one whose writer is unknown,
+        is a conflict, never this event's answer. A claim record without either is an event whose
+        receipt row went missing: it was claimed, may have run and been delivered, so it is uncertain
+        and never run again. A missing row is never read as an unclaimed event."""
+        kept, receipt, claimed = records
+        if kept is not None:
+            return self._decode_kept(kept, fingerprint)
+        if receipt is not None:
+            answer = self._decode(receipt, fingerprint)
+            claim_owner = self._decode_claim(claimed, fingerprint) if claimed is not None else None
+            # A terminal answers only when the claim that ran the event names its owner and the
+            # terminal names that same owner. An unknown owner proves no writer, on every path: a claim
+            # record from before claims named one, or no claim record at all (its row lost, read cold
+            # after a restart). The terminal stays where it is; it is never answered as this event's.
+            if answer.status == "terminal" and (not claim_owner or json.loads(receipt).get("owner") != claim_owner):
+                _log_record_state(logging.WARNING, "terminal not bound to its claim", stage="replay.owner",
+                                  binding=binding, event=event, key=key,
+                                  observed="recorded_other" if claim_owner else "owner_unknown",
+                                  delivery="not_delivered")
+                raise ValueError("canonical_receipt_conflict")
+            return answer
+        if claimed is None:
+            return None
+        self._decode_claim(claimed, fingerprint)
+        _log_record_state(logging.WARNING, "receipt row missing", stage="claim.receipt_missing",
+                          binding=binding, event=event, key=key, observed="absent", delivery="unknown")
+        return CanonicalReceiptResult("uncertain")
+
+    @staticmethod
+    def _decode_claim(value: Any, fingerprint: str) -> str | None:
+        """The owner the claim record names, or None for a claim record that names none."""
+        try:
+            parsed = json.loads(value)
+        except Exception:
+            parsed = None
+        if not isinstance(parsed, dict) or parsed.get("v") != 1 or parsed.get("state") != "claimed" \
+                or parsed.get("fingerprint") != fingerprint or not isinstance(parsed.get("owner", ""), str):
+            raise ValueError("canonical_receipt_conflict")
+        return parsed.get("owner")
+
+    @staticmethod
+    def _decode_kept(value: Any, fingerprint: str) -> CanonicalReceiptResult:
+        try:
+            parsed = json.loads(value)
+        except Exception:
+            parsed = None
+        if (not isinstance(parsed, dict) or parsed.get("v") != 1 or parsed.get("state") != "kept"
+                or parsed.get("fingerprint") != fingerprint or not _valid_failure(parsed.get("unrecorded"))
+                or parsed["unrecorded"].get("code") != ANSWER_UNRECORDED):
+            raise ValueError("canonical_receipt_conflict")
+        # A length and digest stand for an answer; they are not the answer, so they never read as kept.
+        answer = parsed.get("answer")
+        summary_only = (isinstance(answer, dict) and isinstance(answer.get("failure"), dict)
+                        and answer["failure"].get("code") == _RESULT_TOO_LARGE)
+        return CanonicalReceiptResult("unrecorded", None, {**parsed["unrecorded"], "answer_kept": not summary_only})
+
+    @staticmethod
+    def _observe_receipt(db: Any, key: str, pending: str, terminal: str | None, fingerprint: str,
+                         proof: CanonicalBindingProof) -> str:
+        """What the receipt row holds once this request's terminal record did not land."""
+        try:
+            value = db.get_meta(key)
+        except Exception:
+            return "unreadable"
+        if value is None:
+            return "absent"
+        if value == pending:
+            return "own_pending"
+        if terminal is not None and value == terminal:
+            # Binding only while the proven file is still the one its path names.
+            return "recorded_same" if _path_identity(proof.db_path) == proof.db_identity else "replaced"
+        try:
+            parsed = json.loads(value)
+        except Exception:
+            return "unreadable"
+        if not isinstance(parsed, dict) or parsed.get("fingerprint") != fingerprint:
+            return "conflict"
+        return {"pending": "other_pending", "terminal": "recorded_other"}.get(parsed.get("state"), "unreadable")
+
+    @staticmethod
+    def _encode(value: dict[str, Any], limit: int = _MAX_RECEIPT_CHARS) -> str:
         encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-        if len(encoded) > _MAX_RECEIPT_CHARS:
+        if len(encoded) > limit:
             raise ValueError("canonical_receipt_invalid")
         return encoded
 
@@ -577,7 +754,7 @@ class CanonicalReceiptCoordinator:
         return actor, db
 
     def _recorded_or_refuse(
-        self, binding: CanonicalSurfaceBinding, key: str, fingerprint: str, code: str,
+        self, binding: CanonicalSurfaceBinding, event: Any, key: str, fingerprint: str, code: str,
         proof: CanonicalBindingProof | None = None,
     ) -> CanonicalReceiptResult:
         """Answer an event an earlier request recorded; refuse with ``code`` only when none was.
@@ -586,7 +763,8 @@ class CanonicalReceiptCoordinator:
         recorded, that runs it twice. Without the cached actor there is no writable handle, and
         without a resolved head (a restarted gateway loads its routing index only after its
         listeners are up) there is no proof, so the receipt is read on a read-only handle to the
-        state.db the resolver proves for this binding's own session key and profile scope.
+        state.db the resolver proves for this binding's own session key and profile scope. "Recorded"
+        includes a kept answer and a claim record whose receipt row went missing.
         """
         from hermes_state import SessionDB
 
@@ -604,12 +782,13 @@ class CanonicalReceiptCoordinator:
             if getattr(reader, "_db_file_identity", None) != db_identity:
                 # The proven file was replaced: whether it held a receipt cannot be known now.
                 raise ValueError("canonical_receipt_unreadable")
-            recorded = reader.get_meta(key)
+            records = self._read_records(reader, key, db_path.parent)
         finally:
             reader.close()
-        if recorded is None:
+        answer = self._answer_records(binding, event, key, fingerprint, records)
+        if answer is None:
             raise ValueError(code)
-        return self._decode(recorded, fingerprint)
+        return answer
 
     def _require_current_claim_target(
         self, proof: CanonicalBindingProof, actor: Any, db: Any,
@@ -670,13 +849,13 @@ class CanonicalReceiptCoordinator:
         except ValueError as refusal:
             if str(refusal) == "canonical_principal_rejected":
                 raise
-            return self._recorded_or_refuse(binding, key, fingerprint, str(refusal))
+            return self._recorded_or_refuse(binding, event, key, fingerprint, str(refusal))
         if cached_actor(self._runner, proof.session_key)[0] is None:
             # No agent cached (a clean restart, before any ordinary turn). An event already recorded
             # answers from its receipt here, as it always has; only an unrecorded one goes on to have
             # this resolved session's agent built, under the turn lease, below.
             try:
-                return self._recorded_or_refuse(binding, key, fingerprint, _UNRECORDED, proof)
+                return self._recorded_or_refuse(binding, event, key, fingerprint, _UNRECORDED, proof)
             except ValueError as refusal:
                 if str(refusal) != _UNRECORDED:
                     raise
@@ -698,7 +877,7 @@ class CanonicalReceiptCoordinator:
                                      channel_id=event.channel_id, event_id=event.event_id, receipt=key)
             render_peer_turn(peer, event.text)
         except ValueError as refusal:
-            return self._recorded_or_refuse(binding, key, fingerprint, str(refusal), proof)
+            return self._recorded_or_refuse(binding, event, key, fingerprint, str(refusal), proof)
         owner = secrets.token_hex(16)
         pending = self._encode({"v": 1, "state": "pending", "owner": owner, "fingerprint": fingerprint})
         try:
@@ -706,7 +885,7 @@ class CanonicalReceiptCoordinator:
                 proof.session_id, owner_key=f"canonical:{id(event)}", generation=0,
             )
         except Exception:
-            return self._recorded_or_refuse(binding, key, fingerprint, "canonical_turn_busy", proof)
+            return self._recorded_or_refuse(binding, event, key, fingerprint, "canonical_turn_busy", proof)
         run_generation: int | None = None
         try:
             # Waiting for the turn lease may have exposed a new head, actor, or DB generation, and the
@@ -727,7 +906,7 @@ class CanonicalReceiptCoordinator:
                 if db.latest_conversation_role(proof.session_id) == "user":
                     raise ValueError("canonical_history_unanswered")
             except ValueError as refusal:
-                return self._recorded_or_refuse(binding, key, fingerprint, str(refusal), proof)
+                return self._recorded_or_refuse(binding, event, key, fingerprint, str(refusal), proof)
             run_generation = self._runner._begin_session_run_generation(proof.session_key)
             turn = self._runner._session_state(proof.session_key).turn
             turn.agent = actor
@@ -736,15 +915,21 @@ class CanonicalReceiptCoordinator:
             turn.started_ts = time.time()
             # The handle is bound to the proof by file identity (bound_actor_db), so its own path
             # spelling is the one SessionDB's literal path guard can match; the identity is the proof.
-            if not db.claim_meta_once(
-                key, pending, proven_db_path=db.db_path, proven_db_identity=proof.db_identity
-            ):
+            proven = {"proven_db_path": db.db_path, "proven_db_identity": proof.db_identity}
+            # A missing receipt row is not an unclaimed event: the claim record goes first and stays,
+            # so neither a re-entry nor a restored row can run a claimed event again. It names the
+            # claim's owner, so a terminal is this event's answer only when this claim wrote it.
+            claim = self._encode({"v": 1, "state": "claimed", "fingerprint": fingerprint, "owner": owner})
+            if not (db.claim_meta_once(self._beside(_CLAIM_NAMESPACE, key), claim, **proven)
+                    and db.claim_meta_once(key, pending, **proven)):
                 with _unconfirmed_once_claimed():
-                    receipt = db.get_meta(key)
+                    records = self._read_records(db, key, proof.db_path.parent)
                     # get_meta has no generation fence, so its result is usable only after this recheck.
                     self._require_current_claim_target(proof, actor, db, run_generation)
-                return self._decode(receipt, fingerprint)
+                answer = self._answer_records(binding, event, key, fingerprint, records)
+                return answer if answer is not None else CanonicalReceiptResult("uncertain")
 
+            from gateway.canonical_answer_fallback import keep as keep_locally
             from gateway.canonical_surface import request_local_reply_sink
 
             async def discard(_result: CanonicalTurnResult) -> None:
@@ -752,17 +937,95 @@ class CanonicalReceiptCoordinator:
 
             observation = CanonicalTurnObservation()
 
+            def outcome(answer: CanonicalReceiptResult) -> dict[str, Any]:
+                return ({"failure": answer.failure} if answer.failure is not None else {"response": {
+                    "binding_name": binding.name, "terminal_text": answer.terminal_text}})
+
+            def terminal_of(answer: CanonicalReceiptResult) -> str:
+                # Bound to this claim (its owner) and to this one write (a nonce no one holds before it
+                # lands): a readback equal to it is this write, never another holder's equal answer.
+                return self._encode({"v": 1, "state": "terminal", "fingerprint": fingerprint, "owner": owner,
+                                     "write": secrets.token_hex(16), **outcome(answer)})
+
             def record(answer: CanonicalReceiptResult, generation: int | None) -> None:
-                outcome = ({"failure": answer.failure} if answer.failure is not None else {"response": {
-                    "binding_name": result.binding_name, "terminal_text": answer.terminal_text}})
-                terminal = self._encode({"v": 1, "state": "terminal", "fingerprint": fingerprint, **outcome})
+                terminal = terminal_of(answer)
                 self._require_current_claim_target(proof, actor, db, generation)
-                if not db.compare_and_set_meta(
-                    key, pending, terminal, proven_db_path=db.db_path, proven_db_identity=proof.db_identity
-                ):
+                if not db.compare_and_set_meta(key, pending, terminal, **proven):
                     raise ValueError("canonical_receipt_terminal_unconfirmed")
 
-            result = None
+            def keep(answer: CanonicalReceiptResult, whole: str | None, *, stage: str, cause: str,
+                     observed: str) -> CanonicalReceiptResult:
+                """The one boundary an answer the request will not deliver passes, before the request
+                is answered: kept beside the receipt or, when the state.db refuses that, in the local
+                fallback beside it, and read back either way. Kept is not delivered and is never resent;
+                the turn never runs again. When neither holds it, the failure and the log say so.
+
+                What is kept is ``whole``, the answer text exactly as the actor returned it, never the
+                receipt's length-and-digest summary of an over-cap answer: ``answer_kept`` is true only
+                when those very bytes read back. A turn that returned no text keeps its failure."""
+                failure = observation.failure(ANSWER_UNRECORDED, stage=stage, observed=observed)
+                kept_answer = outcome(answer) if whole is None else {
+                    "response": {"binding_name": binding.name, "terminal_text": whole}}
+                # Ties the log and the kept record to the answer, without the log carrying it.
+                digest = hashlib.sha256((whole if whole is not None else json.dumps(
+                    answer.failure, sort_keys=True)).encode("utf-8", "surrogatepass")).hexdigest()
+                kept_key, preserved, errors, record_kept = self._beside(_KEPT_NAMESPACE, key), None, {}, None
+                try:
+                    record_kept = self._encode({"v": 1, "state": "kept", "fingerprint": fingerprint, "owner": owner,
+                                                "receipt": key, "unrecorded": failure, "answer": kept_answer,
+                                                "answer_sha256": digest}, _MAX_KEPT_CHARS)
+                    if not db.claim_meta_once(kept_key, record_kept, **proven):
+                        errors["keep_error"] = "already_kept"  # never written over
+                    elif db.get_meta(kept_key) != record_kept:
+                        errors["keep_error"] = "readback_mismatch"
+                    else:
+                        preserved = "receipt_store"
+                except Exception as exc:
+                    errors["keep_error"] = type(exc).__name__
+                if preserved is None and record_kept is None:
+                    errors["fallback_error"] = "no_record"  # the record itself could not be built
+                elif preserved is None:
+                    try:
+                        errors["fallback"] = keep_locally(proof.db_path.parent, key.rsplit(":", 1)[1], owner,
+                                                          record_kept.encode("utf-8", "surrogatepass"))
+                        preserved = "local_fallback"
+                    except Exception as exc:
+                        errors["fallback_error"] = type(exc).__name__
+                _log_record_state(
+                    logging.ERROR if preserved else logging.CRITICAL,
+                    "terminal not recorded" if preserved else "terminal not recorded and its answer NOT preserved",
+                    stage=stage, binding=binding, event=event, key=key, observed=observed, delivery="not_delivered",
+                    cause=cause, answer_kept=preserved is not None, preservation=preserved or "failed",
+                    answer_sha256=digest, **errors)
+                return CanonicalReceiptResult("unrecorded", None, {**failure, "answer_kept": preserved is not None})
+
+            def record_or_keep(answer: CanonicalReceiptResult, whole: str | None) -> CanonicalReceiptResult:
+                """Record the answer as the event's terminal, or, when that does not land, keep it (its
+                ``whole`` text) and end in an explicit failure: it is never delivered unbound, never
+                written over another holder's row or answer, and the turn never runs again. Only a
+                receipt that holds this very write answers with it; another holder's equal answer is a
+                conflict."""
+                stage, terminal = "record.encode", None
+                try:
+                    terminal = terminal_of(answer)
+                    stage = "record.proof"
+                    self._require_current_claim_target(proof, actor, db, run_generation)
+                    stage = "record.compare_and_set"
+                    if db.compare_and_set_meta(key, pending, terminal, **proven):
+                        return answer
+                    cause = "no_row_changed"
+                except Exception as exc:
+                    code = str(exc)
+                    cause = code if isinstance(exc, ValueError) and _REFUSAL_CODE.fullmatch(code) else type(exc).__name__
+                observed = self._observe_receipt(db, key, pending, terminal, fingerprint, proof)
+                if observed == "recorded_same":
+                    _log_record_state(logging.WARNING, "terminal not recorded by this write", stage=stage,
+                                      binding=binding, event=event, key=key, observed=observed,
+                                      delivery="answered_from_receipt", cause=cause)
+                    return answer
+                return keep(answer, whole, stage=stage, cause=cause, observed=observed)
+
+            result = whole = None
             with _unconfirmed_once_claimed():
                 try:
                     result = await self._runner.run_bound_existing_turn(
@@ -786,14 +1049,26 @@ class CanonicalReceiptCoordinator:
                     # The actor raised, or its turn ended partial or failed: a durable terminal failure
                     # with the side effects actually observed, never success and never a replay.
                     code = _turn_failure_code(exc, observation)
+                    returned = _returned_text(observation) if code is None else None
+                    if returned is not None:
+                        # The actor returned an answer and the turn was then rejected (its head, actor or
+                        # generation no longer current): the receipt stays pending as before, and the
+                        # answer passes the same boundary as one whose terminal record did not land.
+                        rejected = str(exc)
+                        return keep(_result_answer(CanonicalTurnResult(binding.name, returned), observation),
+                                    returned, stage="turn.rejected_after_return",
+                                    cause=rejected if isinstance(exc, ValueError) and _REFUSAL_CODE.fullmatch(rejected)
+                                    else type(exc).__name__,
+                                    observed=self._observe_receipt(db, key, pending, None, fingerprint, proof))
                     if code is None:
                         raise
                     answer = CanonicalReceiptResult("terminal", None, observation.failure(code))
                 else:
                     answer = _result_answer(result, observation)
-                record(answer, run_generation)
-            # The terminal is durable and a replay answers it, so this answer is the same; a head
-            # that moves after the compare-and-set cannot change what was recorded.
+                    whole = result.terminal_text if isinstance(result, CanonicalTurnResult) else None
+                answer = record_or_keep(answer, whole)
+            # The terminal (or the kept answer) is durable and a replay answers it, so this answer is
+            # the same; a head that moves after the compare-and-set cannot change what was recorded.
             return answer
         finally:
             if run_generation is not None:
