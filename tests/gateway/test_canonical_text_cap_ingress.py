@@ -6,20 +6,28 @@ in the bridge's own log. The answer the bridge reads stays the same (it tells th
 the gateway's log names the refused event by its correlation and sizes, never by its text.
 """
 
+import asyncio
 import atexit
+import json
+import logging
 import os
+import secrets
 import shutil
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+
+from tests.hermes_home_pin import import_home, pinned_hermes_home
 
 try:
     import pwd  # the account database names the real home even when HOME is redirected
 except ImportError:  # not POSIX
     pwd = None
 
-# Pinned BEFORE any Hermes import, as in test_canonical_record_cas.py: a resolver that still names the
+# As in test_canonical_record_cas.py: HOME, HERMES_HOME and the home override name a fresh tmp home
+# while this module imports Hermes and while its tests run, and a resolver that still names the
 # real Hermes home fails the test before anything is written.
 _REAL_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir) if pwd is not None else Path.home()
 _LIVE_ROOT = (_REAL_HOME / ".hermes").resolve()
@@ -27,29 +35,24 @@ _PINNED_ROOT = Path(tempfile.mkdtemp(prefix="hermes-text-cap-")).resolve()
 if _PINNED_ROOT.is_relative_to(_LIVE_ROOT) or _LIVE_ROOT.is_relative_to(_PINNED_ROOT):
     raise RuntimeError(f"the pinned test home {_PINNED_ROOT} overlaps the real home")
 atexit.register(shutil.rmtree, _PINNED_ROOT, True)
-os.environ["HOME"] = str(_PINNED_ROOT)
-os.environ["HERMES_HOME"] = str(_PINNED_ROOT / ".hermes")
 
-from hermes_constants import reset_hermes_home_override, set_hermes_home_override  # noqa: E402
+# The imports run pinned to the tmp home all pinned modules import under, so a path they cache names
+# no module's test home; the pin is put back (in ``finally``) as soon as they have run: collecting
+# this module leaves no home, override or home cache behind for the modules collected after it.
+with pinned_hermes_home(import_home(), importer=__name__):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
-_MODULE_PIN = set_hermes_home_override(_PINNED_ROOT / ".hermes")
+    from gateway.canonical_surface import _MAX_TEXT_CHARS
+    from gateway.config import PlatformConfig
+    from gateway.platforms.api_server import APIServerAdapter, _api_request_profile
 
 
 @pytest.fixture(autouse=True, scope="module")
-def _release_the_module_pin():
-    yield
-    reset_hermes_home_override(_MODULE_PIN)
+def _pin_the_module_home():
+    """The same pin while this module's tests run, owned by this fixture and put back on teardown."""
+    with pinned_hermes_home(_PINNED_ROOT):
+        yield
 
-
-import asyncio  # noqa: E402
-import json  # noqa: E402
-import logging  # noqa: E402
-import secrets  # noqa: E402
-from types import SimpleNamespace  # noqa: E402
-
-from gateway.canonical_surface import _MAX_TEXT_CHARS  # noqa: E402
-from gateway.config import PlatformConfig  # noqa: E402
-from gateway.platforms.api_server import APIServerAdapter, _api_request_profile  # noqa: E402
 
 _ROUTE = "/v1/canonical-surface/events"
 

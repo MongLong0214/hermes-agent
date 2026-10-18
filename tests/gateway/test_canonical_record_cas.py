@@ -13,23 +13,35 @@ Never: a second run of the turn, an overwrite of another holder's row or answer,
 the receipt does not bind, or an answer that is neither delivered nor reported as a failure.
 """
 
+import asyncio
 import atexit
+import contextlib
+import hashlib
+import json
+import logging
 import os
+import secrets
 import shutil
+import sqlite3
+import stat
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+
+from tests.hermes_home_pin import import_home, pinned_hermes_home
 
 try:
     import pwd  # the account database names the real home even when HOME is redirected
 except ImportError:  # not POSIX
     pwd = None
 
-# Pinned BEFORE any dependent Hermes import, for every resolver, import-time path, cache and
-# subprocess of this module: HOME and HERMES_HOME name a fresh tmp dir and the context-local home
-# override (which wins over both) names that same tmp home. A path that still resolves into the real
-# Hermes home fails the test before anything is written (see ``_never_a_live_path``).
+# Pinned for every Hermes import of this module (its import-time paths and caches) and, by a
+# module fixture, for every resolver and subprocess of its tests: HOME and HERMES_HOME name a fresh
+# tmp dir and the context-local home override (which wins over both) names that same tmp home. A
+# path that still resolves into the real Hermes home fails the test before anything is written (see
+# ``_never_a_live_path``).
 _REAL_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir) if pwd is not None else Path.home()
 _LIVE_ROOT = (_REAL_HOME / ".hermes").resolve()
 _LIVE_CONFIG = _LIVE_ROOT / "config.yaml"
@@ -37,18 +49,31 @@ _PINNED_ROOT = Path(tempfile.mkdtemp(prefix="hermes-record-cas-")).resolve()
 if _PINNED_ROOT.is_relative_to(_LIVE_ROOT) or _LIVE_ROOT.is_relative_to(_PINNED_ROOT):
     raise RuntimeError(f"the pinned test home {_PINNED_ROOT} overlaps the real home")
 atexit.register(shutil.rmtree, _PINNED_ROOT, True)
-os.environ["HOME"] = str(_PINNED_ROOT)
-os.environ["HERMES_HOME"] = str(_PINNED_ROOT / ".hermes")
 
-from hermes_constants import reset_hermes_home_override, set_hermes_home_override  # noqa: E402
+# The imports run pinned to the tmp home all pinned modules import under, so a path they cache names
+# no module's test home; the pin is put back (in ``finally``) as soon as they have run: collecting
+# this module leaves no home, override or home cache behind for the modules collected after it.
+with pinned_hermes_home(import_home(), importer=__name__):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
-_MODULE_PIN = set_hermes_home_override(_PINNED_ROOT / ".hermes")
+    from gateway import canonical_answer_fallback
+    from gateway.canonical_surface import (
+        CanonicalIngressEvent,
+        CanonicalReceiptCoordinator,
+        CanonicalSurfaceBinding,
+    )
+    from gateway.config import GatewayConfig, Platform, PlatformConfig
+    from gateway.platforms.api_server import APIServerAdapter, _api_request_profile
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionSource
+    from run_agent import AIAgent as _PersistenceAgent
 
 
 @pytest.fixture(autouse=True, scope="module")
-def _release_the_module_pin():
-    yield
-    reset_hermes_home_override(_MODULE_PIN)
+def _pin_the_module_home():
+    """The same pin while this module's tests run, owned by this fixture and put back on teardown."""
+    with pinned_hermes_home(_PINNED_ROOT):
+        yield
 
 
 def _is_live(path) -> bool:
@@ -65,27 +90,6 @@ def _never_a_live_path():
         if _is_live(path):
             pytest.fail(f"a resolver names the live Hermes home: {path}")
 
-
-import asyncio  # noqa: E402
-import contextlib  # noqa: E402
-import hashlib  # noqa: E402
-import json  # noqa: E402
-import logging  # noqa: E402
-import secrets  # noqa: E402
-import sqlite3  # noqa: E402
-import stat  # noqa: E402
-from types import SimpleNamespace  # noqa: E402
-
-from gateway import canonical_answer_fallback  # noqa: E402
-from gateway.canonical_surface import (  # noqa: E402
-    CanonicalIngressEvent,
-    CanonicalReceiptCoordinator,
-    CanonicalSurfaceBinding,
-)
-from gateway.config import GatewayConfig, Platform, PlatformConfig  # noqa: E402
-from gateway.platforms.api_server import APIServerAdapter, _api_request_profile  # noqa: E402
-from gateway.run import GatewayRunner  # noqa: E402
-from gateway.session import SessionSource  # noqa: E402
 
 _ROUTE = "/v1/canonical-surface/events"
 _RECEIPT = "canonical-receipt:"
@@ -504,9 +508,6 @@ def test_another_holder_writing_identical_text_does_not_authorize_our_delivery(g
     print("OTHER_HOLDER_SAME_ANSWER", json.dumps(observed, sort_keys=True))
     assert status == 409, observed
     assert "text" not in body, observed
-
-
-from run_agent import AIAgent as _PersistenceAgent
 
 
 def _exercise_real_flush(gw, monkeypatch, *, inject_locked=True):

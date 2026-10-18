@@ -9,63 +9,66 @@ Each case drives the real shim (``bridge/canonical/acp-canonical-shim.py``, or `
 in-process gateway under a tmp home. The Buzz wrapper is a stand-in that records what was posted.
 """
 
+import asyncio
 import atexit
+import contextlib
+import importlib.util
+import io
+import json
 import os
+import secrets
 import shutil
+import sqlite3
+import sys
 import tempfile
+import urllib.error
+import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+
+from tests.hermes_home_pin import import_home, pinned_hermes_home
 
 try:
     import pwd  # the account database names the real home even when HOME is redirected
 except ImportError:  # not POSIX
     pwd = None
 
-# Pinned BEFORE any Hermes import: HOME, HERMES_HOME and the context-local home override name a
-# fresh tmp dir. A path that still resolves into the real Hermes home fails before anything is written.
+# HOME, HERMES_HOME and the context-local home override name a fresh tmp dir while this module
+# imports Hermes and while its tests run. A path that still resolves into the real Hermes home fails
+# before anything is written.
 _REAL_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir) if pwd is not None else Path.home()
 _LIVE_ROOT = (_REAL_HOME / ".hermes").resolve()
 _PINNED_ROOT = Path(tempfile.mkdtemp(prefix="hermes-shim-cap-")).resolve()
 if _PINNED_ROOT.is_relative_to(_LIVE_ROOT) or _LIVE_ROOT.is_relative_to(_PINNED_ROOT):
     raise RuntimeError(f"the pinned test home {_PINNED_ROOT} overlaps the real home")
 atexit.register(shutil.rmtree, _PINNED_ROOT, True)
-os.environ["HOME"] = str(_PINNED_ROOT)
-os.environ["HERMES_HOME"] = str(_PINNED_ROOT / ".hermes")
 
-from hermes_constants import reset_hermes_home_override, set_hermes_home_override  # noqa: E402
+# The imports run pinned to the tmp home all pinned modules import under, so a path they cache names
+# no module's test home; the pin is put back (in ``finally``) as soon as they have run: collecting
+# this module leaves no home, override or home cache behind for the modules collected after it.
+with pinned_hermes_home(import_home(), importer=__name__):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
-_MODULE_PIN = set_hermes_home_override(_PINNED_ROOT / ".hermes")
+    from gateway import canonical_surface
+    from gateway.canonical_surface import CanonicalSurfaceBinding
+    from gateway.config import GatewayConfig, Platform, PlatformConfig
+    from gateway.platforms.api_server import APIServerAdapter, _api_request_profile
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionSource
 
 
 @pytest.fixture(autouse=True, scope="module")
-def _release_the_module_pin():
-    yield
-    reset_hermes_home_override(_MODULE_PIN)
+def _pin_the_module_home():
+    """The same pin while this module's tests run, owned by this fixture and put back on teardown."""
+    with pinned_hermes_home(_PINNED_ROOT):
+        yield
 
 
 def _is_live(path) -> bool:
     return Path(path).expanduser().resolve().is_relative_to(_LIVE_ROOT)
 
-
-import asyncio  # noqa: E402
-import contextlib  # noqa: E402
-import importlib.util  # noqa: E402
-import io  # noqa: E402
-import json  # noqa: E402
-import secrets  # noqa: E402
-import sqlite3  # noqa: E402
-import sys  # noqa: E402
-import urllib.error  # noqa: E402
-import urllib.request  # noqa: E402
-from types import SimpleNamespace  # noqa: E402
-
-from gateway import canonical_surface  # noqa: E402
-from gateway.canonical_surface import CanonicalSurfaceBinding  # noqa: E402
-from gateway.config import GatewayConfig, Platform, PlatformConfig  # noqa: E402
-from gateway.platforms.api_server import APIServerAdapter, _api_request_profile  # noqa: E402
-from gateway.run import GatewayRunner  # noqa: E402
-from gateway.session import SessionSource  # noqa: E402
 
 _SHIM = Path(os.environ.get("SHIM_PATH") or
              Path(__file__).resolve().parents[2] / "bridge" / "canonical" / "acp-canonical-shim.py")
