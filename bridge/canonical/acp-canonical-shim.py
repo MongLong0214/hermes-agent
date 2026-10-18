@@ -13,6 +13,7 @@ avoided here, it is unreachable: this process owns no session and can create non
 The endpoint answers the turn on the same connection and keeps a durable receipt, so a resend of
 one `event_id` replays that receipt rather than running a second turn.
 """
+import fcntl
 import hashlib
 import json
 import os
@@ -117,11 +118,43 @@ def log(message):
         pass
 
 
-def write(payload):
+def _emit(payload):
     line = json.dumps(payload, ensure_ascii=False)
     with _out:
         sys.stdout.write(line + "\n")
         sys.stdout.flush()
+
+
+class PromptTurn:
+    """One ``session/prompt`` as this process answers it. The stdin loop hands each prompt to its own
+    thread (``dispatch``), so a ``session/cancel`` is read while the prompt runs. Exactly one response
+    goes out per prompt: from the thread serving it, or earlier from ``cancel_prompts``. Once it is
+    answered, that thread writes nothing more to stdout; buzz-acp has moved on."""
+
+    def __init__(self, rpc_id, session):
+        self.rpc_id, self.session = rpc_id, session
+        self.lock = threading.Lock()
+        self.answered = False
+        self.cancelled = threading.Event()  # cancelled before anything was submitted
+        self.submitted = None  # the event id once handed to the canonical surface
+
+
+_local = threading.local()  # .prompt: the PromptTurn this thread serves; .submission: its event's turn
+_PROMPTS = {}  # id(PromptTurn) -> PromptTurn, for every prompt not yet finished
+_PROMPTS_LOCK = threading.Lock()
+
+
+def write(payload):
+    prompt = getattr(_local, "prompt", None)
+    if prompt is None:
+        _emit(payload)
+        return
+    with prompt.lock:
+        if prompt.answered:
+            return
+        if "method" not in payload and payload.get("id") == prompt.rpc_id:
+            prompt.answered = True
+        _emit(payload)
 
 
 def result(rpc_id, value):
@@ -812,7 +845,35 @@ def refusal_notice(status, code, error, event_id, chars):
         return (f"CEO 턴은 실행됐지만 답변을 기록하지 못해 이 스레드에 전달되지 않았습니다. 이 턴은 다시 "
                 f"실행되지 않고 자동 재전송도 없습니다. 상태: {code} (delivery={delivery}, "
                 f"answer_kept={kept}). (event {event_id})")
+    if status == 409 and code in TERMINAL_NOTICES:
+        # Answered past the claim: the turn ran, or may have, and nothing of it is delivered or run again.
+        # The side-effect scope is the gateway's own record, never assumed; without one it is unknown.
+        scope = error.get("side_effects")
+        scope = scope if scope in ("none", "attempted", "unknown") else "unknown"
+        return (f"{TERMINAL_NOTICES[code]}. 답변은 이 스레드에 전달되지 않았고, 이 턴은 다시 실행되지 않으며 "
+                f"자동 재전송도 없습니다. 상태: {code} (HTTP 409, gateway 기록 side_effects={scope}). "
+                f"(event {event_id})")
+    if code is None and status >= 500:
+        return unknown_outcome_notice(f"HTTP {status}", event_id)
     return None
+
+
+# Codes the gateway answers only once the event was claimed (api_server_canonical.py): a refusal raised
+# before the claim means the turn never ran and no answer exists, and stays as it is.
+TERMINAL_NOTICES = {
+    "canonical_event_failed": "CEO 턴이 실패로 끝났고 gateway 에 실패로 기록됐습니다",
+    "canonical_event_uncertain": "이 메시지로 시작된 CEO 턴이 실행됐는지, 어떻게 끝났는지 gateway 가 확정하지 못했습니다",
+    "canonical_event_conflict": "이 이벤트의 gateway 기록이 이 요청과 맞지 않아 그 결과를 전달할 수 없습니다",
+}
+
+
+def unknown_outcome_notice(cause, event_id):
+    """The sender's notice when the gateway gave no usable answer to a submission: whether the turn ran
+    is unknown here, so neither success nor its absence is stated. ``cause`` is an exception type or an
+    HTTP status, never a message."""
+    return (f"CEO 에게 제출한 이 메시지에 대해 canonical surface 의 응답을 받지 못했습니다({cause}). 턴이 "
+            f"실행됐는지 이 브리지는 알 수 없고, 그 결과는 이 스레드에 전달되지 않습니다. 자동 재전송은 "
+            f"없습니다. (event {event_id})")
 
 
 def _claim(name):
@@ -1035,6 +1096,343 @@ def hold(session, author, channel, base, text):
                    "content": {"type": "text", "text": held}}}})
 
 
+# One canonical turn at a time from this process, and a cancel never recalls one (D2 / O2). The stdin
+# loop reads on while a prompt's thread waits for the gateway, so buzz-acp's steer ``session/cancel`` is
+# answered inside its 5 s drain and this process is not SIGKILLed with a turn in flight. A prompt that
+# arrives while an earlier turn still runs waits for this slot: two turns never share the session, and
+# an event already in flight is never submitted again.
+_TURN_SLOT = threading.Lock()
+_INFLIGHT = set()  # event ids this process submitted and has not finished delivering
+_INFLIGHT_LOCK = threading.Lock()
+_THREADS = []  # prompt threads and the startup reaper, joined when stdin closes
+INFLIGHT_SUFFIX = ".inflight"
+INFLIGHT_RE = re.compile(r"[0-9a-f]{64}\.inflight")
+
+UNFINISHED_NOTICE = (
+    "이 메시지는 CEO 에게 제출됐지만, 이를 제출한 브리지 처리가 gateway 의 응답을 받기 전에 끝났습니다(프로세스 "
+    "교체 또는 중단). 턴이 실행됐는지, 어떻게 끝났는지 이 브리지는 알 수 없고, 그 결과는 이 스레드에 게시되지 "
+    "않습니다. 이 브리지는 이 메시지를 자동으로 다시 제출하지 않습니다. (event {event_id})")
+
+
+def _same_file(fd, path):
+    """Ownership, checked each time it is relied on: the entry now at *path* is the very file *fd* holds
+    locked (same st_dev and st_ino). An unlinked or replaced entry is never ownership."""
+    try:
+        held, named = os.fstat(fd), os.stat(path, follow_symlinks=False)
+    except OSError:
+        return False
+    return (held.st_dev, held.st_ino) == (named.st_dev, named.st_ino)
+
+
+def _claim_inflight(base, channel):
+    """(fd, None) holding ``PUBLISHED/<event id>.inflight`` under an exclusive ``flock`` while this process
+    owns the event's turn, or (None, why not). The kernel drops the lock when the process dies, which is
+    how a later shim tells a replaced owner from a live one.
+
+    The entry is published only once initialized and locked: the owner record is written and fsync'd to
+    a private file under the lock, which is then linked to the entry's name (``link`` never replaces a
+    name). So no reader ever finds it empty or unlocked while its owner lives. A name already taken — a
+    live owner, or an unfinished entry not yet reaped — is no claim, and neither is a name that does not
+    end up being this very file."""
+    path = os.path.join(PUBLISHED, base + INFLIGHT_SUFFIX)
+    private = os.path.join(PUBLISHED, f".{base}.{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}.claim")
+    try:
+        os.makedirs(PUBLISHED, exist_ok=True)
+        fd = os.open(private, os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    except OSError as exc:
+        return None, f"the in-flight entry cannot be written: {type(exc).__name__}"
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        record = (json.dumps({"event_id": base, "channel": channel, "pid": os.getpid(),
+                              "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}) + "\n").encode()
+        if os.write(fd, record) != len(record):
+            raise OSError("short write")
+        os.fsync(fd)
+        os.link(private, path)
+    except FileExistsError:
+        os.close(fd)
+        return None, "another shim process holds this event, or its unfinished entry is not yet reaped"
+    except OSError as exc:
+        os.close(fd)
+        return None, f"the in-flight entry was not published: {type(exc).__name__}"
+    finally:
+        try:
+            os.unlink(private)
+        except OSError:
+            pass
+    if not _same_file(fd, path):
+        os.close(fd)
+        return None, "the in-flight entry was replaced as it was published"
+    return fd, None
+
+
+def _unfinished(base):
+    """Why *base* must never be submitted again, or None. The record read is the event's existing
+    PUBLISHED journal entry, and only to refuse a resubmission — it never decides or completes delivery,
+    and the gateway receipt stays the turn's outcome. An ``unfinished_notice`` entry is the reaper's: a
+    shim submitted the event (or was about to) and ended without its outcome, so whether the turn ran is
+    unknown, and it stays unresolved rather than being sent again. An entry with no complete record (a
+    post cut short) is as unknown. An answer or notice entry is the turn's own outcome: a redelivery is
+    submitted as before, and the gateway answers it from the receipt without running it again."""
+    try:
+        with open(os.path.join(PUBLISHED, base), encoding="utf-8") as handle:
+            raw = handle.read(65_536)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        return f"its journal entry is unreadable ({type(exc).__name__})"
+    try:
+        kind = json.loads(raw.splitlines()[0]).get("kind")
+    except Exception:
+        kind = None
+    if kind in ("answer", "notice"):
+        return None
+    if kind == "unfinished_notice":
+        return "a shim submitted it and ended before its outcome; whether the turn ran is unknown"
+    return "its journal entry holds no complete record"
+
+
+def _wait_for_turn_slot(prompt, session):
+    """True once this process's turn slot is held. A wait writes ``canonical_wait`` (it resets
+    buzz-acp's idle timeout and is never published) and ends at a cancel or the busy deadline."""
+    deadline = time.monotonic() + BUSY_DEADLINE_SECS
+    attempt = 0
+    while not _TURN_SLOT.acquire(timeout=max(min(BUSY_RETRY_SECS, deadline - time.monotonic()), 0.2)):
+        if (prompt is not None and prompt.cancelled.is_set()) or time.monotonic() >= deadline:
+            return False
+        attempt += 1
+        write({"jsonrpc": "2.0", "method": "session/update", "params": {
+            "sessionId": session, "update": {"sessionUpdate": "canonical_wait", "attempt": attempt}}})
+    return True
+
+
+def begin_submission(session, base, channel):
+    """Take the turn slot and the event's in-flight entry before *base* is submitted. False when it must
+    not be submitted: already in flight here or in another live shim process, already submitted by a
+    shim that ended without its outcome (``_unfinished``), cancelled while it waited, the slot still taken
+    at the busy deadline, or the entry not provably this process's. Past this point a cancel never
+    recalls it. Refusing a resubmission is no execution or delivery guarantee: a turn whose shim ended
+    stays unknown, and is told once as such by the reaper."""
+    prompt = getattr(_local, "prompt", None)
+    with _INFLIGHT_LOCK:
+        if base in _INFLIGHT:
+            log(f"prompt {base[:12]}… already in flight in this process; not submitted again")
+            return False
+        _INFLIGHT.add(base)
+    taken, journal, ok = False, None, False
+    try:
+        taken = _wait_for_turn_slot(prompt, session)
+        if not taken:
+            log(f"prompt {base[:12]}… NOT submitted: " + (
+                "cancelled while an earlier turn held this process's turn slot"
+                if prompt is not None and prompt.cancelled.is_set()
+                else f"an earlier turn still held this process's turn slot after {BUSY_DEADLINE_SECS:.0f}s"))
+            return False
+        journal, why = _claim_inflight(base, channel)
+        if journal is None:
+            log(f"prompt {base[:12]}… NOT submitted: {why}")
+            return False
+        why = _unfinished(base)
+        if why is None and not _same_file(journal, os.path.join(PUBLISHED, base + INFLIGHT_SUFFIX)):
+            why = "this process no longer holds the event's in-flight entry"
+        if why is not None:
+            log(f"prompt {base[:12]}… NOT submitted again: {why}")
+            return False
+        if prompt is not None:
+            with prompt.lock:
+                if prompt.answered:
+                    log(f"prompt {base[:12]}… NOT submitted: cancelled before submission")
+                    return False
+                prompt.submitted = base
+        _local.submission = {"event": base, "fd": journal, "slot": True}
+        ok = True
+        return True
+    finally:
+        if not ok:
+            if journal is not None:
+                _drop_inflight(base, journal)
+            if taken:
+                _TURN_SLOT.release()
+            with _INFLIGHT_LOCK:
+                _INFLIGHT.discard(base)
+
+
+def _drop_inflight(base, fd):
+    path = os.path.join(PUBLISHED, base + INFLIGHT_SUFFIX)
+    try:
+        if _same_file(fd, path):
+            os.unlink(path)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def release_turn_slot():
+    """The canonical surface answered (or no answer will come): another prompt may submit."""
+    submission = getattr(_local, "submission", None)
+    if submission is not None and submission["slot"]:
+        submission["slot"] = False
+        _TURN_SLOT.release()
+
+
+def finish_submission():
+    """The event's outcome is posted or journaled: it is no longer in flight."""
+    submission = getattr(_local, "submission", None)
+    if submission is None:
+        return
+    release_turn_slot()
+    _local.submission = None
+    if submission["fd"] is not None:
+        _drop_inflight(submission["event"], submission["fd"])
+    with _INFLIGHT_LOCK:
+        _INFLIGHT.discard(submission["event"])
+
+
+def abandon_submission():
+    """A prompt thread ended before its event's outcome was posted (its handler raised): the slot and
+    the lock go, the entry stays linked, so ``reap_unfinished`` tells the thread. True when one stays."""
+    submission = getattr(_local, "submission", None)
+    if submission is None:
+        return False
+    release_turn_slot()
+    _local.submission = None
+    if submission["fd"] is not None:
+        os.close(submission["fd"])
+    with _INFLIGHT_LOCK:
+        _INFLIGHT.discard(submission["event"])
+    return submission["fd"] is not None
+
+
+def _prohibition_persisted(event_id):
+    """Whether ``PUBLISHED/<event id>`` now holds the record that refuses this event's resubmission once its
+    ``.inflight`` entry is gone (``_unfinished``): readable, complete, naming this very event, of kind
+    ``unfinished_notice``, and flushed to disk with its directory entry. A file that merely exists — empty,
+    cut short, unreadable, another event's, or any other kind — is not that record. Whether the notice was
+    posted is a separate fact: the record may say it was not, and still refuses the resubmission."""
+    try:
+        fd = os.open(os.path.join(PUBLISHED, event_id), os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            raw = os.read(fd, 65_536)
+            record = json.loads(raw.decode("utf-8").splitlines()[0])
+            if not (isinstance(record, dict) and record.get("event_id") == event_id
+                    and record.get("kind") == "unfinished_notice"):
+                return False
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        directory = os.open(PUBLISHED, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except Exception:
+        return False
+    return True
+
+
+def reap_unfinished():
+    """Tell the thread, once, about each event a shim process submitted and never finished delivering:
+    its ``.inflight`` entry is still linked and no live process holds its lock (the owner was replaced
+    — buzz-acp SIGKILLs the group on CancelDrainTimeout — or its handler raised). The notice takes the
+    event's one post (``PUBLISHED/<event id>``), so it never goes out beside or after an answer; an
+    event that already has its post keeps no second one. The entry is retired only once the event's
+    ``unfinished_notice`` record is persisted (``_prohibition_persisted``); until then — the journal could
+    not be created or written, or the entry holds another kind — it stays as the guard against a
+    resubmission, an explicit unresolved state, and a later reap tries again. Best effort, not crash
+    safety: it runs when a shim starts and before each prompt it takes."""
+    try:
+        names = sorted(name for name in os.listdir(PUBLISHED) if INFLIGHT_RE.fullmatch(name))
+    except OSError:
+        return
+    for name in names:
+        path, event_id = os.path.join(PUBLISHED, name), name[:-len(INFLIGHT_SUFFIX)]
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
+        except OSError:
+            continue
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                if not _same_file(fd, path):
+                    continue  # finished and unlinked meanwhile
+                raw = os.read(fd, 4096)
+            except OSError:
+                continue  # a live process holds it, or it is gone
+            try:
+                record = json.loads(raw.decode())
+            except Exception:
+                record = None
+            channel = record.get("channel") if isinstance(record, dict) else None
+            if not os.path.lexists(os.path.join(PUBLISHED, event_id)):
+                try:
+                    if isinstance(channel, str) and re.fullmatch(_UUID, channel):
+                        log(f"prompt {event_id[:12]}… was submitted by a shim that ended before its outcome; "
+                            "telling the thread")
+                        publish_reply(event_id, channel, UNFINISHED_NOTICE.format(event_id=event_id),
+                                      kind="unfinished_notice")
+                    else:
+                        marker, _ = _claim(event_id)
+                        if marker is not None:
+                            with os.fdopen(marker, "w") as record_file:
+                                record_file.write(json.dumps({
+                                    "sent": False, "state": "notice_impossible", "delivery": "failed",
+                                    "kind": "unfinished_notice", "event_id": event_id, "channel": None,
+                                    "reason": "the in-flight entry names no channel",
+                                    "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}) + "\n")
+                except Exception as exc:  # checked below: an entry claimed and not filled is no record
+                    log(f"prompt {event_id[:12]}… unfinished; its journal entry was not completed: "
+                        f"{type(exc).__name__}")
+            # Until the record that refuses a resubmission is persisted, the in-flight entry is the only guard
+            # (``_claim_inflight`` refuses a taken name). It is retired only once that record is read back and
+            # flushed; otherwise it stays — an explicit unresolved state, never success or delivery — and a
+            # later reap tries again.
+            if not _prohibition_persisted(event_id):
+                log(f"prompt {event_id[:12]}… UNRESOLVED: unfinished, and no resubmission-refusing journal record "
+                    "could be persisted; its in-flight entry stays, so it is not submitted again")
+                continue
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        finally:
+            os.close(fd)
+
+
+def cancel_prompts(message):
+    """``session/cancel`` (ACP: a notification). A prompt not yet submitted is cancelled
+    (``stopReason: cancelled``) and never submitted. A prompt whose event is already at the canonical
+    surface cannot be recalled, so it is NOT reported cancelled: it is answered ``end_turn`` with
+    ``_meta.canonical`` saying the turn goes on, and its own thread still posts the outcome once — the
+    answer, or a failure notice. buzz-acp treats any response inside its drain alike (pool.rs: Ok of
+    any stop reason → the batch requeued, this agent kept); none within 5 s is CancelDrainTimeout,
+    which SIGKILLs this process and loses the running turn's answer."""
+    params = message.get("params") or {}
+    session = params.get("sessionId")
+    with _PROMPTS_LOCK:
+        prompts = [p for p in _PROMPTS.values() if session is None or p.session == session]
+    if not prompts:
+        log("session/cancel received; no prompt in flight")
+    for prompt in prompts:
+        with prompt.lock:
+            if prompt.answered:
+                continue
+            prompt.answered = True
+            if prompt.submitted is None:
+                prompt.cancelled.set()
+                value = {"stopReason": "cancelled"}
+                log(f"session/cancel: prompt {prompt.rpc_id} cancelled before anything was submitted")
+            else:
+                value = {"stopReason": "end_turn", "_meta": {"canonical": {
+                    "cancelled": False, "turn": "running", "event_id": prompt.submitted,
+                    "outcome": "posted once to the thread by this shim: the answer or a failure notice"}}}
+                log(f"session/cancel: prompt {prompt.rpc_id} NOT cancelled: event {prompt.submitted[:12]}… is "
+                    "at the canonical surface and goes on; answered end_turn, its outcome is posted once")
+            _emit({"jsonrpc": "2.0", "id": prompt.rpc_id, "result": value})
+    if message.get("id") is not None:
+        result(message.get("id"), {})
+
+
 HEARTBEAT_HEADER = "[System: Heartbeat]"
 
 
@@ -1179,6 +1577,9 @@ def handle(message):
             log(f"prompt {base[:12]}… {len(text)} chars is over the gateway limit {GATEWAY_TEXT_LIMIT}: "
                 f"omitted {fitted[1]} thread messages ({fitted[2]} chars), submitting {len(fitted[0])} chars")
         text = fitted[0]
+        if not begin_submission(session, base, channel):
+            result(rpc_id, {"stopReason": "end_turn"})
+            return
         # Every attempt and every replay of this event uses its own Buzz event id. A busy refusal is
         # raised before the gateway claims the event (it records nothing), so retrying the same id
         # runs it once when the session frees; once claimed, a replay answers from the receipt and
@@ -1219,7 +1620,11 @@ def handle(message):
             except Exception as exc:
                 log(f"prompt {event_id} failed: {type(exc).__name__}: {exc}")
                 answer = f"canonical surface unreachable: {type(exc).__name__}: {exc}"
+                # No gateway answer: the turn may have run, so the thread is told its outcome is unknown.
+                code, refusal = None, {}
+                notice = unknown_outcome_notice(type(exc).__name__, base)
                 break
+        release_turn_slot()  # the gateway answered, or never will: another prompt may submit
         write({"jsonrpc": "2.0", "method": "session/update", "params": {
             "sessionId": session,
             "update": {"sessionUpdate": "agent_message_chunk",
@@ -1236,18 +1641,54 @@ def handle(message):
                    ", answer NOT preserved" if kept is False else f", answer_kept={kept}")
                 + "); telling the thread")
             publish_reply(base, channel, notice, kind="notice")
+        finish_submission()
         result(rpc_id, {"stopReason": "end_turn"})
         return
 
     if method == "session/cancel":
-        # A turn already handed to the CEO cannot be recalled, so say so rather than imply it stopped.
-        log("session/cancel received; the submitted turn continues at the binding")
-        if rpc_id is not None:
-            result(rpc_id, {})
+        # A turn already handed to the CEO cannot be recalled, so it is never reported cancelled.
+        cancel_prompts(message)
         return
 
     if rpc_id is not None:
         error(rpc_id, -32601, f"method not supported by acp-canonical-shim: {method}")
+
+
+def _serve_prompt(prompt, message):
+    """One prompt's thread: tell the thread about any unfinished event first, then handle the prompt."""
+    _local.prompt = prompt
+    try:
+        reap_unfinished()
+        handle(message)
+    except Exception as exc:
+        log(f"handler crashed on session/prompt: {type(exc).__name__}: {exc}")
+        if prompt.rpc_id is not None:
+            error(prompt.rpc_id, -32603, f"{type(exc).__name__}: {exc}")
+    finally:
+        left = abandon_submission()
+        with _PROMPTS_LOCK:
+            _PROMPTS.pop(id(prompt), None)
+        _local.prompt = None
+        if left:
+            reap_unfinished()
+
+
+def dispatch(message):
+    """The stdin loop's one call per line. It never waits on a canonical turn: each prompt runs on its
+    own thread, so the next line — a ``session/cancel`` above all — is read while the turn runs."""
+    method = message.get("method")
+    if method == "session/cancel":
+        cancel_prompts(message)
+        return
+    if method != "session/prompt":
+        handle(message)
+        return
+    prompt = PromptTurn(message.get("id"), (message.get("params") or {}).get("sessionId"))
+    with _PROMPTS_LOCK:
+        _PROMPTS[id(prompt)] = prompt
+    thread = threading.Thread(target=_serve_prompt, args=(prompt, message), name=f"prompt-{message.get('id')}")
+    _THREADS[:] = [running for running in _THREADS if running.is_alive()] + [thread]
+    thread.start()
 
 
 def main():
@@ -1260,6 +1701,9 @@ def main():
         sys.stderr.write("acp-canonical-shim: missing " + ", ".join(missing) + "\n")
         raise SystemExit(2)
     log(f"started binding={BINDING} base={BASE}")
+    reaper = threading.Thread(target=reap_unfinished, name="reap-unfinished")
+    _THREADS.append(reaper)
+    reaper.start()
     # `for line in sys.stdin` reads ahead into an internal buffer, so a peer that sends one line
     # and keeps the pipe open can have that line withheld until the buffer fills. A pipe closed by
     # the test harness flushes it and hides this entirely; buzz-acp holds the pipe open, and the
@@ -1267,7 +1711,10 @@ def main():
     while True:
         line = sys.stdin.readline()
         if not line:
-            log("stdin closed; exiting")
+            running = [thread for thread in _THREADS if thread.is_alive()]
+            log("stdin closed; exiting" + (f" once {len(running)} running thread(s) finish" if running else ""))
+            for thread in running:
+                thread.join()
             break
         line = line.strip()
         if not line:
@@ -1279,7 +1726,7 @@ def main():
             log(f"unparsable line dropped: {line[:200]}")
             continue
         try:
-            handle(message)
+            dispatch(message)
         except Exception as exc:
             log(f"handler crashed on {message.get('method')}: {type(exc).__name__}: {exc}")
             if message.get("id") is not None:
