@@ -156,6 +156,15 @@ HEADER_CHANNEL_RE = re.compile(r"Channel: [^()#]* \(#(" + _UUID + r")\)")
 HEADER_KIND_RE = re.compile(r"Kind: \d{1,10}")
 HEADER_FROM_RE = re.compile(r"From: [^()]* \(npub: npub1[02-9ac-hj-np-z]+, hex: ([0-9a-f]{64})\)")
 HEADER_TIME_RE = re.compile(r"Time: [0-9][0-9T:.+\-Z]{0,40}")
+# What buzz-acp can write on each header line, whatever a channel name or a label holds — wide enough to
+# match every header it produces (queue.rs ``format_event_block``: the Channel field ends ``(#<uuid>)``, a
+# label is stripped of control characters by ``sanitize_prompt_label``, Time is RFC 3339 or bare seconds),
+# so a second reading of the header lines is never missed. They only rule a reading out; nothing is read
+# from them.
+ANY_CHANNEL_END_RE = re.compile(r".* \(#" + _UUID + r"\)")
+ANY_KIND_RE = re.compile(r"Kind: \d+")
+ANY_FROM_RE = re.compile(r"From: .*hex: [0-9a-f]{64}\)")
+ANY_TIME_RE = re.compile(r"Time: \S+")
 
 
 def prompt_blocks(prompt):
@@ -169,6 +178,22 @@ def prompt_blocks(prompt):
             and isinstance(block.get("text"), str) else None for block in prompt]
 
 
+def _header_readings(lines):
+    """Every offset j at which ``lines[2 + j:7 + j]`` could be buzz-acp's own header — the last line of
+    the Channel field, then Kind, From, Time and Content — under the widest forms the producer writes.
+
+    The channel name is the one header field buzz-acp writes unsanitized (pool.rs takes it from the
+    channel's ``name`` tag), so it can hold newlines, and with them whole header lines of its own: the
+    Kind, From and Time lines the producer writes then come after them, inside what would read as the
+    message. The producer's own header is always among these readings, at j = its name's newline count,
+    so when 0 is the only one the fixed positions are the producer's; any other reading means the
+    boundary it drew cannot be told from the element, and nothing is attributed."""
+    return [j for j in range(len(lines) - 6)
+            if lines[6 + j].startswith("Content:") and ANY_KIND_RE.fullmatch(lines[3 + j])
+            and ANY_TIME_RE.fullmatch(lines[5 + j]) and ANY_FROM_RE.fullmatch(lines[4 + j])
+            and ANY_CHANNEL_END_RE.fullmatch(lines[2 + j])]
+
+
 def envelope(prompt):
     """(author_id, channel_id, event_id, body) of a single-event prompt, or None.
 
@@ -179,9 +204,20 @@ def envelope(prompt):
     (cancel + re-prompt) or batched prompt ends in another element, so it is never taken for a single
     event whatever its bodies quote: no body is searched for a header to promote, and no identity
     stands in for a missing one. A body line opening another event section makes the element
-    ambiguous: None."""
+    ambiguous: None. So does a second reading of the header lines (``_header_readings``): a channel
+    name carrying a line break and header lines of its own is never taken for the producer's header,
+    and neither the channel name, a display name nor a body is ever matched against anything to
+    vouch for one."""
     blocks = prompt_blocks(prompt)
     if not blocks or blocks[-1] is None or not blocks[-1].startswith(EVENT_HEADER + " "):
+        return None
+    # Exactly one event element, right after buzz-acp's own [Context] or its quoted conversation history
+    # (queue.rs ``format_prompt``): a second event element, or any element between those and the event,
+    # is no single-event prompt buzz-acp writes.
+    if sum(isinstance(block, str) and block.startswith(EVENT_HEADER) for block in blocks) != 1:
+        return None
+    if len(blocks) < 2 or not (isinstance(blocks[-2], str)
+                               and (blocks[-2].startswith("[Context]\n") or blocks[-2].startswith(CONVERSATION_HEADERS))):
         return None
     lines = blocks[-1].split("\n")
     if len(lines) < 7 or not EVENT_TITLE_RE.fullmatch(lines[0]):
@@ -197,6 +233,8 @@ def envelope(prompt):
             and HEADER_KIND_RE.fullmatch(lines[3]) and HEADER_TIME_RE.fullmatch(lines[5])
             and lines[6].startswith("Content:")):
         return None
+    if _header_readings(lines) != [0]:
+        return None
     body = "\n".join([lines[6][len("Content:"):]] + lines[7:]).strip()
     return author.group(1), channel.group(1), event.group(1), body
 
@@ -208,45 +246,251 @@ CONTEXT_NEW_THREAD_RE = re.compile(
     r"([0-9a-f]{64})` on `buzz messages send` — the triggering message is the thread root\. Do NOT reply "
     r"into any other \(older\) thread\. If the human explicitly asks for a channel-root, top-level, or "
     r"broadcast post, send that message without `--reply-to`\.")
+CONTEXT_PARENT_RE = re.compile(r"Parent: ([0-9a-f]{64})")
+CONTEXT_THREAD_HINTS = (
+    "Thread context included below. Use `buzz messages thread --channel <UUID> --event <ID>` for full history "
+    "if truncated.",
+    "Use `buzz messages thread --channel <UUID> --event <ID>` to fetch thread context.")
+CONTEXT_THREAD_ANCHOR_RE = re.compile(
+    r"IMPORTANT: For ordinary replies in this turn, use `--reply-to ([0-9a-f]{64})` on `buzz messages send` so "
+    r"the conversation stays threaded\. If the human explicitly asks for a channel-root, top-level, or broadcast "
+    r"post, send that message without `--reply-to`\. If the requested destination is ambiguous, ask before "
+    r"sending\.")
+# The closing element of a merged prompt and the header of the element before it, which holds the events that
+# arrived meanwhile (queue.rs ``MergeFraming``, 1596-1612); a batch's header (1539-1549).
+CLOSING_NOTES = (
+    "Note: A new message arrived while you were working. Continue your in-progress work and incorporate the new "
+    "message if it's relevant; if it's unrelated, you may briefly acknowledge it and carry on.",
+    "Note: The previous request was interrupted. Please address the new request.\nIf the new request is unrelated "
+    "to the previous one, you may briefly acknowledge the interruption.")
+NEW_EVENT_SINGLE = ("[New message — arrived while you were working]", "[New request — supersedes previous]")
+NEW_EVENT_HEADERS = NEW_EVENT_SINGLE + ("[New messages — arrived while you were working",
+                                        "[New request — supersedes previous")
+EVENT_COUNT_RE = re.compile(r"(?:\[Buzz events|\[New messages — arrived while you were working"
+                            r"|\[New request — supersedes previous) — (\d{1,6}) events\]")
+
+
+def _context_form(lines):
+    """(scope, root, parent, anchor) when ``lines[3:]`` of a ``[Context]`` element are exactly buzz-acp's
+    thread or channel form (queue.rs 1285-1318), else None. Every line is held to its form and the count
+    is exact."""
+    if lines[1] == "Scope: thread":
+        root, rest = CONTEXT_THREAD_ROOT_RE.fullmatch(lines[3]), lines[4:]
+        parent = CONTEXT_PARENT_RE.fullmatch(rest[0]) if rest else None
+        rest = rest[1:] if parent else rest
+        if root is None or not rest or rest[0] not in CONTEXT_THREAD_HINTS or len(rest) > 2:
+            return None
+        anchor = CONTEXT_THREAD_ANCHOR_RE.fullmatch(rest[1]) if len(rest) == 2 else None
+        if len(rest) == 2 and anchor is None:
+            return None
+        return ("thread", root.group(1), parent.group(1) if parent else None,
+                anchor.group(1) if anchor else None)
+    if lines[1] == "Scope: channel" and lines[3] == CONTEXT_CHANNEL_HINT and len(lines) in (4, 5):
+        anchor = CONTEXT_NEW_THREAD_RE.fullmatch(lines[4]) if len(lines) == 5 else None
+        if len(lines) == 5 and anchor is None:
+            return None
+        return "channel", None, None, anchor.group(1) if anchor else None
+    return None
+
+
+def _last_event_element(blocks):
+    """The element holding the event buzz-acp built ``[Context]`` from — its batch's last — told by the
+    prompt's layout alone: the last element, or the one before a merged prompt's own closing note."""
+    if len(blocks) >= 2 and blocks[-1] in CLOSING_NOTES:
+        element, heads = blocks[-2], NEW_EVENT_HEADERS
+    else:
+        element, heads = blocks[-1] if blocks else None, (EVENT_HEADER + " ", "[Buzz events — ")
+    return element.split("\n") if isinstance(element, str) and element.startswith(heads) else None
+
+
+def _tags_at_end(lines):
+    """The tags of the element's last event, from the ``Tags:`` line buzz-acp writes after its message and
+    before its optional one-line ``Parsed:`` (queue.rs 1116-1144): the end of an element is the producer's,
+    since no message can close one. None when that line is not there in that form."""
+    tail = lines[-2] if len(lines) >= 2 and lines[-1].startswith("Parsed: ") else lines[-1]
+    if not tail.startswith("Tags: "):
+        return None
+    try:
+        tags = json.loads(tail[len("Tags: "):])
+    except Exception:
+        return None
+    if not (isinstance(tags, list) and all(isinstance(tag, list) and all(isinstance(v, str) for v in tag)
+                                           for tag in tags)):
+        return None
+    return tags
+
+
+def _thread_of(tags):
+    """(root, parent) as buzz-acp's ``parse_thread_tags`` reads NIP-10 markers (queue.rs 854-892)."""
+    root = reply = None
+    for tag in tags:
+        if len(tag) >= 4 and tag[0] == "e":
+            if tag[3] == "root":
+                root = tag[1]
+            elif tag[3] == "reply":
+                reply = tag[1]
+    if root is not None:
+        return root, root if reply is None else reply
+    return reply, reply
+
+
+def _last_event_id(lines, channel_line):
+    """The id of the element's last event where buzz-acp writes it, or None. A single event's id is at a
+    fixed line. In a list of N events, the ``--- Event N (<tag>) ---`` section is taken only when one line
+    alone opens it with buzz-acp's own header under it — the [Context] channel line included — since an
+    earlier message could quote one; any other count is no answer."""
+    if EVENT_TITLE_RE.fullmatch(lines[0]):
+        at = 1
+    elif lines[0] in NEW_EVENT_SINGLE:
+        at = 3 if len(lines) > 3 and lines[1] == "" and FIRST_EVENT_RE.fullmatch(lines[2]) else None
+    else:
+        count = EVENT_COUNT_RE.fullmatch(lines[0])
+        head = f"--- Event {count.group(1)} (" if count else None
+        readings = [i for i in range(1, len(lines) - 6) if head and lines[i].startswith(head)
+                    and lines[i].endswith(") ---") and lines[i - 1] == "" and lines[i + 2] == channel_line
+                    and HEADER_EVENT_RE.fullmatch(lines[i + 1]) and ANY_KIND_RE.fullmatch(lines[i + 3])
+                    and ANY_FROM_RE.fullmatch(lines[i + 4]) and ANY_TIME_RE.fullmatch(lines[i + 5])
+                    and lines[i + 6].startswith("Content:")]
+        at = readings[0] + 1 if len(readings) == 1 else None
+    if at is None or at + 1 >= len(lines) or lines[at + 1] != channel_line:
+        return None
+    found = HEADER_EVENT_RE.fullmatch(lines[at])
+    return found.group(1) if found else None
+
+
+def _disagreement(blocks, channel_line, channel, scope, root, parent, anchor):
+    """Why the ``[Context]`` destination does not agree with the event buzz-acp built it from, or None.
+
+    buzz-acp derives [Context] from the batch's last event (queue.rs ``format_prompt``): its channel, its
+    NIP-10 root and parent, and — for a top-level message — its own id as the anchor. That event's tags are
+    committed by its id and written, JSON-escaped, at the end of its element, where no message can write.
+    The channel must be the event's only ``h`` tag, the thread its root (and parent), and an anchor its
+    root or its own id. A Context that is not this event's — whatever its form — names no destination."""
+    lines = _last_event_element(blocks)
+    tags = _tags_at_end(lines) if lines else None
+    if tags is None:
+        return "no event section of buzz-acp's ends the prompt to bind the [Context] destination to"
+    if {tag[1] for tag in tags if len(tag) >= 2 and tag[0] == "h"} != {channel}:
+        return "the [Context] channel is not the last event's own channel"
+    event_root, event_parent = _thread_of(tags)
+    if scope == "thread":
+        if (event_root != root or event_parent != (parent or root) or parent == root
+                or anchor not in (None, root)):
+            return "the [Context] thread is not the last event's own thread"
+    elif event_root is not None:
+        return "a channel-scope [Context] for an event in a thread"
+    elif anchor is not None and anchor != _last_event_id(lines, channel_line):
+        return "the [Context] anchor is not the last event's own id"
+    return None
 
 
 def notice_destination(blocks):
     """(channel, reply_to, None) for an unattributed refusal's notice, or (None, None, why not).
 
     Read only from ``params.prompt[0]``, where buzz-acp puts its own ``[Context]`` section
-    (``format_context_hints``, queue.rs 1238-1319), and only in its exact thread or channel form:
-    the thread's root, or for a top-level message the anchor buzz-acp names (without one, the channel
-    itself). It says where the conversation is, never who wrote what — it is no evidence of an author
-    or an approval. A first element of any other shape (a slash command, a legacy ``[Base]``, a DM)
-    names no destination."""
+    (``format_context_hints``, queue.rs 1238-1319), and only when the WHOLE element is in its exact
+    thread or channel form: the thread's root, or for a top-level message the anchor buzz-acp names
+    (without one, the channel itself). buzz-acp writes the channel name there unsanitized too, so a name
+    carrying line breaks — and with them a ``Channel:`` or ``Thread root:`` line of its own — always
+    leaves the producer's ``(#<uuid>)`` at the end of a later line that no form allows.
+
+    Form alone does not make it this prompt's destination: the channel and thread must also agree with
+    the event buzz-acp built the element from (``_disagreement``), and the caller then requires the
+    channel to be registered with a counterpart. When any of it fails there is no destination, and the
+    refusal is journaled as undeliverable — never sent anywhere else. It says where the conversation is,
+    never who wrote what: no evidence of an author or an approval. A first element of any other shape (a
+    slash command, a legacy ``[Base]``, a DM, a whole prompt sent as one element) names no destination."""
     first = blocks[0] if blocks else None
     lines = first.split("\n") if isinstance(first, str) else []
     channel = HEADER_CHANNEL_RE.fullmatch(lines[2]) if len(lines) >= 4 and lines[0] == "[Context]" else None
     if channel is None:
         return None, None, "params.prompt[0] is not buzz-acp's [Context] block"
-    if lines[1] == "Scope: thread":
-        root = CONTEXT_THREAD_ROOT_RE.fullmatch(lines[3])
-        if root:
-            return channel.group(1), root.group(1), None
-    elif lines[1] == "Scope: channel" and lines[3] == CONTEXT_CHANNEL_HINT:
-        if len(lines) == 4:
-            return channel.group(1), None, None
-        anchor = CONTEXT_NEW_THREAD_RE.fullmatch(lines[4]) if len(lines) == 5 else None
-        if anchor:
-            return channel.group(1), anchor.group(1), None
-    return None, None, "the [Context] block names no thread or channel in buzz-acp's form"
+    form = _context_form(lines)
+    if form is None:
+        return None, None, "the [Context] block names no thread or channel in buzz-acp's form"
+    scope, root, parent, anchor = form
+    why = _disagreement(blocks, lines[2], channel.group(1), scope, root, parent, anchor)
+    if why is not None:
+        return None, None, why
+    return channel.group(1), root if scope == "thread" else anchor, None
 
 
 CONVERSATION_HEADERS = ("[Thread Context (", "[Conversation Context (")
 MERGE_HEADERS = ("[What you were working on]", "[Previous request — interrupted before completion]")
 
 
-def refusal_key(blocks):
-    """The correlation key of an unattributed refusal: a digest of its elements, less the quoted
-    conversation history buzz-acp fetches afresh on every dispatch. The same events dispatched again
-    (a requeue, a respawned shim) give the same key and so one notice; other events give their own."""
-    kept = [block for block in blocks if not (isinstance(block, str) and block.startswith(CONVERSATION_HEADERS))]
-    return "unattributed-" + hashlib.sha256(json.dumps(kept).encode("ascii")).hexdigest()
+# The elements buzz-acp opens with an event section header and then ``--- Event 1 (<tag>) ---`` (queue.rs
+# 1503-1569, ``MergeFraming``): a batch, the interrupted request's events, and what arrived meanwhile.
+EVENT_LIST_HEADERS = ("[Buzz events — ",) + MERGE_HEADERS + (
+    "[New message — arrived while you were working]", "[New messages — arrived while you were working",
+    "[New request — supersedes previous")
+FIRST_EVENT_RE = re.compile(r"--- Event 1 \([^\n]*\) ---")
+# Display names buzz-acp looks up again on every dispatch (pool.rs ``fetch_prompt_profile_lookup``): a
+# From line's label, and the labels of a Parsed line's mentions. A label never holds a line break
+# (``sanitize_prompt_label``), so taking it out never moves a line.
+KEY_FROM_RE = re.compile(r"From: .*hex: ([0-9a-f]{64})\)")
+KEY_HEX_RE = re.compile(r"(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])")
+
+
+def _names_its_first_event(text):
+    """Whether an element states an event id where buzz-acp writes it before any message body: the
+    ``Event ID:`` line right under ``[Buzz event: <tag>]``, or under ``--- Event 1 (<tag>) ---`` of an
+    event list. That id is the event's own hash, so it is a stable identity; nothing is searched for."""
+    lines = text.split("\n", 4)
+    if len(lines) >= 2 and EVENT_TITLE_RE.fullmatch(lines[0]) and HEADER_EVENT_RE.fullmatch(lines[1]):
+        return True
+    return (len(lines) >= 4 and lines[0].startswith(EVENT_LIST_HEADERS) and lines[1] == ""
+            and FIRST_EVENT_RE.fullmatch(lines[2]) is not None and HEADER_EVENT_RE.fullmatch(lines[3]) is not None)
+
+
+def _without_labels(text):
+    """*text* with every label taken out of a From or Parsed line, line by line, keeping each pubkey.
+    Every other byte — event ids, channel names, bodies — stays as it is."""
+    out = []
+    for line in text.split("\n"):
+        sender = KEY_FROM_RE.fullmatch(line)
+        if sender:
+            line = "From: " + sender.group(1)
+        elif line.startswith("Parsed: ") and "mentions=[" in line:
+            at = line.index("mentions=[")
+            line = line[:at] + "mentions=" + ",".join(KEY_HEX_RE.findall(line[at:]))
+        out.append(line)
+    return "\n".join(out)
+
+
+def refusal_key(prompt):
+    """The correlation key of an unattributed refusal, and None or why it is this refusal's own.
+
+    A digest of every element of ``params.prompt`` as it was sent — type, data and every field of a
+    non-text element included — less the quoted conversation history buzz-acp fetches afresh on every
+    dispatch, and less the display names it looks up again each time. The same events dispatched again
+    (a requeue, a respawned shim, a refreshed profile) give the same key and so one notice; any other
+    difference, an image's bytes included, gives another key.
+
+    The digest stands for "the same events" only when an element names its first event where buzz-acp
+    writes the id (``_names_its_first_event``): those ids are the events' own hashes, and every line
+    after them is kept. A prompt with no such id has no identity that tells a second dispatch from a
+    second, identical message, so it is never presumed to be the same refusal: it gets a key of its
+    own, as does one that cannot be serialized at all."""
+    elements = prompt if isinstance(prompt, list) else [prompt]
+    kept, identified = [], False
+    try:
+        for element in elements:
+            if isinstance(element, dict) and element.get("type") == "text" and isinstance(element.get("text"), str):
+                text = element["text"]
+                if text.startswith(CONVERSATION_HEADERS):
+                    continue
+                identified = identified or _names_its_first_event(text)
+                element = dict(element, text=_without_labels(text))
+            kept.append(element)
+        digest = hashlib.sha256(json.dumps(kept, sort_keys=True).encode("ascii")).hexdigest()
+    except Exception as exc:  # an element nested past the recursion limit, or not JSON at all
+        return "unattributed-" + hashlib.sha256(os.urandom(32)).hexdigest(), (
+            f"its elements cannot be serialized ({type(exc).__name__})")
+    if not identified:
+        return ("unattributed-" + hashlib.sha256(os.urandom(32)).hexdigest(),
+                "no element names an event id where buzz-acp writes one")
+    return "unattributed-" + digest, None
 
 
 def prompt_shape(blocks):
@@ -364,12 +608,27 @@ def submit(text, event_id, author, channel):
         return json.loads(response.read().decode()).get("text", "")
 
 
-def _peer_handle(channel):
+def _registry_peer(channel):
+    """(the channel's registered counterpart handle, None) or (None, why not). Never raises: the reason
+    is a fixed category and the exception type, nothing else, as for ``_own_signers``."""
     try:
-        with open(MENTIONS) as handle:
-            return json.load(handle)["channels"][channel]["peer"]["handle"]
-    except (OSError, ValueError, KeyError, TypeError):
-        return None  # the wrapper refuses an unregistered channel, and adds the handle itself
+        with open(MENTIONS, encoding="utf-8") as handle:
+            channels = json.load(handle)["channels"]
+    except OSError as exc:
+        return None, f"reply registry unreadable: {type(exc).__name__}"
+    except Exception as exc:  # malformed in any way, nesting past the recursion limit included
+        return None, f"reply registry malformed: {type(exc).__name__}"
+    try:
+        peer = channels[channel]["peer"]["handle"]
+    except Exception:
+        peer = None
+    if peer is None:
+        return None, "the [Context] channel has no registered counterpart to post to"
+    return peer, None
+
+
+def _peer_handle(channel):
+    return _registry_peer(channel)[0]  # the wrapper refuses an unregistered channel, and adds the handle itself
 
 
 def _own_signers():
@@ -555,8 +814,9 @@ def refuse_unattributed(session, prompt, chars):
     """Refuse a prompt that is not one attributable event — a merged or batched dispatch, or an event
     section out of its fixed form — attributing it to no one. The conversation is told once per
     correlation key, in fixed text that names no sender and quotes no body, at the destination
-    buzz-acp's own ``[Context]`` element names; when there is none, or the post fails, the journal
-    records a delivery failure, never a sent notice.
+    buzz-acp's own ``[Context]`` element names; when there is none, the reply registry cannot be read
+    or parsed (nesting past the recursion limit included), or the post fails, the journal records a
+    delivery failure under the refusal's key with a fixed reason, never a sent notice.
 
     The notice is signed with this bridge's own key and mentions only the channel's registered
     counterpart. buzz-acp drops its own events (``ignore_self``, on unless BUZZ_ACP_NO_IGNORE_SELF;
@@ -564,12 +824,15 @@ def refuse_unattributed(session, prompt, chars):
     as one event is refused before any submission or post. A notice therefore starts no further
     refusal or reply."""
     blocks = prompt_blocks(prompt)
-    ref, shape = refusal_key(blocks), prompt_shape(blocks)
+    (ref, own), shape = refusal_key(prompt), prompt_shape(blocks)
     log(f"prompt refused locally: not one attributable [Buzz event] element ({shape}, {len(blocks)} "
-        f"elements, {chars} chars); ref {ref}")
+        f"elements, {chars} chars); ref {ref}" + (f" (a key of its own: {own})" if own else ""))
     channel, reply_to, why = notice_destination(blocks)
-    if channel is not None and _peer_handle(channel) is None:
-        channel, why = None, "the [Context] channel has no registered counterpart to post to"
+    if channel is not None:
+        # A registry that cannot be read or parsed is an undeliverable notice, journaled as one.
+        handle, unknown = _registry_peer(channel)
+        if handle is None:
+            channel, why = None, unknown
     if channel is None:
         journal_undeliverable(ref, shape, why)
         return
@@ -619,6 +882,30 @@ def hold(session, author, channel, base, text):
                    "content": {"type": "text", "text": held}}}})
 
 
+HEARTBEAT_HEADER = "[System: Heartbeat]"
+
+
+def is_heartbeat(prompt):
+    """Whether ``params.prompt`` is buzz-acp's own heartbeat, told from its ACP shape alone.
+
+    A heartbeat (lib.rs ``dispatch_heartbeat`` → pool.rs ``run_prompt_task``) is exactly ONE text
+    element, ``{"type": "text", "text": …}``, which opens with its ``[System: Heartbeat]`` header — or,
+    for a legacy agent, with the ``[Base]`` section prepended to it (pool.rs ``prepend_base_for_legacy``).
+    It carries no Buzz message at all. A channel prompt is never one element: ``format_prompt`` always
+    writes ``[Context]`` and an event section as elements of their own, and no message body can merge
+    or open an element. So the header is trusted only where nothing but buzz-acp writes, and a body
+    quoting it never makes a prompt a heartbeat."""
+    if not isinstance(prompt, list) or len(prompt) != 1:
+        return False
+    block = prompt[0]
+    if not (isinstance(block, dict) and set(block) == {"type", "text"} and block["type"] == "text"
+            and isinstance(block["text"], str)):
+        return False
+    lines = block["text"].split("\n")
+    return lines[0].strip() == HEARTBEAT_HEADER or (
+        lines[0] == "[Base]" and any(line.strip() == HEARTBEAT_HEADER for line in lines[1:]))
+
+
 def prompt_text(params):
     """ACP sends a prompt as a list of content blocks; only text is carried to the CEO."""
     chunks = []
@@ -651,8 +938,9 @@ def handle(message):
 
     if method == "session/prompt":
         session = params.get("sessionId") or ("canonical:" + BINDING)
-        text = prompt_text(params)
-        if not text:
+        prompt = params.get("prompt")
+        if not prompt:
+            # Nothing was sent (queue.rs ``format_prompt`` of an empty batch): no message to refuse.
             result(rpc_id, {"stopReason": "end_turn"})
             return
         # buzz-acp wakes its agent every --heartbeat-interval seconds with a prompt that carries no
@@ -663,16 +951,18 @@ def handle(message):
         # timing, not a guard.
         # 2026-09-27: substring 검사는 실패했다. "routine heartbeat" 는 heartbeat 본문이 아니라 매
         # 프롬프트에 붙는 [Base]/persona 프롬프트 안에 있어서, repo-factory 방에서 온 실제 메시지
-        # (3765자)가 거부됐다. heartbeat 는 자기 섹션 머리글을 한 줄로 갖는다 — 줄에 앵커를 둔다.
-        if any(ln.strip() == "[System: Heartbeat]" for ln in text.splitlines()):
-            log(f"prompt refused locally: heartbeat, not a message ({len(text)} chars)")
+        # (3765자)가 거부됐다. 2026-10-18 (#91 r1): 줄 앵커도 본문을 믿었다 — 병합 프롬프트가 인용한
+        # 기록 속 한 줄이 거부 알림과 기록을 통째로 지웠다. heartbeat 는 이제 ACP 모양으로만 판정한다.
+        if is_heartbeat(prompt):
+            log("prompt refused locally: heartbeat, not a message (buzz-acp's one-element heartbeat prompt)")
             result(rpc_id, {"stopReason": "end_turn"})
             return
-        parsed = envelope(params.get("prompt"))
+        text = prompt_text(params)
+        parsed = envelope(prompt)
         if parsed is None:
             # No single unambiguous event: nothing can be attributed, so nothing is forwarded in any
             # mode — and the conversation is told, or the journal says it could not be.
-            refuse_unattributed(session, params.get("prompt"), len(text))
+            refuse_unattributed(session, prompt, len(text))
             result(rpc_id, {"stopReason": "end_turn"})
             return
         author, channel, base, body = parsed

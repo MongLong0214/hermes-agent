@@ -24,8 +24,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from buzz_prompt_port import section_blocks
 
+from tests.bridge.buzz_prompt_port import section_blocks
 from tests.hermes_home_pin import import_home, pinned_hermes_home, tmp_root
 
 try:
