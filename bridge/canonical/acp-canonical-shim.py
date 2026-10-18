@@ -1304,13 +1304,43 @@ def abandon_submission():
     return submission["fd"] is not None
 
 
+def _prohibition_persisted(event_id):
+    """Whether ``PUBLISHED/<event id>`` now holds the record that refuses this event's resubmission once its
+    ``.inflight`` entry is gone (``_unfinished``): readable, complete, naming this very event, of kind
+    ``unfinished_notice``, and flushed to disk with its directory entry. A file that merely exists — empty,
+    cut short, unreadable, another event's, or any other kind — is not that record. Whether the notice was
+    posted is a separate fact: the record may say it was not, and still refuses the resubmission."""
+    try:
+        fd = os.open(os.path.join(PUBLISHED, event_id), os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            raw = os.read(fd, 65_536)
+            record = json.loads(raw.decode("utf-8").splitlines()[0])
+            if not (isinstance(record, dict) and record.get("event_id") == event_id
+                    and record.get("kind") == "unfinished_notice"):
+                return False
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        directory = os.open(PUBLISHED, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except Exception:
+        return False
+    return True
+
+
 def reap_unfinished():
     """Tell the thread, once, about each event a shim process submitted and never finished delivering:
     its ``.inflight`` entry is still linked and no live process holds its lock (the owner was replaced
     — buzz-acp SIGKILLs the group on CancelDrainTimeout — or its handler raised). The notice takes the
     event's one post (``PUBLISHED/<event id>``), so it never goes out beside or after an answer; an
-    event that already has its post only loses the stale entry. Best effort, not crash safety: it runs
-    when a shim starts and before each prompt it takes."""
+    event that already has its post keeps no second one. The entry is retired only once the event's
+    ``unfinished_notice`` record is persisted (``_prohibition_persisted``); until then — the journal could
+    not be created or written, or the entry holds another kind — it stays as the guard against a
+    resubmission, an explicit unresolved state, and a later reap tries again. Best effort, not crash
+    safety: it runs when a shim starts and before each prompt it takes."""
     try:
         names = sorted(name for name in os.listdir(PUBLISHED) if INFLIGHT_RE.fullmatch(name))
     except OSError:
@@ -1335,21 +1365,32 @@ def reap_unfinished():
                 record = None
             channel = record.get("channel") if isinstance(record, dict) else None
             if not os.path.lexists(os.path.join(PUBLISHED, event_id)):
-                if isinstance(channel, str) and re.fullmatch(_UUID, channel):
-                    log(f"prompt {event_id[:12]}… was submitted by a shim that ended before its outcome; "
-                        "telling the thread")
-                    publish_reply(event_id, channel, UNFINISHED_NOTICE.format(event_id=event_id),
-                                  kind="unfinished_notice")
-                else:
-                    marker, why = _claim(event_id)
-                    if marker is not None:
-                        with os.fdopen(marker, "w") as record_file:
-                            record_file.write(json.dumps({
-                                "sent": False, "state": "notice_impossible", "delivery": "failed",
-                                "kind": "unfinished_notice", "event_id": event_id, "channel": None,
-                                "reason": "the in-flight entry names no channel",
-                                "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}) + "\n")
-                    log(f"prompt {event_id[:12]}… unfinished, and its entry names no channel: journaled")
+                try:
+                    if isinstance(channel, str) and re.fullmatch(_UUID, channel):
+                        log(f"prompt {event_id[:12]}… was submitted by a shim that ended before its outcome; "
+                            "telling the thread")
+                        publish_reply(event_id, channel, UNFINISHED_NOTICE.format(event_id=event_id),
+                                      kind="unfinished_notice")
+                    else:
+                        marker, _ = _claim(event_id)
+                        if marker is not None:
+                            with os.fdopen(marker, "w") as record_file:
+                                record_file.write(json.dumps({
+                                    "sent": False, "state": "notice_impossible", "delivery": "failed",
+                                    "kind": "unfinished_notice", "event_id": event_id, "channel": None,
+                                    "reason": "the in-flight entry names no channel",
+                                    "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}) + "\n")
+                except Exception as exc:  # checked below: an entry claimed and not filled is no record
+                    log(f"prompt {event_id[:12]}… unfinished; its journal entry was not completed: "
+                        f"{type(exc).__name__}")
+            # Until the record that refuses a resubmission is persisted, the in-flight entry is the only guard
+            # (``_claim_inflight`` refuses a taken name). It is retired only once that record is read back and
+            # flushed; otherwise it stays — an explicit unresolved state, never success or delivery — and a
+            # later reap tries again.
+            if not _prohibition_persisted(event_id):
+                log(f"prompt {event_id[:12]}… UNRESOLVED: unfinished, and no resubmission-refusing journal record "
+                    "could be persisted; its in-flight entry stays, so it is not submitted again")
+                continue
             try:
                 os.unlink(path)
             except OSError:
