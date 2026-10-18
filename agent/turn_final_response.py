@@ -55,10 +55,8 @@ def finish_text_response(
     continuation path sets ``final_response = None`` so an acknowledgment never suppresses
     iteration-limit summarization; the final message is appended and flushed only after the
     stop gates accept it."""
-    from agent.conversation_loop import (
-        _CODEX_ACK_CONTINUATION_NUDGE, _DEGENERATE_FINAL_NUDGE, _DROPPED_TOOLCALL_NUDGE_CONTENT,
-        _join_truncated_parts
-    )
+    from agent.conversation_loop import _join_truncated_parts
+    from agent.recovery_nudge import recovery_nudge_row
 
     def _verdict(action: str, result: Optional[Dict[str, Any]] = None) -> FinalResponseVerdict:
         return FinalResponseVerdict(
@@ -213,13 +211,9 @@ def finish_text_response(
             interim_msg["api_content"] = final_response
         append_message(messages, interim_msg)
         agent._emit_interim_assistant_message(interim_msg)
-        append_message(messages, {
-            "role": "user",
-            "content": (
-                _DEGENERATE_FINAL_NUDGE if _continuation_kind == "degenerate"
-                else _CODEX_ACK_CONTINUATION_NUDGE
-            ),
-        })
+        append_message(messages, recovery_nudge_row(
+            agent, "degenerate_final" if _continuation_kind == "degenerate" else "codex_ack_continuation",
+            messages))
         agent._session_messages = messages
         # An acknowledgment is non-final: its text must not suppress iteration-limit
         # summarization if the continuation exhausts budget.
@@ -268,11 +262,8 @@ def finish_text_response(
         # and the finalization pop strips an unanswered tail pair.
         final_msg["_dropped_toolcall_nudge"] = True
         append_message(messages, final_msg)
-        append_message(messages, {
-            "role": "user",
-            "content": _DROPPED_TOOLCALL_NUDGE_CONTENT,
-            "_dropped_toolcall_nudge": True,
-        })
+        append_message(messages, recovery_nudge_row(agent, "dropped_toolcall", messages,
+                                                    _dropped_toolcall_nudge=True))
         agent._session_messages = messages
         final_response = None
         return _verdict("continue")
