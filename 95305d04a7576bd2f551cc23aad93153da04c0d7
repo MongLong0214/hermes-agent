@@ -1,0 +1,5 @@
+Limit: if a mid-turn compaction moves the turn's opening-row index, later nudges carry no marker and the keep refuses, as before this change; a kept answer is still never delivered
+Warn: every recovery nudge row the agent loop appends inside a turn is built by agent/recovery_nudge.py and carries an internal _recovery_nudge {kind, run} marker whose run is the nonce of that turn's own canonical peer opening row, read from its structured metadata; the marker is never persisted and every provider request path strips it
+Warn: a refused canonical turn's answer is kept only when turn_provenance binds it to this claim and every interior user row is one of the five recovery nudges whose marker names this claim's peer nonce and whose content equals that kind's text; a missing or mismatched nonce refuses the keep, and the normal path stays governed by the selector
+Record-Id: r-e89ce86a9431
+Provenance: inherited a17e30afbd0c794cc7513841bc7e0d5dbc3efbfe
