@@ -247,13 +247,21 @@ def test_without_os_fork_only_the_fork_witness_is_skipped():
     """#90 review r2 (S15-ISO-R2-01): the fork witness called ``os.fork()`` unconditionally, so it
     failed where there is none (Windows). Now it alone is skipped there, and collecting this module
     looks the name up only through ``hasattr``. Checked by collecting and running this module in a
-    fresh interpreter whose ``os`` has no ``fork``: a mocked capability, not a run on Windows."""
+    fresh interpreter whose ``os`` has no ``fork``: a mocked capability, not a run on Windows.
+
+    #90 review r3: that interpreter ran ``del os.fork`` unconditionally, which raised AttributeError
+    before pytest started where ``os.fork`` was absent from the start. It now removes ``fork`` only
+    where it has one, so this check runs both where this platform forks and where it does not. The
+    run deselects this test only so that it does not start itself again."""
     this = str(Path(__file__).resolve().relative_to(_REPO))
-    script = ("import os, sys\ndel os.fork\nimport pytest\nsys.exit(pytest.main(['-v', '-rs', '-p', "
+    script = ("import os, sys\nprint('FORK-AT-START', hasattr(os, 'fork'), flush=True)\n"
+              "if hasattr(os, 'fork'):\n    del os.fork\nimport pytest\nsys.exit(pytest.main(['-v', '-rs', '-p', "
               f"'no:cacheprovider', {this!r}, '-k', 'not without_os_fork']))")
     run = subprocess.run([sys.executable, "-c", script], cwd=_REPO, env=dict(os.environ), capture_output=True,
                          text=True, timeout=240)
     out = run.stdout[-3000:] + run.stderr[-3000:]
+    # The child started as this process did: with os.fork exactly where this process has it.
+    assert f"FORK-AT-START {hasattr(os, 'fork')}" in run.stdout.splitlines(), out
     skipped = [line for line in run.stdout.splitlines() if "::" in line and " SKIPPED" in line]
     assert run.returncode == 0 and len(skipped) == 1, out
     assert "::test_a_forked_child_gets_its_own_import_home_and_never_removes_its_parents " in skipped[0], out
