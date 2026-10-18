@@ -458,6 +458,10 @@ class CanonicalTurnObservation:
     # What the actor's turn returned, set as soon as it returns: a rejection raised after that point
     # (head, actor or generation no longer current) must not discard the answer it holds.
     returned: Any = None
+    # The final answer of a turn whose shape the selector refused, set only when
+    # ``bound_refused_answer`` proved it is this event's, this claim's and this turn's. It is kept,
+    # never delivered and never promoted to the event's answer; None leaves the turn's terminal failure.
+    bound_answer: Any = None
 
     def failure(self, code: str, **detail: Any) -> dict:
         """``side_effects``: ``attempted`` (with the sends, ``settled`` once the actor finished so the
@@ -491,6 +495,65 @@ def _returned_text(observation: CanonicalTurnObservation) -> str | None:
     returned = observation.returned
     text = returned.get("final_response") if isinstance(returned, dict) else None
     return text if isinstance(text, str) and text.strip() else None
+
+
+def bound_refused_answer(result: Any, *, peer: Any, body: str, rendered: str, history_boundary: Any,
+                         expected_session_id: str) -> str | None:
+    """The final answer of a turn the selector refused, or None when it is not provably this event's.
+
+    The selector's refusal stands: the turn ends in its terminal failure and this text is never the
+    event's answer. It is only kept (not delivered) when all of these hold for the very result this
+    claim's run returned:
+
+    * the turn completed, is not failed, partial or interrupted, and ran in the bound session;
+    * the transcript suffix opens with this turn's own peer row: this claim's metadata with its fresh
+      nonce (and this event's body), or exactly the rendering of it the model received;
+    * it ends with one assistant row, without tool calls, whose text is the returned final answer;
+    * every user row between them is one of the agent's own recovery nudges, so no other principal's
+      message can have shaped it.
+
+    Anything else, or anything unreadable, is None: the event stays an explicit failure."""
+    from agent.canonical_peer import PeerProvenanceError, peer_body, peer_metadata
+    from agent.conversation_loop import (
+        _CODEX_ACK_CONTINUATION_NUDGE,
+        _CODEX_INCOMPLETE_NUDGE,
+        _DEGENERATE_FINAL_NUDGE,
+        _DROPPED_TOOLCALL_NUDGE_CONTENT,
+        _EMPTY_TOOL_RESPONSE_NUDGE,
+    )
+
+    if (not isinstance(result, dict) or result.get("completed") is not True
+            or any(bool(result.get(flag)) for flag in ("failed", "partial", "interrupted"))
+            or result.get("session_id", expected_session_id) != expected_session_id):
+        return None
+    final, messages = result.get("final_response"), result.get("messages")
+    if (not isinstance(final, str) or not final.strip() or not isinstance(messages, list)
+            or type(history_boundary) is not int or not 0 <= history_boundary < len(messages) - 1):
+        return None
+    suffix = messages[history_boundary:]
+    first, last = suffix[0], suffix[-1]
+    if not isinstance(first, dict) or first.get("role") != "user":
+        return None
+    try:
+        marked = peer_metadata(first)
+        if marked is None:
+            if first.get("content") != rendered:
+                return None
+        elif marked != peer or peer_body(first) != body:
+            return None
+    except (PeerProvenanceError, ValueError, TypeError):
+        return None
+    if (not isinstance(last, dict) or last.get("role") != "assistant" or "tool_calls" in last
+            or last.get("content") != final):
+        return None
+    nudges = {_CODEX_INCOMPLETE_NUDGE, _CODEX_ACK_CONTINUATION_NUDGE, _DEGENERATE_FINAL_NUDGE,
+              _DROPPED_TOOLCALL_NUDGE_CONTENT, _EMPTY_TOOL_RESPONSE_NUDGE}
+    for row in suffix[1:-1]:
+        if not isinstance(row, dict) or row.get("role") not in ("assistant", "tool", "user"):
+            return None
+        if row["role"] == "user" and row.get("content") not in nudges:
+            return None
+    return final
 
 
 def _valid_failure(failure: Any) -> bool:
@@ -651,11 +714,18 @@ class CanonicalReceiptCoordinator:
                 or parsed.get("fingerprint") != fingerprint or not _valid_failure(parsed.get("unrecorded"))
                 or parsed["unrecorded"].get("code") != ANSWER_UNRECORDED):
             raise ValueError("canonical_receipt_conflict")
-        # A length and digest stand for an answer; they are not the answer, so they never read as kept.
-        answer = parsed.get("answer")
-        summary_only = (isinstance(answer, dict) and isinstance(answer.get("failure"), dict)
-                        and answer["failure"].get("code") == _RESULT_TOO_LARGE)
-        return CanonicalReceiptResult("unrecorded", None, {**parsed["unrecorded"], "answer_kept": not summary_only})
+        # Kept means the record holds the answer's text. A length and digest stand for an answer and a
+        # failure is no answer at all; neither reads as kept.
+        response = (parsed.get("answer") or {}).get("response") if isinstance(parsed.get("answer"), dict) else None
+        kept = isinstance(response, dict) and isinstance(response.get("terminal_text"), str)
+        return CanonicalReceiptResult("unrecorded", None, {**parsed["unrecorded"], "answer_kept": kept})
+
+    @classmethod
+    def _kept_text(cls, value: Any, fingerprint: str) -> str | None:
+        """The answer text a kept record holds, read the way a replay reads it; None for none."""
+        if value is None or cls._decode_kept(value, fingerprint).failure.get("answer_kept") is not True:
+            return None
+        return json.loads(value)["answer"]["response"]["terminal_text"]
 
     @staticmethod
     def _observe_receipt(db: Any, key: str, pending: str, terminal: str | None, fingerprint: str,
@@ -970,13 +1040,14 @@ class CanonicalReceiptCoordinator:
                 digest = hashlib.sha256((whole if whole is not None else json.dumps(
                     answer.failure, sort_keys=True)).encode("utf-8", "surrogatepass")).hexdigest()
                 kept_key, preserved, errors, record_kept = self._beside(_KEPT_NAMESPACE, key), None, {}, None
+                readback = None
                 try:
                     record_kept = self._encode({"v": 1, "state": "kept", "fingerprint": fingerprint, "owner": owner,
                                                 "receipt": key, "unrecorded": failure, "answer": kept_answer,
                                                 "answer_sha256": digest}, _MAX_KEPT_CHARS)
                     if not db.claim_meta_once(kept_key, record_kept, **proven):
                         errors["keep_error"] = "already_kept"  # never written over
-                    elif db.get_meta(kept_key) != record_kept:
+                    elif (readback := db.get_meta(kept_key)) != record_kept:
                         errors["keep_error"] = "readback_mismatch"
                     else:
                         preserved = "receipt_store"
@@ -989,15 +1060,28 @@ class CanonicalReceiptCoordinator:
                         errors["fallback"] = keep_locally(proof.db_path.parent, key.rsplit(":", 1)[1], owner,
                                                           record_kept.encode("utf-8", "surrogatepass"))
                         preserved = "local_fallback"
+                        # Read back the way a replay reads the fallback: the record it finds first.
+                        readback = self._fallback_kept(proof.db_path.parent, key)
                     except Exception as exc:
-                        errors["fallback_error"] = type(exc).__name__
+                        errors["fallback_error" if preserved is None else "readback_error"] = type(exc).__name__
+                # ``answer_kept`` is true only for answer text that was written and then read back, through
+                # the replay's own decoding, as these very characters. A kept failure is no kept answer.
+                answer_kept = False
+                if preserved is not None and whole is not None:
+                    try:
+                        answer_kept = readback == record_kept and self._kept_text(readback, fingerprint) == whole
+                    except Exception as exc:
+                        errors["readback_error"] = type(exc).__name__
+                    if not answer_kept:
+                        errors.setdefault("readback_error", "not_read_back_as_this_answer")
+                lost = preserved is None or (whole is not None and not answer_kept)
                 _log_record_state(
-                    logging.ERROR if preserved else logging.CRITICAL,
-                    "terminal not recorded" if preserved else "terminal not recorded and its answer NOT preserved",
+                    logging.CRITICAL if lost else logging.ERROR,
+                    "terminal not recorded and its answer NOT preserved" if lost else "terminal not recorded",
                     stage=stage, binding=binding, event=event, key=key, observed=observed, delivery="not_delivered",
-                    cause=cause, answer_kept=preserved is not None, preservation=preserved or "failed",
+                    cause=cause, answer_kept=answer_kept, preservation=preserved or "failed",
                     answer_sha256=digest, **errors)
-                return CanonicalReceiptResult("unrecorded", None, {**failure, "answer_kept": preserved is not None})
+                return CanonicalReceiptResult("unrecorded", None, {**failure, "answer_kept": answer_kept})
 
             def record_or_keep(answer: CanonicalReceiptResult, whole: str | None) -> CanonicalReceiptResult:
                 """Record the answer as the event's terminal, or, when that does not land, keep it (its
@@ -1063,6 +1147,24 @@ class CanonicalReceiptCoordinator:
                     if code is None:
                         raise
                     answer = CanonicalReceiptResult("terminal", None, observation.failure(code))
+                    bound = observation.bound_answer if code == "canonical_turn_refused" else None
+                    if isinstance(bound, str) and bound.strip():
+                        # The selector refused the turn's shape, so its text is never the event's answer.
+                        # The final answer proven to be this event's, claim's and turn's is kept first
+                        # (not delivered), then the refusal is recorded as the terminal failure; the
+                        # request answers the kept state, never success.
+                        kept = keep(_result_answer(CanonicalTurnResult(binding.name, bound), observation), bound,
+                                    stage="turn.refused_bound_answer", cause=code,
+                                    observed=self._observe_receipt(db, key, pending, None, fingerprint, proof))
+                        try:
+                            record(answer, run_generation)
+                        except Exception as exc:
+                            _log_record_state(logging.WARNING, "refusal not recorded beside its kept answer",
+                                              stage="turn.refused_bound_answer", binding=binding, event=event,
+                                              key=key, delivery="not_delivered", cause=type(exc).__name__,
+                                              observed=self._observe_receipt(db, key, pending, None, fingerprint,
+                                                                             proof))
+                        return kept
                 else:
                     answer = _result_answer(result, observation)
                     whole = result.terminal_text if isinstance(result, CanonicalTurnResult) else None

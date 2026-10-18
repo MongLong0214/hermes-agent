@@ -812,7 +812,35 @@ def refusal_notice(status, code, error, event_id, chars):
         return (f"CEO 턴은 실행됐지만 답변을 기록하지 못해 이 스레드에 전달되지 않았습니다. 이 턴은 다시 "
                 f"실행되지 않고 자동 재전송도 없습니다. 상태: {code} (delivery={delivery}, "
                 f"answer_kept={kept}). (event {event_id})")
+    if status == 409 and code in TERMINAL_NOTICES:
+        # Answered past the claim: the turn ran, or may have, and nothing of it is delivered or run again.
+        # The side-effect scope is the gateway's own record, never assumed; without one it is unknown.
+        scope = error.get("side_effects")
+        scope = scope if scope in ("none", "attempted", "unknown") else "unknown"
+        return (f"{TERMINAL_NOTICES[code]}. 답변은 이 스레드에 전달되지 않았고, 이 턴은 다시 실행되지 않으며 "
+                f"자동 재전송도 없습니다. 상태: {code} (HTTP 409, gateway 기록 side_effects={scope}). "
+                f"(event {event_id})")
+    if code is None and status >= 500:
+        return unknown_outcome_notice(f"HTTP {status}", event_id)
     return None
+
+
+# Codes the gateway answers only once the event was claimed (api_server_canonical.py): a refusal raised
+# before the claim means the turn never ran and no answer exists, and stays as it is.
+TERMINAL_NOTICES = {
+    "canonical_event_failed": "CEO 턴이 실패로 끝났고 gateway 에 실패로 기록됐습니다",
+    "canonical_event_uncertain": "이 메시지로 시작된 CEO 턴이 실행됐는지, 어떻게 끝났는지 gateway 가 확정하지 못했습니다",
+    "canonical_event_conflict": "이 이벤트의 gateway 기록이 이 요청과 맞지 않아 그 결과를 전달할 수 없습니다",
+}
+
+
+def unknown_outcome_notice(cause, event_id):
+    """The sender's notice when the gateway gave no usable answer to a submission: whether the turn ran
+    is unknown here, so neither success nor its absence is stated. ``cause`` is an exception type or an
+    HTTP status, never a message."""
+    return (f"CEO 에게 제출한 이 메시지에 대해 canonical surface 의 응답을 받지 못했습니다({cause}). 턴이 "
+            f"실행됐는지 이 브리지는 알 수 없고, 그 결과는 이 스레드에 전달되지 않습니다. 자동 재전송은 "
+            f"없습니다. (event {event_id})")
 
 
 def _claim(name):
@@ -1219,6 +1247,9 @@ def handle(message):
             except Exception as exc:
                 log(f"prompt {event_id} failed: {type(exc).__name__}: {exc}")
                 answer = f"canonical surface unreachable: {type(exc).__name__}: {exc}"
+                # No gateway answer: the turn may have run, so the thread is told its outcome is unknown.
+                code, refusal = None, {}
+                notice = unknown_outcome_notice(type(exc).__name__, base)
                 break
         write({"jsonrpc": "2.0", "method": "session/update", "params": {
             "sessionId": session,

@@ -3710,6 +3710,7 @@ class GatewayRunner(
                 CanonicalBindingProof,
                 CanonicalReceiptCoordinator,
                 _runs_tools_outside_hermes,
+                bound_refused_answer,
             )
             from gateway.session_context import (
                 clear_session_vars,
@@ -3821,12 +3822,24 @@ class GatewayRunner(
                 boundary = getattr(agent, "_persist_user_message_idx", None)
                 if isinstance(boundary, bool) or not isinstance(boundary, int):
                     raise ValueError("canonical_turn_refused")
-                return self._select_canonical_turn_result(
-                    result,
-                    binding_name=binding.name,
-                    history_boundary=boundary,
-                    expected_session_id=session_id,
-                )
+                try:
+                    return self._select_canonical_turn_result(
+                        result,
+                        binding_name=binding.name,
+                        history_boundary=boundary,
+                        expected_session_id=session_id,
+                    )
+                except ValueError:
+                    # The refusal stands. Only a final answer proven to be this event's, this claim's
+                    # and this turn's is handed to the receipt coordinator, to be kept, not delivered.
+                    if observation is not None:
+                        try:
+                            observation.bound_answer = bound_refused_answer(
+                                result, peer=peer, body=event.text, rendered=peer_prompt,
+                                history_boundary=boundary, expected_session_id=session_id)
+                        except Exception:
+                            observation.bound_answer = None  # unprovable: the failure stands
+                    raise
             finally:
                 for name, value in outward_callbacks.items():
                     setattr(agent, name, value)
