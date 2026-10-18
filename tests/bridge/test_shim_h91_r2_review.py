@@ -7,8 +7,11 @@ writes under its event headers, and the [Context] element its channel id without
 
 H91-R2-01: an answer by this bridge's own signer that quoted header-like example text was refused before
 the own-signer check and answered with a refusal notice. Once ``notice_destination`` binds the [Context] to
-the last event, that event's From line at buzz-acp's fixed position decides: this bridge's own signer gets
-no notice, and the refusal is journaled as an echo, neither posted nor failed. Attribution is unchanged.
+the event and the channel's counterpart is registered, a plain single-event prompt's From line at buzz-acp's
+fixed position decides: this bridge's own signer gets no notice, and the refusal is journaled as an echo,
+neither posted nor failed. Attribution is unchanged. A merged prompt whose new event is this bridge's own
+still holds another author's request in its cancelled section, so it gets one notice to the conversation
+(review r3, H91-R3-01: these expectations were blanket suppression at e727df33).
 
 The reviewer's two witnesses (test_remediation_adversarial.py) are copied unchanged except that their record
 goes to the test's tmp dir, not beside this file. Offline: the Buzz wrapper is a stand-in.
@@ -157,7 +160,8 @@ def _answer(author, quoted=OTHER):
 
 
 def _forms(ev):
-    """Every refused form whose last event's From line buzz-acp writes at a fixed position."""
+    """Every refused form whose last event's From line buzz-acp writes at a fixed position. The two merged
+    forms also hold the cancelled request of ``root``, written by the counterpart."""
     root, b, reply = _events()
     context = ([root, b, reply], 3, False)
     return {
@@ -176,9 +180,8 @@ def _echoes(tmp_path):
 
 
 @pytest.mark.parametrize("forward", ["live", "quarantine"])
-@pytest.mark.parametrize("form", ["single", "single_with_history", "steer_new_message", "interrupt_new_request"])
-def test_r2_own_post_refused_in_any_fixed_form_is_journaled_as_an_echo_never_answered(shim, monkeypatch,
-                                                                                       forward, form):
+@pytest.mark.parametrize("form", ["single", "single_with_history"])
+def test_r2_own_post_refused_alone_is_journaled_as_an_echo_never_answered(shim, monkeypatch, forward, form):
     monkeypatch.setattr(shim, "FORWARD", forward)
     blocks = _forms(_answer(CEO))[form]
     drive(shim, blocks)
@@ -190,6 +193,24 @@ def test_r2_own_post_refused_in_any_fixed_form_is_journaled_as_an_echo_never_ans
         "event_id": None, "channel": CH, "reply_to": ROOT_ID}
     assert name == "own-echo-" + record["ref"][len("unattributed-"):]
     assert "POSTED" not in log_of(shim) and " prompt author=" not in log_of(shim)
+
+
+@pytest.mark.parametrize("forward", ["live", "quarantine"])
+@pytest.mark.parametrize("form", ["steer_new_message", "interrupt_new_request"])
+def test_r2_own_new_event_beside_another_authors_cancelled_request_gets_one_notice(shim, monkeypatch, forward,
+                                                                                    form):
+    """H91-R3-01: the own post is the new event, but the cancelled section holds the counterpart's request.
+    One notice to the conversation, journaled as sent, and no echo record; nothing is submitted."""
+    monkeypatch.setattr(shim, "FORWARD", forward)
+    blocks = _forms(_answer(CEO))[form]
+    drive(shim, blocks)
+    drive(shim, blocks, rpc_id=2)
+    assert shim.submitted == []
+    [call] = _calls(shim.tmp)
+    assert_one_anonymous_notice(call, ROOT_ID)
+    [(_, [record])] = _journal(shim.tmp).items()
+    assert (record["sent"], record["state"]) == (True, "sent") and _echoes(shim.tmp) == {}
+    assert " prompt author=" not in log_of(shim)
 
 
 @pytest.mark.parametrize("forward", ["live", "quarantine"])

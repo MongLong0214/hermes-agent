@@ -299,10 +299,15 @@ def test_control_a_notice_that_fails_or_cannot_be_built_is_a_delivery_failure(sh
     drive(shim, blocks, rpc_id=2)  # dispatched again: the failure stands, nothing is retried
     assert shim.submitted == []
     assert len(_calls(shim.tmp)) == (1 if state != "notice_impossible" else 0)
-    [(name, [record])] = _journal(shim.tmp).items()
-    assert {k: record[k] for k in ("sent", "state", "delivery", "kind", "event_id", "ref")} == {
-        "sent": False, "state": state, "delivery": "failed", "kind": "unattributed_notice", "event_id": None,
-        "ref": name}
+    records = _journal(shim.tmp)
+    # With no exact-form [Context] at params.prompt[0], no section of the merged prompt's event lists is
+    # confirmed (#91 review r3, H91-R1-02): the refusal is unidentified and each dispatch is journaled under a
+    # key of its own — two failures, never a post. Every other case keeps its one key across both dispatches.
+    assert len(records) == (2 if case in ("slash_command_first", "legacy_base_first") else 1)
+    for name, [record] in records.items():
+        assert {k: record[k] for k in ("sent", "state", "delivery", "kind", "event_id", "ref")} == {
+            "sent": False, "state": state, "delivery": "failed", "kind": "unattributed_notice", "event_id": None,
+            "ref": name}
     assert "NOT posted" in log_of(shim) and "POSTED" not in log_of(shim)
 
 
