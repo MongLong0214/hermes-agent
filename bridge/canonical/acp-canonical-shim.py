@@ -13,6 +13,7 @@ avoided here, it is unreachable: this process owns no session and can create non
 The endpoint answers the turn on the same connection and keeps a durable receipt, so a resend of
 one `event_id` replays that receipt rather than running a second turn.
 """
+import hashlib
 import json
 import os
 import re
@@ -135,7 +136,7 @@ def error(rpc_id, code, message):
 # `author_id`/`channel_id`, so sending this process's own env constants would make that check
 # vacuous: every author buzz-acp forwards — owner, orchestrator, anyone later added to the
 # allowlist — would arrive at the CEO as the one identity named in the environment. The values are
-# read from the event and the env values serve only as a fallback that is logged as such.
+# read from the event only; the env values are a startup requirement and never stand in for them.
 AUTHOR_RE = re.compile(r"hex:\s*([0-9a-f]{64})")
 CHANNEL_RE = re.compile(r"#([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})")
 EVENT_RE = re.compile(r"Event ID:\s*([0-9a-f]{64})")
@@ -149,50 +150,114 @@ BUSY_DEADLINE_SECS = float(os.environ.get("CANONICAL_BUSY_DEADLINE_SECS", "840")
 
 EVENT_HEADER = "[Buzz event:"
 _UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+EVENT_TITLE_RE = re.compile(r"\[Buzz event: [^\[\]\n]+\]")
 HEADER_EVENT_RE = re.compile(r"Event ID: ([0-9a-f]{64})")
 HEADER_CHANNEL_RE = re.compile(r"Channel: [^()#]* \(#(" + _UUID + r")\)")
+HEADER_KIND_RE = re.compile(r"Kind: \d{1,10}")
 HEADER_FROM_RE = re.compile(r"From: [^()]* \(npub: npub1[02-9ac-hj-np-z]+, hex: ([0-9a-f]{64})\)")
+HEADER_TIME_RE = re.compile(r"Time: [0-9][0-9T:.+\-Z]{0,40}")
 
 
-def envelope(text):
-    """(author_id, channel_id, event_id, body) of the one ``[Buzz event: …]`` section buzz-acp appends
-    after its context blocks, or None. The thread context above it quotes other members' ``hex:``
-    ids and their text, so signer, channel and id are read only from that section's own header lines
-    (each exactly once, before ``Content:``) and the body only after ``Content:``. A second section
-    header (a body imitating one) or any missing field makes the event ambiguous: None, never a guess
-    and never the env fallback."""
-    lines = text.splitlines()
-    starts = [i for i, line in enumerate(lines) if line.startswith(EVENT_HEADER)]
-    if len(starts) != 1:
+def prompt_blocks(prompt):
+    """The text of each element of ACP ``params.prompt``, in order; None for one that is not a text
+    block. buzz-acp sends each prompt section as its own element (queue.rs ``format_prompt``, acp.rs
+    ``build_prompt_params``), so a message body always lies inside one element and can never open
+    another: the element boundary is the one delimiter no body can write."""
+    if not isinstance(prompt, list):
+        return []
+    return [block["text"] if isinstance(block, dict) and block.get("type") == "text"
+            and isinstance(block.get("text"), str) else None for block in prompt]
+
+
+def envelope(prompt):
+    """(author_id, channel_id, event_id, body) of a single-event prompt, or None.
+
+    In buzz-acp's single-event shape the LAST element of ``params.prompt`` is the event section:
+    ``[Buzz event: <tag>]`` and then ``format_event_block``'s header lines at fixed positions —
+    Event ID, Channel, Kind, From, Time, Content (queue.rs 1081-1147, 1533-1537). Only that element
+    is read, only at those positions, and only when it starts with ``[Buzz event: ``. A merged
+    (cancel + re-prompt) or batched prompt ends in another element, so it is never taken for a single
+    event whatever its bodies quote: no body is searched for a header to promote, and no identity
+    stands in for a missing one. A body line opening another event section makes the element
+    ambiguous: None."""
+    blocks = prompt_blocks(prompt)
+    if not blocks or blocks[-1] is None or not blocks[-1].startswith(EVENT_HEADER + " "):
         return None
-    section = lines[starts[0] + 1:]
-    content = next((i for i, line in enumerate(section) if line.startswith("Content:")), None)
-    if content is None:
+    lines = blocks[-1].split("\n")
+    if len(lines) < 7 or not EVENT_TITLE_RE.fullmatch(lines[0]):
         return None
-    head = section[:content]
-
-    def field(prefix, pattern, *, token=None):
-        # The whole line must have buzz-acp's exact shape, carrying one value: a line with a second
-        # id, an extra parenthesis or any other variation is ambiguous and refuses the event. For
-        # ``From:``, buzz-acp never puts a second ``hex:`` anywhere on the line (CANONICAL-01): a
-        # display name quoting one, however it is placed, makes the line ambiguous on its own,
-        # independent of which occurrence the pattern's own group would have captured.
-        matches = [line for line in head if line.startswith(prefix)]
-        if len(matches) != 1:
-            return None
-        line = matches[0].rstrip()
-        if token is not None and line.count(token) != 1:
-            return None
-        found = pattern.fullmatch(line)
-        return found.group(1) if found else None
-
-    event_id = field("Event ID:", HEADER_EVENT_RE)
-    channel = field("Channel:", HEADER_CHANNEL_RE)
-    author = field("From:", HEADER_FROM_RE, token="hex:")
-    if not (event_id and channel and author):
+    if sum(line.startswith(EVENT_HEADER) for line in lines) != 1:
         return None
-    body = "\n".join([section[content][len("Content:"):]] + section[content + 1:]).strip()
-    return author, channel, event_id, body
+    event = HEADER_EVENT_RE.fullmatch(lines[1])
+    channel = HEADER_CHANNEL_RE.fullmatch(lines[2])
+    author = HEADER_FROM_RE.fullmatch(lines[4])
+    # buzz-acp never puts a second ``hex:`` on the From line (CANONICAL-01): a display name quoting
+    # one makes the line ambiguous on its own, whichever occurrence the pattern would capture.
+    if not (event and channel and author and lines[4].count("hex:") == 1
+            and HEADER_KIND_RE.fullmatch(lines[3]) and HEADER_TIME_RE.fullmatch(lines[5])
+            and lines[6].startswith("Content:")):
+        return None
+    body = "\n".join([lines[6][len("Content:"):]] + lines[7:]).strip()
+    return author.group(1), channel.group(1), event.group(1), body
+
+
+CONTEXT_THREAD_ROOT_RE = re.compile(r"Thread root: ([0-9a-f]{64})")
+CONTEXT_CHANNEL_HINT = "Hint: Use `buzz messages get --channel <UUID>` for recent messages if needed."
+CONTEXT_NEW_THREAD_RE = re.compile(
+    r"IMPORTANT: This is a new top-level message\. For ordinary replies in this turn, use `--reply-to "
+    r"([0-9a-f]{64})` on `buzz messages send` — the triggering message is the thread root\. Do NOT reply "
+    r"into any other \(older\) thread\. If the human explicitly asks for a channel-root, top-level, or "
+    r"broadcast post, send that message without `--reply-to`\.")
+
+
+def notice_destination(blocks):
+    """(channel, reply_to, None) for an unattributed refusal's notice, or (None, None, why not).
+
+    Read only from ``params.prompt[0]``, where buzz-acp puts its own ``[Context]`` section
+    (``format_context_hints``, queue.rs 1238-1319), and only in its exact thread or channel form:
+    the thread's root, or for a top-level message the anchor buzz-acp names (without one, the channel
+    itself). It says where the conversation is, never who wrote what — it is no evidence of an author
+    or an approval. A first element of any other shape (a slash command, a legacy ``[Base]``, a DM)
+    names no destination."""
+    first = blocks[0] if blocks else None
+    lines = first.split("\n") if isinstance(first, str) else []
+    channel = HEADER_CHANNEL_RE.fullmatch(lines[2]) if len(lines) >= 4 and lines[0] == "[Context]" else None
+    if channel is None:
+        return None, None, "params.prompt[0] is not buzz-acp's [Context] block"
+    if lines[1] == "Scope: thread":
+        root = CONTEXT_THREAD_ROOT_RE.fullmatch(lines[3])
+        if root:
+            return channel.group(1), root.group(1), None
+    elif lines[1] == "Scope: channel" and lines[3] == CONTEXT_CHANNEL_HINT:
+        if len(lines) == 4:
+            return channel.group(1), None, None
+        anchor = CONTEXT_NEW_THREAD_RE.fullmatch(lines[4]) if len(lines) == 5 else None
+        if anchor:
+            return channel.group(1), anchor.group(1), None
+    return None, None, "the [Context] block names no thread or channel in buzz-acp's form"
+
+
+CONVERSATION_HEADERS = ("[Thread Context (", "[Conversation Context (")
+MERGE_HEADERS = ("[What you were working on]", "[Previous request — interrupted before completion]")
+
+
+def refusal_key(blocks):
+    """The correlation key of an unattributed refusal: a digest of its elements, less the quoted
+    conversation history buzz-acp fetches afresh on every dispatch. The same events dispatched again
+    (a requeue, a respawned shim) give the same key and so one notice; other events give their own."""
+    kept = [block for block in blocks if not (isinstance(block, str) and block.startswith(CONVERSATION_HEADERS))]
+    return "unattributed-" + hashlib.sha256(json.dumps(kept).encode("ascii")).hexdigest()
+
+
+def prompt_shape(blocks):
+    """The buzz-acp shape of an unattributed prompt, by its elements' leading headers. For the journal
+    and the log only: it decides nothing."""
+    last = blocks[-1] if blocks and isinstance(blocks[-1], str) else ""
+    if any(isinstance(block, str) and block.startswith(MERGE_HEADERS) for block in blocks):
+        return "merged"
+    if last.startswith("[Buzz events — "):
+        return "batch"
+    return "single_unreadable" if last.startswith(EVENT_HEADER + " ") else "unrecognized"
 
 
 # 2026-10-10 04:28–04:29 KST: two replies in a long thread (17,550 and 17,079 chars) were refused with
@@ -240,7 +305,7 @@ def fit_text(text, channel, event_id):
     entries are dropped oldest first and replaced by one marker naming what was dropped and how to
     read it back; when the entry boundaries are ambiguous, the whole history block goes as one unit.
     The ``[Context]`` block and the ``[Buzz event: …]`` section — envelope, the newest message in
-    full, its tags — are never touched, so ``envelope()`` reads the same event from the result. The
+    full, its tags — are never touched, so the result carries the event ``envelope()`` read. The
     fewest drops that land within TEXT_BUDGET win; failing that, the fewest within the gateway limit.
     None when even dropping all history leaves the text over the limit."""
     if len(text) <= GATEWAY_TEXT_LIMIT:
@@ -286,11 +351,12 @@ def fit_text(text, channel, event_id):
     return legal
 
 
-def submit(text, event_id, author=None, channel=None):
-    """Answer text, or raise. The caller turns a failure into a visible refusal sentence."""
+def submit(text, event_id, author, channel):
+    """Answer text, or raise. The caller turns a failure into a visible refusal sentence. Author and
+    channel are the event's own, from ``envelope()``; nothing stands in for either."""
     body = json.dumps({
         "binding": BINDING, "event_id": event_id,
-        "author_id": author or AUTHOR, "channel_id": channel or CHANNEL, "text": text}).encode()
+        "author_id": author, "channel_id": channel, "text": text}).encode()
     request = urllib.request.Request(
         BASE + ROUTE, data=body, method="POST",
         headers={"Authorization": "Bearer " + KEY, "Content-Type": "application/json"})
@@ -403,27 +469,39 @@ def refusal_notice(status, code, error, event_id, chars):
     return None
 
 
-def publish_reply(event_id, channel, answer, kind="answer"):
+def _claim(name):
+    """(fd, None) for a fresh O_EXCL claim of the journal entry ``PUBLISHED/<name>``, else (None, why)."""
+    try:
+        os.makedirs(PUBLISHED, exist_ok=True)
+        return os.open(os.path.join(PUBLISHED, name), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600), None
+    except FileExistsError:
+        return None, "exists"
+    except OSError as exc:
+        return None, f"marker unavailable: {type(exc).__name__}: {exc}"
+
+
+def publish_reply(event_id, channel, answer, kind="answer", *, ref=None, reply_to=None):
     """Post *answer* once as the thread reply to *event_id*. True only when the wrapper sent it.
 
     The delivery journal is ``PUBLISHED/<event id>``: claimed before the send (one post per event,
     ever) and then filled with what happened — ``state`` is ``sent``, ``wrapper_refused``,
-    ``send_failed``, ``timeout`` or ``error``, with the ``reason``. A failure stays recorded as one
-    and is never retried."""
-    try:
-        os.makedirs(PUBLISHED, exist_ok=True)
-        fd = os.open(os.path.join(PUBLISHED, event_id), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    except FileExistsError:
-        log(f"prompt {event_id[:12]}… reply already published once; not posting again")
-        return False
-    except OSError as exc:
-        log(f"prompt {event_id[:12]}… reply not posted: marker unavailable: {type(exc).__name__}: {exc}")
+    ``send_failed``, ``timeout`` or ``error``, with the ``reason``, and ``delivery`` is ``posted``
+    or ``failed``. A failure stays recorded as one and is never retried. An unattributed refusal has
+    no event id: its notice passes ``event_id=None``, is journaled under its correlation key *ref*
+    and replies to *reply_to*, the thread buzz-acp's ``[Context]`` names (None: the channel)."""
+    name, target = (event_id, event_id) if event_id is not None else (ref, reply_to)
+    tag = name[:12] if event_id is not None else name
+    fd, why = _claim(name)
+    if fd is None:
+        log(f"prompt {tag}… reply already published once; not posting again" if why == "exists"
+            else f"prompt {tag}… reply not posted: {why}")
         return False
     handle = _peer_handle(channel)
     body = f"@{handle} {answer}" if handle and not answer.lstrip().startswith(f"@{handle}") else answer
     try:
         done = subprocess.run(
-            [BUZZ_CLI, "messages", "send", "--channel", channel, "--reply-to", event_id, "--content", "-"],
+            [BUZZ_CLI, "messages", "send", "--channel", channel]
+            + (["--reply-to", target] if target else []) + ["--content", "-"],
             input=body.encode("utf-8"), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             timeout=PUBLISH_TIMEOUT)
     except subprocess.TimeoutExpired:
@@ -439,12 +517,67 @@ def publish_reply(event_id, channel, answer, kind="answer"):
             reason = f"exit {done.returncode}: stderr unclassifiable ({type(exc).__name__})"
     sent = state == "sent"
     with os.fdopen(fd, "w") as marker:
-        marker.write(json.dumps({"sent": sent, "state": state, "kind": kind, "event_id": event_id,
-                                 "channel": channel, "reason": str(reason)[:400],
+        marker.write(json.dumps({"sent": sent, "state": state, "delivery": "posted" if sent else "failed",
+                                 "kind": kind, "event_id": event_id, "ref": ref, "channel": channel,
+                                 "reply_to": target, "reason": str(reason)[:400],
                                  "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}) + "\n")
-    log(f"prompt {event_id[:12]}… {kind} {'POSTED' if sent else 'NOT posted (no retry)'} to thread: "
+    log(f"prompt {tag}… {kind} {'POSTED' if sent else 'NOT posted (no retry)'} to thread: "
         f"{state}: {reason}")
     return sent
+
+
+# Fixed text: it names no sender, quotes no byte of any message and carries only the refusal's key.
+UNATTRIBUTED_NOTICE = (
+    "이 대화로 온 메시지가 CEO 에게 전달되지 않았습니다. 여러 메시지가 하나로 합쳐진 프롬프트(작업 중 도착한 "
+    "메시지 병합 또는 일괄 전달)이거나 단일 이벤트 머리글이 정해진 자리에 없어, 발신자와 이벤트를 하나로 "
+    "특정할 수 없었습니다. 누구에게도 귀속하지 않고 거부했으며, 턴은 실행되지 않았고 자동 재전송도 없습니다. "
+    "필요하면 메시지를 하나씩 다시 보내 주세요. (ref {ref})")
+
+
+def journal_undeliverable(ref, shape, reason):
+    """Record, once, an unattributed refusal whose notice has no destination: ``PUBLISHED/<ref>`` with
+    ``sent`` false, ``state`` ``notice_impossible`` and ``delivery`` ``failed``. It takes the same
+    one-entry claim a posted notice would, so the refusal is journaled once and never reads as sent."""
+    fd, why = _claim(ref)
+    if fd is None:
+        log(f"prompt {ref}… refusal already journaled once; not again" if why == "exists"
+            else f"prompt {ref}… refusal not journaled: {why}")
+        return
+    with os.fdopen(fd, "w") as record:
+        record.write(json.dumps({"sent": False, "state": "notice_impossible", "delivery": "failed",
+                                 "kind": "unattributed_notice", "event_id": None, "ref": ref, "shape": shape,
+                                 "channel": None, "reply_to": None, "reason": reason,
+                                 "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}) + "\n")
+    log(f"prompt {ref}… unattributed_notice NOT posted: {reason}; journaled as a delivery failure")
+
+
+def refuse_unattributed(session, prompt, chars):
+    """Refuse a prompt that is not one attributable event — a merged or batched dispatch, or an event
+    section out of its fixed form — attributing it to no one. The conversation is told once per
+    correlation key, in fixed text that names no sender and quotes no body, at the destination
+    buzz-acp's own ``[Context]`` element names; when there is none, or the post fails, the journal
+    records a delivery failure, never a sent notice.
+
+    The notice is signed with this bridge's own key and mentions only the channel's registered
+    counterpart. buzz-acp drops its own events (``ignore_self``, on unless BUZZ_ACP_NO_IGNORE_SELF;
+    lib.rs 2329) and wakes this agent only for mentions of it; an own-signer event that still arrives
+    as one event is refused before any submission or post. A notice therefore starts no further
+    refusal or reply."""
+    blocks = prompt_blocks(prompt)
+    ref, shape = refusal_key(blocks), prompt_shape(blocks)
+    log(f"prompt refused locally: not one attributable [Buzz event] element ({shape}, {len(blocks)} "
+        f"elements, {chars} chars); ref {ref}")
+    channel, reply_to, why = notice_destination(blocks)
+    if channel is not None and _peer_handle(channel) is None:
+        channel, why = None, "the [Context] channel has no registered counterpart to post to"
+    if channel is None:
+        journal_undeliverable(ref, shape, why)
+        return
+    notice = UNATTRIBUTED_NOTICE.format(ref=ref[:29])
+    write({"jsonrpc": "2.0", "method": "session/update", "params": {
+        "sessionId": session,
+        "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": notice}}}})
+    publish_reply(None, channel, notice, kind="unattributed_notice", ref=ref, reply_to=reply_to)
 
 
 def journal_held(event_id, channel, reason):
@@ -535,10 +668,11 @@ def handle(message):
             log(f"prompt refused locally: heartbeat, not a message ({len(text)} chars)")
             result(rpc_id, {"stopReason": "end_turn"})
             return
-        parsed = envelope(text)
+        parsed = envelope(params.get("prompt"))
         if parsed is None:
-            # No single unambiguous event: nothing can be attributed, so nothing is forwarded in any mode.
-            log(f"prompt refused locally: no unambiguous [Buzz event] envelope ({len(text)} chars)")
+            # No single unambiguous event: nothing can be attributed, so nothing is forwarded in any
+            # mode — and the conversation is told, or the journal says it could not be.
+            refuse_unattributed(session, params.get("prompt"), len(text))
             result(rpc_id, {"stopReason": "end_turn"})
             return
         author, channel, base, body = parsed
