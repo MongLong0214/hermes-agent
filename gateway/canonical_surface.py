@@ -497,6 +497,61 @@ def _returned_text(observation: CanonicalTurnObservation) -> str | None:
     return text if isinstance(text, str) and text.strip() else None
 
 
+@dataclass(frozen=True)
+class TurnProvenance:
+    """The provenance facts of the rows one canonical turn added (``messages[history_boundary:]``), read once
+    by ``turn_provenance`` for both the accepted path and the refused-answer keep, so neither is a second
+    authority.
+
+    ``opening_is_this_claims``: the opening row is this turn's own peer row — this claim's metadata with its
+    fresh nonce and this event's body, or exactly the rendering the model received. ``other_peer_row``: a
+    later row, up to and including the last, is marked as a peer row (``display_kind`` ``canonical_peer``,
+    or ``display_metadata`` carrying ``canonical_peer``) — another event's, receipt's or nonce's, or this
+    one's again. ``interior_user_row``: a row other than the actor's assistant or tool rows (a user row) lies
+    between the first and the last. These are facts, not verdicts: a row with no metadata is never trusted
+    by them, and nothing classifies a row by its text."""
+
+    opening_is_this_claims: bool
+    other_peer_row: bool
+    interior_user_row: bool
+
+    @property
+    def binds(self) -> bool:
+        """The rule both paths share (H92-03): the turn opened with this claim's row and carries no other
+        peer row."""
+        return self.opening_is_this_claims and not self.other_peer_row
+
+
+def turn_provenance(messages: Any, *, history_boundary: Any, peer: Any, body: str,
+                    rendered: str) -> TurnProvenance | None:
+    """The ``TurnProvenance`` of a turn's rows, or None when they cannot be read (never bound)."""
+    from collections.abc import Mapping
+
+    from agent.canonical_peer import PEER_DISPLAY_KIND, PEER_METADATA_KEY, PeerProvenanceError, peer_body, peer_metadata
+
+    if (not isinstance(messages, list) or type(history_boundary) is not int
+            or not 0 <= history_boundary < len(messages) - 1):
+        return None
+    suffix = messages[history_boundary:]
+    if not all(isinstance(row, dict) for row in suffix):
+        return None
+    first = suffix[0]
+    opening = False
+    if first.get("role") == "user":
+        try:
+            marked = peer_metadata(first)
+            opening = (first.get("content") == rendered if marked is None
+                       else marked == peer and peer_body(first) == body)
+        except (PeerProvenanceError, ValueError, TypeError):
+            opening = False
+    other_peer = any(row.get("display_kind") == PEER_DISPLAY_KIND
+                     or (isinstance(row.get("display_metadata"), Mapping)
+                         and PEER_METADATA_KEY in row["display_metadata"])
+                     for row in suffix[1:])
+    interior_user = any(row.get("role") not in ("assistant", "tool") for row in suffix[1:-1])
+    return TurnProvenance(opening, other_peer, interior_user)
+
+
 def bound_refused_answer(result: Any, *, peer: Any, body: str, rendered: str, history_boundary: Any,
                          expected_session_id: str) -> str | None:
     """The final answer of a turn the selector refused, or None when it is not provably this event's.
@@ -506,11 +561,9 @@ def bound_refused_answer(result: Any, *, peer: Any, body: str, rendered: str, hi
     claim's run returned:
 
     * the turn completed, is not failed, partial or interrupted, and ran in the bound session;
-    * the transcript suffix opens with this turn's own peer row: this claim's metadata with its fresh
-      nonce (and this event's body), or exactly the rendering of it the model received;
-    * it ends with one assistant row, without tool calls, whose text is the returned final answer;
-    * no other row of the suffix is marked as a peer row (another event's, receipt's or nonce's, or this
-      one's again), and every row between the first and the last is the actor's own assistant or tool row.
+    * its rows bind it to this claim (``turn_provenance(...).binds``, the same rule a selected answer
+      meets), and, beyond that rule, no user row lies inside the turn (the Limit below);
+    * it ends with one assistant row, without tool calls, whose text is the returned final answer.
 
     Limit: a user row inside the turn — a recovery nudge included — makes the answer unbound. Matching a
     nudge's fixed text is no provenance, and none of the five nudges carries metadata bound to this run:
@@ -521,40 +574,19 @@ def bound_refused_answer(result: Any, *, peer: Any, body: str, rendered: str, hi
     nothing here and stays an explicit failure.
 
     Anything else, or anything unreadable, is None: the event stays an explicit failure."""
-    from collections.abc import Mapping
-
-    from agent.canonical_peer import PEER_DISPLAY_KIND, PEER_METADATA_KEY, PeerProvenanceError, peer_body, peer_metadata
-
     if (not isinstance(result, dict) or result.get("completed") is not True
             or any(bool(result.get(flag)) for flag in ("failed", "partial", "interrupted"))
             or result.get("session_id", expected_session_id) != expected_session_id):
         return None
     final, messages = result.get("final_response"), result.get("messages")
-    if (not isinstance(final, str) or not final.strip() or not isinstance(messages, list)
-            or type(history_boundary) is not int or not 0 <= history_boundary < len(messages) - 1):
+    if not isinstance(final, str) or not final.strip():
         return None
-    suffix = messages[history_boundary:]
-    first, last = suffix[0], suffix[-1]
-    if not isinstance(first, dict) or first.get("role") != "user":
+    facts = turn_provenance(messages, history_boundary=history_boundary, peer=peer, body=body, rendered=rendered)
+    if facts is None or not facts.binds or facts.interior_user_row:
         return None
-    try:
-        marked = peer_metadata(first)
-        if marked is None:
-            if first.get("content") != rendered:
-                return None
-        elif marked != peer or peer_body(first) != body:
-            return None
-    except (PeerProvenanceError, ValueError, TypeError):
-        return None
+    last = messages[-1]
     if (not isinstance(last, dict) or last.get("role") != "assistant" or "tool_calls" in last
             or last.get("content") != final):
-        return None
-    for row in suffix[1:]:
-        meta = row.get("display_metadata") if isinstance(row, dict) else None
-        if (not isinstance(row, dict) or row.get("display_kind") == PEER_DISPLAY_KIND
-                or (isinstance(meta, Mapping) and PEER_METADATA_KEY in meta)):
-            return None
-    if any(row.get("role") not in ("assistant", "tool") for row in suffix[1:-1]):
         return None
     return final
 

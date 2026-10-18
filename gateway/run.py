@@ -3711,6 +3711,7 @@ class GatewayRunner(
                 CanonicalReceiptCoordinator,
                 _runs_tools_outside_hermes,
                 bound_refused_answer,
+                turn_provenance,
             )
             from gateway.session_context import (
                 clear_session_vars,
@@ -3823,7 +3824,7 @@ class GatewayRunner(
                 if isinstance(boundary, bool) or not isinstance(boundary, int):
                     raise ValueError("canonical_turn_refused")
                 try:
-                    return self._select_canonical_turn_result(
+                    selected = self._select_canonical_turn_result(
                         result,
                         binding_name=binding.name,
                         history_boundary=boundary,
@@ -3840,6 +3841,20 @@ class GatewayRunner(
                         except Exception:
                             observation.bound_answer = None  # unprovable: the failure stands
                     raise
+                # A well-formed turn is this event's answer only when it opened with this claim's own row
+                # and carries no other peer row: the rule a refused answer is kept by too
+                # (turn_provenance). Otherwise it is refused (an explicit failure), never recorded or
+                # delivered as the answer. The refused path's extra Limit (no user row inside the turn) is
+                # not this rule; the selector above already governs the accepted shape.
+                try:
+                    facts = turn_provenance(
+                        result.get("messages"), history_boundary=boundary, peer=peer, body=event.text,
+                        rendered=peer_prompt)
+                except Exception:
+                    facts = None
+                if facts is None or not facts.binds:
+                    raise ValueError("canonical_turn_refused")
+                return selected
             finally:
                 for name, value in outward_callbacks.items():
                     setattr(agent, name, value)

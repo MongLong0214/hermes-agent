@@ -62,7 +62,9 @@ def _runner(tmp_path, monkeypatch, home=None):
             self.calls += 1
             self._persist_user_message_idx = len(conversation_history)
             return {"completed": True, "session_id": task_id, "final_response": "done:" + text,
-                    "messages": [*conversation_history, {"role": "user", "content": text},
+                    "messages": [*conversation_history, {"role": "user", "content": text,
+                                 "display_kind": _peer_turn["persist_user_display_kind"],
+                                 "display_metadata": _peer_turn["persist_user_display_metadata"]},
                                  {"role": "assistant", "content": "done:" + text}]}
 
     agent = Agent()
