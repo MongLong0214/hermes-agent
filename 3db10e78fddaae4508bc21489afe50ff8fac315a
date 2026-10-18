@@ -1,0 +1,36 @@
+Warn: a canonical turn whose terminal record fails, or whose actor is rejected after it returns, keeps its full answer through one boundary that falls back to an fsync'd 0600 file outside the failed database (O_EXCL, O_NOFOLLOW, read back); the turn is never re-run, preservation is never reported as delivery, and an unknown or different claim owner is a conflict rather than a 200
+Record-Id: r-84ee9dfacbf3
+Provenance: inherited 41a1eebec43c9963be17d217f6bb7a6a0e6feb1d
+
+Warn: the canonical shim fits a thread reply under the gateway's 16,384-character limit by trimming the oldest thread context first while keeping the current message, target and reply correlation, refuses an over-limit current body with a notice instead of truncating it, and posts a short notice to the sender's thread for a 400 canonical_invalid_request or a 409 canonical_answer_unrecorded, carrying only the event correlation and failure state, with no retry and no resend
+Record-Id: r-0bd7d49ddb34
+Provenance: inherited 47e164bc9fd3b16bc7385fd9e9d5b9438780d36f
+
+Ruled-out: re-applying the pin at interpreter exit | rejected because it depends on the order of later exit hooks and can change HOME for other cleanup; exit hooks are verified instead in a subprocess whose HOME is a tmp dir from the start
+Warn: a pinned test module pins HOME, HERMES_HOME and the Hermes home override only while it imports Hermes and while its own tests run, and puts every value and the hermes_constants home caches back on each exit, so modules collected later in the same pytest process see the home they would have seen without it
+Warn: import-time constants computed from the home cannot be put back, so every import-time pin uses one tmp home per process (import_home), which no module's tests use; a test writing through such a constant lands there, never in another module's test home
+Record-Id: r-4eb8187a82ea
+Provenance: inherited 8ff437b3ea774823bc66740c061e54c9e6b50d4c
+
+Limit: test_canonical_receipt_coordinator.py's wait loop spins on entered.is_set() without checking whether its task already ended, so an early failure there hangs; it is left for its own follow-up and is not fixed here
+Warn: the two peer-tool test modules from #89 pinned the Hermes home at import and never restored it; peer_tool_grant's teardown even put the override back to peer_tools' tmp home, so the receipt coordinator's submit raised canonical_binding_stale in one order and hit the live-DB guard in the other; both now use pinned_hermes_home with the shared import home
+Record-Id: r-364dead706a4
+Provenance: inherited 429bf0a202fb0e8008f4c7e6b649e88242f81470
+
+Ruled-out: letting a forked child keep using pins after an import-time pin ran in its parent | rejected because constants such as gateway.run._hermes_home still name the parent's home and the child read the parent's file through them; the helper raises ForkedPinError and points to a fresh interpreter instead
+Warn: each process gets its own import home keyed by its PID, and every pinned tmp root is removed at exit only by the process that created it, so a forked child that inherits the exit hook removes nothing of its parent's
+Record-Id: r-c19df0fa5430
+Provenance: inherited 6bc3ac5320e80153166fd6783e053bc1acc6e053
+
+Limit: _tmp_parent finds the temp dir without writing by calling CPython's private tempfile._candidate_tempdir_list, because gettempdir() writes a probe file into each candidate before it caches an answer; a Python release that renames or removes that function makes every pinned test fail loudly at allocation
+Warn: the overlap check compares each dir from the tmp parent up with the real Hermes home by file identity as well as by resolved path parts, because on a case-insensitive file system another case of .hermes is the same dir, and 6bc3ac53 made a test home inside it
+Record-Id: r-33ce21bc54c4
+Provenance: inherited bda4bea767cc6b4c2c3adc75fffe4c0d360c405e
+
+Warn: the no-fork capability check removes os.fork in its child only where the platform has it and asserts FORK-AT-START matches the parent, so the module runs whole where os.fork is absent from the start; a selector that deselects this test does not count as a full mocked run, and a mocked absence on macOS is not a Windows run
+Record-Id: r-ca4bb26e96e4
+Provenance: inherited 8d08c422609eb1efc4562d02d100a381f8f370ee
+
+Warn: the coordinator test's wait for the actor also stops when the submit task is done, awaiting it so a raised error surfaces and failing when it returned without entering the actor; a wait loop on an event alone spins forever if the task ends first
+Record-Id: r-d22b8858fe92
+Provenance: inherited 8246d2075b721dbc88fd34510191273f6715e5ca
