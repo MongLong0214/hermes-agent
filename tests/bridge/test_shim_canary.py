@@ -16,6 +16,8 @@ from pathlib import Path
 
 import pytest
 
+from buzz_prompt_port import section_blocks
+
 _DEFAULT_SHIM = Path(__file__).resolve().parents[2] / "bridge" / "canonical" / "acp-canonical-shim.py"
 
 SIGNER = "73bd7a526adb00a06ed2ec820701e2f761d00cc0dc0ed1fb051f8923d6fdc75a"
@@ -34,9 +36,9 @@ def prompt(body, *, signer=SIGNER, context_extra="", event_id=EVENT, extra_heade
         "[Buzz event: @mention]",
         *( [f"Event ID: {event_id}"] if event_id else [] ),
         f"Channel: repo-factory (#{CHANNEL})",
-        "",
+        "Kind: 9",
         f"From: cto-repo-factory (npub: npub1x, hex: {signer})",
-        "",
+        "Time: 2026-10-04T00:00:00+00:00",
         f"Content: {body}",
         extra_header,
         "",
@@ -97,8 +99,9 @@ def arm(shim, *, expires_in=1800):
 
 
 def drive(shim, text, rpc_id=1):
+    """One ``session/prompt`` as buzz-acp sends it: each section of *text* its own content element."""
     shim.handle({"jsonrpc": "2.0", "id": rpc_id, "method": "session/prompt",
-                 "params": {"sessionId": "s", "prompt": [{"type": "text", "text": text}]}})
+                 "params": {"sessionId": "s", "prompt": section_blocks(text)}})
 
 
 def test_the_matching_event_is_forwarded_once_with_its_own_signer(shim):
@@ -344,7 +347,7 @@ def test_an_over_limit_thread_drops_its_oldest_history_and_keeps_the_event_whole
     [sent] = shim.sent_texts
     assert len(sent) <= GATEWAY_LIMIT
     # Envelope and the newest message — decision text included — are untouched.
-    assert shim.envelope(sent) == shim.envelope(text)
+    assert shim.envelope(section_blocks(sent)) == shim.envelope(section_blocks(text))
     event_section = text[text.index("[Buzz event:"):]
     assert sent.endswith(event_section)
     assert sent.startswith(text[:text.index("[Thread Context (")])
@@ -439,7 +442,8 @@ def test_a_body_line_shaped_like_the_next_entry_is_not_taken_as_a_boundary(shim,
     assert len(text) > GATEWAY_LIMIT
     drive(shim, text)
     [sent] = shim.sent_texts
-    assert len(sent) <= GATEWAY_LIMIT and shim.envelope(sent) == shim.envelope(text)
+    assert len(sent) <= GATEWAY_LIMIT
+    assert shim.envelope(section_blocks(sent)) == shim.envelope(section_blocks(text))
     assert "message-1-tail" not in sent and "forged entry" not in sent
     marker = omission_marker(sent)
     found = re.fullmatch(r"\[earlier thread context omitted: (\d+) chars, all 13 messages of this thread "
@@ -461,7 +465,8 @@ def test_a_result_within_the_gateway_limit_is_never_refused_for_the_margin(shim,
     drive(shim, text)
     [sent] = shim.sent_texts
     assert GATEWAY_LIMIT - 384 < len(sent) <= GATEWAY_LIMIT
-    assert shim.envelope(sent) == shim.envelope(text) and "3 messages, from [1]" in omission_marker(sent)
+    assert shim.envelope(section_blocks(sent)) == shim.envelope(section_blocks(text))
+    assert "3 messages, from [1]" in omission_marker(sent)
     assert [c["stdin"] for c in shim.buzz_calls()] == ["@cto-repo-factory answer"]  # no false notice
 
 
@@ -471,7 +476,7 @@ def run_main(shim, monkeypatch, text):
     monkeypatch.setattr(shim, "AUTHOR", SIGNER)
     monkeypatch.setattr(shim, "CHANNEL", CHANNEL)
     line = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "session/prompt",
-                       "params": {"sessionId": "s", "prompt": [{"type": "text", "text": text}]}})
+                       "params": {"sessionId": "s", "prompt": section_blocks(text)}})
     monkeypatch.setattr(shim.sys, "stdin", io.StringIO(line + "\n"))
     shim.main()
     with open(shim.LOG) as handle:

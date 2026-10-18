@@ -13,6 +13,8 @@ avoided here, it is unreachable: this process owns no session and can create non
 The endpoint answers the turn on the same connection and keeps a durable receipt, so a resend of
 one `event_id` replays that receipt rather than running a second turn.
 """
+import fcntl
+import hashlib
 import json
 import os
 import re
@@ -116,11 +118,43 @@ def log(message):
         pass
 
 
-def write(payload):
+def _emit(payload):
     line = json.dumps(payload, ensure_ascii=False)
     with _out:
         sys.stdout.write(line + "\n")
         sys.stdout.flush()
+
+
+class PromptTurn:
+    """One ``session/prompt`` as this process answers it. The stdin loop hands each prompt to its own
+    thread (``dispatch``), so a ``session/cancel`` is read while the prompt runs. Exactly one response
+    goes out per prompt: from the thread serving it, or earlier from ``cancel_prompts``. Once it is
+    answered, that thread writes nothing more to stdout; buzz-acp has moved on."""
+
+    def __init__(self, rpc_id, session):
+        self.rpc_id, self.session = rpc_id, session
+        self.lock = threading.Lock()
+        self.answered = False
+        self.cancelled = threading.Event()  # cancelled before anything was submitted
+        self.submitted = None  # the event id once handed to the canonical surface
+
+
+_local = threading.local()  # .prompt: the PromptTurn this thread serves; .submission: its event's turn
+_PROMPTS = {}  # id(PromptTurn) -> PromptTurn, for every prompt not yet finished
+_PROMPTS_LOCK = threading.Lock()
+
+
+def write(payload):
+    prompt = getattr(_local, "prompt", None)
+    if prompt is None:
+        _emit(payload)
+        return
+    with prompt.lock:
+        if prompt.answered:
+            return
+        if "method" not in payload and payload.get("id") == prompt.rpc_id:
+            prompt.answered = True
+        _emit(payload)
 
 
 def result(rpc_id, value):
@@ -135,7 +169,7 @@ def error(rpc_id, code, message):
 # `author_id`/`channel_id`, so sending this process's own env constants would make that check
 # vacuous: every author buzz-acp forwards — owner, orchestrator, anyone later added to the
 # allowlist — would arrive at the CEO as the one identity named in the environment. The values are
-# read from the event and the env values serve only as a fallback that is logged as such.
+# read from the event only; the env values are a startup requirement and never stand in for them.
 AUTHOR_RE = re.compile(r"hex:\s*([0-9a-f]{64})")
 CHANNEL_RE = re.compile(r"#([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})")
 EVENT_RE = re.compile(r"Event ID:\s*([0-9a-f]{64})")
@@ -149,50 +183,445 @@ BUSY_DEADLINE_SECS = float(os.environ.get("CANONICAL_BUSY_DEADLINE_SECS", "840")
 
 EVENT_HEADER = "[Buzz event:"
 _UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+EVENT_TITLE_RE = re.compile(r"\[Buzz event: [^\[\]\n]+\]")
 HEADER_EVENT_RE = re.compile(r"Event ID: ([0-9a-f]{64})")
 HEADER_CHANNEL_RE = re.compile(r"Channel: [^()#]* \(#(" + _UUID + r")\)")
+HEADER_KIND_RE = re.compile(r"Kind: \d{1,10}")
 HEADER_FROM_RE = re.compile(r"From: [^()]* \(npub: npub1[02-9ac-hj-np-z]+, hex: ([0-9a-f]{64})\)")
+HEADER_TIME_RE = re.compile(r"Time: [0-9][0-9T:.+\-Z]{0,40}")
+# What buzz-acp can write on each header line, whatever a channel name or a label holds — wide enough to
+# match every header it produces (queue.rs ``format_event_block``: the Channel field ends ``(#<uuid>)``, a
+# label is stripped of control characters by ``sanitize_prompt_label``, Time is RFC 3339 or bare seconds),
+# so a second reading of the header lines is never missed. They only rule a reading out; nothing is read
+# from them.
+ANY_CHANNEL_END_RE = re.compile(r".* \(#" + _UUID + r"\)")
+ANY_KIND_RE = re.compile(r"Kind: \d+")
+ANY_FROM_RE = re.compile(r"From: .*hex: [0-9a-f]{64}\)")
+ANY_TIME_RE = re.compile(r"Time: \S+")
 
 
-def envelope(text):
-    """(author_id, channel_id, event_id, body) of the one ``[Buzz event: …]`` section buzz-acp appends
-    after its context blocks, or None. The thread context above it quotes other members' ``hex:``
-    ids and their text, so signer, channel and id are read only from that section's own header lines
-    (each exactly once, before ``Content:``) and the body only after ``Content:``. A second section
-    header (a body imitating one) or any missing field makes the event ambiguous: None, never a guess
-    and never the env fallback."""
-    lines = text.splitlines()
-    starts = [i for i, line in enumerate(lines) if line.startswith(EVENT_HEADER)]
-    if len(starts) != 1:
+def prompt_blocks(prompt):
+    """The text of each element of ACP ``params.prompt``, in order; None for one that is not a text
+    block. buzz-acp sends each prompt section as its own element (queue.rs ``format_prompt``, acp.rs
+    ``build_prompt_params``), so a message body always lies inside one element and can never open
+    another: the element boundary is the one delimiter no body can write."""
+    if not isinstance(prompt, list):
+        return []
+    return [block["text"] if isinstance(block, dict) and block.get("type") == "text"
+            and isinstance(block.get("text"), str) else None for block in prompt]
+
+
+def _header_readings(lines):
+    """Every offset j at which ``lines[2 + j:7 + j]`` could be buzz-acp's own header — the last line of
+    the Channel field, then Kind, From, Time and Content — under the widest forms the producer writes.
+
+    The channel name is the one header field buzz-acp writes unsanitized (pool.rs takes it from the
+    channel's ``name`` tag), so it can hold newlines, and with them whole header lines of its own: the
+    Kind, From and Time lines the producer writes then come after them, inside what would read as the
+    message. The producer's own header is always among these readings, at j = its name's newline count,
+    so when 0 is the only one the fixed positions are the producer's; any other reading means the
+    boundary it drew cannot be told from the element, and nothing is attributed."""
+    return [j for j in range(len(lines) - 6)
+            if lines[6 + j].startswith("Content:") and ANY_KIND_RE.fullmatch(lines[3 + j])
+            and ANY_TIME_RE.fullmatch(lines[5 + j]) and ANY_FROM_RE.fullmatch(lines[4 + j])
+            and ANY_CHANNEL_END_RE.fullmatch(lines[2 + j])]
+
+
+def envelope(prompt):
+    """(author_id, channel_id, event_id, body) of a single-event prompt, or None.
+
+    In buzz-acp's single-event shape the LAST element of ``params.prompt`` is the event section:
+    ``[Buzz event: <tag>]`` and then ``format_event_block``'s header lines at fixed positions —
+    Event ID, Channel, Kind, From, Time, Content (queue.rs 1081-1147, 1533-1537). Only that element
+    is read, only at those positions, and only when it starts with ``[Buzz event: ``. A merged
+    (cancel + re-prompt) or batched prompt ends in another element, so it is never taken for a single
+    event whatever its bodies quote: no body is searched for a header to promote, and no identity
+    stands in for a missing one. A body line opening another event section makes the element
+    ambiguous: None. So does a second reading of the header lines (``_header_readings``): a channel
+    name carrying a line break and header lines of its own is never taken for the producer's header,
+    and neither the channel name, a display name nor a body is ever matched against anything to
+    vouch for one."""
+    blocks = prompt_blocks(prompt)
+    if not blocks or blocks[-1] is None or not blocks[-1].startswith(EVENT_HEADER + " "):
         return None
-    section = lines[starts[0] + 1:]
-    content = next((i for i, line in enumerate(section) if line.startswith("Content:")), None)
-    if content is None:
+    # Exactly one event element, right after buzz-acp's own [Context] or its quoted conversation history
+    # (queue.rs ``format_prompt``): a second event element, or any element between those and the event,
+    # is no single-event prompt buzz-acp writes.
+    if sum(isinstance(block, str) and block.startswith(EVENT_HEADER) for block in blocks) != 1:
         return None
-    head = section[:content]
+    if len(blocks) < 2 or not (isinstance(blocks[-2], str)
+                               and (blocks[-2].startswith("[Context]\n") or blocks[-2].startswith(CONVERSATION_HEADERS))):
+        return None
+    lines = blocks[-1].split("\n")
+    if len(lines) < 7 or not EVENT_TITLE_RE.fullmatch(lines[0]):
+        return None
+    if sum(line.startswith(EVENT_HEADER) for line in lines) != 1:
+        return None
+    event = HEADER_EVENT_RE.fullmatch(lines[1])
+    channel = HEADER_CHANNEL_RE.fullmatch(lines[2])
+    author = HEADER_FROM_RE.fullmatch(lines[4])
+    # buzz-acp never puts a second ``hex:`` on the From line (CANONICAL-01): a display name quoting
+    # one makes the line ambiguous on its own, whichever occurrence the pattern would capture.
+    if not (event and channel and author and lines[4].count("hex:") == 1
+            and HEADER_KIND_RE.fullmatch(lines[3]) and HEADER_TIME_RE.fullmatch(lines[5])
+            and lines[6].startswith("Content:")):
+        return None
+    if _header_readings(lines) != [0]:
+        return None
+    body = "\n".join([lines[6][len("Content:"):]] + lines[7:]).strip()
+    return author.group(1), channel.group(1), event.group(1), body
 
-    def field(prefix, pattern, *, token=None):
-        # The whole line must have buzz-acp's exact shape, carrying one value: a line with a second
-        # id, an extra parenthesis or any other variation is ambiguous and refuses the event. For
-        # ``From:``, buzz-acp never puts a second ``hex:`` anywhere on the line (CANONICAL-01): a
-        # display name quoting one, however it is placed, makes the line ambiguous on its own,
-        # independent of which occurrence the pattern's own group would have captured.
-        matches = [line for line in head if line.startswith(prefix)]
-        if len(matches) != 1:
+
+CONTEXT_THREAD_ROOT_RE = re.compile(r"Thread root: ([0-9a-f]{64})")
+CONTEXT_CHANNEL_HINT = "Hint: Use `buzz messages get --channel <UUID>` for recent messages if needed."
+CONTEXT_NEW_THREAD_RE = re.compile(
+    r"IMPORTANT: This is a new top-level message\. For ordinary replies in this turn, use `--reply-to "
+    r"([0-9a-f]{64})` on `buzz messages send` — the triggering message is the thread root\. Do NOT reply "
+    r"into any other \(older\) thread\. If the human explicitly asks for a channel-root, top-level, or "
+    r"broadcast post, send that message without `--reply-to`\.")
+CONTEXT_PARENT_RE = re.compile(r"Parent: ([0-9a-f]{64})")
+CONTEXT_THREAD_HINTS = (
+    "Thread context included below. Use `buzz messages thread --channel <UUID> --event <ID>` for full history "
+    "if truncated.",
+    "Use `buzz messages thread --channel <UUID> --event <ID>` to fetch thread context.")
+CONTEXT_THREAD_ANCHOR_RE = re.compile(
+    r"IMPORTANT: For ordinary replies in this turn, use `--reply-to ([0-9a-f]{64})` on `buzz messages send` so "
+    r"the conversation stays threaded\. If the human explicitly asks for a channel-root, top-level, or broadcast "
+    r"post, send that message without `--reply-to`\. If the requested destination is ambiguous, ask before "
+    r"sending\.")
+# The closing element of a merged prompt and the header of the element before it, which holds the events that
+# arrived meanwhile (queue.rs ``MergeFraming``, 1596-1612); a batch's header (1539-1549).
+CLOSING_NOTES = (
+    "Note: A new message arrived while you were working. Continue your in-progress work and incorporate the new "
+    "message if it's relevant; if it's unrelated, you may briefly acknowledge it and carry on.",
+    "Note: The previous request was interrupted. Please address the new request.\nIf the new request is unrelated "
+    "to the previous one, you may briefly acknowledge the interruption.")
+NEW_EVENT_SINGLE = ("[New message — arrived while you were working]", "[New request — supersedes previous]")
+NEW_EVENT_HEADERS = NEW_EVENT_SINGLE + ("[New messages — arrived while you were working",
+                                        "[New request — supersedes previous")
+EVENT_COUNT_RE = re.compile(r"(?:\[Buzz events|\[New messages — arrived while you were working"
+                            r"|\[New request — supersedes previous) — (\d{1,6}) events\]")
+
+
+def _context_form(lines):
+    """(scope, root, parent, anchor) when ``lines[3:]`` of a ``[Context]`` element are exactly buzz-acp's
+    thread or channel form (queue.rs 1285-1318), else None. Every line is held to its form and the count
+    is exact."""
+    if lines[1] == "Scope: thread":
+        root, rest = CONTEXT_THREAD_ROOT_RE.fullmatch(lines[3]), lines[4:]
+        parent = CONTEXT_PARENT_RE.fullmatch(rest[0]) if rest else None
+        rest = rest[1:] if parent else rest
+        if root is None or not rest or rest[0] not in CONTEXT_THREAD_HINTS or len(rest) > 2:
             return None
-        line = matches[0].rstrip()
-        if token is not None and line.count(token) != 1:
+        anchor = CONTEXT_THREAD_ANCHOR_RE.fullmatch(rest[1]) if len(rest) == 2 else None
+        if len(rest) == 2 and anchor is None:
             return None
-        found = pattern.fullmatch(line)
-        return found.group(1) if found else None
+        return ("thread", root.group(1), parent.group(1) if parent else None,
+                anchor.group(1) if anchor else None)
+    if lines[1] == "Scope: channel" and lines[3] == CONTEXT_CHANNEL_HINT and len(lines) in (4, 5):
+        anchor = CONTEXT_NEW_THREAD_RE.fullmatch(lines[4]) if len(lines) == 5 else None
+        if len(lines) == 5 and anchor is None:
+            return None
+        return "channel", None, None, anchor.group(1) if anchor else None
+    return None
 
-    event_id = field("Event ID:", HEADER_EVENT_RE)
-    channel = field("Channel:", HEADER_CHANNEL_RE)
-    author = field("From:", HEADER_FROM_RE, token="hex:")
-    if not (event_id and channel and author):
+
+def _last_event_element(blocks):
+    """The element holding the event buzz-acp built ``[Context]`` from — its batch's last — told by the
+    prompt's layout alone: the last element, or the one before a merged prompt's own closing note."""
+    if len(blocks) >= 2 and blocks[-1] in CLOSING_NOTES:
+        element, heads = blocks[-2], NEW_EVENT_HEADERS
+    else:
+        element, heads = blocks[-1] if blocks else None, (EVENT_HEADER + " ", "[Buzz events — ")
+    return element.split("\n") if isinstance(element, str) and element.startswith(heads) else None
+
+
+def _tags_at_end(lines):
+    """The tags of the element's last event, from the ``Tags:`` line buzz-acp writes after its message and
+    before its optional one-line ``Parsed:`` (queue.rs 1116-1144): the end of an element is the producer's,
+    since no message can close one. None when that line is not there in that form."""
+    tail = lines[-2] if len(lines) >= 2 and lines[-1].startswith("Parsed: ") else lines[-1]
+    if not tail.startswith("Tags: "):
         return None
-    body = "\n".join([section[content][len("Content:"):]] + section[content + 1:]).strip()
-    return author, channel, event_id, body
+    try:
+        tags = json.loads(tail[len("Tags: "):])
+    except Exception:
+        return None
+    if not (isinstance(tags, list) and all(isinstance(tag, list) and all(isinstance(v, str) for v in tag)
+                                           for tag in tags)):
+        return None
+    return tags
+
+
+def _thread_of(tags):
+    """(root, parent) as buzz-acp's ``parse_thread_tags`` reads NIP-10 markers (queue.rs 854-892)."""
+    root = reply = None
+    for tag in tags:
+        if len(tag) >= 4 and tag[0] == "e":
+            if tag[3] == "root":
+                root = tag[1]
+            elif tag[3] == "reply":
+                reply = tag[1]
+    if root is not None:
+        return root, root if reply is None else reply
+    return reply, reply
+
+
+def _last_event_id(lines, channel_line):
+    """The id of the element's last event, or None, from the same confirmed sections the refusal key reads
+    (``_confirmed_sections``): no second reading of where buzz-acp wrote an id. *channel_line* is the exact
+    [Context]'s own. An element whose sections cannot all be confirmed gives None, so an id a body may have
+    quoted never binds a destination; neither does one whose Channel line is not the [Context]'s."""
+    sections = _confirmed_sections(lines, channel_line)
+    if not sections:
+        return None
+    at, event_id = sections[-1]
+    return event_id if at + 1 < len(lines) and lines[at + 1] == channel_line else None
+
+
+def _disagreement(blocks, channel_line, channel, scope, root, parent, anchor):
+    """Why the ``[Context]`` destination does not agree with the event buzz-acp built it from, or None.
+
+    buzz-acp derives [Context] from the batch's last event (queue.rs ``format_prompt``): its channel, its
+    NIP-10 root and parent, and — for a top-level message — its own id as the anchor. That event's tags are
+    committed by its id and written, JSON-escaped, at the end of its element, where no message can write.
+    The channel must be the event's only ``h`` tag, the thread its root (and parent), and an anchor its
+    root or its own id. A Context that is not this event's — whatever its form — names no destination."""
+    lines = _last_event_element(blocks)
+    tags = _tags_at_end(lines) if lines else None
+    if tags is None:
+        return "no event section of buzz-acp's ends the prompt to bind the [Context] destination to"
+    if {tag[1] for tag in tags if len(tag) >= 2 and tag[0] == "h"} != {channel}:
+        return "the [Context] channel is not the last event's own channel"
+    event_root, event_parent = _thread_of(tags)
+    if scope == "thread":
+        if (event_root != root or event_parent != (parent or root) or parent == root
+                or anchor not in (None, root)):
+            return "the [Context] thread is not the last event's own thread"
+    elif event_root is not None:
+        return "a channel-scope [Context] for an event in a thread"
+    elif anchor is not None and anchor != _last_event_id(lines, channel_line):
+        return "the [Context] anchor is not the last event's own id"
+    return None
+
+
+def _exact_context(blocks):
+    """(lines, channel id, form, None) of ``params.prompt[0]`` when it is buzz-acp's own ``[Context]`` element
+    (``format_context_hints``, queue.rs 1238-1319) in its exact thread or channel form (``_context_form``), else
+    (None, None, None, why not). The form leaves no room for a line break in the channel name: buzz-acp writes
+    it unsanitized, and a name carrying one always leaves the producer's ``(#<uuid>)`` at the end of a later
+    line that no form allows."""
+    first = blocks[0] if blocks else None
+    lines = first.split("\n") if isinstance(first, str) else []
+    channel = HEADER_CHANNEL_RE.fullmatch(lines[2]) if len(lines) >= 4 and lines[0] == "[Context]" else None
+    if channel is None:
+        return None, None, None, "params.prompt[0] is not buzz-acp's [Context] block"
+    form = _context_form(lines)
+    if form is None:
+        return None, None, None, "the [Context] block names no thread or channel in buzz-acp's form"
+    return lines, channel.group(1), form, None
+
+
+def notice_destination(blocks):
+    """(channel, reply_to, None) for an unattributed refusal's notice, or (None, None, why not).
+
+    Read only from ``params.prompt[0]``, where buzz-acp puts its own ``[Context]`` section
+    (``format_context_hints``, queue.rs 1238-1319), and only when the WHOLE element is in its exact
+    thread or channel form: the thread's root, or for a top-level message the anchor buzz-acp names
+    (without one, the channel itself). buzz-acp writes the channel name there unsanitized too, so a name
+    carrying line breaks — and with them a ``Channel:`` or ``Thread root:`` line of its own — always
+    leaves the producer's ``(#<uuid>)`` at the end of a later line that no form allows.
+
+    Form alone does not make it this prompt's destination: the channel and thread must also agree with
+    the event buzz-acp built the element from (``_disagreement``), and the caller then requires the
+    channel to be registered with a counterpart. When any of it fails there is no destination, and the
+    refusal is journaled as undeliverable — never sent anywhere else. It says where the conversation is,
+    never who wrote what: no evidence of an author or an approval. A first element of any other shape (a
+    slash command, a legacy ``[Base]``, a DM, a whole prompt sent as one element) names no destination."""
+    lines, channel, form, why = _exact_context(blocks)
+    if why is not None:
+        return None, None, why
+    scope, root, parent, anchor = form
+    why = _disagreement(blocks, lines[2], channel, scope, root, parent, anchor)
+    if why is not None:
+        return None, None, why
+    return channel, root if scope == "thread" else anchor, None
+
+
+CONVERSATION_HEADERS = ("[Thread Context (", "[Conversation Context (")
+MERGE_HEADERS = ("[What you were working on]", "[Previous request — interrupted before completion]")
+
+
+# The elements buzz-acp opens with an event section header and then ``--- Event 1 (<tag>) ---`` (queue.rs
+# 1503-1569, ``MergeFraming``): a batch, the interrupted request's events, and what arrived meanwhile.
+EVENT_LIST_HEADERS = ("[Buzz events — ",) + MERGE_HEADERS + (
+    "[New message — arrived while you were working]", "[New messages — arrived while you were working",
+    "[New request — supersedes previous")
+FIRST_EVENT_RE = re.compile(r"--- Event 1 \([^\n]*\) ---")
+# Any line that could open section k of an event list; its other lines are held to their form below.
+SECTION_RE = re.compile(r"--- Event (\d{1,6}) \(.*\) ---")
+# The channel line of a [Context] element: the display name, then the channel id buzz-acp appends.
+CONTEXT_CHANNEL_NAME_RE = re.compile(r"Channel: .* (\(#" + _UUID + r"\))")
+
+
+def _section_candidates(lines, channel_line):
+    """(k, line of its Event ID) for every line of an event list that could open buzz-acp's section k:
+    ``--- Event k (<tag>) ---`` after an empty line, then Event ID, *channel_line*, Kind, From, Time and
+    ``Content:`` at their offsets (queue.rs 1511-1517 and 1550-1557 over ``format_event_block``)."""
+    return [(int(head.group(1)), i + 1) for i in range(1, len(lines) - 6)
+            if lines[i - 1] == "" and lines[i].startswith("--- Event ")
+            for head in [SECTION_RE.fullmatch(lines[i])]
+            if head and HEADER_EVENT_RE.fullmatch(lines[i + 1]) and lines[i + 2] == channel_line
+            and ANY_KIND_RE.fullmatch(lines[i + 3]) and ANY_FROM_RE.fullmatch(lines[i + 4])
+            and ANY_TIME_RE.fullmatch(lines[i + 5]) and lines[i + 6].startswith("Content:")]
+
+
+def _confirmed_sections(lines, channel_line):
+    """The sections of one element whose event ids buzz-acp wrote, as ``[(line of the Event ID, id), …]`` in
+    order; ``[]`` when the element opens as an event section but an id in it is not at a position that can be
+    confirmed; None when it names no event. The one reading of where an id is, for the refusal key and for
+    the destination (``_last_event_id``) alike.
+
+    A single-event element proves its own position: ``[Buzz event: <tag>]``, or a merged prompt's ``[New
+    message — …]`` / ``[New request — …]`` header, a blank line and ``--- Event 1 (<tag>) ---``, are written by
+    buzz-acp before any message, so the Event ID line under them (line 1, line 3) is the producer's.
+
+    An event list does not: a message body can quote a whole section, and a candidate that has the shape is
+    not, on its own, a section of buzz-acp's. Its ids count only under these producer facts (queue.rs
+    1081-1147, 1503-1569):
+
+    (a) *channel_line* is the Channel line of ``params.prompt[0]``, given only once ``_exact_context`` has
+        found that [Context] in buzz-acp's exact form. That form proves the channel name holds no line break,
+        and buzz-acp writes the same name in every section; a label holds none either
+        (``sanitize_prompt_label``). So every section buzz-acp wrote is a candidate
+        (``_section_candidates``) with that line under its Event ID, and a body can only add candidates.
+    (b) A declared count N (``[Buzz events — N events]``, ``[New messages — … — N events]``, ``[New request —
+        … — N events]``): buzz-acp writes exactly one section for each k in 1..N, so exactly one candidate for
+        each k is that section. A second candidate for any k <= N leaves it unknown which one is real: the
+        element is ambiguous. A candidate for k > N is no section of buzz-acp's and is not read.
+    (c) A cancelled section (``[What you were working on]`` / ``[Previous request — …]``) declares no count, so
+        no k >= 2 can ever be confirmed: its only candidate must be k = 1, and any other makes it ambiguous.
+    (d) Without a [Context] in exact form (*channel_line* empty) no list section is confirmed.
+
+    The count and its numbering are necessary; the [Context] form is what makes them sufficient. No body is
+    searched for an id, and none is promoted to a section."""
+    first = lines[0]
+    if EVENT_TITLE_RE.fullmatch(first):
+        at = 1
+    elif first in NEW_EVENT_SINGLE:
+        at = 3 if len(lines) > 3 and lines[1] == "" and FIRST_EVENT_RE.fullmatch(lines[2]) else None
+    elif first.startswith((EVENT_HEADER,) + EVENT_LIST_HEADERS):
+        count = EVENT_COUNT_RE.fullmatch(first)
+        if not channel_line or not (count or first in MERGE_HEADERS):
+            return []
+        by_k = {}
+        for k, where in _section_candidates(lines, channel_line):
+            by_k.setdefault(k, []).append(where)
+        if count:
+            wanted = range(1, int(count.group(1)) + 1)
+            if any(len(by_k.get(k, ())) != 1 for k in wanted):
+                return []
+            ats = [by_k[k][0] for k in wanted]
+        elif list(by_k) == [1] and len(by_k[1]) == 1:
+            ats = by_k[1]
+        else:
+            return []
+        if not ats or ats != sorted(ats):
+            return []
+        return [(at, HEADER_EVENT_RE.fullmatch(lines[at]).group(1)) for at in ats]
+    else:
+        return None
+    found = HEADER_EVENT_RE.fullmatch(lines[at]) if at is not None and at < len(lines) else None
+    return [(at, found.group(1))] if found else []
+
+
+def _event_ids(text, channel_line=None):
+    """The event ids that identify one element, in order (``_confirmed_sections``); ``[]`` when the element
+    names events not all at a confirmed position; None when it names none.
+
+    ``refusal_key`` passes *channel_line*: the Channel line of an exact-form [Context], or ``""`` when there is
+    none, and then no list section is confirmed. Called on an element alone (None), its own first Channel line
+    (line 4, under ``--- Event 1``) is taken instead: that reads the element's sections against themselves and
+    proves nothing about the channel name, so no refusal is keyed and no destination bound that way.
+
+    Nothing else of the element is read: not its header or tag, the channel name, a Kind, From, Time, Tags or
+    Parsed line, or any label on them. An id is the event's own hash, committing its content and tags; the
+    rest of the element is presentation buzz-acp renders again on every dispatch (display names: pool.rs
+    ``fetch_prompt_profile_lookup``), so a refreshed label or a renamed channel changes no confirmed id."""
+    lines = text.split("\n")
+    if channel_line is None:
+        channel_line = lines[4] if len(lines) > 4 else ""
+    sections = _confirmed_sections(lines, channel_line)
+    return None if sections is None else [event_id for _, event_id in sections]
+
+
+def _without_channel_name(text):
+    """A ``[Context]`` element with the channel's display name taken off its Channel line and the
+    ``(#<uuid>)`` kept: buzz-acp writes the name it holds for the channel on each dispatch."""
+    lines = text.split("\n")
+    found = CONTEXT_CHANNEL_NAME_RE.fullmatch(lines[2]) if len(lines) > 2 and lines[0] == "[Context]" else None
+    if found:
+        lines[2] = "Channel: " + found.group(1)
+    return "\n".join(lines)
+
+
+def refusal_key(prompt):
+    """The correlation key of an unattributed refusal, and None or why it is this refusal's own.
+
+    A digest of ``params.prompt``, element by element as it was sent, less what buzz-acp renders afresh on
+    every dispatch. An element that names its events contributes only the ids at confirmed producer positions
+    (``_event_ids`` over ``_confirmed_sections``, against the exact [Context]'s Channel line) and its fields
+    other than the text. The quoted conversation history, fetched again each time, is left out.
+    ``params.prompt[0]``, buzz-acp's [Context], is kept but for the channel's display name; every other
+    element — a closing note, any other text, a non-text element with its type, data and every field —
+    is kept whole. So the same events dispatched again (a requeue, a respawned shim, a refreshed profile or
+    a renamed channel) give the same key and so one notice; any other difference, an image's bytes
+    included, gives another key.
+
+    Only confirmed ids give the digest an identity. A prompt with none, or with any element that names events
+    not all at a confirmed position (a body quoting a whole section, a list under no exact-form [Context]),
+    is unidentified: it gets a key of its own, as does one that cannot be serialized at all. That never drops
+    a distinct input; it does not deduplicate a redelivery, so the same input sent again can be noticed again."""
+    elements = prompt if isinstance(prompt, list) else [prompt]
+    kept, identified = [], False
+    try:
+        context = _exact_context(prompt_blocks(prompt))[0]
+        channel_line = context[2] if context else ""
+        for index, element in enumerate(elements):
+            if isinstance(element, dict) and element.get("type") == "text" and isinstance(element.get("text"), str):
+                text = element["text"]
+                if text.startswith(CONVERSATION_HEADERS):
+                    continue
+                ids = _event_ids(text, channel_line)
+                if ids == []:
+                    return ("unattributed-" + hashlib.sha256(os.urandom(32)).hexdigest(),
+                            "an element names events not all at a producer position that can be confirmed")
+                if ids is not None:
+                    identified = True
+                    kept.append(["events", ids, {key: value for key, value in element.items() if key != "text"}])
+                    continue
+                if index == 0:
+                    element = dict(element, text=_without_channel_name(text))
+            kept.append(["element", element])
+        digest = hashlib.sha256(json.dumps(kept, sort_keys=True).encode("ascii")).hexdigest()
+    except Exception as exc:  # an element nested past the recursion limit, or not JSON at all
+        return "unattributed-" + hashlib.sha256(os.urandom(32)).hexdigest(), (
+            f"its elements cannot be serialized ({type(exc).__name__})")
+    if not identified:
+        return ("unattributed-" + hashlib.sha256(os.urandom(32)).hexdigest(),
+                "no element names an event id where buzz-acp writes one")
+    return "unattributed-" + digest, None
+
+
+def prompt_shape(blocks):
+    """The buzz-acp shape of an unattributed prompt, by its elements' leading headers. For the journal
+    and the log only: it decides nothing."""
+    last = blocks[-1] if blocks and isinstance(blocks[-1], str) else ""
+    if any(isinstance(block, str) and block.startswith(MERGE_HEADERS) for block in blocks):
+        return "merged"
+    if last.startswith("[Buzz events — "):
+        return "batch"
+    return "single_unreadable" if last.startswith(EVENT_HEADER + " ") else "unrecognized"
 
 
 # 2026-10-10 04:28–04:29 KST: two replies in a long thread (17,550 and 17,079 chars) were refused with
@@ -240,7 +669,7 @@ def fit_text(text, channel, event_id):
     entries are dropped oldest first and replaced by one marker naming what was dropped and how to
     read it back; when the entry boundaries are ambiguous, the whole history block goes as one unit.
     The ``[Context]`` block and the ``[Buzz event: …]`` section — envelope, the newest message in
-    full, its tags — are never touched, so ``envelope()`` reads the same event from the result. The
+    full, its tags — are never touched, so the result carries the event ``envelope()`` read. The
     fewest drops that land within TEXT_BUDGET win; failing that, the fewest within the gateway limit.
     None when even dropping all history leaves the text over the limit."""
     if len(text) <= GATEWAY_TEXT_LIMIT:
@@ -286,11 +715,12 @@ def fit_text(text, channel, event_id):
     return legal
 
 
-def submit(text, event_id, author=None, channel=None):
-    """Answer text, or raise. The caller turns a failure into a visible refusal sentence."""
+def submit(text, event_id, author, channel):
+    """Answer text, or raise. The caller turns a failure into a visible refusal sentence. Author and
+    channel are the event's own, from ``envelope()``; nothing stands in for either."""
     body = json.dumps({
         "binding": BINDING, "event_id": event_id,
-        "author_id": author or AUTHOR, "channel_id": channel or CHANNEL, "text": text}).encode()
+        "author_id": author, "channel_id": channel, "text": text}).encode()
     request = urllib.request.Request(
         BASE + ROUTE, data=body, method="POST",
         headers={"Authorization": "Bearer " + KEY, "Content-Type": "application/json"})
@@ -298,12 +728,27 @@ def submit(text, event_id, author=None, channel=None):
         return json.loads(response.read().decode()).get("text", "")
 
 
-def _peer_handle(channel):
+def _registry_peer(channel):
+    """(the channel's registered counterpart handle, None) or (None, why not). Never raises: the reason
+    is a fixed category and the exception type, nothing else, as for ``_own_signers``."""
     try:
-        with open(MENTIONS) as handle:
-            return json.load(handle)["channels"][channel]["peer"]["handle"]
-    except (OSError, ValueError, KeyError, TypeError):
-        return None  # the wrapper refuses an unregistered channel, and adds the handle itself
+        with open(MENTIONS, encoding="utf-8") as handle:
+            channels = json.load(handle)["channels"]
+    except OSError as exc:
+        return None, f"reply registry unreadable: {type(exc).__name__}"
+    except Exception as exc:  # malformed in any way, nesting past the recursion limit included
+        return None, f"reply registry malformed: {type(exc).__name__}"
+    try:
+        peer = channels[channel]["peer"]["handle"]
+    except Exception:
+        peer = None
+    if peer is None:
+        return None, "the [Context] channel has no registered counterpart to post to"
+    return peer, None
+
+
+def _peer_handle(channel):
+    return _registry_peer(channel)[0]  # the wrapper refuses an unregistered channel, and adds the handle itself
 
 
 def _own_signers():
@@ -400,30 +845,70 @@ def refusal_notice(status, code, error, event_id, chars):
         return (f"CEO 턴은 실행됐지만 답변을 기록하지 못해 이 스레드에 전달되지 않았습니다. 이 턴은 다시 "
                 f"실행되지 않고 자동 재전송도 없습니다. 상태: {code} (delivery={delivery}, "
                 f"answer_kept={kept}). (event {event_id})")
+    if status == 409 and code in TERMINAL_NOTICES:
+        # Answered past the claim: the turn ran, or may have, and nothing of it is delivered or run again.
+        # The side-effect scope is the gateway's own record, never assumed; without one it is unknown.
+        scope = error.get("side_effects")
+        scope = scope if scope in ("none", "attempted", "unknown") else "unknown"
+        return (f"{TERMINAL_NOTICES[code]}. 답변은 이 스레드에 전달되지 않았고, 이 턴은 다시 실행되지 않으며 "
+                f"자동 재전송도 없습니다. 상태: {code} (HTTP 409, gateway 기록 side_effects={scope}). "
+                f"(event {event_id})")
+    if code is None and status >= 500:
+        return unknown_outcome_notice(f"HTTP {status}", event_id)
     return None
 
 
-def publish_reply(event_id, channel, answer, kind="answer"):
+# Codes the gateway answers only once the event was claimed (api_server_canonical.py): a refusal raised
+# before the claim means the turn never ran and no answer exists, and stays as it is.
+TERMINAL_NOTICES = {
+    "canonical_event_failed": "CEO 턴이 실패로 끝났고 gateway 에 실패로 기록됐습니다",
+    "canonical_event_uncertain": "이 메시지로 시작된 CEO 턴이 실행됐는지, 어떻게 끝났는지 gateway 가 확정하지 못했습니다",
+    "canonical_event_conflict": "이 이벤트의 gateway 기록이 이 요청과 맞지 않아 그 결과를 전달할 수 없습니다",
+}
+
+
+def unknown_outcome_notice(cause, event_id):
+    """The sender's notice when the gateway gave no usable answer to a submission: whether the turn ran
+    is unknown here, so neither success nor its absence is stated. ``cause`` is an exception type or an
+    HTTP status, never a message."""
+    return (f"CEO 에게 제출한 이 메시지에 대해 canonical surface 의 응답을 받지 못했습니다({cause}). 턴이 "
+            f"실행됐는지 이 브리지는 알 수 없고, 그 결과는 이 스레드에 전달되지 않습니다. 자동 재전송은 "
+            f"없습니다. (event {event_id})")
+
+
+def _claim(name):
+    """(fd, None) for a fresh O_EXCL claim of the journal entry ``PUBLISHED/<name>``, else (None, why)."""
+    try:
+        os.makedirs(PUBLISHED, exist_ok=True)
+        return os.open(os.path.join(PUBLISHED, name), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600), None
+    except FileExistsError:
+        return None, "exists"
+    except OSError as exc:
+        return None, f"marker unavailable: {type(exc).__name__}: {exc}"
+
+
+def publish_reply(event_id, channel, answer, kind="answer", *, ref=None, reply_to=None):
     """Post *answer* once as the thread reply to *event_id*. True only when the wrapper sent it.
 
     The delivery journal is ``PUBLISHED/<event id>``: claimed before the send (one post per event,
     ever) and then filled with what happened — ``state`` is ``sent``, ``wrapper_refused``,
-    ``send_failed``, ``timeout`` or ``error``, with the ``reason``. A failure stays recorded as one
-    and is never retried."""
-    try:
-        os.makedirs(PUBLISHED, exist_ok=True)
-        fd = os.open(os.path.join(PUBLISHED, event_id), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    except FileExistsError:
-        log(f"prompt {event_id[:12]}… reply already published once; not posting again")
-        return False
-    except OSError as exc:
-        log(f"prompt {event_id[:12]}… reply not posted: marker unavailable: {type(exc).__name__}: {exc}")
+    ``send_failed``, ``timeout`` or ``error``, with the ``reason``, and ``delivery`` is ``posted``
+    or ``failed``. A failure stays recorded as one and is never retried. An unattributed refusal has
+    no event id: its notice passes ``event_id=None``, is journaled under its correlation key *ref*
+    and replies to *reply_to*, the thread buzz-acp's ``[Context]`` names (None: the channel)."""
+    name, target = (event_id, event_id) if event_id is not None else (ref, reply_to)
+    tag = name[:12] if event_id is not None else name
+    fd, why = _claim(name)
+    if fd is None:
+        log(f"prompt {tag}… reply already published once; not posting again" if why == "exists"
+            else f"prompt {tag}… reply not posted: {why}")
         return False
     handle = _peer_handle(channel)
     body = f"@{handle} {answer}" if handle and not answer.lstrip().startswith(f"@{handle}") else answer
     try:
         done = subprocess.run(
-            [BUZZ_CLI, "messages", "send", "--channel", channel, "--reply-to", event_id, "--content", "-"],
+            [BUZZ_CLI, "messages", "send", "--channel", channel]
+            + (["--reply-to", target] if target else []) + ["--content", "-"],
             input=body.encode("utf-8"), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             timeout=PUBLISH_TIMEOUT)
     except subprocess.TimeoutExpired:
@@ -439,12 +924,137 @@ def publish_reply(event_id, channel, answer, kind="answer"):
             reason = f"exit {done.returncode}: stderr unclassifiable ({type(exc).__name__})"
     sent = state == "sent"
     with os.fdopen(fd, "w") as marker:
-        marker.write(json.dumps({"sent": sent, "state": state, "kind": kind, "event_id": event_id,
-                                 "channel": channel, "reason": str(reason)[:400],
+        marker.write(json.dumps({"sent": sent, "state": state, "delivery": "posted" if sent else "failed",
+                                 "kind": kind, "event_id": event_id, "ref": ref, "channel": channel,
+                                 "reply_to": target, "reason": str(reason)[:400],
                                  "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}) + "\n")
-    log(f"prompt {event_id[:12]}… {kind} {'POSTED' if sent else 'NOT posted (no retry)'} to thread: "
+    log(f"prompt {tag}… {kind} {'POSTED' if sent else 'NOT posted (no retry)'} to thread: "
         f"{state}: {reason}")
     return sent
+
+
+# Fixed text: it names no sender, quotes no byte of any message and carries only the refusal's key.
+UNATTRIBUTED_NOTICE = (
+    "이 대화로 온 메시지가 CEO 에게 전달되지 않았습니다. 여러 메시지가 하나로 합쳐진 프롬프트(작업 중 도착한 "
+    "메시지 병합 또는 일괄 전달)이거나 단일 이벤트 머리글이 정해진 자리에 없어, 발신자와 이벤트를 하나로 "
+    "특정할 수 없었습니다. 누구에게도 귀속하지 않고 거부했으며, 턴은 실행되지 않았고 자동 재전송도 없습니다. "
+    "필요하면 메시지를 하나씩 다시 보내 주세요. (ref {ref})")
+
+
+def journal_undeliverable(ref, shape, reason):
+    """Record, once, an unattributed refusal whose notice has no destination: ``PUBLISHED/<ref>`` with
+    ``sent`` false, ``state`` ``notice_impossible`` and ``delivery`` ``failed``. It takes the same
+    one-entry claim a posted notice would, so the refusal is journaled once and never reads as sent."""
+    fd, why = _claim(ref)
+    if fd is None:
+        log(f"prompt {ref}… refusal already journaled once; not again" if why == "exists"
+            else f"prompt {ref}… refusal not journaled: {why}")
+        return
+    with os.fdopen(fd, "w") as record:
+        record.write(json.dumps({"sent": False, "state": "notice_impossible", "delivery": "failed",
+                                 "kind": "unattributed_notice", "event_id": None, "ref": ref, "shape": shape,
+                                 "channel": None, "reply_to": None, "reason": reason,
+                                 "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}) + "\n")
+    log(f"prompt {ref}… unattributed_notice NOT posted: {reason}; journaled as a delivery failure")
+
+
+# The From line buzz-acp writes ends with the author's hex, after the label (which holds no line break).
+SENDER_HEX_RE = re.compile(r"From: .*hex: ([0-9a-f]{64})\)")
+
+
+def _single_event_author(blocks):
+    """The author of a plain single-event prompt, read from its From line at buzz-acp's fixed line 4, or
+    None for every other prompt. For the refusal path only, once ``notice_destination`` has bound the whole
+    ``params.prompt[0]`` [Context] to the prompt's event: its channel name then holds no line break (any one
+    leaves that form), so every header line above the event's message is where buzz-acp put it.
+
+    Plain means the prompt is exactly buzz-acp's single-event shape (queue.rs ``format_prompt``): [Context],
+    an optional quoted conversation history, then ONE ``[Buzz event: <tag>]`` element, and nothing else. Its
+    Event ID, Channel (the [Context]'s own channel line) and Kind lines must be above the From line, and the
+    author is the hex that ends it. A merged prompt (any cancelled section), a new-event element or an event
+    list is never plain, whoever wrote its last event: another author's request can be in it. Nothing is
+    searched for and no body line is read. Attribution never uses this; it only decides that no notice
+    answers this bridge's own post."""
+    if not (len(blocks) in (2, 3) and all(isinstance(block, str) for block in blocks)
+            and (len(blocks) == 2 or blocks[1].startswith(CONVERSATION_HEADERS))):
+        return None
+    lines = blocks[-1].split("\n")
+    if not (len(lines) > 4 and EVENT_TITLE_RE.fullmatch(lines[0]) and HEADER_EVENT_RE.fullmatch(lines[1])
+            and lines[2] == blocks[0].split("\n")[2] and ANY_KIND_RE.fullmatch(lines[3])):
+        return None
+    sender = SENDER_HEX_RE.fullmatch(lines[4])
+    return sender.group(1) if sender else None
+
+
+def journal_own_echo(ref, shape, channel, reply_to):
+    """Record, once, a refused plain single-event prompt whose one event is this bridge's own post coming
+    back, so no notice answers it: ``PUBLISHED/own-echo-<ref's digest>`` with ``sent`` false, ``state``
+    ``own_echo`` and ``delivery`` ``suppressed`` — neither a posted notice nor a failed one. Only once the
+    destination is whole (channel and registered counterpart): a missing one is a delivery failure, never
+    an echo. Beside the refusal's own entry, not in it: *ref*'s entry stays the record of a notice posted
+    or not."""
+    fd, why = _claim("own-echo-" + ref[len("unattributed-"):])
+    if fd is None:
+        log(f"prompt {ref}… own-post echo already journaled once; not again" if why == "exists"
+            else f"prompt {ref}… own-post echo not journaled: {why}")
+        return
+    with os.fdopen(fd, "w") as record:
+        record.write(json.dumps({"sent": False, "state": "own_echo", "delivery": "suppressed",
+                                 "kind": "unattributed_notice", "event_id": None, "ref": ref, "shape": shape,
+                                 "channel": channel, "reply_to": reply_to,
+                                 "reason": "the prompt's one event is this bridge's own post",
+                                 "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}) + "\n")
+    log(f"prompt {ref}… unattributed_notice NOT posted: the prompt's one event is this bridge's own post "
+        f"(an echo); journaled as own_echo")
+
+
+def refuse_unattributed(session, prompt, chars):
+    """Refuse a prompt that is not one attributable event — a merged or batched dispatch, or an event
+    section out of its fixed form — attributing it to no one. The conversation is told once per
+    correlation key, in fixed text that names no sender and quotes no body, at the destination
+    buzz-acp's own ``[Context]`` element names; when there is none, the reply registry cannot be read
+    or parsed (nesting past the recursion limit included), or the post fails, the journal records a
+    delivery failure under the refusal's key with a fixed reason, never a sent notice.
+
+    The notice is signed with this bridge's own key and mentions only the channel's registered
+    counterpart. It is one notice to the conversation, not one to each author whose message the prompt
+    holds. buzz-acp drops its own events (``ignore_self``, on unless BUZZ_ACP_NO_IGNORE_SELF; lib.rs 2329)
+    and wakes this agent only for mentions of it; an own-signer event that still arrives as one event is
+    refused before any submission or post. One refused here is not answered either, but only in a plain
+    single-event prompt (``_single_event_author``) and only once the whole destination is established:
+    the [Context] bound to the event and a registered counterpart. Then the From line at the event's fixed
+    position naming this bridge's own signer journals the refusal as an echo and posts nothing, and a
+    registry that cannot say whose key that is posts nothing. A merged prompt, a new-event element or an
+    event list gets its notice whoever wrote its last event, since another author's request can be in it;
+    being bridge-signed, that notice starts no further refusal or reply."""
+    blocks = prompt_blocks(prompt)
+    (ref, own), shape = refusal_key(prompt), prompt_shape(blocks)
+    log(f"prompt refused locally: not one attributable [Buzz event] element ({shape}, {len(blocks)} "
+        f"elements, {chars} chars); ref {ref}" + (f" (a key of its own: {own})" if own else ""))
+    channel, reply_to, why = notice_destination(blocks)
+    if channel is not None:
+        # The destination is whole only with the channel's registered counterpart; a registry that cannot
+        # be read or parsed, or names none, is an undeliverable notice, journaled as one and never an echo.
+        handle, unknown = _registry_peer(channel)
+        if handle is None:
+            channel, why = None, unknown
+    if channel is not None:
+        # This bridge's own post coming back alone is never answered. A registry that cannot name the signer
+        # cannot rule an echo out, so nothing is posted, as ``handle`` holds such an event.
+        signers, unknown = _own_signers()
+        if signers is None:
+            channel, why = None, unknown
+        elif _single_event_author(blocks) in signers:
+            journal_own_echo(ref, shape, channel, reply_to)
+            return
+    if channel is None:
+        journal_undeliverable(ref, shape, why)
+        return
+    notice = UNATTRIBUTED_NOTICE.format(ref=ref[:29])
+    write({"jsonrpc": "2.0", "method": "session/update", "params": {
+        "sessionId": session,
+        "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": notice}}}})
+    publish_reply(None, channel, notice, kind="unattributed_notice", ref=ref, reply_to=reply_to)
 
 
 def journal_held(event_id, channel, reason):
@@ -486,6 +1096,367 @@ def hold(session, author, channel, base, text):
                    "content": {"type": "text", "text": held}}}})
 
 
+# One canonical turn at a time from this process, and a cancel never recalls one (D2 / O2). The stdin
+# loop reads on while a prompt's thread waits for the gateway, so buzz-acp's steer ``session/cancel`` is
+# answered inside its 5 s drain and this process is not SIGKILLed with a turn in flight. A prompt that
+# arrives while an earlier turn still runs waits for this slot: two turns never share the session, and
+# an event already in flight is never submitted again.
+_TURN_SLOT = threading.Lock()
+_INFLIGHT = set()  # event ids this process submitted and has not finished delivering
+_INFLIGHT_LOCK = threading.Lock()
+_THREADS = []  # prompt threads and the startup reaper, joined when stdin closes
+INFLIGHT_SUFFIX = ".inflight"
+INFLIGHT_RE = re.compile(r"[0-9a-f]{64}\.inflight")
+
+UNFINISHED_NOTICE = (
+    "이 메시지는 CEO 에게 제출됐지만, 이를 제출한 브리지 처리가 gateway 의 응답을 받기 전에 끝났습니다(프로세스 "
+    "교체 또는 중단). 턴이 실행됐는지, 어떻게 끝났는지 이 브리지는 알 수 없고, 그 결과는 이 스레드에 게시되지 "
+    "않습니다. 이 브리지는 이 메시지를 자동으로 다시 제출하지 않습니다. (event {event_id})")
+
+
+def _same_file(fd, path):
+    """Ownership, checked each time it is relied on: the entry now at *path* is the very file *fd* holds
+    locked (same st_dev and st_ino). An unlinked or replaced entry is never ownership."""
+    try:
+        held, named = os.fstat(fd), os.stat(path, follow_symlinks=False)
+    except OSError:
+        return False
+    return (held.st_dev, held.st_ino) == (named.st_dev, named.st_ino)
+
+
+def _claim_inflight(base, channel):
+    """(fd, None) holding ``PUBLISHED/<event id>.inflight`` under an exclusive ``flock`` while this process
+    owns the event's turn, or (None, why not). The kernel drops the lock when the process dies, which is
+    how a later shim tells a replaced owner from a live one.
+
+    The entry is published only once initialized and locked: the owner record is written and fsync'd to
+    a private file under the lock, which is then linked to the entry's name (``link`` never replaces a
+    name). So no reader ever finds it empty or unlocked while its owner lives. A name already taken — a
+    live owner, or an unfinished entry not yet reaped — is no claim, and neither is a name that does not
+    end up being this very file."""
+    path = os.path.join(PUBLISHED, base + INFLIGHT_SUFFIX)
+    private = os.path.join(PUBLISHED, f".{base}.{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}.claim")
+    try:
+        os.makedirs(PUBLISHED, exist_ok=True)
+        fd = os.open(private, os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    except OSError as exc:
+        return None, f"the in-flight entry cannot be written: {type(exc).__name__}"
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        record = (json.dumps({"event_id": base, "channel": channel, "pid": os.getpid(),
+                              "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}) + "\n").encode()
+        if os.write(fd, record) != len(record):
+            raise OSError("short write")
+        os.fsync(fd)
+        os.link(private, path)
+    except FileExistsError:
+        os.close(fd)
+        return None, "another shim process holds this event, or its unfinished entry is not yet reaped"
+    except OSError as exc:
+        os.close(fd)
+        return None, f"the in-flight entry was not published: {type(exc).__name__}"
+    finally:
+        try:
+            os.unlink(private)
+        except OSError:
+            pass
+    if not _same_file(fd, path):
+        os.close(fd)
+        return None, "the in-flight entry was replaced as it was published"
+    return fd, None
+
+
+def _unfinished(base):
+    """Why *base* must never be submitted again, or None. The record read is the event's existing
+    PUBLISHED journal entry, and only to refuse a resubmission — it never decides or completes delivery,
+    and the gateway receipt stays the turn's outcome. An ``unfinished_notice`` entry is the reaper's: a
+    shim submitted the event (or was about to) and ended without its outcome, so whether the turn ran is
+    unknown, and it stays unresolved rather than being sent again. An entry with no complete record (a
+    post cut short) is as unknown. An answer or notice entry is the turn's own outcome: a redelivery is
+    submitted as before, and the gateway answers it from the receipt without running it again."""
+    try:
+        with open(os.path.join(PUBLISHED, base), encoding="utf-8") as handle:
+            raw = handle.read(65_536)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        return f"its journal entry is unreadable ({type(exc).__name__})"
+    try:
+        kind = json.loads(raw.splitlines()[0]).get("kind")
+    except Exception:
+        kind = None
+    if kind in ("answer", "notice"):
+        return None
+    if kind == "unfinished_notice":
+        return "a shim submitted it and ended before its outcome; whether the turn ran is unknown"
+    return "its journal entry holds no complete record"
+
+
+def _wait_for_turn_slot(prompt, session):
+    """True once this process's turn slot is held. A wait writes ``canonical_wait`` (it resets
+    buzz-acp's idle timeout and is never published) and ends at a cancel or the busy deadline."""
+    deadline = time.monotonic() + BUSY_DEADLINE_SECS
+    attempt = 0
+    while not _TURN_SLOT.acquire(timeout=max(min(BUSY_RETRY_SECS, deadline - time.monotonic()), 0.2)):
+        if (prompt is not None and prompt.cancelled.is_set()) or time.monotonic() >= deadline:
+            return False
+        attempt += 1
+        write({"jsonrpc": "2.0", "method": "session/update", "params": {
+            "sessionId": session, "update": {"sessionUpdate": "canonical_wait", "attempt": attempt}}})
+    return True
+
+
+def begin_submission(session, base, channel):
+    """Take the turn slot and the event's in-flight entry before *base* is submitted. False when it must
+    not be submitted: already in flight here or in another live shim process, already submitted by a
+    shim that ended without its outcome (``_unfinished``), cancelled while it waited, the slot still taken
+    at the busy deadline, or the entry not provably this process's. Past this point a cancel never
+    recalls it. Refusing a resubmission is no execution or delivery guarantee: a turn whose shim ended
+    stays unknown, and is told once as such by the reaper."""
+    prompt = getattr(_local, "prompt", None)
+    with _INFLIGHT_LOCK:
+        if base in _INFLIGHT:
+            log(f"prompt {base[:12]}… already in flight in this process; not submitted again")
+            return False
+        _INFLIGHT.add(base)
+    taken, journal, ok = False, None, False
+    try:
+        taken = _wait_for_turn_slot(prompt, session)
+        if not taken:
+            log(f"prompt {base[:12]}… NOT submitted: " + (
+                "cancelled while an earlier turn held this process's turn slot"
+                if prompt is not None and prompt.cancelled.is_set()
+                else f"an earlier turn still held this process's turn slot after {BUSY_DEADLINE_SECS:.0f}s"))
+            return False
+        journal, why = _claim_inflight(base, channel)
+        if journal is None:
+            log(f"prompt {base[:12]}… NOT submitted: {why}")
+            return False
+        why = _unfinished(base)
+        if why is None and not _same_file(journal, os.path.join(PUBLISHED, base + INFLIGHT_SUFFIX)):
+            why = "this process no longer holds the event's in-flight entry"
+        if why is not None:
+            log(f"prompt {base[:12]}… NOT submitted again: {why}")
+            return False
+        if prompt is not None:
+            with prompt.lock:
+                if prompt.answered:
+                    log(f"prompt {base[:12]}… NOT submitted: cancelled before submission")
+                    return False
+                prompt.submitted = base
+        _local.submission = {"event": base, "fd": journal, "slot": True}
+        ok = True
+        return True
+    finally:
+        if not ok:
+            if journal is not None:
+                _drop_inflight(base, journal)
+            if taken:
+                _TURN_SLOT.release()
+            with _INFLIGHT_LOCK:
+                _INFLIGHT.discard(base)
+
+
+def _drop_inflight(base, fd):
+    path = os.path.join(PUBLISHED, base + INFLIGHT_SUFFIX)
+    try:
+        if _same_file(fd, path):
+            os.unlink(path)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def release_turn_slot():
+    """The canonical surface answered (or no answer will come): another prompt may submit."""
+    submission = getattr(_local, "submission", None)
+    if submission is not None and submission["slot"]:
+        submission["slot"] = False
+        _TURN_SLOT.release()
+
+
+def finish_submission():
+    """The event's outcome is posted or journaled: it is no longer in flight."""
+    submission = getattr(_local, "submission", None)
+    if submission is None:
+        return
+    release_turn_slot()
+    _local.submission = None
+    if submission["fd"] is not None:
+        _drop_inflight(submission["event"], submission["fd"])
+    with _INFLIGHT_LOCK:
+        _INFLIGHT.discard(submission["event"])
+
+
+def abandon_submission():
+    """A prompt thread ended before its event's outcome was posted (its handler raised): the slot and
+    the lock go, the entry stays linked, so ``reap_unfinished`` tells the thread. True when one stays."""
+    submission = getattr(_local, "submission", None)
+    if submission is None:
+        return False
+    release_turn_slot()
+    _local.submission = None
+    if submission["fd"] is not None:
+        os.close(submission["fd"])
+    with _INFLIGHT_LOCK:
+        _INFLIGHT.discard(submission["event"])
+    return submission["fd"] is not None
+
+
+def _prohibition_persisted(event_id):
+    """Whether ``PUBLISHED/<event id>`` now holds the record that refuses this event's resubmission once its
+    ``.inflight`` entry is gone (``_unfinished``): readable, complete, naming this very event, of kind
+    ``unfinished_notice``, and flushed to disk with its directory entry. A file that merely exists — empty,
+    cut short, unreadable, another event's, or any other kind — is not that record. Whether the notice was
+    posted is a separate fact: the record may say it was not, and still refuses the resubmission."""
+    try:
+        fd = os.open(os.path.join(PUBLISHED, event_id), os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            raw = os.read(fd, 65_536)
+            record = json.loads(raw.decode("utf-8").splitlines()[0])
+            if not (isinstance(record, dict) and record.get("event_id") == event_id
+                    and record.get("kind") == "unfinished_notice"):
+                return False
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        directory = os.open(PUBLISHED, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except Exception:
+        return False
+    return True
+
+
+def reap_unfinished():
+    """Tell the thread, once, about each event a shim process submitted and never finished delivering:
+    its ``.inflight`` entry is still linked and no live process holds its lock (the owner was replaced
+    — buzz-acp SIGKILLs the group on CancelDrainTimeout — or its handler raised). The notice takes the
+    event's one post (``PUBLISHED/<event id>``), so it never goes out beside or after an answer; an
+    event that already has its post keeps no second one. The entry is retired only once the event's
+    ``unfinished_notice`` record is persisted (``_prohibition_persisted``); until then — the journal could
+    not be created or written, or the entry holds another kind — it stays as the guard against a
+    resubmission, an explicit unresolved state, and a later reap tries again. Best effort, not crash
+    safety: it runs when a shim starts and before each prompt it takes."""
+    try:
+        names = sorted(name for name in os.listdir(PUBLISHED) if INFLIGHT_RE.fullmatch(name))
+    except OSError:
+        return
+    for name in names:
+        path, event_id = os.path.join(PUBLISHED, name), name[:-len(INFLIGHT_SUFFIX)]
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
+        except OSError:
+            continue
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                if not _same_file(fd, path):
+                    continue  # finished and unlinked meanwhile
+                raw = os.read(fd, 4096)
+            except OSError:
+                continue  # a live process holds it, or it is gone
+            try:
+                record = json.loads(raw.decode())
+            except Exception:
+                record = None
+            channel = record.get("channel") if isinstance(record, dict) else None
+            if not os.path.lexists(os.path.join(PUBLISHED, event_id)):
+                try:
+                    if isinstance(channel, str) and re.fullmatch(_UUID, channel):
+                        log(f"prompt {event_id[:12]}… was submitted by a shim that ended before its outcome; "
+                            "telling the thread")
+                        publish_reply(event_id, channel, UNFINISHED_NOTICE.format(event_id=event_id),
+                                      kind="unfinished_notice")
+                    else:
+                        marker, _ = _claim(event_id)
+                        if marker is not None:
+                            with os.fdopen(marker, "w") as record_file:
+                                record_file.write(json.dumps({
+                                    "sent": False, "state": "notice_impossible", "delivery": "failed",
+                                    "kind": "unfinished_notice", "event_id": event_id, "channel": None,
+                                    "reason": "the in-flight entry names no channel",
+                                    "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}) + "\n")
+                except Exception as exc:  # checked below: an entry claimed and not filled is no record
+                    log(f"prompt {event_id[:12]}… unfinished; its journal entry was not completed: "
+                        f"{type(exc).__name__}")
+            # Until the record that refuses a resubmission is persisted, the in-flight entry is the only guard
+            # (``_claim_inflight`` refuses a taken name). It is retired only once that record is read back and
+            # flushed; otherwise it stays — an explicit unresolved state, never success or delivery — and a
+            # later reap tries again.
+            if not _prohibition_persisted(event_id):
+                log(f"prompt {event_id[:12]}… UNRESOLVED: unfinished, and no resubmission-refusing journal record "
+                    "could be persisted; its in-flight entry stays, so it is not submitted again")
+                continue
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        finally:
+            os.close(fd)
+
+
+def cancel_prompts(message):
+    """``session/cancel`` (ACP: a notification). A prompt not yet submitted is cancelled
+    (``stopReason: cancelled``) and never submitted. A prompt whose event is already at the canonical
+    surface cannot be recalled, so it is NOT reported cancelled: it is answered ``end_turn`` with
+    ``_meta.canonical`` saying the turn goes on, and its own thread still posts the outcome once — the
+    answer, or a failure notice. buzz-acp treats any response inside its drain alike (pool.rs: Ok of
+    any stop reason → the batch requeued, this agent kept); none within 5 s is CancelDrainTimeout,
+    which SIGKILLs this process and loses the running turn's answer."""
+    params = message.get("params") or {}
+    session = params.get("sessionId")
+    with _PROMPTS_LOCK:
+        prompts = [p for p in _PROMPTS.values() if session is None or p.session == session]
+    if not prompts:
+        log("session/cancel received; no prompt in flight")
+    for prompt in prompts:
+        with prompt.lock:
+            if prompt.answered:
+                continue
+            prompt.answered = True
+            if prompt.submitted is None:
+                prompt.cancelled.set()
+                value = {"stopReason": "cancelled"}
+                log(f"session/cancel: prompt {prompt.rpc_id} cancelled before anything was submitted")
+            else:
+                value = {"stopReason": "end_turn", "_meta": {"canonical": {
+                    "cancelled": False, "turn": "running", "event_id": prompt.submitted,
+                    "outcome": "posted once to the thread by this shim: the answer or a failure notice"}}}
+                log(f"session/cancel: prompt {prompt.rpc_id} NOT cancelled: event {prompt.submitted[:12]}… is "
+                    "at the canonical surface and goes on; answered end_turn, its outcome is posted once")
+            _emit({"jsonrpc": "2.0", "id": prompt.rpc_id, "result": value})
+    if message.get("id") is not None:
+        result(message.get("id"), {})
+
+
+HEARTBEAT_HEADER = "[System: Heartbeat]"
+
+
+def is_heartbeat(prompt):
+    """Whether ``params.prompt`` is buzz-acp's own heartbeat, told from its ACP shape alone.
+
+    A heartbeat (lib.rs ``dispatch_heartbeat`` → pool.rs ``run_prompt_task``) is exactly ONE text
+    element, ``{"type": "text", "text": …}``, which opens with its ``[System: Heartbeat]`` header — or,
+    for a legacy agent, with the ``[Base]`` section prepended to it (pool.rs ``prepend_base_for_legacy``).
+    It carries no Buzz message at all. A channel prompt is never one element: ``format_prompt`` always
+    writes ``[Context]`` and an event section as elements of their own, and no message body can merge
+    or open an element. So the header is trusted only where nothing but buzz-acp writes, and a body
+    quoting it never makes a prompt a heartbeat."""
+    if not isinstance(prompt, list) or len(prompt) != 1:
+        return False
+    block = prompt[0]
+    if not (isinstance(block, dict) and set(block) == {"type", "text"} and block["type"] == "text"
+            and isinstance(block["text"], str)):
+        return False
+    lines = block["text"].split("\n")
+    return lines[0].strip() == HEARTBEAT_HEADER or (
+        lines[0] == "[Base]" and any(line.strip() == HEARTBEAT_HEADER for line in lines[1:]))
+
+
 def prompt_text(params):
     """ACP sends a prompt as a list of content blocks; only text is carried to the CEO."""
     chunks = []
@@ -518,8 +1489,9 @@ def handle(message):
 
     if method == "session/prompt":
         session = params.get("sessionId") or ("canonical:" + BINDING)
-        text = prompt_text(params)
-        if not text:
+        prompt = params.get("prompt")
+        if not prompt:
+            # Nothing was sent (queue.rs ``format_prompt`` of an empty batch): no message to refuse.
             result(rpc_id, {"stopReason": "end_turn"})
             return
         # buzz-acp wakes its agent every --heartbeat-interval seconds with a prompt that carries no
@@ -530,15 +1502,19 @@ def handle(message):
         # timing, not a guard.
         # 2026-09-27: substring 검사는 실패했다. "routine heartbeat" 는 heartbeat 본문이 아니라 매
         # 프롬프트에 붙는 [Base]/persona 프롬프트 안에 있어서, repo-factory 방에서 온 실제 메시지
-        # (3765자)가 거부됐다. heartbeat 는 자기 섹션 머리글을 한 줄로 갖는다 — 줄에 앵커를 둔다.
-        if any(ln.strip() == "[System: Heartbeat]" for ln in text.splitlines()):
-            log(f"prompt refused locally: heartbeat, not a message ({len(text)} chars)")
+        # (3765자)가 거부됐다. 2026-10-18 (#91 r1): 줄 앵커도 본문을 믿었다 — 병합 프롬프트가 인용한
+        # 기록 속 한 줄이 거부 알림과 기록을 통째로 지웠다. heartbeat 는 이제 ACP 모양으로만 판정한다.
+        if is_heartbeat(prompt):
+            log("prompt refused locally: heartbeat, not a message (buzz-acp's one-element heartbeat prompt)")
             result(rpc_id, {"stopReason": "end_turn"})
             return
-        parsed = envelope(text)
+        text = prompt_text(params)
+        parsed = envelope(prompt)
         if parsed is None:
-            # No single unambiguous event: nothing can be attributed, so nothing is forwarded in any mode.
-            log(f"prompt refused locally: no unambiguous [Buzz event] envelope ({len(text)} chars)")
+            # No single unambiguous event: nothing can be attributed, so nothing is forwarded in any
+            # mode — and the conversation is told once, or the journal says it could not be or that a
+            # plain single-event prompt's one event is this bridge's own post, which is never answered.
+            refuse_unattributed(session, prompt, len(text))
             result(rpc_id, {"stopReason": "end_turn"})
             return
         author, channel, base, body = parsed
@@ -601,6 +1577,9 @@ def handle(message):
             log(f"prompt {base[:12]}… {len(text)} chars is over the gateway limit {GATEWAY_TEXT_LIMIT}: "
                 f"omitted {fitted[1]} thread messages ({fitted[2]} chars), submitting {len(fitted[0])} chars")
         text = fitted[0]
+        if not begin_submission(session, base, channel):
+            result(rpc_id, {"stopReason": "end_turn"})
+            return
         # Every attempt and every replay of this event uses its own Buzz event id. A busy refusal is
         # raised before the gateway claims the event (it records nothing), so retrying the same id
         # runs it once when the session frees; once claimed, a replay answers from the receipt and
@@ -641,7 +1620,11 @@ def handle(message):
             except Exception as exc:
                 log(f"prompt {event_id} failed: {type(exc).__name__}: {exc}")
                 answer = f"canonical surface unreachable: {type(exc).__name__}: {exc}"
+                # No gateway answer: the turn may have run, so the thread is told its outcome is unknown.
+                code, refusal = None, {}
+                notice = unknown_outcome_notice(type(exc).__name__, base)
                 break
+        release_turn_slot()  # the gateway answered, or never will: another prompt may submit
         write({"jsonrpc": "2.0", "method": "session/update", "params": {
             "sessionId": session,
             "update": {"sessionUpdate": "agent_message_chunk",
@@ -658,18 +1641,54 @@ def handle(message):
                    ", answer NOT preserved" if kept is False else f", answer_kept={kept}")
                 + "); telling the thread")
             publish_reply(base, channel, notice, kind="notice")
+        finish_submission()
         result(rpc_id, {"stopReason": "end_turn"})
         return
 
     if method == "session/cancel":
-        # A turn already handed to the CEO cannot be recalled, so say so rather than imply it stopped.
-        log("session/cancel received; the submitted turn continues at the binding")
-        if rpc_id is not None:
-            result(rpc_id, {})
+        # A turn already handed to the CEO cannot be recalled, so it is never reported cancelled.
+        cancel_prompts(message)
         return
 
     if rpc_id is not None:
         error(rpc_id, -32601, f"method not supported by acp-canonical-shim: {method}")
+
+
+def _serve_prompt(prompt, message):
+    """One prompt's thread: tell the thread about any unfinished event first, then handle the prompt."""
+    _local.prompt = prompt
+    try:
+        reap_unfinished()
+        handle(message)
+    except Exception as exc:
+        log(f"handler crashed on session/prompt: {type(exc).__name__}: {exc}")
+        if prompt.rpc_id is not None:
+            error(prompt.rpc_id, -32603, f"{type(exc).__name__}: {exc}")
+    finally:
+        left = abandon_submission()
+        with _PROMPTS_LOCK:
+            _PROMPTS.pop(id(prompt), None)
+        _local.prompt = None
+        if left:
+            reap_unfinished()
+
+
+def dispatch(message):
+    """The stdin loop's one call per line. It never waits on a canonical turn: each prompt runs on its
+    own thread, so the next line — a ``session/cancel`` above all — is read while the turn runs."""
+    method = message.get("method")
+    if method == "session/cancel":
+        cancel_prompts(message)
+        return
+    if method != "session/prompt":
+        handle(message)
+        return
+    prompt = PromptTurn(message.get("id"), (message.get("params") or {}).get("sessionId"))
+    with _PROMPTS_LOCK:
+        _PROMPTS[id(prompt)] = prompt
+    thread = threading.Thread(target=_serve_prompt, args=(prompt, message), name=f"prompt-{message.get('id')}")
+    _THREADS[:] = [running for running in _THREADS if running.is_alive()] + [thread]
+    thread.start()
 
 
 def main():
@@ -682,6 +1701,9 @@ def main():
         sys.stderr.write("acp-canonical-shim: missing " + ", ".join(missing) + "\n")
         raise SystemExit(2)
     log(f"started binding={BINDING} base={BASE}")
+    reaper = threading.Thread(target=reap_unfinished, name="reap-unfinished")
+    _THREADS.append(reaper)
+    reaper.start()
     # `for line in sys.stdin` reads ahead into an internal buffer, so a peer that sends one line
     # and keeps the pipe open can have that line withheld until the buffer fills. A pipe closed by
     # the test harness flushes it and hides this entirely; buzz-acp holds the pipe open, and the
@@ -689,7 +1711,10 @@ def main():
     while True:
         line = sys.stdin.readline()
         if not line:
-            log("stdin closed; exiting")
+            running = [thread for thread in _THREADS if thread.is_alive()]
+            log("stdin closed; exiting" + (f" once {len(running)} running thread(s) finish" if running else ""))
+            for thread in running:
+                thread.join()
             break
         line = line.strip()
         if not line:
@@ -701,7 +1726,7 @@ def main():
             log(f"unparsable line dropped: {line[:200]}")
             continue
         try:
-            handle(message)
+            dispatch(message)
         except Exception as exc:
             log(f"handler crashed on {message.get('method')}: {type(exc).__name__}: {exc}")
             if message.get("id") is not None:

@@ -25,6 +25,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.bridge.buzz_prompt_port import section_blocks
 from tests.hermes_home_pin import import_home, pinned_hermes_home, tmp_root
 
 try:
@@ -297,7 +298,7 @@ def shim(gw, tmp_path, monkeypatch):
 
 def drive(shim, text, rpc_id=1):
     shim.handle({"jsonrpc": "2.0", "id": rpc_id, "method": "session/prompt",
-                 "params": {"sessionId": "s", "prompt": [{"type": "text", "text": text}]}})
+                 "params": {"sessionId": "s", "prompt": section_blocks(text)}})
 
 
 def _reply(post):
