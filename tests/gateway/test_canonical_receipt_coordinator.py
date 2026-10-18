@@ -207,8 +207,13 @@ def test_canonical_turn_uses_shared_running_slot_and_interrupt_generation(tmp_pa
             task = asyncio.create_task(
                 CanonicalReceiptCoordinator(runner).submit(_binding(entry, source), _event())
             )
-            while not entered.is_set():
+            # Stop waiting once the turn ends too: a submit that finishes before the actor is entered
+            # would otherwise leave this loop spinning forever.
+            while not entered.is_set() and not task.done():
                 await asyncio.sleep(0)
+            if not entered.is_set():
+                outcome = await task  # a submit that raised surfaces its own error here
+                pytest.fail(f"submit returned {outcome!r} without entering the actor")
             assert runner._is_session_running(entry.session_key)
             assert runner._session_state(entry.session_key).turn.agent is agent
             assert runner._session_state(entry.session_key).turn.event is None
