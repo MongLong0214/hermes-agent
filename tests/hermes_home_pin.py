@@ -14,7 +14,16 @@ per process, ``import_home()``, which no module's tests use: a test that writes 
 constant (an ordinary gateway turn saving ``config.yaml``, for one) writes there, never into another
 module's test home.
 
-Nothing here runs at interpreter exit. Hooks Hermes registers for exit (the browser tool's cleanup,
+Every tmp home here (``tmp_root()``, so ``import_home()`` too) belongs to the process that made it:
+only that process (by PID) removes it, at its exit. A forked child inherits that exit hook, which then
+removes nothing, and gets an import home of its own. Pins are NOT supported in a process forked after
+an import-time pin ran in its parent: the Hermes modules it inherited keep naming the parent's import
+home (``gateway.run._hermes_home``, for one), so what the child reads or writes through them lands
+there, and no pin can redirect them. ``import_home()`` and ``pinned_hermes_home()`` raise
+``ForkedPinError`` in such a child; a test that needs a home of its own in another process runs in a
+fresh interpreter (a subprocess) instead.
+
+Nothing else here runs at interpreter exit. Hooks Hermes registers for exit (the browser tool's cleanup,
 for one) resolve the home only then, after every pin is put back, so they see the HOME the process
 started with. A test that runs such hooks does so in a subprocess whose HOME is a tmp dir from the
 start (tests/agent/test_canonical_peer_tools_isolation.py).
@@ -51,20 +60,49 @@ def home_state() -> tuple[str | None, str | None, str | None]:
 
 #: The ``__name__`` of each module whose import-time pin has been entered, in order.
 IMPORT_PINNED: list[str] = []
-_IMPORT_HOME: list[Path] = []
+_IMPORT_PIN_PIDS: set[int] = set()  # the process(es) those import-time pins ran in
+_IMPORT_HOME: dict[int, Path] = {}  # owning PID -> that process's import home
+
+
+class ForkedPinError(RuntimeError):
+    """A pin used in a process forked after an import-time pin ran in its parent (module docstring)."""
+
+
+def _refuse_a_child_forked_after_import_pins() -> None:
+    parents = sorted(_IMPORT_PIN_PIDS - {os.getpid()})
+    if parents:
+        raise ForkedPinError(
+            f"process {os.getpid()} was forked from process {parents[0]} after import-time pins ran there "
+            f"({', '.join(IMPORT_PINNED)}); the Hermes modules it inherited still name that process's import "
+            f"home, and no pin can redirect them: run this in a fresh interpreter (a subprocess) instead")
+
+
+def _remove_if_owner(root: Path, owner_pid: int) -> None:
+    if os.getpid() == owner_pid:  # in a forked child, which inherits this exit hook, removes nothing
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def tmp_root(prefix: str) -> Path:
+    """A fresh tmp dir, neither in nor around the real Hermes home, made by this process and removed
+    at this process's exit, only by this process (nothing is registered for one that overlaps)."""
+    real_hermes_home = ((Path(pwd.getpwuid(os.getuid()).pw_dir) if pwd is not None else Path.home())
+                        / ".hermes").resolve()
+    root = Path(tempfile.mkdtemp(prefix=prefix)).resolve()
+    if root.is_relative_to(real_hermes_home) or real_hermes_home.is_relative_to(root):
+        raise RuntimeError(f"the test home {root} overlaps the real home")
+    atexit.register(_remove_if_owner, root, os.getpid())
+    return root
 
 
 def import_home() -> Path:
-    """The tmp home every import-time pin in this process uses; created on first use, removed at exit."""
-    if not _IMPORT_HOME:
-        real_hermes_home = ((Path(pwd.getpwuid(os.getuid()).pw_dir) if pwd is not None else Path.home())
-                            / ".hermes").resolve()
-        root = Path(tempfile.mkdtemp(prefix="hermes-test-imports-")).resolve()
-        if root.is_relative_to(real_hermes_home) or real_hermes_home.is_relative_to(root):
-            raise RuntimeError(f"the test import home {root} overlaps the real home")
-        atexit.register(shutil.rmtree, root, True)
-        _IMPORT_HOME.append(root)
-    return _IMPORT_HOME[0]
+    """The tmp home every import-time pin in this process uses; made on first use in each process (a
+    forked child included), removed at that process's exit. Raises ``ForkedPinError`` in a process
+    forked after an import-time pin ran in its parent."""
+    _refuse_a_child_forked_after_import_pins()
+    pid = os.getpid()
+    if pid not in _IMPORT_HOME:
+        _IMPORT_HOME[pid] = tmp_root("hermes-test-imports-")
+    return _IMPORT_HOME[pid]
 
 
 #: How many pin exits found each part put back as it was on entry: HOME and HERMES_HOME, the home
@@ -95,7 +133,10 @@ def pinned_hermes_home(root: Path, *, importer: str | None = None) -> Iterator[P
     checked, and counted in ``RESTORE_CHECKS``.
 
     ``importer``: the pinning module's ``__name__``, for an import-time pin (see ``IMPORT_PINNED``).
+    Raises ``ForkedPinError``, changing nothing, in a process forked after an import-time pin ran in
+    its parent.
     """
+    _refuse_a_child_forked_after_import_pins()
     hermes_home = root / ".hermes"
     saved_env = {name: os.environ.get(name) for name in _ENV}
     saved_caches = saved_override = token = constants = None
@@ -109,6 +150,7 @@ def pinned_hermes_home(root: Path, *, importer: str | None = None) -> Iterator[P
         token = constants.set_hermes_home_override(hermes_home)
         if importer is not None:
             IMPORT_PINNED.append(importer)
+            _IMPORT_PIN_PIDS.add(os.getpid())
         yield hermes_home
     finally:
         if token is not None:

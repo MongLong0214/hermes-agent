@@ -7,12 +7,9 @@ reached and every call in the batch gets the peer refusal result."""
 from __future__ import annotations
 
 import asyncio
-import atexit
 import hashlib
 import json
 import os
-import shutil
-import tempfile
 import threading
 from contextlib import contextmanager
 from pathlib import Path
@@ -22,7 +19,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import yaml
 
-from tests.hermes_home_pin import import_home, pinned_hermes_home
+from tests.hermes_home_pin import import_home, pinned_hermes_home, tmp_root
 
 try:
     import pwd  # the account database names the real home even when HOME is redirected
@@ -36,10 +33,9 @@ except ImportError:  # not POSIX
 # outside tests/ (no hermetic conftest) once let these helpers replace the user's live config.
 _REAL_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir) if pwd is not None else Path.home()
 _LIVE_CONFIG = (_REAL_HOME / ".hermes" / "config.yaml").resolve()
-_PINNED_ROOT = Path(tempfile.mkdtemp(prefix="hermes-peer-tools-")).resolve()
+_PINNED_ROOT = tmp_root("hermes-peer-tools-")  # removed at exit by this process only
 if _PINNED_ROOT.is_relative_to(_LIVE_CONFIG.parent) or _LIVE_CONFIG.is_relative_to(_PINNED_ROOT):
     raise RuntimeError(f"the pinned test home {_PINNED_ROOT} overlaps the real home")
-atexit.register(shutil.rmtree, _PINNED_ROOT, True)
 
 # The imports run pinned to the tmp home all pinned modules import under, so a path they cache names
 # no module's test home; the pin is put back (in ``finally``) as soon as they have run: collecting

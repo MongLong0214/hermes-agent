@@ -7,19 +7,16 @@ the gateway's log names the refused event by its correlation and sizes, never by
 """
 
 import asyncio
-import atexit
 import json
 import logging
 import os
 import secrets
-import shutil
-import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from tests.hermes_home_pin import import_home, pinned_hermes_home
+from tests.hermes_home_pin import import_home, pinned_hermes_home, tmp_root
 
 try:
     import pwd  # the account database names the real home even when HOME is redirected
@@ -31,10 +28,9 @@ except ImportError:  # not POSIX
 # real Hermes home fails the test before anything is written.
 _REAL_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir) if pwd is not None else Path.home()
 _LIVE_ROOT = (_REAL_HOME / ".hermes").resolve()
-_PINNED_ROOT = Path(tempfile.mkdtemp(prefix="hermes-text-cap-")).resolve()
+_PINNED_ROOT = tmp_root("hermes-text-cap-")  # removed at exit by this process only
 if _PINNED_ROOT.is_relative_to(_LIVE_ROOT) or _LIVE_ROOT.is_relative_to(_PINNED_ROOT):
     raise RuntimeError(f"the pinned test home {_PINNED_ROOT} overlaps the real home")
-atexit.register(shutil.rmtree, _PINNED_ROOT, True)
 
 # The imports run pinned to the tmp home all pinned modules import under, so a path they cache names
 # no module's test home; the pin is put back (in ``finally``) as soon as they have run: collecting
