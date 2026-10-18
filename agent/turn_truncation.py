@@ -491,6 +491,7 @@ def continue_codex_incomplete(
     cap — the same one-shot overrides the chat-completions length path uses — because
     re-sending the identical budget and effort re-burns the budget identically (#90393)."""
     from agent.conversation_loop import _CODEX_INCOMPLETE_NUDGE
+    from agent.recovery_nudge import recovery_nudge_row
     from agent.turn_response_check import _codex_finish_reason
 
     agent._codex_incomplete_retries += 1
@@ -570,7 +571,7 @@ def continue_codex_incomplete(
                 )
                 # Alternation guard: the nudge may only follow an assistant row.
                 if not _already_nudged and _last_msg.get("role") == "assistant":
-                    append_message(messages, {"role": "user", "content": _CODEX_INCOMPLETE_NUDGE})
+                    append_message(messages, recovery_nudge_row(agent, "codex_incomplete", messages))
         if not interim_has_content and _codex_finish_reason(response) == "incomplete":
             agent._ephemeral_reasoning_off = True
             # No configured cap means the provider's own ceiling was hit: the observed

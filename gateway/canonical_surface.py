@@ -508,8 +508,10 @@ class TurnProvenance:
     later row, up to and including the last, is marked as a peer row (``display_kind`` ``canonical_peer``,
     or ``display_metadata`` carrying ``canonical_peer``) — another event's, receipt's or nonce's, or this
     one's again. ``interior_user_row``: a row other than the actor's assistant or tool rows (a user row) lies
-    between the first and the last. These are facts, not verdicts: a row with no metadata is never trusted
-    by them, and nothing classifies a row by its text."""
+    between the first and the last, and it is not a recovery nudge of this run: one whose
+    ``_recovery_nudge`` marker names this claim's peer nonce as its run, and one of the five nudge kinds
+    whose text is its content (``agent.recovery_nudge.is_run_nudge``). These are facts, not verdicts: a row
+    with no metadata is never trusted by them, and nothing classifies a row by its text alone."""
 
     opening_is_this_claims: bool
     other_peer_row: bool
@@ -528,6 +530,7 @@ def turn_provenance(messages: Any, *, history_boundary: Any, peer: Any, body: st
     from collections.abc import Mapping
 
     from agent.canonical_peer import PEER_DISPLAY_KIND, PEER_METADATA_KEY, PeerProvenanceError, peer_body, peer_metadata
+    from agent.recovery_nudge import is_run_nudge
 
     if (not isinstance(messages, list) or type(history_boundary) is not int
             or not 0 <= history_boundary < len(messages) - 1):
@@ -548,7 +551,10 @@ def turn_provenance(messages: Any, *, history_boundary: Any, peer: Any, body: st
                      or (isinstance(row.get("display_metadata"), Mapping)
                          and PEER_METADATA_KEY in row["display_metadata"])
                      for row in suffix[1:])
-    interior_user = any(row.get("role") not in ("assistant", "tool") for row in suffix[1:-1])
+    # This claim's run token is its own peer's nonce, the one source the agent stamps a nudge's marker from.
+    run = peer.get("nonce") if isinstance(peer, Mapping) else None
+    interior_user = any(row.get("role") not in ("assistant", "tool") and not is_run_nudge(row, run)
+                        for row in suffix[1:-1])
     return TurnProvenance(opening, other_peer, interior_user)
 
 
@@ -562,16 +568,19 @@ def bound_refused_answer(result: Any, *, peer: Any, body: str, rendered: str, hi
 
     * the turn completed, is not failed, partial or interrupted, and ran in the bound session;
     * its rows bind it to this claim (``turn_provenance(...).binds``, the same rule a selected answer
-      meets), and, beyond that rule, no user row lies inside the turn (the Limit below);
+      meets), and, beyond that rule, no user row lies inside the turn but this run's own recovery nudges
+      (the Limit below);
     * it ends with one assistant row, without tool calls, whose text is the returned final answer.
 
-    Limit: a user row inside the turn — a recovery nudge included — makes the answer unbound. Matching a
-    nudge's fixed text is no provenance, and none of the five nudges carries metadata bound to this run:
-    ``_CODEX_INCOMPLETE_NUDGE``, ``_CODEX_ACK_CONTINUATION_NUDGE`` and ``_DEGENERATE_FINAL_NUDGE`` are
-    appended as bare ``{"role", "content"}`` rows, and ``_EMPTY_TOOL_RESPONSE_NUDGE`` /
-    ``_DROPPED_TOOLCALL_NUDGE_CONTENT`` carry only run-agnostic booleans (``_empty_recovery_synthetic``,
-    ``_dropped_toolcall_nudge``) that name no run. So a nudged turn, the live D2 shape among them, keeps
-    nothing here and stays an explicit failure.
+    Limit: a user row inside the turn makes the answer unbound unless it is a recovery nudge this run's
+    agent loop appended. Matching a nudge's fixed text is no provenance. Each of the five nudges is built by
+    ``agent.recovery_nudge.recovery_nudge_row``, which, in a canonical peer turn, marks it
+    ``_recovery_nudge: {"kind", "run"}`` with ``run`` read from the structured metadata of the turn's own
+    peer opening row: this claim's peer nonce, minted fresh per claim. Only a row whose marker names
+    exactly that nonce, one of the five kinds and, after both, that kind's text as its content is accepted
+    (``is_run_nudge``). A row without the marker, with another run, kind or text, or any other user row
+    still unbinds the answer, and ``binds`` stays required, so a marker never admits a foreign or second
+    peer row.
 
     Anything else, or anything unreadable, is None: the event stays an explicit failure."""
     if (not isinstance(result, dict) or result.get("completed") is not True

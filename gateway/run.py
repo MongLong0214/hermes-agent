@@ -3844,8 +3844,10 @@ class GatewayRunner(
                 # A well-formed turn is this event's answer only when it opened with this claim's own row
                 # and carries no other peer row: the rule a refused answer is kept by too
                 # (turn_provenance). Otherwise it is refused (an explicit failure), never recorded or
-                # delivered as the answer. The refused path's extra Limit (no user row inside the turn) is
-                # not this rule; the selector above already governs the accepted shape.
+                # delivered as the answer. The refused path's extra Limit is not this rule: its keep accepts
+                # a user row inside the turn only when it is this claim's own run-bound recovery nudge
+                # (``_recovery_nudge`` naming this claim's opening peer nonce). The normal path is governed
+                # by the selector above, as before.
                 try:
                     facts = turn_provenance(
                         result.get("messages"), history_boundary=boundary, peer=peer, body=event.text,
