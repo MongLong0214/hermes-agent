@@ -23,10 +23,7 @@ _OUTSIDE_RUNS = {
     "tests/gateway/test_canonical_text_cap_ingress.py": "over_the_cap_is_refused",
     "tests/bridge/test_shim_text_cap_notice.py": "short_thread_reply_reaches_the_gateway",
 }
-# Modules whose pins come from tests/hermes_home_pin.py: a run must find each pin put back.
-_PUT_BACK = ("tests/gateway/test_canonical_record_cas.py",
-             "tests/gateway/test_canonical_text_cap_ingress.py",
-             "tests/bridge/test_shim_text_cap_notice.py")
+# Each module pins through tests/hermes_home_pin.py: a run must find each pin put back.
 _EACH_PIN_CHECKED_TWICE = {"env": 2, "override": 2, "home_caches": 2}  # the import pin and the test pin
 
 # Runs one test module with pytest, then reports, still before interpreter exit, whether HOME,
@@ -88,12 +85,11 @@ def test_a_run_outside_the_hermetic_conftest_writes_nothing_in_the_real_home(tmp
                                              browser_cleanup=False)
     written = sorted(str(p.relative_to(real_home)) for p in real_home.rglob("*"))
     assert written == [], f"the run wrote into the real home: {written}"
-    if module in _PUT_BACK:
-        assert report["restored"] and report["checks"] == _EACH_PIN_CHECKED_TWICE, out
-        assert probes == [("first", "true"), ("last", "true")], out
+    assert report["restored"] and report["checks"] == _EACH_PIN_CHECKED_TWICE, out
+    assert probes == [("first", "true"), ("last", "true")], out
 
 
-@pytest.mark.parametrize("module", _PUT_BACK)
+@pytest.mark.parametrize("module", list(_OUTSIDE_RUNS))
 def test_exit_hooks_of_a_run_outside_the_hermetic_conftest_stay_in_the_home_it_started_with(tmp_path, module):
     """Exit hooks run (browser cleanup included) in a process whose HOME is a tmp dir from the start:
     they see that HOME, not a pin, and the run and its hooks write nothing outside it."""
@@ -107,45 +103,6 @@ def test_exit_hooks_of_a_run_outside_the_hermetic_conftest_stay_in_the_home_it_s
     assert outside_home == [], f"the run wrote outside its HOME: {outside_home}"
     assert report["restored"] and report["checks"] == _EACH_PIN_CHECKED_TWICE and report["blocked"] == [], out
     assert probes == [("first", "true"), ("last", "true")], out
-
-
-_LOAD_AND_RESOLVE = r'''
-import importlib.util, subprocess, sys
-from pathlib import Path
-from hermes_constants import get_hermes_home_override, set_hermes_home_override
-set_hermes_home_override(sys.argv[2])
-spec = importlib.util.spec_from_file_location('loaded_peer_test', sys.argv[1])
-module = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = module
-spec.loader.exec_module(module)
-from hermes_cli.config import get_config_path
-path = get_config_path().resolve()
-assert path.is_relative_to(module._PINNED_ROOT), (path, module._PINNED_ROOT)
-override = Path(get_hermes_home_override()).resolve()
-assert override.is_relative_to(module._PINNED_ROOT), ("override", override, module._PINNED_ROOT)
-child = subprocess.run([sys.executable, '-c', 'from hermes_cli.config import get_config_path; '
-                        'print(get_config_path().resolve())'], capture_output=True, text=True, check=True)
-assert Path(child.stdout.strip()).is_relative_to(module._PINNED_ROOT), ("subprocess", child.stdout, child.stderr)
-'''
-
-
-# These two modules still keep their import-time pin after they load; the modules that put it back
-# are checked by test_test_module_pins_its_imports_and_tests_and_restores_a_cached_profile_scope.
-@pytest.mark.parametrize("module", ["tests/agent/test_canonical_peer_tools.py",
-                                    "tests/gateway/test_canonical_peer_tool_grant.py"])
-def test_test_module_pins_the_resolver_even_with_a_cached_profile_scope(tmp_path, module):
-    """An override already bound to a (stand-in) live profile before the module loads is replaced:
-    the override, the real resolver and a subprocess it spawns all name the module's tmp root."""
-    old_home = tmp_path / "stand-in-live-profile"
-    old_home.mkdir()
-    (old_home / "config.yaml").write_text("canary: unchanged\n", encoding="utf-8")
-    env = {"PATH": os.environ.get("PATH", ""), "HOME": str(tmp_path / "start-home"),
-           "HERMES_HOME": str(tmp_path / "start-hermes-home"), "TMPDIR": str(tmp_path),
-           "PYTHONPATH": str(_REPO)}
-    result = subprocess.run([sys.executable, "-c", _LOAD_AND_RESOLVE, str(_REPO / module), str(old_home)],
-                            cwd=_REPO, env=env, capture_output=True, text=True, timeout=60)
-    assert (old_home / "config.yaml").read_text(encoding="utf-8") == "canary: unchanged\n"
-    assert result.returncode == 0, result.stdout + result.stderr
 
 
 # Every module-level value the load imported that names the caller's HOME, HERMES_HOME or override
@@ -193,7 +150,7 @@ assert state() == before, ("left behind by the test pin", state(), before)
 '''
 
 
-@pytest.mark.parametrize("module", _PUT_BACK)
+@pytest.mark.parametrize("module", list(_OUTSIDE_RUNS))
 def test_test_module_pins_its_imports_and_tests_and_restores_a_cached_profile_scope(tmp_path, module):
     """With an override already bound to a (stand-in) live profile, the module's Hermes imports and,
     under its fixture's pin, the resolver, the override and a subprocess all name the module's tmp

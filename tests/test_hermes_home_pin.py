@@ -22,7 +22,9 @@ _REPO = Path(__file__).resolve().parents[1]
 # Each pinned module, and a module it imports inside its import-time pin.
 _PINNED_MODULES = {"tests/gateway/test_canonical_record_cas.py": "gateway.config",
                    "tests/gateway/test_canonical_text_cap_ingress.py": "gateway.config",
-                   "tests/bridge/test_shim_text_cap_notice.py": "gateway.config"}
+                   "tests/bridge/test_shim_text_cap_notice.py": "gateway.config",
+                   "tests/agent/test_canonical_peer_tools.py": "tools.tool_search",
+                   "tests/gateway/test_canonical_peer_tool_grant.py": "gateway.config"}
 _CHILD = "HERMES_HOME_PIN_CHECK_CHILD"
 
 

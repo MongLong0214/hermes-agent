@@ -6,42 +6,59 @@ real MCP tool handler to a fake transport. Only the configured CEO binding, on t
 still its binding's current one, gets a yes; every refusal is checked next to an allowed turn so it
 cannot pass merely because peer turns run nothing."""
 
+import asyncio
 import atexit
+import hashlib
+import json
 import os
 import shutil
+import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+import yaml
+
+from tests.hermes_home_pin import import_home, pinned_hermes_home
 
 try:
     import pwd  # the account database names the real home even when HOME is redirected
 except ImportError:  # not POSIX
     pwd = None
 
-# Pinned BEFORE any dependent Hermes import, for every resolver, import-time path, cache and
-# subprocess of this module: HOME and HERMES_HOME name a fresh tmp dir, and the context-local home
-# override, which wins over both, is replaced by that same tmp home, so a caller's existing override
-# (a profile scope) cannot aim this module at a real home either. A run outside tests/ (no hermetic
-# conftest) once let these helpers replace the user's live config.
+# Pinned for every Hermes import of this module (its import-time paths and caches) and, by a module
+# fixture, for every resolver and subprocess of its tests: HOME and HERMES_HOME name a fresh tmp dir,
+# and the context-local home override, which wins over both, is replaced by that same tmp home, so a
+# caller's existing override (a profile scope) cannot aim this module at a real home either. A run
+# outside tests/ (no hermetic conftest) once let these helpers replace the user's live config.
 _REAL_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir) if pwd is not None else Path.home()
 _LIVE_CONFIG = (_REAL_HOME / ".hermes" / "config.yaml").resolve()
 _PINNED_ROOT = Path(tempfile.mkdtemp(prefix="hermes-peer-tools-")).resolve()
 if _PINNED_ROOT.is_relative_to(_LIVE_CONFIG.parent) or _LIVE_CONFIG.is_relative_to(_PINNED_ROOT):
     raise RuntimeError(f"the pinned test home {_PINNED_ROOT} overlaps the real home")
 atexit.register(shutil.rmtree, _PINNED_ROOT, True)
-os.environ["HOME"] = str(_PINNED_ROOT)
-os.environ["HERMES_HOME"] = str(_PINNED_ROOT / ".hermes")
 
-from hermes_constants import reset_hermes_home_override, set_hermes_home_override  # noqa: E402
+# The imports run pinned to the tmp home all pinned modules import under, so a path they cache names
+# no module's test home; the pin is put back (in ``finally``) as soon as they have run: collecting
+# this module leaves no home, override or home cache behind for the modules collected after it.
+with pinned_hermes_home(import_home(), importer=__name__):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
-_MODULE_PIN = set_hermes_home_override(_PINNED_ROOT / ".hermes")
+    from gateway.canonical_surface import (
+        CanonicalIngressEvent, CanonicalReceiptCoordinator, CanonicalSurfaceBinding,
+    )
+    from gateway.config import GatewayConfig, Platform
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionSource
+    from tools import mcp_tool_loop as _mcp_loop
 
 
 @pytest.fixture(autouse=True, scope="module")
-def _release_the_module_pin():
-    yield
-    reset_hermes_home_override(_MODULE_PIN)
+def _pin_the_module_home():
+    """The same pin while this module's tests run, owned by this fixture and put back on teardown."""
+    with pinned_hermes_home(_PINNED_ROOT):
+        yield
 
 
 @pytest.fixture(autouse=True)
@@ -52,22 +69,6 @@ def _never_the_live_config():
     if get_config_path().resolve().is_relative_to(_LIVE_CONFIG.parent):
         pytest.fail("the config resolver names the live Hermes home")
 
-
-import asyncio  # noqa: E402
-import hashlib  # noqa: E402
-import json  # noqa: E402
-import sys  # noqa: E402
-from types import SimpleNamespace  # noqa: E402
-
-import yaml  # noqa: E402
-
-from gateway.canonical_surface import (  # noqa: E402
-    CanonicalIngressEvent, CanonicalReceiptCoordinator, CanonicalSurfaceBinding,
-)
-from gateway.config import GatewayConfig, Platform  # noqa: E402
-from gateway.run import GatewayRunner  # noqa: E402
-from gateway.session import SessionSource  # noqa: E402
-from tools import mcp_tool_loop as _mcp_loop  # noqa: E402
 
 CEO = "acp-canonical-ceo"
 TOOL = "mcp__acp_ceo__run_get"
