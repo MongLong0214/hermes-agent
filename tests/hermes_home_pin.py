@@ -14,8 +14,10 @@ per process, ``import_home()``, which no module's tests use: a test that writes 
 constant (an ordinary gateway turn saving ``config.yaml``, for one) writes there, never into another
 module's test home.
 
-Every tmp home here (``tmp_root()``, so ``import_home()`` too) belongs to the process that made it:
-only that process (by PID) removes it, at its exit. A forked child inherits that exit hook, which then
+Every tmp home here (``tmp_root()``, so ``import_home()`` too) is checked before anything is written:
+the dir it would be made in, with symlinks resolved, must not be the real Hermes home or inside it;
+if it is, nothing is made. It belongs to the process that made it: only that process (by PID)
+removes it, at its exit. A forked child inherits that exit hook, which then
 removes nothing, and gets an import home of its own. Pins are NOT supported in a process forked after
 an import-time pin ran in its parent: the Hermes modules it inherited keep naming the parent's import
 home (``gateway.run._hermes_home``, for one), so what the child reads or writes through them lands
@@ -82,14 +84,52 @@ def _remove_if_owner(root: Path, owner_pid: int) -> None:
         shutil.rmtree(root, ignore_errors=True)
 
 
+def _real_hermes_home() -> Path:
+    return (Path(pwd.getpwuid(os.getuid()).pw_dir) if pwd is not None else Path.home()) / ".hermes"
+
+
+def _tmp_parent() -> Path:
+    """The dir a tmp home is made in, found without writing anything: ``tempfile.tempdir`` once set,
+    else the first of ``tempfile.gettempdir()``'s candidates, in its order, that is a dir this process
+    may write in. (``gettempdir()`` itself, until it has cached an answer, writes a probe file into
+    each candidate it tries.)"""
+    if tempfile.tempdir is not None:
+        return Path(tempfile.tempdir)
+    candidates = tempfile._candidate_tempdir_list()
+    for candidate in candidates:
+        if os.path.isdir(candidate) and os.access(candidate, os.W_OK | os.X_OK):
+            return Path(candidate)
+    raise FileNotFoundError(f"no tmp dir this process may write in among {candidates}")
+
+
+def _is_in(path: Path, home: Path) -> bool:
+    """Whether ``path`` is ``home`` or inside it. Symlinks are resolved and paths compared part by part
+    (``.hermes2`` is not in ``.hermes``), and each dir from ``path`` up is also compared with ``home``
+    by identity, so another spelling of the same dir (another case, on a case-insensitive file
+    system) counts as ``home``."""
+    path, home = path.resolve(), home.resolve()
+    if path.is_relative_to(home):
+        return True
+    try:
+        home_stat = home.stat()
+    except OSError:  # no such home: nothing is inside it
+        return False
+    for dir_ in (path, *path.parents):
+        with contextlib.suppress(OSError):
+            if os.path.samestat(dir_.stat(), home_stat):
+                return True
+    return False
+
+
 def tmp_root(prefix: str) -> Path:
-    """A fresh tmp dir, neither in nor around the real Hermes home, made by this process and removed
-    at this process's exit, only by this process (nothing is registered for one that overlaps)."""
-    real_hermes_home = ((Path(pwd.getpwuid(os.getuid()).pw_dir) if pwd is not None else Path.home())
-                        / ".hermes").resolve()
-    root = Path(tempfile.mkdtemp(prefix=prefix)).resolve()
-    if root.is_relative_to(real_hermes_home) or real_hermes_home.is_relative_to(root):
-        raise RuntimeError(f"the test home {root} overlaps the real home")
+    """A fresh tmp dir outside the real Hermes home, made by this process and removed at this
+    process's exit, only by this process. The dir it would be made in is checked first: one that is
+    the real Hermes home or inside it raises, and nothing is written (a fresh dir cannot hold the
+    real home, so only where it goes is checked)."""
+    parent = _tmp_parent().resolve()
+    if _is_in(parent, _real_hermes_home()):
+        raise RuntimeError(f"a test home made in {parent} would be inside the real home; nothing was made")
+    root = Path(tempfile.mkdtemp(prefix=prefix, dir=parent))
     atexit.register(_remove_if_owner, root, os.getpid())
     return root
 

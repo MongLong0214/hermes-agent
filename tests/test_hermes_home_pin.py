@@ -11,8 +11,10 @@ import importlib.util
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -201,6 +203,7 @@ print("FORK-AFTER-IMPORT-PINS " + json.dumps({
 '''
 
 
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="forks: needs os.fork, which this platform lacks")
 def test_a_forked_child_gets_its_own_import_home_and_never_removes_its_parents(tmp_path):
     """#90 review (S15-ISO-R1-01): a forked child got its parent's import home and, on a normal exit,
     removed it under the parent, whose import home then named nothing. Now each process makes and
@@ -238,3 +241,87 @@ def test_a_forked_child_gets_its_own_import_home_and_never_removes_its_parents(t
     # The parent removed its own at its exit; no tmp home is left behind.
     assert not Path(parent).exists() and not Path(after["module_root"]).exists(), out
     assert not [path.name for path in tmpdir.iterdir() if path.name.startswith("hermes-")], out
+
+
+def test_without_os_fork_only_the_fork_witness_is_skipped():
+    """#90 review r2 (S15-ISO-R2-01): the fork witness called ``os.fork()`` unconditionally, so it
+    failed where there is none (Windows). Now it alone is skipped there, and collecting this module
+    looks the name up only through ``hasattr``. Checked by collecting and running this module in a
+    fresh interpreter whose ``os`` has no ``fork``: a mocked capability, not a run on Windows."""
+    this = str(Path(__file__).resolve().relative_to(_REPO))
+    script = ("import os, sys\ndel os.fork\nimport pytest\nsys.exit(pytest.main(['-v', '-rs', '-p', "
+              f"'no:cacheprovider', {this!r}, '-k', 'not without_os_fork']))")
+    run = subprocess.run([sys.executable, "-c", script], cwd=_REPO, env=dict(os.environ), capture_output=True,
+                         text=True, timeout=240)
+    out = run.stdout[-3000:] + run.stderr[-3000:]
+    skipped = [line for line in run.stdout.splitlines() if "::" in line and " SKIPPED" in line]
+    assert run.returncode == 0 and len(skipped) == 1, out
+    assert "::test_a_forked_child_gets_its_own_import_home_and_never_removes_its_parents " in skipped[0], out
+    assert "needs os.fork" in run.stdout and re.search(r"\b\d+ passed, 1 skipped, 1 deselected\b", run.stdout), out
+
+
+def _tree(root):
+    """Each entry under ``root``, ``root`` included: its type, size and modification time, which any
+    write there changes (a file made and removed again changes its dir's)."""
+    entries = {}
+    for dir_, dirs, files in os.walk(root):
+        for path in (Path(dir_), *(Path(dir_, name) for name in dirs + files)):
+            st = path.lstat()
+            entries[path.relative_to(root).as_posix()] = (stat.S_IFMT(st.st_mode), st.st_size, st.st_mtime_ns)
+    return entries
+
+
+@pytest.mark.parametrize("where", ["the-home", "deep-in-the-home", "TMPDIR-in-the-home", "a-symlink-into-the-home",
+                                   "the-home-in-another-case"])
+def test_a_tmp_home_that_would_be_in_the_real_home_is_refused_before_anything_is_written(where, tmp_path, monkeypatch):
+    """#90 review r2 (ROUND1-ESCAPE-01): ``tmp_root`` made its dir, then checked it, so a refused tmp
+    home was left in the real home. Now the dir it would be made in is checked first. With an account
+    home stand-in whose ``.hermes`` holds that dir, ``tmp_root`` and ``import_home`` both refuse, and
+    every entry under it is as it was: nothing made, nothing made and removed (no ``gettempdir()``
+    probe file either, for a ``TMPDIR`` there)."""
+    account = tmp_path / "account"
+    real = account / ".hermes"  # the real Hermes home, as far as the helper knows
+    (real / "cache" / "scratch").mkdir(parents=True)
+    (real / "config.yaml").write_text("{}")
+    monkeypatch.setattr(hermes_home_pin, "_real_hermes_home", lambda: real)
+    monkeypatch.setattr(hermes_home_pin, "_IMPORT_HOME", {})  # so import_home() would make one
+    monkeypatch.setattr(tempfile, "tempdir", None)  # where gettempdir() would look, unless set below
+    if where == "the-home":
+        monkeypatch.setattr(tempfile, "tempdir", str(real))
+    elif where == "deep-in-the-home":
+        monkeypatch.setattr(tempfile, "tempdir", str(real / "cache" / "scratch"))
+    elif where == "TMPDIR-in-the-home":
+        monkeypatch.setenv("TMPDIR", str(real / "cache"))
+    elif where == "a-symlink-into-the-home":
+        link = tmp_path / "tmp"
+        try:
+            link.symlink_to(real / "cache", target_is_directory=True)
+        except OSError as exc:  # e.g. Windows without the symlink privilege
+            pytest.skip(f"cannot make a symlink here: {exc}")
+        monkeypatch.setattr(tempfile, "tempdir", str(link))
+    else:
+        if not (account / ".HERMES" / "cache").is_dir():
+            pytest.skip("a case-sensitive file system: .HERMES is not .hermes here")
+        monkeypatch.setattr(tempfile, "tempdir", str(account / ".HERMES" / "cache"))
+    before = _tree(tmp_path)
+    for make in (lambda: hermes_home_pin.tmp_root("hermes-refused-"), hermes_home_pin.import_home):
+        with pytest.raises(RuntimeError, match="would be inside the real home; nothing was made"):
+            make()
+        assert _tree(tmp_path) == before
+    assert hermes_home_pin._IMPORT_HOME == {}
+
+
+def test_a_tmp_home_beside_the_real_home_is_made_even_when_its_name_starts_like_the_home(tmp_path, monkeypatch):
+    """Paths are compared part by part, not as strings: ``.hermes-other`` starts with ``.hermes`` and
+    is not in it, so a tmp home is made there."""
+    real = tmp_path / "account" / ".hermes"
+    beside = tmp_path / "account" / ".hermes-other"
+    for path in (real, beside):
+        path.mkdir(parents=True)
+    monkeypatch.setattr(hermes_home_pin, "_real_hermes_home", lambda: real)
+    monkeypatch.setattr(tempfile, "tempdir", str(beside))
+    made = hermes_home_pin.tmp_root("hermes-beside-")
+    try:
+        assert made.parent == beside.resolve() and made.is_dir()
+    finally:
+        made.rmdir()
