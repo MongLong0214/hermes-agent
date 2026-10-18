@@ -1,0 +1,47 @@
+Limit: the gateway uses the author only for its allowlist and runs every admitted turn as principal peer, so a forged header could record another participant's message as the allowlisted author but never run a turn as the owner; buzz-acp does not strip newlines from channel names, so a crafted channel name could still shift the fixed header lines
+Warn: the canonical shim attributes a prompt only from the last element of ACP params.prompt in buzz-acp's fixed single-event shape; merged and batched prompts are refused unattributed with one sender-anonymous notice to the producer-owned [Context] destination, journaled as posted, failed or notice_impossible, never as a published answer
+Record-Id: r-fbc50e394db6
+Provenance: inherited f3c1e3c5f2f77cb4f29116610a1ecd4efd09d30e
+
+Limit: a refused prompt with no event id in buzz-acp's own position gets its own refusal key, so the shim never drops distinct inputs; that key does not deduplicate a redelivered prompt
+Warn: the canonical shim posts an unattributed refusal's notice only when the whole params.prompt[0] [Context] is in buzz-acp's exact thread or channel form and agrees with the Tags line buzz-acp wrote at the end of the last event element: that event's only h tag is the channel, its NIP-10 root and parent are the thread, a channel-scope anchor is that event's own id, and the channel is registered with a counterpart; anything else is journaled notice_impossible and posted nowhere
+Warn: a prompt is attributed only when it holds exactly one [Buzz event: element, immediately after buzz-acp's [Context] or its quoted conversation history; a second event element or any element in between makes it unattributed
+Record-Id: r-22f560ce06c7
+Provenance: inherited 8ccba8b4f8d58f15a7e0a8254fe3afa91ff523c2
+
+Limit: an own post that is the last of two or more events in one list has no fixed From position, so its refusal still gets one notice, as before this change; the notice mentions no agent, so it starts no loop
+Warn: an unattributed refusal's key is built from the event ids buzz-acp writes under [Buzz event:] or under each --- Event N --- line, the elements' non-text fields, and [Context] without the channel's display name; a refreshed label, a 64-hex display name or a renamed channel gives the same key, while a prompt with no such id gets its own key so distinct inputs are never dropped, which is not redelivery deduplication
+Warn: a refusal whose last event is this bridge's own post is journaled own_echo and not answered, but only after notice_destination has bound the whole [Context] to that event and only from the From line at buzz-acp's fixed position; an unreadable registry or one with no valid ceo signer journals notice_impossible and posts nothing; attribution never uses this
+Record-Id: r-21093c983bed
+Provenance: inherited e727df33c9a14215775a88af94a4592ae508cb86
+
+Limit: more prompts now get a key of their own (a malformed event header, a real cancelled section of two or more events, a prompt without an exact-form [Context]), so a redispatch of one can be notified or journaled twice; no input is dropped
+Warn: event ids count for a refusal's key or its destination only where _confirmed_sections confirms them: the fixed line of a single-event element, or in an event list only when params.prompt[0] is buzz-acp's exact-form [Context] and each section k in 1..N has exactly one candidate (a cancelled section, which declares no count, only k = 1); anything ambiguous makes the prompt unidentified with its own key, and an unconfirmed anchor binds no destination
+Warn: a refusal is treated as this bridge's own echo only for a plain single-event prompt whose From at the fixed line is an own signer, and only after the [Context] destination and a registered counterpart are established; a merged prompt, a new-event element or an event list gets one notice to the conversation, which is not a notice to each author in it
+Record-Id: r-1d07e0b80307
+Provenance: inherited f67c37be6c05ad112a4005c6ca901f8fedb575f8
+
+Warn: when the selector refuses a canonical turn's shape, the gateway keeps its final answer only if bound_refused_answer proves it is this event's, this claim's and this turn's; the kept answer is never delivered or promoted to the event's answer, the event stays a 409 canonical_answer_unrecorded failure, and answer_kept is true only for text written and read back through the replay's own decoding
+Warn: the canonical shim posts one notice for a 409 canonical_event_failed, canonical_event_uncertain or canonical_event_conflict, a 5xx without a code and a transport failure, taking side_effects only from the gateway's own record (otherwise unknown) and never stating success when the outcome is unknown; refusals before a claim keep their silence
+Record-Id: r-03423abb2660
+Provenance: inherited e5bdac00f05647e827a9059c74c008a5f4db256e
+
+Limit: an unfinished turn's notice is posted only when a later shim starts and reaps the PUBLISHED/<event>.inflight marker whose owner died; a SIGKILL between claiming that marker and sending can still lose the post, so this is not crash safety
+Warn: the canonical shim runs one canonical turn at a time per process on its own thread while the stdin loop keeps reading, so buzz-acp's steer session/cancel is answered inside its 5 s drain: a prompt not yet submitted is cancelled and never submitted, one already submitted answers end_turn with _meta.canonical turn running and still posts once, and an event already in flight is never submitted again
+Record-Id: r-20204520c3ed
+Provenance: inherited c37b2cacc326bdc56c2a9509a1a92157209cba60
+
+Limit: no recovery nudge carries metadata bound to its run, so any nudged turn keeps nothing; the live D2 shape (event 813415c3) now ends as one explicit canonical_event_failed notice instead of a kept answer, and only refused turns without a nudge are kept
+Warn: an event's PUBLISHED/<event>.inflight entry appears only after its owner record is written and flocked in a private .claim file that is then os.link-ed into place, and ownership is relied on only while the file at that path is the locked one (same st_dev and st_ino); an event whose shim died before its outcome, which the reaper has marked unfinished_notice, is never submitted again and its outcome stays unknown
+Warn: bound_refused_answer keeps a refused turn's answer only when no row after this claim's opening row is a peer row and no user row appears inside the turn; matching a recovery nudge's text is never provenance
+Record-Id: r-d794f325366a
+Provenance: inherited 53d27b6d277720298f6b875c18a58d0600d40518
+
+Warn: the reaper retires an event's .inflight only after it has read back a complete unfinished_notice record for that same event and fsynced it and its directory; if the journal cannot be created or persisted, .inflight stays as an explicit unresolved state, the redelivered event is not submitted, and a later reap retires it once the record persists; a posted notice and a persisted record are separate facts
+Record-Id: r-0bff3ae952e0
+Provenance: inherited 20462c50433dc098a3d103432750a6a8c17743cd
+
+Limit: the defect predates #92 (the reviewer's three counterexamples fail at f67c37be); the live 3db10e78 gateway was not reproduced directly because its tree fails test collection, so its exposure stays suspected; missing metadata is never treated as a trusted row and no row is classified by its text
+Warn: a normally selected canonical turn is this event's answer only when turn_provenance says it binds to this claim: the opening row is this claim's own peer row and no other row carries canonical_peer metadata; otherwise it is refused as an explicit failure, never 200, recorded or posted; the refused-answer keep uses the same facts and additionally requires no interior user row, while the normal path's accepted shape stays governed by the selector
+Record-Id: r-31100c44da3c
+Provenance: inherited 30f903f32f34c4651c08ac8a286c7f63b480f51d
