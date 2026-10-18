@@ -509,18 +509,21 @@ def bound_refused_answer(result: Any, *, peer: Any, body: str, rendered: str, hi
     * the transcript suffix opens with this turn's own peer row: this claim's metadata with its fresh
       nonce (and this event's body), or exactly the rendering of it the model received;
     * it ends with one assistant row, without tool calls, whose text is the returned final answer;
-    * every user row between them is one of the agent's own recovery nudges, so no other principal's
-      message can have shaped it.
+    * no other row of the suffix is marked as a peer row (another event's, receipt's or nonce's, or this
+      one's again), and every row between the first and the last is the actor's own assistant or tool row.
+
+    Limit: a user row inside the turn — a recovery nudge included — makes the answer unbound. Matching a
+    nudge's fixed text is no provenance, and none of the five nudges carries metadata bound to this run:
+    ``_CODEX_INCOMPLETE_NUDGE``, ``_CODEX_ACK_CONTINUATION_NUDGE`` and ``_DEGENERATE_FINAL_NUDGE`` are
+    appended as bare ``{"role", "content"}`` rows, and ``_EMPTY_TOOL_RESPONSE_NUDGE`` /
+    ``_DROPPED_TOOLCALL_NUDGE_CONTENT`` carry only run-agnostic booleans (``_empty_recovery_synthetic``,
+    ``_dropped_toolcall_nudge``) that name no run. So a nudged turn, the live D2 shape among them, keeps
+    nothing here and stays an explicit failure.
 
     Anything else, or anything unreadable, is None: the event stays an explicit failure."""
-    from agent.canonical_peer import PeerProvenanceError, peer_body, peer_metadata
-    from agent.conversation_loop import (
-        _CODEX_ACK_CONTINUATION_NUDGE,
-        _CODEX_INCOMPLETE_NUDGE,
-        _DEGENERATE_FINAL_NUDGE,
-        _DROPPED_TOOLCALL_NUDGE_CONTENT,
-        _EMPTY_TOOL_RESPONSE_NUDGE,
-    )
+    from collections.abc import Mapping
+
+    from agent.canonical_peer import PEER_DISPLAY_KIND, PEER_METADATA_KEY, PeerProvenanceError, peer_body, peer_metadata
 
     if (not isinstance(result, dict) or result.get("completed") is not True
             or any(bool(result.get(flag)) for flag in ("failed", "partial", "interrupted"))
@@ -546,13 +549,13 @@ def bound_refused_answer(result: Any, *, peer: Any, body: str, rendered: str, hi
     if (not isinstance(last, dict) or last.get("role") != "assistant" or "tool_calls" in last
             or last.get("content") != final):
         return None
-    nudges = {_CODEX_INCOMPLETE_NUDGE, _CODEX_ACK_CONTINUATION_NUDGE, _DEGENERATE_FINAL_NUDGE,
-              _DROPPED_TOOLCALL_NUDGE_CONTENT, _EMPTY_TOOL_RESPONSE_NUDGE}
-    for row in suffix[1:-1]:
-        if not isinstance(row, dict) or row.get("role") not in ("assistant", "tool", "user"):
+    for row in suffix[1:]:
+        meta = row.get("display_metadata") if isinstance(row, dict) else None
+        if (not isinstance(row, dict) or row.get("display_kind") == PEER_DISPLAY_KIND
+                or (isinstance(meta, Mapping) and PEER_METADATA_KEY in meta)):
             return None
-        if row["role"] == "user" and row.get("content") not in nudges:
-            return None
+    if any(row.get("role") not in ("assistant", "tool") for row in suffix[1:-1]):
+        return None
     return final
 
 

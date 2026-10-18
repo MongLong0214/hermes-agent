@@ -13,6 +13,11 @@ this event's, this claim's and this turn's; ``answer_kept`` is true only once th
 through the replay's own decoding; and ``canonical_event_failed`` / ``_uncertain`` / ``_conflict``
 and an unanswered submission end in a notice instead of silence.
 
+Since #92 r1 (H92-02) a user row inside the turn makes the answer unbound: no recovery nudge carries
+provenance bound to the run, and matching its text is none. The live 813415c3 shape (a nudge inside the
+turn) therefore keeps nothing and ends as one explicit ``canonical_event_failed`` notice — never silence.
+The keep path is exercised by a refused shape with no user row inside the turn (``unnudged_retry``).
+
 The real shim drives the real canonical handler, coordinator and SQLite of an in-process gateway under
 a tmp home (the pattern of tests/bridge/test_shim_text_cap_notice.py).
 """
@@ -99,7 +104,7 @@ class _ShapedActor:
         self.session_id = session_id
         self._session_db = db
         self.runs = runs
-        self.shape = "nudged"
+        self.shape = "unnudged_retry"  # refused by the selector, provably this turn's
 
     def interrupt(self, text=None):
         pass
@@ -122,6 +127,8 @@ class _ShapedActor:
         nudge = {"role": "user", "content": _CODEX_INCOMPLETE_NUDGE}
         suffix = {
             "plain": [user, final],
+            "unnudged_retry": [user, empty, final],
+            "unnudged_retry_marked": [marked, empty, final],
             "nudged": [user, empty, nudge, final],
             "nudged_marked": [marked, empty, nudge, final],
             "foreign_marked": [foreign, empty, nudge, final],
@@ -338,16 +345,21 @@ def test_the_witness_prompt_is_valid_under_the_shims_own_rules(shim):
 # ── W2 (ported): the live 813415c3 shape ─────────────────────────────────────────────────────────────
 
 
-def test_w2_an_answer_the_actor_returned_is_never_dropped_when_its_turn_shape_is_refused(gw, shim):
+def test_w2_the_live_nudged_turn_is_never_dropped_silently_and_ends_as_one_explicit_failure(gw, shim):
+    """The live shape: its nudge row has no run-bound provenance (H92-02 Limit), so the answer is not kept
+    — and the sender is told once, explicitly, instead of nothing."""
+    gw.actor.shape = "nudged"
     _drive(shim)
 
     _reached_the_refusal(gw, shim)
     assert len(gw.runs) == 1, "the turn ran more than once"
-    assert len(shim.posts()) <= 1, "posted more than once"
-    assert FINAL in _held(gw), "the answer the actor returned is held nowhere in the receipt store"
+    assert gw.bound == [None] and _held(gw) == [], "an answer without run-bound provenance was kept"
+    assert _codes(gw) == [(409, "canonical_event_failed")]
+    [post] = shim.posts()
+    assert "canonical_event_failed" in post["stdin"] and FINAL not in post["stdin"]
 
 
-@pytest.mark.parametrize("shape", ["nudged", "nudged_marked"])
+@pytest.mark.parametrize("shape", ["unnudged_retry", "unnudged_retry_marked"])
 def test_a_proven_answer_is_kept_not_delivered_and_the_refusal_stays_the_events_terminal(gw, shim, shape):
     gw.actor.shape = shape
     _drive(shim)
@@ -376,7 +388,8 @@ def test_a_proven_answer_is_kept_not_delivered_and_the_refusal_stays_the_events_
     assert gw.bound == [FINAL]  # the binding check proved it, once; the replay never reached the actor
 
 
-@pytest.mark.parametrize("shape", ["other_user_row", "foreign_peer_row", "foreign_marked", "final_mismatch"])
+@pytest.mark.parametrize("shape", ["nudged", "nudged_marked", "other_user_row", "foreign_peer_row",
+                                   "foreign_marked", "final_mismatch"])
 def test_an_answer_not_provably_this_turns_is_not_kept_and_the_failure_is_noticed(gw, shim, shape):
     gw.actor.shape = shape
     _drive(shim)

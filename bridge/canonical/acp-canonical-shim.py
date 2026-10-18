@@ -1114,35 +1114,82 @@ UNFINISHED_NOTICE = (
     "않습니다. 이 브리지는 이 메시지를 자동으로 다시 제출하지 않습니다. (event {event_id})")
 
 
+def _same_file(fd, path):
+    """Ownership, checked each time it is relied on: the entry now at *path* is the very file *fd* holds
+    locked (same st_dev and st_ino). An unlinked or replaced entry is never ownership."""
+    try:
+        held, named = os.fstat(fd), os.stat(path, follow_symlinks=False)
+    except OSError:
+        return False
+    return (held.st_dev, held.st_ino) == (named.st_dev, named.st_ino)
+
+
 def _claim_inflight(base, channel):
-    """The fd of ``PUBLISHED/<event id>.inflight``, held under an exclusive ``flock`` while this process
-    owns the event's turn. The kernel drops the lock when the process dies, which is how a later shim
-    tells a replaced owner from a live one. False: another live process holds it. None: it cannot be
-    written, and the submission goes on unjournaled."""
+    """(fd, None) holding ``PUBLISHED/<event id>.inflight`` under an exclusive ``flock`` while this process
+    owns the event's turn, or (None, why not). The kernel drops the lock when the process dies, which is
+    how a later shim tells a replaced owner from a live one.
+
+    The entry is published only once initialized and locked: the owner record is written and fsync'd to
+    a private file under the lock, which is then linked to the entry's name (``link`` never replaces a
+    name). So no reader ever finds it empty or unlocked while its owner lives. A name already taken — a
+    live owner, or an unfinished entry not yet reaped — is no claim, and neither is a name that does not
+    end up being this very file."""
     path = os.path.join(PUBLISHED, base + INFLIGHT_SUFFIX)
-    for _ in range(3):
+    private = os.path.join(PUBLISHED, f".{base}.{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}.claim")
+    try:
+        os.makedirs(PUBLISHED, exist_ok=True)
+        fd = os.open(private, os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    except OSError as exc:
+        return None, f"the in-flight entry cannot be written: {type(exc).__name__}"
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        record = (json.dumps({"event_id": base, "channel": channel, "pid": os.getpid(),
+                              "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}) + "\n").encode()
+        if os.write(fd, record) != len(record):
+            raise OSError("short write")
+        os.fsync(fd)
+        os.link(private, path)
+    except FileExistsError:
+        os.close(fd)
+        return None, "another shim process holds this event, or its unfinished entry is not yet reaped"
+    except OSError as exc:
+        os.close(fd)
+        return None, f"the in-flight entry was not published: {type(exc).__name__}"
+    finally:
         try:
-            os.makedirs(PUBLISHED, exist_ok=True)
-            fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-        except OSError as exc:
-            log(f"prompt {base[:12]}… in-flight entry not journaled: {type(exc).__name__}")
-            return None
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            os.unlink(private)
         except OSError:
-            os.close(fd)
-            return False
-        try:
-            if os.fstat(fd).st_ino != os.stat(path).st_ino:
-                os.close(fd)  # its owner finished and unlinked it meanwhile: take the new name
-                continue
-            os.ftruncate(fd, 0)
-            os.write(fd, (json.dumps({"event_id": base, "channel": channel, "pid": os.getpid(),
-                                      "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}) + "\n").encode())
-        except OSError as exc:
-            log(f"prompt {base[:12]}… in-flight entry not written: {type(exc).__name__}")
-        return fd
-    return None
+            pass
+    if not _same_file(fd, path):
+        os.close(fd)
+        return None, "the in-flight entry was replaced as it was published"
+    return fd, None
+
+
+def _unfinished(base):
+    """Why *base* must never be submitted again, or None. The record read is the event's existing
+    PUBLISHED journal entry, and only to refuse a resubmission — it never decides or completes delivery,
+    and the gateway receipt stays the turn's outcome. An ``unfinished_notice`` entry is the reaper's: a
+    shim submitted the event (or was about to) and ended without its outcome, so whether the turn ran is
+    unknown, and it stays unresolved rather than being sent again. An entry with no complete record (a
+    post cut short) is as unknown. An answer or notice entry is the turn's own outcome: a redelivery is
+    submitted as before, and the gateway answers it from the receipt without running it again."""
+    try:
+        with open(os.path.join(PUBLISHED, base), encoding="utf-8") as handle:
+            raw = handle.read(65_536)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        return f"its journal entry is unreadable ({type(exc).__name__})"
+    try:
+        kind = json.loads(raw.splitlines()[0]).get("kind")
+    except Exception:
+        kind = None
+    if kind in ("answer", "notice"):
+        return None
+    if kind == "unfinished_notice":
+        return "a shim submitted it and ended before its outcome; whether the turn ran is unknown"
+    return "its journal entry holds no complete record"
 
 
 def _wait_for_turn_slot(prompt, session):
@@ -1161,8 +1208,11 @@ def _wait_for_turn_slot(prompt, session):
 
 def begin_submission(session, base, channel):
     """Take the turn slot and the event's in-flight entry before *base* is submitted. False when it must
-    not be submitted: already in flight here or in another live shim process, cancelled while it
-    waited, or the slot still taken at the busy deadline. Past this point a cancel never recalls it."""
+    not be submitted: already in flight here or in another live shim process, already submitted by a
+    shim that ended without its outcome (``_unfinished``), cancelled while it waited, the slot still taken
+    at the busy deadline, or the entry not provably this process's. Past this point a cancel never
+    recalls it. Refusing a resubmission is no execution or delivery guarantee: a turn whose shim ended
+    stays unknown, and is told once as such by the reaper."""
     prompt = getattr(_local, "prompt", None)
     with _INFLIGHT_LOCK:
         if base in _INFLIGHT:
@@ -1178,9 +1228,15 @@ def begin_submission(session, base, channel):
                 if prompt is not None and prompt.cancelled.is_set()
                 else f"an earlier turn still held this process's turn slot after {BUSY_DEADLINE_SECS:.0f}s"))
             return False
-        journal = _claim_inflight(base, channel)
-        if journal is False:
-            log(f"prompt {base[:12]}… NOT submitted: another live shim process is submitting this event")
+        journal, why = _claim_inflight(base, channel)
+        if journal is None:
+            log(f"prompt {base[:12]}… NOT submitted: {why}")
+            return False
+        why = _unfinished(base)
+        if why is None and not _same_file(journal, os.path.join(PUBLISHED, base + INFLIGHT_SUFFIX)):
+            why = "this process no longer holds the event's in-flight entry"
+        if why is not None:
+            log(f"prompt {base[:12]}… NOT submitted again: {why}")
             return False
         if prompt is not None:
             with prompt.lock:
@@ -1193,7 +1249,7 @@ def begin_submission(session, base, channel):
         return True
     finally:
         if not ok:
-            if isinstance(journal, int) and not isinstance(journal, bool):
+            if journal is not None:
                 _drop_inflight(base, journal)
             if taken:
                 _TURN_SLOT.release()
@@ -1204,7 +1260,7 @@ def begin_submission(session, base, channel):
 def _drop_inflight(base, fd):
     path = os.path.join(PUBLISHED, base + INFLIGHT_SUFFIX)
     try:
-        if os.stat(path).st_ino == os.fstat(fd).st_ino:
+        if _same_file(fd, path):
             os.unlink(path)
     except OSError:
         pass
@@ -1268,7 +1324,7 @@ def reap_unfinished():
         try:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                if os.fstat(fd).st_ino != os.stat(path).st_ino:
+                if not _same_file(fd, path):
                     continue  # finished and unlinked meanwhile
                 raw = os.read(fd, 4096)
             except OSError:
