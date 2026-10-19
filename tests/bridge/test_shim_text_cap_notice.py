@@ -517,11 +517,15 @@ def test_control_a_short_thread_reply_reaches_the_gateway_byte_for_byte(gw, shim
     assert _reply(post) == (CHANNEL, EVENT, "@cto-repo-factory answer #1")
 
 
-def test_control_any_other_refusal_still_posts_nothing(gw, shim):
+def test_control_any_other_refusal_posts_no_text_cap_notice(gw, shim):
     drive(shim, thread_prompt([entry(1, 100)], "@ceo hello", sender="f" * 64))  # not an allowed author
 
     assert len(gw.received) == 1 and gw.runs == []
-    assert shim.posts() == [] and shim.journal() is None
+    # #95 (CEO 027b7d89): a principal refusal now tells the sender once, never the text-cap notice.
+    [post] = shim.posts()
+    channel, event, body = _reply(post)
+    assert (channel, event) == (CHANNEL, EVENT)
+    assert "CEO 에게 전달되지 않았습니다" in body and "길이 한도" not in body
 
 
 def test_canary_a_live_path_or_surface_fails_before_anything_is_loaded_or_written(tmp_path, monkeypatch):
