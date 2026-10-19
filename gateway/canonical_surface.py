@@ -185,6 +185,26 @@ class CanonicalSurfaceBinding:
     telegram_thread_id: str | None
     allowed_author_ids: tuple[str, ...]
     allowed_channel_ids: tuple[str, ...]
+    # The intended (author_id, channel_id) pairs, in declared order. Empty for a binding of one author
+    # in one channel, which admits exactly that pair.
+    pairs: tuple[tuple[str, str], ...] = ()
+
+    def admits(self, author_id: Any, channel_id: Any) -> bool:
+        """Only a declared pair, never the cross product of the two lists: a peer admitted in its own
+        room is refused in every other room the binding lists. With no pairs declared, only the single
+        author in the single channel; more than one of either with no pairs admits nothing."""
+        if author_id not in self.allowed_author_ids or channel_id not in self.allowed_channel_ids:
+            return False
+        if self.pairs:
+            return (author_id, channel_id) in self.pairs
+        return len(self.allowed_author_ids) == 1 and len(self.allowed_channel_ids) == 1
+
+    def primary_pair(self) -> tuple[str, str]:
+        """The binding's own (author_id, channel_id): the first declared pair, or else the single author
+        and channel. IndexError when the binding names neither."""
+        if self.pairs:
+            return self.pairs[0]
+        return self.allowed_author_ids[0], self.allowed_channel_ids[0]
 
 
 @dataclass(frozen=True)
@@ -326,10 +346,7 @@ class ExistingCanonicalBindingResolver:
     def _resolve(
         self, binding: CanonicalSurfaceBinding, event: Any, *, require_proof: bool
     ) -> tuple[Any, CanonicalBindingProof | None]:
-        if (
-            getattr(event, "author_id", None) not in binding.allowed_author_ids
-            or getattr(event, "channel_id", None) not in binding.allowed_channel_ids
-        ):
+        if not binding.admits(getattr(event, "author_id", None), getattr(event, "channel_id", None)):
             raise ValueError("canonical_principal_rejected")
 
         entry = self._session_store.lookup_by_session_key_existing(binding.session_key)
