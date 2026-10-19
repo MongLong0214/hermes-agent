@@ -829,6 +829,12 @@ def refusal_notice(status, code, error, event_id, chars):
                 f"(HTTP 400 {code}, 제출 {chars}자, 길이 한도 {GATEWAY_TEXT_LIMIT}자). 턴은 실행되지 않았고 "
                 f"자동 재전송도 없습니다. 메시지를 나눠 보내거나 새 최상위 스레드로 다시 시작해 주세요. "
                 f"(event {event_id})")
+    if status == 403 and code == "canonical_principal_rejected":
+        # Refused before any claim: this sender is not admitted in this room. The body can name a key
+        # or a binding, so none of it is copied — the text is fixed and names only the event.
+        return ("이 메시지는 CEO 에게 전달되지 않았습니다. 이 방에서 이 발신자의 메시지는 CEO 가 받지 않도록 "
+                "설정되어 있습니다. 턴은 실행되지 않았고 자동 재전송도 없습니다. "
+                f"(event {event_id})")
     if status == 409 and code == "canonical_answer_unrecorded":
         # The turn ran once and its answer is held at the gateway, unbound to any receipt: it is not
         # delivered, the turn is never re-run, and this event is not resent (#1110).

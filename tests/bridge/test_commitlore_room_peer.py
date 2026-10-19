@@ -300,7 +300,8 @@ def test_both_rooms_in_turn_each_answer_goes_to_its_own_room(gw, shim):
     (LPM_CTO, CL_ROOM),  # a foreign author in an admitted room
     (LPM_CTO, LPM_ROOM),  # a registered room the binding does not admit (Logic, until its CTO is live)
 ], ids=["rf-cto-in-commitlore", "clore-cto-in-repo-factory", "foreign-author", "foreign-room"])
-def test_a_cross_or_foreign_pair_is_refused_at_the_gateway_and_nothing_is_posted(gw, shim, author, room):
+def test_a_cross_or_foreign_pair_is_refused_once_and_the_sender_is_told_without_the_refusal_body(
+        gw, shim, author, room):
     event = _hex("d1000001")
     drive(shim, mention(event, author, room, "@ceo should not run"))
 
@@ -308,5 +309,16 @@ def test_a_cross_or_foreign_pair_is_refused_at_the_gateway_and_nothing_is_posted
     assert (sent["author_id"], sent["channel_id"]) == (author, room)  # the event's own, nothing stands in
     [(status, body)] = gw.answers
     assert (status, body["error"]["code"]) == (403, "canonical_principal_rejected")
-    assert gw.runs == []
-    assert shim.posts() == []  # a refusal before the claim keeps its silence
+    assert gw.runs == []  # refused before the claim, and not retried
+    notice = (
+        "이 메시지는 CEO 에게 전달되지 않았습니다. 이 방에서 이 발신자의 메시지는 CEO 가 받지 않도록 "
+        "설정되어 있습니다. 턴은 실행되지 않았고 자동 재전송도 없습니다. "
+        f"(event {event})")
+    [post] = shim.posts()
+    assert _reply(post) == (room, event, f"@{ROOMS[room][2]} {notice}")
+    posted = json.dumps(post)
+    assert gw.key not in posted and author not in post["stdin"] and "Canonical request rejected" not in posted
+    assert "acp-canonical-ceo" not in post["stdin"]
+
+    drive(shim, mention(event, author, room, "@ceo should not run"), rpc_id=2)
+    assert shim.posts() == [post] and gw.runs == []
