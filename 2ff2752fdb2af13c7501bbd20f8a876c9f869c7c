@@ -1,0 +1,4 @@
+Limit: the notice says only that the sender is not admitted in this room; it does not say how to get admitted, and other 403 codes (canonical_binding_unknown) stay silent
+Warn: a 403 canonical_principal_rejected now posts one fixed notice to the sender's thread ('이 메시지는 CEO 에게 전달되지 않았습니다…', event id only) through the existing journaled notice path, so a refused human never sees silence; the gateway body is never copied because it can name a key or binding, and the bridge's own signer is still refused locally, so the notice cannot loop
+Record-Id: r-1b84e893e56b
+Provenance: inherited 521a0b3fecbd9052f15b6b2a9b9cff04d3cb3730
