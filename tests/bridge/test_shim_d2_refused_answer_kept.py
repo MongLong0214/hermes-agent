@@ -490,10 +490,67 @@ def test_each_post_claim_terminal_code_has_a_notice_that_assumes_nothing(shim, c
 
 
 @pytest.mark.parametrize(("status", "code"), [(409, "canonical_turn_busy"), (409, "canonical_binding_stale"),
-                                              (403, "canonical_principal_rejected"), (401, None),
+                                              (403, "canonical_binding_unknown"), (401, None),
                                               (503, "canonical_unavailable")])
 def test_control_a_refusal_raised_before_the_claim_keeps_its_existing_silence(shim, status, code):
     assert shim.refusal_notice(status, code, {"code": code} if code else {}, EVENT, 300) is None
+
+
+_PRINCIPAL_NOTICE = (
+    "이 메시지는 CEO 에게 전달되지 않았습니다. 이 방에서 이 발신자의 메시지는 CEO 가 받지 않도록 "
+    "설정되어 있습니다. 턴은 실행되지 않았고 자동 재전송도 없습니다. (event {event_id})")
+
+
+def test_a_403_principal_rejection_posts_one_fixed_notice_and_a_redelivery_posts_nothing_more(
+        gw, shim, monkeypatch):
+    """HTTP 403 canonical_principal_rejected tells the sender once, in fixed text. The gateway body
+    (its prose, a binding name, a key) is not copied, the refusal is not retried, and a second
+    delivery of the same event does not post again."""
+    expected = _PRINCIPAL_NOTICE.format(event_id=EVENT)
+    secret = "sk-live-" + gw.key
+    binding = "acp-canonical-ceo"
+    poisoned = {"code": "canonical_principal_rejected", "message": "Canonical request rejected.",
+                "binding": binding, "key": secret}
+    notice = shim.refusal_notice(403, "canonical_principal_rejected", poisoned, EVENT, 300)
+    assert notice == expected
+    assert secret not in notice and gw.key not in notice and binding not in notice
+    assert "Canonical request rejected" not in notice
+
+    calls = []
+
+    def urlopen(request, timeout=None):
+        calls.append(1)
+        raise urllib.error.HTTPError(request.full_url, 403, "refused", {}, io.BytesIO(json.dumps(
+            {"error": poisoned}).encode()))
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    _drive(shim)
+
+    assert calls == [1]  # 403 leaves the submit loop; it is not the busy retry
+    [post] = shim.posts()
+    assert post["stdin"] == f"@cto-repo-factory {expected}"
+    assert secret not in json.dumps(post) and gw.key not in json.dumps(post)
+    assert binding not in post["stdin"] and "Canonical request rejected" not in post["stdin"]
+    journal = json.loads((shim.root / "published" / EVENT).read_text())
+    assert (journal["kind"], journal["sent"], journal["event_id"]) == ("notice", True, EVENT)
+
+    _drive(shim, rpc_id=5)
+    assert shim.posts() == [post]
+
+
+def test_the_bridges_own_signer_is_refused_locally_and_never_submitted(gw, shim):
+    """A notice this bridge signed comes back as its own signer. That is refused before submit, so
+    it cannot be refused again at the gateway and post another notice."""
+    own = bp.format_prompt(CHANNEL, "repo-factory", [bp.Ev(
+        EVENT, OTHER, 1_792_324_251, "the bridge's own notice", [["h", CHANNEL]], prompt_tag="message")],
+        {OTHER: "ceo", SIGNER: "cto-repo-factory"})
+    blocks = bp.prompt_params("s", own)["prompt"]
+    assert shim.envelope(blocks)[:3] == (OTHER, CHANNEL, EVENT)
+
+    shim.handle({"jsonrpc": "2.0", "id": 9, "method": "session/prompt", "params": bp.prompt_params("s", own)})
+
+    assert gw.responses == [] and gw.runs == [] and shim.posts() == []
+    assert "refused locally: authored by this bridge's own signer" in (shim.root / "shim.log").read_text()
 
 
 def test_a_submission_the_gateway_never_answered_ends_in_a_notice_that_states_no_outcome(gw, shim, monkeypatch):
