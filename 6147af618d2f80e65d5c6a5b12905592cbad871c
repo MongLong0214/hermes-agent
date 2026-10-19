@@ -1,0 +1,4 @@
+Limit: a binding built in code with several authors or channels and no pairs admits no one instead of the cross product; cross-pair refusal is proven with synthetic keys through the real POST route and SQLite, and the live refusal is checked only after cutover
+Warn: the canonical Buzz binding now admits only its declared author-channel pairs, so the live config and this code must change in the same gateway restart: a buzz block with more than one author or channel and no pairs now refuses to load (the gateway does not start), while the previous code refuses any pairs key; keep the repo-factory pair first, because the identity route resolves the first declared pair and accepts exactly one binding
+Record-Id: r-da538edc7504
+Provenance: inherited 1cd3b58d158ccfdfd96391d62ad5394ff6b809d9
