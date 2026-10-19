@@ -137,8 +137,8 @@ async def handle_canonical_surface_identity(self, request: "web.Request") -> "we
     binding = next(iter(bindings.values()))
     resolver = ExistingCanonicalBindingResolver(runner.session_store)
     try:
-        entry = resolver.resolve(binding, SimpleNamespace(
-            author_id=binding.allowed_author_ids[0], channel_id=binding.allowed_channel_ids[0]))
+        author_id, channel_id = binding.primary_pair()
+        entry = resolver.resolve(binding, SimpleNamespace(author_id=author_id, channel_id=channel_id))
         path = resolver._existing_db_path(binding.session_key)
         if path is None:
             raise ValueError("canonical_binding_stale")

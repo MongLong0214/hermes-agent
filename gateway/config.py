@@ -602,6 +602,28 @@ def _parse_canonical_surface_bindings(value: Any) -> Dict[str, Any]:
             raise ValueError("canonical surface principal lists must be unique")
         return result  # type: ignore[return-value]
 
+    def buzz_pairs(buzz: dict) -> tuple[tuple[str, str], ...]:
+        # Admission is by declared pair, never by the two lists alone: two authors and two channels
+        # without pairs would also admit each author in the other's channel.
+        authors, channels = principals(buzz["author_ids"]), principals(buzz["channel_ids"])
+        if "pairs" not in buzz:
+            if len(authors) != 1 or len(channels) != 1:
+                raise ValueError("canonical Buzz binding must declare its author–channel pairs")
+            return ()
+        raw = buzz["pairs"]
+        if not isinstance(raw, list) or not raw:
+            raise ValueError("canonical Buzz binding pairs must be a non-empty list")
+        result = []
+        for item in raw:
+            if not isinstance(item, dict) or set(item) != {"author_id", "channel_id"}:
+                raise ValueError("canonical Buzz binding pair schema is invalid")
+            result.append((text(item["author_id"]), text(item["channel_id"])))
+        if len(set(result)) != len(result):
+            raise ValueError("canonical Buzz binding pairs must be unique")
+        if {a for a, _ in result} != set(authors) or {c for _, c in result} != set(channels):
+            raise ValueError("canonical Buzz binding pairs must cover exactly its author_ids and channel_ids")
+        return tuple(result)  # type: ignore[return-value]
+
     parsed: Dict[str, Any] = {}
     for raw_name, raw in value.items():
         name = text(raw_name, maximum=128)
@@ -610,7 +632,7 @@ def _parse_canonical_surface_bindings(value: Any) -> Dict[str, Any]:
         telegram, buzz = raw["telegram"], raw["buzz"]
         if not isinstance(telegram, dict) or set(telegram) != {"chat_id", "chat_type", "user_id", "thread_id"}:
             raise ValueError("canonical Telegram binding schema is invalid")
-        if not isinstance(buzz, dict) or set(buzz) != {"author_ids", "channel_ids"}:
+        if not isinstance(buzz, dict) or set(buzz) - {"pairs"} != {"author_ids", "channel_ids"}:
             raise ValueError("canonical Buzz binding schema is invalid")
         chat_type = text(telegram["chat_type"], maximum=16)
         if chat_type not in {"dm", "group", "channel", "thread"}:
@@ -627,6 +649,7 @@ def _parse_canonical_surface_bindings(value: Any) -> Dict[str, Any]:
             telegram_thread_id=text(telegram["thread_id"], optional=True),
             allowed_author_ids=principals(buzz["author_ids"]),
             allowed_channel_ids=principals(buzz["channel_ids"]),
+            pairs=buzz_pairs(buzz),
         )
     return parsed
 
@@ -774,6 +797,10 @@ class GatewayConfig:
                     "buzz": {
                         "author_ids": list(binding.allowed_author_ids),
                         "channel_ids": list(binding.allowed_channel_ids),
+                        # Present only when declared, so a binding of one author in one channel
+                        # serializes as it always did.
+                        **({"pairs": [{"author_id": author, "channel_id": channel}
+                                      for author, channel in binding.pairs]} if binding.pairs else {}),
                     },
                 }
                 for name, binding in self.canonical_surface_bindings.items()
