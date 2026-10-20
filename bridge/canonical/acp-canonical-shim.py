@@ -58,6 +58,8 @@ QUARANTINE = os.environ.get(
 # send, and a failed or refused send is logged, never retried.
 BUZZ_CLI = os.environ.get("CANONICAL_BUZZ_CLI", os.path.expanduser("~/.hermes/bridge/bin/buzz"))
 MENTIONS = os.environ.get("CANONICAL_MENTIONS_FILE", os.path.expanduser("~/.hermes/bridge/required-mentions.json"))
+# Owner broadcasts may wake the CEO only in its paired project channels (2026-10-20).
+OWNER = "d046238dd1422955898205bd60507992cb101a1ea2ecfa6e52fd00d5ddca98c4"
 PUBLISHED = os.environ.get("CANONICAL_PUBLISHED_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                                                    "published"))
 PUBLISH_TIMEOUT = float(os.environ.get("CANONICAL_PUBLISH_TIMEOUT_SECS", "60"))
@@ -1524,6 +1526,20 @@ def handle(message):
             result(rpc_id, {"stopReason": "end_turn"})
             return
         author, channel, base, body = parsed
+        # The producer's title or final Tags line identifies a mention, including in all/config
+        # mode. Body text and thread history cannot supply either. Drop broadcasts before holds,
+        # receipts, canary claims and notices; a published mention cannot also become a broadcast turn.
+        lines = prompt_blocks(prompt)[-1].split("\n")
+        tags = _tags_at_end(lines)
+        signers, unknown = _own_signers()
+        mentioned = lines[0] == "[Buzz event: @mention]" or (
+            tags is not None and signers is not None
+            and any(len(tag) >= 2 and tag[0] == "p" and tag[1] in signers for tag in tags))
+        if not mentioned:
+            if (author != OWNER or _peer_handle(channel) is None
+                    or os.path.exists(os.path.join(PUBLISHED, base))):
+                result(rpc_id, {"stopReason": "end_turn"})
+                return
         log(f"prompt author={author[:12]}… channel={channel} base={base[:12]}… chars={len(text)}")
         # Every refusal is decided before anything is claimed, so an armed canary is spent only on an
         # event that is actually submitted — not on an echo, an unreadable registry or an oversize text.
@@ -1531,7 +1547,6 @@ def handle(message):
             hold(session, author, channel, base, text)
             result(rpc_id, {"stopReason": "end_turn"})
             return
-        signers, unknown = _own_signers()
         if signers is None:
             log(f"prompt {base[:12]}… HELD, not sent: {unknown}")
             journal_held(base, channel, unknown)
@@ -1539,7 +1554,7 @@ def handle(message):
             return
         if author in signers:
             # This bridge's own post — an answer or a not-delivered notice — coming back. buzz-acp drops
-            # it first (ignore-self, the author gate, mentions-only) and the binding's author allowlist
+            # it first (ignore-self, the author gate) and the binding's author allowlist
             # refuses it after, but nothing here may depend on either: forwarded, it would reach the CEO
             # as a turn and be answered into the thread under a new event id, which no per-event marker
             # stops. (A registry that cannot be read cannot rule an echo out: held above, nothing posted —
