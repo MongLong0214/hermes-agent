@@ -90,7 +90,9 @@ def channel_prompt(body):
     """buzz-acp's own single-event prompt for a top-level message (queue.rs ``format_prompt``, ported in
     buzz_prompt_port): ``[Context]`` and the event as elements of their own, the event's Tags line naming
     the [Context] channel, and the anchor its own id, as #91 r1 requires."""
-    return bp.format_prompt(CHANNEL, "repo-factory", [bp.Ev(EVENT, SIGNER, 1_792_324_251, body, [["h", CHANNEL]],
+    # Receipt tests must reach a turn: non-owner broadcasts are now intentionally dropped.
+    return bp.format_prompt(CHANNEL, "repo-factory", [bp.Ev(EVENT, SIGNER, 1_792_324_251, body,
+                                                            [["h", CHANNEL], ["p", OTHER]],
                                                             prompt_tag="message")], {SIGNER: "cto-repo-factory"})
 
 
@@ -542,7 +544,8 @@ def test_the_bridges_own_signer_is_refused_locally_and_never_submitted(gw, shim)
     """A notice this bridge signed comes back as its own signer. That is refused before submit, so
     it cannot be refused again at the gateway and post another notice."""
     own = bp.format_prompt(CHANNEL, "repo-factory", [bp.Ev(
-        EVENT, OTHER, 1_792_324_251, "the bridge's own notice", [["h", CHANNEL]], prompt_tag="message")],
+        EVENT, OTHER, 1_792_324_251, "the bridge's own notice", [["h", CHANNEL], ["p", OTHER]],
+        prompt_tag="message")],
         {OTHER: "ceo", SIGNER: "cto-repo-factory"})
     blocks = bp.prompt_params("s", own)["prompt"]
     assert shim.envelope(blocks)[:3] == (OTHER, CHANNEL, EVENT)

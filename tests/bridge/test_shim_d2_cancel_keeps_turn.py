@@ -51,7 +51,9 @@ ROOT_TEXT = "root message without a mention " + "x" * 400
 
 
 def _ev(event_id, content, *, root=None, tag="message", at=1_792_324_251):
-    return bp.Ev(event_id, SIGNER, at, content, [["h", CHANNEL]] + ([["e", root, "", "root"]] if root else []),
+    # Cancellation tests must reach a turn: non-owner broadcasts are now intentionally dropped.
+    return bp.Ev(event_id, SIGNER, at, content, [["h", CHANNEL], ["p", OTHER]]
+                 + ([["e", root, "", "root"]] if root else []),
                  prompt_tag=tag)
 
 
