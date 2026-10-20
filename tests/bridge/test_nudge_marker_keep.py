@@ -1,15 +1,7 @@
-"""FIX-NUDGE-MARKER: a refused canonical turn whose only user rows inside the turn are this run's own
-recovery nudges keeps its answer (kept, never delivered: 409 canonical_answer_unrecorded), through the real
-shim, canonical handler, coordinator and SQLite of tests/bridge/test_shim_d2_refused_answer_kept.py.
+"""Recovery markers constrain the kept-answer fallback after a tool-pairing refusal.
 
-Since #92 r1 (H92-02) any user row inside the turn left the answer unbound, because no nudge carried
-metadata bound to its run; the live D2 shape (#1110: a refused turn with a recovery nudge) kept nothing.
-Each nudge row the agent appends is now marked ``_recovery_nudge: {"kind", "run"}`` with ``run`` the nonce
-of the turn's own peer opening row (agent.recovery_nudge; the real-path witnesses that the agent code
-writes exactly this row are in tests/agent/test_recovery_nudge_marker.py). The keep accepts an interior
-user row only when its marker names this claim's nonce, one of the five kinds and, after both, that kind's
-text as its content; anything else still unbinds the answer, and ``binds`` stays required. The rows below
-are the rows each site's turn returns, with the marker as the agent writes it.
+Completed turns deliver through recovery rows regardless of their nudge markers. A refused turn's
+fallback still requires its own run-bound nudges and rejects any foreign peer provenance.
 """
 
 import json
@@ -81,7 +73,7 @@ def _another_claims_peer():
                                 event_id=o4.EVENT, receipt="canonical-receipt:v2:" + "e" * 64)
 
 
-def _turn(gw, monkeypatch, kind, nudge_for, *, extra=None):
+def _turn(gw, monkeypatch, kind, nudge_for, *, extra=None, refuse=True):
     """The bound agent's turn: its own peer opening row as the real agent returns it (clean body, this
     claim's metadata), then ``kind``'s recovery rows with the nudge ``nudge_for(peer)`` builds;
     ``extra(peer, rows)`` may change those rows."""
@@ -95,6 +87,9 @@ def _turn(gw, monkeypatch, kind, nudge_for, *, extra=None):
         rows = _recovery(kind, nudge_for(peer))
         if extra is not None:
             extra(peer, rows)
+        if refuse:
+            # A real pairing error reaches the fallback; recovery rows alone must deliver.
+            rows.insert(-1, {"role": "assistant", "tool_calls": [_call("missing-result")]})
         return {"completed": True, "session_id": task_id, "final_response": o4.FINAL,
                 "messages": [*conversation_history, opening, *rows]}
 
@@ -124,8 +119,9 @@ def _kept_not_delivered(gw, shim):
 
 
 def _unbound_and_noticed(gw, shim):
-    o4._reached_the_refusal(gw, shim)
-    assert gw.bound == [None], "an answer without this run's provenance was proved bound"
+    o4._attributed_and_submitted(gw, shim)
+    assert len(gw.runs) == 1
+    assert not any(gw.bound), "an answer without this run's provenance was proved bound"
     assert gw.rows("canonical-answer-kept:") == {} and o4._held(gw) == []
     assert not (gw.home / "canonical-answer-kept").exists()
     assert o4._codes(gw) == [(409, "canonical_event_failed")]
@@ -143,12 +139,11 @@ def test_a_refused_turn_with_this_runs_own_nudge_keeps_its_answer_not_delivered(
     _kept_not_delivered(gw, shim)
 
 
-def test_the_live_d2_shape_an_empty_tool_response_nudge_inside_the_turn_is_kept(gw, shim, monkeypatch):
-    """#1110: tool work, an empty response, the agent's nudge, more tool work, the answer. The selector
-    refuses it (a user row inside the turn); the answer is this run's, so it is kept, not delivered."""
-    _turn(gw, monkeypatch, "empty_tool_response", lambda peer: _nudge("empty_tool_response", peer["nonce"]))
+def test_the_live_d2_shape_with_an_empty_tool_response_nudge_delivers(gw, shim, monkeypatch):
+    _turn(gw, monkeypatch, "empty_tool_response", lambda peer: _nudge("empty_tool_response", peer["nonce"]),
+          refuse=False)
     o4._drive(shim)
-    _kept_not_delivered(gw, shim)
+    o4._delivered_once(gw, shim)
 
 
 def test_two_of_this_runs_nudges_in_one_turn_keep_its_answer(gw, shim, monkeypatch):
@@ -246,7 +241,7 @@ def test_a_marked_nudge_in_a_turn_opened_under_another_claims_nonce_is_not_kept(
     _unbound_and_noticed(gw, shim)
 
 
-# ── the normal path is unchanged ─────────────────────────────────────────────────────────────────────
+# ── completed turns deliver ─────────────────────────────────────────────────────────────────────
 
 
 def test_control_a_normal_turn_is_recorded_and_posted_once(gw, shim):
@@ -257,12 +252,8 @@ def test_control_a_normal_turn_is_recorded_and_posted_once(gw, shim):
     assert [post["stdin"] for post in shim.posts()] == [f"@cto-repo-factory {o4.FINAL}"]
 
 
-def test_control_the_selector_still_refuses_a_turn_with_this_runs_nudge(gw, shim, monkeypatch):
-    """Not widened: the normal path never accepts a nudged turn; only the refused-answer keep reads the
-    marker, and the event stays a 409 failure, never 200."""
-    _turn(gw, monkeypatch, "codex_incomplete", lambda peer: _nudge("codex_incomplete", peer["nonce"]))
+def test_completed_turn_with_this_runs_nudge_delivers(gw, shim, monkeypatch):
+    _turn(gw, monkeypatch, "codex_incomplete", lambda peer: _nudge("codex_incomplete", peer["nonce"]),
+          refuse=False)
     o4._drive(shim)
-    o4._reached_the_refusal(gw, shim)
-    assert all(status != 200 for status, _ in gw.responses)
-    assert [json.loads(v).get("state") for v in gw.rows("canonical-receipt:").values()] == ["terminal"]
-    assert "response" not in o4._receipt(gw)
+    o4._delivered_once(gw, shim)

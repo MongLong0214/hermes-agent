@@ -104,7 +104,9 @@ def test_a_foreign_claims_user_row_is_not_a_recovery_nudge(gw, shim, monkeypatch
 
     monkeypatch.setattr(gw.actor, "run_conversation", other_claim)
     o4._drive(shim)
-    o4._reached_the_refusal(gw, shim)
+    o4._attributed_and_submitted(gw, shim)
+    assert o4._codes(gw) == [(409, "canonical_event_failed")]
+    assert o4._held(gw) == []
     print("FOREIGN_NUDGE", json.dumps({"http": gw.responses, "kept": gw.rows("canonical-answer-kept:")}))
     assert gw.rows("canonical-answer-kept:") == {}, "another claim's peer row was treated as a system nudge"
 
@@ -530,7 +532,7 @@ def _unbound_and_noticed(gw, shim):
 @pytest.mark.parametrize(("nudge", "variant"), [(n, v) for n in NUDGES for v in ("plain", "another_events_peer")]
                          + [(n, "its_own_flag") for n in FLAGS])
 def test_h92_02_a_nudge_inside_the_turn_is_no_provenance(gw, shim, monkeypatch, nudge, variant):
-    gw.actor.shape = "unnudged_retry"  # bound and kept without the row (see the control below)
+    gw.actor.shape = "unanswered_tool"  # bound and kept without the row (see the control below)
     row = {"role": "user", "content": getattr(loop, nudge)}
     if variant == "another_events_peer":
         row.update(display_kind="canonical_peer", display_metadata={"canonical_peer": _another_events_peer()})
@@ -542,7 +544,7 @@ def test_h92_02_a_nudge_inside_the_turn_is_no_provenance(gw, shim, monkeypatch, 
 
 
 def test_h92_02_another_events_peer_marker_on_an_assistant_row_of_the_turn_unbinds_it(gw, shim, monkeypatch):
-    gw.actor.shape = "unnudged_retry"
+    gw.actor.shape = "unanswered_tool"
     _insert_before_final(gw, monkeypatch, {"role": "assistant", "content": "", "finish_reason": "incomplete",
                                            "display_kind": "canonical_peer",
                                            "display_metadata": {"canonical_peer": _another_events_peer()}})
@@ -559,7 +561,7 @@ def test_h92_02_control_the_same_events_normal_turn_is_recorded_and_posted_once(
 
 
 def test_h92_02_control_a_refused_turn_with_no_row_but_its_own_is_still_kept(gw, shim):
-    gw.actor.shape = "unnudged_retry"
+    gw.actor.shape = "unanswered_tool"
     o4._drive(shim)
     o4._reached_the_refusal(gw, shim)
     assert gw.bound == [o4.FINAL] and o4._held(gw) == [o4.FINAL]

@@ -162,6 +162,96 @@ def _payload(**changes):
             "channel_id": "channel", "text": "hello", **changes}
 
 
+# Sanitized state.db suffixes from CEO turns ending 2026-10-20 08:23:45Z and
+# 13:40:39Z: 650771..650774 and 650791..650794 respectively. Both nudges were unmarked.
+_REASONING_ONLY_NUDGE = (
+    "[System: Your previous response contained only internal reasoning and never produced a visible "
+    "answer or tool call. Do not keep thinking. Produce your final answer as plain text now "
+    "(or make the tool call you were planning).]"
+)
+
+
+@pytest.mark.parametrize("shape", ["08:23:45Z", "13:40:39Z", "interim_and_continuation"])
+def test_completed_bound_turn_delivers_final_response_through_recovery_rows(ingress, send, monkeypatch, shape):
+    original = ingress.actor.run_conversation
+    final = f"Sanitized CEO answer for {shape}"
+
+    def recovered(text, **kwargs):
+        result = original(text, **kwargs)
+        boundary = ingress.actor._persist_user_message_idx
+        middle = [{"role": "assistant", "content": "", "finish_reason": "incomplete"},
+                  {"role": "user", "content": _REASONING_ONLY_NUDGE}]
+        if shape == "interim_and_continuation":
+            middle += [{"role": "assistant", "content": "Checking the result."},
+                       {"role": "user", "content": "Continue the current task."},
+                       {"role": "assistant", "content": None, "tool_calls": None},
+                       {"role": "assistant", "content": "", "tool_calls": []}]
+        result["messages"][boundary + 1:] = [*middle, {"role": "assistant", "content": final, "finish_reason": "stop"}]
+        result["final_response"] = final
+        return result
+
+    monkeypatch.setattr(ingress.actor, "run_conversation", recovered)
+
+    async def exercise():
+        first = await send()
+        assert first[0] == 200
+        assert first == (200, {"event_id": "event", "text": final})
+        assert await send() == first
+        assert len(ingress.actor.calls) == 1
+        [receipt] = ingress.receipts()
+        assert receipt["response"]["terminal_text"] == final
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("damage", ["foreign_kind", "foreign_metadata", "foreign_final", "opening",
+                                   "failed", "partial", "interrupted", "incomplete", "session", "empty",
+                                   "unanswered_tool", "orphan_tool"])
+def test_completed_answer_still_requires_bound_provenance_and_success(ingress, send, monkeypatch, damage):
+    original = ingress.actor.run_conversation
+
+    def damaged(text, **kwargs):
+        from agent.canonical_peer import new_peer_metadata
+
+        result = original(text, **kwargs)
+        boundary = ingress.actor._persist_user_message_idx
+        nudge = {"role": "user", "content": _REASONING_ONLY_NUDGE}
+        result["messages"].insert(boundary + 1, nudge)
+        foreign = new_peer_metadata(binding="canonical", author_id="author", channel_id="channel",
+                                    event_id="another-event", receipt="canonical-receipt:v2:other")
+        mutations = {
+            "foreign_kind": lambda: nudge.update(display_kind="canonical_peer"),
+            "foreign_metadata": lambda: nudge.update(display_metadata={"canonical_peer": foreign}),
+            "foreign_final": lambda: result["messages"][-1].update(
+                display_kind="canonical_peer", display_metadata={"canonical_peer": foreign}),
+            "opening": lambda: result["messages"][boundary].update(content="another event's opening"),
+            "failed": lambda: result.update(failed=True),
+            "partial": lambda: result.update(partial=True),
+            "interrupted": lambda: result.update(interrupted=True),
+            "incomplete": lambda: result.update(completed=False),
+            "session": lambda: result.update(session_id="another-session"),
+            "empty": lambda: result.update(final_response="  "),
+            "unanswered_tool": lambda: result["messages"].insert(-1, {
+                "role": "assistant", "content": "", "tool_calls": [{"id": "unanswered"}]}),
+            "orphan_tool": lambda: result["messages"].insert(-1, {
+                "role": "tool", "tool_call_id": "orphan", "content": "data"}),
+        }
+        mutations[damage]()
+        return result
+
+    monkeypatch.setattr(ingress.actor, "run_conversation", damaged)
+
+    async def exercise():
+        first = await send()
+        assert first[0] == 409
+        assert await send() == first
+        assert len(ingress.actor.calls) == 1
+        [receipt] = ingress.receipts()
+        assert "response" not in receipt
+
+    asyncio.run(exercise())
+
+
 def test_identity_get_is_authenticated_and_reports_live_head_without_writes(ingress, send, monkeypatch):
     from hermes_state_target_bind import _lineage_root_digest
 
