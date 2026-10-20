@@ -169,15 +169,8 @@ def test_h92_03_control_a_tool_round_trip_of_this_turn_is_answered_once(gw, shim
     assert [post["stdin"] for post in shim.posts()] == [f"@cto-repo-factory {o4.FINAL}"]
 
 
-# ── the split: interior rows on the normal path keep their 20462c50 outcome ─────────────────────────
-#
-# The normal path refuses only what the shared provenance facts refuse (an opening row not this claim's, or
-# another peer row); the refused-answer keep adds the H92-02 Limit (no user row inside the turn). Each turn
-# below is measured at 20462c50 and must keep that outcome; with a foreign peer row added it is refused.
-# The selector itself (unchanged) already refuses any user row after the opening row, so (a) and (c)-in-turn
-# were 409 at 20462c50 too: "matching 20462c50" is that outcome, not 200. A summary the real assembly leaves
-# inside the turn is a standalone row the selector refuses; the refused path then keeps the answer (409
-# canonical_answer_unrecorded), as at 20462c50.
+# Completed same-event turns deliver through nudges, compaction and continuation rows.
+# Each shape must still refuse foreign peer provenance anywhere in its suffix.
 
 NOTICE = "[ASYNC DELEGATION COMPLETE — deleg-1]\nThe delegated task finished."  # the format of tools/process_registry_notifications.py
 
@@ -236,12 +229,6 @@ def _turn(shape, foreign):
 
 SHAPES = ["a_nudge", "b_compaction_before_opening", "b_compaction_inside_turn", "c_notice_in_history",
           "c_steered_into_the_turn"]
-AT_20462C50 = {  # (HTTP outcome, answer held) measured at 20462c50: r3fix/split-measurements-20462c50.txt
-    "a_nudge": ([(409, "canonical_event_failed")], []),
-    "b_compaction_before_opening": ([(200, "text")], [o4.FINAL]),
-    "b_compaction_inside_turn": ([(409, "canonical_answer_unrecorded")], [o4.FINAL]),
-    "c_notice_in_history": ([(200, "text")], [o4.FINAL]),
-    "c_steered_into_the_turn": ([(409, "canonical_event_failed")], [])}
 
 
 def _drive_turn(gw, shim, monkeypatch, shape, foreign):
@@ -256,14 +243,11 @@ def _drive_turn(gw, shim, monkeypatch, shape, foreign):
 
 
 @pytest.mark.parametrize("shape", SHAPES)
-def test_split_a_same_event_turn_keeps_its_20462c50_outcome(gw, shim, monkeypatch, shape):
+def test_completed_same_event_turn_delivers_through_interior_rows(gw, shim, monkeypatch, shape):
     out = _drive_turn(gw, shim, monkeypatch, shape, foreign=False)
-    codes, held = AT_20462C50[shape]
-    assert (out["codes"], out["held"]) == (codes, held), "the outcome differs from 20462c50's"
-    if codes == [(200, "text")]:
-        assert [p["stdin"] for p in shim.posts()] == [f"@cto-repo-factory {o4.FINAL}"]
-    else:  # refused by the selector; delivered never, the sender told once
-        assert out["selector_refused"] and len(shim.posts()) == 1 and o4.FINAL not in shim.posts()[0]["stdin"]
+    assert out["codes"] == [(200, "text")]
+    assert out["held"] == [o4.FINAL]
+    assert [p["stdin"] for p in shim.posts()] == [f"@cto-repo-factory {o4.FINAL}"]
 
 
 @pytest.mark.parametrize("shape", SHAPES)

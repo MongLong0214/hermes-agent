@@ -3529,8 +3529,11 @@ class GatewayRunner(
         history_boundary: int,
         expected_session_id: str,
     ) -> Any:
-        """Select exactly one terminal assistant message from the current turn, after complete
-        tool-call rows each answered by exactly one result per call."""
+        """Select the completed turn's final response after checking tool-call/result pairing.
+
+        Opening-row and foreign-event provenance are checked by ``turn_provenance`` in the caller.
+        Recovery and continuation rows are normal parts of a completed turn.
+        """
         from gateway.canonical_surface import CanonicalTurnResult
 
         if (
@@ -3563,8 +3566,7 @@ class GatewayRunner(
         # Ids of the open tool-call row still owed a result: one tool row per id, each exactly once,
         # before anything else (executors may answer a batch out of call order).
         owed: set[str] = set()
-        terminal: Optional[str] = None
-        for index, row in enumerate(suffix[1:], start=1):
+        for row in suffix[1:]:
             if not isinstance(row, dict) or not isinstance(row.get("role"), str):
                 raise ValueError("canonical_turn_refused")
             role = row["role"]
@@ -3578,9 +3580,11 @@ class GatewayRunner(
                     raise ValueError("canonical_turn_refused")
                 owed.discard(row["tool_call_id"])
                 continue
+            if role == "user":
+                continue
             if role != "assistant":
                 raise ValueError("canonical_turn_refused")
-            if "tool_calls" in row:
+            if row.get("tool_calls"):
                 tool_calls = row["tool_calls"]
                 ids = [call.get("id") if isinstance(call, dict) else None
                        for call in (tool_calls if isinstance(tool_calls, list) else ())]
@@ -3592,18 +3596,9 @@ class GatewayRunner(
                     raise ValueError("canonical_turn_refused")
                 owed = set(ids)
                 continue
-            content = row.get("content")
-            if (
-                not isinstance(content, str)
-                or not content.strip()
-                or content != result["final_response"]
-                or index != len(suffix) - 1
-            ):
-                raise ValueError("canonical_turn_refused")
-            terminal = content
-        if owed or terminal is None:
+        if owed:
             raise ValueError("canonical_turn_refused")
-        return CanonicalTurnResult(binding_name=binding_name, terminal_text=terminal)
+        return CanonicalTurnResult(binding_name=binding_name, terminal_text=result["final_response"])
 
     async def run_bound_existing_turn(
         self, binding: Any, event: Any, entry: Any, *, reply_sink: Any = None,
@@ -3841,13 +3836,9 @@ class GatewayRunner(
                         except Exception:
                             observation.bound_answer = None  # unprovable: the failure stands
                     raise
-                # A well-formed turn is this event's answer only when it opened with this claim's own row
-                # and carries no other peer row: the rule a refused answer is kept by too
-                # (turn_provenance). Otherwise it is refused (an explicit failure), never recorded or
-                # delivered as the answer. The refused path's extra Limit is not this rule: its keep accepts
-                # a user row inside the turn only when it is this claim's own run-bound recovery nudge
-                # (``_recovery_nudge`` naming this claim's opening peer nonce). The normal path is governed
-                # by the selector above, as before.
+                # A completed turn belongs to this event only when it opened with this claim's own
+                # row and carries no other peer row. Internal recovery/continuation rows do not
+                # change that provenance; use the same helper as the refused-answer keep.
                 try:
                     facts = turn_provenance(
                         result.get("messages"), history_boundary=boundary, peer=peer, body=event.text,

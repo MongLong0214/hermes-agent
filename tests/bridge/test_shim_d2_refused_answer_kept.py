@@ -1,25 +1,8 @@
-"""D2 / O4: a canonical turn whose shape the selector refuses keeps only an answer proven to be its own,
-and every terminal outcome the gateway answers past the claim reaches the sender as a notice.
+"""Canonical reply delivery and refused-answer storage through the real shim and gateway.
 
-W2 of DIAG-H1110-1111 D2 (``tests/diag_d2_test_refused_answer_dropped.py``), ported to the prompt shape
-the shim reads since #1111 P1 (buzz-acp's sections as separate ``params.prompt`` elements): event
-813415c3… ran as rows user (peer) → assistant (empty, finish ``incomplete``) → user
-(``_CODEX_INCOMPLETE_NUDGE``) → assistant (final, ``stop``). The selector refuses that suffix and the
-receipt recorded ``canonical_turn_refused``; the answer the actor returned was held nowhere.
-
-The selector stays as it is (O5 is out of scope). What changes: the final answer is kept beside the
-receipt (never delivered, never the event's answer) only when ``bound_refused_answer`` proves it is
-this event's, this claim's and this turn's; ``answer_kept`` is true only once that answer read back
-through the replay's own decoding; and ``canonical_event_failed`` / ``_uncertain`` / ``_conflict``
-and an unanswered submission end in a notice instead of silence.
-
-Since #92 r1 (H92-02) a user row inside the turn makes the answer unbound: no recovery nudge carries
-provenance bound to the run, and matching its text is none. The live 813415c3 shape (a nudge inside the
-turn) therefore keeps nothing and ends as one explicit ``canonical_event_failed`` notice — never silence.
-The keep path is exercised by a refused shape with no user row inside the turn (``unnudged_retry``).
-
-The real shim drives the real canonical handler, coordinator and SQLite of an in-process gateway under
-a tmp home (the pattern of tests/bridge/test_shim_text_cap_notice.py).
+Completed turns deliver through empty assistant rows and recovery nudges. A tool-pairing error
+still refuses; its bound answer exercises kept-answer storage and sender notices without relying
+on the obsolete rule that refused recovery rows.
 """
 
 import asyncio
@@ -97,8 +80,7 @@ def channel_prompt(body):
 
 
 class _ShapedActor:
-    """The bound cached agent. ``shape`` picks the suffix its turn returns: ``nudged`` is the live
-    813415c3 turn; the others are refused shapes whose final answer is not provably this turn's."""
+    """Return completed recovery shapes, foreign-event rows, or a tool-pairing error."""
 
     compression_in_place = True
 
@@ -106,7 +88,7 @@ class _ShapedActor:
         self.session_id = session_id
         self._session_db = db
         self.runs = runs
-        self.shape = "unnudged_retry"  # refused by the selector, provably this turn's
+        self.shape = "unanswered_tool"  # pairing error, provably this turn's
 
     def interrupt(self, text=None):
         pass
@@ -129,6 +111,8 @@ class _ShapedActor:
         nudge = {"role": "user", "content": _CODEX_INCOMPLETE_NUDGE}
         suffix = {
             "plain": [user, final],
+            "unanswered_tool": [user, {**empty, "tool_calls": [{"id": "missing-result"}]}, final],
+            "unanswered_tool_marked": [marked, {**empty, "tool_calls": [{"id": "missing-result"}]}, final],
             "unnudged_retry": [user, empty, final],
             "unnudged_retry_marked": [marked, empty, final],
             "nudged": [user, empty, nudge, final],
@@ -347,21 +331,13 @@ def test_the_witness_prompt_is_valid_under_the_shims_own_rules(shim):
 # ── W2 (ported): the live 813415c3 shape ─────────────────────────────────────────────────────────────
 
 
-def test_w2_the_live_nudged_turn_is_never_dropped_silently_and_ends_as_one_explicit_failure(gw, shim):
-    """The live shape: its nudge row has no run-bound provenance (H92-02 Limit), so the answer is not kept
-    — and the sender is told once, explicitly, instead of nothing."""
+def test_w2_the_live_nudged_turn_delivers_the_completed_answer(gw, shim):
     gw.actor.shape = "nudged"
     _drive(shim)
-
-    _reached_the_refusal(gw, shim)
-    assert len(gw.runs) == 1, "the turn ran more than once"
-    assert gw.bound == [None] and _held(gw) == [], "an answer without run-bound provenance was kept"
-    assert _codes(gw) == [(409, "canonical_event_failed")]
-    [post] = shim.posts()
-    assert "canonical_event_failed" in post["stdin"] and FINAL not in post["stdin"]
+    _delivered_once(gw, shim)
 
 
-@pytest.mark.parametrize("shape", ["unnudged_retry", "unnudged_retry_marked"])
+@pytest.mark.parametrize("shape", ["unanswered_tool", "unanswered_tool_marked"])
 def test_a_proven_answer_is_kept_not_delivered_and_the_refusal_stays_the_events_terminal(gw, shim, shape):
     gw.actor.shape = shape
     _drive(shim)
@@ -390,13 +366,13 @@ def test_a_proven_answer_is_kept_not_delivered_and_the_refusal_stays_the_events_
     assert gw.bound == [FINAL]  # the binding check proved it, once; the replay never reached the actor
 
 
-@pytest.mark.parametrize("shape", ["nudged", "nudged_marked", "other_user_row", "foreign_peer_row",
-                                   "foreign_marked", "final_mismatch"])
+@pytest.mark.parametrize("shape", ["foreign_peer_row", "foreign_marked"])
 def test_an_answer_not_provably_this_turns_is_not_kept_and_the_failure_is_noticed(gw, shim, shape):
     gw.actor.shape = shape
     _drive(shim)
 
-    _reached_the_refusal(gw, shim)
+    _attributed_and_submitted(gw, shim)
+    assert len(gw.runs) == 1
     assert gw.rows("canonical-answer-kept:") == {} and _held(gw) == []
     assert not (gw.home / "canonical-answer-kept").exists()
     receipt = _receipt(gw)
@@ -410,17 +386,26 @@ def test_an_answer_not_provably_this_turns_is_not_kept_and_the_failure_is_notice
 
     _drive(shim, rpc_id=5)  # buzz-acp redelivers: the same failure, never a second post or run
     assert len(gw.runs) == 1 and len(shim.posts()) == 1
-    assert gw.bound == [None]  # reached the binding check, which proved nothing
+    assert gw.bound == []  # the shared provenance check refused it before recording
 
 
-def test_control_the_same_answer_without_recovery_rows_is_recorded_and_posted_once(gw, shim):
-    gw.actor.shape = "plain"
-    _drive(shim)
-
+def _delivered_once(gw, shim):
     _attributed_and_submitted(gw, shim)
     assert len(gw.runs) == 1 and gw.refusals == [] and gw.bound == []
+    assert _codes(gw) == [(200, "text")]
     assert _held(gw) == [FINAL] and gw.rows("canonical-answer-kept:") == {}
     assert [post["stdin"] for post in shim.posts()] == [f"@cto-repo-factory {FINAL}"]
+    _drive(shim, rpc_id=5)
+    assert len(gw.runs) == 1 and len(shim.posts()) == 1
+    assert _codes(gw) == [(200, "text")] * 2
+
+
+@pytest.mark.parametrize("shape", ["plain", "unnudged_retry", "unnudged_retry_marked", "nudged_marked",
+                                   "other_user_row", "final_mismatch"])
+def test_completed_answer_is_recorded_and_posted_once(gw, shim, shape):
+    gw.actor.shape = shape
+    _drive(shim)
+    _delivered_once(gw, shim)
 
 
 # ── answer_kept only once the answer read back ───────────────────────────────────────────────────────
