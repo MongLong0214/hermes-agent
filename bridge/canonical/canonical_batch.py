@@ -96,12 +96,16 @@ def rendered_end(lines, at, event_id):
         for end in range(at + 6, len(lines)):
             if not lines[end].startswith("Tags: "):
                 continue
+            # Every candidate is isolated: a quoted Tags line in a body may be unparsable, unencodable
+            # (a lone surrogate) or nested past the recursion limit. Such a decoy is only a
+            # non-match; it must never end the walk and drop the members after it.
             try:
                 tags = json.loads(lines[end][len("Tags: "):])
-            except (ValueError, RecursionError):
+                event.update(content="\n".join(lines[at + 5:end])[len("Content: "):], tags=tags)
+                matched = event_digest(event).hex() == event_id
+            except (ValueError, TypeError, RecursionError, OverflowError):
                 continue
-            event.update(content="\n".join(lines[at + 5:end])[len("Content: "):], tags=tags)
-            if event_digest(event).hex() == event_id:
+            if matched:
                 return end + 1
     except (ValueError, OverflowError, AttributeError, IndexError):
         return None
