@@ -281,4 +281,4 @@ def test_r2_a_registry_naming_no_valid_signer_cannot_rule_out_an_echo_and_posts_
     assert shim.submitted == [] and _calls(shim.tmp) == [] and _echoes(shim.tmp) == {}
     [(_, [record])] = _journal(shim.tmp).items()
     assert (record["sent"], record["state"], record["reason"]) == (
-        False, "notice_impossible", "reply registry names no valid ceo signer")
+        False, "notice_impossible", "reply registry malformed: RosterError")

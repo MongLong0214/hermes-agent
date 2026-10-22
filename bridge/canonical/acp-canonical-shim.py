@@ -29,8 +29,6 @@ import urllib.request
 BASE = os.environ.get("CANONICAL_SURFACE_URL", "http://127.0.0.1:8642")
 ROUTE = "/v1/canonical-surface/events"
 BINDING = os.environ.get("CANONICAL_BINDING", "acp-canonical-ceo")
-AUTHOR = os.environ.get("CANONICAL_AUTHOR_ID", "")
-CHANNEL = os.environ.get("CANONICAL_CHANNEL_ID", "")
 KEY = os.environ.get("API_SERVER_KEY", "")
 # The endpoint runs a full model turn before it answers, so this budget is a turn's, not an RPC's.
 TIMEOUT = float(os.environ.get("CANONICAL_TIMEOUT_SECS", "900"))
@@ -60,7 +58,7 @@ QUARANTINE = os.environ.get(
 BUZZ_CLI = os.environ.get("CANONICAL_BUZZ_CLI", os.path.expanduser("~/.hermes/bridge/bin/buzz"))
 MENTIONS = os.environ.get("CANONICAL_MENTIONS_FILE", os.path.expanduser("~/.hermes/bridge/required-mentions.json"))
 # Owner broadcasts may wake the CEO only in its paired project channels (2026-10-20).
-OWNER = "d046238dd1422955898205bd60507992cb101a1ea2ecfa6e52fd00d5ddca98c4"
+OWNER = os.environ.get("BUZZ_ACP_AGENT_OWNER", "d046238dd1422955898205bd60507992cb101a1ea2ecfa6e52fd00d5ddca98c4")
 PUBLISHED = os.environ.get("CANONICAL_PUBLISHED_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                                                    "published"))
 PUBLISH_TIMEOUT = float(os.environ.get("CANONICAL_PUBLISH_TIMEOUT_SECS", "60"))
@@ -77,6 +75,13 @@ except Exception as exc:
     _batch = None
     _batch_error = f"{type(exc).__name__}: {exc}"
     print(f"acp-canonical-shim: batch recovery unavailable: {_batch_error}", file=sys.stderr, flush=True)
+
+# The gateway imports the same reader; standalone deployments copy this sibling with the shim.
+_roster_spec = importlib.util.spec_from_file_location(
+    "canonical_roster", os.path.join(os.path.dirname(os.path.abspath(__file__)), "canonical_roster.py"))
+_roster_module = importlib.util.module_from_spec(_roster_spec)
+_roster_spec.loader.exec_module(_roster_module)
+_roster_reader = _roster_module.RosterReader(MENTIONS)
 
 _out = threading.Lock()
 
@@ -186,7 +191,7 @@ def error(rpc_id, code, message):
 # `author_id`/`channel_id`, so sending this process's own env constants would make that check
 # vacuous: every author buzz-acp forwards — owner, orchestrator, anyone later added to the
 # allowlist — would arrive at the CEO as the one identity named in the environment. The values are
-# read from the event only; the env values are a startup requirement and never stand in for them.
+# read from the event only; no startup author/channel constants stand in for them.
 AUTHOR_RE = re.compile(r"hex:\s*([0-9a-f]{64})")
 CHANNEL_RE = re.compile(r"#([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})")
 EVENT_RE = re.compile(r"Event ID:\s*([0-9a-f]{64})")
@@ -204,7 +209,9 @@ EVENT_TITLE_RE = re.compile(r"\[Buzz event: [^\[\]\n]+\]")
 HEADER_EVENT_RE = re.compile(r"Event ID: ([0-9a-f]{64})")
 HEADER_CHANNEL_RE = re.compile(r"Channel: [^()#]* \(#(" + _UUID + r")\)")
 HEADER_KIND_RE = re.compile(r"Kind: \d{1,10}")
-HEADER_FROM_RE = re.compile(r"From: [^()]* \(npub: npub1[02-9ac-hj-np-z]+, hex: ([0-9a-f]{64})\)")
+# queue.rs also renders an unlabeled author as `npub1… (hex: …)`.
+HEADER_FROM_RE = re.compile(
+    r"From: (?:[^()]* \(npub: npub1[02-9ac-hj-np-z]+, |npub1[02-9ac-hj-np-z]+ \()hex: ([0-9a-f]{64})\)")
 HEADER_TIME_RE = re.compile(r"Time: [0-9][0-9T:.+\-Z]{0,40}")
 # What buzz-acp can write on each header line, whatever a channel name or a label holds — wide enough to
 # match every header it produces (queue.rs ``format_event_block``: the Channel field ends ``(#<uuid>)``, a
@@ -748,43 +755,37 @@ def submit(text, event_id, author, channel):
 def _registry_peer(channel):
     """(the channel's registered counterpart handle, None) or (None, why not). Never raises: the reason
     is a fixed category and the exception type, nothing else, as for ``_own_signers``."""
-    try:
-        with open(MENTIONS, encoding="utf-8") as handle:
-            channels = json.load(handle)["channels"]
-    except OSError as exc:
-        return None, f"reply registry unreadable: {type(exc).__name__}"
-    except Exception as exc:  # malformed in any way, nesting past the recursion limit included
-        return None, f"reply registry malformed: {type(exc).__name__}"
-    try:
-        peer = channels[channel]["peer"]["handle"]
-    except Exception:
-        peer = None
-    if peer is None:
+    snapshot, why = _read_roster()
+    if snapshot is None:
+        return None, why
+    room = snapshot.active(channel)
+    if room is None:
         return None, "the [Context] channel has no registered counterpart to post to"
-    return peer, None
+    return room["peer"]["handle"], None
 
 
 def _peer_handle(channel):
-    return _registry_peer(channel)[0]  # the wrapper refuses an unregistered channel, and adds the handle itself
+    return _registry_peer(channel)[0]
+
+
+def _read_roster():
+    try:
+        snapshot = _roster_reader.read()
+    except _roster_module.RosterError as exc:
+        cause = exc.__cause__
+        category = "unreadable" if isinstance(cause, OSError) else "malformed"
+        log(f"routing {exc}; current event refused, last good roster retained")
+        return None, f"reply registry {category}: {type(cause).__name__}"
+    return snapshot, None
 
 
 def _own_signers():
-    """(pubkeys this bridge's posts can carry, None) or (None, why not). The wrapper signs with the key
-    inherited from buzz-acp and accepts it only as a channel's registered ``ceo``. Every registered
-    channel's, not only the event's: the key is one key, and an echo can be read in any channel. When
-    the registry cannot be read or names no valid ``ceo``, the caller cannot rule out an echo and
-    forwards nothing."""
-    try:
-        with open(MENTIONS) as handle:
-            channels = json.load(handle)["channels"]
-        signers = {rule["ceo"]["pubkey"] for rule in channels.values()}
-    # The reason is a fixed category and the exception type, nothing else: an OS message or a parser
-    # message can carry a path or the registry's own bytes, and the journal is not where those go.
-    except OSError as exc:
-        return None, f"reply registry unreadable: {type(exc).__name__}"
-    except Exception as exc:  # malformed in any way, nesting past the recursion limit included
-        return None, f"reply registry malformed: {type(exc).__name__}"
-    if not signers or not all(isinstance(key, str) and re.fullmatch(r"[0-9a-f]{64}", key) for key in signers):
+    snapshot, why = _read_roster()
+    if snapshot is None:
+        return None, why
+    signers = {rule["ceo"]["pubkey"] for rule in snapshot.channels.values()
+               if rule["status"] == "active"}
+    if not signers:
         return None, "reply registry names no valid ceo signer"
     return signers, None
 
@@ -952,6 +953,8 @@ def publish_reply(event_id, channel, answer, kind="answer", *, ref=None, reply_t
     handle = _peer_handle(channel)
     body = f"@{handle} {answer}" if handle and not answer.lstrip().startswith(f"@{handle}") else answer
     try:
+        if handle is None:
+            raise _roster_module.RosterError("reply room inactive or roster unavailable")
         done = subprocess.run(
             [BUZZ_CLI, "messages", "send", "--channel", channel]
             + (["--reply-to", target] if target else []) + ["--content", "-"],
@@ -973,6 +976,7 @@ def publish_reply(event_id, channel, answer, kind="answer", *, ref=None, reply_t
         marker.write(json.dumps({**({"preclaim": True} if preclaim else {}),
                                  "sent": sent, "state": state, "delivery": "posted" if sent else "failed",
                                  "kind": kind, "event_id": event_id, "ref": ref, "channel": channel,
+                                 "roster_generation": getattr(_local, "roster_generation", None),
                                  "reply_to": target, "reason": str(reason)[:400],
                                  "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}) + "\n")
     log(f"prompt {tag}… {kind} {'POSTED' if sent else 'NOT posted (no retry)'} to thread: "
@@ -1620,12 +1624,21 @@ def prompt_text(params):
 def deliver_event(session, parsed, text, mentioned):
     """Run one attributed event through the existing safety, retry and receipt path."""
     author, channel, base, body = parsed
+    snapshot, _ = _read_roster()
+    _local.roster_generation = snapshot.generation if snapshot is not None else None
+    if snapshot is None and not mentioned and author == OWNER:
+        journal_held(base, channel, "owner broadcast held: routing roster unavailable")
+        return
+    if snapshot is not None and channel in snapshot.channels and snapshot.active(channel) is None:
+        log(f"prompt {base[:12]}… refused: retired room; roster_generation={snapshot.generation}")
+        return
     signers, unknown = _own_signers()
     if not mentioned:
         if (author != OWNER or _peer_handle(channel) is None
                 or os.path.exists(os.path.join(PUBLISHED, outcome_key(base, channel)))):
             return
-    log(f"prompt author={author[:12]}… channel={channel} base={base[:12]}… chars={len(text)}")
+    log(f"prompt author={author[:12]}… channel={channel} base={base[:12]}… chars={len(text)} "
+        f"roster_generation={getattr(_local, 'roster_generation', None)}")
     # Every refusal is decided before anything is claimed, so an armed canary is spent only on an
     # event that is actually submitted — not on an echo, an unreadable registry or an oversize text.
     if FORWARD != "live" and not canary_armed_for(author, channel, body):
@@ -1857,7 +1870,7 @@ def dispatch(message):
 
 def main():
     missing = [name for name, value in
-               (("API_SERVER_KEY", KEY), ("CANONICAL_AUTHOR_ID", AUTHOR), ("CANONICAL_CHANNEL_ID", CHANNEL))
+               (("API_SERVER_KEY", KEY),)
                if not value]
     if missing:
         # Fail before ACP initialize: a shim that answers initialize and then refuses every turn

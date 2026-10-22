@@ -7,6 +7,7 @@ import io
 import json
 from pathlib import Path
 import subprocess
+import shutil
 import sys
 import threading
 import urllib.error
@@ -322,6 +323,7 @@ def test_batch_over_real_stdio_and_one_shot_local_http(tmp_path, unavailable):
     if unavailable in ("sibling", "broken_sibling"):
         script = tmp_path / _SHIM.name
         script.write_bytes(_SHIM.read_bytes())
+        shutil.copyfile(_SHIM.parent / "canonical_roster.py", tmp_path / "canonical_roster.py")
         if unavailable == "broken_sibling":
             (tmp_path / "canonical_batch.py").write_text("raise ImportError('broken batch module')\n")
     # -S deterministically exercises missing crypto on venv and user-site installations alike.
