@@ -920,11 +920,18 @@ def publication_record(name):
         return {}
 
 
+# Set only by the operator's explicit ``recover`` command (#98 r2 H98-03): a notice journaled before
+# records carried "journal" (and so before pre-claim proof existed) may yield its event's one later
+# answer when an operator explicitly recovers that event. No automatic path ever sets it.
+_EXPLICIT_RECOVERY = False
+
+
 def outcome_key(event_id, channel=None):
-    """Only a recorded, proven pre-claim refusal leaves room for a later terminal outcome."""
+    """Only a recorded, proven pre-claim refusal leaves room for a later terminal outcome; so does a
+    legacy notice, but only under an explicit operator recovery."""
     prior = publication_record(event_id)
     if (prior.get("event_id") == event_id and prior.get("kind") == "notice"
-            and prior.get("preclaim") is True
+            and (prior.get("preclaim") is True or (_EXPLICIT_RECOVERY and "journal" not in prior))
             and (channel is None or prior.get("channel") == channel)):
         return event_id + ".answer"
     return event_id
@@ -973,7 +980,7 @@ def publish_reply(event_id, channel, answer, kind="answer", *, ref=None, reply_t
             reason = f"exit {done.returncode}: stderr unclassifiable ({type(exc).__name__})"
     sent = state == "sent"
     with os.fdopen(fd, "w") as marker:
-        marker.write(json.dumps({**({"preclaim": True} if preclaim else {}),
+        marker.write(json.dumps({"journal": 2, **({"preclaim": True} if preclaim else {}),
                                  "sent": sent, "state": state, "delivery": "posted" if sent else "failed",
                                  "kind": kind, "event_id": event_id, "ref": ref, "channel": channel,
                                  "roster_generation": getattr(_local, "roster_generation", None),
@@ -1621,14 +1628,21 @@ def prompt_text(params):
     return "\n".join(part for part in chunks if part).strip()
 
 
+# A transient refusal before any claim (#99 r1 H99-02): the event is held and the ACP prompt fails so
+# buzz-acp requeues and resends the same event id; the gateway has recorded nothing for it, so the
+# resend runs it once. Ending the turn instead would count the event as delivered and lose it.
+RETRY = "retry"
+
+
 def deliver_event(session, parsed, text, mentioned):
-    """Run one attributed event through the existing safety, retry and receipt path."""
+    """Run one attributed event through the existing safety, retry and receipt path. Returns RETRY when
+    the event must be resent later (nothing was claimed), otherwise None."""
     author, channel, base, body = parsed
     snapshot, _ = _read_roster()
     _local.roster_generation = snapshot.generation if snapshot is not None else None
     if snapshot is None and not mentioned and author == OWNER:
-        journal_held(base, channel, "owner broadcast held: routing roster unavailable")
-        return
+        journal_held(base, channel, "owner broadcast held: routing roster unavailable; ACP retry requested")
+        return RETRY
     if snapshot is not None and channel in snapshot.channels and snapshot.active(channel) is None:
         log(f"prompt {base[:12]}… refused: retired room; roster_generation={snapshot.generation}")
         return
@@ -1715,6 +1729,13 @@ def deliver_event(session, parsed, text, mentioned):
             raw = exc.read(REFUSAL_BODY_BYTES)
             detail = raw.decode(errors="replace")[:400]
             code, refusal = refusal_of(raw)
+            if exc.code == 503 and code == "canonical_roster_unavailable":
+                log(f"prompt {event_id} refused HTTP 503 canonical_roster_unavailable before any claim; "
+                    "held for ACP retry")
+                release_turn_slot()
+                journal_held(base, channel, "gateway routing roster unavailable; ACP retry requested")
+                finish_submission()
+                return RETRY
             busy = exc.code == 409 and code == "canonical_turn_busy"
             if busy and time.monotonic() + BUSY_RETRY_SECS < deadline:
                 log(f"prompt {event_id} busy; retrying in {BUSY_RETRY_SECS:.0f}s (attempt {attempt})")
@@ -1806,7 +1827,11 @@ def handle(message):
         if parsed is None:
             # Rendered bundle headers cannot establish identity. Recover signed originals separately;
             # an unrecognized or ambiguous framing retains the existing anonymous refusal path.
-            if recover_batch(session, prompt):
+            recovered = recover_batch(session, prompt)
+            if recovered == RETRY:
+                error(rpc_id, -32000, "retryable: canonical_roster_unavailable (nothing claimed; resend)")
+                return
+            if recovered:
                 result(rpc_id, {"stopReason": "end_turn"})
                 return
             refuse_unattributed(session, prompt, len(text))
@@ -1818,7 +1843,9 @@ def handle(message):
         mentioned = lines[0] == "[Buzz event: @mention]" or (
             tags is not None and signers is not None
             and any(len(tag) >= 2 and tag[0] == "p" and tag[1] in signers for tag in tags))
-        deliver_event(session, parsed, text, mentioned)
+        if deliver_event(session, parsed, text, mentioned) == RETRY:
+            error(rpc_id, -32000, "retryable: canonical_roster_unavailable (nothing claimed; resend)")
+            return
         result(rpc_id, {"stopReason": "end_turn"})
         return
 
@@ -1901,6 +1928,8 @@ def recover_main(args):
         return 2
     from types import SimpleNamespace
 
+    global _EXPLICIT_RECOVERY
+    _EXPLICIT_RECOVERY = True
     session = "canonical:" + BINDING
     api = SimpleNamespace(**globals())
     recovered = {}

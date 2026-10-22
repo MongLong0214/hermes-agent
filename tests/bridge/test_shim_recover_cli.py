@@ -98,3 +98,32 @@ def test_recover_refuses_malformed_arguments_before_any_request(tmp_path, args):
     done = _run(tmp_path, "http://127.0.0.1:9", *args)
     assert done.returncode == 2 and done.stderr
     assert not (tmp_path / "published").exists() or not any((tmp_path / "published").iterdir())
+
+
+def test_explicit_recovery_publishes_one_answer_after_a_legacy_notice(tmp_path):
+    """#98 r2 H98-03: a notice journaled before records carried "journal" holds the event's only
+    slot. Automatic replays keep that guard; an explicit operator recovery may post one answer."""
+    event = signed(5)
+    published = tmp_path / "published"
+    published.mkdir()
+    (published / event["id"]).write_text(json.dumps({
+        "sent": True, "state": "sent", "delivery": "posted", "kind": "notice", "event_id": event["id"],
+        "ref": None, "channel": CH, "reply_to": event["id"], "reason": "exit 0: ",
+        "at": "2026-10-20T19:01:45+0900"}) + "\n")
+    delivered, queried = [], []
+    server, thread = _serve([event], delivered, queried)
+    url = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        first = _run(tmp_path, url, CH, event["id"])
+        second = _run(tmp_path, url, CH, event["id"])
+    finally:
+        server.shutdown()
+        thread.join(5)
+        server.server_close()
+    assert first.returncode == 0, first.stderr
+    assert [d["event_id"] for d in delivered] == [event["id"]]
+    assert len(_calls(tmp_path)) == 1
+    assert json.loads((published / (event["id"] + ".answer")).read_text())["kind"] == "answer"
+    # The legacy notice is kept as it was; a rerun finds the answer and posts nothing more.
+    assert "journal" not in json.loads((published / event["id"]).read_text())
+    assert second.returncode == 0 and len(delivered) == 1 and len(_calls(tmp_path)) == 1

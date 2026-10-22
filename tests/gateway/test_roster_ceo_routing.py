@@ -98,3 +98,46 @@ def test_malformed_roster_refuses_gateway_and_shim_without_discarding_last_good(
     replace(path, document(generation=2, channels={ACP_ROOM: room(RF_CTO)}))
     drive(shim, mention('4' * 64, RF_CTO, ACP_ROOM, '@ceo recovery'))
     assert len(gw.runs) == 2 and binding.roster.last_good.generation == 2
+
+
+def test_reassigned_room_refuses_the_old_cto_despite_its_config_grant(gw, shim, monkeypatch):
+    """#99 r1 H99-01: a room the roster lists is decided by the roster alone."""
+    from tests.bridge.test_commitlore_room_peer import RF_CTO, LPM_CTO, ACP_ROOM, LPM_ROOM, drive, mention
+    binding, path = install(gw, shim, monkeypatch, 2)
+    drive(shim, mention("1" * 64, RF_CTO, ACP_ROOM, "@ceo initial"))
+    turns = len(gw.runs)
+    replace(path, document(2, 2, {ACP_ROOM: room(LPM_CTO), LPM_ROOM: room(RF_CTO)}))
+    assert binding.roster.read().admits(RF_CTO, ACP_ROOM, shim.OWNER) is False
+    with pytest.raises(urllib.error.HTTPError) as refused:
+        shim.submit("old CTO must not be admitted to the reassigned room", "2" * 64, RF_CTO, ACP_ROOM)
+    assert refused.value.code == 403
+    assert len(gw.runs) == turns
+
+
+def test_gateway_roster_outage_requests_an_acp_retry_and_the_resend_runs_once(gw, shim, monkeypatch):
+    """#99 r1 H99-02: a 503 canonical_roster_unavailable claims nothing, so the prompt must fail
+    (buzz-acp resends the same event id) instead of ending the turn as if delivered."""
+    from tests.bridge.test_commitlore_room_peer import RF_CTO, ACP_ROOM, bp, mention
+    binding, path = install(gw, shim, monkeypatch, 2)
+    owner_pub = path.parent / "keys" / "owner.pub"
+    saved = owner_pub.read_bytes()
+    owner_pub.unlink()
+    frames = []
+    monkeypatch.setattr(shim, "write", frames.append)
+    event = "3" * 64
+    message = {"jsonrpc": "2.0", "id": 7, "method": "session/prompt",
+               "params": bp.prompt_params("canonical:acp-canonical-ceo",
+                                          mention(event, RF_CTO, ACP_ROOM, "@ceo must survive a roster outage"))}
+    shim.handle(message)
+    assert gw.answers[-1][0] == 503 and gw.answers[-1][1]["error"]["code"] == "canonical_roster_unavailable"
+    assert not gw.runs and not shim.posts()
+    errors = [frame for frame in frames if frame.get("id") == 7 and "error" in frame]
+    assert errors and "retryable" in errors[0]["error"]["message"]
+    assert not any(frame.get("id") == 7 and "result" in frame for frame in frames)
+    assert (Path(shim.PUBLISHED) / (event + ".held")).exists()
+    # The roster is readable again: buzz-acp's resend of the same event runs exactly one turn.
+    owner_pub.write_bytes(saved)
+    frames.clear()
+    shim.handle(message)
+    assert len(gw.runs) == 1
+    assert any(frame.get("id") == 7 and frame.get("result") == {"stopReason": "end_turn"} for frame in frames)

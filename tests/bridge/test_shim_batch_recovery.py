@@ -125,3 +125,39 @@ def test_unavailable_module_does_not_refuse_already_answered_events(bridge, monk
     assert len(posts) == len(events) + int(merged)  # ambiguous fallback says only outcome unknown
     if merged:
         assert 'outcome unknown' in posts[-1]
+
+
+# Review r2 of #98 (H98-01 reopened): a quoted Tags line in an unavailable member's body is a decoy
+# candidate. Unencodable (lone surrogate) or over-deep JSON must be a non-match, never the end of the
+# walk or a crash of the whole batch.
+@pytest.mark.parametrize("framing", [bp.STEER, bp.INTERRUPT], ids=["steer", "interrupt"])
+def test_unencodable_quoted_tags_do_not_drop_cancelled_siblings(bridge, framing):
+    events = [signed(n) for n in (1, 2, 3, 4)]
+    events[0] = signed(1, content='@ceo quote of JSON:\nTags: ["\\ud800"]\nend quote')
+    install(bridge, *events[1:])
+    drive(bridge, batch([events[3]], cancelled=events[:3], framing=framing))
+    assert_delivered(bridge, events[1:])
+
+
+def test_over_deep_quoted_tags_never_crash_the_batch(bridge, monkeypatch):
+    """The recursion limit is reached inside the digest's JSON encoding at some depth near 1000,
+    which depends on the thread's stack; sweep the band the review reproduced."""
+    monkeypatch.setattr(bridge, "publish_reply", lambda *args, **kwargs: True)
+    monkeypatch.setattr(bridge, "_emit", bridge.frames.append)
+    crashed, lost = [], []
+    for depth in range(920, 997):
+        events = [signed(n) for n in (1, 2, 3, 4)]
+        events[0] = signed(1, content="@ceo quoted tags\nTags: " + "[" * depth + "]" * depth)
+        install(bridge, *events[1:])
+        bridge.deliveries.clear()
+        bridge.frames.clear()
+        bridge.dispatch({"jsonrpc": "2.0", "id": depth, "method": "session/prompt",
+                         "params": bp.prompt_params("s", batch([events[3]], cancelled=events[:3]))})
+        for thread in bridge._THREADS:
+            thread.join(10)
+            assert not thread.is_alive()
+        if any("error" in frame for frame in bridge.frames):
+            crashed.append(depth)
+        if {d["event_id"] for d in bridge.deliveries} != {e["id"] for e in events[1:]}:
+            lost.append(depth)
+    assert not crashed and not lost, (crashed, lost)
