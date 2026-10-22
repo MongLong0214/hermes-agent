@@ -473,8 +473,6 @@ def test_a_result_within_the_gateway_limit_is_never_refused_for_the_margin(shim,
 def run_main(shim, monkeypatch, text):
     """Drive the real ``main()`` loop with one ACP prompt line, as buzz-acp writes it."""
     monkeypatch.setattr(shim, "KEY", "k")
-    monkeypatch.setattr(shim, "AUTHOR", SIGNER)
-    monkeypatch.setattr(shim, "CHANNEL", CHANNEL)
     line = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "session/prompt",
                        "params": {"sessionId": "s", "prompt": section_blocks(text)}})
     monkeypatch.setattr(shim.sys, "stdin", io.StringIO(line + "\n"))
@@ -517,8 +515,8 @@ def journal(shim, name):
 
 @pytest.mark.parametrize("registry, reason", [
     ("{not json", "reply registry malformed: JSONDecodeError"),
-    (json.dumps({"channels": {CHANNEL: {"peer": {}}}}), "reply registry malformed: KeyError"),
-    (json.dumps({"channels": {CHANNEL: {"ceo": {"pubkey": ""}}}}), "reply registry names no valid ceo signer"),
+    (json.dumps({"channels": {CHANNEL: {"peer": {}}}}), "reply registry malformed: RosterError"),
+    (json.dumps({"channels": {CHANNEL: {"ceo": {"pubkey": ""}}}}), "reply registry malformed: RosterError"),
     (None, "reply registry unreadable: FileNotFoundError"),
 ])
 def test_a_registry_that_cannot_rule_out_an_echo_holds_the_event_in_the_journal(shim, monkeypatch, registry,
@@ -645,14 +643,14 @@ def test_every_registry_failure_is_held_with_a_category_and_type_only(shim, monk
             handle.write('{"channels":' + "[" * 1500 + json.dumps(planted))
         expected = "reply registry malformed: RecursionError"
     else:
-        real_open = open
+        real_read = Path.read_bytes
 
-        def failing_open(path, *args, **kwargs):
+        def failing_read(path, *args, **kwargs):
             if os.fspath(path) == shim.MENTIONS:
                 raise OSError(5, "read failed: " + planted, shim.MENTIONS)
-            return real_open(path, *args, **kwargs)
+            return real_read(path, *args, **kwargs)
 
-        monkeypatch.setattr(shim, "open", failing_open, raising=False)
+        monkeypatch.setattr(shim._roster_module.Path, "read_bytes", failing_read)
         expected = "reply registry unreadable: OSError"
     drive(shim, prompt("@ceo hello"))
     assert shim.submitted == [] and shim.buzz_calls() == []
