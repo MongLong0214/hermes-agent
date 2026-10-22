@@ -1868,7 +1868,82 @@ def dispatch(message):
     thread.start()
 
 
+_EVENT_ID = re.compile(r"[0-9a-f]{64}")
+
+
+def recover_main(args):
+    """``recover <channel-uuid> <event-id>...``: deliver events this shim refused or never received.
+
+    For operators after an outage or a refused merged prompt (2026-10-20: the owner's thread reply
+    was refused unattributed). Each original is fetched from the relay once and its hash, Schnorr
+    signature and channel tag are verified before the existing per-event delivery runs, so the
+    signed author, never this command line, supplies identity. An event already answered is
+    skipped, so rerunning never duplicates. One line per event reports its final local state.
+    """
+    if len(args) < 2:
+        sys.stderr.write("usage: acp-canonical-shim.py recover <channel-uuid> <event-id> [<event-id> ...]\n")
+        return 2
+    channel = args[0].lower()
+    if not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", channel):
+        sys.stderr.write(f"acp-canonical-shim: not a channel uuid: {args[0]}\n")
+        return 2
+    ids = list(dict.fromkeys(arg.lower() for arg in args[1:]))
+    bad = [event_id for event_id in ids if not _EVENT_ID.fullmatch(event_id)]
+    if bad:
+        sys.stderr.write("acp-canonical-shim: not an event id: " + ", ".join(bad) + "\n")
+        return 2
+    missing = [name for name, value in (("API_SERVER_KEY", KEY),
+                                        ("BUZZ_RELAY_URL", os.environ.get("BUZZ_RELAY_URL")),
+                                        ("BUZZ_PRIVATE_KEY", os.environ.get("BUZZ_PRIVATE_KEY"))) if not value]
+    if missing or _batch is None:
+        sys.stderr.write("acp-canonical-shim: recovery unavailable: "
+                         + (("missing " + ", ".join(missing)) if missing else _batch_error) + "\n")
+        return 2
+    from types import SimpleNamespace
+
+    session = "canonical:" + BINDING
+    api = SimpleNamespace(**globals())
+    recovered = {}
+    # No buzz-acp reads this process's ACP frames; the answer is posted to Buzz and journaled as in a
+    # live turn. Stdout carries only the per-event report.
+    report, sys.stdout = sys.stdout, open(os.devnull, "w")
+
+    def lookup(event_id):
+        if event_id not in recovered:
+            try:
+                recovered[event_id] = _batch.fetch_event(event_id, channel)
+            except Exception as exc:
+                recovered[event_id] = exc
+        return recovered[event_id]
+
+    status = 0
+    for event_id in ids:
+        log(f"recover {event_id} channel={channel}")
+        prompt = [{"type": "text", "text": f"[Buzz event: recovered]\nEvent ID: {event_id}\nChannel ID: {channel}"}]
+        _local.prompt = PromptTurn(None, session)
+        try:
+            _batch.deliver_member(api, session, prompt, channel, event_id, lookup)
+        except Exception as exc:
+            status = 1
+            log(f"recover {event_id} failed: {_batch.failure_reason(exc)}")
+            sys.stderr.write(f"acp-canonical-shim: recover {event_id} failed: {_batch.failure_reason(exc)}\n")
+        finally:
+            left = abandon_submission()
+            _local.prompt = None
+            if left:
+                reap_unfinished()
+        found = recovered.get(event_id)
+        state = recovery_delivery_state(event_id)
+        if isinstance(found, Exception):
+            state = "unavailable: " + _batch.failure_reason(found)
+            status = 1
+        print(f"{event_id} {state}", file=report, flush=True)
+    return status
+
+
 def main():
+    if sys.argv[1:2] == ["recover"]:
+        raise SystemExit(recover_main(sys.argv[2:]))
     missing = [name for name, value in
                (("API_SERVER_KEY", KEY),)
                if not value]
