@@ -12,6 +12,7 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+from datetime import datetime
 from types import SimpleNamespace
 
 
@@ -75,11 +76,43 @@ def fetch_event(event_id, channel):
     return verify_event(events[0], event_id, channel)
 
 
+def rendered_end(lines, at, event_id):
+    """Find the Tags line committed by the ID at an already-proven producer position.
+
+    queue.rs format_event_block renders pubkey, timestamp, kind, content and JSON tags: all
+    NIP-01 hash inputs. A quoted Tags/delimiter cannot shorten this body without a SHA-256
+    second preimage. This proves only the boundary; delivery still requires the signed original.
+    Labels (including a label's own 'hex:') are excluded by taking the terminal pubkey field.
+    """
+    try:
+        author = re.search(r"hex: ([0-9a-f]{64})\)$", lines[at + 3]).group(1)
+        stamp = lines[at + 4][len("Time: "):]
+        created = int(stamp) if stamp.isdecimal() else int(datetime.fromisoformat(
+            stamp.replace("Z", "+00:00")).timestamp())
+        event = {"pubkey": author, "created_at": created,
+                 "kind": int(lines[at + 2][len("Kind: "):])}
+        if not lines[at + 5].startswith("Content: "):
+            return None
+        for end in range(at + 6, len(lines)):
+            if not lines[end].startswith("Tags: "):
+                continue
+            try:
+                tags = json.loads(lines[end][len("Tags: "):])
+            except (ValueError, RecursionError):
+                continue
+            event.update(content="\n".join(lines[at + 5:end])[len("Content: "):], tags=tags)
+            if event_digest(event).hex() == event_id:
+                return end + 1
+    except (ValueError, OverflowError, AttributeError, IndexError):
+        return None
+    return None
+
+
 def recover_members(api, section, channel_line, lookup):
-    """IDs at confirmed positions, or a walk bounded by each verified original's entire content.
+    """IDs at confirmed positions, or a walk bounded by signed content or a rendered hash match.
 
     Cancelled lists have no declared count. A delimiter inside a body cannot end an event: the walk
-    consumes the signed content and JSON tags in full before accepting the next producer delimiter.
+    consumes the content and JSON tags committed by that event's ID before the next delimiter.
     Declared batches also use this walk when a quoted delimiter makes the older ID parser ambiguous.
     """
     lines = section.split("\n")
@@ -99,11 +132,12 @@ def recover_members(api, section, channel_line, lookup):
         ids.append(event_id)
         event = lookup(event_id)
         if isinstance(event, Exception):
-            break  # its unsigned body cannot authenticate where the next section starts
-        tail = ("Content: " + event["content"] + "\nTags: "
-                + json.dumps(event["tags"], ensure_ascii=False, separators=(",", ":"))).split("\n")
-        end = at + 5 + len(tail)
-        if lines[at + 5:end] != tail:
+            end = rendered_end(lines, at, event_id)
+        else:
+            tail = ("Content: " + event["content"] + "\nTags: "
+                    + json.dumps(event["tags"], ensure_ascii=False, separators=(",", ":"))).split("\n")
+            end = at + 5 + len(tail) if lines[at + 5:at + 5 + len(tail)] == tail else None
+        if end is None:
             break
         if end < len(lines) and lines[end].startswith("Parsed: "):
             end += 1
@@ -128,13 +162,7 @@ def recover_members(api, section, channel_line, lookup):
 
 
 def already_delivered(api, event_id):
-    try:
-        with open(os.path.join(api.PUBLISHED, event_id), encoding="utf-8") as handle:
-            record = json.load(handle)
-        return (record.get("event_id") == event_id and record.get("kind") == "answer"
-                and record.get("sent") is True)
-    except (OSError, ValueError, AttributeError):
-        return False  # the existing in-flight lock and gateway receipt still arbitrate submission
+    return api.recovery_delivery_state(event_id) == "answered"
 
 
 def deliver_batch(namespace, session, prompt):

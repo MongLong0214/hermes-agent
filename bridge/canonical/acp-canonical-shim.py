@@ -55,7 +55,7 @@ QUARANTINE = os.environ.get(
 # and the CEO's canonical turn is a peer turn that only returns text. The shim posts that text as the
 # reply through the mention-enforce wrapper rather than buzz-real (its signer, roster and recipient guards
 # stay in force), signed
-# with the key inherited from buzz-acp. One post per event id, ever: a marker is claimed before the
+# with the key inherited from buzz-acp. One terminal post per event id: a marker is claimed before the
 # send, and a failed or refused send is logged, never retried.
 BUZZ_CLI = os.environ.get("CANONICAL_BUZZ_CLI", os.path.expanduser("~/.hermes/bridge/bin/buzz"))
 MENTIONS = os.environ.get("CANONICAL_MENTIONS_FILE", os.path.expanduser("~/.hermes/bridge/required-mentions.json"))
@@ -910,16 +910,39 @@ def _claim(name):
         return None, f"marker unavailable: {type(exc).__name__}: {exc}"
 
 
-def publish_reply(event_id, channel, answer, kind="answer", *, ref=None, reply_to=None):
+def publication_record(name):
+    try:
+        with open(os.path.join(PUBLISHED, name), encoding="utf-8") as handle:
+            record = json.load(handle)
+        return record if isinstance(record, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def outcome_key(event_id, channel=None):
+    """Only a recorded, proven pre-claim refusal leaves room for a later terminal outcome."""
+    prior = publication_record(event_id)
+    if (prior.get("event_id") == event_id and prior.get("kind") == "notice"
+            and prior.get("preclaim") is True
+            and (channel is None or prior.get("channel") == channel)):
+        return event_id + ".answer"
+    return event_id
+
+
+def publish_reply(event_id, channel, answer, kind="answer", *, ref=None, reply_to=None, preclaim=False):
     """Post *answer* once as the thread reply to *event_id*. True only when the wrapper sent it.
 
     The delivery journal is ``PUBLISHED/<event id>``: claimed before the send (one post per event,
-    ever) and then filled with what happened — ``state`` is ``sent``, ``wrapper_refused``,
+    ever, except an explicit replay after a proven pre-claim refusal can publish one terminal outcome
+    under ``<event id>.answer``). That slot also holds terminal failure/uncertainty notices, never
+    another answer after one. The journal records ``state`` as ``sent``, ``wrapper_refused``,
     ``send_failed``, ``timeout`` or ``error``, with the ``reason``, and ``delivery`` is ``posted``
     or ``failed``. A failure stays recorded as one and is never retried. An unattributed refusal has
     no event id: its notice passes ``event_id=None``, is journaled under its correlation key *ref*
     and replies to *reply_to*, the thread buzz-acp's ``[Context]`` names (None: the channel)."""
     name, target = (event_id, event_id) if event_id is not None else (ref, reply_to)
+    if event_id is not None and not preclaim:
+        name = outcome_key(event_id, channel)
     tag = name[:12] if event_id is not None else name
     fd, why = _claim(name)
     if fd is None:
@@ -947,7 +970,8 @@ def publish_reply(event_id, channel, answer, kind="answer", *, ref=None, reply_t
             reason = f"exit {done.returncode}: stderr unclassifiable ({type(exc).__name__})"
     sent = state == "sent"
     with os.fdopen(fd, "w") as marker:
-        marker.write(json.dumps({"sent": sent, "state": state, "delivery": "posted" if sent else "failed",
+        marker.write(json.dumps({**({"preclaim": True} if preclaim else {}),
+                                 "sent": sent, "state": state, "delivery": "posted" if sent else "failed",
                                  "kind": kind, "event_id": event_id, "ref": ref, "channel": channel,
                                  "reply_to": target, "reason": str(reason)[:400],
                                  "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}) + "\n")
@@ -962,6 +986,9 @@ UNATTRIBUTED_NOTICE = (
     "메시지 병합 또는 일괄 전달)이거나 단일 이벤트 머리글이 정해진 자리에 없어, 발신자와 이벤트를 하나로 "
     "특정할 수 없었습니다. 누구에게도 귀속하지 않고 거부했으며, 턴은 실행되지 않았고 자동 재전송도 없습니다. "
     "필요하면 메시지를 하나씩 다시 보내 주세요. (ref {ref})")
+RECOVERY_UNKNOWN_NOTICE = (
+    "이 프롬프트의 이벤트 경계를 복구하지 못했습니다. 이전 제출의 CEO 수신 여부와 턴의 결과는 "
+    "알 수 없습니다(outcome unknown). 이번 복구에서는 제출하지 않았고 자동 재전송은 없습니다. (ref {ref})")
 
 
 def journal_undeliverable(ref, shape, reason):
@@ -1031,7 +1058,7 @@ def journal_own_echo(ref, shape, channel, reply_to):
         f"(an echo); journaled as own_echo")
 
 
-def refuse_unattributed(session, prompt, chars):
+def refuse_unattributed(session, prompt, chars, *, notice_template=UNATTRIBUTED_NOTICE):
     """Refuse a prompt that is not one attributable event — a merged or batched dispatch, or an event
     section out of its fixed form — attributing it to no one. The conversation is told once per
     correlation key, in fixed text that names no sender and quotes no body, at the destination
@@ -1073,7 +1100,7 @@ def refuse_unattributed(session, prompt, chars):
     if channel is None:
         journal_undeliverable(ref, shape, why)
         return
-    notice = UNATTRIBUTED_NOTICE.format(ref=ref[:29])
+    notice = notice_template.format(ref=ref[:29])
     write({"jsonrpc": "2.0", "method": "session/update", "params": {
         "sessionId": session,
         "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": notice}}}})
@@ -1107,6 +1134,10 @@ def batch_sections(prompt):
 
 def refuse_recovery_event(session, prompt, event_id, reason):
     """A recovery refusal owns a separate notice key; it never spends the event's answer marker."""
+    state = recovery_delivery_state(event_id)
+    if state in ("answered", "pending", "notified"):
+        log(f"prompt {event_id} recovery unavailable; existing delivery state {state}; no new notice")
+        return
     ref = "unattributed-" + hashlib.sha256(("recovery:" + event_id).encode()).hexdigest()
     log(f"prompt {event_id} recovery refused: {reason}; ref {ref}")
     print(f"acp-canonical-shim: event {event_id} recovery refused: {reason}", file=sys.stderr, flush=True)
@@ -1119,11 +1150,33 @@ def refuse_recovery_event(session, prompt, event_id, reason):
     if channel is None:
         journal_undeliverable(ref, "event_recovery", why)
         return
-    notice = ("이 메시지는 CEO 에게 전달되지 않았습니다. 원본 이벤트를 인증하여 복구하지 못했으므로 "
-              f"이 이벤트만 거부했습니다. 다른 이벤트의 처리는 계속됩니다. (event {event_id}, ref {ref[:29]})")
+    notice = ("원본 이벤트를 인증하여 복구하지 못했습니다. 이전 제출의 CEO 수신 여부와 턴의 결과는 "
+              "알 수 없습니다(outcome unknown). 이번 복구에서는 제출하지 않았고 자동 재전송은 없습니다. "
+              f"다른 이벤트의 처리는 계속됩니다. (event {event_id}, ref {ref[:29]})")
     write({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": session,
         "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": notice}}}})
     publish_reply(None, channel, notice, kind="unattributed_notice", ref=ref, reply_to=event_id)
+
+
+def recovery_delivery_state(event_id):
+    """Reconcile local answers/outcomes and submission ownership without resubmitting a body.
+
+    The gateway exposes receipt replay through the original attributed POST, not a read-only
+    receipt lookup. Without that verified original we cannot safely replay it. Missing local
+    evidence therefore means unknown, never proof that no gateway receipt exists.
+    """
+    records = [publication_record(event_id + suffix) for suffix in ("", ".answer")]
+    records = [r for r in records if r.get("event_id") == event_id]
+    if any(r.get("kind") == "answer" and r.get("sent") is True for r in records):
+        return "answered"
+    with _INFLIGHT_LOCK:
+        if event_id in _INFLIGHT:
+            return "pending"
+    if os.path.lexists(os.path.join(PUBLISHED, event_id + INFLIGHT_SUFFIX)):
+        return "pending"  # includes abandoned/uncertain ownership; the reaper arbitrates it
+    if any(r.get("kind") in ("notice", "unfinished_notice", "answer") for r in records):
+        return "notified"
+    return "unknown"
 
 
 def recover_batch(session, prompt):
@@ -1135,7 +1188,7 @@ def recover_batch(session, prompt):
     if _batch is not None:
         return _batch.deliver_batch(globals(), session, prompt)
     # Only producer-confirmed IDs can receive a per-event notice without the recovery module.
-    # Ambiguous sections still get the existing whole-prompt refusal, never guessed identities.
+    # Ambiguous sections get a whole-prompt unknown outcome, never guessed identities/non-receipt.
     _, channel_line, sections = batch
     unresolved = False
     ids = []
@@ -1146,7 +1199,8 @@ def recover_batch(session, prompt):
     for event_id in dict.fromkeys(ids):
         refuse_recovery_event(session, prompt, event_id, "batch module unavailable: " + _batch_error)
     if unresolved:
-        refuse_unattributed(session, prompt, len(prompt_text({"prompt": prompt})))
+        refuse_unattributed(session, prompt, len(prompt_text({"prompt": prompt})),
+                            notice_template=RECOVERY_UNKNOWN_NOTICE)
     return True
 
 
@@ -1266,9 +1320,11 @@ def _unfinished(base):
     shim submitted the event (or was about to) and ended without its outcome, so whether the turn ran is
     unknown, and it stays unresolved rather than being sent again. An entry with no complete record (a
     post cut short) is as unknown. An answer or notice entry is the turn's own outcome: a redelivery is
-    submitted as before, and the gateway answers it from the receipt without running it again."""
+    submitted as before, and the gateway answers it from the receipt without running it again.
+    After a proven pre-claim refusal the terminal record lives at ``<base>.answer`` instead;
+    legacy notices without that proof keep their original one-post limit."""
     try:
-        with open(os.path.join(PUBLISHED, base), encoding="utf-8") as handle:
+        with open(os.path.join(PUBLISHED, outcome_key(base)), encoding="utf-8") as handle:
             raw = handle.read(65_536)
     except FileNotFoundError:
         return None
@@ -1404,7 +1460,7 @@ def _prohibition_persisted(event_id):
     cut short, unreadable, another event's, or any other kind — is not that record. Whether the notice was
     posted is a separate fact: the record may say it was not, and still refuses the resubmission."""
     try:
-        fd = os.open(os.path.join(PUBLISHED, event_id), os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(os.path.join(PUBLISHED, outcome_key(event_id)), os.O_RDONLY | os.O_NOFOLLOW)
         try:
             raw = os.read(fd, 65_536)
             record = json.loads(raw.decode("utf-8").splitlines()[0])
@@ -1428,7 +1484,7 @@ def reap_unfinished():
     """Tell the thread, once, about each event a shim process submitted and never finished delivering:
     its ``.inflight`` entry is still linked and no live process holds its lock (the owner was replaced
     — buzz-acp SIGKILLs the group on CancelDrainTimeout — or its handler raised). The notice takes the
-    event's one post (``PUBLISHED/<event id>``), so it never goes out beside or after an answer; an
+    event's terminal post (``outcome_key``), so it never goes out beside or after an answer; an
     event that already has its post keeps no second one. The entry is retired only once the event's
     ``unfinished_notice`` record is persisted (``_prohibition_persisted``); until then — the journal could
     not be created or written, or the entry holds another kind — it stays as the guard against a
@@ -1457,7 +1513,7 @@ def reap_unfinished():
             except Exception:
                 record = None
             channel = record.get("channel") if isinstance(record, dict) else None
-            if not os.path.lexists(os.path.join(PUBLISHED, event_id)):
+            if not os.path.lexists(os.path.join(PUBLISHED, outcome_key(event_id))):
                 try:
                     if isinstance(channel, str) and re.fullmatch(_UUID, channel):
                         log(f"prompt {event_id[:12]}… was submitted by a shim that ended before its outcome; "
@@ -1465,7 +1521,7 @@ def reap_unfinished():
                         publish_reply(event_id, channel, UNFINISHED_NOTICE.format(event_id=event_id),
                                       kind="unfinished_notice")
                     else:
-                        marker, _ = _claim(event_id)
+                        marker, _ = _claim(outcome_key(event_id))
                         if marker is not None:
                             with os.fdopen(marker, "w") as record_file:
                                 record_file.write(json.dumps({
@@ -1567,7 +1623,7 @@ def deliver_event(session, parsed, text, mentioned):
     signers, unknown = _own_signers()
     if not mentioned:
         if (author != OWNER or _peer_handle(channel) is None
-                or os.path.exists(os.path.join(PUBLISHED, base))):
+                or os.path.exists(os.path.join(PUBLISHED, outcome_key(base, channel)))):
             return
     log(f"prompt author={author[:12]}… channel={channel} base={base[:12]}… chars={len(text)}")
     # Every refusal is decided before anything is claimed, so an armed canary is spent only on an
@@ -1611,7 +1667,7 @@ def deliver_event(session, parsed, text, mentioned):
             "sessionId": session,
             "update": {"sessionUpdate": "agent_message_chunk",
                        "content": {"type": "text", "text": notice}}}})
-        publish_reply(base, channel, notice, kind="notice")
+        publish_reply(base, channel, notice, kind="notice", preclaim=True)
         return
     if FORWARD != "live":
         if not claim_canary(author, channel, body):
@@ -1634,6 +1690,7 @@ def deliver_event(session, parsed, text, mentioned):
     answer = None
     answered = False
     notice = None
+    preclaim = False
     while True:
         attempt += 1
         event_id = base
@@ -1660,6 +1717,8 @@ def deliver_event(session, parsed, text, mentioned):
             answer = (f"canonical surface refused this turn (HTTP {exc.code}) after {attempt} "
                       f"attempt(s): {detail}")
             notice = refusal_notice(exc.code, code, refusal, base, len(text))
+            preclaim = ((exc.code, code) in ((400, "canonical_invalid_request"),
+                                           (403, "canonical_principal_rejected")))
             break
         except Exception as exc:
             log(f"prompt {event_id} failed: {type(exc).__name__}: {exc}")
@@ -1684,7 +1743,7 @@ def deliver_event(session, parsed, text, mentioned):
             + ("" if code != "canonical_answer_unrecorded" else
                ", answer NOT preserved" if kept is False else f", answer_kept={kept}")
             + "); telling the thread")
-        publish_reply(base, channel, notice, kind="notice")
+        publish_reply(base, channel, notice, kind="notice", preclaim=preclaim)
     finish_submission()
     return
 
