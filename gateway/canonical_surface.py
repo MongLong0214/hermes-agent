@@ -222,8 +222,9 @@ class CanonicalSurfaceBinding:
                 except RosterError as exc:
                     logger.error("Canonical routing roster rejected: %s", exc)
                     raise ValueError("canonical_roster_unavailable") from exc
-                if snapshot.admits(author_id, channel_id, owner):
-                    return True
+                # A room the roster lists is decided by the roster alone, refusal included: an
+                # older config grant must not readmit an author the roster reassigned (#99 r1).
+                return snapshot.admits(author_id, channel_id, owner)
         if author_id not in self.allowed_author_ids or channel_id not in self.allowed_channel_ids:
             return False
         if self.pairs:
@@ -236,7 +237,11 @@ class CanonicalSurfaceBinding:
         IndexError when the binding names neither."""
         primary = self.pairs[0] if self.pairs else (self.allowed_author_ids[0], self.allowed_channel_ids[0])
         snapshot = self.roster_snapshot()
-        if snapshot is not None and primary[1] in snapshot.channels and snapshot.active(primary[1]) is None:
+        if snapshot is not None and primary[1] in snapshot.channels:
+            current = snapshot.active(primary[1])
+            if current is not None:
+                # The roster's current peer for this room, even when it reassigned the identity.
+                return current["peer"]["pubkey"], primary[1]
             for channel, room in snapshot.channels.items():
                 if room["status"] == "active":
                     return room["peer"]["pubkey"], channel
