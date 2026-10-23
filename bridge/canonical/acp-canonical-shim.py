@@ -1652,9 +1652,12 @@ def deliver_event(session, parsed, text, mentioned):
         hold(session, author, channel, base, text)
         return
     if signers is None:
-        log(f"prompt {base[:12]}… HELD, not sent: {unknown}")
+        # The bridge's own identities are unreadable, so an echo cannot be ruled out: nothing is
+        # claimed, and the prompt fails so buzz-acp resends this event once they are readable again
+        # (#99 r2 H99-02); ending the turn would count the event as delivered.
+        log(f"prompt {base[:12]}… HELD, not sent: {unknown}; ACP retry requested")
         journal_held(base, channel, unknown)
-        return
+        return RETRY
     if author in signers:
         # This bridge's own post — an answer or a not-delivered notice — coming back. buzz-acp drops
         # it first (ignore-self, the author gate) and the binding's author allowlist
