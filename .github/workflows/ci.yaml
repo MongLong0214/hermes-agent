@@ -159,9 +159,9 @@ jobs:
   contributor-check:
     name: Check contributors
     needs: detect
-    # Upstream attribution policy: it checks every author since the merge base with upstream main,
-    # which a fork's release branch (carrying ported upstream commits) can never satisfy.
-    if: needs.detect.outputs.python == 'true' && github.repository_owner == 'NousResearch'
+    # The attribution check compares a PR's commits against its actual target SHA
+    # (contributor-check.yml) and runs on ubuntu-latest, so it runs in the fork too (#101 r1 H101-01).
+    if: needs.detect.outputs.python == 'true'
     uses: ./.github/workflows/contributor-check.yml
 
   uv-lockfile:
@@ -306,7 +306,7 @@ jobs:
               'e2e-desktop-core': lane('python_prod') or lane('frontend'),
               'docs-site': lane('site'),
               'history-check': pr,
-              'contributor-check': lane('python') and os.environ['REPOSITORY_OWNER'] == 'NousResearch',
+              'contributor-check': lane('python'),
               'uv-lockfile': lane('uv_lock'),
               'case-collision-check': True,
               'lockfile-diff': pr and lane('npm_lock'),
