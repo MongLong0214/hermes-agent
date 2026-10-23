@@ -69,10 +69,10 @@ def backup_config(config_path: Path, reason: str, *, keep: int = DEFAULT_KEEP) -
         # has since been pruned.
         seq_file = root / f".{reason}.seq"
         try:
-            seq = int(seq_file.read_text().strip()) + 1
+            seq = int(seq_file.read_text(encoding="utf-8").strip()) + 1
         except (OSError, ValueError):
             seq = 1
-        seq_file.write_text(str(seq))
+        seq_file.write_text(str(seq), encoding="utf-8")
         dest = root / f"{config_path.name}.{reason}.{stamp}-{seq:08d}"
         if dest.is_symlink() or dest.exists():  # never write through a planted link
             return None

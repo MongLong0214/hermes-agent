@@ -14,6 +14,7 @@ concurrency:
 jobs:
   test:
     name: Run tests
+    if: github.repository_owner == 'NousResearch'
     # One 96-core runner for the whole suite. There is no slicing. Slicing
     # existed to spread the suite over 4-core runners. It cost a matrix job, a
     # duration cache, a per-slice artifact and a merge job to do it.
@@ -166,11 +167,270 @@ jobs:
           path: test_durations.json
           key: test-durations-${{ github.run_id }}
 
+  # ─────────────────────────────────────────────────────────────────────
+  # Outside the upstream repository there are no larger runners, so the
+  # suite runs as slices on standard ubuntu-latest runners instead of the
+  # single `test` job above. The partition is computed once per run by
+  # test-plan and every slice runs only its own explicit file list, so the
+  # slices are disjoint and together cover the discovered suite exactly
+  # once. Duration measurements are merged and saved once by test-durations.
+  # ─────────────────────────────────────────────────────────────────────
+  test-plan:
+    name: Plan test slices
+    if: github.repository_owner != 'NousResearch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      SLICE_COUNT: 8
+    outputs:
+      slices: ${{ steps.plan.outputs.slices }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Restore per-file duration cache
+        # Restored once here; the slices use this exact snapshot (for the
+        # per-file timeout scaler) instead of restoring their own.
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: test_durations.json
+          key: test-durations-never-exact
+          restore-keys: |
+            test-durations-
+
+      - name: Partition the suite
+        id: plan
+        # Same discovery as `scripts/run_tests.sh` with no path arguments,
+        # distributed by LPT over the restored durations (stdlib only, so the
+        # runner image's python3 is enough).
+        run: |
+          set -euo pipefail
+          plan_dir="$RUNNER_TEMP/test-plan"
+          mkdir -p "$plan_dir"
+          python3 scripts/run_tests_parallel.py --generate-slices "$SLICE_COUNT" > "$RUNNER_TEMP/plan.out"
+          python3 - "$RUNNER_TEMP/plan.out" "$plan_dir" "$SLICE_COUNT" >> "$GITHUB_OUTPUT" <<'PY'
+          import json, pathlib, sys
+          lines = [l for l in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines() if l.strip()]
+          plan = json.loads(lines[-1])["slice"]
+          out = pathlib.Path(sys.argv[2])
+          if len(plan) != int(sys.argv[3]):
+              sys.exit(f"expected {sys.argv[3]} slices, got {len(plan)}")
+          indices = []
+          for entry in plan:
+              files = [f for f in entry["files"].split(":") if f]
+              if not files:
+                  sys.exit(f"slice {entry['index']} is empty")
+              (out / f"slice-{entry['index']}.txt").write_text("\n".join(files) + "\n", encoding="utf-8")
+              indices.append(entry["index"])
+              print(f"slice {entry['index']}: {len(files)} files", file=sys.stderr)
+          print(f"slices={json.dumps(indices)}")
+          PY
+          if [ -f test_durations.json ]; then
+            cp test_durations.json "$plan_dir/test_durations.json"
+          fi
+
+      - name: Upload the test plan
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: test-plan
+          path: ${{ runner.temp }}/test-plan
+          overwrite: true
+          retention-days: 3
+
+  test-slice:
+    name: Run tests (slice ${{ matrix.slice }})
+    needs: test-plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        slice: ${{ fromJSON(needs.test-plan.outputs.slices) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install ripgrep (prebuilt binary)
+        run: |
+          set -euo pipefail
+          RG_VERSION=15.1.0
+          RG_SHA256=1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599
+          RG_TARBALL=ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl.tar.gz
+          curl -sSfL --retry 3 --retry-delay 5 -o "$RG_TARBALL" \
+            "https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/${RG_TARBALL}"
+          echo "${RG_SHA256}  ${RG_TARBALL}" | sha256sum -c -
+          tar -xzf "$RG_TARBALL"
+          sudo mv "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl/rg" /usr/local/bin/rg
+          rm -rf "$RG_TARBALL" "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl"
+          rg --version
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          # Pin the uv version: unpinned, setup-uv resolves "latest" by
+          # fetching a manifest from raw.githubusercontent.com on EVERY job —
+          # a transient fetch failure fails the whole job (2026-07-28 slice-5
+          # incident). Pinned, the binary downloads directly; no manifest hop.
+          #
+          # The uv pin also fixes which CPython `uv python install 3.11`
+          # resolves, and with it the linked SQLite. uv 0.9.28 resolved
+          # 3.11.14 / SQLite 3.50.4, which has the WAL-reset bug, so Hermes
+          # ran every state.db in DELETE mode here and the WAL path went
+          # untested. 0.12.13 resolves 3.11.16 / SQLite 3.53.1. The
+          # "Check SQLite runs WAL" step fails the job if a bump regresses it.
+          version: "0.12.13"
+          # Persist uv's download/wheel cache (~/.cache/uv) across runs.
+          # Keyed on the dependency manifests, so the cache is reused until
+          # pyproject.toml or uv.lock changes. `uv sync` still runs every
+          # time, but resolves from the warm cache instead of re-downloading
+          # and re-building wheels.
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python 3.11
+        uses: ./.github/actions/retry
+        with:
+          command: uv python install 3.11
+
+      - name: Install dependencies
+        # `uv sync --locked` installs the exact pinned set from uv.lock (and
+        # fails if the lock is out of sync with pyproject.toml), giving a
+        # reproducible env. It also creates .venv itself, so no separate
+        # `uv venv` step is needed.
+        #
+        # The trailing extras beyond all/dev are the lazy-install features
+        # (tools/lazy_deps.py) that tests exercise for real: provider.anthropic,
+        # stt/tts.mistral, image.fal, terminal.modal, terminal.daytona,
+        # search.parallel, provider.bedrock. The hermetic test env forbids
+        # mid-run pip installs (HERMES_DISABLE_LAZY_INSTALLS=1 in
+        # tests/conftest.py), so the SDKs those tests need must be in the
+        # venv up front — resolved from uv.lock like everything else, which
+        # also honors the exact supply-chain pins these extras carry.
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra parallel-web --extra bedrock
+
+      - name: Minimize uv cache
+        # Optimized for CI: prunes pre-built wheels that are cheap to
+        # re-download, keeping the persisted cache small and fast to restore.
+        run: uv cache prune --ci
+
+      - name: Check SQLite runs WAL
+        # Hermes picks DELETE journal mode on a SQLite with the WAL-reset
+        # bug. If this interpreter links one, every WAL test silently runs
+        # DELETE (or skips), so fail loudly instead. Tests that need DELETE
+        # select it explicitly (journal_mode config, a pinned vulnerable
+        # version), so they run on any interpreter.
+        run: |
+          .venv/bin/python -c "import sqlite3, sys, hermes_state_wal as w; v = w.is_sqlite_wal_reset_vulnerable(); print(f'Python {sys.version.split()[0]}, SQLite {sqlite3.sqlite_version}, WAL-reset vulnerable: {v}'); sys.exit(1 if v else 0)"
+
+      - name: Download the test plan
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: test-plan
+          path: ${{ runner.temp }}/test-plan
+
+      - name: Use the plan's duration snapshot
+        run: |
+          if [ -f "$RUNNER_TEMP/test-plan/test_durations.json" ]; then
+            cp "$RUNNER_TEMP/test-plan/test_durations.json" test_durations.json
+          fi
+
+      - name: Run tests
+        # Runs exactly this slice's list from test-plan; no discovery here.
+        run: |
+          source .venv/bin/activate
+          scripts/run_tests.sh --files-from "$RUNNER_TEMP/test-plan/slice-${{ matrix.slice }}.txt"
+        env:
+          # One test file per vCPU of the standard runner.
+          HERMES_TEST_WORKERS: 4
+          # Ensure tests don't accidentally call real APIs
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+
+      - name: Keep this slice's durations (main only)
+        # The runner merges its clean first-attempt durations into the
+        # snapshot; keep only this slice's own files so the merge job never
+        # lets one slice's copy of the snapshot overwrite another's fresh
+        # measurement.
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && hashFiles('test_durations.json') != ''
+        run: |
+          mkdir -p "$RUNNER_TEMP/slice-durations"
+          python3 - "$RUNNER_TEMP/test-plan/slice-${{ matrix.slice }}.txt" <<'PY'
+          import json, os, pathlib, sys
+          own = {l.strip() for l in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines() if l.strip()}
+          data = json.loads(pathlib.Path("test_durations.json").read_text(encoding="utf-8"))
+          kept = {k: v for k, v in data.items() if k in own}
+          out = pathlib.Path(os.environ["RUNNER_TEMP"]) / "slice-durations" / "test_durations.json"
+          out.write_text(json.dumps(kept, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          print(f"kept {len(kept)} of {len(own)} files")
+          PY
+
+      - name: Upload this slice's durations (main only)
+        # Advisory (feeds slice balancing and the timeout scaler): an
+        # artifact-service blip must not fail an otherwise-green slice.
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && hashFiles('test_durations.json') != ''
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: test-durations-slice-${{ matrix.slice }}
+          path: ${{ runner.temp }}/slice-durations/test_durations.json
+          overwrite: true
+          retention-days: 3
+
+  test-durations:
+    name: Save test durations
+    needs: [test-plan, test-slice]
+    if: ${{ !cancelled() && github.repository_owner != 'NousResearch' && needs.test-plan.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    # Advisory cache: a failure here must not fail the test lane.
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download the test plan
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: test-plan
+          path: plan
+
+      - name: Download slice durations
+        # No merge-multiple: every slice's file is named test_durations.json,
+        # so each artifact gets its own directory.
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: test-durations-slice-*
+          path: durations
+
+      - name: Merge into one durations file
+        # Start from the snapshot the run used; slices own disjoint files, so
+        # applying them in any order gives the same result.
+        run: |
+          python3 - <<'PY'
+          import glob, json, pathlib
+          base = pathlib.Path("plan/test_durations.json")
+          merged = json.loads(base.read_text(encoding="utf-8")) if base.is_file() else {}
+          for path in sorted(glob.glob("durations/*/test_durations.json")):
+              merged.update(json.loads(pathlib.Path(path).read_text(encoding="utf-8")))
+          pathlib.Path("test_durations.json").write_text(json.dumps(merged, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          print(f"merged {len(merged)} file durations")
+          PY
+
+      - name: Save merged duration cache
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: test_durations.json
+          key: test-durations-${{ github.run_id }}
+
   e2e:
     # The core suites spawn real serve / gateway / tui_gateway / MCP / SQLite
     # writer processes per test; a 4-vCPU runner serialises them into timeouts.
-    runs-on: ubuntu-latest-32-core
-    timeout-minutes: 30
+    # Outside the upstream repository only standard runners exist, so the job
+    # runs there with a longer time limit.
+    runs-on: ${{ github.repository_owner == 'NousResearch' && 'ubuntu-latest-32-core' || 'ubuntu-latest' }}
+    timeout-minutes: ${{ github.repository_owner == 'NousResearch' && 30 || 60 }}
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -284,7 +544,7 @@ jobs:
     # autostash, killed mid-pull / mid-deps, offline), fresh-process import and
     # entrypoint smoke, and the config round-trip property matrix. Its own job:
     # it needs full history + tags, bubblewrap, and one file runs ~5-15 min.
-    runs-on: ubuntu-latest-32-core
+    runs-on: ${{ github.repository_owner == 'NousResearch' && 'ubuntu-latest-32-core' || 'ubuntu-latest' }}
     timeout-minutes: 60
     steps:
       - name: Checkout code
