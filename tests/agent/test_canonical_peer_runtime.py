@@ -582,6 +582,104 @@ def _backfill_genuine_sidecar(db, sid, row_id):
     return genuine_sidecar
 
 
+_LEGACY_SIDECAR_MARKER = "canonical-peer-sidecar-legacy:v1"
+
+
+@pytest.mark.parametrize("loader", ["conversation", "resume", "gateway", "codex"])
+def test_legacy_backfilled_sidecar_survives_upgrade_and_repeated_open(tmp_path, loader):
+    """R103-6: pre-digest Hermes context survives all four real history consumers."""
+    from agent.canonical_peer import sidecar_digest
+    from agent.codex_runtime_history_seed import render_history_seed
+    from gateway.run import _build_gateway_agent_history
+
+    db = _store(tmp_path)
+    try:
+        row_id = db.append_message("sess-peer", "user", BODY, display_kind="canonical_peer",
+                                   display_metadata={"canonical_peer": _peer()})
+        sidecar = _backfill_genuine_sidecar(db, "sess-peer", row_id)
+        db.append_message("sess-peer", "assistant", "ok")
+        key = f"canonical-peer-row:v1:{row_id}"
+        record = json.loads(db.get_meta(key))
+        del record["sidecar_sha256"]
+        db.set_meta(key, json.dumps(record))
+        db._write_sql("DELETE FROM state_meta WHERE key = ?", (_LEGACY_SIDECAR_MARKER,))
+    finally:
+        db.close()
+
+    rebound = None
+    for _ in range(2):
+        db = SessionDB(tmp_path / "state.db")
+        try:
+            if loader == "resume":
+                history = db.get_resume_conversations("sess-peer")[0]
+            else:
+                history = db.get_messages_as_conversation("sess-peer")
+            if loader == "gateway":
+                history, _ = _build_gateway_agent_history(history)
+            if loader == "codex":
+                assert sidecar in render_history_seed(history)
+            else:
+                assert _peer_rows(history)[0]["api_content"] == sidecar
+
+            migrated = json.loads(db.get_meta(key))
+            assert migrated == {**record, "sidecar_sha256": sidecar_digest(sidecar)}
+            assert db.get_meta(_LEGACY_SIDECAR_MARKER) is not None
+            if rebound is not None:
+                assert db.get_meta(key) == rebound
+            rebound = db.get_meta(key)
+        finally:
+            db.close()
+
+
+@pytest.mark.parametrize("case", ["nonprefix", "imported", "bound_tamper", "post_marker",
+                                  "body_tampered", "receipt_missing"])
+def test_legacy_sidecar_migration_leaves_ineligible_records_unchanged(tmp_path, case):
+    """The one-time trust grant never extends to imports, new rows or invalid provenance."""
+    from agent.canonical_peer import PeerProvenanceError
+
+    db = _store(tmp_path)
+    try:
+        row_id = db.append_message("sess-peer", "user", BODY, display_kind="canonical_peer",
+                                   display_metadata={"canonical_peer": _peer()})
+        sidecar = _backfill_genuine_sidecar(db, "sess-peer", row_id)
+        key = f"canonical-peer-row:v1:{row_id}"
+        record = json.loads(db.get_meta(key))
+        if case != "bound_tamper":
+            del record["sidecar_sha256"]
+        db.set_meta(key, json.dumps(record))
+        if case == "imported":
+            imported_key = f"canonical-peer-imported-row:v1:{row_id}"
+            db.set_meta(imported_key, db.get_meta(key))
+            db._write_sql("DELETE FROM state_meta WHERE key = ?", (key,))
+            key = imported_key
+        elif case == "body_tampered":
+            db._write_sql("UPDATE messages SET content = ? WHERE id = ?", ("altered body", row_id))
+        elif case == "receipt_missing":
+            db._write_sql("DELETE FROM state_meta WHERE key = ?", (RECEIPT,))
+
+        replacement = "unrelated context" if case == "nonprefix" else sidecar + _TAMPER_SUFFIX
+        db._write_sql("UPDATE messages SET api_content = ? WHERE id = ?", (replacement, row_id))
+        if case != "post_marker":
+            db._write_sql("DELETE FROM state_meta WHERE key = ?", (_LEGACY_SIDECAR_MARKER,))
+        original_record = db.get_meta(key)
+    finally:
+        db.close()
+
+    for _ in range(2):
+        db = SessionDB(tmp_path / "state.db")
+        try:
+            assert db.get_meta(key) == original_record
+            if case in {"body_tampered", "receipt_missing"}:
+                with pytest.raises(PeerProvenanceError):
+                    db.get_messages_as_conversation("sess-peer")
+            else:
+                history = db.get_messages_as_conversation("sess-peer")
+                assert _peer_rows(history)[0]["api_content"] == _rendered()
+            assert db.get_meta(_LEGACY_SIDECAR_MARKER) is not None
+        finally:
+            db.close()
+
+
 def test_legitimate_backfilled_sidecar_survives_reload_gateway_replay_and_codex_seed(agent_db):
     """R1 BLOCKER close: a peer row's Hermes-appended context (the live sidecar backfilled onto
     it after admission) is real context that was really sent. Discarding it unconditionally on
