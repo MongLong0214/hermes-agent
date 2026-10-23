@@ -898,6 +898,12 @@ def _stamp_api_content_sidecar(
     if _api_content is None or _api_content == durable_content:
         return
     _turn_user_msg["api_content"] = _api_content
+    from agent.canonical_peer import PEER_SIDECAR_VERIFIED_KEY, peer_metadata
+    if peer_metadata(_turn_user_msg) is not None:
+        # Hermes just composed this sidecar itself, on the live dict — first-party, not a stored
+        # value — so same-turn and retained-history consumers of THIS dict (iteration summary,
+        # next-turn replay) send what the live request sent instead of the bare rendering.
+        _turn_user_msg[PEER_SIDECAR_VERIFIED_KEY] = True
 
     # When another writer materialized this turn's user row BEFORE the sidecar existed — in-place
     # preflight compaction, or a close/early flush that raced the prologue (#102194) — the crash
