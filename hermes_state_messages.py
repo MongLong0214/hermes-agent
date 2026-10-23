@@ -549,6 +549,24 @@ class SessionMessagesMixin:
             "AND role NOT IN ('session_meta', 'system') ORDER BY id DESC LIMIT 1", (session_id,))
         return row[0] if row else None
 
+    def open_user_tail_is_delivery_only(self, session_id: str) -> bool:
+        """True when the open user tail (active user rows after the newest assistant/tool row) holds
+        only recorded delegation deliveries (``async_delegation_complete`` / ``hidden``), which
+        ``append_delegation_delivery`` writes between client turns to be read with the next one.
+        Such rows are no principal's message, so they do not make the history unanswered."""
+        # ``hidden`` also marks ordinary off-screen user prompts (#102 r1 H102-01): only a row that
+        # carries the delivery's own delegation_id, as append_delegation_delivery writes it, counts.
+        rows = self._read_all(
+            "SELECT role, display_kind, json_extract(display_metadata, '$.delegation_id') "
+            "FROM messages WHERE session_id = ? AND active = 1 "
+            "AND role NOT IN ('session_meta', 'system') AND id > coalesce((SELECT max(id) FROM messages "
+            "WHERE session_id = ? AND active = 1 AND role IN ('assistant', 'tool')), 0) ORDER BY id",
+            (session_id, session_id))
+        return bool(rows) and all(
+            role == "user" and kind in ("async_delegation_complete", "hidden")
+            and isinstance(delegation_id, str) and delegation_id.strip()
+            for role, kind, delegation_id in rows)
+
     def get_message_role(self, session_id: str, row_id: int) -> Optional[str]:
         """Role of the active message at *row_id* in *session_id*, or ``None``."""
         if not session_id:

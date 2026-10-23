@@ -503,6 +503,64 @@ def test_peer_turn_after_an_unanswered_user_row_is_refused_before_the_claim(ingr
     assert ingress.actor.calls == [] and ingress.receipts() == []
 
 
+def test_peer_turn_after_only_recorded_delegation_deliveries_is_admitted(ingress, send):
+    """delegation.completion_delivery: quiet records each detached result as a user row to be read
+    with the next turn. Those rows are no principal's message; refusing on them blocked every
+    canonical event until something else ran a turn (live CEO session, 2026-10-23)."""
+    db, sid = ingress.actor._session_db, ingress.entry.session_id
+    db.append_message(sid, "user", "owner question")
+    db.append_message(sid, "assistant", "owner answer")
+    db.append_delegation_delivery(sid, "[delegation result 1]", {"delegation_id": "deleg_a"})
+    db.append_delegation_delivery(sid, "[delegation result 2]", {"delegation_id": "deleg_b"})
+    assert db.latest_conversation_role(sid) == "user" and db.open_user_tail_is_delivery_only(sid)
+
+    async def exercise():
+        assert (await send())[0] == 200
+
+    asyncio.run(exercise())
+    assert len(ingress.actor.calls) == 1
+
+
+def test_a_principal_row_after_delegation_deliveries_still_refuses_the_peer_turn(ingress, send):
+    db, sid = ingress.actor._session_db, ingress.entry.session_id
+    db.append_delegation_delivery(sid, "[delegation result]", {"delegation_id": "deleg_c"})
+    db.append_message(sid, "user", "owner question, no reply yet")
+    assert not db.open_user_tail_is_delivery_only(sid)
+
+    async def exercise():
+        assert _code(await send()) == (409, "canonical_history_unanswered")
+
+    asyncio.run(exercise())
+    assert ingress.actor.calls == [] and ingress.receipts() == []
+
+
+@pytest.mark.parametrize("display_kind", ["hidden", "async_delegation_complete"])
+def test_an_unanswered_hidden_principal_row_without_delivery_provenance_still_refuses(ingress, send, display_kind):
+    """#102 r1 H102-01: ``hidden`` also marks ordinary off-screen user prompts. Only a row carrying the
+    delivery's own delegation_id is a recorded delivery; anything else is a principal's open row."""
+    db, sid = ingress.actor._session_db, ingress.entry.session_id
+    db.append_message(sid, "user", "owner question", display_kind=display_kind)
+    assert not db.open_user_tail_is_delivery_only(sid)
+
+    async def exercise():
+        assert _code(await send()) == (409, "canonical_history_unanswered")
+
+    asyncio.run(exercise())
+    assert ingress.actor.calls == [] and ingress.receipts() == []
+
+
+def test_a_suppressed_delegation_delivery_is_still_admitted(ingress, send):
+    db, sid = ingress.actor._session_db, ingress.entry.session_id
+    db.append_delegation_delivery(sid, "[delegation result]", {"delegation_id": "deleg_h", "presentation_suppressed": True})
+    assert db.open_user_tail_is_delivery_only(sid)
+
+    async def exercise():
+        assert (await send())[0] == 200
+
+    asyncio.run(exercise())
+    assert len(ingress.actor.calls) == 1
+
+
 def _persisted_peer(ingress, send, body=_PEER_BODY):
     """Run one peer turn through the agent's own flush row builder, then one owner exchange."""
     ingress.actor.persist = True
