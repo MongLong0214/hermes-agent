@@ -239,6 +239,11 @@ def deliver_member(api, session, prompt, channel, event_id, lookup):
             + json.dumps(tags, ensure_ascii=False, separators=(",", ":")))
     signers, unknown = api._own_signers()
     if signers is None:
+        snapshot, _ = api._read_roster()
+        if snapshot is not None:
+            # A readable roster with no active signer (every room retired) is not an outage: the
+            # single-event path's retirement suppression decides, as it does there (#99 r3 H99-03).
+            return api.deliver_event(session, (event["pubkey"], channel, event_id, event["content"]), text, False)
         # Without the bridge's own identities neither an echo nor a mention can be decided; keep the
         # event replayable instead of letting the batch end as delivered (#99 r2 H99-02).
         api.log(f"prompt {event_id} HELD, not sent: {unknown}; ACP retry requested")
