@@ -237,7 +237,13 @@ def deliver_member(api, session, prompt, channel, event_id, lookup):
             + (f"Thread root: {root}\n" if root else "")
             + f"Content: {event['content']}\nTags: "
             + json.dumps(tags, ensure_ascii=False, separators=(",", ":")))
-    signers, _ = api._own_signers()
-    mentioned = signers is not None and any(
+    signers, unknown = api._own_signers()
+    if signers is None:
+        # Without the bridge's own identities neither an echo nor a mention can be decided; keep the
+        # event replayable instead of letting the batch end as delivered (#99 r2 H99-02).
+        api.log(f"prompt {event_id} HELD, not sent: {unknown}; ACP retry requested")
+        api.journal_held(event_id, channel, unknown)
+        return api.RETRY
+    mentioned = any(
         len(tag) >= 2 and tag[0] == "p" and tag[1] in signers for tag in tags)
     return api.deliver_event(session, (event["pubkey"], channel, event_id, event["content"]), text, mentioned)
