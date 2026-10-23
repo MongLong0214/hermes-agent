@@ -35,6 +35,7 @@ from hermes_state_fence import (
 from hermes_state_fts import SessionFtsSetupMixin, _drop_orphan_fts_shadow_tables
 from hermes_state_holders import _read_proc_argv
 from hermes_state_errors import is_sqlite_lock_error
+from hermes_state_peer_migrations import migrate_legacy_peer_sidecars
 
 # Pre-split logger identity so log filtering/capture is unchanged.
 logger = logging.getLogger("hermes_state")
@@ -1126,6 +1127,7 @@ class SessionSchemaMixin:
         else:
             fts_migrations_complete = self._run_data_migrations(cursor, lineage.gate, fts5_available)
 
+        migrate_legacy_peer_sidecars(self, cursor)
         self._ensure_unique_title_index(cursor)
         if fts5_available:
             self._init_fts(cursor)
