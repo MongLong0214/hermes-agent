@@ -73,6 +73,319 @@ def run_cell(request, execution_count):
     }, out.getvalue()
 '''
 
+# Hard-block gateway-lifecycle commands against the REAL argv, not the cell's source text: the
+# guard in tools/code_execution_tool.py scans the cell's source for a lifecycle command before
+# the kernel is even spawned, so a cell that builds the argv at runtime (``a = "launch"; b =
+# "ctl"; subprocess.run([a + b, "bootout", ...])``) never looks like a literal string to that
+# scan. sys.addaudithook() callbacks cannot be removed or replaced by code that runs after them
+# in the same interpreter, so installing this before the first cell runs makes it unconditional
+# for the life of the kernel. The same source is the kernel runner's bootstrap AND the
+# ``sitecustomize`` every Python interpreter the kernel starts imports (see ``_spawn``), because
+# an audit hook is per-interpreter: a ``python -c`` child the cell launches had no hook at all
+# and could build the lifecycle argv itself (R70-1 round 2 (b)).
+#
+# Nothing the hook does at call time may resolve through state a cell can rebind first. Inside
+# ``_install_hermes_lifecycle_guard`` every helper, builtin and module function the hook calls is
+# captured into a local before any cell code runs (a cell shares the runner's ``__main__``, and
+# ``__main__.shlex.join = ...`` rewrote every argv to ``echo safe`` -- R70-1c and round 2 (a)).
+# The classifier runs with private builtins/import bindings. Its own code, shell-heredoc
+# helper and shlex are loaded into private namespaces before cells run, so normal mocking of
+# shared modules neither disables the guard nor makes harmless subprocess calls fail.
+#
+# Limits (local single-user guard, not a sandbox; PEP 578): introspection can reach and rewrite
+# the hook's closure/private code; transitive dependencies (pathlib, profile and SQLite helpers,
+# logging, re internals) still share interpreter state. Public shell-heredoc __code__ replacement
+# is isolated, but arbitrary same-account object/code rewriting is not a security boundary.
+# Other Limits: cell-controlled __fspath__/__str__; process creation without an audit event
+# (_posixsubprocess.fork_exec, ctypes/libc); foreign/old interpreters; Python -I/-E/-S or shells
+# clearing PYTHONPATH. MappingProxyType envs and os.exec*/posix_spawn explicit envs may leave
+# descendants unarmed because the audit event cannot replace their pre-converted environment.
+# Direct lifecycle commands are still checked in those routes. Closing descendant gaps requires
+# enforcement outside this interpreter; do not reject legitimate commands to approximate it.
+LIFECYCLE_GUARD_SOURCE = '''\
+def _install_hermes_lifecycle_guard():
+    import builtins
+    import importlib
+    import importlib.util
+    import os
+    import shlex
+    import sys
+    import types
+
+    guard_root = os.environ.get("HERMES_KERNEL_LIFECYCLE_GUARD_ROOT", "")
+    if not guard_root or not hasattr(sys, "addaudithook"):
+        return
+    site_dir = os.environ.get("HERMES_KERNEL_LIFECYCLE_GUARD_SITE", "")
+    block_message = (
+        "Blocked: cannot restart or stop the gateway from inside the gateway process "
+        "(execute_code audit-hook guard). The gateway would kill this script before it could "
+        "complete. Run the lifecycle command from a shell outside the gateway."
+    )
+    root_key, site_key = "HERMES_KERNEL_LIFECYCLE_GUARD_ROOT", "HERMES_KERNEL_LIFECYCLE_GUARD_SITE"
+    fspath, fsdecode = os.fspath, os.fsdecode
+    environ, pathsep, makedirs = os.environ, os.pathsep, os.makedirs
+    sys_mod = sys
+    _isinstance, _str, _bytes, _bool, _type, _list = isinstance, str, bytes, bool, type, list
+    _open, _PermissionError, _Exception = open, PermissionError, Exception
+    _TypeError, _ValueError, _OSError = TypeError, ValueError, OSError
+
+    scan = None
+    path_added = guard_root not in sys.path
+    if path_added:
+        sys.path.append(guard_root)
+    try:
+        # Capture imports in this namespace, never by mutating sys.modules or the cell's modules.
+        # Load the parsing code afresh so replacing a public helper's __code__ also stays local
+        # to the cell. Other Hermes helpers retain their live profile/SQLite state.
+        private_builtins = dict(vars(builtins))
+        real_import = builtins.__import__
+        private_imports = {}
+
+        def private_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if level == 0 and name in private_imports:
+                return private_imports[name]
+            return real_import(name, globals, locals, fromlist, level)
+
+        private_builtins["__import__"] = private_import
+
+        def copy_module(module):
+            copied = types.ModuleType(module.__name__)
+            vars(copied).update(vars(module))
+            return copied
+
+        private_os = copy_module(os)
+        private_os.path = copy_module(os.path)
+        private_imports.update({"os": private_os, "os.path": private_os.path})
+        for name in ("re", "stat", "hermes_cli.profiles", "hermes_cli.sqlite_safe_read", "hermes_constants"):
+            private_imports[name] = copy_module(importlib.import_module(name))
+
+        def load_private(name, path):
+            module = types.ModuleType(name)
+            namespace = vars(module)
+            namespace.update(__file__=path, __builtins__=private_builtins)
+            with _open(path, "rb") as source_file:
+                exec(compile(source_file.read(), path, "exec"), namespace)
+            return module
+
+        private_imports["shlex"] = load_private("shlex", shlex.__file__)
+        private_imports["tools.shell_heredoc"] = load_private(
+            "tools.shell_heredoc", os.path.join(guard_root, "tools", "shell_heredoc.py"))
+        # Bypass cron.__init__: it imports the scheduler and optional dependencies a project
+        # interpreter need not have. The classifier itself has only stdlib top-level imports.
+        guard_mod = load_private("_hermes_kernel_lifecycle_guard",
+                                 os.path.join(guard_root, "cron", "lifecycle_guard.py"))
+        scan = guard_mod.scan_gateway_lifecycle
+        join = private_imports["shlex"].join
+    except _Exception:
+        scan = None  # fails open to the source-text scan already run on the cell
+    finally:
+        if path_added:
+            try:
+                sys.path.remove(guard_root)
+            except _ValueError:
+                pass
+    if scan is None:
+        return
+
+    site_file = os.path.join(site_dir, "sitecustomize.py") if site_dir else ""
+    site_source = None
+    if site_file:
+        try:
+            with _open(site_file, "rb") as source_file:
+                site_source = source_file.read()
+        except _OSError:
+            site_source = None
+
+    def _cmdline_text(value):
+        """Flatten a Popen/exec/spawn argv (str, bytes, path-like, or a sequence of those) into one
+        text blob -- the shape the classifier expects from a shell command line."""
+        if not value:
+            return ""
+        if _isinstance(value, _bytes):
+            return fsdecode(value)
+        if _isinstance(value, _str):
+            return value
+        parts = []
+        try:
+            for item in value:
+                if _isinstance(item, _bytes):
+                    parts.append(fsdecode(item))
+                else:
+                    try:
+                        parts.append(fsdecode(fspath(item)))
+                    except _TypeError:
+                        parts.append(_str(item))
+        except _TypeError:
+            return _str(value)
+        try:
+            return join(parts)
+        except (_TypeError, _ValueError):
+            return " ".join(parts)
+
+    def _argv_text(executable, argv):
+        # argv[0] is the caller's display name, not necessarily the executable (Popen's
+        # executable= and exec/spawn path override it). Never prepend it a second time.
+        if _isinstance(argv, (_str, _bytes)):
+            return _cmdline_text(argv)
+        return _cmdline_text([executable, *argv[1:]])
+
+    def _classify_cmdline(cmdline):
+        """Run the real classifier with the Hermes root transiently on sys.path -- its own lazy
+        sub-imports need it -- and never leave it there for the cell's own imports. Any classifier
+        error fails OPEN: an import hiccup under a foreign interpreter must not block ordinary
+        subprocess use; the source-text scan already run on the cell still covers the
+        literal-command case either way."""
+        if not cmdline:
+            return False
+        path = sys_mod.path
+        added = _type(path) is _list and guard_root not in path
+        if added:
+            _list.append(path, guard_root)
+        try:
+            return _bool(scan(cmdline)[0])
+        except _Exception:
+            return False
+        finally:
+            if added:
+                try:
+                    _list.remove(path, guard_root)
+                except _ValueError:
+                    pass
+
+    def _bytes_keys(env):
+        """POSIX subprocess also accepts BYTES env keys; a ``b"PYTHONPATH"`` entry would sit beside
+        the str one and win. ``os.environ`` itself rejects bytes lookups with TypeError."""
+        found = []
+        for key in (b"PYTHONPATH", root_key.encode(), site_key.encode()):
+            try:
+                if key in env:
+                    found.append(key)
+            except _Exception:
+                pass
+        return found
+
+    def _arm_env(env):
+        # CPython accepts bytes envs on POSIX. Preserve their search path before removing
+        # duplicate keys; the caller's modules and sitecustomize must remain discoverable.
+        byte_keys = _bytes_keys(env)
+        current = env.get(b"PYTHONPATH") if b"PYTHONPATH" in byte_keys else env.get("PYTHONPATH")
+        current = fsdecode(current) if current is not None else ""
+        for key in byte_keys:
+            del env[key]
+        parts = [p for p in current.split(pathsep) if p and p != site_dir]
+        env[root_key] = guard_root
+        env[site_key] = site_dir
+        env["PYTHONPATH"] = pathsep.join([site_dir] + parts)
+
+    def _env_armed(env):
+        if _bytes_keys(env):
+            return False
+        try:
+            pythonpath = env.get("PYTHONPATH")
+            return (env.get(root_key) == guard_root and env.get(site_key) == site_dir
+                    and _isinstance(pythonpath, _str) and pythonpath.split(pathsep)[0] == site_dir)
+        except _Exception:
+            return False
+
+    def _arm_child(event, env):
+        """Make sure the child about to start -- and, through it, every Python interpreter below
+        it -- imports the ``sitecustomize`` that installs this same hook: restore the bootstrap
+        file if the cell rewrote it, and keep it first on the child's PYTHONPATH. Returns why the
+        child could not be armed, or ""."""
+        if not site_dir or site_source is None:
+            return ""
+        try:
+            with _open(site_file, "rb") as source_file:
+                current = source_file.read()
+        except _OSError:
+            current = None
+        if current != site_source:
+            try:
+                makedirs(site_dir, exist_ok=True)
+                with _open(site_file, "wb") as source_file:
+                    source_file.write(site_source)
+            except _OSError:
+                return "its bootstrap file could not be restored"
+        if env is None:
+            env = environ  # the child inherits the live process environment
+        elif event != "subprocess.Popen":
+            # os.exec*/os.posix_spawn have already converted the mapping before auditing it, so
+            # changing it here would not reach the child: it must arrive armed.
+            return "" if _env_armed(env) else "an explicit environment without the guard"
+        try:
+            _arm_env(env)
+        except _Exception:
+            pass
+        return "" if _env_armed(env) else "an environment the guard cannot update"
+
+    def _audit_hook(event, args):
+        """``subprocess.Popen``, ``os.system``, the ``os.exec*`` family and the ``os.posix_spawn*``
+        family each raise one auditing event right before CPython creates the process; raising here
+        aborts that creation instead of merely logging it."""
+        if event == "os.system":
+            # CPython on at least macOS raises this event with the command as BYTES even when
+            # os.system() was called with a str (verified: os.system("echo hi") audits b"echo
+            # hi") -- decode it like every other argv shape, or the classifier raises on bytes
+            # input and the except-Exception fail-open lets it straight through (R70-1a).
+            cmdline, env = _cmdline_text(args[0] if args else ""), None
+        elif event == "subprocess.Popen":
+            executable, popen_args, _cwd, env = args
+            cmdline = _argv_text(executable, popen_args)
+        elif event == "os.exec" or event == "os.posix_spawn":
+            path, exec_args, env = args
+            cmdline = _argv_text(path, exec_args)
+        else:
+            return
+        if _classify_cmdline(cmdline):
+            raise _PermissionError(block_message)
+        # Best-effort only (R70-4): an ordinary, non-lifecycle command must still run even when its
+        # env cannot be armed for descendant coverage (an immutable mapping, or os.exec*/
+        # os.posix_spawn's pre-converted env that must already be armed to take effect). Blocking
+        # a harmless call here does not close any boundary -- it only breaks supported subprocess
+        # use -- while the real coverage gap this would have caught is the already-documented
+        # unarmed-descendant limitation (R70-1).
+        _arm_child(event, env)
+
+    sys.addaudithook(_audit_hook)
+    if site_dir and site_source is not None:
+        try:
+            _arm_env(environ)
+        except _Exception:
+            pass
+'''
+
+# The Python interpreters a guarded kernel starts import this from the staging dir that leads
+# their PYTHONPATH: it installs the same hook, then runs whatever ``sitecustomize`` it shadows so
+# a project's or interpreter's own one still applies.
+LIFECYCLE_GUARD_SITECUSTOMIZE_SOURCE = (
+    '"""Auto-generated by Hermes (tools/code_kernel.py): arms the execute_code lifecycle guard."""\n'
+    + LIFECYCLE_GUARD_SOURCE + '''
+
+try:
+    _install_hermes_lifecycle_guard()
+except Exception:
+    pass
+
+
+def _hermes_chain_sitecustomize():
+    import importlib.machinery
+    import importlib.util
+    import os
+    import sys
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = [p for p in sys.path if os.path.abspath(p or os.curdir) != here]
+    spec = importlib.machinery.PathFinder.find_spec("sitecustomize", path)
+    if spec is None or spec.loader is None:
+        return
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["sitecustomize"] = module
+    spec.loader.exec_module(module)
+
+
+_hermes_chain_sitecustomize()
+''')
+
 KERNEL_RUNNER_SOURCE = '''\
 """Auto-generated Hermes session-kernel runner. One exec cell per request."""
 import contextlib
@@ -178,6 +491,10 @@ _start_parent_death_pipe_watchdog()
 
 _real_stdout = sys.stdout
 
+{lifecycle_guard_source}
+
+_install_hermes_lifecycle_guard()
+
 {cell_source}
 
 def _spill(text, spill_name):
@@ -225,7 +542,8 @@ def main():
 
 if __name__ == "__main__":
     main()
-'''.format(cell_source=RUNNER_CELL_SOURCE, capture_limit=_RUNNER_CAPTURE_BYTES, spill_cap=5_000_000)
+'''.format(cell_source=RUNNER_CELL_SOURCE, lifecycle_guard_source=LIFECYCLE_GUARD_SOURCE,
+           capture_limit=_RUNNER_CAPTURE_BYTES, spill_cap=5_000_000)
 
 
 class CellAuthority:
@@ -608,7 +926,8 @@ def _parent_process_handle(child_env: Dict[str, str]):
 
 
 def _spawn(kernel: SessionKernel, *, child_python: str, child_cwd: str,
-           sandbox_tools: frozenset, max_tool_calls: int, task_id: str = "") -> None:
+           sandbox_tools: frozenset, max_tool_calls: int, task_id: str = "",
+           lifecycle_guard_active: bool = False) -> None:
     from tools.code_execution_env import _build_child_env
     from tools.code_execution_tool import generate_hermes_tools_module
     kernel.tmpdir = tempfile.mkdtemp(prefix="hermes_kernel_")
@@ -619,7 +938,16 @@ def _spawn(kernel: SessionKernel, *, child_python: str, child_cwd: str,
                       ("hermes_kernel_runner.py", KERNEL_RUNNER_SOURCE)):
         Path(kernel.tmpdir, name).write_text(src, encoding="utf-8")
     child_env = _build_child_env(rpc_endpoint=rpc_endpoint, rpc_token=kernel.rpc_token,
+                                 lifecycle_guard_active=lifecycle_guard_active,
                                  tmpdir=kernel.tmpdir, child_python=child_python)
+    if child_env.get("HERMES_KERNEL_LIFECYCLE_GUARD_ROOT"):
+        # Off the kernel's own PYTHONPATH (the runner installs the hook itself): the runner puts
+        # this dir first on the PYTHONPATH its children inherit, so every Python interpreter the
+        # cell starts imports the guard as its ``sitecustomize`` (see LIFECYCLE_GUARD_SOURCE).
+        site_dir = Path(kernel.tmpdir, "lifecycle_guard_site")
+        site_dir.mkdir()
+        (site_dir / "sitecustomize.py").write_text(LIFECYCLE_GUARD_SITECUSTOMIZE_SOURCE, encoding="utf-8")
+        child_env["HERMES_KERNEL_LIFECYCLE_GUARD_SITE"] = str(site_dir)
     child_env["HERMES_KERNEL_SENTINEL"] = kernel.sentinel
     # Full clipped stdout spills to the kernel's tmpdir so the agent can read_file the middle.
     child_env["HERMES_KERNEL_SPILL_DIR"] = kernel.tmpdir
@@ -845,9 +1173,15 @@ def _cell_result(kernel: SessionKernel, key: Tuple, status: str, payload: Dict[s
 def execute_in_session_kernel(
     code: str, *, task_id: str, mode: str, child_python: str, child_cwd: str,
     sandbox_tools: frozenset, timeout: int, max_tool_calls: int, reset: bool, is_interrupted,
+    lifecycle_guard_active: bool = False,
 ) -> str:
     """Run one cell in the (owner, mode, python, cwd, tools) session kernel. The owner is the
-    session key (``_resolve_owner``), not the per-turn task id, so state survives across turns."""
+    session key (``_resolve_owner``), not the per-turn task id, so state survives across turns.
+
+    ``lifecycle_guard_active`` carries the caller's already-computed
+    ``_is_supervised_gateway_process()`` verdict: the kernel's subprocess-creation audit hook (see
+    tools/code_kernel.py's ``_install_hermes_lifecycle_guard``) is wired into the child env only for
+    the supervised gateway, matching the condition the SOURCE-TEXT scan already applies (R70-2)."""
     key = (_resolve_owner(task_id) or "", mode, child_python, child_cwd, tuple(sorted(sandbox_tools)))
     exec_start = time.monotonic()
     from agent.delegation_context import is_delegated_child_context
@@ -855,7 +1189,8 @@ def execute_in_session_kernel(
     try:
         return _run_cell(kernel, key, code, task_id=task_id, child_python=child_python, child_cwd=child_cwd,
                          sandbox_tools=sandbox_tools, timeout=timeout, max_tool_calls=max_tool_calls,
-                         is_interrupted=is_interrupted, exec_start=exec_start, state_reset=state_reset)
+                         is_interrupted=is_interrupted, exec_start=exec_start, state_reset=state_reset,
+                         lifecycle_guard_active=lifecycle_guard_active)
     finally:
         with _REGISTRY.lock:
             kernel.attached -= 1
@@ -869,7 +1204,8 @@ def execute_in_session_kernel(
 
 def _run_cell(kernel: SessionKernel, key: Tuple, code: str, *, task_id: str, child_python: str,
               child_cwd: str, sandbox_tools: frozenset, timeout: int, max_tool_calls: int,
-              is_interrupted, exec_start: float, state_reset: bool) -> str:
+              is_interrupted, exec_start: float, state_reset: bool,
+              lifecycle_guard_active: bool = False) -> str:
     reused = kernel.proc is not None
     # Captured on the calling thread BEFORE the cell runs (the snapshot a per-call RPC thread
     # would get) and installed on the kernel so RPC dispatches under THIS cell's identity.
@@ -878,7 +1214,8 @@ def _run_cell(kernel: SessionKernel, key: Tuple, code: str, *, task_id: str, chi
         try:
             if kernel.proc is None:
                 _spawn(kernel, task_id=task_id, child_python=child_python, child_cwd=child_cwd,
-                       sandbox_tools=sandbox_tools, max_tool_calls=max_tool_calls)
+                       sandbox_tools=sandbox_tools, max_tool_calls=max_tool_calls,
+                       lifecycle_guard_active=lifecycle_guard_active)
             assert kernel.proc is not None and kernel.proc.stdin is not None
             # Per-cell tool budget: the RPC loop enforces counter < max; reset without restarting.
             kernel.tool_call_counter[0] = 0
