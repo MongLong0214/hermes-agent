@@ -634,6 +634,128 @@ class TestLifecycleGuardAuditHook(unittest.TestCase):
         self.assertFalse(record_path.exists(),
                           "the stub launchctl must never have been invoked")
 
+    @unittest.skipUnless(hasattr(os, "fork") and hasattr(os, "posix_spawnp"),
+                         "requires POSIX process APIs")
+    def test_executable_and_argv_tail_agree_across_process_routes(self):
+        """R103-1: classify the actual executable and argv[1:], including overrides."""
+        result, record_path = self._run_with_stub_launchctl(textwrap.dedent("""\
+            import os, subprocess
+            name = "launch" + "ctl"
+            def invoke(route, verb):
+                argv = [name if route == "popen" else "different-argv-zero", verb, "unrelated-label"]
+                if route in ("popen", "override"):
+                    try:
+                        kwargs = {} if route == "popen" else {"executable": name}
+                        subprocess.run(argv, check=True, **kwargs)
+                        return False
+                    except PermissionError:
+                        return True
+                if route == "spawn":
+                    try:
+                        pid = os.posix_spawnp(name, argv, dict(os.environ))
+                    except PermissionError:
+                        return True
+                else:
+                    pid = os.fork()
+                    if pid == 0:
+                        try:
+                            os.execvpe(name, argv, dict(os.environ))
+                        except PermissionError:
+                            os._exit(73)
+                        except BaseException:
+                            os._exit(74)
+                _, status = os.waitpid(pid, 0)
+                code = os.waitstatus_to_exitcode(status)
+                assert code in (0, 73), (route, code)
+                return code == 73
+            for route in ("popen", "override", "spawn", "exec"):
+                for verb in ("submit", "bootstrap"):
+                    assert invoke(route, verb), (route, verb, "not blocked")
+                assert not invoke(route, "bootout"), (route, "harmless call blocked")
+            # A harmless executable override must also supersede a lifecycle-shaped argv[0].
+            subprocess.run([name, "submit", "unrelated-label"], executable="/bin/echo", check=True)
+            print("all-routes-ok")
+            """))
+        self.assertEqual(result["status"], "success", result)
+        self.assertIn("all-routes-ok", result["output"])
+        records = [json.loads(line) for line in record_path.read_text().splitlines()]
+        self.assertEqual([entry[1:] for entry in records], [["bootout", "unrelated-label"]] * 4)
+
+    def test_mocked_cell_dependencies_preserve_harmless_and_blocked_commands(self):
+        """R103-2: ordinary mocks must not affect the guard's private classifier."""
+        result, record_path = self._run_with_stub_launchctl(textwrap.dedent("""\
+            import subprocess
+            from unittest.mock import patch
+            name = "launch" + "ctl"
+            for target in ("os.path.exists", "builtins.open"):
+                with patch(target):
+                    r = subprocess.run(["/bin/echo", "mock-ok"], capture_output=True, text=True)
+                    assert r.returncode == 0 and r.stdout.strip() == "mock-ok", r
+                    try:
+                        subprocess.run([name, "submit", "unrelated-label"], check=True)
+                    except PermissionError:
+                        pass
+                    else:
+                        raise AssertionError("lifecycle command escaped while mocking " + target)
+            print("mocks-ok")
+            """))
+        self.assertEqual(result["status"], "success", result)
+        self.assertIn("mocks-ok", result["output"])
+        self.assertFalse(record_path.exists())
+
+    def test_public_helper_code_replacement_does_not_change_private_classifier(self):
+        """R103-2: a helper's identity can survive replacement of its code."""
+        result, record_path = self._run_with_stub_launchctl(textwrap.dedent("""\
+            import subprocess, tools.shell_heredoc
+            tools.shell_heredoc.strip_inert_heredoc_bodies.__code__ = (lambda command: "").__code__
+            name = "launch" + "ctl"
+            subprocess.run([name, "bootout", "gui/501/ai.hermes.gateway"])
+            """))
+        self.assertEqual(result["status"], "error", result)
+        self.assertIn("Blocked: cannot restart or stop the gateway", result["error"])
+        self.assertFalse(record_path.exists())
+
+    def test_subprocess_accepts_text_bytes_and_pathlike_arguments(self):
+        """R103-4: fspath may return bytes, including for arguments after argv[0]."""
+        result, _ = self._run_with_stub_launchctl(textwrap.dedent("""\
+            import subprocess
+            from pathlib import Path
+            class BytesPath:
+                def __init__(self, value):
+                    self.value = value
+                def __fspath__(self):
+                    return self.value
+            for executable in ("/bin/echo", b"/bin/echo", Path("/bin/echo"), BytesPath(b"/bin/echo")):
+                for arg in ("path-ok", b"path-ok", Path("path-ok"), BytesPath(b"path-ok")):
+                    r = subprocess.run([executable, arg], capture_output=True, text=True)
+                    assert r.returncode == 0 and r.stdout.strip() == "path-ok", r
+            print("paths-ok")
+            """))
+        self.assertEqual(result["status"], "success", result)
+        self.assertIn("paths-ok", result["output"])
+
+    @unittest.skipUnless(os.supports_bytes_environ, "requires bytes environments")
+    def test_child_pythonpath_and_sitecustomize_survive_environment_arming(self):
+        """R103-5: retain the caller's bytes/string PYTHONPATH and chain its startup."""
+        result, _ = self._run_with_stub_launchctl(textwrap.dedent("""\
+            import os, subprocess, sys, tempfile
+            from pathlib import Path
+            with tempfile.TemporaryDirectory() as directory:
+                Path(directory, "h103_module.py").write_text("value = 'module-ok'")
+                Path(directory, "sitecustomize.py").write_text("import os; os.environ['H103_SITE'] = 'site-ok'")
+                for use_bytes in (False, True):
+                    env = {"PATH": os.environ["PATH"], "PYTHONPATH": directory}
+                    if use_bytes:
+                        env = {os.fsencode(k): os.fsencode(v) for k, v in env.items()}
+                    r = subprocess.run([sys.executable, "-c",
+                        "import os, h103_module; print(h103_module.value, os.environ['H103_SITE'])"],
+                        env=env, capture_output=True, text=True)
+                    assert r.returncode == 0 and "module-ok site-ok" in r.stdout, (r.stdout, r.stderr)
+            print("pythonpath-ok")
+            """))
+        self.assertEqual(result["status"], "success", result)
+        self.assertIn("pythonpath-ok", result["output"])
+
     def test_literal_lifecycle_argv_still_blocked(self):
         result, record_path = self._run_with_stub_launchctl(
             'import subprocess\n'

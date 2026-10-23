@@ -88,19 +88,20 @@ def run_cell(request, execution_count):
 # ``_install_hermes_lifecycle_guard`` every helper, builtin and module function the hook calls is
 # captured into a local before any cell code runs (a cell shares the runner's ``__main__``, and
 # ``__main__.shlex.join = ...`` rewrote every argv to ``echo safe`` -- R70-1c and round 2 (a)).
-# The classifier itself (``cron/lifecycle_guard.py``) resolves its helpers through module
-# globals and function-level imports on every call, so those are pinned differently: its lazy
-# imports are pre-loaded here, the identity of every callable in the modules it uses is recorded,
-# and a spawn is refused if any of them was replaced since.
+# The classifier runs with private builtins/import bindings. Its own code, shell-heredoc
+# helper and shlex are loaded into private namespaces before cells run, so normal mocking of
+# shared modules neither disables the guard nor makes harmless subprocess calls fail.
 #
-# What this cannot stop -- an in-process audit hook is not a sandbox (PEP 578): object-graph
-# introspection that reaches the hook's own closure (``gc.get_objects()``, a caught
-# PermissionError's ``tb_frame``) and rewrites its cells; a cell-supplied object whose
-# ``__fspath__``/``__str__`` runs while the hook flattens the argv; process creation that raises
-# no audit event at all (``_posixsubprocess.fork_exec`` called directly, ``ctypes`` into libc);
-# a child interpreter started with ``-I``/``-E``/``-S``, through a shell that clears PYTHONPATH,
-# or one too old/foreign to load the classifier; and the classifier's own transitive
-# dependencies beyond the modules recorded below (e.g. ``contextlib``, ``sqlite3``, ``logging``).
+# Limits (local single-user guard, not a sandbox; PEP 578): introspection can reach and rewrite
+# the hook's closure/private code; transitive dependencies (pathlib, profile and SQLite helpers,
+# logging, re internals) still share interpreter state. Public shell-heredoc __code__ replacement
+# is isolated, but arbitrary same-account object/code rewriting is not a security boundary.
+# Other Limits: cell-controlled __fspath__/__str__; process creation without an audit event
+# (_posixsubprocess.fork_exec, ctypes/libc); foreign/old interpreters; Python -I/-E/-S or shells
+# clearing PYTHONPATH. MappingProxyType envs and os.exec*/posix_spawn explicit envs may leave
+# descendants unarmed because the audit event cannot replace their pre-converted environment.
+# Direct lifecycle commands are still checked in those routes. Closing descendant gaps requires
+# enforcement outside this interpreter; do not reject legitimate commands to approximate it.
 LIFECYCLE_GUARD_SOURCE = '''\
 def _install_hermes_lifecycle_guard():
     import builtins
@@ -120,81 +121,61 @@ def _install_hermes_lifecycle_guard():
         "(execute_code audit-hook guard). The gateway would kill this script before it could "
         "complete. Run the lifecycle command from a shell outside the gateway."
     )
-    tamper_message = (
-        "Blocked: the execute_code lifecycle guard cannot vouch for this command: %s was replaced "
-        "after the guard was armed. Restore it, or run the command from a shell outside the gateway."
-    )
-    unarmed_message = (
-        "Blocked: the execute_code lifecycle guard could not be extended to this child process "
-        "(%s). Keep PYTHONPATH and the HERMES_KERNEL_LIFECYCLE_GUARD_* variables in its "
-        "environment, or run the command from a shell outside the gateway."
-    )
     root_key, site_key = "HERMES_KERNEL_LIFECYCLE_GUARD_ROOT", "HERMES_KERNEL_LIFECYCLE_GUARD_SITE"
-    join, fspath, environ, pathsep, makedirs = shlex.join, os.fspath, os.environ, os.pathsep, os.makedirs
-    sys_mod, modules, missing = sys, sys.modules, object()
+    fspath, fsdecode = os.fspath, os.fsdecode
+    environ, pathsep, makedirs = os.environ, os.pathsep, os.makedirs
+    sys_mod = sys
     _isinstance, _str, _bytes, _bool, _type, _list = isinstance, str, bytes, bool, type, list
     _open, _PermissionError, _Exception = open, PermissionError, Exception
     _TypeError, _ValueError, _OSError = TypeError, ValueError, OSError
 
     scan = None
-    snapshot = []
     path_added = guard_root not in sys.path
     if path_added:
         sys.path.append(guard_root)
     try:
-        # Loaded by file path, not ``import cron.lifecycle_guard``: the ``cron`` package's own
-        # __init__ pulls in the scheduler, which a foreign code_execution.mode: project
-        # interpreter may not have the dependencies for. This file's own top-level imports are
-        # stdlib-only.
-        guard_path = os.path.join(guard_root, "cron", "lifecycle_guard.py")
-        guard_spec = importlib.util.spec_from_file_location("_hermes_kernel_lifecycle_guard", guard_path)
-        guard_mod = importlib.util.module_from_spec(guard_spec)
-        guard_spec.loader.exec_module(guard_mod)
-        # Every module the classifier imports, including the function-level imports it would
-        # otherwise resolve lazily on its first call -- by which time a cell could have planted
-        # its own ``sys.modules`` entry or replaced a function in the real one. A line scan, not
-        # ``ast``: this also runs at every child interpreter's startup.
-        with _open(guard_path, "r", encoding="utf-8") as guard_file:
-            guard_lines = guard_file.read().splitlines()
-        tracked = {id(guard_mod): guard_mod, id(builtins): builtins, id(os.path): os.path}
-        for line in guard_lines:
-            words = line.split()
-            if len(words) >= 4 and words[0] == "from" and words[2] == "import":
-                names = [words[1]] if not words[1].startswith(".") else []
-            elif len(words) >= 2 and words[0] == "import":
-                names = [word.rstrip(",") for word in words[1:] if word != "as"]
-            else:
-                continue
-            for name in names:
-                # Not ``sys``/``logging``/``typing``: their attributes legitimately change (stdout
-                # redirection, logger classes) or are annotation-only here.
-                if name in ("sys", "logging", "typing", "__future__"):
-                    continue
-                try:
-                    module = importlib.import_module(name)
-                except _Exception:
-                    continue
-                tracked[id(module)] = module
-        scan = guard_mod.scan_gateway_lifecycle
-        scan("launchctl kickstart gui/0/ai.hermes.gateway")  # warm every remaining lazy path
-        # ``print``/``input`` and the interactive helpers are not used by the classifier and
-        # are the builtins a cell is most likely to rebind for its own reasons.
-        free_builtins = ("print", "input", "help", "breakpoint", "exit", "quit", "copyright", "credits", "license")
-        for module in tracked.values():
-            label = getattr(module, "__name__", "?")
+        # Capture imports in this namespace, never by mutating sys.modules or the cell's modules.
+        # Load the parsing code afresh so replacing a public helper's __code__ also stays local
+        # to the cell. Other Hermes helpers retain their live profile/SQLite state.
+        private_builtins = dict(vars(builtins))
+        real_import = builtins.__import__
+        private_imports = {}
+
+        def private_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if level == 0 and name in private_imports:
+                return private_imports[name]
+            return real_import(name, globals, locals, fromlist, level)
+
+        private_builtins["__import__"] = private_import
+
+        def copy_module(module):
+            copied = types.ModuleType(module.__name__)
+            vars(copied).update(vars(module))
+            return copied
+
+        private_os = copy_module(os)
+        private_os.path = copy_module(os.path)
+        private_imports.update({"os": private_os, "os.path": private_os.path})
+        for name in ("re", "stat", "hermes_cli.profiles", "hermes_cli.sqlite_safe_read", "hermes_constants"):
+            private_imports[name] = copy_module(importlib.import_module(name))
+
+        def load_private(name, path):
+            module = types.ModuleType(name)
             namespace = vars(module)
-            for key, value in list(namespace.items()):
-                if module is builtins and key in free_builtins:
-                    continue
-                if module is not guard_mod and not (callable(value) or _isinstance(value, types.ModuleType)):
-                    continue
-                snapshot.append((namespace, key, value, label + "." + key))
-                if (_isinstance(value, _type) and module is not builtins
-                        and getattr(value, "__module__", None) == label):
-                    for attr, attr_value in list(vars(value).items()):
-                        snapshot.append((vars(value), attr, attr_value, label + "." + key + "." + attr))
-            if modules.get(label) is module:
-                snapshot.append((modules, label, module, "sys.modules[" + repr(label) + "]"))
+            namespace.update(__file__=path, __builtins__=private_builtins)
+            with _open(path, "rb") as source_file:
+                exec(compile(source_file.read(), path, "exec"), namespace)
+            return module
+
+        private_imports["shlex"] = load_private("shlex", shlex.__file__)
+        private_imports["tools.shell_heredoc"] = load_private(
+            "tools.shell_heredoc", os.path.join(guard_root, "tools", "shell_heredoc.py"))
+        # Bypass cron.__init__: it imports the scheduler and optional dependencies a project
+        # interpreter need not have. The classifier itself has only stdlib top-level imports.
+        guard_mod = load_private("_hermes_kernel_lifecycle_guard",
+                                 os.path.join(guard_root, "cron", "lifecycle_guard.py"))
+        scan = guard_mod.scan_gateway_lifecycle
+        join = private_imports["shlex"].join
     except _Exception:
         scan = None  # fails open to the source-text scan already run on the cell
     finally:
@@ -221,17 +202,17 @@ def _install_hermes_lifecycle_guard():
         if not value:
             return ""
         if _isinstance(value, _bytes):
-            return value.decode("utf-8", "replace")
+            return fsdecode(value)
         if _isinstance(value, _str):
             return value
         parts = []
         try:
             for item in value:
                 if _isinstance(item, _bytes):
-                    parts.append(item.decode("utf-8", "replace"))
+                    parts.append(fsdecode(item))
                 else:
                     try:
-                        parts.append(fspath(item))
+                        parts.append(fsdecode(fspath(item)))
                     except _TypeError:
                         parts.append(_str(item))
         except _TypeError:
@@ -241,11 +222,12 @@ def _install_hermes_lifecycle_guard():
         except (_TypeError, _ValueError):
             return " ".join(parts)
 
-    def _tampered():
-        for namespace, key, value, label in snapshot:
-            if namespace.get(key, missing) is not value:
-                return label
-        return ""
+    def _argv_text(executable, argv):
+        # argv[0] is the caller's display name, not necessarily the executable (Popen's
+        # executable= and exec/spawn path override it). Never prepend it a second time.
+        if _isinstance(argv, (_str, _bytes)):
+            return _cmdline_text(argv)
+        return _cmdline_text([executable, *argv[1:]])
 
     def _classify_cmdline(cmdline):
         """Run the real classifier with the Hermes root transiently on sys.path -- its own lazy
@@ -283,10 +265,14 @@ def _install_hermes_lifecycle_guard():
         return found
 
     def _arm_env(env):
-        for key in _bytes_keys(env):
+        # CPython accepts bytes envs on POSIX. Preserve their search path before removing
+        # duplicate keys; the caller's modules and sitecustomize must remain discoverable.
+        byte_keys = _bytes_keys(env)
+        current = env.get(b"PYTHONPATH") if b"PYTHONPATH" in byte_keys else env.get("PYTHONPATH")
+        current = fsdecode(current) if current is not None else ""
+        for key in byte_keys:
             del env[key]
-        current = env.get("PYTHONPATH") or ""
-        parts = [p for p in current.split(pathsep) if p and p != site_dir] if _isinstance(current, _str) else []
+        parts = [p for p in current.split(pathsep) if p and p != site_dir]
         env[root_key] = guard_root
         env[site_key] = site_dir
         env["PYTHONPATH"] = pathsep.join([site_dir] + parts)
@@ -344,15 +330,12 @@ def _install_hermes_lifecycle_guard():
             cmdline, env = _cmdline_text(args[0] if args else ""), None
         elif event == "subprocess.Popen":
             executable, popen_args, _cwd, env = args
-            cmdline = (_cmdline_text(executable) + " " + _cmdline_text(popen_args)).strip()
+            cmdline = _argv_text(executable, popen_args)
         elif event == "os.exec" or event == "os.posix_spawn":
             path, exec_args, env = args
-            cmdline = (_cmdline_text(path) + " " + _cmdline_text(exec_args)).strip()
+            cmdline = _argv_text(path, exec_args)
         else:
             return
-        replaced = _tampered()
-        if replaced:
-            raise _PermissionError(tamper_message % replaced)
         if _classify_cmdline(cmdline):
             raise _PermissionError(block_message)
         # Best-effort only (R70-4): an ordinary, non-lifecycle command must still run even when its
