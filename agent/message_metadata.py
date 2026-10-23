@@ -17,6 +17,9 @@ PERSISTENCE_ONLY_MESSAGE_FIELDS = frozenset({
     # to avoid an import cycle): the pre-mutation source row id captured for a reinsertion that
     # might retry; never provider-visible, never priced.
     "_source_row_id_before_reinsertion",
+    # Runtime-only trust marker (agent.canonical_peer.PEER_SIDECAR_VERIFIED_KEY duplicated as a
+    # literal to avoid a module import cycle): never provider-visible, never priced.
+    "_peer_sidecar_verified",
 })
 
 _Message = TypeVar("_Message", bound=MutableMapping[str, Any])
