@@ -929,6 +929,11 @@ _EXPLICIT_RECOVERY = False
 def outcome_key(event_id, channel=None):
     """Only a recorded, proven pre-claim refusal leaves room for a later terminal outcome; so does a
     legacy notice, but only under an explicit operator recovery."""
+    # Once the second slot exists it is authoritative in every mode (#100 r2 H100-R2-01): only a proven
+    # pre-claim refusal or an explicit recovery ever opened it, and its terminal record (an answer or an
+    # unfinished/uncertainty notice) must stop a later live replay from submitting again.
+    if os.path.lexists(os.path.join(PUBLISHED, event_id + ".answer")):
+        return event_id + ".answer"
     prior = publication_record(event_id)
     if (prior.get("event_id") == event_id and prior.get("kind") == "notice"
             and (prior.get("preclaim") is True or (_EXPLICIT_RECOVERY and "journal" not in prior))

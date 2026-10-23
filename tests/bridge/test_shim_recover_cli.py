@@ -127,3 +127,65 @@ def test_explicit_recovery_publishes_one_answer_after_a_legacy_notice(tmp_path):
     # The legacy notice is kept as it was; a rerun finds the answer and posts nothing more.
     assert "journal" not in json.loads((published / event["id"]).read_text())
     assert second.returncode == 0 and len(delivered) == 1 and len(_calls(tmp_path)) == 1
+
+
+@pytest.mark.parametrize("shape", ["single", "batch", "steer"])
+def test_abandoned_explicit_recovery_keeps_its_terminal_guard_for_a_later_live_replay(tmp_path, shape):
+    """#100 r2 H100-R2-01: recovery opens the legacy event's second slot and abandons its submission,
+    so the reaper persists an unfinished notice there. A later live shim, which runs without the
+    explicit-recovery flag, must still read that slot and never submit the event again."""
+    from test_shim_batch_delivery import batch, bp, ev
+    from test_shim_envelope_attribution import NAME
+    event = signed(6)
+    base = event["id"]
+    published = tmp_path / "published"
+    published.mkdir()
+    (published / base).write_text(json.dumps({"sent": True, "state": "sent", "kind": "notice",
+                                              "event_id": base, "channel": CH}))
+    delivered = []
+
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            if self.path == "/query":
+                result = [event]
+            else:
+                delivered.append(body)
+                # A malformed answer makes the recovering handler abandon its submission.
+                result = {"text": ["bad-type"]} if len(delivered) == 1 else {"text": "later answer"}
+            raw = json.dumps(result).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    url = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        recovered = _run(tmp_path, url, CH, base)
+        assert recovered.returncode == 1, recovered.stderr
+        assert json.loads((published / (base + ".answer")).read_text())["kind"] == "unfinished_notice"
+        assert not (published / (base + ".inflight")).exists()
+        blocks = {"single": lambda: bp.format_prompt(CH, NAME, [ev(event)], {}),
+                  "batch": lambda: batch([event]),
+                  "steer": lambda: batch([signed(7)], cancelled=[event], framing=bp.STEER)}[shape]()
+        env = {**_stand_in_wrapper(tmp_path), "HOME": str(tmp_path), "HERMES_HOME": str(tmp_path / "hermes"),
+               "PATH": "/usr/bin:/bin", "CANONICAL_SURFACE_URL": url, "CANONICAL_FORWARD": "live",
+               "BUZZ_RELAY_URL": url, "BUZZ_PRIVATE_KEY": PrivateKey.from_int(77).secret.hex(),
+               "API_SERVER_KEY": "test-only", "PYTHONPATH": str(Path(_crypto.__file__).resolve().parent.parent)}
+        message = {"jsonrpc": "2.0", "id": 9, "method": "session/prompt", "params": bp.prompt_params("s", blocks)}
+        live = subprocess.run([sys.executable, str(_SHIM), "acp"], input=json.dumps(message) + "\n",
+                              text=True, capture_output=True, env=env, cwd=tmp_path, timeout=60)
+        assert live.returncode == 0, live.stderr
+    finally:
+        server.shutdown()
+        thread.join(5)
+        server.server_close()
+    assert [d["event_id"] for d in delivered].count(base) == 1, delivered
