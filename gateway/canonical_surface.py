@@ -1076,7 +1076,11 @@ class CanonicalReceiptCoordinator:
                     raise ValueError("canonical_turn_busy")
                 # An open user row would be merged with this peer turn by the agent's alternation
                 # repair, erasing the boundary between the two principals. Checked under the lease.
-                if db.latest_conversation_role(proof.session_id) == "user":
+                # Recorded delegation deliveries (delegation.completion_delivery: quiet) are no
+                # principal's message: they are written to be read with the next turn, and refusing
+                # on them blocked every canonical event until something else ran a turn (2026-10-23).
+                if (db.latest_conversation_role(proof.session_id) == "user"
+                        and not db.open_user_tail_is_delivery_only(proof.session_id)):
                     raise ValueError("canonical_history_unanswered")
             except ValueError as refusal:
                 return self._recorded_or_refuse(binding, event, key, fingerprint, str(refusal), proof)
