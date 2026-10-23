@@ -197,9 +197,11 @@ def deliver_batch(namespace, session, prompt):
     turn = getattr(api._local, "prompt", None)
     if turn is not None:
         turn.batch = True
+    retry = False
     for event_id in dict.fromkeys(ids):
         try:
-            deliver_member(api, session, prompt, channel, event_id, lookup)
+            if deliver_member(api, session, prompt, channel, event_id, lookup) == api.RETRY:
+                retry = True
         except Exception as exc:
             # Isolate lookup, refusal and publication failures too. A submitted event retains the
             # existing unknown-outcome journal; its siblings must still get their own attempt.
@@ -215,7 +217,8 @@ def deliver_batch(namespace, session, prompt):
         ref, _ = api.refusal_key(prompt)
         api.journal_undeliverable(ref, "event_recovery", "some event boundaries could not be authenticated; "
                                   "confirmed siblings were processed independently")
-    return True
+    # A member refused before any claim makes buzz-acp resend the batch; delivered members are skipped.
+    return api.RETRY if retry else True
 
 
 def deliver_member(api, session, prompt, channel, event_id, lookup):
@@ -234,7 +237,18 @@ def deliver_member(api, session, prompt, channel, event_id, lookup):
             + (f"Thread root: {root}\n" if root else "")
             + f"Content: {event['content']}\nTags: "
             + json.dumps(tags, ensure_ascii=False, separators=(",", ":")))
-    signers, _ = api._own_signers()
-    mentioned = signers is not None and any(
+    signers, unknown = api._own_signers()
+    if signers is None:
+        snapshot, _ = api._read_roster()
+        if snapshot is not None:
+            # A readable roster with no active signer (every room retired) is not an outage: the
+            # single-event path's retirement suppression decides, as it does there (#99 r3 H99-03).
+            return api.deliver_event(session, (event["pubkey"], channel, event_id, event["content"]), text, False)
+        # Without the bridge's own identities neither an echo nor a mention can be decided; keep the
+        # event replayable instead of letting the batch end as delivered (#99 r2 H99-02).
+        api.log(f"prompt {event_id} HELD, not sent: {unknown}; ACP retry requested")
+        api.journal_held(event_id, channel, unknown)
+        return api.RETRY
+    mentioned = any(
         len(tag) >= 2 and tag[0] == "p" and tag[1] in signers for tag in tags)
-    api.deliver_event(session, (event["pubkey"], channel, event_id, event["content"]), text, mentioned)
+    return api.deliver_event(session, (event["pubkey"], channel, event_id, event["content"]), text, mentioned)

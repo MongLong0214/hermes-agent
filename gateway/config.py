@@ -578,6 +578,7 @@ _TOPLEVEL_BOOL_DEFAULTS = {
 def _parse_canonical_surface_bindings(value: Any) -> Dict[str, Any]:
     """Validate the closed, server-owned canonical binding schema."""
     from gateway.canonical_surface import CanonicalSurfaceBinding
+    from bridge.canonical.canonical_roster import RosterReader
 
     if value is None:
         return {}
@@ -650,6 +651,8 @@ def _parse_canonical_surface_bindings(value: Any) -> Dict[str, Any]:
             allowed_author_ids=principals(buzz["author_ids"]),
             allowed_channel_ids=principals(buzz["channel_ids"]),
             pairs=buzz_pairs(buzz),
+            roster=(RosterReader(get_hermes_home() / "bridge" / "required-mentions.json")
+                    if name == "acp-canonical-ceo" else None),
         )
     return parsed
 

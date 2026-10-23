@@ -75,8 +75,6 @@ def test_malformed_registry_does_not_escape_the_delivery_failure_journal(shim, m
     # Same malformed-registry class already guarded on the normal single-event path.
     Path(shim.MENTIONS).write_text('{"channels":' + "[" * 1500 + "0" + "]" * 1500 + "}")
     monkeypatch.setattr(shim, "KEY", "test-only")
-    monkeypatch.setattr(shim, "AUTHOR", CTO)
-    monkeypatch.setattr(shim, "CHANNEL", CH)
     request = {"id": 1, "method": "session/prompt", "params": bp.prompt_params("s", merged())}
     monkeypatch.setattr(shim.sys, "stdin", io.StringIO(json.dumps(request) + "\n"))
     shim.main()

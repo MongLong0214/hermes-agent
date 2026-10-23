@@ -78,6 +78,7 @@ def _process_started_at(pid: int) -> str | None:
 # Refusals the coordinator raises before it claims the event, and only once the binding's own state.db
 # holds no receipt for the event: nothing ran under its id, so a resend under a new id is safe.
 _PRE_CLAIM_CODES = frozenset({
+    "canonical_roster_unavailable",
     "canonical_binding_stale",
     "canonical_agent_replaced",
     "canonical_turn_busy",
@@ -145,7 +146,9 @@ async def handle_canonical_surface_identity(self, request: "web.Request") -> "we
         with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as conn:
             conn.row_factory = sqlite3.Row
             root_id = _resolve_lineage_root(conn, entry.session_id)
-    except (ValueError, IndexError, sqlite3.Error, TargetBindReceiptFenceError):
+    except (ValueError, IndexError, sqlite3.Error, TargetBindReceiptFenceError) as exc:
+        if str(exc) == "canonical_roster_unavailable":
+            return _refusal_for(str(exc))
         return _refusal("canonical_binding_stale", 409)
     pid = os.getpid()
     started_at = _process_started_at(pid)
@@ -160,6 +163,8 @@ async def handle_canonical_surface_identity(self, request: "web.Request") -> "we
 
 
 def _refusal_for(code: str) -> "web.Response":
+    if code == "canonical_roster_unavailable":
+        return _refusal(code, 503, "Routing roster unavailable; no turn was admitted.")
     if code == "canonical_principal_rejected":
         return _refusal(code, 403)
     if code == "canonical_receipt_conflict":
