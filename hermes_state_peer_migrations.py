@@ -1,7 +1,7 @@
 """One-time trust upgrade for locally admitted peer context written before sidecar digests."""
 
 from agent.canonical_peer import (
-    PEER_ROW_LEDGER_PREFIX, parse_ledger_value, rebind_sidecar, render_peer_turn,
+    PEER_ROW_LEDGER_PREFIX, parse_ledger_value, peer_rendering, rebind_sidecar,
 )
 from hermes_state_fence import _in_write_transaction
 
@@ -54,7 +54,7 @@ def migrate_legacy_peer_sidecars(store, cursor) -> None:
                 msg = {"role": row["role"], "display_kind": row["display_kind"],
                        "display_metadata": store._decode_display_metadata(row["display_metadata"])}
                 peer = store._validated_peer(msg, record, row["content"])
-                rendering = render_peer_turn(peer, store._decode_content(row["content"]))
+                rendering = peer_rendering(peer, store._decode_content(row["content"]))
             except ValueError:  # Invalid provenance remains unbound; its loader still refuses it.
                 continue
             if row["api_content"].startswith(rendering):

@@ -113,6 +113,14 @@ def _unrendered_body(peer: Mapping[str, str], text: str) -> Optional[str]:
     return body if peer["nonce"] not in body else None
 
 
+def peer_rendering(peer: Mapping[str, str], content: Any) -> str:
+    """The rendering of a peer message whose ``content`` is either its clean body or already this
+    metadata's exact rendering — the single place both stored forms are normalized."""
+    if not isinstance(content, str):
+        raise PeerProvenanceError()
+    return content if _unrendered_body(peer, content) is not None else render_peer_turn(peer, content)
+
+
 def peer_metadata(msg: Any) -> Optional[dict[str, str]]:
     """Validated provenance of a peer-marked message; None for an unmarked one.
 
@@ -170,10 +178,7 @@ def _peer_wire_parts(msg: Mapping[str, Any]) -> tuple[str, str]:
     peer = peer_metadata(msg)
     if peer is None:
         raise PeerProvenanceError()
-    content = msg.get("content")
-    if not isinstance(content, str):
-        raise PeerProvenanceError()
-    rendering = content if _unrendered_body(peer, content) is not None else render_peer_turn(peer, content)
+    rendering = peer_rendering(peer, msg.get("content"))
     sidecar = msg.get("api_content")
     if (msg.get(PEER_SIDECAR_VERIFIED_KEY) and isinstance(sidecar, str) and sidecar.startswith(rendering)
             and peer["nonce"] not in sidecar[len(rendering):]):
