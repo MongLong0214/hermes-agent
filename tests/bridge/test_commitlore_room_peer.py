@@ -208,7 +208,7 @@ def gw(tmp_path, monkeypatch):
 
     monkeypatch.setattr(urllib.request, "urlopen", urlopen)
     try:
-        yield SimpleNamespace(key=key, runs=runs, received=received, answers=answers)
+        yield SimpleNamespace(key=key, runs=runs, received=received, answers=answers, runner=runner, adapter=adapter)
     finally:
         reset_hermes_home_override(override)
         runner.session_store.close_all_db_handles()

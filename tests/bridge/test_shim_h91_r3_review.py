@@ -316,7 +316,9 @@ def test_r3_an_own_post_with_no_registered_counterpart_is_a_delivery_failure_not
     assert shim.submitted == [] and _calls(shim.tmp) == [] and _echoes(shim) == {}
     [(_, [record])] = _journal(shim.tmp).items()
     assert (record["sent"], record["state"], record["delivery"], record["reason"]) == (
-        False, "notice_impossible", "failed", "the [Context] channel has no registered counterpart to post to")
+        False, "notice_impossible", "failed",
+        "reply registry malformed: RosterError" if registry == "ceo_only" else
+        "the [Context] channel has no registered counterpart to post to")
 
 
 @pytest.mark.parametrize("registry", sorted(NO_COUNTERPART))

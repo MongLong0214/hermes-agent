@@ -189,10 +189,42 @@ class CanonicalSurfaceBinding:
     # in one channel, which admits exactly that pair.
     pairs: tuple[tuple[str, str], ...] = ()
 
+    # Bound to the config's home, never the request thread's ambient profile.
+    roster: Any = field(default=None, compare=False, repr=False)
+
+    def roster_snapshot(self):
+        if self.roster is None:
+            return None
+        from bridge.canonical.canonical_roster import RosterError
+        try:
+            return self.roster.read()
+        except RosterError as exc:
+            # Existing installations without a roster keep their configured pairs. Once observed,
+            # disappearance is an outage, not permission to revive a retired config grant.
+            if isinstance(exc.__cause__, FileNotFoundError) and self.roster.last_good is None:
+                return None
+            logger.error("Canonical routing roster rejected: %s", exc)
+            raise ValueError("canonical_roster_unavailable") from exc
+
     def admits(self, author_id: Any, channel_id: Any) -> bool:
         """Only a declared pair, never the cross product of the two lists: a peer admitted in its own
         room is refused in every other room the binding lists. With no pairs declared, only the single
         author in the single channel; more than one of either with no pairs admits nothing."""
+        snapshot = self.roster_snapshot()
+        if snapshot is not None:
+            from bridge.canonical.canonical_roster import RosterError, read_owner
+            if channel_id in snapshot.channels:
+                # Retirement revokes even an older explicit config grant.
+                if snapshot.active(channel_id) is None:
+                    return False
+                try:
+                    owner = read_owner(self.roster.path.parent / "keys" / "owner.pub")
+                except RosterError as exc:
+                    logger.error("Canonical routing roster rejected: %s", exc)
+                    raise ValueError("canonical_roster_unavailable") from exc
+                # A room the roster lists is decided by the roster alone, refusal included: an
+                # older config grant must not readmit an author the roster reassigned (#99 r1).
+                return snapshot.admits(author_id, channel_id, owner)
         if author_id not in self.allowed_author_ids or channel_id not in self.allowed_channel_ids:
             return False
         if self.pairs:
@@ -201,10 +233,20 @@ class CanonicalSurfaceBinding:
 
     def primary_pair(self) -> tuple[str, str]:
         """The binding's own (author_id, channel_id): the first declared pair, or else the single author
-        and channel. IndexError when the binding names neither."""
-        if self.pairs:
-            return self.pairs[0]
-        return self.allowed_author_ids[0], self.allowed_channel_ids[0]
+        and channel. A retired primary yields to the first active roster pair, preserving the session.
+        IndexError when the binding names neither."""
+        primary = self.pairs[0] if self.pairs else (self.allowed_author_ids[0], self.allowed_channel_ids[0])
+        snapshot = self.roster_snapshot()
+        if snapshot is not None and primary[1] in snapshot.channels:
+            current = snapshot.active(primary[1])
+            if current is not None:
+                # The roster's current peer for this room, even when it reassigned the identity.
+                return current["peer"]["pubkey"], primary[1]
+            for channel, room in snapshot.channels.items():
+                if room["status"] == "active":
+                    return room["peer"]["pubkey"], channel
+            raise ValueError("canonical_principal_rejected")
+        return primary
 
 
 @dataclass(frozen=True)
@@ -978,7 +1020,7 @@ class CanonicalReceiptCoordinator:
                 binding, event
             )
         except ValueError as refusal:
-            if str(refusal) == "canonical_principal_rejected":
+            if str(refusal) in {"canonical_principal_rejected", "canonical_roster_unavailable"}:
                 raise
             return self._recorded_or_refuse(binding, event, key, fingerprint, str(refusal))
         if cached_actor(self._runner, proof.session_key)[0] is None:

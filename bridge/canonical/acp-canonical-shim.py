@@ -15,6 +15,7 @@ one `event_id` replays that receipt rather than running a second turn.
 """
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -28,8 +29,6 @@ import urllib.request
 BASE = os.environ.get("CANONICAL_SURFACE_URL", "http://127.0.0.1:8642")
 ROUTE = "/v1/canonical-surface/events"
 BINDING = os.environ.get("CANONICAL_BINDING", "acp-canonical-ceo")
-AUTHOR = os.environ.get("CANONICAL_AUTHOR_ID", "")
-CHANNEL = os.environ.get("CANONICAL_CHANNEL_ID", "")
 KEY = os.environ.get("API_SERVER_KEY", "")
 # The endpoint runs a full model turn before it answers, so this budget is a turn's, not an RPC's.
 TIMEOUT = float(os.environ.get("CANONICAL_TIMEOUT_SECS", "900"))
@@ -54,15 +53,35 @@ QUARANTINE = os.environ.get(
 # and the CEO's canonical turn is a peer turn that only returns text. The shim posts that text as the
 # reply through the mention-enforce wrapper rather than buzz-real (its signer, roster and recipient guards
 # stay in force), signed
-# with the key inherited from buzz-acp. One post per event id, ever: a marker is claimed before the
+# with the key inherited from buzz-acp. One terminal post per event id: a marker is claimed before the
 # send, and a failed or refused send is logged, never retried.
 BUZZ_CLI = os.environ.get("CANONICAL_BUZZ_CLI", os.path.expanduser("~/.hermes/bridge/bin/buzz"))
 MENTIONS = os.environ.get("CANONICAL_MENTIONS_FILE", os.path.expanduser("~/.hermes/bridge/required-mentions.json"))
 # Owner broadcasts may wake the CEO only in its paired project channels (2026-10-20).
-OWNER = "d046238dd1422955898205bd60507992cb101a1ea2ecfa6e52fd00d5ddca98c4"
+OWNER = os.environ.get("BUZZ_ACP_AGENT_OWNER", "d046238dd1422955898205bd60507992cb101a1ea2ecfa6e52fd00d5ddca98c4")
 PUBLISHED = os.environ.get("CANONICAL_PUBLISHED_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                                                    "published"))
 PUBLISH_TIMEOUT = float(os.environ.get("CANONICAL_PUBLISH_TIMEOUT_SECS", "60"))
+
+# This shim is also installed as a standalone script; load its topical sibling beside it.
+_batch_error = None
+try:
+    _batch_spec = importlib.util.spec_from_file_location(
+        "canonical_batch", os.path.join(os.path.dirname(os.path.abspath(__file__)), "canonical_batch.py"))
+    _batch = importlib.util.module_from_spec(_batch_spec)
+    _batch_spec.loader.exec_module(_batch)
+except Exception as exc:
+    # Keep ACP available to refuse each affected event even after a partial/broken deployment.
+    _batch = None
+    _batch_error = f"{type(exc).__name__}: {exc}"
+    print(f"acp-canonical-shim: batch recovery unavailable: {_batch_error}", file=sys.stderr, flush=True)
+
+# The gateway imports the same reader; standalone deployments copy this sibling with the shim.
+_roster_spec = importlib.util.spec_from_file_location(
+    "canonical_roster", os.path.join(os.path.dirname(os.path.abspath(__file__)), "canonical_roster.py"))
+_roster_module = importlib.util.module_from_spec(_roster_spec)
+_roster_spec.loader.exec_module(_roster_module)
+_roster_reader = _roster_module.RosterReader(MENTIONS)
 
 _out = threading.Lock()
 
@@ -138,6 +157,7 @@ class PromptTurn:
         self.lock = threading.Lock()
         self.answered = False
         self.cancelled = threading.Event()  # cancelled before anything was submitted
+        self.batch = False  # keep draining authenticated siblings after a mid-batch steer
         self.submitted = None  # the event id once handed to the canonical surface
 
 
@@ -171,7 +191,7 @@ def error(rpc_id, code, message):
 # `author_id`/`channel_id`, so sending this process's own env constants would make that check
 # vacuous: every author buzz-acp forwards — owner, orchestrator, anyone later added to the
 # allowlist — would arrive at the CEO as the one identity named in the environment. The values are
-# read from the event only; the env values are a startup requirement and never stand in for them.
+# read from the event only; no startup author/channel constants stand in for them.
 AUTHOR_RE = re.compile(r"hex:\s*([0-9a-f]{64})")
 CHANNEL_RE = re.compile(r"#([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})")
 EVENT_RE = re.compile(r"Event ID:\s*([0-9a-f]{64})")
@@ -189,7 +209,9 @@ EVENT_TITLE_RE = re.compile(r"\[Buzz event: [^\[\]\n]+\]")
 HEADER_EVENT_RE = re.compile(r"Event ID: ([0-9a-f]{64})")
 HEADER_CHANNEL_RE = re.compile(r"Channel: [^()#]* \(#(" + _UUID + r")\)")
 HEADER_KIND_RE = re.compile(r"Kind: \d{1,10}")
-HEADER_FROM_RE = re.compile(r"From: [^()]* \(npub: npub1[02-9ac-hj-np-z]+, hex: ([0-9a-f]{64})\)")
+# queue.rs also renders an unlabeled author as `npub1… (hex: …)`.
+HEADER_FROM_RE = re.compile(
+    r"From: (?:[^()]* \(npub: npub1[02-9ac-hj-np-z]+, |npub1[02-9ac-hj-np-z]+ \()hex: ([0-9a-f]{64})\)")
 HEADER_TIME_RE = re.compile(r"Time: [0-9][0-9T:.+\-Z]{0,40}")
 # What buzz-acp can write on each header line, whatever a channel name or a label holds — wide enough to
 # match every header it produces (queue.rs ``format_event_block``: the Channel field ends ``(#<uuid>)``, a
@@ -719,7 +741,7 @@ def fit_text(text, channel, event_id):
 
 def submit(text, event_id, author, channel):
     """Answer text, or raise. The caller turns a failure into a visible refusal sentence. Author and
-    channel are the event's own, from ``envelope()``; nothing stands in for either."""
+    channel are the event's own, from ``envelope()`` or a verified relay event; nothing stands in for either."""
     body = json.dumps({
         "binding": BINDING, "event_id": event_id,
         "author_id": author, "channel_id": channel, "text": text}).encode()
@@ -733,43 +755,37 @@ def submit(text, event_id, author, channel):
 def _registry_peer(channel):
     """(the channel's registered counterpart handle, None) or (None, why not). Never raises: the reason
     is a fixed category and the exception type, nothing else, as for ``_own_signers``."""
-    try:
-        with open(MENTIONS, encoding="utf-8") as handle:
-            channels = json.load(handle)["channels"]
-    except OSError as exc:
-        return None, f"reply registry unreadable: {type(exc).__name__}"
-    except Exception as exc:  # malformed in any way, nesting past the recursion limit included
-        return None, f"reply registry malformed: {type(exc).__name__}"
-    try:
-        peer = channels[channel]["peer"]["handle"]
-    except Exception:
-        peer = None
-    if peer is None:
+    snapshot, why = _read_roster()
+    if snapshot is None:
+        return None, why
+    room = snapshot.active(channel)
+    if room is None:
         return None, "the [Context] channel has no registered counterpart to post to"
-    return peer, None
+    return room["peer"]["handle"], None
 
 
 def _peer_handle(channel):
-    return _registry_peer(channel)[0]  # the wrapper refuses an unregistered channel, and adds the handle itself
+    return _registry_peer(channel)[0]
+
+
+def _read_roster():
+    try:
+        snapshot = _roster_reader.read()
+    except _roster_module.RosterError as exc:
+        cause = exc.__cause__
+        category = "unreadable" if isinstance(cause, OSError) else "malformed"
+        log(f"routing {exc}; current event refused, last good roster retained")
+        return None, f"reply registry {category}: {type(cause).__name__}"
+    return snapshot, None
 
 
 def _own_signers():
-    """(pubkeys this bridge's posts can carry, None) or (None, why not). The wrapper signs with the key
-    inherited from buzz-acp and accepts it only as a channel's registered ``ceo``. Every registered
-    channel's, not only the event's: the key is one key, and an echo can be read in any channel. When
-    the registry cannot be read or names no valid ``ceo``, the caller cannot rule out an echo and
-    forwards nothing."""
-    try:
-        with open(MENTIONS) as handle:
-            channels = json.load(handle)["channels"]
-        signers = {rule["ceo"]["pubkey"] for rule in channels.values()}
-    # The reason is a fixed category and the exception type, nothing else: an OS message or a parser
-    # message can carry a path or the registry's own bytes, and the journal is not where those go.
-    except OSError as exc:
-        return None, f"reply registry unreadable: {type(exc).__name__}"
-    except Exception as exc:  # malformed in any way, nesting past the recursion limit included
-        return None, f"reply registry malformed: {type(exc).__name__}"
-    if not signers or not all(isinstance(key, str) and re.fullmatch(r"[0-9a-f]{64}", key) for key in signers):
+    snapshot, why = _read_roster()
+    if snapshot is None:
+        return None, why
+    signers = {rule["ceo"]["pubkey"] for rule in snapshot.channels.values()
+               if rule["status"] == "active"}
+    if not signers:
         return None, "reply registry names no valid ceo signer"
     return signers, None
 
@@ -895,16 +911,51 @@ def _claim(name):
         return None, f"marker unavailable: {type(exc).__name__}: {exc}"
 
 
-def publish_reply(event_id, channel, answer, kind="answer", *, ref=None, reply_to=None):
+def publication_record(name):
+    try:
+        with open(os.path.join(PUBLISHED, name), encoding="utf-8") as handle:
+            record = json.load(handle)
+        return record if isinstance(record, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+# Set only by the operator's explicit ``recover`` command (#98 r2 H98-03): a notice journaled before
+# records carried "journal" (and so before pre-claim proof existed) may yield its event's one later
+# answer when an operator explicitly recovers that event. No automatic path ever sets it.
+_EXPLICIT_RECOVERY = False
+
+
+def outcome_key(event_id, channel=None):
+    """Only a recorded, proven pre-claim refusal leaves room for a later terminal outcome; so does a
+    legacy notice, but only under an explicit operator recovery."""
+    # Once the second slot exists it is authoritative in every mode (#100 r2 H100-R2-01): only a proven
+    # pre-claim refusal or an explicit recovery ever opened it, and its terminal record (an answer or an
+    # unfinished/uncertainty notice) must stop a later live replay from submitting again.
+    if os.path.lexists(os.path.join(PUBLISHED, event_id + ".answer")):
+        return event_id + ".answer"
+    prior = publication_record(event_id)
+    if (prior.get("event_id") == event_id and prior.get("kind") == "notice"
+            and (prior.get("preclaim") is True or (_EXPLICIT_RECOVERY and "journal" not in prior))
+            and (channel is None or prior.get("channel") == channel)):
+        return event_id + ".answer"
+    return event_id
+
+
+def publish_reply(event_id, channel, answer, kind="answer", *, ref=None, reply_to=None, preclaim=False):
     """Post *answer* once as the thread reply to *event_id*. True only when the wrapper sent it.
 
     The delivery journal is ``PUBLISHED/<event id>``: claimed before the send (one post per event,
-    ever) and then filled with what happened — ``state`` is ``sent``, ``wrapper_refused``,
+    ever, except an explicit replay after a proven pre-claim refusal can publish one terminal outcome
+    under ``<event id>.answer``). That slot also holds terminal failure/uncertainty notices, never
+    another answer after one. The journal records ``state`` as ``sent``, ``wrapper_refused``,
     ``send_failed``, ``timeout`` or ``error``, with the ``reason``, and ``delivery`` is ``posted``
     or ``failed``. A failure stays recorded as one and is never retried. An unattributed refusal has
     no event id: its notice passes ``event_id=None``, is journaled under its correlation key *ref*
     and replies to *reply_to*, the thread buzz-acp's ``[Context]`` names (None: the channel)."""
     name, target = (event_id, event_id) if event_id is not None else (ref, reply_to)
+    if event_id is not None and not preclaim:
+        name = outcome_key(event_id, channel)
     tag = name[:12] if event_id is not None else name
     fd, why = _claim(name)
     if fd is None:
@@ -914,6 +965,8 @@ def publish_reply(event_id, channel, answer, kind="answer", *, ref=None, reply_t
     handle = _peer_handle(channel)
     body = f"@{handle} {answer}" if handle and not answer.lstrip().startswith(f"@{handle}") else answer
     try:
+        if handle is None:
+            raise _roster_module.RosterError("reply room inactive or roster unavailable")
         done = subprocess.run(
             [BUZZ_CLI, "messages", "send", "--channel", channel]
             + (["--reply-to", target] if target else []) + ["--content", "-"],
@@ -932,8 +985,10 @@ def publish_reply(event_id, channel, answer, kind="answer", *, ref=None, reply_t
             reason = f"exit {done.returncode}: stderr unclassifiable ({type(exc).__name__})"
     sent = state == "sent"
     with os.fdopen(fd, "w") as marker:
-        marker.write(json.dumps({"sent": sent, "state": state, "delivery": "posted" if sent else "failed",
+        marker.write(json.dumps({"journal": 2, **({"preclaim": True} if preclaim else {}),
+                                 "sent": sent, "state": state, "delivery": "posted" if sent else "failed",
                                  "kind": kind, "event_id": event_id, "ref": ref, "channel": channel,
+                                 "roster_generation": getattr(_local, "roster_generation", None),
                                  "reply_to": target, "reason": str(reason)[:400],
                                  "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}) + "\n")
     log(f"prompt {tag}… {kind} {'POSTED' if sent else 'NOT posted (no retry)'} to thread: "
@@ -947,6 +1002,9 @@ UNATTRIBUTED_NOTICE = (
     "메시지 병합 또는 일괄 전달)이거나 단일 이벤트 머리글이 정해진 자리에 없어, 발신자와 이벤트를 하나로 "
     "특정할 수 없었습니다. 누구에게도 귀속하지 않고 거부했으며, 턴은 실행되지 않았고 자동 재전송도 없습니다. "
     "필요하면 메시지를 하나씩 다시 보내 주세요. (ref {ref})")
+RECOVERY_UNKNOWN_NOTICE = (
+    "이 프롬프트의 이벤트 경계를 복구하지 못했습니다. 이전 제출의 CEO 수신 여부와 턴의 결과는 "
+    "알 수 없습니다(outcome unknown). 이번 복구에서는 제출하지 않았고 자동 재전송은 없습니다. (ref {ref})")
 
 
 def journal_undeliverable(ref, shape, reason):
@@ -1016,7 +1074,7 @@ def journal_own_echo(ref, shape, channel, reply_to):
         f"(an echo); journaled as own_echo")
 
 
-def refuse_unattributed(session, prompt, chars):
+def refuse_unattributed(session, prompt, chars, *, notice_template=UNATTRIBUTED_NOTICE):
     """Refuse a prompt that is not one attributable event — a merged or batched dispatch, or an event
     section out of its fixed form — attributing it to no one. The conversation is told once per
     correlation key, in fixed text that names no sender and quotes no body, at the destination
@@ -1058,11 +1116,108 @@ def refuse_unattributed(session, prompt, chars):
     if channel is None:
         journal_undeliverable(ref, shape, why)
         return
-    notice = UNATTRIBUTED_NOTICE.format(ref=ref[:29])
+    notice = notice_template.format(ref=ref[:29])
     write({"jsonrpc": "2.0", "method": "session/update", "params": {
         "sessionId": session,
         "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": notice}}}})
     publish_reply(None, channel, notice, kind="unattributed_notice", ref=ref, reply_to=reply_to)
+
+
+def batch_sections(prompt):
+    """Recognized event-list elements under the shim's existing anti-spoof framing contract.
+
+    None leaves unrecognized/ambiguous prompts on the existing refusal path. Presentation headers
+    supply no author, mention status, message body or thread context to a canonical submission.
+    """
+    blocks = prompt_blocks(prompt)
+    context, channel, _, why = _exact_context(blocks)
+    if why or any(not isinstance(block, str) for block in blocks):
+        return None
+    rest = blocks[1:]
+    if rest and rest[0].startswith(CONVERSATION_HEADERS):
+        rest = rest[1:]
+    if len(rest) == 1 and EVENT_COUNT_RE.fullmatch(rest[0].split("\n")[0]):
+        sections = rest
+    elif (len(rest) == 3 and rest[0].split("\n")[0] in MERGE_HEADERS
+          and rest[-1] in CLOSING_NOTES
+          and (rest[1].split("\n")[0] in NEW_EVENT_SINGLE
+               or EVENT_COUNT_RE.fullmatch(rest[1].split("\n")[0]))):
+        sections = rest[:2]
+    else:
+        return None
+    return channel, context[2], sections
+
+
+def refuse_recovery_event(session, prompt, event_id, reason):
+    """A recovery refusal owns a separate notice key; it never spends the event's answer marker."""
+    state = recovery_delivery_state(event_id)
+    if state in ("answered", "pending", "notified"):
+        log(f"prompt {event_id} recovery unavailable; existing delivery state {state}; no new notice")
+        return
+    ref = "unattributed-" + hashlib.sha256(("recovery:" + event_id).encode()).hexdigest()
+    log(f"prompt {event_id} recovery refused: {reason}; ref {ref}")
+    print(f"acp-canonical-shim: event {event_id} recovery refused: {reason}", file=sys.stderr, flush=True)
+    channel, _, why = notice_destination(prompt_blocks(prompt))
+    if channel is not None:
+        handle, why = _registry_peer(channel)
+        signers, unknown = _own_signers()
+        if handle is None or signers is None:
+            channel, why = None, why or unknown
+    if channel is None:
+        journal_undeliverable(ref, "event_recovery", why)
+        return
+    notice = ("원본 이벤트를 인증하여 복구하지 못했습니다. 이전 제출의 CEO 수신 여부와 턴의 결과는 "
+              "알 수 없습니다(outcome unknown). 이번 복구에서는 제출하지 않았고 자동 재전송은 없습니다. "
+              f"다른 이벤트의 처리는 계속됩니다. (event {event_id}, ref {ref[:29]})")
+    write({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": session,
+        "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": notice}}}})
+    publish_reply(None, channel, notice, kind="unattributed_notice", ref=ref, reply_to=event_id)
+
+
+def recovery_delivery_state(event_id):
+    """Reconcile local answers/outcomes and submission ownership without resubmitting a body.
+
+    The gateway exposes receipt replay through the original attributed POST, not a read-only
+    receipt lookup. Without that verified original we cannot safely replay it. Missing local
+    evidence therefore means unknown, never proof that no gateway receipt exists.
+    """
+    records = [publication_record(event_id + suffix) for suffix in ("", ".answer")]
+    records = [r for r in records if r.get("event_id") == event_id]
+    if any(r.get("kind") == "answer" and r.get("sent") is True for r in records):
+        return "answered"
+    with _INFLIGHT_LOCK:
+        if event_id in _INFLIGHT:
+            return "pending"
+    if os.path.lexists(os.path.join(PUBLISHED, event_id + INFLIGHT_SUFFIX)):
+        return "pending"  # includes abandoned/uncertain ownership; the reaper arbitrates it
+    if any(r.get("kind") in ("notice", "unfinished_notice", "answer") for r in records):
+        return "notified"
+    return "unknown"
+
+
+def recover_batch(session, prompt):
+    if not os.environ.get("BUZZ_RELAY_URL"):
+        return False
+    batch = batch_sections(prompt)
+    if batch is None:
+        return False
+    if _batch is not None:
+        return _batch.deliver_batch(globals(), session, prompt)
+    # Only producer-confirmed IDs can receive a per-event notice without the recovery module.
+    # Ambiguous sections get a whole-prompt unknown outcome, never guessed identities/non-receipt.
+    _, channel_line, sections = batch
+    unresolved = False
+    ids = []
+    for section in sections:
+        confirmed = _confirmed_sections(section.split("\n"), channel_line)
+        ids.extend(event_id for _, event_id in confirmed or [])
+        unresolved |= not confirmed
+    for event_id in dict.fromkeys(ids):
+        refuse_recovery_event(session, prompt, event_id, "batch module unavailable: " + _batch_error)
+    if unresolved:
+        refuse_unattributed(session, prompt, len(prompt_text({"prompt": prompt})),
+                            notice_template=RECOVERY_UNKNOWN_NOTICE)
+    return True
 
 
 def journal_held(event_id, channel, reason):
@@ -1181,9 +1336,11 @@ def _unfinished(base):
     shim submitted the event (or was about to) and ended without its outcome, so whether the turn ran is
     unknown, and it stays unresolved rather than being sent again. An entry with no complete record (a
     post cut short) is as unknown. An answer or notice entry is the turn's own outcome: a redelivery is
-    submitted as before, and the gateway answers it from the receipt without running it again."""
+    submitted as before, and the gateway answers it from the receipt without running it again.
+    After a proven pre-claim refusal the terminal record lives at ``<base>.answer`` instead;
+    legacy notices without that proof keep their original one-post limit."""
     try:
-        with open(os.path.join(PUBLISHED, base), encoding="utf-8") as handle:
+        with open(os.path.join(PUBLISHED, outcome_key(base)), encoding="utf-8") as handle:
             raw = handle.read(65_536)
     except FileNotFoundError:
         return None
@@ -1248,7 +1405,7 @@ def begin_submission(session, base, channel):
             return False
         if prompt is not None:
             with prompt.lock:
-                if prompt.answered:
+                if prompt.answered and not (prompt.batch and prompt.submitted is not None):
                     log(f"prompt {base[:12]}… NOT submitted: cancelled before submission")
                     return False
                 prompt.submitted = base
@@ -1319,7 +1476,7 @@ def _prohibition_persisted(event_id):
     cut short, unreadable, another event's, or any other kind — is not that record. Whether the notice was
     posted is a separate fact: the record may say it was not, and still refuses the resubmission."""
     try:
-        fd = os.open(os.path.join(PUBLISHED, event_id), os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(os.path.join(PUBLISHED, outcome_key(event_id)), os.O_RDONLY | os.O_NOFOLLOW)
         try:
             raw = os.read(fd, 65_536)
             record = json.loads(raw.decode("utf-8").splitlines()[0])
@@ -1343,7 +1500,7 @@ def reap_unfinished():
     """Tell the thread, once, about each event a shim process submitted and never finished delivering:
     its ``.inflight`` entry is still linked and no live process holds its lock (the owner was replaced
     — buzz-acp SIGKILLs the group on CancelDrainTimeout — or its handler raised). The notice takes the
-    event's one post (``PUBLISHED/<event id>``), so it never goes out beside or after an answer; an
+    event's terminal post (``outcome_key``), so it never goes out beside or after an answer; an
     event that already has its post keeps no second one. The entry is retired only once the event's
     ``unfinished_notice`` record is persisted (``_prohibition_persisted``); until then — the journal could
     not be created or written, or the entry holds another kind — it stays as the guard against a
@@ -1372,7 +1529,7 @@ def reap_unfinished():
             except Exception:
                 record = None
             channel = record.get("channel") if isinstance(record, dict) else None
-            if not os.path.lexists(os.path.join(PUBLISHED, event_id)):
+            if not os.path.lexists(os.path.join(PUBLISHED, outcome_key(event_id))):
                 try:
                     if isinstance(channel, str) and re.fullmatch(_UUID, channel):
                         log(f"prompt {event_id[:12]}… was submitted by a shim that ended before its outcome; "
@@ -1380,7 +1537,7 @@ def reap_unfinished():
                         publish_reply(event_id, channel, UNFINISHED_NOTICE.format(event_id=event_id),
                                       kind="unfinished_notice")
                     else:
-                        marker, _ = _claim(event_id)
+                        marker, _ = _claim(outcome_key(event_id))
                         if marker is not None:
                             with os.fdopen(marker, "w") as record_file:
                                 record_file.write(json.dumps({
@@ -1476,6 +1633,170 @@ def prompt_text(params):
     return "\n".join(part for part in chunks if part).strip()
 
 
+# A transient refusal before any claim (#99 r1 H99-02): the event is held and the ACP prompt fails so
+# buzz-acp requeues and resends the same event id; the gateway has recorded nothing for it, so the
+# resend runs it once. Ending the turn instead would count the event as delivered and lose it.
+RETRY = "retry"
+
+
+def deliver_event(session, parsed, text, mentioned):
+    """Run one attributed event through the existing safety, retry and receipt path. Returns RETRY when
+    the event must be resent later (nothing was claimed), otherwise None."""
+    author, channel, base, body = parsed
+    # One snapshot decides this event (#100 r3 H100-R3-01): reading the roster again for the signers or
+    # the room's counterpart could fail between reads and silently drop an owner broadcast.
+    snapshot, why = _read_roster()
+    _local.roster_generation = snapshot.generation if snapshot is not None else None
+    if snapshot is None and not mentioned and author == OWNER:
+        journal_held(base, channel, "owner broadcast held: routing roster unavailable; ACP retry requested")
+        return RETRY
+    if snapshot is not None and channel in snapshot.channels and snapshot.active(channel) is None:
+        log(f"prompt {base[:12]}… refused: retired room; roster_generation={snapshot.generation}")
+        return
+    if snapshot is None:
+        signers, unknown = None, why
+    else:
+        signers = {rule["ceo"]["pubkey"] for rule in snapshot.channels.values()
+                   if rule["status"] == "active"} or None
+        unknown = None if signers else "reply registry names no valid ceo signer"
+    if not mentioned:
+        if (author != OWNER or snapshot is None or snapshot.active(channel) is None
+                or os.path.exists(os.path.join(PUBLISHED, outcome_key(base, channel)))):
+            return
+    log(f"prompt author={author[:12]}… channel={channel} base={base[:12]}… chars={len(text)} "
+        f"roster_generation={getattr(_local, 'roster_generation', None)}")
+    # Every refusal is decided before anything is claimed, so an armed canary is spent only on an
+    # event that is actually submitted — not on an echo, an unreadable registry or an oversize text.
+    if FORWARD != "live" and not canary_armed_for(author, channel, body):
+        hold(session, author, channel, base, text)
+        return
+    if signers is None:
+        # The bridge's own identities are unreadable, so an echo cannot be ruled out: nothing is
+        # claimed, and the prompt fails so buzz-acp resends this event once they are readable again
+        # (#99 r2 H99-02); ending the turn would count the event as delivered.
+        log(f"prompt {base[:12]}… HELD, not sent: {unknown}; ACP retry requested")
+        journal_held(base, channel, unknown)
+        return RETRY
+    if author in signers:
+        # This bridge's own post — an answer or a not-delivered notice — coming back. buzz-acp drops
+        # it first (ignore-self, the author gate) and the binding's author allowlist
+        # refuses it after, but nothing here may depend on either: forwarded, it would reach the CEO
+        # as a turn and be answered into the thread under a new event id, which no per-event marker
+        # stops. (A registry that cannot be read cannot rule an echo out: held above, nothing posted —
+        # the wrapper refuses to post without it.)
+        log(f"prompt {base[:12]}… refused locally: authored by this bridge's own signer; not forwarded")
+        return
+    try:
+        fitted = fit_text(text, channel, base)
+        reason = (f"canonical surface 길이 한도({GATEWAY_TEXT_LIMIT}자)를 넘습니다: 이전 스레드 맥락을 "
+                  f"모두 생략해도 이 메시지와 이벤트 머리글만으로 한도를 넘습니다(원문 {len(text)}자)")
+    except Exception as exc:  # whatever the text holds, the outcome is a submission or a notice
+        log(f"prompt {base[:12]}… fitting {len(text)} chars failed: {type(exc).__name__}: {str(exc)[:200]}")
+        fitted = None
+        reason = (f"canonical surface 길이 한도({GATEWAY_TEXT_LIMIT}자)에 맞추는 중 오류가 났습니다"
+                  f"(원문 {len(text)}자)")
+    if fitted is None:
+        # Not submitted, and the thread is told so: a refusal that is only logged is what left
+        # 2026-10-10's long thread talking to nobody. One post per event id, as for an answer: a
+        # notice whose post fails is journaled as that failure and not retried — the marker is
+        # claimed before the send because a send that timed out may still have been published, and
+        # a wrapper refusal is deterministic, so a retry would duplicate or fail again. The notice
+        # carries only fixed text, the limit, the length and the event id — never the message.
+        log(f"prompt {base[:12]}… NOT submitted: {len(text)} chars; telling the thread")
+        notice = (f"이 메시지는 CEO 에게 전달되지 않았습니다. {reason}. 메시지를 나눠 보내거나 새 "
+                  f"최상위 스레드로 다시 시작해 주세요. (event {base})")
+        write({"jsonrpc": "2.0", "method": "session/update", "params": {
+            "sessionId": session,
+            "update": {"sessionUpdate": "agent_message_chunk",
+                       "content": {"type": "text", "text": notice}}}})
+        publish_reply(base, channel, notice, kind="notice", preclaim=True)
+        return
+    if FORWARD != "live":
+        if not claim_canary(author, channel, body):
+            hold(session, author, channel, base, text)  # disarmed, expired or taken in between
+            return
+        log(f"prompt {base[:12]}… CANARY: forwarding this one armed event (CANONICAL_FORWARD={FORWARD})")
+    if fitted[0] is not text:
+        log(f"prompt {base[:12]}… {len(text)} chars is over the gateway limit {GATEWAY_TEXT_LIMIT}: "
+            f"omitted {fitted[1]} thread messages ({fitted[2]} chars), submitting {len(fitted[0])} chars")
+    text = fitted[0]
+    if not begin_submission(session, base, channel):
+        return
+    # Every attempt and every replay of this event uses its own Buzz event id. A busy refusal is
+    # raised before the gateway claims the event (it records nothing), so retrying the same id
+    # runs it once when the session frees; once claimed, a replay answers from the receipt and
+    # never runs it again. A per-attempt id would give each retry its own receipt key, and a later
+    # replay of an earlier attempt would run the turn a second time.
+    deadline = time.monotonic() + BUSY_DEADLINE_SECS
+    attempt = 0
+    answer = None
+    answered = False
+    notice = None
+    preclaim = False
+    while True:
+        attempt += 1
+        event_id = base
+        try:
+            answer = submit(text, event_id, author, channel)
+            answered = True
+            break
+        except urllib.error.HTTPError as exc:
+            raw = exc.read(REFUSAL_BODY_BYTES)
+            detail = raw.decode(errors="replace")[:400]
+            code, refusal = refusal_of(raw)
+            if exc.code == 503 and code == "canonical_roster_unavailable":
+                log(f"prompt {event_id} refused HTTP 503 canonical_roster_unavailable before any claim; "
+                    "held for ACP retry")
+                release_turn_slot()
+                journal_held(base, channel, "gateway routing roster unavailable; ACP retry requested")
+                finish_submission()
+                return RETRY
+            busy = exc.code == 409 and code == "canonical_turn_busy"
+            if busy and time.monotonic() + BUSY_RETRY_SECS < deadline:
+                log(f"prompt {event_id} busy; retrying in {BUSY_RETRY_SECS:.0f}s (attempt {attempt})")
+                # Any stdout write resets buzz-acp's --idle-timeout. An unrecognised
+                # `sessionUpdate` deserialises to its Other variant and is not published, so
+                # waiting does not leak a message into the channel.
+                write({"jsonrpc": "2.0", "method": "session/update", "params": {
+                    "sessionId": session,
+                    "update": {"sessionUpdate": "canonical_wait", "attempt": attempt}}})
+                time.sleep(BUSY_RETRY_SECS)
+                continue
+            log(f"prompt {event_id} refused HTTP {exc.code}: {detail}")
+            answer = (f"canonical surface refused this turn (HTTP {exc.code}) after {attempt} "
+                      f"attempt(s): {detail}")
+            notice = refusal_notice(exc.code, code, refusal, base, len(text))
+            preclaim = ((exc.code, code) in ((400, "canonical_invalid_request"),
+                                           (403, "canonical_principal_rejected")))
+            break
+        except Exception as exc:
+            log(f"prompt {event_id} failed: {type(exc).__name__}: {exc}")
+            answer = f"canonical surface unreachable: {type(exc).__name__}: {exc}"
+            # No gateway answer: the turn may have run, so the thread is told its outcome is unknown.
+            code, refusal = None, {}
+            notice = unknown_outcome_notice(type(exc).__name__, base)
+            break
+    release_turn_slot()  # the gateway answered, or never will: another prompt may submit
+    write({"jsonrpc": "2.0", "method": "session/update", "params": {
+        "sessionId": session,
+        "update": {"sessionUpdate": "agent_message_chunk",
+                   "content": {"type": "text", "text": answer}}}})
+    if answered and answer and answer.strip():
+        publish_reply(base, channel, answer)
+    elif notice is not None:
+        # A notice that fails stays journaled as that failure and is the end of it. It is not
+        # turned into an error result either: buzz-acp requeues a failed attempt, which would
+        # resend this event.
+        kept = refusal.get("answer_kept")
+        log(f"prompt {base[:12]}… NOT delivered ({code}"
+            + ("" if code != "canonical_answer_unrecorded" else
+               ", answer NOT preserved" if kept is False else f", answer_kept={kept}")
+            + "); telling the thread")
+        publish_reply(base, channel, notice, kind="notice", preclaim=preclaim)
+    finish_submission()
+    return
+
+
 def handle(message):
     rpc_id, method = message.get("id"), message.get("method")
     params = message.get("params") or {}
@@ -1519,150 +1840,27 @@ def handle(message):
         text = prompt_text(params)
         parsed = envelope(prompt)
         if parsed is None:
-            # No single unambiguous event: nothing can be attributed, so nothing is forwarded in any
-            # mode — and the conversation is told once, or the journal says it could not be or that a
-            # plain single-event prompt's one event is this bridge's own post, which is never answered.
+            # Rendered bundle headers cannot establish identity. Recover signed originals separately;
+            # an unrecognized or ambiguous framing retains the existing anonymous refusal path.
+            recovered = recover_batch(session, prompt)
+            if recovered == RETRY:
+                error(rpc_id, -32000, "retryable: canonical_roster_unavailable (nothing claimed; resend)")
+                return
+            if recovered:
+                result(rpc_id, {"stopReason": "end_turn"})
+                return
             refuse_unattributed(session, prompt, len(text))
             result(rpc_id, {"stopReason": "end_turn"})
             return
-        author, channel, base, body = parsed
-        # The producer's title or final Tags line identifies a mention, including in all/config
-        # mode. Body text and thread history cannot supply either. Drop broadcasts before holds,
-        # receipts, canary claims and notices; a published mention cannot also become a broadcast turn.
         lines = prompt_blocks(prompt)[-1].split("\n")
         tags = _tags_at_end(lines)
-        signers, unknown = _own_signers()
+        signers, _ = _own_signers()
         mentioned = lines[0] == "[Buzz event: @mention]" or (
             tags is not None and signers is not None
             and any(len(tag) >= 2 and tag[0] == "p" and tag[1] in signers for tag in tags))
-        if not mentioned:
-            if (author != OWNER or _peer_handle(channel) is None
-                    or os.path.exists(os.path.join(PUBLISHED, base))):
-                result(rpc_id, {"stopReason": "end_turn"})
-                return
-        log(f"prompt author={author[:12]}… channel={channel} base={base[:12]}… chars={len(text)}")
-        # Every refusal is decided before anything is claimed, so an armed canary is spent only on an
-        # event that is actually submitted — not on an echo, an unreadable registry or an oversize text.
-        if FORWARD != "live" and not canary_armed_for(author, channel, body):
-            hold(session, author, channel, base, text)
-            result(rpc_id, {"stopReason": "end_turn"})
+        if deliver_event(session, parsed, text, mentioned) == RETRY:
+            error(rpc_id, -32000, "retryable: canonical_roster_unavailable (nothing claimed; resend)")
             return
-        if signers is None:
-            log(f"prompt {base[:12]}… HELD, not sent: {unknown}")
-            journal_held(base, channel, unknown)
-            result(rpc_id, {"stopReason": "end_turn"})
-            return
-        if author in signers:
-            # This bridge's own post — an answer or a not-delivered notice — coming back. buzz-acp drops
-            # it first (ignore-self, the author gate) and the binding's author allowlist
-            # refuses it after, but nothing here may depend on either: forwarded, it would reach the CEO
-            # as a turn and be answered into the thread under a new event id, which no per-event marker
-            # stops. (A registry that cannot be read cannot rule an echo out: held above, nothing posted —
-            # the wrapper refuses to post without it.)
-            log(f"prompt {base[:12]}… refused locally: authored by this bridge's own signer; not forwarded")
-            result(rpc_id, {"stopReason": "end_turn"})
-            return
-        try:
-            fitted = fit_text(text, channel, base)
-            reason = (f"canonical surface 길이 한도({GATEWAY_TEXT_LIMIT}자)를 넘습니다: 이전 스레드 맥락을 "
-                      f"모두 생략해도 이 메시지와 이벤트 머리글만으로 한도를 넘습니다(원문 {len(text)}자)")
-        except Exception as exc:  # whatever the text holds, the outcome is a submission or a notice
-            log(f"prompt {base[:12]}… fitting {len(text)} chars failed: {type(exc).__name__}: {str(exc)[:200]}")
-            fitted = None
-            reason = (f"canonical surface 길이 한도({GATEWAY_TEXT_LIMIT}자)에 맞추는 중 오류가 났습니다"
-                      f"(원문 {len(text)}자)")
-        if fitted is None:
-            # Not submitted, and the thread is told so: a refusal that is only logged is what left
-            # 2026-10-10's long thread talking to nobody. One post per event id, as for an answer: a
-            # notice whose post fails is journaled as that failure and not retried — the marker is
-            # claimed before the send because a send that timed out may still have been published, and
-            # a wrapper refusal is deterministic, so a retry would duplicate or fail again. The notice
-            # carries only fixed text, the limit, the length and the event id — never the message.
-            log(f"prompt {base[:12]}… NOT submitted: {len(text)} chars; telling the thread")
-            notice = (f"이 메시지는 CEO 에게 전달되지 않았습니다. {reason}. 메시지를 나눠 보내거나 새 "
-                      f"최상위 스레드로 다시 시작해 주세요. (event {base})")
-            write({"jsonrpc": "2.0", "method": "session/update", "params": {
-                "sessionId": session,
-                "update": {"sessionUpdate": "agent_message_chunk",
-                           "content": {"type": "text", "text": notice}}}})
-            publish_reply(base, channel, notice, kind="notice")
-            result(rpc_id, {"stopReason": "end_turn"})
-            return
-        if FORWARD != "live":
-            if not claim_canary(author, channel, body):
-                hold(session, author, channel, base, text)  # disarmed, expired or taken in between
-                result(rpc_id, {"stopReason": "end_turn"})
-                return
-            log(f"prompt {base[:12]}… CANARY: forwarding this one armed event (CANONICAL_FORWARD={FORWARD})")
-        if fitted[0] is not text:
-            log(f"prompt {base[:12]}… {len(text)} chars is over the gateway limit {GATEWAY_TEXT_LIMIT}: "
-                f"omitted {fitted[1]} thread messages ({fitted[2]} chars), submitting {len(fitted[0])} chars")
-        text = fitted[0]
-        if not begin_submission(session, base, channel):
-            result(rpc_id, {"stopReason": "end_turn"})
-            return
-        # Every attempt and every replay of this event uses its own Buzz event id. A busy refusal is
-        # raised before the gateway claims the event (it records nothing), so retrying the same id
-        # runs it once when the session frees; once claimed, a replay answers from the receipt and
-        # never runs it again. A per-attempt id would give each retry its own receipt key, and a later
-        # replay of an earlier attempt would run the turn a second time.
-        deadline = time.monotonic() + BUSY_DEADLINE_SECS
-        attempt = 0
-        answer = None
-        answered = False
-        notice = None
-        while True:
-            attempt += 1
-            event_id = base
-            try:
-                answer = submit(text, event_id, author, channel)
-                answered = True
-                break
-            except urllib.error.HTTPError as exc:
-                raw = exc.read(REFUSAL_BODY_BYTES)
-                detail = raw.decode(errors="replace")[:400]
-                code, refusal = refusal_of(raw)
-                busy = exc.code == 409 and code == "canonical_turn_busy"
-                if busy and time.monotonic() + BUSY_RETRY_SECS < deadline:
-                    log(f"prompt {event_id} busy; retrying in {BUSY_RETRY_SECS:.0f}s (attempt {attempt})")
-                    # Any stdout write resets buzz-acp's --idle-timeout. An unrecognised
-                    # `sessionUpdate` deserialises to its Other variant and is not published, so
-                    # waiting does not leak a message into the channel.
-                    write({"jsonrpc": "2.0", "method": "session/update", "params": {
-                        "sessionId": session,
-                        "update": {"sessionUpdate": "canonical_wait", "attempt": attempt}}})
-                    time.sleep(BUSY_RETRY_SECS)
-                    continue
-                log(f"prompt {event_id} refused HTTP {exc.code}: {detail}")
-                answer = (f"canonical surface refused this turn (HTTP {exc.code}) after {attempt} "
-                          f"attempt(s): {detail}")
-                notice = refusal_notice(exc.code, code, refusal, base, len(text))
-                break
-            except Exception as exc:
-                log(f"prompt {event_id} failed: {type(exc).__name__}: {exc}")
-                answer = f"canonical surface unreachable: {type(exc).__name__}: {exc}"
-                # No gateway answer: the turn may have run, so the thread is told its outcome is unknown.
-                code, refusal = None, {}
-                notice = unknown_outcome_notice(type(exc).__name__, base)
-                break
-        release_turn_slot()  # the gateway answered, or never will: another prompt may submit
-        write({"jsonrpc": "2.0", "method": "session/update", "params": {
-            "sessionId": session,
-            "update": {"sessionUpdate": "agent_message_chunk",
-                       "content": {"type": "text", "text": answer}}}})
-        if answered and answer and answer.strip():
-            publish_reply(base, channel, answer)
-        elif notice is not None:
-            # A notice that fails stays journaled as that failure and is the end of it. It is not
-            # turned into an error result either: buzz-acp requeues a failed attempt, which would
-            # resend this event.
-            kept = refusal.get("answer_kept")
-            log(f"prompt {base[:12]}… NOT delivered ({code}"
-                + ("" if code != "canonical_answer_unrecorded" else
-                   ", answer NOT preserved" if kept is False else f", answer_kept={kept}")
-                + "); telling the thread")
-            publish_reply(base, channel, notice, kind="notice")
-        finish_submission()
         result(rpc_id, {"stopReason": "end_turn"})
         return
 
@@ -1712,9 +1910,86 @@ def dispatch(message):
     thread.start()
 
 
+_EVENT_ID = re.compile(r"[0-9a-f]{64}")
+
+
+def recover_main(args):
+    """``recover <channel-uuid> <event-id>...``: deliver events this shim refused or never received.
+
+    For operators after an outage or a refused merged prompt (2026-10-20: the owner's thread reply
+    was refused unattributed). Each original is fetched from the relay once and its hash, Schnorr
+    signature and channel tag are verified before the existing per-event delivery runs, so the
+    signed author, never this command line, supplies identity. An event already answered is
+    skipped, so rerunning never duplicates. One line per event reports its final local state.
+    """
+    if len(args) < 2:
+        sys.stderr.write("usage: acp-canonical-shim.py recover <channel-uuid> <event-id> [<event-id> ...]\n")
+        return 2
+    channel = args[0].lower()
+    if not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", channel):
+        sys.stderr.write(f"acp-canonical-shim: not a channel uuid: {args[0]}\n")
+        return 2
+    ids = list(dict.fromkeys(arg.lower() for arg in args[1:]))
+    bad = [event_id for event_id in ids if not _EVENT_ID.fullmatch(event_id)]
+    if bad:
+        sys.stderr.write("acp-canonical-shim: not an event id: " + ", ".join(bad) + "\n")
+        return 2
+    missing = [name for name, value in (("API_SERVER_KEY", KEY),
+                                        ("BUZZ_RELAY_URL", os.environ.get("BUZZ_RELAY_URL")),
+                                        ("BUZZ_PRIVATE_KEY", os.environ.get("BUZZ_PRIVATE_KEY"))) if not value]
+    if missing or _batch is None:
+        sys.stderr.write("acp-canonical-shim: recovery unavailable: "
+                         + (("missing " + ", ".join(missing)) if missing else _batch_error) + "\n")
+        return 2
+    from types import SimpleNamespace
+
+    global _EXPLICIT_RECOVERY
+    _EXPLICIT_RECOVERY = True
+    session = "canonical:" + BINDING
+    api = SimpleNamespace(**globals())
+    recovered = {}
+    # No buzz-acp reads this process's ACP frames; the answer is posted to Buzz and journaled as in a
+    # live turn. Stdout carries only the per-event report.
+    report, sys.stdout = sys.stdout, open(os.devnull, "w")
+
+    def lookup(event_id):
+        if event_id not in recovered:
+            try:
+                recovered[event_id] = _batch.fetch_event(event_id, channel)
+            except Exception as exc:
+                recovered[event_id] = exc
+        return recovered[event_id]
+
+    status = 0
+    for event_id in ids:
+        log(f"recover {event_id} channel={channel}")
+        prompt = [{"type": "text", "text": f"[Buzz event: recovered]\nEvent ID: {event_id}\nChannel ID: {channel}"}]
+        _local.prompt = PromptTurn(None, session)
+        try:
+            _batch.deliver_member(api, session, prompt, channel, event_id, lookup)
+        except Exception as exc:
+            status = 1
+            log(f"recover {event_id} failed: {_batch.failure_reason(exc)}")
+            sys.stderr.write(f"acp-canonical-shim: recover {event_id} failed: {_batch.failure_reason(exc)}\n")
+        finally:
+            left = abandon_submission()
+            _local.prompt = None
+            if left:
+                reap_unfinished()
+        found = recovered.get(event_id)
+        state = recovery_delivery_state(event_id)
+        if isinstance(found, Exception):
+            state = "unavailable: " + _batch.failure_reason(found)
+            status = 1
+        print(f"{event_id} {state}", file=report, flush=True)
+    return status
+
+
 def main():
+    if sys.argv[1:2] == ["recover"]:
+        raise SystemExit(recover_main(sys.argv[2:]))
     missing = [name for name, value in
-               (("API_SERVER_KEY", KEY), ("CANONICAL_AUTHOR_ID", AUTHOR), ("CANONICAL_CHANNEL_ID", CHANNEL))
+               (("API_SERVER_KEY", KEY),)
                if not value]
     if missing:
         # Fail before ACP initialize: a shim that answers initialize and then refuses every turn

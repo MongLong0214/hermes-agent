@@ -1,0 +1,3 @@
+# Standalone shim's signed-event recovery (not a core Hermes dependency).
+# Python 3.9+: install with the shim's interpreter; pip --user also requires its launch HOME.
+coincurve>=21.0.0,<22
