@@ -1643,7 +1643,9 @@ def deliver_event(session, parsed, text, mentioned):
     """Run one attributed event through the existing safety, retry and receipt path. Returns RETRY when
     the event must be resent later (nothing was claimed), otherwise None."""
     author, channel, base, body = parsed
-    snapshot, _ = _read_roster()
+    # One snapshot decides this event (#100 r3 H100-R3-01): reading the roster again for the signers or
+    # the room's counterpart could fail between reads and silently drop an owner broadcast.
+    snapshot, why = _read_roster()
     _local.roster_generation = snapshot.generation if snapshot is not None else None
     if snapshot is None and not mentioned and author == OWNER:
         journal_held(base, channel, "owner broadcast held: routing roster unavailable; ACP retry requested")
@@ -1651,9 +1653,14 @@ def deliver_event(session, parsed, text, mentioned):
     if snapshot is not None and channel in snapshot.channels and snapshot.active(channel) is None:
         log(f"prompt {base[:12]}… refused: retired room; roster_generation={snapshot.generation}")
         return
-    signers, unknown = _own_signers()
+    if snapshot is None:
+        signers, unknown = None, why
+    else:
+        signers = {rule["ceo"]["pubkey"] for rule in snapshot.channels.values()
+                   if rule["status"] == "active"} or None
+        unknown = None if signers else "reply registry names no valid ceo signer"
     if not mentioned:
-        if (author != OWNER or _peer_handle(channel) is None
+        if (author != OWNER or snapshot is None or snapshot.active(channel) is None
                 or os.path.exists(os.path.join(PUBLISHED, outcome_key(base, channel)))):
             return
     log(f"prompt author={author[:12]}… channel={channel} base={base[:12]}… chars={len(text)} "
