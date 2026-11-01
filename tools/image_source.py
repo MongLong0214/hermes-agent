@@ -10,11 +10,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
+import contextvars
 import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
+from urllib.parse import unquote, urljoin, urlsplit
 
 # Raw-bytes INGEST budget: deliberately the 50MB download cap, NOT the 20MB provider
 # payload cap — that one is enforced post-resize at the call sites.
@@ -49,12 +52,151 @@ class ResolvedImage:
 # Explicit URL scheme ("ftp://", "s3://"). Bare Windows drive paths lack the "//".
 _SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*://")
 
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+_MAX_SCOPED_REDIRECTS = 5
+
+
+def _url_parts(url: Any) -> Optional[tuple]:
+    """``(scheme, host, port, path)`` of an http(s) URL; None for any other scheme, userinfo, a bad
+    port, whitespace, a control character, a backslash or a ``.``/``..`` path segment (also encoded)."""
+    if not isinstance(url, str) or any(c.isspace() or ord(c) < 0x20 or c in "\\\x7f" for c in url):
+        return None
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return None
+    scheme = parts.scheme.lower()
+    if scheme not in _DEFAULT_PORTS or not parts.hostname or "@" in parts.netloc:
+        return None
+    path = parts.path or "/"
+    if any(segment in (".", "..") for segment in unquote(path).split("/")):
+        return None
+    return scheme, parts.hostname, port or _DEFAULT_PORTS[scheme], path
+
+
+@dataclass(frozen=True)
+class MediaScope:
+    """What a scoped resolve (a canonical peer turn's ``vision_analyze``) may read: URLs whose
+    scheme, host and port equal a base's and whose path sits under its path prefix, and files whose
+    realpath sits under a root. Under :func:`scoped_media` anything else is refused before any read
+    or fetch, and every redirect hop is checked against the same bases."""
+
+    bases: tuple = ()  # (scheme, host, port, path prefix ending in "/")
+    roots: tuple = ()  # realpath'd root Paths
+
+    @classmethod
+    def parse(cls, urls: Any, roots: Any) -> Optional["MediaScope"]:
+        """The scope of a configured ``urls``/``roots`` pair; None when either is malformed."""
+        urls, roots = urls or [], roots or []
+        if not (isinstance(urls, list) and isinstance(roots, list) and all(isinstance(v, str) for v in urls + roots)):
+            return None
+        bases = []
+        for url in urls:
+            parts = _url_parts(url)
+            if parts is None or urlsplit(url).query or urlsplit(url).fragment:
+                return None
+            bases.append(parts[:3] + (parts[3] if parts[3].endswith("/") else parts[3] + "/",))
+        real_roots = []
+        for root in roots:
+            expanded = os.path.expanduser(root)
+            if not os.path.isabs(expanded):
+                return None
+            real_roots.append(Path(os.path.realpath(os.path.normpath(expanded))))
+        return cls(tuple(bases), tuple(real_roots))
+
+    def admits_url(self, url: Any) -> bool:
+        parts = _url_parts(url)
+        return parts is not None and any(parts[:3] == base[:3] and parts[3].startswith(base[3]) for base in self.bases)
+
+    def local_target(self, src: Any) -> Optional[Path]:
+        """The realpath to read for a path source (``file://`` stripped, ``~`` expanded, normalised),
+        or None when it is not absolute or does not sit under a root."""
+        if not isinstance(src, str):
+            return None
+        s = src.strip()
+        s = s[len("file://"):] if s.lower().startswith("file://") else s
+        expanded = os.path.expanduser(s)
+        if not os.path.isabs(expanded):
+            return None
+        real = Path(os.path.realpath(os.path.normpath(expanded)))
+        return real if any(real.is_relative_to(root) for root in self.roots) else None
+
+    def admits(self, src: Any) -> bool:
+        s = src.strip() if isinstance(src, str) else src
+        return self.admits_url(s) or self.local_target(s) is not None
+
+
+_media_scope: contextvars.ContextVar[Optional[MediaScope]] = contextvars.ContextVar(
+    "image_source_media_scope", default=None)
+
+
+@contextlib.contextmanager
+def scoped_media(scope: MediaScope):
+    """Confine every :func:`resolve_image_source` in this context to ``scope``."""
+    token = _media_scope.set(scope)
+    try:
+        yield
+    finally:
+        _media_scope.reset(token)
+
+
+def _scoped_http_client(timeout: float):
+    import httpx
+
+    # Redirects are followed by hand in _fetch_scoped, each hop checked first.
+    return httpx.AsyncClient(follow_redirects=False, timeout=timeout)
+
+
+async def _fetch_scoped(url: str, scope: MediaScope) -> bytes:
+    """GET ``url`` with redirects off: each ``Location`` is checked against ``scope`` before it is
+    requested. The configured host is dialed even when it resolves to a private (tailnet) address."""
+    from tools.vision_tools import _DOWNLOAD_USER_AGENT, _VISION_DOWNLOAD_TIMEOUT
+    from tools.website_policy import check_website_access
+
+    async with _scoped_http_client(_VISION_DOWNLOAD_TIMEOUT) as client:
+        for _ in range(_MAX_SCOPED_REDIRECTS + 1):
+            if not scope.admits_url(url):
+                raise SourceUnsafe("blocked: outside the media base this turn may fetch", src=url, origin="http")
+            if blocked := check_website_access(url):
+                raise SourceUnsafe(blocked.get("message") or "blocked by website policy", src=url, origin="http")
+            async with client.stream("GET", url, headers={"User-Agent": _DOWNLOAD_USER_AGENT,
+                                                          "Accept": "image/*,*/*;q=0.8"}) as response:
+                if response.is_redirect:
+                    url = urljoin(str(response.url), response.headers["location"])
+                    continue
+                response.raise_for_status()
+                data = bytearray()
+                async for chunk in response.aiter_bytes():
+                    data.extend(chunk)
+                    if len(data) > _MAX_INGEST_BYTES:
+                        raise SourceTooLarge("media exceeds size limit", src=url, origin="http")
+                return bytes(data)
+    raise SourceUnsafe("blocked: too many redirects", src=url, origin="http")
+
+
+async def _resolve_scoped(src: str, scope: MediaScope, permitted: tuple) -> ResolvedImage:
+    """Only an allowed URL (fetched hop by hop) or a file under an allowed root (read at its
+    realpath); anything else is refused before any read or fetch."""
+    if scope.admits_url(src):
+        return _finalize(await _fetch_scoped(src, scope), "", "http", src, permitted)
+    target = scope.local_target(src)
+    if target is None:
+        raise SourceUnsafe("blocked: outside the media this turn may read", src=src)
+    if not target.is_file():
+        raise SourceNotFound(f"media file not found: '{target}'", src=src, origin="file")
+    _guard_credential_read(target, src)
+    return _finalize(await asyncio.to_thread(target.read_bytes), "", "file", src, permitted)
+
 
 async def resolve_image_source(
     src: str, ctx: ResolveContext, *, permitted: tuple = ("image",)) -> ResolvedImage:
     if not isinstance(src, str) or not src.strip():
         raise SourceNotFound("image_url is required", src=str(src))
     s = src.strip()
+    scope = _media_scope.get()
+    if scope is not None:
+        return await _resolve_scoped(s, scope, permitted)
     if s.startswith("data:"):
         data, mime = _resolve_data_url(s)
         return _finalize(data, mime, "data", s, permitted)

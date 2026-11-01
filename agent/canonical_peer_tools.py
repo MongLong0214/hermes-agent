@@ -12,7 +12,10 @@ so a later id needs no restart):
 * every call is allowed: a ``read`` name (any arguments) or a ``mutate`` name whose every
   constrained argument is present as one of its exact string values (``mutate`` wins over
   ``read``). The tool must be a native tool of the configured ``mcp_server`` in this profile and
-  must run without a Hermes approval, since a peer turn never asks the owner anything;
+  must run without a Hermes approval, since a peer turn never asks the owner anything. The one
+  exception is ``local``: the built-in ``vision_analyze`` only, whose ``image_url`` must sit inside
+  the entry's media scope (``tools.image_source.MediaScope``), checked before anything is read or
+  fetched; it then runs under that scope, so every read and every redirect hop stays inside it;
 * ``tool_search``/``tool_describe`` only discover allowed tools (:func:`scope_discovery_defs`);
   ``tool_call`` is allowed only when every call it wraps is.
 
@@ -102,9 +105,17 @@ class _Policy:
     mutate: Mapping[str, Optional[Mapping[str, frozenset]]]
     # tool -> its mutate entry exactly as read, for the peer_grant digest.
     mutate_raw: Mapping[str, Any]
+    # built-in tool -> its MediaScope; None is a malformed entry, which allows nothing.
+    local: Mapping[str, Any] = field(default_factory=dict)
+    # built-in tool -> its local entry exactly as read, for the peer_grant digest.
+    local_raw: Mapping[str, Any] = field(default_factory=dict)
 
     def names(self) -> frozenset:
-        return self.read | frozenset(self.mutate)
+        return self.read | frozenset(self.mutate) | frozenset(self.local)
+
+
+# The built-in tools ``local`` may name; any other name there allows nothing.
+_LOCAL_TOOLS = frozenset({"vision_analyze"})
 
 
 def _strings(raw: Any) -> Optional[frozenset]:
@@ -136,8 +147,20 @@ def _load_policy() -> Optional[_Policy]:
     if not (isinstance(binding, str) and binding and isinstance(server, str) and server):
         return None
     mutate = {name: c for name, c in mutate.items() if isinstance(name, str)} if isinstance(mutate, Mapping) else {}
+    local = raw.get("local")
+    local = {name: e for name, e in local.items() if name in _LOCAL_TOOLS} if isinstance(local, Mapping) else {}
     return _Policy(binding, server, _strings(raw.get("read")) or frozenset(),
-                   {name: _constraints(c) for name, c in mutate.items()}, copy.deepcopy(mutate))
+                   {name: _constraints(c) for name, c in mutate.items()}, copy.deepcopy(mutate),
+                   {name: _media_scope(e) for name, e in local.items()}, copy.deepcopy(local))
+
+
+def _media_scope(raw: Any) -> Any:
+    """The MediaScope of one ``local`` entry (``urls``, ``roots``); None when it is malformed."""
+    from tools.image_source import MediaScope
+
+    if not isinstance(raw, Mapping) or not set(raw) <= {"urls", "roots"}:
+        return None
+    return MediaScope.parse(raw.get("urls"), raw.get("roots"))
 
 
 def _canonical(value: Any) -> Optional[str]:
@@ -149,7 +172,8 @@ def _canonical(value: Any) -> Optional[str]:
 
 def peer_grant_digest(entry: Mapping[str, Any]) -> str:
     """``sha256:<hex>`` of the canonical JSON (sorted keys, no spaces, UTF-8) of one policy entry:
-    ``{"read": tool}`` or ``{"mutate": {tool: {argument: [values as configured]}}}``."""
+    ``{"read": tool}``, ``{"mutate": {tool: {argument: [values as configured]}}}`` or
+    ``{"local": {tool: entry as configured}}``."""
     return "sha256:" + hashlib.sha256(_canonical(entry).encode("utf-8")).hexdigest()
 
 
@@ -170,6 +194,64 @@ def _native_handler(policy: _Policy, name: str) -> Any:
 
     origin = mcp_tool_origin(name)
     return origin[2] if origin is not None and origin[0] == policy.server and not origin[1] else None
+
+
+def _builtin_handler(name: str) -> Any:
+    """The handler registered for a ``local`` tool now, when it is the built-in one; else None."""
+    from tools.registry import registry
+    from tools.vision_tools import _handle_vision_analyze
+
+    entry = registry.get_entry(name)
+    if name != "vision_analyze" or entry is None or entry.handler is not _handle_vision_analyze:
+        return None
+    return entry.handler
+
+
+def _allowed_handler(policy: _Policy, name: str) -> Any:
+    """The handler an allowed ``name`` runs: its built-in one for a well-formed ``local`` entry,
+    else its native MCP handler; None when there is none."""
+    if name in policy.local:
+        return _builtin_handler(name) if policy.local[name] is not None else None
+    return _native_handler(policy, name)
+
+
+def _scoped_run(handler: Any, scope: Any, canonical: str) -> Callable:
+    """The sync handler dispatch runs for a ``local`` call: the built-in async ``handler`` under
+    ``scope`` (``tools.image_source.scoped_media``), only on exactly the checked arguments and only
+    while the identity fence holds."""
+
+    def run(args: Any, **kwargs: Any) -> Any:
+        from model_tools import _run_async
+        from tools.image_source import scoped_media
+        from tools.registry import tool_error
+
+        grant = _grant.get()
+        if grant is None or _canonical(args) != canonical or not _fence_holds(grant):
+            return tool_error("Not run: a canonical peer turn runs this call only with the arguments its batch checked.")
+
+        async def scoped() -> Any:
+            with scoped_media(scope):
+                return await handler(args, **kwargs)
+
+        return _run_async(scoped())
+
+    return run
+
+
+def _check_local(policy: _Policy, name: str, args: Mapping) -> Optional[list]:
+    """A ``local`` call: the built-in handler, its source inside the entry's media scope (checked
+    here, before anything is read or fetched), pinned to run only under that scope."""
+    from tools.arg_coercion import coerce_tool_args
+
+    scope, handler = policy.local[name], _builtin_handler(name)
+    if scope is None or handler is None:
+        return None
+    final = coerce_tool_args(name, copy.deepcopy(dict(args)))
+    canonical = _canonical(final)
+    if canonical is None or not scope.admits(final.get("image_url")):
+        return None
+    entry = {"local": {name: policy.local_raw[name]}}
+    return [PinnedCall(name, _scoped_run(handler, scope, canonical), final, canonical, peer_grant_digest(entry))]
 
 
 def _fence_holds(grant: PeerToolGrant) -> bool:
@@ -194,7 +276,7 @@ def _check(policy: _Policy, name: str, args: Any) -> Optional[list]:
         names = [str(n or "").strip() for n in ([raw] if isinstance(raw, str) else raw)] if isinstance(
             raw, (str, list)) else []
         names = [n for n in names if n]
-        allowed = bool(names) and all(n in policy.names() and _native_handler(policy, n) is not None for n in names)
+        allowed = bool(names) and all(n in policy.names() and _allowed_handler(policy, n) is not None for n in names)
         return [] if allowed else None
     if name == TOOL_CALL_NAME:
         entries, error = normalize_tool_call_entries(dict(args))
@@ -207,6 +289,8 @@ def _check(policy: _Policy, name: str, args: Any) -> Optional[list]:
                 return None
             pins.extend(inner)
         return pins
+    if name in policy.local:
+        return _check_local(policy, name, args)
     handler = _native_handler(policy, name)
     if handler is None:
         return None
@@ -351,4 +435,4 @@ def scope_discovery_defs(tool_defs: Iterable[dict]) -> list:
     def name(tool_def: Any) -> Any:
         return ((tool_def or {}).get("function") or {}).get("name") if isinstance(tool_def, dict) else None
 
-    return [d for d in tool_defs if name(d) in allowed and _native_handler(policy, name(d)) is not None]
+    return [d for d in tool_defs if name(d) in allowed and _allowed_handler(policy, name(d)) is not None]

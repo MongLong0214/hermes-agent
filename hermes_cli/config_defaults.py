@@ -2098,8 +2098,12 @@ DEFAULT_CONFIG = {
         # registered by MCP server ``mcp_server`` and run without an approval prompt. ``read``:
         # exact tool names, any arguments. ``mutate``: ``{tool: {argument: [exact values]}}`` —
         # every listed argument must be present as one of its string values; ``{}`` leaves all
-        # free. A batch with any other call runs nothing. Re-read per tool batch (no restart).
-        "canonical_peer_tools": {"binding": "", "mcp_server": "", "read": [], "mutate": {}},
+        # free. ``local``: built-in tools, ``vision_analyze`` only, as ``{vision_analyze: {urls:
+        # [exact http(s) base URLs], roots: [absolute dirs]}}`` — image_url must be a URL with a
+        # base's scheme, host and port under its path (each redirect hop too), or a file whose
+        # realpath is under a root. A batch with any other call runs nothing. Re-read per tool
+        # batch (no restart).
+        "canonical_peer_tools": {"binding": "", "mcp_server": "", "read": [], "mutate": {}, "local": {}},
         # Seconds to wait for one platform to connect at startup/reconnect; raise on "discord
         # connect timed out" loops (many slash commands to sync). 0/negative = wait forever. Bridged
         # to HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT, which wins if set explicitly.
