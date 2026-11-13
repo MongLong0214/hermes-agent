@@ -35,6 +35,38 @@ _approval_session_id: contextvars.ContextVar[str] = _ctx("approval_session_id")
 _hermes_interactive_ctx: contextvars.ContextVar[str | None] = _ctx("hermes_interactive", None)
 
 
+# Principal of the turn running in this context. Unbound (the default) is an ordinary owner turn, unchanged. The
+# canonical peer surface binds ``"peer"`` for a turn another agent relayed through a verified binding: that turn never
+# inherits the owner's approval bypass and every approval gate refuses it. Any bound value other than exactly
+# ``"owner"`` (``"peer"``, ``None``, ``""``, a typo, a non-string) reads as a peer, so a principal that is missing or
+# corrupt fails closed. Context copies (``propagate_context_to_thread``, ``copy_context().run``) carry it into tool
+# workers and delegate children, so a child a peer turn spawns stays peer-scoped.
+_UNBOUND_PRINCIPAL = object()
+_turn_principal_ctx: contextvars.ContextVar[object] = contextvars.ContextVar("turn_principal",
+                                                                             default=_UNBOUND_PRINCIPAL)
+
+
+def set_turn_principal(principal: object) -> contextvars.Token:
+    """Bind the current turn's principal; pair with :func:`reset_turn_principal`."""
+    return _turn_principal_ctx.set(principal)
+
+
+def reset_turn_principal(token: contextvars.Token) -> None:
+    _turn_principal_ctx.reset(token)
+
+
+def get_turn_principal() -> str:
+    """``"owner"`` for an ordinary turn (nothing bound, or exactly ``"owner"``), else ``"peer"``: the value MCP call
+    provenance reports."""
+    value = _turn_principal_ctx.get()
+    return "owner" if value is _UNBOUND_PRINCIPAL or value == "owner" else "peer"
+
+
+def is_peer_turn() -> bool:
+    """True while a canonical peer turn, or a turn whose principal is unreadable, runs in this context."""
+    return get_turn_principal() == "peer"
+
+
 def set_hermes_interactive_context(interactive: bool) -> contextvars.Token:
     """Bind interactive mode for the current context instead of mutating os.environ."""
     return _hermes_interactive_ctx.set("1" if interactive else "")
