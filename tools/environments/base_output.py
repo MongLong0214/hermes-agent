@@ -19,6 +19,17 @@ from tools.environments.fd_wait import open_fd_waiter
 from tools.tool_output_truncate import head_tail_split, truncation_notice
 from hermes_cli._subprocess_compat import windows_hide_flags
 
+
+class PostSpawnExecutionError(RuntimeError):
+    """``execute()`` failed after the command was already spawned (collecting output, updating
+    state, ...). The shell may already have produced a side effect (``git push``, a sent mail),
+    so a caller must not retry this the way it retries a failure proven to precede spawn. The
+    original exception is ``__cause__``.
+
+    Defined here, not in ``tools.environments.base`` (which re-exports it), so ``_popen_bash``
+    can raise it for a failure discovered right after its own ``Popen`` succeeds."""
+
+
 # Sentinel capacity for full-fidelity capture: large enough that the collector
 # never evicts, so bounded and unbounded modes share one code path.
 _UNBOUNDED_CAPTURE_CHARS = 2**63 - 1
@@ -261,7 +272,11 @@ def _popen_bash(cmd: list[str], stdin_data: str | None = None, **kwargs) -> subp
         text=True, encoding="utf-8", errors="replace",
         **kwargs)
     if stdin_data is not None:
-        _pipe_stdin(proc, stdin_data)
+        try:
+            _pipe_stdin(proc, stdin_data)
+        except Exception as exc:
+            # Popen already succeeded, so the shell exists and may be running: not retryable.
+            raise PostSpawnExecutionError(str(exc)) from exc
     return proc
 
 

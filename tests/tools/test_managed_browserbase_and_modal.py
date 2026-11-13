@@ -198,9 +198,13 @@ def _install_fake_tools_package():
             self.backend = backend
             self.detail = detail
 
+    class _DummyPostSpawnExecutionError(RuntimeError):
+        pass
+
     sys.modules["tools.environments.base"] = types.SimpleNamespace(
         BaseEnvironment=_DummyEnvironment,
         EnvironmentConnectionError=_DummyConnectionError,
+        PostSpawnExecutionError=_DummyPostSpawnExecutionError,
     )
     sys.modules["tools.environments.local"] = types.SimpleNamespace(LocalEnvironment=_DummyEnvironment)
     sys.modules["tools.environments.ssh"] = types.SimpleNamespace(SSHEnvironment=_DummyEnvironment)

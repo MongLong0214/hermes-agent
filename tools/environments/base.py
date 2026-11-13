@@ -22,7 +22,7 @@ from typing import Callable, Iterable
 from hermes_constants import get_hermes_home
 from tools.interrupt import consume_yield, is_interrupted, is_thread_interrupted
 from tools.environments.base_output import (
-    ProcessHandle, _finalize_wait_result, _new_output_collector, _start_drain_thread,
+    PostSpawnExecutionError, ProcessHandle, _finalize_wait_result, _new_output_collector, _start_drain_thread,
 )
 from tools.environments.base_session_env import (
     _SHELL_ENV_NAME_RE, _SNAP_TMP_SUFFIX, _cwd_marker, _pipe_marker, _snapshot_bootstrap_script, _split_cwd_marker,
@@ -730,13 +730,18 @@ class BaseEnvironment(ABC):
             proc_holder.append(spawned)
             if fenced:  # the hard-exit kill may have stopped waiting for us before we registered
                 self._force_kill_process(spawned)
-            output = _new_output_collector(spawned, bounded_capture)
-            output_holder.append(output)
             try:
-                return self._wait_for_process(
-                    spawned, timeout=effective_timeout, bounded_capture=bounded_capture,
-                    watch_interrupt_tid=parent_tid, output=output,
-                    **({"yield_handler": yield_handler} if yield_handler is not None else {}))
+                try:
+                    output = _new_output_collector(spawned, bounded_capture)
+                    output_holder.append(output)
+                    return self._wait_for_process(
+                        spawned, timeout=effective_timeout, bounded_capture=bounded_capture,
+                        watch_interrupt_tid=parent_tid, output=output,
+                        **({"yield_handler": yield_handler} if yield_handler is not None else {}))
+                except Exception as exc:
+                    # The shell is already running (or ran): a caller retrying this exception
+                    # would repeat whatever side effect it already produced.
+                    raise PostSpawnExecutionError(str(exc)) from exc
             finally:
                 with _live_foreground_cond:
                     _live_foreground.pop(id(spawned), None)
