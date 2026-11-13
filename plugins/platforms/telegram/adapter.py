@@ -6132,6 +6132,14 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             if event is not None:
                 self._hold_inbound_event(event, where=f"{where}-flush-cancelled")
             raise
+        except Exception:
+            # The pop already took the only copy (PTB acked the update): hold it like a cancel. A failure
+            # in the redispatch re-holds without rescheduling, so a poison event cannot tight-loop. Once the
+            # gateway accepted the event it owns it; holding a second copy would deliver it twice.
+            if event is None or getattr(event, "_gateway_accepted", False):
+                raise
+            logger.exception("[Telegram] %s flush dispatch failed; holding the event for redispatch", where)
+            self._hold_inbound_event(event, where=f"{where}-flush-failed")
         finally:
             if committed.get((where, key)) is current_task:
                 committed.pop((where, key), None)
