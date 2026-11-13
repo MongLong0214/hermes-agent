@@ -257,6 +257,53 @@ def test_bind_prints_the_receipt_and_changes_only_the_store(fresh_home):
     assert {key: meta_after[key] for key in meta_before} == meta_before
 
 
+def test_stdout_is_only_the_reply_when_startup_prints(home, tmp_path):
+    # An installed entry-point plugin enabled in config is imported during startup, before bind runs.
+    site = tmp_path / "site"
+    dist = site / "noisy_ep-1.0.dist-info"
+    dist.mkdir(parents=True)
+    (dist / "METADATA").write_text("Metadata-Version: 2.1\nName: noisy-ep\nVersion: 1.0\n", encoding="utf-8")
+    (dist / "entry_points.txt").write_text("[hermes_agent.plugins]\nnoisy-ep = noisy_ep_mod\n", encoding="utf-8")
+    (site / "noisy_ep_mod.py").write_text(
+        "import os\nprint('NOISY-EP-PRINT')\nos.write(1, b'NOISY-EP-FD1\\n')\n", encoding="utf-8"
+    )
+    (home / "config.yaml").write_text("plugins:\n  enabled: [noisy-ep]\n", encoding="utf-8")
+    request = _request()
+
+    proc, _ = _run(home, request, extra_env={"PYTHONPATH": str(site)})
+
+    assert proc.returncode == 0, proc.stderr
+    _assert_receipt(proc.stdout, request)
+    # The plugin did run; its Python and fd-level writes both went to stderr.
+    assert b"NOISY-EP-PRINT" in proc.stderr and b"NOISY-EP-FD1" in proc.stderr
+
+
+# ``-m hermes_cli.main`` whose update-debt recovery, a repair main() runs before dispatching any command,
+# also writes to stdout at the Python and the fd level.
+_PRINTING_REPAIR_MAIN = (
+    "import os, runpy, sys\n"
+    "import hermes_cli.main_install_repair as repair\n"
+    "recover = repair._recover_update_debts_on_startup\n"
+    "def printing():\n"
+    "    print('STARTUP-REPAIR-PRINT', flush=True)\n"
+    "    os.write(1, b'STARTUP-REPAIR-FD1\\n')\n"
+    "    recover()\n"
+    "repair._recover_update_debts_on_startup = printing\n"
+    "sys.argv = ['hermes', *sys.argv[1:]]\n"
+    "runpy.run_module('hermes_cli.main', run_name='__main__', alter_sys=True)\n"
+)
+
+
+def test_stdout_is_only_the_reply_when_a_startup_repair_prints(home):
+    request = _request()
+
+    proc, _ = _run(home, request, python_args=("-c", _PRINTING_REPAIR_MAIN))
+
+    assert proc.returncode == 0, proc.stderr
+    _assert_receipt(proc.stdout, request)
+    assert b"STARTUP-REPAIR-PRINT" in proc.stderr and b"STARTUP-REPAIR-FD1" in proc.stderr
+
+
 def test_child_keeps_the_live_checkout_guards_armed(home):
     probe = (
         "import json, sys\n"
@@ -486,6 +533,117 @@ def test_fork_store_this_build_migrated_binds(tmp_path, monkeypatch):
 
     assert proc.returncode == 0, proc.stderr
     _assert_receipt(proc.stdout, request)
+
+
+@pytest.fixture
+def instrumented_home(home, tmp_path):
+    """A home whose config runs a command secret helper and loads a plugin that prints at import."""
+    sentinel = tmp_path / "secret-helper-ran"
+    plugin = home / "plugins" / "noisy"
+    plugin.mkdir(parents=True)
+    (plugin / "plugin.yaml").write_text("name: noisy\nversion: 0.1.0\ndescription: noisy\n", encoding="utf-8")
+    (plugin / "__init__.py").write_text(
+        "print('NOISY-PLUGIN-IMPORTED')\n\n\ndef register(ctx):\n    pass\n", encoding="utf-8"
+    )
+    # ``:`` and the redirect are shell builtins, so the helper needs no PATH.
+    (home / "config.yaml").write_text(
+        "plugins:\n  enabled: [noisy]\n"
+        f"secrets:\n  command:\n    enabled: true\n    command: ': > {sentinel}'\n",
+        encoding="utf-8",
+    )
+    return home, sentinel
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [(), ("--safe-mode",), ("--reasoning", "high"), ("-r", "some-session")],
+    ids=["bare", "flag", "value-flag", "resume-value"],
+)
+def test_bind_runs_no_secret_helper_and_no_plugin(instrumented_home, prefix):
+    home, sentinel = instrumented_home
+    request = _request()
+    proc, _ = _run(home, request, (*prefix, *_BIND))
+
+    assert proc.returncode == 0, proc.stderr
+    _assert_receipt(proc.stdout, request)
+    assert not sentinel.exists()
+    # The reserved stdout would hide an imported plugin's print; stderr would not.
+    assert b"NOISY-PLUGIN-IMPORTED" not in proc.stderr
+
+
+def test_instrumentation_is_live_outside_bind(instrumented_home):
+    home, sentinel = instrumented_home
+    # ``target`` alone is not the bind preflight, so the helper runs.
+    group, _ = _run(home, b"", ("target",))
+    assert sentinel.exists(), group.stderr
+    sentinel.unlink()
+
+    # The parser consumes ``target`` as the --reasoning value: argv merely CONTAINING the words is not
+    # the preflight, so the helper runs and the plugin (discovered for the unknown ``bind``) prints.
+    lookalike, _ = _run(home, _request(), ("--reasoning", *_BIND))
+    assert sentinel.exists(), lookalike.stderr
+    assert b"NOISY-PLUGIN-IMPORTED" in lookalike.stdout
+    assert _receipt_rows(home) == []
+
+
+# ``-m hermes_cli.main``, announcing on stderr each SQLite integrity check before it runs.
+_INTEGRITY_PROBED_MAIN = (
+    "import os, runpy, sys\n"
+    "import hermes_cli.backup as backup\n"
+    "verify = backup.verify_sqlite_integrity\n"
+    "def announced(*args, **kwargs):\n"
+    "    os.write(2, b'\\nINTEGRITY_CHECK_RAN\\n')\n"
+    "    return verify(*args, **kwargs)\n"
+    "backup.verify_sqlite_integrity = announced\n"
+    "sys.argv = ['hermes', *sys.argv[1:]]\n"
+    "runpy.run_module('hermes_cli.main', run_name='__main__', alter_sys=True)\n"
+)
+
+
+def _stale_revision_home(tmp_path, monkeypatch, make_store) -> tuple[Path, Path]:
+    """A home last maintained by another install revision, so its next CLI start is the first at this one."""
+    home = _scaffold(tmp_path / "home", monkeypatch)
+    (record,) = home.glob("installs/*/bootstrap/default.json")
+    stale = json.loads(record.read_text(encoding="utf-8"))
+    stale["identity"] = "0" * 40
+    record.write_text(json.dumps(stale), encoding="utf-8")
+    make_store(home / "state.db")
+    return home, record
+
+
+def _seeded_store(path: Path) -> None:
+    _seed(path.parent, ("root", "mid-1", "mid-2", "tip"), ("other",))
+
+
+# What bind answers on each store, cold: a settled store binds, the fork store is not bind's to migrate.
+_COLD_STORES = {"settled store": (_seeded_store, 0), "fork 1030 store": (fork_1030_store, 1)}
+
+
+@pytest.mark.parametrize("make_store, returncode", list(_COLD_STORES.values()), ids=list(_COLD_STORES))
+def test_first_start_at_a_revision_defers_home_maintenance_past_bind(tmp_path, monkeypatch, make_store, returncode):
+    home, record = _stale_revision_home(tmp_path, monkeypatch, make_store)
+    stale_record = record.read_bytes()
+    request = _request()
+
+    proc, _ = _run(home, request, python_args=("-c", _INTEGRITY_PROBED_MAIN))
+
+    assert proc.returncode == returncode, proc.stderr
+    if returncode == 0:
+        _assert_receipt(proc.stdout, request)
+    else:
+        assert proc.stdout == _UNAVAILABLE, proc.stderr
+    # The integrity check never ran, so it left no journal sidecars, and the revision is still owed.
+    assert b"INTEGRITY_CHECK_RAN" not in proc.stderr
+    assert {p.name for p in home.glob("state.db-*")} == set()
+    assert record.read_bytes() == stale_record
+
+    # The next start that is not bind pays what bind deferred.
+    group, _ = _run(home, b"", ("target",), python_args=("-c", _INTEGRITY_PROBED_MAIN))
+    assert group.returncode == 0, group.stderr
+    assert b"INTEGRITY_CHECK_RAN" in group.stderr
+    maintained = json.loads(record.read_text(encoding="utf-8"))
+    assert maintained["identity"] != "0" * 40
+    assert maintained["results"]["state_db_guard"] == {"ok": True}
 
 
 # Cross-language vector. ``receipt_digest`` below was computed by ``digestOf`` from the controller's
