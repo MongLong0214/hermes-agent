@@ -342,7 +342,7 @@ class GatewayBusySessionMixin:
         refused ``canonical_turn_busy`` until the head's own turn has claimed, and the adapter starts
         that turn; when a live task still holds the adapter's session guard, that task dispatches the
         head as it ends, as for any queued follow-up. The head stays queued until the claim
-        (:meth:`_take_reserved_turn`); a drain refuses the turn before it claims, and the head is
+        (:meth:`_take_queued_event_for_claim`); a drain refuses the turn before it claims, and the head is
         then kept for the restart flush (:meth:`_end_unclaimed_reservation`). Nothing happens while
         the session is running anything else."""
         from gateway.run import _AGENT_PENDING_SENTINEL
@@ -375,16 +375,22 @@ class GatewayBusySessionMixin:
             return None
         return reservation
 
-    def _take_reserved_turn(self, event: MessageEvent, reservation: tuple) -> None:
-        """Turn the reservation into this turn's own claim (synchronously, just before
-        ``_claim_active_session_slot``): the slot is cleared for the claim and the head leaves the
-        pending slot, the next queued event moving up into it."""
-        session_key, adapter = reservation
-        event._turn_reservation = None
-        state = self._peek_session_state(session_key)
-        if state is not None and state.turn.event is event:
-            state.turn.agent = None
-        if adapter._pending_messages.get(session_key) is event:
+    def _take_queued_event_for_claim(
+        self, event: MessageEvent, session_key: str, reservation: Optional[tuple]
+    ) -> None:
+        """Synchronously, just before ``_claim_active_session_slot``: a reservation becomes this
+        turn's own claim (the slot is cleared for it), and an event still at its queue head leaves
+        the queue, the next one moving up. A reserved head is dispatched without leaving the queue
+        (``_pop_pending_for_drain`` on the adapter), so it is recoverable until exactly here; one
+        whose reservation was released meanwhile (/stop) leaves it here all the same, or its own
+        turn's queue drain would run it a second time."""
+        if reservation is not None:
+            event._turn_reservation = None
+            state = self._peek_session_state(session_key)
+            if state is not None and state.turn.event is event:
+                state.turn.agent = None
+        adapter = self._adapter_holding_pending(session_key)
+        if adapter is not None and adapter._pending_messages.get(session_key) is event:
             del adapter._pending_messages[session_key]
             self._promote_queued_event(session_key, adapter, event)
 

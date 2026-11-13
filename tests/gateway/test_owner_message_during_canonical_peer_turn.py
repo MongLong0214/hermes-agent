@@ -411,11 +411,8 @@ def test_an_owner_message_never_overwrites_a_peer_turn_admitted_while_it_was_pre
     assert h.owner_replies()[-1] == (ingress.source.chat_id, _TERMINAL)
 
 
-@pytest.mark.parametrize("when", ["peer_turn_ended", "peer_turn_running"])
-def test_a_restart_keeps_the_owner_message_queued_behind_a_peer_turn(ingress, send, monkeypatch, when):
-    """Review r1 P1-a: a restart after the owner message was queued never loses it. Stopped right after
-    the peer turn handed the session on (the owner turn still preparing) or while the peer turn still
-    runs, the message stays in the FIFO and the shutdown flush writes it out for the next process."""
+def _capture_shutdown_flush(monkeypatch):
+    """The texts the shutdown flush writes out for the next process (pending slots and overflow)."""
     import gateway.shutdown_flush as shutdown_flush
 
     flushed = []
@@ -423,6 +420,15 @@ def test_a_restart_keeps_the_owner_message_queued_behind_a_peer_turn(ingress, se
         getattr(v, "text", v) for v in pending.values()) or len(pending))
     monkeypatch.setattr(shutdown_flush, "flush_overflow_to_file", lambda overflow, **kw: flushed.extend(
         getattr(v, "text", v) for events in overflow.values() for v in events) or 0)
+    return flushed
+
+
+@pytest.mark.parametrize("when", ["peer_turn_ended", "peer_turn_running"])
+def test_a_restart_keeps_the_owner_message_queued_behind_a_peer_turn(ingress, send, monkeypatch, when):
+    """Review r1 P1-a: a restart after the owner message was queued never loses it. Stopped right after
+    the peer turn handed the session on (the owner turn still preparing) or while the peer turn still
+    runs, the message stays in the FIFO and the shutdown flush writes it out for the next process."""
+    flushed = _capture_shutdown_flush(monkeypatch)
     h = _Harness(ingress, send, monkeypatch, "queue")
     h.preparation_gates[_OWNER_TEXT] = gate = asyncio.Event()
 
@@ -448,6 +454,78 @@ def test_a_restart_keeps_the_owner_message_queued_behind_a_peer_turn(ingress, se
     assert _OWNER_TEXT not in repr((h.actor.steered, h.actor.redirected, h.actor.interrupted))
     assert h.actor.calls == ["hello", "cto: status?"]  # the owner turn did not run in this process
     assert _OWNER_TEXT in flushed  # and is written out for the next one
+
+
+def test_a_restart_while_the_handed_on_message_awaits_on_processing_start_keeps_it(
+        ingress, send, monkeypatch):
+    """Review r2 P1-a: the peer turn ends while the owner's queued ack is still being sent, so the task
+    sending it dispatches the reserved head as it ends; a restart while the new task awaits
+    on_processing_start (Telegram may await a reaction request there) still leaves the message
+    queued for the shutdown flush. The reserved head leaves the queue only at its own claim."""
+    flushed = _capture_shutdown_flush(monkeypatch)
+    h = _Harness(ingress, send, monkeypatch, "queue")
+    h.runner._restart_drain_timeout = 0.5
+    ack_gate, start_gate, starting = asyncio.Event(), asyncio.Event(), []
+    plain_send = h.adapter.send
+
+    async def held_send(chat_id, content, reply_to=None, metadata=None):
+        if content.startswith(_QUEUED_ACK):
+            await ack_gate.wait()
+        return await plain_send(chat_id, content, reply_to=reply_to, metadata=metadata)
+
+    async def on_processing_start(event):
+        if event.text == _OWNER_TEXT and ack_gate.is_set():  # the handed-on dispatch
+            starting.append(event)
+            await start_gate.wait()
+    monkeypatch.setattr(h.adapter, "send", held_send)
+    monkeypatch.setattr(h.adapter, "on_processing_start", on_processing_start, raising=False)
+
+    async def exercise():
+        await h.warm()
+        peer = await h.peer_turn_running()
+        await h.adapter.handle_message(h.owner_event())
+        await h.wait(lambda: h.queued() == [_OWNER_TEXT], "the owner message to be queued")
+        h.release.set()
+        assert (await peer)[0] == 200  # the peer turn ended while the ack is still being sent
+        ack_gate.set()
+        await h.wait(lambda: starting, "the handed-on message to await on_processing_start")
+        await asyncio.wait_for(h.runner.stop(restart=True), 60)
+
+    asyncio.run(exercise())
+    assert h.actor.calls == ["hello", "cto: status?"]  # the owner turn did not run in this process
+    assert _OWNER_TEXT in flushed  # and is written out for the next one
+
+
+def test_a_handed_on_message_whose_reservation_is_dropped_before_it_claims_runs_once(
+        ingress, send, monkeypatch):
+    """The reserved head is dispatched without leaving the queue. If its reservation is released before
+    it claims (a reaper or stale-slot eviction), it runs as an ordinary turn and still leaves the
+    queue at its claim, so its own turn's queue drain does not run it a second time."""
+    h = _Harness(ingress, send, monkeypatch, "queue")
+    start_gate, starting = asyncio.Event(), []
+
+    async def on_processing_start(event):
+        if event.text == _OWNER_TEXT and h.release.is_set():  # the handed-on dispatch
+            starting.append(event)
+            await start_gate.wait()
+    monkeypatch.setattr(h.adapter, "on_processing_start", on_processing_start, raising=False)
+
+    async def exercise():
+        await h.warm()
+        peer = await h.peer_turn_running()
+        await h.adapter.handle_message(h.owner_event())
+        await h.wait(lambda: h.queued() == [_OWNER_TEXT] and all(
+            t.done() for t in h.adapter._session_tasks.values()), "the owner message to be queued")
+        h.release.set()
+        assert (await peer)[0] == 200
+        await h.wait(lambda: starting, "the handed-on message to await on_processing_start")
+        assert h.runner._release_running_agent_state(h.key)  # the reservation is dropped
+        start_gate.set()
+        await h.settle()
+
+    asyncio.run(exercise())
+    assert h.actor.calls == ["hello", "cto: status?", _OWNER_TEXT]
+    assert h.queued() == []
 
 
 @pytest.mark.parametrize("mode", ["steer", "interrupt"])

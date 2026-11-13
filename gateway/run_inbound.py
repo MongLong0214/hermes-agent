@@ -1380,12 +1380,11 @@ class GatewayInboundMixin:
             event._acp_admission = _acp.admission
             event.text = _acp.admission.task_text
 
-        if _reservation is not None:
-            self._take_reserved_turn(_incoming, _reservation)
-        elif not _acp_managed and self._queues_behind_peer_turn(event, _quick_key):
+        if _reservation is None and not _acp_managed and self._queues_behind_peer_turn(event, _quick_key):
             # A canonical peer turn was admitted during the awaits above: claiming now would overwrite
             # its running slot and generation and fail its answer (canonical_turn_interrupted).
             return self._queue_behind_peer_turn(event, _quick_key)
+        self._take_queued_event_for_claim(_incoming, _quick_key, _reservation)
 
         # Claim this session before any await: many awaits sit between here and _run_agent
         # registering the real AIAgent; without this sentinel a second message during any of them
