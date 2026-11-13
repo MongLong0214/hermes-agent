@@ -338,3 +338,96 @@ class TestRotationPathWatermark:
         assert [m["content"] for m in child] == [
             SUMMARY[0]["content"], SUMMARY[1]["content"],
         ]
+
+
+class TestUnreadableStartWatermark:
+    """A compression that cannot read its start watermark must not commit (fail closed).
+
+    ``archive_and_compact(watermark=None)`` archives every active row, so carrying on after a failed read
+    would archive a row appended after the snapshot without it ever reaching the summary."""
+
+    LATE_ROW = "LATE APPEND: also update the changelog"
+
+    @staticmethod
+    def _agent(db: SessionDB, session_id: str):
+        import os
+        from unittest.mock import MagicMock, patch
+
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
+            from run_agent import AIAgent
+
+            agent = AIAgent(
+                api_key="test-key", base_url="https://openrouter.ai/api/v1", model="test/model",
+                quiet_mode=True, session_db=db, session_id=session_id, skip_context_files=True,
+                skip_memory=True,
+            )
+        compressor = MagicMock()
+        compressor.compress.side_effect = lambda *_a, **_kw: list(SUMMARY)
+        compressor.compression_count = 1
+        compressor.last_prompt_tokens = 0
+        compressor.last_completion_tokens = 0
+        compressor._last_summary_error = None
+        compressor._last_compress_aborted = False
+        compressor._last_aux_model_failure_model = None
+        compressor._last_aux_model_failure_error = None
+        agent.context_compressor = compressor
+        agent._compression_feasibility_checked = True
+        agent.compression_in_place = True
+        return agent
+
+    def _fail_first_read(self, db: SessionDB):
+        real = db.get_active_message_watermark
+        calls = {"n": 0}
+
+        def _read(session_id):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # Another writer commits right after the snapshot, as this read fails.
+                db.append_message(session_id, role="user", content=self.LATE_ROW)
+                raise sqlite3.OperationalError("database is locked")
+            return real(session_id)
+        return _read, calls
+
+    def test_failed_start_watermark_read_archives_no_row_unsummarized(self, db: SessionDB) -> None:
+        from unittest.mock import patch
+
+        _seed(db)
+        messages = db.get_messages_as_conversation("sess1")
+        agent = self._agent(db, "sess1")
+        read, calls = self._fail_first_read(db)
+
+        with patch.object(db, "get_active_message_watermark", side_effect=read):
+            out, _prompt = agent._compress_context(messages, "sys", approx_tokens=120_000)
+
+        assert calls["n"] >= 1  # the injected read failure actually happened
+        assert out is messages  # sat out: nothing committed this cycle
+        assert agent.context_compressor.compress.call_count == 0  # no summary was built on a blind snapshot
+        live = [r["content"] for r in db.get_messages("sess1")]
+        assert self.LATE_ROW in live
+        assert live[:6] == [f"turn {i}" for i in range(6)]  # nothing archived
+        # The lock is released, so the next attempt can compress right away.
+        assert db.get_compression_lock_holder("sess1") is None
+
+    def test_unreadable_watermark_abort_is_a_transient_defer(self, db: SessionDB) -> None:
+        """The sit-out must read as a transient defer, not as proof the session cannot shrink, or the
+        overflow-recovery paths would count a one-off read failure toward compression exhaustion."""
+        from unittest.mock import patch
+
+        from agent.conversation_compression import compression_blocked_transiently
+
+        _seed(db)
+        messages = db.get_messages_as_conversation("sess1")
+        agent = self._agent(db, "sess1")
+        read, _calls = self._fail_first_read(db)
+
+        with patch.object(db, "get_active_message_watermark", side_effect=read):
+            agent._compress_context(messages, "sys", approx_tokens=120_000)
+
+        assert compression_blocked_transiently(agent) is True
+        assert not agent._compression_skipped_due_to_lock  # not misreported as lock contention
+
+        # Read recovered: the next attempt compresses and clears the signal.
+        agent._compress_context(db.get_messages_as_conversation("sess1"), "sys", approx_tokens=120_000)
+        assert agent.context_compressor.compress.call_count == 1
+        assert compression_blocked_transiently(agent) is False
+        assert self.LATE_ROW not in [r["content"] for r in db.get_messages("sess1")[:2]]
