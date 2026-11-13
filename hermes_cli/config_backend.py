@@ -203,7 +203,10 @@ class FileBackend:
         if changes.document is not None:
             atomic_roundtrip_yaml_save(path, changes.document, extra_content_on_create=changes.extra_content_on_create)
         for key, value in changes.set.items():
-            atomic_roundtrip_yaml_update(path, key, value)
+            if value is None:
+                _write_yaml_null(path, key)  # atomic_roundtrip_yaml_update would remove the key
+            else:
+                atomic_roundtrip_yaml_update(path, key, value)
         for key in changes.unset:
             atomic_roundtrip_yaml_update(path, key, None)
 
@@ -271,6 +274,58 @@ class FileBackend:
 
     def destination(self, home: Path) -> str:
         return str(self.config_path(home))
+
+
+def _write_yaml_null(path: Path, key_path: str) -> None:
+    """Store an explicit YAML null at dotted *key_path*, creating parents: the comment-preserving
+    round trip and key navigation of ``utils.atomic_roundtrip_yaml_update``, which removes the
+    key when given None."""
+    from ruamel.yaml.comments import CommentedMap
+    from hermes_cli.config import _greedy_literal_match, _split_key_path
+    from hermes_constants import mkdir_under_hermes_home
+    from utils import _roundtrip_dump, _roundtrip_load
+
+    mkdir_under_hermes_home(path.parent)
+    yaml_rt, root = _roundtrip_load(path)
+    current, keys = root, _split_key_path(key_path)
+    while True:
+        seg, consumed = _greedy_literal_match(dict(current), keys) or (keys[0], 1)
+        keys = keys[consumed:]
+        if not keys:
+            current[seg] = None
+            break
+        if not isinstance(current.get(seg), CommentedMap):
+            current[seg] = CommentedMap()
+        current = current[seg]
+    _roundtrip_dump(path, yaml_rt, root)
+
+
+class _ExplicitNull:
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "EXPLICIT_NULL"
+
+
+#: ``read_config_doc(..., explicit_null=True)`` for a root the author wrote as null.
+EXPLICIT_NULL = _ExplicitNull()
+_NULL_TAG = "tag:yaml.org,2002:null"
+
+
+def _is_explicit_null_text(text: str) -> bool:
+    """True when *text* composes to a null root the author wrote (``null``, ``~``, ``!!null``,
+    after any directive or ``---``), not to nothing (empty, comment-only, a bare ``---``). Both
+    load as None; the root node's own source span is empty only for the second."""
+    from ruamel.yaml import YAML
+    from ruamel.yaml.error import YAMLError
+    loader = YAML(typ="safe", pure=True)
+    loader.version = (1, 1)  # hermes_yaml's load policy
+    try:
+        node = loader.compose(text)
+    except YAMLError:
+        return False
+    return (node is not None and node.tag == _NULL_TAG
+            and bool(text[node.start_mark.index:node.end_mark.index].strip()))
 
 
 _FILE_BACKEND = FileBackend()
@@ -397,10 +452,18 @@ def local_file_layer(config_path: PathLike) -> tuple[ConfigBackend, Path]:
     return _ExplicitFile(path), path.parent
 
 
-def read_config_doc(config_path: PathLike) -> Any:
-    """Parsed root of a config file (None when empty); raises like ``open`` + ``fast_safe_load``."""
+def read_config_doc(config_path: PathLike, *, explicit_null: bool = False) -> Any:
+    """Parsed root of a config file (None when empty); raises like ``open`` + ``fast_safe_load``.
+
+    With *explicit_null*, a root written as null (``null``, ``~``, ``!!null``) is
+    :data:`EXPLICIT_NULL` instead of None: "the config is null", not "no config yet". Only a file
+    has the text to tell them apart, re-read in this rare branch; any other backend's None stays."""
     backend, home = _route(config_path)
-    return backend.read_user_doc(home)
+    doc = backend.read_user_doc(home)
+    if doc is None and explicit_null and isinstance(backend, FileBackend):
+        if _is_explicit_null_text(backend.config_path(home).read_text(encoding="utf-8-sig")):
+            return EXPLICIT_NULL
+    return doc
 
 
 def read_config_doc_readonly(config_path: PathLike) -> Any:

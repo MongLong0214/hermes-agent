@@ -2018,3 +2018,74 @@ class TestCompatibleProvidersMalformedLegacyKey:
 
         assert names == ["legacy"]
         assert not [r for r in caplog.records if "custom_providers is a" in r.getMessage()]
+
+
+_EXPLICIT_NULL_ROOTS = [b"null\n", b"~\n", b"\xef\xbb\xbfnull\n", b"%YAML 1.2\n--- !!null\n"]
+_NULL_IDS = ["null", "tilde", "bom-null", "yaml12-tagged-null"]
+_FALSY_ROOTS = [b"false\n", b"[]\n", b"0\n"]
+_FALSY_IDS = ["false", "empty-list", "zero"]
+
+
+class TestNullAndNonMappingRoots:
+    """An explicit ``null`` root and an empty file both parse to ``None``, and ``false``/``[]``/``0``
+    are falsy. Only an empty or comment-only file is a first run; the others are not a mapping and
+    must neither pass the non-interactive guard nor be served (and backed up as good) as ``{}``."""
+
+    _GOOD = b"model:\n  default: test/kept-model\n"
+
+    @pytest.mark.parametrize("data", _EXPLICIT_NULL_ROOTS, ids=_NULL_IDS)
+    def test_noninteractive_guard_rejects_explicit_null_root(self, tmp_path, data):
+        from hermes_cli.config import require_parseable_user_config
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            (tmp_path / "config.yaml").write_bytes(data)
+            with pytest.raises(InvalidUserConfigError, match="explicit null"):
+                require_parseable_user_config()
+
+    @pytest.mark.parametrize("data", [b"", b"# just a comment\n"], ids=["empty", "comment-only"])
+    def test_empty_or_comment_only_file_is_a_first_run(self, tmp_path, data):
+        from hermes_cli.config import require_parseable_user_config
+        from hermes_cli.config_read_errors import FailedConfigRead
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            (tmp_path / "config.yaml").write_bytes(data)
+            require_parseable_user_config()
+            raw = read_raw_config()
+            assert raw == {} and not isinstance(raw, FailedConfigRead)
+            loaded = load_config()
+            assert not isinstance(loaded, FailedConfigRead)
+            assert loaded["model"] == DEFAULT_CONFIG["model"]
+
+    @pytest.mark.parametrize("data", _EXPLICIT_NULL_ROOTS + _FALSY_ROOTS, ids=_NULL_IDS + _FALSY_IDS)
+    def test_non_mapping_root_keeps_the_last_good_config(self, tmp_path, data):
+        from hermes_cli import config as config_mod
+        from hermes_cli.config_backups import list_config_backups
+        from hermes_cli.config_read_errors import FailedConfigRead
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            cfg = tmp_path / "config.yaml"
+            cfg.write_bytes(self._GOOD)
+            assert load_config()["model"]["default"] == "test/kept-model"
+            config_mod._LAST_EXPANDED_CONFIG_BY_PATH.pop(str(cfg))  # a fresh process: backup only
+
+            cfg.write_bytes(data)
+            after = load_config()
+
+            assert after["model"] != DEFAULT_CONFIG["model"], "defaults replaced the last good config"
+            assert after["model"]["default"] == "test/kept-model"
+            assert isinstance(read_raw_config(), FailedConfigRead)
+            assert [p.read_bytes() for p in list_config_backups(cfg, "good")] == [self._GOOD]
+
+    @pytest.mark.parametrize("version, path", [
+        (15, ("display", "tool_progress_overrides")),
+        (16, ("compression", "summary_base_url")),
+    ], ids=["v16", "v17"])
+    def test_migration_retires_a_null_legacy_key_by_presence(self, tmp_path, version, path):
+        section, key = path
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            (tmp_path / "config.yaml").write_text(
+                f"_config_version: {version}\n{section}:\n  {key}: null\n  keep_me: 1\n")
+            migrate_config(interactive=False, quiet=True)
+            raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
+            assert key not in raw[section]
+            assert raw[section]["keep_me"] == 1
