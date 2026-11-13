@@ -36,7 +36,7 @@ from agent.chat_completion_headers import _chat_completion_capturing_headers
 from agent.chat_completion_stream_monitor import StreamingWaitMonitor, StreamLifetimeExceeded
 from agent.transports.chat_completions import is_router_timeout_shim, router_timeout_shim_may_follow
 from agent.fast_mode import effective_request_overrides
-from agent.turn_context import substitute_api_content
+from agent.turn_context import substitute_message_wire_content
 from agent.gemini_native_adapter import is_native_gemini_base_url
 # Remote endpoints must never be fingerprinted: the probe waterfall is only valid for local/LM-Studio/Ollama
 # boxes. Non-Ollama remotes (sglang, vLLM, OpenAI-compat) expose Ollama-compat endpoints that can
@@ -2134,8 +2134,8 @@ def _iteration_summary_api_messages(agent, messages: list) -> list:
         # chat.completions.create() directly, bypassing the transport — so mirror that sanitization here:
         # tool_name (SQLite FTS bookkeeping), the codex_* reasoning carriers, timestamp (preserved on
         # gateway user replay entries for the stale-confirmation expiry check — #47868 rejection class), and
-        # every Hermes-internal underscore-prefixed scaffolding key.
-        substitute_api_content(api_msg)
+        # every Hermes-internal underscore-prefixed scaffolding key. A canonical peer row is its rendering.
+        substitute_message_wire_content(msg, api_msg)
         if needs_sanitize:
             agent._sanitize_tool_calls_for_strict_api(api_msg, model=sanitize_model)
         api_messages.append(api_msg)
