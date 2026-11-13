@@ -245,6 +245,70 @@ async def test_failed_turn_with_text_never_drives_goal_or_until_judge(loop_env, 
     assert reloaded.awaiting_response is False and reloaded.status == "active"
 
 
+_EXHAUSTED = {"final_response": "This conversation has grown too long.", "failed": True,
+              "compression_exhausted": True}
+
+
+async def _exhausted_tick(runner, tick, result):
+    from gateway.session_results import execution_result
+
+    mgr = loops.LoopManager(session_id="sid-gateway-loop")
+    mgr.state.next_due_at = time.time() - 1
+    assert mgr.fire_tick() is not None, f"tick {tick} must still be due"
+    token = execution_result.set({"result": dict(result)})
+    try:
+        await GatewayRunner._run_post_turn_hooks(
+            runner, agent_result=result["final_response"], source=_make_event("wakeup").source, is_internal=True,
+        )
+    finally:
+        execution_result.reset(token)
+
+
+@pytest.mark.asyncio
+async def test_exhausted_ticks_are_never_judged_and_the_second_pauses_the_loop(loop_env, monkeypatch):
+    """The session is kept on exhaustion, so every tick would re-send the oversized request up to
+    ``loops.max_ticks``: the stale reply is never judged, one tick retries, the second pauses."""
+    runner = _make_runner()
+    await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI --until CI is green"))
+    judged = []
+    monkeypatch.setattr(goals, "judge_goal", lambda *a, **k: judged.append(a) or ("done", "green", False, None, False))
+    runner._post_turn_goal_continuation = AsyncMock()
+    notices = []
+
+    async def _notice(_source, message):
+        notices.append(message)
+
+    runner._defer_goal_status_notice_after_delivery = _notice
+    key = runner._session_key_for_source(_make_event("wakeup").source)
+
+    await _exhausted_tick(runner, 1, _EXHAUSTED)
+    first = loops.load_loop("sid-gateway-loop")
+    assert first.status == "active" and first.awaiting_response is False
+    assert runner._session_state(key).conversation.loop_compression_recovery["ticks"] == 1
+
+    await _exhausted_tick(runner, 2, _EXHAUSTED)
+    assert judged == []
+    reloaded = loops.load_loop("sid-gateway-loop")
+    assert reloaded.status == "paused" and reloaded.awaiting_response is False
+    assert reloaded.paused_reason == "context compression exhausted twice consecutively"
+    assert runner._session_state(key).conversation.loop_compression_recovery is None
+    assert notices == ["⏸ Loop paused after context compression was exhausted twice. "
+                       "Run /compress, then /loop resume to continue."]
+
+
+@pytest.mark.asyncio
+async def test_deferred_or_plain_failed_ticks_do_not_count_as_exhaustion(loop_env):
+    runner = _make_runner()
+    await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
+    runner._post_turn_goal_continuation = AsyncMock()
+    deferred = dict(_EXHAUSTED, compression_deferred=True)
+    plain = {"final_response": "provider error", "failed": True}
+    for tick, result in enumerate((_EXHAUSTED, deferred, _EXHAUSTED, plain, _EXHAUSTED), 1):
+        await _exhausted_tick(runner, tick, result)
+    reloaded = loops.load_loop("sid-gateway-loop")
+    assert reloaded.status == "active", "each non-exhausted tick between resets the bound"
+
+
 @pytest.mark.asyncio
 async def test_goal_hook_failure_does_not_block_loop_completion(loop_env, caplog):
     runner = _make_runner()

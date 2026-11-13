@@ -202,3 +202,47 @@ async def test_runner_goal_hook_enqueues_into_the_key_the_adapter_drains(hermes_
         f"drains: pending keys={list(adapter._pending_messages)} "
         f"expected={adapter_key}"
     )
+
+
+@pytest.mark.asyncio
+async def test_exhaustion_retry_lands_in_the_key_the_adapter_drains(hermes_home):
+    """The bounded retry after compression exhaustion is a continuation on the SAME session: it goes
+    through the same FIFO key the adapter drains, so the goal never sits active with nothing queued."""
+    from unittest.mock import MagicMock, patch
+    from datetime import datetime
+    import uuid
+
+    from gateway.config import GatewayConfig
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionEntry
+    from hermes_cli.goals import GoalManager
+
+    src = _slack_thread_source()
+    adapter_key = build_session_key(src)
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(platforms={Platform.SLACK: PlatformConfig(enabled=True, token="x")})
+    runner._queued_events = {}
+    session_entry = SessionEntry(
+        session_key=adapter_key, session_id=f"goal-sess-{uuid.uuid4().hex[:8]}",
+        created_at=datetime.now(), updated_at=datetime.now(), platform=Platform.SLACK, chat_type="channel",
+    )
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = session_entry
+    runner.session_store._generate_session_key.return_value = adapter_key
+    adapter = _DrainProbeAdapter()
+    runner.adapters = {Platform.SLACK: adapter}
+
+    mgr = GoalManager(session_entry.session_id)
+    mgr.set("ship it")
+    exhausted = {"final_response": "This conversation has grown too long.", "failed": True,
+                 "compression_exhausted": True}
+    judge = MagicMock(return_value=("done", "shipped", False, None, False))
+    with patch("hermes_cli.goals.judge_goal", judge):
+        await runner._run_post_turn_hooks(agent_result=exhausted, source=src, is_internal=False)
+        await asyncio.sleep(0.05)
+
+    judge.assert_not_called()
+    assert list(adapter._pending_messages) == [adapter_key]
+    assert adapter._pending_messages[adapter_key].text == mgr.next_continuation_prompt()
+    assert runner.session_store.get_or_create_session.call_count >= 1
+    assert GoalManager(session_entry.session_id).state.status == "active"
