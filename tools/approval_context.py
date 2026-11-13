@@ -67,6 +67,34 @@ def is_peer_turn() -> bool:
     return get_turn_principal() == "peer"
 
 
+# How many delegation hops deep this context runs: 0 for a top-level turn, N for an Nth-generation subagent. A
+# delegated worker runs in a copy of its PARENT's context, so without the bump in :func:`as_delegation_hop` a
+# subagent's MCP call would be indistinguishable from the turn that dispatched it.
+_delegation_depth_ctx: contextvars.ContextVar[int] = contextvars.ContextVar("delegation_depth", default=0)
+
+
+def get_delegation_depth() -> int:
+    """0 for an ordinary turn; >0 while running inside a delegated subagent (the value MCP call provenance reports)."""
+    return _delegation_depth_ctx.get()
+
+
+def as_delegation_hop(fn):
+    """Run *fn* one delegation hop deeper, restoring the caller's depth on every exit path.
+
+    A synchronous child runs on its parent's own thread and context, so an unrestored bump would leave the parent
+    (and every later sibling) reporting the child's depth."""
+    import functools
+
+    @functools.wraps(fn)
+    def _hop(*args, **kwargs):
+        token = _delegation_depth_ctx.set(_delegation_depth_ctx.get() + 1)
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _delegation_depth_ctx.reset(token)
+    return _hop
+
+
 def set_hermes_interactive_context(interactive: bool) -> contextvars.Token:
     """Bind interactive mode for the current context instead of mutating os.environ."""
     return _hermes_interactive_ctx.set("1" if interactive else "")
