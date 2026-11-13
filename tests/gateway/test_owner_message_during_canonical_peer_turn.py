@@ -528,6 +528,49 @@ def test_a_handed_on_message_whose_reservation_is_dropped_before_it_claims_runs_
     assert h.queued() == []
 
 
+@pytest.mark.parametrize("path", ["ordinary", "queued_behind_peer"])
+def test_a_restart_after_the_claim_before_the_turn_marker_matches_an_ordinary_owner_turn(
+        ingress, send, monkeypatch, path):
+    """Review r3 comparison: an owner turn that has claimed the session and pauses at topic recovery
+    (``_hmwa_resolve_session``, before the turn lease and the durable active-turn marker that
+    ``_mark_durable_active_turn`` writes after it) when stop(restart=True) runs. For an ordinary owner
+    message on an idle session that window already keeps nothing: no queue entry to flush, no
+    marker, no transcript row. The message handed on by a peer turn is measured against it."""
+    flushed = _capture_shutdown_flush(monkeypatch)
+    h = _Harness(ingress, send, monkeypatch, "queue")
+    h.runner._restart_drain_timeout = 0.5
+    resolve_gate, resolving = asyncio.Event(), []
+    resolve = h.runner._hmwa_resolve_session
+
+    async def paused_resolve(event, source):
+        if event.text == _OWNER_TEXT:
+            resolving.append(event)
+            await resolve_gate.wait()
+        return await resolve(event, source)
+    monkeypatch.setattr(h.runner, "_hmwa_resolve_session", paused_resolve)
+
+    async def exercise():
+        await h.warm()
+        if path == "queued_behind_peer":
+            peer = await h.peer_turn_running()
+            await h.adapter.handle_message(h.owner_event())
+            await h.wait(lambda: h.queued() == [_OWNER_TEXT], "the owner message to be queued")
+            h.release.set()
+            assert (await peer)[0] == 200
+        else:
+            await h.adapter.handle_message(h.owner_event())
+        await h.wait(lambda: resolving, "the claimed owner turn to pause at topic recovery")
+        assert h.runner._is_session_running(h.key) and h.queued() == []
+        await asyncio.wait_for(h.runner.stop(restart=True), 60)
+        entry = h.runner.session_store.lookup_by_session_key_existing(h.key)
+        rows = h.runner.session_store.load_transcript(ingress.entry.session_id)
+        return (_OWNER_TEXT in flushed, getattr(entry, "active_turn_token", None) is not None,
+                any(_OWNER_TEXT in str(row.get("content")) for row in rows), _OWNER_TEXT in h.actor.calls)
+
+    # (flushed for the next process, durable turn marker, owner transcript row, turn ran)
+    assert asyncio.run(exercise()) == (False, False, False, False)
+
+
 @pytest.mark.parametrize("mode", ["steer", "interrupt"])
 def test_witness_without_the_peer_turn_check_the_owner_is_answered_in_the_peer_thread(
         ingress, send, monkeypatch, mode):
