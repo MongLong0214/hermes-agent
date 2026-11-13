@@ -40,6 +40,12 @@ def open_db(
     from hermes_state_wal import apply_wal_with_fallback
 
     path = Path(path)
+    if path.name == "state.db":
+        # The shared session store: refuse a lineage this build cannot migrate before the connect,
+        # WAL switch or ``initialize`` DDL can change a byte of it (raw openers share this path).
+        from hermes_state_fence import refuse_unadmitted_lineage
+
+        refuse_unadmitted_lineage(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     # Resolved at call time: fd-leak tests patch ``sqlite3.connect`` through the caller's module.
     conn = sqlite3.connect(path, timeout=busy_timeout_ms / 1000, check_same_thread=check_same_thread)

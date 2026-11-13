@@ -66,6 +66,7 @@ from hermes_state_dbfile import (
     quarantine_invalid_state_db,
     RetiredGenerationCaptureError, capture_retired_wal_generation, refuse_deleted_wal_generation,
 )
+from hermes_state_fence import refuse_unadmitted_lineage
 from hermes_state_messages import SessionMessagesMixin
 from hermes_state_prune_rewrite import SessionPruneRewriteMixin
 from hermes_state_api_content import SessionApiContentMixin
@@ -196,6 +197,20 @@ _READ_ONLY_IOERR_RETRY_ATTEMPTS, _READ_ONLY_IOERR_RETRY_BACKOFF_S = 3, 0.05
 # connection's 1 s timeout exists for writes (they retry at application level) and starved readers
 # into "database is locked" (dashboard 503s, `hermes sessions list` crashes) under a busy gateway.
 _READ_BUSY_TIMEOUT_S = 5.0
+
+# The exception object behind get_last_init_error(), kept beside the text: a classifier needs the
+# type and fields of an IncompatibleSchemaError, and str(exc) throws both away. Only __init__ sets it.
+_last_init_error_exc: Optional[BaseException] = None
+
+
+def _set_last_init_error_exc(exc: Optional[BaseException]) -> None:
+    global _last_init_error_exc
+    _last_init_error_exc = exc
+
+
+def get_last_init_error_exc() -> Optional[BaseException]:
+    """The exception behind :func:`get_last_init_error`, or None when that failure was text only."""
+    return _last_init_error_exc
 
 
 def _default_db_path() -> Path:
@@ -663,6 +678,7 @@ class SessionDB(
         except Exception as exc:
             # Surface WHY via /resume and friends; callers keep their ``_session_db = None`` path.
             _set_last_init_error(f"{type(exc).__name__}: {exc}")
+            _set_last_init_error_exc(exc)
             raise
         finally:
             if not initialization_complete:
@@ -734,6 +750,8 @@ class SessionDB(
         must exist. FTS flags are probed with SELECTs only, and the connection is
         closed on ANY probe failure (malformed schema raises DatabaseError) so a
         leaked tracked connection cannot block the forensic backup the writable heal takes next."""
+        # A reader must not serve a lineage this build does not own: refuse before the first read.
+        refuse_unadmitted_lineage(self.db_path)
         for attempt in range(_READ_ONLY_IOERR_RETRY_ATTEMPTS + 1):
             try:
                 self._conn = conn = self._connect_read_only(timeout=_READ_BUSY_TIMEOUT_S)
@@ -791,6 +809,7 @@ class SessionDB(
         )
         logger.error(msg)
         _set_last_init_error(msg)
+        _set_last_init_error_exc(None)
         if qpath is None and self.db_path.exists() and has_invalid_sqlite_header_preopen(self.db_path):
             raise sqlite3.DatabaseError(msg)
 
@@ -820,6 +839,9 @@ class SessionDB(
         return conn
 
     def _connect_and_init(self) -> None:
+        # Lineage first, SELECT-only on a read-only connection: a store this build cannot migrate
+        # must come out of the open byte-identical, so nothing below (chmod, WAL, DDL) may run on it.
+        refuse_unadmitted_lineage(self.db_path)
         # Refuse before sqlite3.connect (under the startup lock) so we cannot mint
         # a replacement WAL while a live writer still holds a deleted sidecar inode.
         refuse_deleted_wal_generation(self.db_path)
