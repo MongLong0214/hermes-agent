@@ -1817,7 +1817,7 @@ class TestDeliverResultTimeoutCancelsFuture:
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
              patch("tools.send_message_tool._send_to_platform", new=standalone_send):
             result = _deliver_result(job, "Hello world", adapters={Platform.TELEGRAM: adapter}, loop=loop)
-        return result, standalone_send
+        return result, standalone_send, job
 
     def test_in_flight_send_outlasting_the_wait_keeps_running_and_is_not_duplicated(self, monkeypatch):
         import asyncio
@@ -1837,13 +1837,16 @@ class TestDeliverResultTimeoutCancelsFuture:
         adapter = MagicMock()
         adapter.send = slow_send
         try:
-            result, standalone_send = self._deliver(monkeypatch, adapter, loop)
+            result, standalone_send, job = self._deliver(monkeypatch, adapter, loop)
             time.sleep(0.6)
         finally:
             loop.call_soon_threadsafe(loop.stop)
-        assert result is None, f"expected the in-flight send to count as delivered, got {result!r}"
+        assert result is None, f"an in-flight send is not a delivery error, got {result!r}"
         standalone_send.assert_not_awaited()
         assert events == ["started", "finished"], "the in-flight send must not be cancelled mid-way"
+        # Began but never confirmed: uncertain, not delivered.
+        assert job.get("_delivery_uncertain") == ["telegram:123"]
+        assert any("telegram:123" in entry for entry in job.get("last_delivery_unverified") or []), job
 
     def test_send_that_never_started_falls_back_to_standalone(self, monkeypatch):
         import asyncio
@@ -1856,13 +1859,14 @@ class TestDeliverResultTimeoutCancelsFuture:
         adapter = MagicMock()
         adapter.send = AsyncMock(return_value=MagicMock(success=True))
         try:
-            result, standalone_send = self._deliver(monkeypatch, adapter, loop)
+            result, standalone_send, job = self._deliver(monkeypatch, adapter, loop)
             time.sleep(0.8)  # the loop un-wedges: the abandoned send must still never go out
         finally:
             loop.call_soon_threadsafe(loop.stop)
         assert result is None, f"standalone should have delivered, got {result!r}"
         standalone_send.assert_awaited_once()
         adapter.send.assert_not_awaited()
+        assert "_delivery_uncertain" not in job
 
 class TestDeliverResultPartialSplitDelivery:
     def test_partial_split_delivery_is_not_resent_by_standalone(self):
@@ -1896,6 +1900,7 @@ class TestDeliverResultPartialSplitDelivery:
         adapter.send.assert_awaited_once()
         standalone_send.assert_not_awaited()
         assert result and "delivered 2 of 5 chunks" in result, result
+        assert "_delivery_uncertain" not in job, "a partial split send is delivered-partial, not uncertain"
 
 
 class TestDeliverResultLiveAdapterUnconfirmed:

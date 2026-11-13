@@ -14,7 +14,6 @@ import contextlib
 import contextvars
 import logging
 import os
-import threading
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
@@ -1290,11 +1289,12 @@ _LIVE_SEND_CONFIRM_TIMEOUT_SECS = 60
 
 def _live_send_text(
     t: _TargetDelivery, text_to_send: str, route_thread_id: Optional[str], route_metadata: dict, *,
-    target_errors: list, delivery_errors: list, unverified_targets: list,
+    target_errors: list, delivery_errors: list, unverified_targets: list, uncertain_targets: list,
 ) -> tuple[bool, bool, Any]:
     """Schedule the text send on the gateway loop; returns ``(adapter_ok, timed_out, message_id)``.
+    ``timed_out`` = began but unconfirmed: never resent, recorded in ``uncertain_targets``.
     Re-raises a real send error so the caller falls through to standalone."""
-    from agent.async_utils import safe_schedule_threadsafe
+    from agent.async_utils import safe_schedule_threadsafe_gated
     from gateway.delivery import DeliveryRouter, DeliveryTarget, PartialDeliveryError
     job = t.job
     router = DeliveryRouter(t.config, t.target_adapters)
@@ -1305,43 +1305,31 @@ def _live_send_text(
     # Send through the already-authorized transport: re-resolving from the plain target_adapters
     # dict cannot re-derive the SharedRouteAdapters satellite grant (the satellite owned
     # platforms.<p> block is disabled), yields None, and drops the delivery (#115656).
-    # cancel() cannot tell "never started" from "in flight": a run_coroutine_threadsafe future stays
-    # PENDING until the coroutine finishes, so cancel() returns True mid-send AND kills it. The send
-    # records its own start under a lock; a timeout abandons it only if it never began.
-    dispatch_lock = threading.Lock()
-    dispatch = {"started": False, "abandoned": False}
-
-    async def _send_once():
-        with dispatch_lock:
-            if dispatch["abandoned"]:
-                return None
-            dispatch["started"] = True
-        return await router._deliver_to_platform(route_target, text_to_send, route_metadata, transport=t.transport)
-
-    future = safe_schedule_threadsafe(_send_once(), t.loop)
+    future, dispatch_gate = safe_schedule_threadsafe_gated(
+        router._deliver_to_platform(route_target, text_to_send, route_metadata, transport=t.transport), t.loop)
     if future is None:
         target_errors.append("live adapter event loop scheduling failed")
         return False, False, None
     try:
         send_result = future.result(timeout=_LIVE_SEND_CONFIRM_TIMEOUT_SECS)
     except TimeoutError:
-        # Slow confirmation != failure. Never started (loop wedged): nothing was sent, so fall through
-        # to standalone or it is silently dropped. Started: in flight (a paced multi-chunk send can
-        # legitimately outlast the wait) — leave it running; a standalone resend would DUPLICATE.
-        with dispatch_lock:
-            dispatch["abandoned"] = not dispatch["started"]
-        if dispatch["abandoned"]:
+        # Slow confirmation != failure, and cancel() cannot tell "never started" from "in flight"
+        # (see async_utils.DispatchGate). Abandoning the gate decides it atomically: won -> the send
+        # never ran and never will (loop wedged), so fall through to standalone or it is silently
+        # dropped; lost -> it already began (a paced multi-chunk send can legitimately outlast the
+        # wait), so leave it running: a standalone resend could DUPLICATE it. Uncertain, not resent.
+        if dispatch_gate.abandon():
             future.cancel()
             msg = f"live adapter send to {t.where} timed out before the coroutine was dispatched"
             logger.warning("Job '%s': %s, falling back to standalone", job["id"], msg)
             target_errors.append(msg)
             return False, False, None
         logger.warning(
-            "Job '%s': live adapter send to %s:%s timed out "
-            "after 60s; already dispatched (in flight), "
-            "assuming delivered (skipping standalone fallback "
-            "to avoid duplicate)",
-            job["id"], t.platform_name, t.chat_id)
+            "Job '%s': live adapter send to %s:%s timed out after %.0fs; dispatch had begun, "
+            "treating as uncertain (skipping standalone fallback to avoid a possible duplicate)",
+            job["id"], t.platform_name, t.chat_id, _LIVE_SEND_CONFIRM_TIMEOUT_SECS)
+        uncertain_targets.append(t.where)
+        unverified_targets.append(f"{t.where} (send began, confirmation timed out; not resent)")
         return True, True, None
     except PartialDeliveryError as ex:
         # The head of a split send is already on screen: a standalone resend would duplicate it.
@@ -1494,12 +1482,16 @@ def _seed_live_delivery_sessions(t: _TargetDelivery, delivered_message_id) -> No
 
 def _deliver_via_live_adapter(
     t: _TargetDelivery, cleaned_text: str, media_files: list, *, target_errors: list,
-    delivery_errors: list, unverified_targets: list,
+    delivery_errors: list, unverified_targets: list, uncertain_targets: Optional[list] = None,
 ) -> bool:
-    """Deliver one target via the live gateway adapter; True once delivered. ``target_errors`` =
-    this lane's soft failures (surfaced only if standalone also fails); ``delivery_errors`` =
-    partial failures (media, thread fallback) that surface even on success."""
+    """Deliver one target via the live gateway adapter; True once delivered or once a send began
+    whose outcome is uncertain (either way it must not be resent; the latter is appended to
+    ``uncertain_targets``). ``target_errors`` = this lane's soft failures (surfaced only if
+    standalone also fails); ``delivery_errors`` = partial failures (media, thread fallback) that
+    surface even on success."""
     job = t.job
+    if uncertain_targets is None:
+        uncertain_targets = []
     route_thread_id, route_metadata, media_metadata = _live_route_metadata(t)
     delivered = False
     try:
@@ -1517,16 +1509,16 @@ def _deliver_via_live_adapter(
             adapter_ok, timed_out, delivered_message_id = _live_send_text(
                 t, text_to_send, route_thread_id, route_metadata,
                 target_errors=target_errors, delivery_errors=delivery_errors,
-                unverified_targets=unverified_targets,
+                unverified_targets=unverified_targets, uncertain_targets=uncertain_targets,
             )
 
         # Media rides the same DM-topic-aware routing as text. Skipped after a confirmation
-        # timeout (loop contended, text already assumed delivered) — record the drop instead.
+        # timeout (loop contended, text outcome uncertain) — record the drop instead.
         # Send extracted media files as native attachments via the live adapter, using the same
         # DM-topic-aware routing as the text send (#22773 — media previously used a bare thread_id and
         # landed in the General lane for private DM topics). Skip on an in-flight confirmation timeout: the
         # gateway loop is contended, so each media send would also block its 30s budget, and the text
-        # payload is already assumed delivered (#38922). Record the skipped attachments so the drop is
+        # payload may already have landed (#38922). Record the skipped attachments so the drop is
         # visible rather than silently lost.
         if (topic_name := _named_dm_topic(t)) is not None and adapter_ok and not timed_out:
             adapter_ok = _resolve_named_dm_topic(
@@ -1540,7 +1532,14 @@ def _deliver_via_live_adapter(
                 f"{t.where} (live adapter confirmation timed out)",
                 delivery_errors)
 
-        if adapter_ok:
+        if adapter_ok and timed_out:
+            # Began but never confirmed: handled (never resent), not delivered — so no "delivered"
+            # log and no continuation seed for a brief the chat may never have received.
+            logger.warning(
+                "Job '%s': live adapter send to %s:%s outcome uncertain (not resent)",
+                job["id"], t.platform_name, t.chat_id)
+            delivered = True
+        elif adapter_ok:
             # Log WHERE it went: a ghost delivery in the wrong lane is otherwise indistinguishable.
             logger.info(
                 # Log WHERE it went, not just that it went: a ghost delivery that landed in the wrong lane
@@ -1829,7 +1828,11 @@ def _deliver_result(
     """Deliver job output to the configured target(s). With ``adapters``/``loop`` (gateway
     running) the live adapter is tried first (E2EE rooms can't use the standalone HTTP path), then
     standalone fallback. ``for_failure=True`` routes failure-category notices through the job's
-    ``failure_deliver`` override when present (NS-788). Returns None on success, else an error."""
+    ``failure_deliver`` override when present (NS-788). Returns None on success, else an error.
+
+    ``job["_delivery_uncertain"]`` lists live sends that began but never confirmed (never resent,
+    so neither delivered nor failed)."""
+    job.pop("_delivery_uncertain", None)
     job.pop("_bot_chat_delivery_receipts", None)
     job.pop("_notification_all_targets_suppressed", None)
     targets = _resolve_delivery_targets(job, for_failure=for_failure)
@@ -1872,6 +1875,8 @@ def _deliver_result(
     # Targets acked with NO evidence (bare SendResult(success=True) — Slack/Matrix/Mattermost);
     # persisted as ``last_delivery_unverified`` so `hermes cron list` shows it.
     unverified_targets: list = []
+    # Live sends that began but never confirmed (also listed in unverified_targets).
+    uncertain_targets: list = []
     if wrap_response:
         task_name = job.get("name", job["id"])
         delivery_content = (
@@ -1973,7 +1978,7 @@ def _deliver_result(
         delivered = t.live_adapter_ready and _deliver_via_live_adapter(
             t, cleaned_delivery_content, media_files,
             target_errors=target_errors, delivery_errors=delivery_errors,
-            unverified_targets=unverified_targets,
+            unverified_targets=unverified_targets, uncertain_targets=uncertain_targets,
         )
         if not delivered:
             _deliver_standalone(
@@ -1986,6 +1991,8 @@ def _deliver_result(
     else:
         delivery_errors.extend(policy_drop_errors)
     _record_delivery_verification(job, unverified_targets)
+    if uncertain_targets:
+        job["_delivery_uncertain"] = uncertain_targets
     return "; ".join(delivery_errors) if delivery_errors else None
 
 
