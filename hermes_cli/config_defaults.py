@@ -2096,10 +2096,11 @@ DEFAULT_CONFIG = {
         # at-least-once). Disable to lose in-flight final responses on crash/restart.
         "delivery_ledger": True,
         # Tools a canonical peer turn on ``binding`` (a canonical_surface_bindings name) may run; the
-        # empty default allows none. Each must be a native tool of MCP server ``mcp_server`` that runs
-        # without an approval prompt. ``read``: exact names, any arguments. ``mutate``: ``{tool: {argument:
-        # [exact string values]}}``, ``{}`` = any. A batch with any other call runs nothing. Re-read per batch.
-        "canonical_peer_tools": {"binding": "", "mcp_server": "", "read": [], "mutate": {}},
+        # empty default allows none. ``read``/``mutate`` name native tools of MCP server ``mcp_server`` that
+        # run without an approval prompt: ``read`` any arguments, ``mutate`` ``{tool: {argument: [exact string
+        # values]}}`` (``{}`` = any). ``local``: ``{vision_analyze: {urls: [http(s) bases], roots: [absolute
+        # dirs]}}``, image_url under one (realpath; every redirect hop). Else none runs; re-read per batch.
+        "canonical_peer_tools": {"binding": "", "mcp_server": "", "read": [], "mutate": {}, "local": {}},
         # Seconds to wait for one platform to connect at startup/reconnect; raise it on "discord connect timed
         # out" loops (#19776). 0/negative = wait forever. HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT wins if set.
         "platform_connect_timeout": 30,
