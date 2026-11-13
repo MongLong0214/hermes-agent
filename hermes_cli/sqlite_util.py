@@ -27,8 +27,13 @@ def open_db(
     check_same_thread: bool = True,
     wal_lock_retries: int = 1,
     initialize: Callable[[sqlite3.Connection], None] | None = None,
+    migrate_fork_store: bool = True,
 ) -> sqlite3.Connection:
     """Open ``path`` (parent created), apply the PRAGMA set, run ``initialize``; closed if anything raises.
+
+    On the shared ``state.db`` the lineage gate runs first. A writer hands the fork's 1030 store to a
+    writable SessionDB open, which migrates it, before this connect; ``migrate_fork_store=False`` is for a
+    steady-state reader, which refuses that store instead (readers never migrate).
 
     ``busy_timeout_ms`` is the single busy knob: it is passed as ``connect(timeout=)`` AND set as the
     explicit PRAGMA so it is observable. ``wal=True`` goes through ``apply_wal_with_fallback`` — the
@@ -44,14 +49,19 @@ def open_db(
     connect_kwargs = {}
     if shared_state:
         # The shared session store: refuse a lineage this build cannot migrate before the connect,
-        # WAL switch or ``initialize`` DDL can change a byte of it (raw openers share this path). A
-        # raw opener never migrates; on a store this build fenced its writes need the fence UDF, on a
-        # connection serialized like SessionDB's.
+        # WAL switch or ``initialize`` DDL can change a byte of it (raw openers share this path). The
+        # fork's store is migrated by a writable SessionDB open before a writer goes on, never by this
+        # connection; on a store this build fenced the writes need the fence UDF, on a connection
+        # serialized like SessionDB's.
         from hermes_state_fence import (
-            refuse_unadmitted_lineage, register_turn_fence_generation, serialized_connection_factory,
+            admit_raw_state_writer, refuse_unadmitted_lineage, register_turn_fence_generation,
+            serialized_connection_factory,
         )
 
-        refuse_unadmitted_lineage(path)
+        if migrate_fork_store:
+            admit_raw_state_writer(path)
+        else:
+            refuse_unadmitted_lineage(path)
         connect_kwargs["factory"] = serialized_connection_factory()
     path.parent.mkdir(parents=True, exist_ok=True)
     # Resolved at call time: fd-leak tests patch ``sqlite3.connect`` through the caller's module.

@@ -95,11 +95,12 @@ def clock(now: float | None) -> float:
 
 
 def open_sqlite(path: DbPath, *, timeout: float = 10) -> sqlite3.Connection:
-    """Row-factory connection with foreign keys on; no journal or schema work (steady-state readers)."""
+    """Row-factory connection with foreign keys on; no journal or schema work (steady-state readers).
+    A reader never migrates: on a ``state.db`` the fork's store is refused, not migrated."""
     from hermes_cli.sqlite_util import open_db
 
     return open_db(path, db_label="shared-state.db", busy_timeout_ms=int(timeout * 1000), wal=False,
-                   foreign_keys=True)
+                   foreign_keys=True, migrate_fork_store=False)
 
 
 def connect(

@@ -12,7 +12,8 @@ Admitted unchanged: fresh, missing, empty and pure-upstream stores (``schema_ver
 this build fenced (``STORED_SCHEMA_VERSION`` with exactly this build's fences), which opens without
 fence DDL. The live fork's store (1030 with exactly the fork's fences) is migrated by a writable
 SessionDB open alone, in one transaction under the profile's ``gateway.lock`` lease
-(:func:`fence_migration_admission`, :func:`migrate_fenced_store`). Every other shape is refused.
+(:func:`fence_migration_admission`, :func:`migrate_fenced_store`); a writable raw opener hands it to
+that open first (:func:`admit_raw_state_writer`), and a reader refuses it. Every other shape is refused.
 
 A fence trigger aborts a governed write unless the writing connection's ``hermes_turn_fence_generation()``
 equals the literal the store was fenced with, so every connection that writes a fenced store registers
@@ -518,6 +519,23 @@ def refuse_unadmitted_lineage(path, *, migrate: bool = False) -> StoreLineage:
         cause=SCHEMA_CAUSE_FENCE_GENERATION_MISMATCH, expected_generation=STORED_SCHEMA_VERSION,
         actual_generation=actual, detail=f"{lineage.lineage} lineage at schema_version {lineage.stored}; {reason}",
     )
+
+
+def admit_raw_state_writer(path) -> StoreLineage:
+    """The lineage gate for a writable raw (non-SessionDB) opener of *path*, before it connects.
+
+    Admits what :func:`refuse_unadmitted_lineage` admits. The fork's 1030 store is first opened by a
+    writable SessionDB, which migrates it once under the ``gateway.lock`` lease (a sibling that migrated
+    it meanwhile leaves nothing to do), then re-admitted: the raw opener's own WAL switch and
+    ``initialize`` DDL only ever meet a settled store. A writable open that came back without migrating
+    leaves the store refused, unchanged."""
+    lineage = refuse_unadmitted_lineage(path, migrate=True)
+    if not lineage.migratable:
+        return lineage
+    from hermes_state import SessionDB
+
+    SessionDB(db_path=Path(path)).close()
+    return refuse_unadmitted_lineage(path)
 
 
 # ── The fork migration: 1030 -> 1033 under the admission lease, in one transaction ──

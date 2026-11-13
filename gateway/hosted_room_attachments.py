@@ -415,18 +415,13 @@ class HostedRoomAttachmentStore:
         )
 
     def _connect(self) -> sqlite3.Connection:
-        from hermes_state_wal import apply_wal_with_fallback
+        # The shared store's one raw-open path: on a state.db the lineage gate runs before the WAL
+        # switch and table DDL (the fork's store is migrated by a writable SessionDB open first), and
+        # the connection carries the fence UDF, serialized like SessionDB's.
+        from hermes_cli.sqlite_util import open_db
 
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self.db_path, timeout=10)
-        conn.row_factory = sqlite3.Row
-        try:
-            apply_wal_with_fallback(conn, db_label="state.db (hosted room attachments)")
-            conn.execute("PRAGMA foreign_keys=ON")
-        except Exception:
-            conn.close()
-            raise
-        return conn
+        return open_db(self.db_path, db_label="state.db (hosted room attachments)", busy_timeout_ms=10_000,
+                       foreign_keys=True)
 
     @contextmanager
     def _transaction(self, *, immediate: bool = False) -> Iterator[sqlite3.Connection]:

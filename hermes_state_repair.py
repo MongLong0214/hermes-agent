@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from hermes_constants import get_hermes_home
 from hermes_startup_watchdog import report_startup_progress
 from hermes_state_errors import is_disk_full_error
+from hermes_state_fence import register_turn_fence_generation, serialized_connection_factory
 from hermes_state_holders import read_only_db_uri
 from hermes_state_common import (
     _acquire_db_flock, _clear_lock_holder_record, _describe_lock_holder, _read_lock_holder_record,
@@ -601,10 +602,20 @@ def _connect_repair_durable(db_path: Path, *, timeout: float = 5.0) -> sqlite3.C
     strongest locks in the process (``locking_mode=EXCLUSIVE``, ``BEGIN IMMEDIATE``); an untracked fd let
     the byte-level probes ``open()``/``close()`` the live file, which cancels every POSIX advisory lock this
     process holds on it (sqlite.org/howtocorrupt §2.2) and lets an external writer commit mid-repair (#63386).
+
+    Carries the fence UDF, serialized like SessionDB's connections: the write-health probe and the repair
+    checks write governed tables, which a fenced store aborts on a connection without it. Never migrates:
+    on a store fenced at another generation those writes are refused by its fences.
     """
     from hermes_cli.sqlite_safe_read import connect_tracked
 
-    conn = connect_tracked(db_path, tracking_path=db_path, timeout=timeout, isolation_level=None)
+    conn = connect_tracked(db_path, tracking_path=db_path, timeout=timeout, isolation_level=None,
+                           factory=serialized_connection_factory())
+    try:
+        register_turn_fence_generation(conn)
+    except BaseException:
+        conn.close()
+        raise
     _reapply_durability_barriers(conn)
     return conn
 
