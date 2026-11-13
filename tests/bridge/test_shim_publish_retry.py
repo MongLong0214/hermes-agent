@@ -23,8 +23,8 @@ EVENT_A, EVENT_B = "a" * 64, "b" * 64
 PEER = "cto-repo-factory"
 
 # The fake buzz CLI. ``messages send`` follows the plan file for its --reply-to target (the last step
-# repeats; no plan: post and exit 0); ``messages thread`` prints the target event and every reply in
-# the relay file as one JSON list, the shape of buzz-cli's cmd_get_thread. Every call is recorded.
+# repeats; no plan: post and exit 0); ``messages thread`` prints the target event and the oldest --limit
+# replies in the relay file as one JSON list, the shape of buzz-cli's cmd_get_thread. Every call is recorded.
 _FAKE = r'''
 import fcntl, hashlib, json, os, subprocess, sys, time
 STATE, SIGNER, CHANNEL = {state!r}, {signer!r}, {channel!r}
@@ -87,7 +87,8 @@ if argv[:2] == ["messages", "thread"]:
         relay = []
     root = {{"id": target, "pubkey": "d" * 64, "kind": 9, "content": "@ceo question", "created_at": 1,
              "tags": [["h", CHANNEL]]}}
-    print(json.dumps([root] + relay))  # the whole thread: replies to other events in it come back too
+    # The whole thread up to the limit: replies to other events in it come back too.
+    print(json.dumps([root] + relay[:int(arg("--limit") or 100)]))
     sys.exit(0)
 sys.exit(64)
 '''
@@ -236,6 +237,22 @@ def test_a_reply_from_another_signer_or_to_another_event_is_not_this_post(shim):
     ask(shim, EVENT_A)
     done = final(shim, EVENT_A)
     assert (done["state"], done["attempts"], done.get("recovered")) == ("sent", 2, None)
+
+
+def test_a_read_back_cut_at_its_limit_is_never_taken_for_absence(shim):
+    """A thread longer than the read-back's limit: the landed reply lies past the cut, so no read shows
+    it absent and it is never sent again."""
+    with open(shim.state / "relay.jsonl", "w") as handle:
+        for n in range(500):
+            handle.write(json.dumps({"id": f"{n:064x}", "pubkey": SIGNER, "kind": 9, "content": f"note {n}",
+                                     "created_at": 1, "tags": [["e", EVENT_A, "", "reply"]]}) + "\n")
+    plan(shim, "send", EVENT_A, {"posts": True, "sleep": 30})
+    ask(shim, EVENT_A)
+    done = final(shim, EVENT_A)
+    assert sum(c["cmd"] == "send" for c in calls(shim, EVENT_A)) == 1
+    assert [p["content"] for p in posts(shim, EVENT_A)].count(body(EVENT_A)) == 1
+    assert {k: done.get(k) for k in ("sent", "state", "attempts", "pending")} == {
+        "sent": False, "state": "timeout", "attempts": 1, "pending": False}
 
 
 def test_a_timed_out_attempt_is_killed_with_its_whole_process_group(shim):

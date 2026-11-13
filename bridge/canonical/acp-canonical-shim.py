@@ -68,6 +68,9 @@ PUBLISH_TIMEOUT = float(os.environ.get("CANONICAL_PUBLISH_TIMEOUT_SECS", "60"))
 # all. Each attempt keeps PUBLISH_TIMEOUT; each read-back is bounded by PUBLISH_READBACK_TIMEOUT.
 PUBLISH_RETRY_BACKOFF = (10, 30, 60, 120, 300)
 PUBLISH_READBACK_TIMEOUT = float(os.environ.get("CANONICAL_PUBLISH_READBACK_TIMEOUT_SECS", "30"))
+# buzz-cli caps `messages thread --limit` at 500 and has no cursor, so a read that returns this many
+# events may be cut short and never shows that a reply is absent.
+PUBLISH_READBACK_LIMIT = 500
 RETRYABLE_SEND_STATES = ("timeout", "send_failed", "error")
 
 # This shim is also installed as a standalone script; load its topical sibling beside it.
@@ -1015,20 +1018,26 @@ def _is_this_post(event, target, signers, digests):
 
 def _read_back(channel, target, digests):
     """"posted" when the thread already holds this post, "absent" only when a complete read shows it does
-    not, else "unknown": a read that failed, timed out, did not parse or does not even hold *target*
+    not, else "unknown": a read that failed, timed out, did not parse, does not even hold *target*, or
+    returned as many events as it asked for (``PUBLISH_READBACK_LIMIT``: the post may lie past the cut)
     proves nothing, and nothing is resent on it."""
     try:
         code, out, _ = _run_in_own_group(
-            [BUZZ_CLI, "messages", "thread", "--channel", channel, "--event", target, "--limit", "500"],
+            [BUZZ_CLI, "messages", "thread", "--channel", channel, "--event", target,
+             "--limit", str(PUBLISH_READBACK_LIMIT)],
             b"", PUBLISH_READBACK_TIMEOUT)
         events = json.loads(out.decode("utf-8")) if code == 0 else None
     except Exception:
         return "unknown"
     signers, _ = _own_signers()
-    if not (isinstance(events, list) and signers
-            and any(isinstance(event, dict) and event.get("id") == target for event in events)):
+    if not (isinstance(events, list) and signers):
         return "unknown"
-    return "posted" if any(_is_this_post(event, target, signers, digests) for event in events) else "absent"
+    if any(_is_this_post(event, target, signers, digests) for event in events):
+        return "posted"
+    if len(events) >= PUBLISH_READBACK_LIMIT or not any(
+            isinstance(event, dict) and event.get("id") == target for event in events):
+        return "unknown"
+    return "absent"
 
 
 def _rewrite_publication(name, record):
