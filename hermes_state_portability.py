@@ -713,7 +713,9 @@ class SessionPortabilityMixin:
         return item
 
     def _import_session_row(self, conn, raw: dict[str, Any], messages: list[dict[str, Any]], session_id: str) -> None:
-        """INSERT one normalized session + its messages; counts fixed up after."""
+        """INSERT one normalized session + its messages; counts fixed up after. A peer-marked message (a
+        canonical event another store admitted) is filed as imported-unverified, never rejected for the
+        receipt this store cannot have nor admitted on a borrowed claim (``_insert_message_rows(importing=True)``)."""
         started_at = coerce_epoch(raw.get("started_at"), session_id=session_id, field="started_at")
         params = {
             "id": session_id, "source": str(raw.get("source") or "import"),
@@ -738,7 +740,7 @@ class SessionPortabilityMixin:
         archived: list[dict[str, Any]] = []
         for msg in sanitized_messages:
             (live if self._coerce_or(msg.get("active"), int, 1) else archived).append(msg)
-        self._insert_message_rows(conn, session_id, sanitized_messages, prune_checkpoints=False)
+        self._insert_message_rows(conn, session_id, sanitized_messages, prune_checkpoints=False, importing=True)
         if archived:
             conn.executemany("UPDATE messages SET active = 0, compacted = ? WHERE id = ?",
                              [(1 if self._coerce_or(msg.get("compacted"), int, 0) else 0, msg["_row_id"])
