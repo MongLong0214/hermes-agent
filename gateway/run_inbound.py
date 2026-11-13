@@ -676,6 +676,28 @@ class GatewayInboundMixin:
         # — that copy was never consumed and grew unbounded.
         running_agent.interrupt(_interrupt_text)
 
+    # Poll interval while a follow-up waits behind a canonical peer turn.
+    _CANONICAL_PEER_WAIT_POLL_SECONDS = 0.1
+
+    async def _hm_wait_behind_canonical_peer_turn(self, event: "MessageEvent", _quick_key: str) -> None:
+        """Hold a follow-up that arrives during a canonical peer turn until that turn ends, so it
+        runs as its own turn and is answered to its sender. Every busy mode would otherwise put it
+        into the peer turn (steer, redirect, interrupt), or queue it where nothing drains it until
+        the peer turn ends while the adapter re-dispatches it in a loop. Recognized slash commands
+        keep their busy handling (/stop, /new, /status ...). The adapter's session guard stays with
+        this task meanwhile, so later follow-ups queue behind it through the busy handler. A drain
+        ends the wait: the busy path's drain branch then queues it for after the restart or says it
+        is refused, where a task still waiting here would be cancelled with nothing kept."""
+        from hermes_cli.commands import resolve_command
+        _cmd = event.get_command()
+        if _cmd and resolve_command(_cmd):
+            return
+        if not self._canonical_peer_turn_running(_quick_key):
+            return
+        logger.info("Follow-up for session %s waits for the running canonical peer turn to end", _quick_key)
+        while self._canonical_peer_turn_running(_quick_key) and not self._draining:
+            await asyncio.sleep(self._CANONICAL_PEER_WAIT_POLL_SECONDS)
+
     async def _hm_handle_running_session_message(
         self, event: "MessageEvent", source: SessionSource, _quick_key: str
     ) -> Optional[str]:
@@ -1322,6 +1344,8 @@ class GatewayInboundMixin:
         self._hm_evict_idle_stale_agent(_quick_key)
         if self._is_session_running(_quick_key):
             self._hm_evict_reaped_agent(_quick_key)
+        if not _acp_managed:
+            await self._hm_wait_behind_canonical_peer_turn(event, _quick_key)
         if self._is_session_running(_quick_key):
             if _acp_managed:
                 return acp_managed_ingress.BUSY

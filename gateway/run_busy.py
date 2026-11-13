@@ -280,6 +280,30 @@ class GatewayBusySessionMixin:
             logger.warning("Failed to claim active session slot: %s", exc)
             return None, None
 
+    # Owner-key prefix of the turn lease a canonical peer turn runs under (gateway.canonical_surface
+    # submit, GatewayRunner.run_bound_existing_turn).
+    _CANONICAL_TURN_LEASE_PREFIX = "canonical:"
+
+    def _canonical_peer_turn_running(self, session_key: str) -> bool:
+        """True while the turn running on ``session_key`` is a canonical peer turn.
+
+        The canonical surface takes the session's turn lease before it occupies the running slot and
+        releases it only after clearing the slot, so for the whole peer turn the running actor's
+        session lease is held under its ``canonical:`` key; an owner turn holds it under its routing
+        key. A follow-up steered or redirected into a peer turn is answered in the peer's thread and
+        never reaches its sender; an interrupt fails the peer's answer (2026-11-13)."""
+        from gateway.run import _AGENT_PENDING_SENTINEL
+        state = self._peek_session_state(session_key)
+        agent = state.turn.agent if state is not None else None
+        if agent is None or agent is _AGENT_PENDING_SENTINEL:
+            return False
+        session_id = getattr(agent, "session_id", None)
+        leases = getattr(getattr(self, "_turn_leases", None), "_leases", None)
+        if not isinstance(leases, dict) or not isinstance(session_id, str):
+            return False
+        owner_key = getattr(getattr(leases.get(session_id), "holder", None), "owner_key", None)
+        return isinstance(owner_key, str) and owner_key.startswith(self._CANONICAL_TURN_LEASE_PREFIX)
+
     @staticmethod
     def _agent_has_active_subagents(running_agent: Any) -> bool:
         """True when *running_agent* is driving subagents (callers demote interrupt → queue;
@@ -599,6 +623,14 @@ class GatewayBusySessionMixin:
     ) -> "GatewayRunner._BusySteerOutcome":
         """Apply interrupt->queue demotions, then attempt steer (steer mode) or redirect (interrupt mode)."""
         from gateway.run import _AGENT_PENDING_SENTINEL
+        if self._canonical_peer_turn_running(session_key):
+            # Whatever the mode: queued as its own turn, never steered, redirected or interrupting.
+            logger.info("Queueing busy follow-up for session %s behind a canonical peer turn (mode %s)",
+                        session_key, effective_mode)
+            return self._BusySteerOutcome(
+                effective_mode="queue", demoted_for_subagents=False, demoted_for_compression=False,
+                steered=False, redirected=False,
+            )
         # Steer injects mid-run via running_agent.steer(), falling back to queue (nothing lost) when
         # the agent isn't running yet, lacks steer(), or the payload is empty. Interrupt is demoted
         # to queue while subagents run (interrupt() would abort them); /stop and /new still cancel all.
@@ -1102,6 +1134,8 @@ class GatewayBusySessionMixin:
 
         if running_agent is _AGENT_PENDING_SENTINEL:
             return _queue_fallback("Agent still starting — /steer queued for the next turn.")
+        if self._canonical_peer_turn_running(quick_key):
+            return _queue_fallback("A peer turn is running — /steer queued for the next turn.")
         if not running_agent or not hasattr(running_agent, "steer"):
             return _queue_fallback("No active agent — /steer queued for the next turn.")
         try:
