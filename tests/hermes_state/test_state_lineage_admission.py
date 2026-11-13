@@ -188,7 +188,8 @@ def test_refused_lineages_raise_and_leave_the_file_byte_identical(tmp_path, name
 
 
 def test_live_1030_refusal_message_names_the_writable_open_that_migrates_it(tmp_path):
-    # Readers and raw openers never migrate; only a writable SessionDB open admits 1030.
+    # Readers never migrate: a writable SessionDB open admits 1030 and migrates it, and a writable raw
+    # opener hands the store to that open first (admit_raw_state_writer).
     fence = _fence()
     db = make_store(tmp_path / "state.db")
 

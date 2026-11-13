@@ -538,6 +538,68 @@ def admit_raw_state_writer(path) -> StoreLineage:
     return refuse_unadmitted_lineage(path)
 
 
+# ── Refusals that are not damage, for the health probe and the repair paths ──
+
+_FENCE_ABORT_PHRASE = "state db generation incompatible"
+_MISSING_FENCE_FUNCTION_PHRASE = f"no such function: {TURN_FENCE_FUNCTION}"
+
+
+def lineage_refusal_verdict(path) -> Optional[str]:
+    """Why this build neither probes nor repairs *path* as it stands, with the remedy; None when it opens
+    the store unchanged, or when it cannot be read (damage or an OS error, which the caller's own probes name).
+
+    The fork's 1030 store is healthy for the build that wrote it and is migrated by this build's next
+    writable SessionDB open; every other refused shape is never this build's to write. A probe write
+    on either is refused by its fences, and the repair ladder would strip them."""
+    try:
+        lineage = refuse_unadmitted_lineage(path, migrate=True)
+    except IncompatibleSchemaError as exc:
+        return f"{exc} This build cannot write this store, so no repair was attempted."
+    except (sqlite3.DatabaseError, OSError):
+        return None
+    if not lineage.migratable:
+        return None
+    return (f"state.db is still the previous Hermes build's store (schema_version {lineage.stored} under its turn "
+            f"fences), which is not damage: this build migrates it to {STORED_SCHEMA_VERSION} the next time it opens "
+            "the session store for writing. Start this version's gateway once (after stopping an older one), then "
+            "check again. Nothing was changed and no repair was attempted.")
+
+
+def _exception_chain(exc):
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        yield exc
+        exc = exc.__cause__ or exc.__context__
+
+
+def _carries_fences(path) -> bool:
+    try:
+        return bool(probe_store_lineage(path).fence_literals)
+    except IncompatibleSchemaError:
+        return True
+    except (sqlite3.DatabaseError, OSError):
+        return False
+
+
+def fence_refusal_verdict(exc, *, db_path=None) -> Optional[str]:
+    """Why a write failed when a turn fence refused it, else None.
+
+    Typed: only a SQLite error on *exc*'s chain counts, never prose that quotes the phrases. A fence's
+    RAISE(ABORT) is a refusal by itself. A missing fence function only says the writing connection never
+    registered it, so it is a refusal only when *db_path* carries fences that call it."""
+    for link in _exception_chain(exc):
+        if not isinstance(link, sqlite3.DatabaseError):
+            continue
+        text = str(link).lower()
+        if _FENCE_ABORT_PHRASE in text or (
+                _MISSING_FENCE_FUNCTION_PHRASE in text and db_path is not None and _carries_fences(db_path)):
+            return (f"state.db's turn fences refused the write probe ({link}): the probing connection does not "
+                    f"carry this build's fence generation {TURN_FENCE_GENERATION}. That is a refusal, not damage, "
+                    "so no repair was attempted.")
+    return None
+
+
 # ── The fork migration: 1030 -> 1033 under the admission lease, in one transaction ──
 
 def _runtime_lease(home: Path):

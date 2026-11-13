@@ -500,9 +500,20 @@ def reconcile_drift_for_browse(path: Path) -> bool:
 def repair_declarative_schema(path: Path, *, backup: bool = True):
     """Reuse repair's snapshot/SQLite exclusion beneath the runtime owner lock."""
     from gateway.runtime_ownership import OwnershipConflict, exclusive_maintenance
+    from hermes_state_fence import IncompatibleSchemaError, refuse_unadmitted_lineage
     from hermes_state_repair import _cross_process_repair_lock
 
     report = {'repaired': False, 'strategy': None, 'backup_path': None, 'error': None}
+    # Lineage first, before the runtime lease, the backup and any DDL: a store this build does not write as
+    # it stands (the fork's 1030 before its migration, other fenced stamps, fork markers, newer builds) is
+    # refused unchanged. One that cannot be read goes on to the checks below, which name the failure.
+    try:
+        refuse_unadmitted_lineage(path)
+    except IncompatibleSchemaError as exc:
+        report['error'] = str(exc)
+        return report
+    except (sqlite3.DatabaseError, OSError):
+        pass
     try:
         with exclusive_maintenance([path.parent]):
             with _cross_process_repair_lock(path) as holding:

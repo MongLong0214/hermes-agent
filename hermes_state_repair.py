@@ -24,7 +24,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from hermes_constants import get_hermes_home
 from hermes_startup_watchdog import report_startup_progress
 from hermes_state_errors import is_disk_full_error
-from hermes_state_fence import register_turn_fence_generation, serialized_connection_factory
+from hermes_state_fence import (
+    fence_refusal_verdict, lineage_refusal_verdict, register_turn_fence_generation, serialized_connection_factory,
+)
 from hermes_state_holders import read_only_db_uri
 from hermes_state_common import (
     _acquire_db_flock, _clear_lock_holder_record, _describe_lock_holder, _read_lock_holder_record,
@@ -800,7 +802,8 @@ def _is_temporary_file_failure(failure) -> bool:
 
 class HealthCheckUnavailable(str):
     """A ``_db_opens_cleanly`` reason meaning the probe could not run, not that the store is damaged: callers
-    must neither report the store healthy nor route it to repair."""
+    must neither report the store healthy nor route it to repair. That includes a store this build does not
+    write as it stands (its lineage) and a probe write its turn fences refused."""
 
 
 def _retired_cjk_snapshot_health(db_path: Path, conn: sqlite3.Connection) -> Optional[str]:
@@ -851,10 +854,15 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
     index corruption (reads and ``integrity_check`` pass, every ``INSERT INTO messages`` fails through the FTS
     triggers) is reported as unhealthy.
 
+    The lineage decides first, before any connection: a store this build does not write as it stands is
+    ``HealthCheckUnavailable``, as is a probe write refused by the store's turn fences, never damage.
+
     See #50502.
     """
     from hermes_state import SessionDB
     from hermes_state_fts import drop_retired_cjk_index, retired_cjk_index_present
+    if (refusal := lineage_refusal_verdict(db_path)) is not None:
+        return HealthCheckUnavailable(refusal)
     # ── Strategy 0.5: rebuild stale B-tree indexes (#63386) ── PRAGMA integrity_check can report "wrong #
     # of entries in index" when a B-tree index (e.g. idx_sessions_handoff_state) falls out of sync with its
     # base table. REINDEX rewrites the index b-tree from the canonical table rows using the existing index
@@ -913,6 +921,8 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
                 # Missing messages/sessions tables = brand new file mid-init, not corruption.
                 if _schema_not_built(exc):
                     return None
+                if (refusal := fence_refusal_verdict(exc, db_path=db_path)) is not None:
+                    return HealthCheckUnavailable(refusal)
                 return _ProbeFailure(f"fts5 write probe failed: {exc}", exc)
             finally:
                 with contextlib.suppress(sqlite3.Error):
@@ -965,6 +975,10 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> dict[str, A
     if not db_path.exists():
         report["error"] = f"{db_path} does not exist"
         return report
+    # A store this build does not write as it stands is refused before the repair lock, the forensic backup,
+    # the attempt ledger and every strategy (FTS drop, VACUUM): reporting it is the whole remedy.
+    if (refusal := lineage_refusal_verdict(db_path)) is not None:
+        return _repair_skip(report, "refused", refusal)
     # Cross-restart cap: the in-memory claim bounds one process, but unhealable b-tree damage used to re-run
     # surgery + a fresh backup on EVERY restart.
     # Cross-restart attempt cap (#86747): the in-memory claim bounds one process, but a corruption class the
