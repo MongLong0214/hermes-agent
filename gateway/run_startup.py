@@ -300,7 +300,8 @@ class GatewayStartupMixin:
     ) -> list:
         """Clear resume flags and return rows safe to redeliver. Startup recovery is best-effort;
         runtime reconnect recovery (``require_success``) is stricter: if the session-store write
-        fails the response must not be sent, or the turn could be resumed too."""
+        fails the response must not be sent, or the turn could be resumed too. A flag marked after
+        the row's reply was recorded belongs to a newer interrupted turn and is kept."""
         sendable = []
         for row in claimed:
             session_key = row.get("session_key") or ""
@@ -308,7 +309,8 @@ class GatewayStartupMixin:
                 sendable.append(row)
                 continue
             try:
-                await self.async_session_store.clear_resume_pending(session_key)
+                await self.async_session_store.clear_resume_pending(
+                    session_key, marked_before=row.get("created_at"))
             except Exception:
                 logger.debug("clear_resume_pending failed for %s", session_key, exc_info=True)
                 if require_success:

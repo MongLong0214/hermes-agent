@@ -210,10 +210,15 @@ class SessionLifecycleMixin:
             entry.last_resume_marked_at = _now()
         return self._update_entry(session_key, _apply)
 
-    def clear_resume_pending(self, session_key: str) -> bool:
-        """Clear the resume-pending flag after a successful resumed turn; True if cleared."""
+    def clear_resume_pending(self, session_key: str, *, marked_before: Optional[float] = None) -> bool:
+        """Clear the resume-pending flag after a successful resumed turn; True if cleared. With
+        ``marked_before`` (epoch seconds) a flag marked after that time is kept: it belongs to a newer
+        interrupted turn than the one the caller settled."""
         def _apply(entry: SessionEntry):
             if not entry.resume_pending:
+                return False
+            marked_at = entry.last_resume_marked_at
+            if marked_before is not None and marked_at is not None and marked_at.timestamp() > marked_before:
                 return False
             entry.resume_pending = False
             entry.resume_reason = None

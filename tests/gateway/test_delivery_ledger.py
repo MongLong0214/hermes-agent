@@ -42,6 +42,11 @@ def _record(oid="ob-1", session_key="agent:main:slack:channel:C1", **kw):
     )
 
 
+def _created_at(oid):
+    with dl._connect() as conn:
+        return conn.execute("SELECT created_at FROM delivery_obligations WHERE obligation_id=?", (oid,)).fetchone()[0]
+
+
 def _row(oid):
     with dl._connect() as conn:
         r = conn.execute(
@@ -426,7 +431,7 @@ class TestGatewayRedeliverySweep:
         assert sent["metadata"] == {"thread_id": "171.001"}
         assert _row("ob-1")["state"] == "delivered"
         runner._async_session_store.clear_resume_pending.assert_awaited_once_with(
-            "agent:main:slack:channel:C1"
+            "agent:main:slack:channel:C1", marked_before=_created_at("ob-1")
         )
 
     @pytest.mark.asyncio
@@ -550,7 +555,7 @@ class TestGatewayRedeliverySweep:
 
         assert n == 1
         runner._async_session_store.clear_resume_pending.assert_awaited_once_with(
-            "agent:main:slack:channel:C1"
+            "agent:main:slack:channel:C1", marked_before=_created_at("ob-1")
         )
         assert adapter.send.await_count == 1
         assert adapter.send.call_args.kwargs["content"].startswith(
@@ -784,7 +789,7 @@ class TestGatewayRedeliverySweep:
             await asyncio.sleep(0)
 
         runner._async_session_store.clear_resume_pending.assert_awaited_once_with(
-            "agent:main:slack:channel:C1"
+            "agent:main:slack:channel:C1", marked_before=_created_at("ob-1")
         )
         assert not task.done()
 

@@ -768,6 +768,140 @@ def test_a_restart_after_the_turn_wrote_its_row_answers_that_row_once(ingress, s
     assert _answered_once(ingress, _next_process(ingress, send, monkeypatch)) == (1, 1, 1, [])
 
 
+def _owner_rows(rows):
+    return sum(r.get("role") == "user" and r.get("content") == _OWNER_TEXT for r in rows)
+
+
+@pytest.mark.parametrize("path", ["ordinary", "queued_behind_peer"])
+def test_a_turn_whose_marker_write_failed_hands_nothing_back_once_its_agent_ran(
+        ingress, send, monkeypatch, path):
+    """Review r1 P1-a: the marker write fails transiently and the turn runs anyway; its agent writes
+    the user row and the answer, and the restart cuts the turn off while it stops typing. Nothing is
+    handed back, so the next process holds that one row and does not answer it a second time."""
+    h = _Harness(ingress, send, monkeypatch, "queue")
+    h.runner._restart_drain_timeout = 0.5
+    store, failed, stopping, gate = h.runner.session_store, [], [], asyncio.Event()
+    mark, stop_typing, armed = store.mark_turn_active, h.runner._hmwa_stop_typing_for_turn, []
+
+    def transiently_failing_mark(session_key):
+        if armed and not failed:
+            failed.append(session_key)
+            raise OSError("state.db is busy")
+        return mark(session_key)
+    monkeypatch.setattr(store, "mark_turn_active", transiently_failing_mark)
+
+    async def held_stop_typing(event, source):
+        if event.text == _OWNER_TEXT:
+            stopping.append(event)
+            await gate.wait()
+        return await stop_typing(event, source)
+    monkeypatch.setattr(h.runner, "_hmwa_stop_typing_for_turn", held_stop_typing)
+
+    import run_agent
+
+    build = run_agent.AIAgent
+
+    def persisting(**kwargs):  # the agent writes each turn's user row and answer
+        actor = build(**kwargs)
+        actor.persist = True
+        return actor
+    monkeypatch.setattr(run_agent, "AIAgent", persisting)
+
+    async def cut_off():
+        await h.warm()
+        if path == "queued_behind_peer":
+            peer = await h.peer_turn_running()
+            await h.adapter.handle_message(h.owner_event())
+            await h.wait(lambda: h.queued() == [_OWNER_TEXT], "the owner message to be queued")
+            armed.append(True)
+            h.release.set()
+            assert (await peer)[0] == 200
+        else:
+            armed.append(True)
+            await h.adapter.handle_message(h.owner_event())
+        await h.wait(lambda: stopping, "the owner turn to stop typing after its agent ran")
+        await asyncio.wait_for(h.runner.stop(restart=True), 60)
+
+    asyncio.run(cut_off())
+    assert failed and any(_OWNER_TEXT in actor.calls for actor in h.built)
+    nxt = _next_process(ingress, send, monkeypatch)
+    rows = nxt.runner.session_store.load_transcript(ingress.entry.session_id)
+    flush_dir = ingress.home / "pending_messages"
+    assert (_owner_rows(rows), sorted(flush_dir.iterdir()) if flush_dir.exists() else []) == (1, [])
+
+
+@pytest.mark.parametrize("path", ["ordinary", "queued_behind_peer"])
+def test_an_older_owed_reply_does_not_cancel_the_resume_a_cut_off_owner_turn_is_owed(
+        ingress, send, monkeypatch, path):
+    """Review r1 P1-b: the session already owes an older reply in the delivery ledger when a restart
+    cuts the owner turn off before its marker. The next process's boot redelivery settles that older
+    reply without clearing the resume the newer turn is owed, so its turn still answers the message."""
+    from gateway import delivery_ledger
+
+    h = _Harness(ingress, send, monkeypatch, "queue")
+    h.runner._restart_drain_timeout = 0.5
+    arm, paused, release = _pause_owner_turn_at(h, monkeypatch, "topic_recovery")
+    delivery_ledger.record_crash_left_reply(
+        obligation_id="older-reply", session_key=h.key, platform="telegram", chat_id="chat",
+        thread_id=None, content="an older reply", since=0)
+
+    async def cut_off():
+        await _owner_turn_started(h, path, arm)
+        await h.wait(lambda: paused, "the claimed owner turn to pause")
+        try:
+            await asyncio.wait_for(h.runner.stop(restart=True), 60)
+        finally:
+            release()
+
+    asyncio.run(cut_off())
+    claimed, sweep = [], delivery_ledger.sweep_recoverable
+
+    def recorded_sweep(*args, **kwargs):
+        rows = sweep(*args, **kwargs)
+        claimed.extend(rows)
+        return rows
+    monkeypatch.setattr(delivery_ledger, "sweep_recoverable", recorded_sweep)
+    nxt = _next_process(ingress, send, monkeypatch)
+    assert [row["obligation_id"] for row in claimed] == ["older-reply"]  # settled at boot
+    [history] = nxt.actor.histories  # and the owner message still got its turn
+    rows = nxt.runner.session_store.load_transcript(ingress.entry.session_id)
+    assert (_owner_rows(history), _owner_rows(rows)) == (1, 1)
+
+
+def test_a_first_message_cut_off_before_its_session_exists_is_answered_by_the_next_process(
+        ingress, send, monkeypatch):
+    """Review r1 P1-c: the first message of a chat with no session yet, cut off by a restart before
+    its turn opened the session. The hand-back opens it, so the next process replays the flush into
+    it and its resumed turn answers the message once."""
+    from gateway.session import SessionSource
+
+    h = _Harness(ingress, send, monkeypatch, "queue")
+    h.runner._restart_drain_timeout = 0.5
+    arm, paused, release = _pause_owner_turn_at(h, monkeypatch, "topic_recovery")
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat2", chat_type="dm", user_id="user")
+    key = h.runner._session_key_for_source(source)
+    assert h.runner.session_store.lookup_by_session_key_existing(key) is None
+
+    async def cut_off():
+        await h.warm()
+        arm()
+        await h.adapter.handle_message(MessageEvent(
+            text=_OWNER_TEXT, message_type=MessageType.TEXT, source=source, message_id="first"))
+        await h.wait(lambda: paused, "the claimed first message to pause")
+        try:
+            await asyncio.wait_for(h.runner.stop(restart=True), 60)
+        finally:
+            release()
+
+    asyncio.run(cut_off())
+    nxt = _next_process(ingress, send, monkeypatch)
+    entry = nxt.runner.session_store.lookup_by_session_key_existing(key)
+    [history] = nxt.actor.histories
+    rows = nxt.runner.session_store.load_transcript(entry.session_id)
+    assert (_owner_rows(history), _owner_rows(rows)) == (1, 1)
+    assert any(chat == "chat2" for chat, _text in nxt.owner_replies())
+
+
 @pytest.mark.parametrize("mode", ["steer", "interrupt"])
 def test_witness_without_the_peer_turn_check_the_owner_is_answered_in_the_peer_thread(
         ingress, send, monkeypatch, mode):

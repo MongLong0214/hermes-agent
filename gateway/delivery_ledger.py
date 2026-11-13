@@ -399,19 +399,21 @@ def _log_abandoned(oid, platform, chat_id, state, attempts, created_at, now) -> 
 
 def _claimed_row(oid, session_key, platform, chat_id, thread_id, content, attempts, profile, *,
                  needs_marker: bool, runtime: bool = False, flood: bool = False,
-                 last_error: Optional[str] = None) -> Dict[str, Any]:
+                 last_error: Optional[str] = None, created_at: Optional[float] = None) -> Dict[str, Any]:
     """Claimed-row dict handed back for redelivery. A marked row names its own cause: ``flood`` (a reply
     the rate limit refused, possibly after accepting part of it) gets FLOOD_MARKER at boot or at runtime, a
     ``runtime`` reconnect replay gets RECONNECTED_MARKER, and a boot-recovered crash keeps the runner's
     restart marker default. ``last_error`` is the row's pre-claim error, carried so a claim that is
     released unsent goes back to ``failed`` with the same error and keeps its retry eligibility.
-    ``attempts`` is the post-claim count: with the owner pid it names this claim when it is settled."""
+    ``attempts`` is the post-claim count: with the owner pid it names this claim when it is settled.
+    ``created_at`` dates the reply, so clearing its session's resume flag spares a newer turn's."""
     marker = FLOOD_MARKER if flood else (RECONNECTED_MARKER if runtime else None)
     return {"obligation_id": oid, "session_key": session_key, "platform": platform, "chat_id": chat_id,
             "thread_id": thread_id, "content": content, "needs_marker": needs_marker,
             **({"marker": marker} if needs_marker and marker else {}), "profile": profile,
             **({"runtime_recovery": True} if runtime else {}),
-            **({"last_error": last_error} if last_error else {}), "attempts": attempts + 1}
+            **({"last_error": last_error} if last_error else {}), "attempts": attempts + 1,
+            "created_at": created_at}
 
 
 def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Optional[set] = None,
@@ -472,7 +474,8 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
                         "obligation_id": oid, "session_key": session_key, "platform": platform,
                         "chat_id": chat_id, "thread_id": thread_id, "content": content,
                         "profile": adapter_profile or "default", "attempts": attempts,
-                        "adopted": True, "not_before": flood_not_before(updated_at, last_error)})
+                        "adopted": True, "not_before": flood_not_before(updated_at, last_error),
+                        "created_at": created_at})
                 continue
             # Every claim starts a send, so the row leaves 'pending'/'failed' for 'attempting' in the same
             # CAS, as a fresh attempt held by this process with no error: a boot killed inside the
@@ -493,7 +496,7 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
                 claimed.append(_claimed_row(oid, session_key, platform, chat_id, thread_id, content, attempts,
                                             adapter_profile or "default",
                                             needs_marker=state != "pending" or attempts > 0,
-                                            flood=flood_row, last_error=last_error))
+                                            flood=flood_row, last_error=last_error, created_at=created_at))
     return claimed
 
 
@@ -553,7 +556,8 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
                 # claim released unsent keeps its flood retry eligibility.
                 claimed.append(_claimed_row(oid, session_key, row_platform, chat_id, thread_id, content,
                                             attempts, adapter_profile, needs_marker=True, runtime=True,
-                                            flood=is_flood_error(last_error), last_error=last_error))
+                                            flood=is_flood_error(last_error), last_error=last_error,
+                                            created_at=created_at))
     return claimed
 
 

@@ -1409,6 +1409,7 @@ class GatewayInboundMixin:
         _claim_state.turn.agent = _AGENT_PENDING_SENTINEL
         _claim_state.turn.event = event
         _claim_state.turn.started_ts = time.time()
+        event._turn_entered_agent = False
         self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
 
@@ -1443,11 +1444,13 @@ class GatewayInboundMixin:
                 logger.debug("post-turn hook failed: %s", _goal_exc)
             return _agent_result
         except BaseException:
-            # A drain cut this turn off. Until its durable marker exists nothing else holds the
-            # message (the queue gave it up at the claim, the transcript row comes later still);
-            # a managed /acp task is never re-run as ordinary text.
+            # A drain cut this turn off. Until its durable marker exists, and before the agent ran
+            # (only it writes the user row or streams a reply; a failed marker write does not stop
+            # it), nothing else holds the message: the queue gave it up at the claim. A managed /acp
+            # task is never re-run as ordinary text.
             if (self._draining and not is_internal and not _acp_managed
-                    and getattr(event, "_gateway_active_turn_token", None) is None):
+                    and getattr(event, "_gateway_active_turn_token", None) is None
+                    and not getattr(event, "_turn_entered_agent", False)):
                 await self._keep_cut_off_message_for_restart(event, source, _quick_key)
             raise
         finally:
@@ -1491,8 +1494,14 @@ class GatewayInboundMixin:
         logger.info("Restart cut off a turn on %s before it owned its message: kept for the next process",
                     session_key)
         reason = "restart_timeout" if self._restart_requested else "shutdown_timeout"
+        store = self.async_session_store
         try:
-            await self.async_session_store.mark_resume_pending(session_key, reason)
+            if not await store.mark_resume_pending(session_key, reason):
+                # A first message cut off before its session existed: open it as the turn would have,
+                # so the next process can replay the flush into it and resume it.
+                await store.get_or_create_session(source)
+                if not await store.mark_resume_pending(session_key, reason):
+                    logger.warning("Could not mark %s resume_pending for its kept message", session_key)
         except Exception as exc:
             logger.warning("Could not mark %s resume_pending for its kept message: %s", session_key, exc)
 

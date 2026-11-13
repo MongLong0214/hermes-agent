@@ -2375,6 +2375,9 @@ class GatewayTurnMixin:
             # Admission/typing is not execution. All routing, authorization and
             # turn preparation gates have passed when the agent runner is entered.
             event._heartbeat_execution_started = True
+            # From here the agent may write this message's user row and stream a reply: a restart that
+            # cuts the turn off now hands nothing back, marker or not (_keep_cut_off_message_for_restart).
+            event._turn_entered_agent = True
             agent_result = await self._run_agent(
                 message=message_text, context_prompt=prepared.context_prompt, history=history, source=source,
                 session_id=_run_start_session_id, session_key=session_key,
