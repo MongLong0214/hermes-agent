@@ -267,6 +267,37 @@ class TestGatewayCleanupWiring:
         mock_agent.close.assert_not_called()
         assert "session-key" not in runner._agent_cache
 
+    def test_forced_reap_evicts_an_agent_with_dirty_transcript_rows(self):
+        """The cache-pressure / LRU / idle-TTL passes keep an agent whose transcript has a row that never
+        reached disk; the forced turn-slot drop (/stop, interrupt, reaper) must still evict it, or the next
+        message would route to the stale agent."""
+        import threading
+        from unittest.mock import MagicMock
+
+        from agent.context_compressor import _DB_PERSISTED_MARKER
+        from gateway.agent_cache_pressure import transcript_persistence_caught_up
+        from gateway.run import GatewayRunner
+
+        runner = object.__new__(GatewayRunner)
+        runner._agent_cache_lock = threading.Lock()
+        runner._running_agents = {}
+        runner._release_evicted_agent_soft = lambda agent: None
+
+        dirty = MagicMock()
+        dirty._session_messages = [
+            {"role": "user", "content": "q", _DB_PERSISTED_MARKER: True},
+            {"role": "assistant", "content": "rewritten after its flush"},  # marker popped
+            {"role": "user", "content": "next", _DB_PERSISTED_MARKER: True},
+        ]
+        dirty._last_flushed_db_idx = 3
+        assert transcript_persistence_caught_up(dirty) is False  # premise: soft eviction would refuse it
+        runner._agent_cache = {"session-key": (dirty, 12345)}
+
+        GatewayRunner._drop_turn_slot(runner, "session-key")
+
+        assert "session-key" not in runner._agent_cache
+        dirty.close.assert_not_called()
+
 
 class TestDelegationCleanup:
     """Verify subagent delegation cleans up child agents."""
