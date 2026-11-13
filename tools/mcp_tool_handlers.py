@@ -49,6 +49,9 @@ _SESSION_OUTCOME_UNCERTAIN_MSG = (
     "with a read-only tool) before re-invoking it.")
 # A native ``tools/call`` handler carries the (server, tool) it was built for; see :func:`mcp_tool_origin`.
 _NATIVE_TOOL_ATTR = "mcp_native_tool"
+_PEER_REFUSAL = ("MCP tool '{tool}' was NOT run: in a canonical peer turn only the exact call the peer "
+                 "tool check approved may be sent, through the handler it checked, while the binding "
+                 "it was approved under is still current.")
 
 
 class _NotSent(str):
@@ -730,6 +733,16 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float, *,
     op = f"tools/call {tool_name}"
 
     def _handler(args: dict, **kwargs) -> Any:
+        from tools.approval_context import is_peer_turn
+        claim = None
+        if is_peer_turn():
+            # A canonical peer turn sends only the exact call its batch pinned to this handler, as the
+            # pinned deep snapshot (agent.canonical_peer_tools); anything else never reaches the server.
+            from agent.canonical_peer_tools import claim_pinned_call
+            from tools.mcp_tool_schema import mcp_prefixed_tool_name
+            claim = claim_pinned_call(mcp_prefixed_tool_name(server_name, tool_name), args, _handler)
+            if claim is None:
+                return tool_error(_PEER_REFUSAL.format(tool=tool_name))
         # Security boundary: untrusted-server write tools need approval before ANY transport work (incl. lazy spawn).
         booked: list = []  # a costed call's charge; refunded when the call never reaches the server
         error = _trust_gate_check(server_name, tool_name, booked, args)
@@ -754,12 +767,23 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float, *,
             if report is not None:
                 report(progress, total, message)
 
+        dispatched: list = []  # one mark per attempt that went on to the send
+
         async def _call():
             async with server._rpc_lock, _track_inflight_rpc(server, server_name, op, retry_safe=read_only):
+                # Every attempt (after a queue wait, or a retry) re-proves a peer turn's binding and
+                # that no alias changed the checked arguments, then sends the owned snapshot itself.
+                if claim is not None and not await asyncio.to_thread(claim.sendable, args):
+                    if not dispatched:  # nothing of this call reached the server
+                        while booked:
+                            booked.pop().refund()
+                    return _NotSent(tool_error(_PEER_REFUSAL.format(tool=tool_name)))
+                dispatched.append(None)
                 server._pending_call_context = contextvars.copy_context()  # for the elicitation callback
                 try:
                     result = await _call_tool_racing_stdio_death(
-                        server, server_name, tool_name, args, _on_progress if report is not None else None)
+                        server, server_name, tool_name, args if claim is None else claim.snapshot,
+                        _on_progress if report is not None else None)
                 finally:
                     server._pending_call_context = None
             if getattr(server, "_mark_session_proven", None) is not None:  # round-trip done: transport healthy
@@ -788,6 +812,9 @@ def _make_utility_handler(op: str, log_label: str, rpc, render, required: Option
     def _factory(server_name: str, tool_timeout: float):
         def _handler(args: dict, **kwargs) -> str:
             from tools import mcp_tool_discovery as _discovery  # lazy: import cycle
+            from tools.approval_context import is_peer_turn
+            if is_peer_turn():  # never a peer tool: no pin can name it (mcp_tool_origin)
+                return tool_error(_PEER_REFUSAL.format(tool=log_label))
             server = _discovery._get_connected_server_for_call(server_name)
             if not server or not server.session:
                 return tool_error(f"MCP server '{server_name}' is not connected")
