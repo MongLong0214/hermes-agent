@@ -2095,14 +2095,13 @@ DEFAULT_CONFIG = {
         # boot (ambiguous cases carry a "recovered reply — may be a duplicate" marker;
         # at-least-once). Disable to lose in-flight final responses on crash/restart.
         "delivery_ledger": True,
-        # Seconds to wait for one platform to connect at startup/reconnect; raise on "discord
-        # connect timed out" loops (many slash commands to sync). 0/negative = wait forever. Bridged
-        # to HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT, which wins if set explicitly.
-        # Seconds the gateway waits for a single messaging platform to finish connecting during startup (and
-        # on reconnect). Discord in particular can blow past the old fixed 30s when an account has many
-        # slash commands to sync (#19776: 90-173 skills → ~28-31s sync). Raise this if your gateway hits
-        # "discord connect timed out" / "Timeout waiting for connection to Discord" restart loops. ``0`` or
-        # negative disables the timeout entirely (wait indefinitely).
+        # Tools a canonical peer turn on ``binding`` (a canonical_surface_bindings name) may run; the
+        # empty default allows none. Each must be a native tool of MCP server ``mcp_server`` that runs
+        # without an approval prompt. ``read``: exact names, any arguments. ``mutate``: ``{tool: {argument:
+        # [exact string values]}}``, ``{}`` = any. A batch with any other call runs nothing. Re-read per batch.
+        "canonical_peer_tools": {"binding": "", "mcp_server": "", "read": [], "mutate": {}},
+        # Seconds to wait for one platform to connect at startup/reconnect; raise it on "discord connect timed
+        # out" loops (#19776). 0/negative = wait forever. HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT wins if set.
         "platform_connect_timeout": 30,
         # Event-loop liveness watchdog: a daemon thread probes the asyncio loop; after consecutive
         # missed probes it dumps all-thread stacks and hard-exits with the service-restart code so
