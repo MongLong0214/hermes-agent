@@ -120,7 +120,7 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None, toolchain
 
 
 def _build_child_env(*, rpc_endpoint: str, rpc_token: str, tmpdir: str,
-                     child_python: str) -> dict[str, str]:
+                     child_python: str, lifecycle_guard_active: bool = False) -> dict[str, str]:
     """Build the scrubbed child environment both execution paths share."""
     from hermes_constants import apply_scratch_tmp_env, apply_subprocess_home_env, get_hermes_home_override
     from agent.session_client_env import tool_env, toolchain_environ
@@ -179,11 +179,12 @@ def _build_child_env(*, rpc_endpoint: str, rpc_token: str, tmpdir: str,
                 _runtime_path = str(candidate)
     _strip_hermes_owned_pythonpath(child_env)
     _existing_pp = child_env.get("PYTHONPATH", "")
+    _hermes_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     _pp_parts = [tmpdir]
     if _runtime_path is not None:
         _pp_parts.append(_runtime_path)
     if _uses_hermes_python_environment(child_python):
-        _pp_parts.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        _pp_parts.append(_hermes_root)
     elif child_python not in _external_env_logged:
         # Surface once per interpreter so "import hermes_constants fails" is diagnosable.
         _external_env_logged.add(child_python)
@@ -192,6 +193,18 @@ def _build_child_env(*, rpc_endpoint: str, rpc_token: str, tmpdir: str,
     if _existing_pp:
         _pp_parts.append(_existing_pp)
     child_env["PYTHONPATH"] = os.pathsep.join(_pp_parts)
+    # Separate from PYTHONPATH on purpose: the runner's bootstrap loads cron/lifecycle_guard.py by
+    # file path (bypassing the cron package's own __init__, which pulls in the scheduler) to arm its
+    # subprocess-creation audit hook -- the source-text scan a cell is checked against misses an
+    # argv built at runtime, e.g. ``subprocess.run([a+b, ...])``. Staying off PYTHONPATH keeps a
+    # foreign ``code_execution.mode: project`` interpreter's own imports unaffected; the bootstrap
+    # fails open (source-text scan still applies) if loading errors. Only wired in when the caller
+    # already confirmed this host process is the supervised gateway (the SAME
+    # ``_is_supervised_gateway_process()`` verdict the source-text scan gates on): a CLI, `hermes
+    # serve` or unsupervised foreground session is not the process this guard protects, and the
+    # terminal tool's lifecycle guard preserves lifecycle operations for exactly those contexts.
+    if lifecycle_guard_active:
+        child_env["HERMES_KERNEL_LIFECYCLE_GUARD_ROOT"] = _hermes_root
     return child_env
 
 

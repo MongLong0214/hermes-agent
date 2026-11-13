@@ -18,6 +18,8 @@ tests patch ``_load_config`` directly, mirroring test_code_execution_modes.
 
 import json
 import os
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -607,3 +609,164 @@ class TestStaleStagingDirSweep(unittest.TestCase):
                 self.assertFalse(old.exists())
                 self.assertTrue(young.exists())
                 self.assertTrue(bystander.exists())
+
+
+# A fake ``hermes`` CLI: it only records its argv. Every cell (and grandchild) below first checks that
+# PATH resolves the name to this stub, so a guard regression can never reach a real gateway.
+_STUB_MARKER = "LIFECYCLE_STUB_MARKER"
+# A Python grandchild that builds the lifecycle argv itself: nothing in the cell's own argv
+# (``python -c GRANDCHILD``) names the command, so only a hook inside the grandchild can stop it.
+_GRANDCHILD = (
+    "import os, shutil, subprocess; n = 'her' + 'mes'; f = shutil.which(n); "
+    f"assert f and os.path.exists(os.path.join(os.path.dirname(f), {_STUB_MARKER!r})), f; "
+    "subprocess.run([n, 'gateway', 're' + 'start'], check=False)"
+)
+_STUB_PREAMBLE = textwrap.dedent(f"""\
+    import os, shutil
+    name = "her" + "mes"
+    _found = shutil.which(name)
+    assert _found and os.path.exists(os.path.join(os.path.dirname(_found), {_STUB_MARKER!r})), _found
+    GRANDCHILD = {_GRANDCHILD!r}
+    """)
+
+
+class _StubHermesCase(unittest.TestCase):
+    def _run_with_stub_hermes(self, cell: str):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        bin_dir = Path(tmp, "bin")
+        bin_dir.mkdir()
+        record_path = Path(tmp, "hermes_argv.txt")
+        stub = bin_dir / "hermes"
+        stub.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {shlex.quote(str(record_path))}\n")
+        stub.chmod(0o755)
+        (bin_dir / _STUB_MARKER).write_text("")
+        patched_path = str(bin_dir) + os.pathsep + os.environ.get("PATH", "")
+        with _kernel_config(), patch.dict(os.environ, {"PATH": patched_path}):
+            result = _run(_STUB_PREAMBLE + textwrap.dedent(cell))
+        return result, record_path
+
+
+@unittest.skipUnless(hasattr(sys, "addaudithook") and os.name == "posix", "POSIX audit hooks")
+class TestLifecycleGuardAuditHook(_StubHermesCase):
+    """The source-text scan only sees literal commands; under the supervised gateway the kernel's
+    audit hook checks the REAL argv right before CPython creates the process."""
+
+    def setUp(self):
+        from tools import process_registry
+        patcher = patch.object(process_registry, "_is_supervised_gateway_process", lambda: True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _assert_never_ran(self, record_path):
+        self.assertFalse(record_path.exists(), "the stub hermes CLI must never have been invoked")
+
+    def test_dynamically_built_gateway_restart_is_blocked(self):
+        result, record_path = self._run_with_stub_hermes("""\
+            import subprocess
+            subprocess.run([name, "gateway", "re" + "start"], check=False)
+            """)
+        self.assertEqual(result["status"], "error", result)
+        self.assertIn("Blocked: cannot restart or stop the gateway", result["error"])
+        self._assert_never_ran(record_path)
+
+    def test_bytes_and_pathlike_argv_are_blocked(self):
+        result, record_path = self._run_with_stub_hermes("""\
+            import subprocess
+            from pathlib import Path
+            class BytesPath:
+                def __init__(self, value):
+                    self.value = value
+                def __fspath__(self):
+                    return self.value
+            verb = "st" + "op"
+            forms = [
+                [os.fsencode(name), b"gateway", os.fsencode(verb)],
+                [Path(name), "gateway", verb],
+                [BytesPath(os.fsencode(name)), BytesPath(b"gateway"), verb],
+                os.fsencode(name + " gateway " + verb),
+            ]
+            for argv in forms:
+                try:
+                    subprocess.run(argv, check=False, shell=isinstance(argv, bytes))
+                except PermissionError as exc:
+                    assert "Blocked:" in str(exc), exc
+                else:
+                    raise AssertionError("lifecycle argv escaped: %r" % (argv,))
+            try:
+                os.system(name + " gateway " + verb)
+            except PermissionError:
+                pass
+            else:
+                raise AssertionError("os.system lifecycle command escaped")
+            r = subprocess.run([b"/bin/echo", Path("path-ok")], capture_output=True, text=True)
+            assert r.stdout.strip() == "path-ok", r
+            print("all-blocked")
+            """)
+        self.assertEqual(result["status"], "success", result)
+        self.assertIn("all-blocked", result["output"])
+        self._assert_never_ran(record_path)
+
+    def test_overwritten_sitecustomize_does_not_unguard_a_python_grandchild(self):
+        result, record_path = self._run_with_stub_hermes("""\
+            import subprocess, sys
+            site = os.environ.get("HERMES_KERNEL_LIFECYCLE_GUARD_SITE", "")
+            if site:
+                with open(os.path.join(site, "sitecustomize.py"), "w") as f:
+                    f.write("")
+            r = subprocess.run([sys.executable, "-c", GRANDCHILD], capture_output=True, text=True)
+            print(r.returncode, r.stderr)
+            """)
+        self.assertEqual(result["status"], "success", result)
+        self.assertIn("Blocked: cannot restart or stop the gateway", result["output"])
+        self._assert_never_ran(record_path)
+
+    def test_scrubbed_env_does_not_unguard_a_python_grandchild(self):
+        result, record_path = self._run_with_stub_hermes("""\
+            import subprocess, sys
+            env = {k: v for k, v in os.environ.items()
+                   if k != "PYTHONPATH" and not k.startswith("HERMES_KERNEL_")}
+            r = subprocess.run([sys.executable, "-c", GRANDCHILD], env=env, capture_output=True, text=True)
+            print(r.returncode, r.stderr)
+            """)
+        self.assertEqual(result["status"], "success", result)
+        self.assertIn("Blocked: cannot restart or stop the gateway", result["output"])
+        self._assert_never_ran(record_path)
+
+    def test_ordinary_grandchild_and_its_own_sitecustomize_still_run(self):
+        result, record_path = self._run_with_stub_hermes("""\
+            import subprocess, sys, tempfile
+            user_site = tempfile.mkdtemp()
+            with open(os.path.join(user_site, "sitecustomize.py"), "w") as f:
+                f.write("import os; os.environ['USER_SITE_RAN'] = '1'")
+            env = dict(os.environ, PYTHONPATH=user_site)
+            r = subprocess.run(
+                [sys.executable, "-c",
+                 "import os, subprocess; print('child-ok', os.environ.get('USER_SITE_RAN')); "
+                 "print(subprocess.run(['echo', 'gc-ok'], capture_output=True, text=True).stdout.strip())"],
+                env=env, capture_output=True, text=True)
+            print(r.returncode, r.stdout, r.stderr)
+            """)
+        self.assertEqual(result["status"], "success", result)
+        self.assertIn("child-ok 1", result["output"])
+        self.assertIn("gc-ok", result["output"])
+        self.assertNotIn("Error in sitecustomize", result["output"])
+        self._assert_never_ran(record_path)
+
+
+@unittest.skipUnless(os.name == "posix", "POSIX shell stub")
+class TestLifecycleGuardSupervisedGatewayOnly(_StubHermesCase):
+    """CLI, ``hermes serve`` and unsupervised sessions keep lifecycle commands: the hook is armed
+    only under the supervised gateway, matching the source-text scan."""
+
+    def test_hook_is_not_armed_outside_the_supervised_gateway(self):
+        from tools import process_registry
+        with patch.object(process_registry, "_is_supervised_gateway_process", lambda: False):
+            result, record_path = self._run_with_stub_hermes("""\
+                import subprocess
+                print("armed:", any(k.startswith("HERMES_KERNEL_LIFECYCLE_GUARD") for k in os.environ))
+                subprocess.run([name, "gateway", "re" + "start"], check=False)
+                """)
+        self.assertEqual(result["status"], "success", result)
+        self.assertIn("armed: False", result["output"])
+        self.assertEqual(record_path.read_text().split(), ["gateway", "restart"])
