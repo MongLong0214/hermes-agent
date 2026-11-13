@@ -34,6 +34,7 @@ from agent.errors import EmptyStreamError
 from agent.chat_completion_local import _streams_llamacpp, stale_giveup
 from agent.chat_completion_headers import _chat_completion_capturing_headers
 from agent.chat_completion_stream_monitor import StreamingWaitMonitor, StreamLifetimeExceeded
+from agent.chat_completion_accepted_failure import is_accepted_stream_failure, stream_end_fields
 from agent.transports.chat_completions import is_router_timeout_shim, router_timeout_shim_may_follow
 from agent.fast_mode import effective_request_overrides
 from agent.turn_context import substitute_api_content
@@ -1026,8 +1027,9 @@ def direct_api_call(agent, api_kwargs: dict):
         # If a timer already won, the request still completed: return it (the
         # reset undoes the bump; the finally discards the poisoned client).
         request.mark_done()
-        _reset_stale_streak(agent)
-        succeeded = True
+        if not is_accepted_stream_failure(response):  # billed but never completed, even if a timer won
+            _reset_stale_streak(agent)
+            succeeded = True
         return response
     finally:
         request.stop_watchdogs()
@@ -2485,7 +2487,7 @@ def _with_stream_emitters(agent, run):
         raise
     end = getattr(agent, "_emit_stream_end", None)
     if end is not None:
-        end(final_text=_stream_final_text(response), finished=True, error=None)
+        end(**stream_end_fields(response, _stream_final_text))
     return response
 
 

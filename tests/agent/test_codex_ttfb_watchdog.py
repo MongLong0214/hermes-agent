@@ -343,8 +343,11 @@ def test_lifecycle_event_does_not_restart_first_progress_deadline():
 
 
 def test_large_codex_lifecycle_only_stream_hits_attempt_progress_budget(tmp_path, monkeypatch):
-    """Lifecycle events may change phase diagnostics, but cannot buy another full grace period."""
+    """Lifecycle events may change phase diagnostics, but cannot buy another full grace period.
+    The decoder already accepted ``response.created``, so the request is billed: the kill ends
+    the attempt as its accepted failure, never a replayable ``TimeoutError``."""
     from agent import chat_completion_helpers as h
+    from agent.chat_completion_accepted_failure import is_accepted_stream_failure
 
     agent = _make_codex_agent(tmp_path, monkeypatch)
     _shorten_implicit_idle_watchdog(monkeypatch, h, ttfb_timeout=0.9, progress_timeout=0.9)
@@ -359,11 +362,12 @@ def test_large_codex_lifecycle_only_stream_hits_attempt_progress_budget(tmp_path
 
     _install_codex_event_stream(agent, monkeypatch, stream_attempt, closes)
     started = time.monotonic()
-    with pytest.raises(TimeoutError, match="no substantive model progress"):
-        h.interruptible_api_call(agent, {"model": "gpt-5.6-sol", "input": "x" * 40_004})
+    outcome = h.interruptible_api_call(agent, {"model": "gpt-5.6-sol", "input": "x" * 40_004})
 
+    assert is_accepted_stream_failure(outcome)
     assert time.monotonic() - started < 1.5
     assert "codex_progress_kill" in closes
+    assert "request_complete" not in closes
 
 
 @pytest.mark.parametrize(
@@ -374,6 +378,7 @@ def test_event_stale_phase_is_scoped_to_physical_stream_attempt(
 ):
     """Retry lifecycle resets phase without hiding a zero-event reconnect hang."""
     from agent import chat_completion_helpers as h
+    from agent.chat_completion_accepted_failure import is_accepted_stream_failure
 
     agent = _make_codex_agent(tmp_path, monkeypatch)
     _shorten_implicit_idle_watchdog(monkeypatch, h)
@@ -413,11 +418,11 @@ def test_event_stale_phase_is_scoped_to_physical_stream_attempt(
             )
             return
 
-        yield SimpleNamespace(type="response.created")
-        if mode != "retry_no_event":
-            yield SimpleNamespace(type="response.reasoning_text.delta", delta="first step")
         if mode in {"retry_gap", "retry_no_event"}:
+            # Fail before the first event: accepted events are billed and never replayed.
             raise ConnectionError("retry physical stream")
+        yield SimpleNamespace(type="response.created")
+        yield SimpleNamespace(type="response.reasoning_text.delta", delta="first step")
         while getattr(agent, "_active_codex_stream_request_token", None) is not None:
             time.sleep(0.02)
         raise ConnectionError("retired stalled stream")
@@ -430,9 +435,16 @@ def test_event_stale_phase_is_scoped_to_physical_stream_attempt(
         )
         assert response.output_text == "done"
         assert attempts["count"] == (1 if mode == "initial_gap" else 2)
+    elif mode == "stall":
+        # The idle kill lands after an accepted event: the billed attempt ends as its accepted
+        # failure, never a watchdog TimeoutError that generic retry would replay.
+        outcome = h.interruptible_api_call(
+            agent, {"model": "gpt-5.6-sol", "input": "x" * 40_004}
+        )
+        assert is_accepted_stream_failure(outcome)
     else:
-        error_match = "no parsed stream event" if mode == "retry_no_event" else "no SSE events"
-        with pytest.raises(TimeoutError, match=error_match):
+        # No event was accepted on either attempt: the TTFB kill stays a retryable timeout.
+        with pytest.raises(TimeoutError, match="no parsed stream event"):
             h.interruptible_api_call(
                 agent, {"model": "gpt-5.6-sol", "input": "x" * 40_004}
             )
