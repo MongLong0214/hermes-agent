@@ -715,7 +715,7 @@ class SessionDB(
         leaked tracked connection cannot block the forensic backup the writable heal takes next."""
         for attempt in range(_READ_ONLY_IOERR_RETRY_ATTEMPTS + 1):
             try:
-                probe_store_lineage(self.db_path)  # a reader must not serve a lineage it does not own
+                self._admit_read_only_lineage()
                 self._conn = conn = self._connect_read_only(timeout=_READ_BUSY_TIMEOUT_S)
                 try:
                     apply_database_pragmas(conn, db_label="state.db")
@@ -741,6 +741,17 @@ class SessionDB(
                 if attempt >= _READ_ONLY_IOERR_RETRY_ATTEMPTS or not transient:
                     raise
                 time.sleep(_READ_ONLY_IOERR_RETRY_BACKOFF_S)
+
+    def _admit_read_only_lineage(self) -> None:
+        probe_store_lineage(self.db_path)  # a reader must not serve a lineage it does not own
+
+    @classmethod
+    def open_recovery_reader(cls, db_path) -> "SessionDB":
+        """Read-only open of a generation-1033 store (the newer line's) to serve it after a code rollback.
+        Every write is refused; the default open keeps refusing that store. See hermes_state_recovery."""
+        from hermes_state_recovery import RecoverySessionDB
+
+        return RecoverySessionDB(db_path)
 
     def _connect_read_only(self, timeout: float) -> sqlite3.Connection:
         """``mode=ro`` tracked connection with Row factory. check_same_thread=False: pooled connections
