@@ -9,6 +9,7 @@ id stability, and the startup redelivery sweep's contract:
 - poison rows abandon at the attempts cap / stale cutoff
 """
 
+import logging
 import os
 import sqlite3
 import threading
@@ -382,6 +383,134 @@ class TestPrune:
         assert _row("ob-1") is None
 
 
+_OTHER_PROCESS = (999999998, 1)  # no such pid: _owner_alive() reports its claims dead
+
+
+class TestClaimScopedSettlement:
+    """``attempt=`` settles ONE claim: the row must still be ``attempting`` under the settling pid with
+    that ``attempts`` count, so a stale claimant cannot overwrite a newer claim's outcome."""
+
+    def test_stale_claim_cannot_fail_a_row_a_newer_claim_delivered(self, monkeypatch):
+        _record()
+        _orphan("ob-1")
+        with monkeypatch.context() as m:
+            m.setattr(dl, "_owner_stamp", lambda: _OTHER_PROCESS)
+            [claim_a] = dl.sweep_recoverable()
+        [claim_b] = dl.sweep_recoverable()  # A's process looks dead, so this one re-claims
+        assert (claim_a["attempts"], claim_b["attempts"]) == (1, 2)
+        assert dl.mark_delivered("ob-1", attempt=2) is True
+
+        with monkeypatch.context() as m:
+            m.setattr(dl, "_owner_stamp", lambda: _OTHER_PROCESS)
+            assert dl.mark_failed("ob-1", "timed out", attempt=1) is False
+        # A settled claim stays settled, even for its own claimant.
+        assert dl.mark_failed("ob-1", "timed out", attempt=2) is False
+
+        row = _row("ob-1")
+        assert (row["state"], row["attempts"], row["last_error"]) == ("delivered", 2, None)
+
+    def test_older_claim_in_this_process_cannot_settle_the_newer_one(self):
+        _record()
+        _orphan("ob-1")
+        [first] = dl.sweep_recoverable()
+        _orphan("ob-1")
+        [second] = dl.sweep_recoverable()
+
+        assert dl.mark_failed("ob-1", "timed out", attempt=first["attempts"]) is False
+        assert (_row("ob-1")["state"], _row("ob-1")["attempts"]) == ("attempting", 2)
+        assert dl.mark_delivered("ob-1", attempt=second["attempts"]) is True
+
+    def test_settlement_from_another_owner_pid_is_refused(self, monkeypatch):
+        _record()
+        dl.mark_attempting("ob-1")  # the producer's own claim: attempting, attempts 0, this pid
+
+        with monkeypatch.context() as m:
+            m.setattr(dl, "_owner_stamp", lambda: _OTHER_PROCESS)
+            assert dl.mark_delivered("ob-1", attempt=0) is False
+        assert _row("ob-1")["state"] == "attempting"
+        assert dl.mark_delivered("ob-1", attempt=0) is True
+
+    def test_release_to_pending_hands_a_boot_claim_back_unspent(self):
+        _record()
+        _orphan("ob-1")
+        [claim] = dl.sweep_recoverable()
+        assert (claim["needs_marker"], claim["attempts"]) == (False, 1)
+
+        assert dl.release_runtime_claim("ob-1", "shutdown", attempt=2, pending=True) is False
+        assert dl.release_runtime_claim("ob-1", "shutdown", attempt=1, pending=True) is True
+        row = _row("ob-1")
+        assert (row["state"], row["attempts"], row["last_error"]) == ("pending", 0, None)
+        _orphan("ob-1")
+        [again] = dl.sweep_recoverable()
+        assert (again["needs_marker"], again["attempts"]) == (False, 1)
+
+    @pytest.mark.parametrize("error", ["flood_control:5", "503 Service Unavailable"])
+    def test_boot_claim_clears_the_row_error_and_carries_it(self, error):
+        _record()
+        dl.mark_failed("ob-1", error)
+        with dl._connect() as conn:  # the flood wait / backoff has passed
+            conn.execute("UPDATE delivery_obligations SET updated_at=updated_at-600")
+        _orphan("ob-1")
+
+        [claim] = dl.sweep_recoverable()
+
+        assert claim["last_error"] == error
+        assert (_row("ob-1")["state"], _row("ob-1")["last_error"]) == ("attempting", None)
+
+    @pytest.mark.parametrize("sweep", ["boot", "runtime"])
+    def test_abandon_logs_error_with_the_id_and_no_reply_text(self, sweep, caplog):
+        _record(content="PRIVATE REPLY TEXT")
+        dl.mark_failed("ob-1", "send_path_degraded")
+        with dl._connect() as conn:
+            conn.execute("UPDATE delivery_obligations SET attempts=?", (dl.MAX_ATTEMPTS,))
+        if sweep == "boot":
+            _orphan("ob-1")
+
+        with caplog.at_level(logging.ERROR, logger=dl.logger.name):
+            claimed = dl.sweep_recoverable() if sweep == "boot" else dl.sweep_failed_for_runtime("slack")
+
+        assert claimed == [] and _row("ob-1")["state"] == "abandoned"
+        errors = [r.getMessage() for r in caplog.records
+                  if r.name == dl.logger.name and r.levelno >= logging.ERROR]
+        assert len(errors) == 1
+        assert "ob-1" in errors[0] and "PRIVATE REPLY TEXT" not in errors[0]
+
+    def test_live_shaped_acp_rows_survive_the_sweeps_and_the_prune(self):
+        """Fixture only: the live store carries ``acp_update_id``/``delivered_message_ids`` columns this
+        build does not know yet. Its ACP rows must come through every sweep and prune intact."""
+        pid, started = dl._owner_stamp()
+        now = time.time()
+        conn = sqlite3.connect(dl._db_path())
+        try:
+            conn.execute(
+                """CREATE TABLE delivery_obligations (
+                    obligation_id TEXT PRIMARY KEY, session_key TEXT NOT NULL, platform TEXT NOT NULL,
+                    chat_id TEXT NOT NULL, thread_id TEXT, content TEXT NOT NULL, state TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL, updated_at REAL NOT NULL,
+                    owner_pid INTEGER, owner_started_at INTEGER, last_error TEXT, adapter_profile TEXT,
+                    acp_update_id TEXT, delivered_message_ids TEXT)"""
+            )
+            conn.executemany(
+                "INSERT INTO delivery_obligations VALUES (?, 'agent:main:slack:dm:D1', 'slack', 'D1', NULL,"
+                " 'acp answer', ?, ?, ?, ?, ?, ?, NULL, 'default', ?, ?)",
+                [("acp-delivered", "delivered", 1, now - 3600, now - 3600, 999999999, 1, "upd-1", '["m1"]'),
+                 ("acp-in-flight", "attempting", 0, now, now, pid, started, "upd-2", None)])
+            conn.commit()
+        finally:
+            conn.close()
+
+        assert dl.sweep_recoverable() == []
+        assert dl.sweep_failed_for_runtime("slack") == []
+        _record("ob-new")  # runs the retention prune and the row cap in the writer's transaction
+        assert dl.mark_delivered("acp-in-flight", attempt=0) is True
+
+        with dl._connect() as conn:
+            rows = conn.execute(
+                """SELECT obligation_id, state, acp_update_id, delivered_message_ids
+                   FROM delivery_obligations WHERE acp_update_id IS NOT NULL ORDER BY obligation_id"""
+            ).fetchall()
+        assert rows == [("acp-delivered", "delivered", "upd-1", '["m1"]'),
+                        ("acp-in-flight", "delivered", "upd-2", None)]
 
 
 class TestGatewayRedeliverySweep:
@@ -536,6 +665,41 @@ class TestGatewayRedeliverySweep:
 
         assert _row("ob-1")["state"] == "failed" and _row("ob-1")["attempts"] == 0
         assert [r["obligation_id"] for r in dl.sweep_failed_for_runtime("slack")] == ["ob-1"]
+
+    @pytest.mark.asyncio
+    async def test_boot_claim_released_unsent_keeps_its_flood_wait(self):
+        _record()
+        dl.mark_failed("ob-1", "flood_control:5")
+        with dl._connect() as conn:
+            conn.execute("UPDATE delivery_obligations SET updated_at=updated_at-600")
+        _orphan("ob-1")
+        runner = self._runner(self._adapter())
+        claimed = await runner._claim_pending_obligations()
+        runner.adapters = {}  # the adapter went away before the boot send started
+
+        await runner._redeliver_claimed_obligations(claimed)
+
+        row = _row("ob-1")
+        assert (row["state"], row["attempts"], row["last_error"]) == ("failed", 0, "flood_control:5")
+
+    @pytest.mark.asyncio
+    async def test_boot_redelivery_settles_only_its_own_claim(self):
+        """The boot send outlives its claim: a newer claim delivers the row, then the old send fails."""
+        _record()
+        _orphan("ob-1")
+
+        async def _send(**_kwargs):
+            _orphan("ob-1")
+            assert len(dl.sweep_recoverable()) == 1
+            dl.mark_delivered("ob-1")  # the newer claim's send landed
+            return MagicMock(success=False, error="timed out")
+
+        adapter = MagicMock()
+        adapter.send = _send
+
+        assert await self._runner(adapter)._redeliver_pending_obligations() == 0
+        row = _row("ob-1")
+        assert (row["state"], row["attempts"]) == ("delivered", 2)
 
     @pytest.mark.asyncio
     async def test_runtime_failed_redelivery_clears_resume_before_send(self):
