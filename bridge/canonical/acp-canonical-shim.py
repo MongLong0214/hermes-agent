@@ -19,6 +19,7 @@ import importlib.util
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -62,6 +63,12 @@ OWNER = os.environ.get("BUZZ_ACP_AGENT_OWNER", "d046238dd1422955898205bd60507992
 PUBLISHED = os.environ.get("CANONICAL_PUBLISHED_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                                                    "published"))
 PUBLISH_TIMEOUT = float(os.environ.get("CANONICAL_PUBLISH_TIMEOUT_SECS", "60"))
+# An answer whose post ends in timeout, send_failed or error is read back from its thread and, only when
+# that read shows no such reply, sent again: once after each of these waits (s), about nine minutes in
+# all. Each attempt keeps PUBLISH_TIMEOUT; each read-back is bounded by PUBLISH_READBACK_TIMEOUT.
+PUBLISH_RETRY_BACKOFF = (10, 30, 60, 120, 300)
+PUBLISH_READBACK_TIMEOUT = float(os.environ.get("CANONICAL_PUBLISH_READBACK_TIMEOUT_SECS", "30"))
+RETRYABLE_SEND_STATES = ("timeout", "send_failed", "error")
 
 # This shim is also installed as a standalone script; load its topical sibling beside it.
 _batch_error = None
@@ -942,6 +949,159 @@ def outcome_key(event_id, channel=None):
     return event_id
 
 
+def _run_in_own_group(argv, data, timeout):
+    """(returncode, stdout, stderr) of *argv* fed *data*, run in a process group of its own. At *timeout*
+    the whole group is killed before ``TimeoutExpired`` propagates: the wrapper runs buzz-real as its child,
+    and on 2026-11-13 such a child of a killed send still finished its query 25 s after the timeout."""
+    proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            start_new_session=True)
+    try:
+        out, err = proc.communicate(data, timeout=timeout)
+    except BaseException:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        try:
+            proc.communicate(timeout=5)
+        except Exception:  # something left the group and holds a pipe: never wait on it
+            for stream in (proc.stdin, proc.stdout, proc.stderr):
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+        raise
+    return proc.returncode, out, err
+
+
+def _send_attempt(channel, target, body):
+    """(state, reason) of one ``buzz messages send`` of *body*."""
+    try:
+        code, _, err = _run_in_own_group(
+            [BUZZ_CLI, "messages", "send", "--channel", channel]
+            + (["--reply-to", target] if target else []) + ["--content", "-"],
+            body.encode("utf-8"), PUBLISH_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return "timeout", f"no exit within {PUBLISH_TIMEOUT:g}s"
+    except Exception as exc:
+        return "error", f"{type(exc).__name__}: {exc}"[:300]
+    try:
+        stderr = err.decode(errors="replace")
+        return _send_state(code, stderr), f"exit {code}: {stderr.strip()[:300]}"
+    except Exception as exc:  # the claimed marker is filled whatever the classification does
+        return ("sent" if code == 0 else "send_failed"), f"exit {code}: stderr unclassifiable ({type(exc).__name__})"
+
+
+def _sha256(text):
+    return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def _is_this_post(event, target, signers, digests):
+    """A reply to *target* (its NIP-10 ``reply`` e-tag, as buzz-cli writes one) from this bridge's own signer
+    whose content is the body: as sent, or with the recipient's handle the wrapper puts in front of a body
+    that lacks it."""
+    if not isinstance(event, dict):
+        return False
+    pubkey, content, tags = event.get("pubkey"), event.get("content"), event.get("tags")
+    return (isinstance(pubkey, str) and pubkey in signers and isinstance(content, str)
+            and _sha256(content) in digests and isinstance(tags, list)
+            and any(isinstance(tag, list) and len(tag) >= 4 and tag[0] == "e" and tag[1] == target
+                    and tag[3] == "reply" for tag in tags))
+
+
+def _read_back(channel, target, digests):
+    """"posted" when the thread already holds this post, "absent" only when a complete read shows it does
+    not, else "unknown": a read that failed, timed out, did not parse or does not even hold *target*
+    proves nothing, and nothing is resent on it."""
+    try:
+        code, out, _ = _run_in_own_group(
+            [BUZZ_CLI, "messages", "thread", "--channel", channel, "--event", target, "--limit", "500"],
+            b"", PUBLISH_READBACK_TIMEOUT)
+        events = json.loads(out.decode("utf-8")) if code == 0 else None
+    except Exception:
+        return "unknown"
+    signers, _ = _own_signers()
+    if not (isinstance(events, list) and signers
+            and any(isinstance(event, dict) and event.get("id") == target for event in events)):
+        return "unknown"
+    return "posted" if any(_is_this_post(event, target, signers, digests) for event in events) else "absent"
+
+
+def _rewrite_publication(name, record):
+    """Replace the claimed ``PUBLISHED/<name>`` with *record* in one step, so a reader sees the previous
+    record or this one and never a part. The name stays taken throughout: the one-post claim never reopens."""
+    path = os.path.join(PUBLISHED, name)
+    private = os.path.join(PUBLISHED, f".{name}.{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}.journal")
+    try:
+        with os.fdopen(os.open(private, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600), "w") as handle:
+            handle.write(json.dumps(record) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(private, path)
+    except OSError as exc:
+        log(f"publication {name[:12]}… journal not updated ({type(exc).__name__}); its last record stands")
+        try:
+            os.unlink(private)
+        except OSError:
+            pass
+
+
+_RETRIES = []  # one daemon thread per answer whose post is still being retried; never joined
+_RETRIES_LOCK = threading.Lock()
+
+
+def _retry_publication(name, record, body, digests, tag):
+    """Finish one answer's post off the turn path. Before each resend the thread is read back: an earlier
+    attempt that landed is recorded as ``sent`` (``recovered``) and never sent again, and a read-back that
+    fails is read again after the next wait, never taken for absence. At most one resend per wait in
+    ``PUBLISH_RETRY_BACKOFF``; a ``wrapper_refused`` ends it. The claimed marker takes each attempt and the
+    final state; while this runs it holds ``pending: true`` over the last failure, which is how a shim that
+    ends meanwhile leaves it: as that failure, with nothing to resume."""
+    channel, target, kind = record["channel"], record["reply_to"], record["kind"]
+    state, reason, attempts, found = record["state"], record["reason"], record["attempts"], False
+    try:
+        for delay in PUBLISH_RETRY_BACKOFF:
+            time.sleep(delay)
+            seen = _read_back(channel, target, digests)
+            if seen == "posted":
+                found = True
+                break
+            if seen == "unknown":
+                log(f"prompt {tag}… {kind} read-back failed; not resending until a read-back shows no reply")
+                continue
+            state, reason = _send_attempt(channel, target, body)
+            attempts += 1
+            if state not in RETRYABLE_SEND_STATES:
+                break
+            log(f"prompt {tag}… {kind} NOT posted on attempt {attempts}: {state}: {reason}")
+            _rewrite_publication(name, dict(record, state=state, reason=str(reason)[:400], attempts=attempts,
+                                            at=time.strftime("%Y-%m-%dT%H:%M:%S%z")))
+        else:
+            found = _read_back(channel, target, digests) == "posted"  # the last attempt landed, then hung
+    except Exception as exc:
+        log(f"prompt {tag}… {kind} retry stopped: {type(exc).__name__}")
+    if found:
+        state, reason = "sent", f"found in the thread after attempt {attempts} ({state}: {reason})"
+    sent = state == "sent"
+    _rewrite_publication(name, dict(record, sent=sent, state=state, delivery="posted" if sent else "failed",
+                                    reason=str(reason)[:400], attempts=attempts, pending=False,
+                                    **({"recovered": True} if found else {}),
+                                    at=time.strftime("%Y-%m-%dT%H:%M:%S%z")))
+    if found:
+        log(f"prompt {tag}… {kind} found in the thread after attempt {attempts}: POSTED, not sent again")
+    elif sent:
+        log(f"prompt {tag}… {kind} POSTED to thread on attempt {attempts}")
+    elif state in RETRYABLE_SEND_STATES:
+        log(f"prompt {tag}… {kind} NOT posted after {attempts} attempt(s): retries exhausted, no further retry: "
+            f"{state}: {reason}")
+    else:
+        log(f"prompt {tag}… {kind} NOT posted (no retry) on attempt {attempts}: {state}: {reason}")
+
+
 def publish_reply(event_id, channel, answer, kind="answer", *, ref=None, reply_to=None, preclaim=False):
     """Post *answer* once as the thread reply to *event_id*. True only when the wrapper sent it.
 
@@ -949,8 +1109,12 @@ def publish_reply(event_id, channel, answer, kind="answer", *, ref=None, reply_t
     ever, except an explicit replay after a proven pre-claim refusal can publish one terminal outcome
     under ``<event id>.answer``). That slot also holds terminal failure/uncertainty notices, never
     another answer after one. The journal records ``state`` as ``sent``, ``wrapper_refused``,
-    ``send_failed``, ``timeout`` or ``error``, with the ``reason``, and ``delivery`` is ``posted``
-    or ``failed``. A failure stays recorded as one and is never retried. An unattributed refusal has
+    ``send_failed``, ``timeout`` or ``error``, with the ``reason``, the body's ``body_sha256`` (never
+    the body) and ``attempts``; ``delivery`` is ``posted`` or ``failed``. Each attempt runs in its own
+    process group, killed whole at ``PUBLISH_TIMEOUT``. An answer whose attempt ends in ``timeout``,
+    ``send_failed`` or ``error`` is finished by ``_retry_publication`` on a thread of its own (False
+    here; the journal holds ``pending: true`` until it ends); every other failure, and every notice,
+    stays recorded as one and is never retried. An unattributed refusal has
     no event id: its notice passes ``event_id=None``, is journaled under its correlation key *ref*
     and replies to *reply_to*, the thread buzz-acp's ``[Context]`` names (None: the channel)."""
     name, target = (event_id, event_id) if event_id is not None else (ref, reply_to)
@@ -964,36 +1128,40 @@ def publish_reply(event_id, channel, answer, kind="answer", *, ref=None, reply_t
         return False
     handle = _peer_handle(channel)
     body = f"@{handle} {answer}" if handle and not answer.lstrip().startswith(f"@{handle}") else answer
-    try:
-        if handle is None:
-            raise _roster_module.RosterError("reply room inactive or roster unavailable")
-        done = subprocess.run(
-            [BUZZ_CLI, "messages", "send", "--channel", channel]
-            + (["--reply-to", target] if target else []) + ["--content", "-"],
-            input=body.encode("utf-8"), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            timeout=PUBLISH_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        done, state, reason = None, "timeout", f"no exit within {PUBLISH_TIMEOUT:g}s"
-    except Exception as exc:
-        done, state, reason = None, "error", f"{type(exc).__name__}: {exc}"[:300]
-    if done is not None:
-        try:
-            stderr = done.stderr.decode(errors="replace")
-            state, reason = _send_state(done.returncode, stderr), f"exit {done.returncode}: {stderr.strip()[:300]}"
-        except Exception as exc:  # the claimed marker is filled whatever the classification does
-            state = "sent" if done.returncode == 0 else "send_failed"
-            reason = f"exit {done.returncode}: stderr unclassifiable ({type(exc).__name__})"
+    if handle is None:  # nothing was sent: no attempt, and no retry
+        refusal = _roster_module.RosterError("reply room inactive or roster unavailable")
+        state, reason, attempts = "error", f"{type(refusal).__name__}: {refusal}"[:300], 0
+    else:
+        (state, reason), attempts = _send_attempt(channel, target, body), 1
     sent = state == "sent"
+    retry = bool(kind == "answer" and attempts and target and state in RETRYABLE_SEND_STATES)
+    record = {"journal": 2, **({"preclaim": True} if preclaim else {}),
+              "sent": sent, "state": state, "delivery": "posted" if sent else "failed",
+              "kind": kind, "event_id": event_id, "ref": ref, "channel": channel,
+              "roster_generation": getattr(_local, "roster_generation", None),
+              "reply_to": target, "reason": str(reason)[:400], "body_sha256": _sha256(body),
+              "attempts": attempts, **({"pending": True} if retry else {}),
+              "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
     with os.fdopen(fd, "w") as marker:
-        marker.write(json.dumps({"journal": 2, **({"preclaim": True} if preclaim else {}),
-                                 "sent": sent, "state": state, "delivery": "posted" if sent else "failed",
-                                 "kind": kind, "event_id": event_id, "ref": ref, "channel": channel,
-                                 "roster_generation": getattr(_local, "roster_generation", None),
-                                 "reply_to": target, "reason": str(reason)[:400],
-                                 "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}) + "\n")
-    log(f"prompt {tag}… {kind} {'POSTED' if sent else 'NOT posted (no retry)'} to thread: "
-        f"{state}: {reason}")
-    return sent
+        marker.write(json.dumps(record) + "\n")
+    if not retry:
+        log(f"prompt {tag}… {kind} {'POSTED' if sent else 'NOT posted (no retry)'} to thread: "
+            f"{state}: {reason}")
+        return sent
+    log(f"prompt {tag}… {kind} NOT posted on attempt 1: {state}: {reason}; the thread is read back before "
+        f"any retry")
+    digests = {_sha256(body), _sha256(f"@{handle} {body}")}
+    thread = threading.Thread(target=_retry_publication, args=(name, record, body, digests, tag),
+                              name=f"publish-retry-{tag}", daemon=True)
+    try:
+        thread.start()
+    except RuntimeError as exc:  # no thread to retry on: the first failure is the final one
+        _rewrite_publication(name, dict(record, pending=False))
+        log(f"prompt {tag}… {kind} NOT posted (no retry: {type(exc).__name__}): {state}: {reason}")
+        return False
+    with _RETRIES_LOCK:
+        _RETRIES[:] = [running for running in _RETRIES if running.is_alive()] + [thread]
+    return False
 
 
 # Fixed text: it names no sender, quotes no byte of any message and carries only the refusal's key.
@@ -2011,6 +2179,11 @@ def main():
             log("stdin closed; exiting" + (f" once {len(running)} running thread(s) finish" if running else ""))
             for thread in running:
                 thread.join()
+            with _RETRIES_LOCK:
+                retrying = sum(thread.is_alive() for thread in _RETRIES)
+            if retrying:  # never waited on: each stays journaled as its last failure, and nothing resumes it
+                log(f"{retrying} answer post(s) still retrying end with this process; each stays journaled "
+                    "as its last failure")
             break
         line = line.strip()
         if not line:
