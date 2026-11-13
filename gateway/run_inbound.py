@@ -29,6 +29,7 @@ from gateway.session import (
     SessionSource, build_session_context, is_shared_multi_user_session,
     neutralize_untrusted_inline_text,
 )
+from gateway.turn_context import ConversationHandoff
 from gateway.turn_lease import TurnLeaseTimeoutError
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1409,7 +1410,7 @@ class GatewayInboundMixin:
         _claim_state.turn.agent = _AGENT_PENDING_SENTINEL
         _claim_state.turn.event = event
         _claim_state.turn.started_ts = time.time()
-        event._turn_entered_agent = False
+        event._conversation_handoff = ConversationHandoff()
         self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
 
@@ -1444,14 +1445,14 @@ class GatewayInboundMixin:
                 logger.debug("post-turn hook failed: %s", _goal_exc)
             return _agent_result
         except BaseException:
-            # A drain cut this turn off. Until its durable marker exists, and before the agent ran
-            # (only it writes the user row or streams a reply; a failed marker write does not stop
-            # it), nothing else holds the message: the queue gave it up at the claim. A managed /acp
-            # task is never re-run as ordinary text.
+            # A drain cut this turn off. Until its durable marker exists, and before its agent
+            # conversation starts (the first step that writes the user row or streams a reply; a
+            # failed marker write does not stop the turn), nothing else holds the message: the queue
+            # gave it up at the claim. A managed /acp task is never re-run as ordinary text.
             if (self._draining and not is_internal and not _acp_managed
                     and getattr(event, "_gateway_active_turn_token", None) is None
-                    and not getattr(event, "_turn_entered_agent", False)):
-                await self._keep_cut_off_message_for_restart(event, source, _quick_key)
+                    and event._conversation_handoff.hand_back()):
+                self._keep_cut_off_message_for_restart(event, source, _quick_key)
             raise
         finally:
             # One-shot restore (/moa, /model --once) must run on EVERY exit path (success,
@@ -1479,31 +1480,21 @@ class GatewayInboundMixin:
                 # the lease its own turn acquired, never a newer turn's.
                 self._release_turn_lease(_quick_key, _run_generation)
 
-    async def _keep_cut_off_message_for_restart(self, event: MessageEvent, source: SessionSource,
-                                                session_key: str) -> None:
+    def _keep_cut_off_message_for_restart(self, event: MessageEvent, source: SessionSource,
+                                          session_key: str) -> None:
         """Keep the message of a turn a drain cut off after its claim and before its durable
-        active-turn marker: back at the session's queue head, where the shutdown flush writes it
-        out as it does a queued follow-up, and the session marked resume_pending, so the next
-        process replays the flush and its auto-resume turn answers it once."""
+        active-turn marker and agent conversation: back at the session's queue head, where the
+        shutdown flush writes it out as it does a queued follow-up, tagged so the next process runs
+        it, and the follow-ups behind it, as the owner's messages (``_redispatch_kept_messages``)."""
         adapter = self._delivery_adapter_for(source)
         if adapter is None:
             logger.warning("Restart cut off a turn on %s before it owned its message; no adapter "
                            "holds a queue for it", session_key)
             return
+        event._gateway_redispatch = True
         self._restore_undrained_pending_event(session_key, adapter, event)
         logger.info("Restart cut off a turn on %s before it owned its message: kept for the next process",
                     session_key)
-        reason = "restart_timeout" if self._restart_requested else "shutdown_timeout"
-        store = self.async_session_store
-        try:
-            if not await store.mark_resume_pending(session_key, reason):
-                # A first message cut off before its session existed: open it as the turn would have,
-                # so the next process can replay the flush into it and resume it.
-                await store.get_or_create_session(source)
-                if not await store.mark_resume_pending(session_key, reason):
-                    logger.warning("Could not mark %s resume_pending for its kept message", session_key)
-        except Exception as exc:
-            logger.warning("Could not mark %s resume_pending for its kept message: %s", session_key, exc)
 
     def _restore_pending_one_turn_model_override(self, session_key: str, run_generation: int | None = None) -> None:
         """Restore the per-session model override captured by ``/model --once`` or ``/moa``.

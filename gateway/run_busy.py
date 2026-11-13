@@ -345,6 +345,10 @@ class GatewayBusySessionMixin:
         (:meth:`_take_queued_event_for_claim`); a drain refuses the turn before it claims, and the head is
         then kept for the restart flush (:meth:`_end_unclaimed_reservation`). Nothing happens while
         the session is running anything else."""
+        self._start_queue_head(session_key, "released by a canonical peer turn")
+
+    def _start_queue_head(self, session_key: str, why: str) -> None:
+        """Hand an idle session to its FIFO head (see :meth:`_dispatch_queued_turn_after_peer_turn`)."""
         from gateway.run import _AGENT_PENDING_SENTINEL
         if self._is_session_running(session_key):
             return
@@ -355,7 +359,7 @@ class GatewayBusySessionMixin:
         turn = self._session_state(session_key).turn
         turn.agent, turn.event, turn.started_ts = _AGENT_PENDING_SENTINEL, head, time.time()
         head._turn_reservation = (session_key, adapter)
-        logger.info("Session %s released by a canonical peer turn: reserved for its queued follow-up", session_key)
+        logger.info("Session %s %s: reserved for its queued follow-up", session_key, why)
         if session_key in adapter._active_sessions and not adapter._session_task_is_stale(session_key):
             return
         if not adapter._start_session_processing(head, session_key):

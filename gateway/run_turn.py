@@ -2375,9 +2375,6 @@ class GatewayTurnMixin:
             # Admission/typing is not execution. All routing, authorization and
             # turn preparation gates have passed when the agent runner is entered.
             event._heartbeat_execution_started = True
-            # From here the agent may write this message's user row and stream a reply: a restart that
-            # cuts the turn off now hands nothing back, marker or not (_keep_cut_off_message_for_restart).
-            event._turn_entered_agent = True
             agent_result = await self._run_agent(
                 message=message_text, context_prompt=prepared.context_prompt, history=history, source=source,
                 session_id=_run_start_session_id, session_key=session_key,
@@ -2396,6 +2393,7 @@ class GatewayTurnMixin:
                 message_type=event.message_type,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
                 acp_admission=getattr(event, "_acp_admission", None),
+                conversation_handoff=getattr(event, "_conversation_handoff", None),
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -4516,7 +4514,7 @@ class GatewayTurnMixin:
         persist_user_message: Optional[Any] = None, persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None, message_type: Optional[str] = None,
         persist_user_display_metadata: Optional[dict] = None,
-        scheduled_heartbeat: bool = False, acp_admission: Any = None,
+        scheduled_heartbeat: bool = False, acp_admission: Any = None, conversation_handoff: Any = None,
     ) -> Dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
@@ -4528,6 +4526,8 @@ class GatewayTurnMixin:
             return {"final_response": acp_managed_ingress.REFUSED.format(reason="proxy mode"),
                     "messages": [], "api_calls": 0, "tools": []}
         if self._get_proxy_url():
+            if conversation_handoff is not None and not conversation_handoff.start_conversation():
+                return {"final_response": "", "messages": [], "api_calls": 0, "tools": []}
             return await self._run_agent_via_proxy(
                 message=message, context_prompt=context_prompt, history=history, source=source,
                 session_id=session_id, session_key=session_key, run_generation=run_generation,
@@ -4560,6 +4560,7 @@ class GatewayTurnMixin:
             persist_user_display_kind=persist_user_display_kind,
             persist_user_display_metadata=persist_user_display_metadata,
             scheduled_heartbeat=scheduled_heartbeat, acp_admission=acp_admission,
+            conversation_handoff=conversation_handoff,
         )
         _status_thread_metadata = self._run_agent_bind_turn_wiring(
             turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards,

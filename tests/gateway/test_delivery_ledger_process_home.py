@@ -100,7 +100,4 @@ async def test_boot_sweep_redelivers_a_reply_recorded_under_a_served_profile_sco
     runner = _runner(adapter)
     assert await runner._redeliver_pending_obligations() == 1
     assert adapter.sent == [dl.RECOVERED_MARKER + ANSWER]
-    with dl._connect() as conn:
-        [(created_at,)] = conn.execute(
-            "SELECT created_at FROM delivery_obligations WHERE session_key=?", (SESSION_KEY,)).fetchall()
-    runner._async_session_store.clear_resume_pending.assert_awaited_once_with(SESSION_KEY, marked_before=created_at)
+    runner._async_session_store.clear_resume_pending.assert_awaited_once_with(SESSION_KEY)

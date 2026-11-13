@@ -223,6 +223,30 @@ def _event_recovery_text(event: Any) -> str:
     return f"{text}\n{placeholder}" if text else placeholder
 
 
+def _event_redispatch_fields(event: Any) -> Dict[str, Any]:
+    """What the next process needs to run a queued event as the message it was: its own text, type,
+    id and source. ``redispatch`` marks a message whose turn a restart cut off before it owned it:
+    that message and every one flushed behind it in its session run again as the owner's messages
+    instead of being replayed as transcript rows."""
+    fields: Dict[str, Any] = {}
+    source = getattr(event, "source", None)
+    source_dict = source.to_dict() if hasattr(source, "to_dict") else None
+    if isinstance(source_dict, dict) and _json_safe(source_dict):
+        fields["source"] = source_dict
+    text = getattr(event, "text", None)
+    if isinstance(text, str):
+        fields["message_text"] = text
+    message_type = getattr(getattr(event, "message_type", None), "value", None)
+    if isinstance(message_type, str):
+        fields["message_type"] = message_type
+    message_id = getattr(event, "message_id", None)
+    if isinstance(message_id, (str, int)) and not isinstance(message_id, bool):
+        fields["message_id"] = str(message_id)
+    if getattr(event, "_gateway_redispatch", False) is True:
+        fields["redispatch"] = True
+    return fields
+
+
 def _serialise_value(value: Any) -> Optional[dict]:
     """Convert a pending message value to a JSON-serialisable dict."""
     if hasattr(value, "text"):  # MessageEvent-like object
@@ -232,6 +256,7 @@ def _serialise_value(value: Any) -> Optional[dict]:
             val = getattr(value, attr, None)
             if val is not None:
                 result[attr] = val if _json_safe(val) else str(val)
+        result.update(_event_redispatch_fields(value))
         return result
     if isinstance(value, str):  # runner-level _pending_messages
         return {"text": value}
@@ -240,8 +265,12 @@ def _serialise_value(value: Any) -> Optional[dict]:
     return {"text": str(value)}
 
 
-def recover_pending_to_db(session_db=None, *, session_resolver=None) -> int:
+def recover_pending_to_db(session_db=None, *, session_resolver=None, redispatch: Optional[list] = None) -> int:
     """Replay flush-dir ``*.json`` files via ``SessionDB.append_message``, deleting each on success.
+
+    A session whose flush holds a ``redispatch`` message (see ``_event_redispatch_fields``) is not
+    replayed from that message on: those payloads, in flush order, are appended to ``redispatch`` as
+    ``(path, payload)`` for the caller to run and delete, and are left on disk when no list is given.
 
     ``session_db=None`` opens (and afterwards releases) the shared default ``state.db``.
     ``session_resolver`` (optional ``(session_key, not_after=ts) -> (session_id, db) | None``, e.g.
@@ -284,6 +313,7 @@ def recover_pending_to_db(session_db=None, *, session_resolver=None) -> int:
         from hermes_state_registry import acquire
         session_db = acquire()
     recovered = 0
+    rerun_sessions: set = set()
     try:
         for path, payload in flush_files:
             # One unparseable payload or rejected append must only skip THIS file: the file is
@@ -291,6 +321,13 @@ def recover_pending_to_db(session_db=None, *, session_resolver=None) -> int:
             try:
                 if payload is None:
                     payload = json.loads(path.read_text(encoding="utf-8"))
+                data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+                if data.get("redispatch") is True:
+                    rerun_sessions.add(payload.get("session_key"))
+                if payload.get("session_key") in rerun_sessions and isinstance(data.get("source"), dict):
+                    if redispatch is not None:
+                        redispatch.append((path, payload))
+                    continue
                 # Agent-history snapshots are for manual operator recovery, not automatic DB
                 # insertion.
                 if payload.get("reason") == "shutdown-with-unpersisted-agent-history":

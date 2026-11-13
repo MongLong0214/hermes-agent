@@ -7,8 +7,33 @@ single-element lists so mutation stays visible to the outer body.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional
+
+
+class ConversationHandoff:
+    """Decides once who owns a claimed message when a drain cuts its turn off: the agent conversation,
+    which starts on an executor thread that cancelling the turn does not stop, or the restart, which
+    hands the message back for the next process. Whichever asks first wins."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._owner: Optional[str] = None
+
+    def _claim(self, owner: str) -> bool:
+        with self._lock:
+            if self._owner is None:
+                self._owner = owner
+            return self._owner == owner
+
+    def start_conversation(self) -> bool:
+        """True when the conversation may start: the restart has not taken the message back."""
+        return self._claim("conversation")
+
+    def hand_back(self) -> bool:
+        """True when the restart may take the message back: no conversation has started."""
+        return self._claim("restart")
 
 
 @dataclass
@@ -63,6 +88,8 @@ class TurnContext:
     # U4 H2: the ACP admission this turn runs under (an explicit /acp task); None for every other
     # turn, including follow-ups that drain after it. Settled by this turn only (TurnRunner.run_sync).
     acp_admission: Any = None
+    # The claimed message's ConversationHandoff (gateway/run_inbound.py); None for any other turn.
+    conversation_handoff: Any = None
     user_config: Any = None
     mute_notification_reply: bool = False
     enabled_toolsets: Any = None

@@ -2043,6 +2043,10 @@ class TurnRunner:
         self._wire_turn_agent_callbacks(agent, turn_route, reasoning_config, stream_delta_cb, interim_cb, want_interim)
         agent_history, observed_group_context, history_media_paths = self._load_turn_history(agent, reused_cached_agent)
         persist_msg, persist_ts = self._prepare_turn_message(agent_history)
+        if ctx.conversation_handoff is not None and not ctx.conversation_handoff.start_conversation():
+            # A restart cut the turn off and took its message back for the next process before the
+            # conversation, the first step that writes its user row or streams a reply, could start.
+            return {"final_response": "", "messages": [], "api_calls": 0, "tools": []}
         result = self._run_conversation_with_approval(agent, agent_history, observed_group_context, persist_msg, persist_ts)
         self._finish_stream_consumer(result, agent_history, stream_consumer)
         # The streaming-TTS consumer's finish() runs on the outer loop thread after the executor

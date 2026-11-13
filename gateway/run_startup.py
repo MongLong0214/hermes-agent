@@ -300,8 +300,7 @@ class GatewayStartupMixin:
     ) -> list:
         """Clear resume flags and return rows safe to redeliver. Startup recovery is best-effort;
         runtime reconnect recovery (``require_success``) is stricter: if the session-store write
-        fails the response must not be sent, or the turn could be resumed too. A flag marked after
-        the row's reply was recorded belongs to a newer interrupted turn and is kept."""
+        fails the response must not be sent, or the turn could be resumed too."""
         sendable = []
         for row in claimed:
             session_key = row.get("session_key") or ""
@@ -309,8 +308,7 @@ class GatewayStartupMixin:
                 sendable.append(row)
                 continue
             try:
-                await self.async_session_store.clear_resume_pending(
-                    session_key, marked_before=row.get("created_at"))
+                await self.async_session_store.clear_resume_pending(session_key)
             except Exception:
                 logger.debug("clear_resume_pending failed for %s", session_key, exc_info=True)
                 if require_success:
@@ -692,6 +690,40 @@ class GatewayStartupMixin:
         except Exception as exc:
             logger.warning("Skipping auto-resume for %s: authorization check failed: %s", session_key, exc)
         return False
+
+    def _redispatch_kept_messages(self, kept: list) -> None:
+        """Run the messages ``recover_pending_to_db`` set aside for re-dispatch as the owner sent them:
+        each session's are queued again in flush order, as they were before the restart, and the
+        session is handed to the first, which then runs as a queued follow-up does, on the platform
+        and chat it came from. A file is deleted once its message is queued again; a message whose
+        adapter is not connected keeps its file, and the ones behind it, for a later start."""
+        from gateway.platforms.event import MessageEvent, MessageType
+        from gateway.session import SessionSource
+        sessions: Dict[str, list] = {}
+        for path, payload in kept:
+            sessions.setdefault(payload["session_key"], []).append((path, payload["data"]))
+        for session_key, items in sessions.items():
+            for path, data in items:
+                try:
+                    source = SessionSource.from_dict(data["source"])
+                    event = MessageEvent(
+                        text=data.get("message_text", data.get("text", "")),
+                        message_type=MessageType(data.get("message_type") or MessageType.TEXT.value),
+                        source=source, message_id=data.get("message_id"),
+                        media_urls=list(data.get("media_urls") or []),
+                        media_types=list(data.get("media_types") or []),
+                    )
+                    adapter = self._delivery_adapter_for(source)
+                except Exception:
+                    logger.warning("Kept message for %s is unreadable", session_key, exc_info=True)
+                    adapter = None
+                else:
+                    event._hermes_startup_restore_replay = True  # accepted before the restart: not re-gated
+                if adapter is None or not self._enqueue_fifo(session_key, event, adapter):
+                    logger.warning("Kept message for %s could not be queued again; its file stays", session_key)
+                    break
+                path.unlink(missing_ok=True)
+            self._start_queue_head(session_key, "restarted with messages a restart kept")
 
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
         """Auto-continue fresh restart-interrupted sessions: synthesize an empty-text turn (the
@@ -1662,12 +1694,17 @@ class GatewayStartupMixin:
         await self._await_startup_boot_sends(
             planned_restart_notification_pending=_planned_restart_notification_pending(),
         )
-        # The previous process's shutdown flush goes into its sessions first, so a resumed turn answers
-        # a message the restart kept (a queued follow-up, or a turn cut off before it owned its message)
-        # instead of that message landing after its reply, unanswered.
+        # The previous process's shutdown flush goes into its sessions first. A message whose turn the
+        # restart cut off before it owned it runs again, with the follow-ups queued behind it, as the
+        # owner's messages; that session is then busy, so auto-resume skips it. Everything else is
+        # replayed as transcript rows, which a resumed turn then answers instead of leaving them
+        # after its reply.
+        kept: list = []
         with _log_suppressed(logging.WARNING, "Shutdown-flush recovery before auto-resume failed", exc_info=True):
             from gateway.shutdown_flush import recover_pending_to_db
-            recover_pending_to_db(session_resolver=self.session_store.resolve_session_id_for_key)
+            recover_pending_to_db(session_resolver=self.session_store.resolve_session_id_for_key, redispatch=kept)
+        with _log_suppressed(logging.WARNING, "Re-running kept messages failed", exc_info=True):
+            self._redispatch_kept_messages(kept)
         # Auto-resume restart-interrupted sessions (ledger-answered ones were cleared above); a failed
         # auto-resume stays visible on the next user message.
         self._schedule_resume_pending_sessions()
