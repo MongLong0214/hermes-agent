@@ -262,6 +262,69 @@ def hidden_declared_sources() -> list[dict[str, Any]]:
     return rows
 
 
+_LISTING_HEADER = ("Deferred tool catalog (call schemas via "
+                   f"`{TOOL_DESCRIBE_NAME}`, invoke via `{TOOL_CALL_NAME}`):")
+# The block shapes ``build_catalog_listing_with_form`` renders, in its own words; keep in step.
+_GROUP_HEADER_RE = re.compile(r"^(.+?) tools \(\d+\):$")
+_GROUP_SUMMARY_RE = re.compile(r"^(.+?) \(\d+ tools — names not listed; ")
+_GROUP_UNAVAILABLE_RE = re.compile(r"^(.+?) \((?:\d+ )?tools unavailable: ")
+# One-tool groups render as bare lines straight under the catalog header, without their label.
+_HEADLESS = ""
+
+
+def _listing_groups(text: str) -> dict[str, Any]:
+    """Per group label, the tool names a rendered listing names, or ``"summary"`` /
+    ``"unavailable"`` for a group shown without names; the headless one-tool lines are keyed
+    ``_HEADLESS``. The inverse of ``build_catalog_listing_with_form``. Text only: it runs under
+    the agent tools lock, where a registry lookup would nest the registry lock inside it."""
+    _, sep, listing = (text or "").partition(_LISTING_HEADER)
+    if not sep:
+        return {}
+    groups: dict[str, Any] = {_HEADLESS: set()}
+    current: Optional[set] = groups[_HEADLESS]
+    after_header = False
+    for line in listing.splitlines()[1:]:
+        if line.startswith("- "):
+            if current is not None:
+                current.add(line[2:].split(":", 1)[0].strip())
+        elif (m := _GROUP_HEADER_RE.match(line)):
+            current = groups.setdefault(m.group(1), set())
+            after_header = True
+            continue
+        elif (m := _GROUP_SUMMARY_RE.match(line)):
+            groups[m.group(1)], current = "summary", None
+        elif (m := _GROUP_UNAVAILABLE_RE.match(line)):
+            groups[m.group(1)], current = "unavailable", None
+        elif current is not None and after_header and line:
+            current.update(name.strip() for name in line.split(", ") if name.strip())
+        after_header = False
+    return {label: names if isinstance(names, str) else frozenset(names) for label, names in groups.items()}
+
+
+def listing_names_new_tools(kept: str, fresh: str) -> bool:
+    """True when ``fresh`` shows an available group ``kept`` does not show at all, or names a tool
+    ``kept`` names nowhere outside a group it showed without names. A group shown without names
+    (summarized or unavailable) on either side adds or hides no names, so availability changes,
+    recounts and budget-driven expansion or collapse are not growth. A headless one-tool line has
+    no label: a new name there is growth even when ``kept`` summarized its group (one extra refresh,
+    never a missed server)."""
+    if _LISTING_HEADER not in (kept or ""):
+        # Kept named nothing (listing off or over budget) and sent the model to search, which
+        # reads the live catalog; a listing that merely fits now advertises nothing new.
+        return False
+    kept_groups = _listing_groups(kept)
+    kept_names = frozenset().union(*(names for names in kept_groups.values() if not isinstance(names, str)))
+    for label, names in _listing_groups(fresh).items():
+        if names == "unavailable" or isinstance(kept_groups.get(label), str):
+            continue
+        if names == "summary":
+            if label not in kept_groups:
+                return True
+        elif names - kept_names:
+            return True
+    return False
+
+
 def build_catalog_listing_with_form(
     deferrable: list[dict[str, Any]], *, max_tokens: int = 4000) -> tuple[Optional[str], str]:
     """Render the deferred-catalog manifest: ``- name: short desc`` lines grouped per source.
@@ -295,8 +358,7 @@ def build_catalog_listing_with_form(
         # A one-tool group's "<label> tools (1):" heading says nothing its single line does not.
         return "\n".join(lines if len(tools) == 1 else [f"{label} tools ({len(tools)}):", *lines])
 
-    header = ("Deferred tool catalog (call schemas via "
-              f"`{TOOL_DESCRIBE_NAME}`, invoke via `{TOOL_CALL_NAME}`):")
+    header = _LISTING_HEADER
 
     def assemble_if_fits(modes: dict[str, str]) -> Optional[str]:
         # Headless one-tool lines go first, straight under the catalog header: placed between

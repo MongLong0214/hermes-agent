@@ -609,3 +609,154 @@ def test_snapshot_rebuild_never_grants_message_agent_to_unauthorized_sessions(
         assert _message_agent_schema_count(agent) == 0
         assert "message_agent" not in agent.valid_tool_names
         _assert_tool_snapshot_coherent(agent)
+
+
+# ---------------------------------------------------------------------------
+# Deferred listing growth: a late MCP server must reach tool_search's listing
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def listing_servers(monkeypatch):
+    """Group ``mcp__<server>__<tool>`` names by server, as the registry does for MCP toolsets, and
+    let a test declare servers that are configured but unavailable."""
+    from tools import tool_search_catalog as catalog
+
+    monkeypatch.setattr(catalog, "_classify_source", lambda name: ("mcp", "mcp-" + name.split("__")[1]))
+    hidden = []
+    monkeypatch.setattr(catalog, "hidden_declared_sources", lambda: list(hidden))
+    return hidden
+
+
+def _render_bridge(hidden, servers, *, unavailable=(), max_tokens=4000):
+    """The ``tool_search`` def the real assembler renders for ``{server: tool_count}``."""
+    from tools import tool_search_catalog as catalog
+    from tools.tool_search import bridge_tool_schemas
+
+    hidden[:] = [{"name": n, "tool_count": 50, "unavailable": "probe failed"} for n in unavailable]
+    deferred = [{"type": "function", "function": {
+        "name": f"mcp__{server}__tool{i:02d}", "description": "Does a, b, and c: then stops. More text."}}
+        for server, count in servers.items() for i in range(count)]
+    listing, form = catalog.build_catalog_listing_with_form(deferred, max_tokens=max_tokens)
+    return bridge_tool_schemas(len(deferred), listing=listing, listing_form=form)[0], form
+
+
+def _connect_server(monkeypatch, fresh_bridge):
+    """A server registering its tools moves the registry generation, so tools[] is not frozen."""
+    from tools import registry as registry_mod
+    from tools.tool_search_catalog import BRIDGE_TOOL_NAMES
+
+    monkeypatch.setattr(registry_mod.registry, "_generation", registry_mod.registry._generation + 1)
+    _registered(monkeypatch, ["read_file", *BRIDGE_TOOL_NAMES])
+    _serve(monkeypatch, [_tool("read_file"), fresh_bridge])
+
+
+def _bridge_agent(built):
+    agent = _agent(["read_file"])
+    agent.tools.append(built)
+    agent.valid_tool_names.add("tool_search")
+    return agent
+
+
+@pytest.mark.parametrize("late", [{"acp": 1}, {"acp": 3}], ids=["one-tool-server", "multi-tool-server"])
+def test_a_server_connected_after_turn_start_reaches_the_bridge_listing(monkeypatch, listing_servers, late):
+    """The listing is the only place a deferred tool is named to the model. A one-tool server
+    renders as a bare line without its group heading, so it must count as growth too."""
+    built, _ = _render_bridge(listing_servers, {"commitlore": 2})
+    grown, _ = _render_bridge(listing_servers, {"commitlore": 2, **late})
+    agent = _bridge_agent(built)
+    _connect_server(monkeypatch, grown)
+
+    _mcp_agent.refresh_agent_mcp_tools(agent, preserve_prefix=True)
+
+    assert agent.tools == [_tool("read_file"), grown]
+    assert "mcp__acp__tool00" in agent.tools[1]["function"]["description"]
+
+
+def test_an_unchanged_or_shrunk_listing_keeps_the_sent_bridge_bytes(monkeypatch, listing_servers):
+    built, _ = _render_bridge(listing_servers, {"commitlore": 2, "acp": 1})
+    agent = _bridge_agent(built)
+    for fresh_servers in ({"commitlore": 2, "acp": 1}, {"commitlore": 1, "acp": 1}, {"commitlore": 2}):
+        fresh, _ = _render_bridge(listing_servers, fresh_servers)
+        # A recount alone (the deferred-count sentence) moves the description, not the listing.
+        fresh["function"]["description"] = fresh["function"]["description"].replace("Search ", "Search  ", 1)
+        _connect_server(monkeypatch, fresh)
+        assert _mcp_agent.refresh_agent_mcp_tools(agent, preserve_prefix=True) == set()
+        assert agent.tools[1] is built
+
+
+def test_a_listing_grown_only_by_a_check_fn_flip_stays_frozen(monkeypatch, listing_servers):
+    """Registry generation and selection unchanged: only a check_fn flip can grow the listing,
+    and tools[] stays frozen for that (search reads the live catalog at dispatch)."""
+    built, _ = _render_bridge(listing_servers, {"commitlore": 2})
+    grown, _ = _render_bridge(listing_servers, {"commitlore": 2, "acp": 1})
+    agent = _bridge_agent(built)
+    _connect_server(monkeypatch, built)
+    _mcp_agent.refresh_agent_mcp_tools(agent, preserve_prefix=True)  # records generation + selection
+    _serve(monkeypatch, [_tool("read_file"), grown])
+
+    _mcp_agent.refresh_agent_mcp_tools(agent, preserve_prefix=True)
+
+    assert agent.tools[1] is built
+
+
+def test_only_a_newly_advertised_tool_counts_as_listing_growth(listing_servers):
+    """Availability wording and the listing budget change the bridge text without adding a tool:
+    a server turning unavailable, a summarized server whose names fit once another server left,
+    a server collapsed to a summary, or a listing that fits only now (the kept bridge named
+    nothing and sent the model to search). A new server, summarized, listed or headless, and a
+    new tool of a listed server are growth."""
+    grew = _mcp_agent._bridge_listing_grew
+    bridge = lambda *a, **k: _render_bridge(listing_servers, *a, **k)
+    listed, _ = bridge({"a": 2})
+    assert not grew(listed, bridge({}, unavailable=["a"])[0])
+    summarized, form = bridge({"x": 50, "y": 16}, max_tokens=100)
+    expanded, expanded_form = bridge({"y": 16}, unavailable=["x"], max_tokens=100)
+    assert (form, expanded_form) == ("groups", "names")
+    assert not grew(summarized, expanded)
+    full, full_form = bridge({"x": 3, "y": 16})
+    collapsed, collapsed_form = bridge({"x": 3, "y": 16}, max_tokens=100)
+    assert (full_form, collapsed_form) == ("full", "mixed")
+    assert not grew(full, collapsed)
+
+    servers = {f"s{i:02d}": 2 for i in range(16)}
+    unlisted, unlisted_form = bridge(servers, max_tokens=200)
+    fits_now, fits_form = bridge({"s00": 2}, unavailable=sorted(servers)[1:], max_tokens=200)
+    assert unlisted_form == "none" and fits_form != "none"
+    assert not grew(unlisted, fits_now)
+
+    assert grew(listed, bridge({"a": 2, "acp": 1})[0])
+    assert grew(listed, bridge({"a": 2, "acp": 2})[0])
+    assert grew(listed, bridge({"a": 3})[0])
+    assert grew(summarized, bridge({"x": 50, "y": 16, "acp": 16}, max_tokens=100)[0])
+
+
+def test_the_listing_parse_round_trips_every_rendered_form(listing_servers):
+    """``_listing_groups`` inverts ``build_catalog_listing_with_form`` for every form it renders:
+    each available group's names (headless one-tool lines keyed ``""``), ``"summary"`` for a
+    collapsed group and ``"unavailable"`` for a declared server that is down."""
+    from tools import tool_search_catalog as catalog
+
+    seen = set()
+    # A small group's names are cheaper than its summary line, so only a listing of groups whose
+    # names all outgrow their summaries collapses all the way to "groups".
+    for servers, max_tokens in [(servers, max_tokens) for servers in (
+            {"solo": 1, "pair": 2, "mid": 6, "big": 40}, {"wide": 5, "mid": 6, "big": 40})
+            for max_tokens in range(60, 1600, 4)]:
+        bridge, form = _render_bridge(listing_servers, servers, unavailable=["down"], max_tokens=max_tokens)
+        if form == "none":
+            continue
+        seen.add(form)
+        parsed = catalog._listing_groups(bridge["function"]["description"])
+        expected = {"": set(), "down": "unavailable"}
+        for server, count in servers.items():
+            names = frozenset(f"mcp__{server}__tool{i:02d}" for i in range(count))
+            if f"{server} ({count} tools — names not listed;" in bridge["function"]["description"]:
+                expected[server] = "summary"
+            elif count == 1:
+                expected[""] |= names
+            else:
+                expected[server] = names
+        expected[""] = frozenset(expected[""])
+        assert parsed == expected, (form, max_tokens)
+    assert seen == {"full", "names", "mixed", "groups"}
