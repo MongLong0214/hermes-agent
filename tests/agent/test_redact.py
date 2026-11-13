@@ -815,6 +815,19 @@ class TestStrictUrlCredentialRedaction:
         text = "/metrics?token_count=17&session_id=public"
         assert redact_sensitive_text(text, redact_url_credentials=True) == text
 
+    @pytest.mark.parametrize("param_name", sorted(
+        __import__("agent.redact", fromlist=["_SENSITIVE_QUERY_PARAMS"])._SENSITIVE_QUERY_PARAMS
+    ))
+    def test_every_declared_sensitive_param_is_masked(self, param_name):
+        """Every declared name is masked in the exact spelling it is declared as. ``x-amz-signature``
+        is declared with a hyphen, and the matcher folds hyphens to underscores before the lookup,
+        so a hyphenated name survives only if the canonicalization keeps it."""
+        secret = "SIG_" + "a" * 60
+        text = f"https://x.test/cb?{param_name}={secret}&view=public"
+        result = redact_sensitive_text(text, redact_url_credentials=True)
+        assert secret not in result, f"{param_name!r} leaked verbatim: {result!r}"
+        assert "view=public" in result
+
 
 class TestBareTokenUserinfoRedaction:
     """Regression tests for #6396 — a bare credential in URL userinfo
@@ -1682,6 +1695,51 @@ class TestRedactForEgress:
         from agent import redact as R
         monkeypatch.setattr(R, "redact_sensitive_text", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
         assert R.redact_for_egress("sk-live-0123456789abcdef") == R.REDACTION_UNAVAILABLE
+
+    @pytest.mark.parametrize("param_name", sorted(
+        __import__("agent.redact", fromlist=["_SENSITIVE_QUERY_PARAMS"])._SENSITIVE_QUERY_PARAMS
+    ))
+    def test_url_credential_opt_in_masks_every_declared_param(self, param_name):
+        """``redact_url_credentials=True`` masks every declared sensitive param, spelled exactly as
+        declared (hyphenated ``x-amz-signature`` included); the default leaves the URL alone."""
+        from agent.redact import redact_for_egress
+        secret = "SIG_" + "a" * 60
+        text = f"https://x.test/cb?{param_name}={secret}&view=public"
+
+        strict = redact_for_egress(text, redact_url_credentials=True)
+        assert secret not in strict, f"{param_name!r} leaked verbatim: {strict!r}"
+        assert "view=public" in strict
+        assert redact_for_egress(text) == text
+
+    def test_url_credential_opt_in_masks_signed_url_and_still_sweeps_bearer(self):
+        from agent.redact import redact_for_egress
+        out = redact_for_egress(
+            "GET https://x/?sig=SECRET&X-Amz-Signature=S2 failed; Bearer opaque0123456789abcdef",
+            redact_url_credentials=True)
+        assert "SECRET" not in out and "S2" not in out
+        assert "opaque0123456789abcdef" not in out
+        assert "https://x/?sig=" in out
+
+    @pytest.mark.parametrize("url", [
+        "https://example.com/docs/page?id=42&view=public",
+        "/metrics?token_count=17&session_id=public",
+        "see https://github.com/org/repo/pull/7#discussion_r1 for context",
+    ])
+    def test_default_output_unchanged_for_non_credential_urls(self, url):
+        """The kwarg defaults to off: the default call is the explicit ``False`` call, and neither
+        it nor the strict call rewrites a URL that carries no credential."""
+        from agent.redact import redact_for_egress
+        assert redact_for_egress(url) == url
+        assert redact_for_egress(url, redact_url_credentials=False) == url
+        assert redact_for_egress(url, redact_url_credentials=True) == url
+
+    def test_default_keeps_magic_link_query_tokens(self):
+        """Ordinary egress (a final reply, a status line) may carry a magic-link/OAuth-callback URL;
+        only callers whose text is a raw provider exception opt into the strict scrub."""
+        from agent.redact import redact_for_egress
+        link = "https://app.example/auth/callback?code=MAGICVALUE1234567890&state=xyz"
+        assert redact_for_egress(link) == link
+        assert "MAGICVALUE1234567890" not in redact_for_egress(link, redact_url_credentials=True)
 
 
 class TestWebappLaunchLinks:
