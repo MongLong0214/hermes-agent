@@ -324,3 +324,98 @@ def test_drain_transcript_spool_skips_parseable_non_dict_payload(tmp_path, monke
     replayed = []
     assert drain_transcript_spool("sess-1", replayed.append) == (1, 0)
     assert replayed == [{"role": "user", "content": "hi"}]
+
+
+# ── Voice-note and media heads keep their text (E3-P4) ─────────────────
+
+
+def _real_event(text, message_type=None, media_urls=(), media_types=()):
+    """A real adapter ``MessageEvent``: it has no ``session_id``, so recovery needs the resolver."""
+    from gateway.platforms.event import MessageEvent, MessageType
+
+    return MessageEvent(text=text, message_type=message_type or MessageType.TEXT,
+                        message_id="m-1", media_urls=list(media_urls), media_types=list(media_types))
+
+
+def _flush_and_recover(flush_dir, pending=None, overflow=None):
+    """Flush the slot heads and FIFO tails, then recover them into a mock store; return contents."""
+    if pending:
+        flush_pending_to_file(pending)
+    if overflow:
+        flush_overflow_to_file(overflow)
+    db = MagicMock()
+    recovered = recover_pending_to_db(session_db=MagicMock(),
+                                      session_resolver=lambda key, not_after=None: ("sid-1", db))
+    contents = [call.kwargs["content"] for call in db.append_message.call_args_list]
+    assert recovered == len(contents)
+    assert list(flush_dir.glob("*.json")) == []
+    return contents
+
+
+def _transcribe_like_the_drain(event, enriched_text):
+    """Run the runner's real once-only STT writer, so the cache lands where the drain leaves it."""
+    import asyncio
+    from gateway.run_inbound_transcription import GatewayInboundTranscriptionMixin
+
+    class _Stt(GatewayInboundTranscriptionMixin):
+        async def _enrich_message_with_transcription(self, user_text, audio_paths, clip_memo=None):
+            return enriched_text, ["Please check the deploy"]
+
+    asyncio.run(_Stt()._transcribe_pending_audio_event_once(event))
+
+
+def test_voice_note_transcribed_during_drain_recovers_the_transcript(tmp_path, monkeypatch):
+    from gateway.platforms.event import MessageType
+
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr("gateway.shutdown_flush._get_flush_dir", lambda: flush_dir)
+    voice = _real_event("", MessageType.VOICE, ["/cache/audio/voice-1.ogg"], ["audio/ogg"])
+    _transcribe_like_the_drain(voice, '[The user sent a voice message] "Please check the deploy"')
+    assert voice.text == ""  # the transcript lives only in the STT cache
+
+    [content] = _flush_and_recover(flush_dir, pending={"agent:main:telegram:dm:1": voice})
+    assert content.startswith('[The user sent a voice message] "Please check the deploy"')
+
+
+def test_media_only_event_becomes_placeholder_and_persists_media(tmp_path, monkeypatch):
+    from gateway.platforms.event import MessageType
+
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr("gateway.shutdown_flush._get_flush_dir", lambda: flush_dir)
+    photo = _real_event("", MessageType.PHOTO, ["/cache/img/a.jpg"], ["image/jpeg"])
+    flush_pending_to_file({"agent:main:telegram:dm:1": photo})
+    [payload] = [json.loads(f.read_text(encoding="utf-8")) for f in flush_dir.glob("*.json")]
+    assert payload["data"]["text"] == "[User sent an image: /cache/img/a.jpg]"
+    assert payload["data"]["media_urls"] == ["/cache/img/a.jpg"]
+    assert payload["data"]["media_types"] == ["image/jpeg"]
+
+    assert _flush_and_recover(flush_dir) == ["[User sent an image: /cache/img/a.jpg]"]
+
+
+@pytest.mark.parametrize("text", ["plain text stays as is", "  spaced\nlines  "])
+def test_text_event_text_is_unchanged(tmp_path, monkeypatch, text):
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr("gateway.shutdown_flush._get_flush_dir", lambda: flush_dir)
+    assert _flush_and_recover(flush_dir, pending={"agent:main:telegram:dm:1": _real_event(text)}) == [text]
+
+
+def test_recovery_keeps_ts_seq_order_for_voice_media_and_text(tmp_path, monkeypatch):
+    """Head (no seq) then the FIFO tail by seq, even when filenames sort the other way."""
+    from types import SimpleNamespace
+    from gateway.platforms.event import MessageType
+
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr("gateway.shutdown_flush._get_flush_dir", lambda: flush_dir)
+    names = iter(f"{n:02d}" for n in range(99, 0, -1))  # each later file sorts earlier by name
+    monkeypatch.setattr("gateway.shutdown_flush.uuid",
+                        SimpleNamespace(uuid4=lambda: SimpleNamespace(hex=next(names))))
+    voice = _real_event("", MessageType.VOICE, ["/cache/audio/v.ogg"], ["audio/ogg"])
+    _transcribe_like_the_drain(voice, "head transcript")
+    tail = [_real_event("", MessageType.PHOTO, ["/cache/img/b.jpg"], ["image/jpeg"]),
+            _real_event("tail text"),
+            _real_event("caption", MessageType.DOCUMENT, ["/cache/doc/e.pdf"], ["application/pdf"])]
+
+    contents = _flush_and_recover(flush_dir, pending={"k": voice}, overflow={"k": tail})
+    assert [c.splitlines()[0] for c in contents] == [
+        "head transcript", "[User sent an image: /cache/img/b.jpg]", "tail text", "caption"]
+    assert contents[3] == "caption\n[User sent a file: /cache/doc/e.pdf]"
