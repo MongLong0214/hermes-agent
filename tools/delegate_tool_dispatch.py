@@ -22,6 +22,7 @@ from tools.delegate_tool_progress import (
 )
 from tools.delegate_tool_registry import _capture_gateway_steer_authority
 from tools.delegate_tool_results import _finalize_child_results
+from tools.registry import tool_error
 
 logger = logging.getLogger("tools.delegate_tool")  # log-record parity with the origin module
 
@@ -457,11 +458,24 @@ def _restore_parent_cancellation(unit: _Batch) -> None:
     for _, _, child in unit.children:
         _attach_child(unit.parent_agent, child)
 
+_NOT_STARTED_HINT = "Retry, or run the task(s) with background=false."
+
+def _dispose_unrun(unit: _Batch) -> None:
+    """Children that will never run: off the parent's stop fan-out, closed, and folded into the call's metrics row."""
+    for _, _, child in unit.children:
+        _detach_child(unit.parent_agent, child)
+        _close_child(child, "Failed to close a subagent that never started")
+    finish_delegation_unit(unit.task_list, [{"status": "error"}] * len(unit.children), background=True)
+
+def _task_entries(units: list[_Batch], error: str, **extra: Any) -> list[dict]:
+    return [{"task_index": i, "goal": t["goal"], "error": error, **extra} for unit in units for i, t, _ in unit.children]
+
 def _dispatch_background(batch: _Batch) -> str:
     """Dispatch the call as independent async units (see ``_units_of``) and return the tool result JSON. Every unit
     of one call shares ONE pool slot (``slot_key``), so grouping never changes capacity accounting. Falls back to
     running synchronously (with an explanatory ``note``) when the session cannot receive detached completions or the
-    async pool is at capacity."""
+    async pool is at capacity. A unit state.db could not record (``not_started``) or whose admission raised
+    (``outcome_uncertain``: a worker may already be running it) is reported and never run inline."""
     from tools.delegate_tool import _get_max_async_children
     wake_sid = _resolve_async_wake_sid(
         batch.origin_wake_sid, batch.origin_session_history_delivery,
@@ -481,6 +495,8 @@ def _dispatch_background(batch: _Batch) -> str:
     units = [replace(unit, refused=[]) for unit in _units_of(batch)]
     dispatched: list[tuple[_Batch, str]] = []
     inline_results: list[dict] = []
+    not_started: list[dict] = []
+    outcome_uncertain: list[dict] = []
     slot_key: Optional[str] = None
     for k, unit in enumerate(units):
         # One unit keeps the live-transcript directory's id so the returned delegation_id matches
@@ -491,25 +507,62 @@ def _dispatch_background(batch: _Batch) -> str:
         # unsubmitted units must still receive parent stops while a fallback runs.
         for _, _, child in unit.children:
             _detach_child(parent_agent, child)
-        dispatch = _dispatch_unit(unit, unit_id, slot_key, routing)
+        try:
+            dispatch = _dispatch_unit(unit, unit_id, slot_key, routing)
+        except Exception as exc:  # the unit's children are detached: never raise past their restore
+            logger.warning("delegate_task: async admission of unit %d/%d raised", k + 1, len(units), exc_info=True)
+            dispatch = {"status": "rejected", "reason": "raised", "error": f"{type(exc).__name__}: {exc}"}
         if dispatch.get("status") == "dispatched":
             slot_key = slot_key or dispatch["delegation_id"]
             dispatched.append((unit, dispatch["delegation_id"]))
             continue
-        _restore_parent_cancellation(unit)
+        reason = dispatch.get("reason")
+        if reason == "persistence":  # never submitted: nothing will ever run these children
+            _dispose_unrun(unit)
+        else:  # a raise leaves submission unresolved, so the children stay owned by the parent
+            _restore_parent_cancellation(unit)
+        if reason in ("persistence", "raised"):
+            if not dispatched:
+                later = units[k + 1:]
+                for unsubmitted in later:
+                    _dispose_unrun(unsubmitted)
+                if reason == "persistence":
+                    return tool_error(
+                        f"Background delegation could not be dispatched: {dispatch['error']}. {_NOT_STARTED_HINT}",
+                        status="error", not_started=_task_entries([unit, *later], dispatch["error"]))
+                return tool_error(
+                    f"Background delegation scheduling raised and whether it started running is unresolved: "
+                    f"{dispatch['error']}. Do not retry or run it with background=false yet: if it is running, "
+                    "its result still arrives as a completion.",
+                    status="error", outcome_uncertain=True,
+                    **({"not_started": _task_entries(later, "not submitted")} if later else {}))
+            if reason == "persistence":
+                logger.warning("delegate_task: unit %d/%d not dispatched (%s); reporting it as not started.",
+                               k + 1, len(units), dispatch["error"])
+                not_started.extend(_task_entries([unit], f"{dispatch['error']}. {_NOT_STARTED_HINT}"))
+            else:
+                logger.warning("delegate_task: unit %d/%d admission raised (%s); reporting its outcome as unresolved.",
+                               k + 1, len(units), dispatch["error"])
+                outcome_uncertain.extend(_task_entries([unit], dispatch["error"], outcome_uncertain=True))
+            continue
         if not dispatched:
             logger.info(
                 "delegate_task: async pool at capacity (%s); running the whole batch synchronously instead.",
                 dispatch.get("error", "rejected"),
             )
             return _run_sync_with_note(batch, "at_capacity")
-        # Later units of an admitted call share its slot and cannot be capacity-rejected; a scheduler failure runs
-        # the unit inline so no task is silently dropped.
+        # Later units of an admitted call share its slot and cannot be capacity-rejected; a clean scheduler failure
+        # (the item provably never ran) runs the unit inline so no task is silently dropped.
         logger.warning("delegate_task: unit %d/%d not accepted (%s); running it inline.", k + 1, len(units), dispatch.get("error"))
         inline_results.extend(_execute_and_aggregate(unit)["results"])
     payload = _dispatched_payload(batch, dispatched)
     if inline_results:
         payload["inline_results"] = inline_results
+    if not_started:
+        payload["not_started"] = not_started
+    if outcome_uncertain:
+        # Not "not_started": these may be running, and a real completion still arrives if so.
+        payload["outcome_uncertain"] = outcome_uncertain
     return json.dumps(payload, ensure_ascii=False)
 
 def _run_batch(batch: _Batch, background: bool) -> str:

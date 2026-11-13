@@ -14,6 +14,7 @@ from __future__ import annotations
 import threading
 import weakref
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import thread as _cf_thread
 from concurrent.futures.thread import _worker
 from contextvars import copy_context
 
@@ -28,12 +29,44 @@ class DaemonThreadPoolExecutor(ThreadPoolExecutor):
 
         Thread-start context cannot track later submissions from other profiles
         (#54937). The stdlib worker context manages initialization, not contextvars.
-        """
-        ctx = copy_context()
 
-        def _run_with_context(*call_args, **call_kwargs):
-            return ctx.run(fn, *call_args, **call_kwargs)
-        return super().submit(_run_with_context, *args, **kwargs)
+        Mirrors ``ThreadPoolExecutor.submit`` so a caller can tell a safe failure from an
+        ambiguous one. Anything that raises before the item reaches ``_work_queue`` is tagged
+        ``exc.never_enqueued = True``: that item can never run. A failure in
+        ``_adjust_thread_count()`` comes after the put, when an idle worker may already be
+        running the item, so it stays untagged and the caller must look for its item in
+        the queue (the wrapper's ``__wrapped__`` names the callable it was given).
+        """
+        try:
+            ctx = copy_context()
+
+            def _run_with_context(*call_args, **call_kwargs):
+                return ctx.run(fn, *call_args, **call_kwargs)
+            _run_with_context.__wrapped__ = fn
+        except Exception as exc:  # tag and re-raise
+            exc.never_enqueued = True
+            raise
+        with self._shutdown_lock, _cf_thread._global_shutdown_lock:
+            try:
+                if self._broken:
+                    raise getattr(self, "BROKEN", _cf_thread.BrokenThreadPool)(self._broken)
+                if self._shutdown:
+                    raise RuntimeError('cannot schedule new futures after shutdown')
+                if _cf_thread._shutdown:
+                    raise RuntimeError('cannot schedule new futures after interpreter shutdown')
+                future = _cf_thread._base.Future()
+                if hasattr(self, "_resolve_work_item_task"):
+                    # Python 3.14: a work item holds one resolved task, not fn/args/kwargs.
+                    work_item = _cf_thread._WorkItem(
+                        future, self._resolve_work_item_task(_run_with_context, args, kwargs))
+                else:
+                    work_item = _cf_thread._WorkItem(future, _run_with_context, args, kwargs)
+                self._work_queue.put(work_item)
+            except Exception as exc:  # tag and re-raise
+                exc.never_enqueued = True
+                raise
+            self._adjust_thread_count()
+            return future
 
     def _adjust_thread_count(self) -> None:
         # Mirrors CPython's implementation with two changes:
