@@ -1224,3 +1224,193 @@ def test_prune_never_evicts_live_records():
 
     assert {"live-stalling", "live-finalizing", "live-running"} <= survivors
     assert "done-0" not in survivors and len(survivors - {"live-stalling", "live-finalizing", "live-running"}) == ad._MAX_RETAINED_COMPLETED
+
+
+def _insert_ledger_rows(rows):
+    """Raw terminal rows ``(delegation_id, delivery_state, updated_at)``; no prune runs while seeding."""
+    with ad._DB_LOCK, ad._transaction() as conn:
+        for delegation_id, delivery_state, updated_at in rows:
+            conn.execute(
+                "INSERT INTO async_delegations (delegation_id, origin_session, parent_session_id, state, "
+                "dispatched_at, completed_at, updated_at, delivery_state, delivery_attempts, event_json, result_json) "
+                "VALUES (?, 's', 'parent', 'completed', ?, ?, ?, ?, 0, ?, ?)",
+                (delegation_id, updated_at, updated_at, updated_at, delivery_state,
+                 json.dumps({"type": "async_delegation", "delegation_id": delegation_id, "session_key": "s",
+                             "parent_session_id": "parent", "status": "completed", "summary": delegation_id}),
+                 json.dumps({"status": "completed", "summary": delegation_id})))
+
+
+def _ledger_states():
+    with ad._DB_LOCK, ad._transaction() as conn:
+        return dict(conn.execute("SELECT delegation_id, delivery_state FROM async_delegations").fetchall())
+
+
+def test_history_cap_never_evicts_an_undelivered_pending_row(tmp_path, monkeypatch):
+    """The 50-row terminal-history cap bounds delivered/dropped history only. Pending rows older than
+    the history are not eviction candidates, even once no delivered row is left to evict first."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    now = time.time()
+    pending = [f"pending-{i}" for i in range(5)]
+    history = [f"dropped-{i}" for i in range(ad._MAX_RETAINED_COMPLETED + 5)]
+    _insert_ledger_rows([(d, "pending", now - 1000 + i) for i, d in enumerate(pending)]
+                        + [(d, "dropped", now - 500 + i) for i, d in enumerate(history)])
+
+    ad._prune_durable_records()
+
+    states = _ledger_states()
+    assert all(states.get(d) == "pending" for d in pending), "no pending row was evicted"
+    assert sum(1 for s in states.values() if s == "dropped") == ad._MAX_RETAINED_COMPLETED
+    assert not any(d in states for d in history[:5]), "the history cap still drops the oldest history"
+
+
+def test_history_cap_still_prefers_delivered_rows(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    now = time.time()
+    _insert_ledger_rows([(f"pending-{i}", "pending", now - 1000 + i) for i in range(5)]
+                        + [(f"delivered-{i}", "delivered", now - 500 + i) for i in range(ad._MAX_RETAINED_COMPLETED)]
+                        + [(f"dropped-{i}", "dropped", now - 900 + i) for i in range(3)])
+
+    ad._prune_durable_records()
+
+    states = _ledger_states()
+    assert sum(1 for s in states.values() if s == "pending") == 5
+    assert sum(1 for s in states.values() if s in ("delivered", "dropped")) == ad._MAX_RETAINED_COMPLETED
+    assert all(f"dropped-{i}" in states for i in range(3)), "delivered rows are evicted before dropped ones"
+
+
+def test_prune_durable_records_never_drops_undelivered_pending(tmp_path, monkeypatch):
+    """A dispatch's own prune must not delete any of 51 still-pending completions, and every one
+    stays restorable."""
+    import queue
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    now = time.time()
+    delegation_ids = [f"deleg-pending-{i}" for i in range(ad._MAX_RETAINED_COMPLETED + 1)]
+    for i, delegation_id in enumerate(delegation_ids):
+        ad._persist_dispatch({
+            "delegation_id": delegation_id, "session_key": "s", "origin_ui_session_id": "",
+            "parent_session_id": "parent", "dispatched_at": now + i,
+        })
+        ad._persist_completion(
+            {"delegation_id": delegation_id, "status": "completed", "completed_at": now + i},
+            {"status": "completed", "summary": f"done-{i}"},
+        )
+    ad._persist_dispatch({
+        "delegation_id": "deleg-next-dispatch", "session_key": "s", "origin_ui_session_id": "",
+        "parent_session_id": "parent", "dispatched_at": now + 1000,
+    })
+
+    states = _ledger_states()
+    assert {d for d, s in states.items() if s == "pending" and d != "deleg-next-dispatch"} == set(delegation_ids)
+    restored_queue = queue.Queue()
+    assert ad.restore_undelivered_completions(restored_queue) == len(delegation_ids)
+    restored_ids = set()
+    while not restored_queue.empty():
+        restored_ids.add(restored_queue.get_nowait()["delegation_id"])
+    assert restored_ids == set(delegation_ids)
+
+
+def test_persist_dispatch_failure_frees_slot_and_reports_error(monkeypatch):
+    """A pre-submit durable write failure must not strand the in-memory ``running`` record in a
+    capacity slot: the dispatch undoes its record, reports the failure, and the slot is free."""
+    real_persist_dispatch = ad._persist_dispatch
+    calls = {"n": 0}
+
+    def boom_once(record):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("database is locked")
+        return real_persist_dispatch(record)
+
+    monkeypatch.setattr(ad, "_persist_dispatch", boom_once)
+
+    res = ad.dispatch_async_delegation(
+        goal="g", context=None, toolsets=None, role="leaf", model="m", session_key="",
+        runner=lambda: {"status": "completed", "summary": "done"}, max_async_children=1,
+    )
+    assert res["status"] == "rejected" and res.get("reason") == "persistence"
+    assert "database is locked" in res["error"]
+    assert ad.active_count() == 0
+    with ad._records_lock:
+        assert not ad._records
+
+    res2 = ad.dispatch_async_delegation(
+        goal="g2", context=None, toolsets=None, role="leaf", model="m", session_key="",
+        runner=lambda: {"status": "completed", "summary": "done2"}, max_async_children=1,
+    )
+    assert res2["status"] == "dispatched"
+    evt = _drain_for(res2["delegation_id"])
+    assert evt is not None and evt["status"] == "completed" and evt["summary"] == "done2"
+
+
+def _abandoned_row_with_blocked_git_probe(tmp_path, monkeypatch):
+    from gateway import status as gw_status
+    from tools import async_delegation_recovery_hints as hints
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(gw_status, "_pid_exists", lambda pid: False)  # every owner reads as dead
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute(
+            "INSERT INTO async_delegations (delegation_id, origin_session, state, dispatched_at, "
+            "updated_at, delivery_state, delivery_attempts, owner_pid, owner_started_at, task_json) "
+            "VALUES ('d-abandoned', 's', 'running', 1.0, 1.0, 'pending', 0, 424242, 1, ?)",
+            (json.dumps({"goal": "g", "owner_cwd": str(tmp_path)}),),
+        )
+    entered, release = threading.Event(), threading.Event()
+
+    def blocking_git_state_hint(cwd):  # no hint: the probe found nothing
+        entered.set()
+        release.wait(timeout=5)
+
+    monkeypatch.setattr(hints, "git_state_hint", blocking_git_state_hint)
+    return entered, release
+
+
+def _write_within(fn, seconds=2.0) -> bool:
+    done = threading.Event()
+    writer = threading.Thread(target=lambda: (fn(), done.set()))
+    writer.start()
+    writer.join(timeout=seconds)
+    return done.is_set()
+
+
+def test_recover_abandoned_delegations_releases_lock_during_git_probe(tmp_path, monkeypatch):
+    """Recovery's git-state probe (up to three serial 5 s `git` calls) runs outside ``_DB_LOCK``, so
+    a concurrent dispatch's ledger write is not blocked for the length of the probe."""
+    entered, release = _abandoned_row_with_blocked_git_probe(tmp_path, monkeypatch)
+    outcome = {}
+    recover_thread = threading.Thread(target=lambda: outcome.update(n=ad.recover_abandoned_delegations()))
+    recover_thread.start()
+    try:
+        assert entered.wait(timeout=5), "recovery never reached the git-state hint"
+        assert _write_within(lambda: ad._persist_dispatch({
+            "delegation_id": "d-live", "session_key": "s", "origin_ui_session_id": "",
+            "parent_session_id": None, "dispatched_at": time.time()})), \
+            "a concurrent ledger write waited on the blocked git-state hint"
+    finally:
+        release.set()
+        recover_thread.join(timeout=5)
+    assert not recover_thread.is_alive()
+    assert outcome["n"] == 1
+    assert ad.get_durable_delegation("d-abandoned")["state"] == "unknown"
+    assert ad.get_durable_delegation("d-live")["state"] == "running"
+
+
+def test_recovery_never_clobbers_a_row_finished_during_the_probe(tmp_path, monkeypatch):
+    """With the lock released for the probe, a row that reached a terminal state meanwhile keeps it."""
+    entered, release = _abandoned_row_with_blocked_git_probe(tmp_path, monkeypatch)
+    outcome = {}
+    recover_thread = threading.Thread(target=lambda: outcome.update(n=ad.recover_abandoned_delegations()))
+    recover_thread.start()
+    try:
+        assert entered.wait(timeout=5), "recovery never reached the git-state hint"
+        finished = _write_within(lambda: ad._persist_completion(
+            {"delegation_id": "d-abandoned", "status": "completed", "completed_at": time.time()},
+            {"status": "completed", "summary": "real result"}))
+    finally:
+        release.set()
+        recover_thread.join(timeout=5)
+    assert finished, "the completion write waited on the blocked git-state hint"
+    assert outcome["n"] == 0
+    row = ad.get_durable_delegation("d-abandoned")
+    assert row["state"] == "completed" and row["result"]["summary"] == "real result"
