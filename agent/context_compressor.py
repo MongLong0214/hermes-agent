@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from agent.image_eviction_policy import images_all_within_many_image_limit, latched_retire_count, outbound_image_retire_count, outbound_retired_image_ids
+from agent.canonical_peer import peer_metadata, peer_wire_text
 from agent.compression_marker import (
     ELISION_MARKER_MAX_LEN,
     _elision_marker,
@@ -3410,12 +3411,12 @@ class ContextCompressor(
 
     def _serialize_records_for_summary(self, turns: list[dict[str, Any]]) -> list[str]:
         """Serialize turns into a list of labeled, redacted records for the summarizer."""
-        # Lazy import: agent_runtime_helpers pulls heavy transitive imports.
-        from agent.agent_runtime_helpers import strip_think_blocks
+        from agent.agent_runtime_helpers import strip_think_blocks  # lazy: heavy transitive imports
         parts = []
         for msg in turns:
             role = msg.get("role", "unknown")
-            content = msg.get("content")
+            is_peer = peer_metadata(msg) is not None  # a peer's body reaches the summarizer only quoted
+            content = peer_wire_text(msg) if is_peer else msg.get("content")
             if isinstance(content, list):
                 content = "\n".join(_summary_part_text(part) for part in content if isinstance(part, (dict, str)))
             content = _redact_compaction_text(content or "")
@@ -3430,7 +3431,7 @@ class ContextCompressor(
                 continue
             if role == "assistant" and msg.get("tool_calls", []):
                 content += "\n[Tool calls:\n" + "\n".join(map(self._render_tool_call_for_summary, msg["tool_calls"])) + "\n]"
-            parts.append(f"[{role.upper()}]: {content}")
+            parts.append(f"[{'PEER' if is_peer else role.upper()}]: {content}")
         return parts
 
     def _serialize_for_summary(self, turns: list[dict[str, Any]]) -> str:
@@ -3463,7 +3464,8 @@ class ContextCompressor(
                     _collect_paths_from_jsonish(parsed, relevant_files)
         for msg in turns_to_summarize:
             role = msg.get("role", "unknown")
-            content = msg.get("content")
+            is_peer = peer_metadata(msg) is not None  # a peer turn is never an owner ask: quoted, labelled PEER
+            content = peer_wire_text(msg) if is_peer else msg.get("content")
             text = _compact_fallback_turn(_typed_user_text(content) if role == "user" and isinstance(content, str) else content)
             _collect_path_mentions(text, relevant_files)
             synthetic_user = role == "user" and self._is_synthetic_compression_user_turn(msg)
@@ -3472,13 +3474,13 @@ class ContextCompressor(
             if tool_names:
                 prefix = "tool calls: " + ", ".join(tool_names[:6])
                 turn_text = f"{prefix}; {turn_text}" if turn_text else prefix
-            turn_label = "INTERNAL CONTEXT" if synthetic_user else str(role).upper()
+            turn_label = "PEER" if is_peer else "INTERNAL CONTEXT" if synthetic_user else str(role).upper()
             if turn_text.strip():
                 last_dropped_turns.append(f"{turn_label}: {turn_text.strip()}")
                 del last_dropped_turns[:-8]
             if len(text) > 600:
                 text = text[:420].rstrip() + " ... " + text[-160:].lstrip()
-            if role == "user" and text and not synthetic_user:
+            if role == "user" and text and not synthetic_user and not is_peer:
                 user_asks.append(text)
             elif role == "assistant":
                 if tool_names:
@@ -4769,20 +4771,18 @@ Write only the summary body. Do not include any preamble or prefix."""
     ) -> list[dict[str, Any]]:
         """Restate an unfinished user task after the compaction handoff.
 
-        ``SUMMARY_PREFIX`` instructs the model to act only on a user message
-        that appears AFTER the summary, and to do nothing when none does.  When
-        the single in-flight instruction lived in the protected head, the
-        assembled transcript orders it before the handoff and the run ends in a
-        ``[SILENT]`` no-op that the scheduler records as success (#100818).
+        ``SUMMARY_PREFIX`` instructs the model to act only on a user message that appears AFTER the summary, and
+        to do nothing when none does.  When the single in-flight instruction lived in the protected head, the
+        assembled transcript orders it before the handoff and the run ends in a ``[SILENT]`` no-op that the
+        scheduler records as success (#100818).
 
-        Re-append a copy of that turn after the surviving tail so the prefix's
-        "latest user message" pointer resolves to it again.  If the transcript
-        already ends on a template-visible user row, appending a second one
-        would break user/assistant alternation, so the restatement is merged
-        onto the handoff carrier instead — after ``_SUMMARY_END_MARKER``, which
-        is the boundary the prefix's rule is written against.
+        Re-append a copy of that turn after the surviving tail so the prefix's "latest user message" pointer
+        resolves to it again.  If the transcript already ends on a template-visible user row, appending a second
+        one would break user/assistant alternation, so the restatement is merged onto the handoff carrier instead
+        — after ``_SUMMARY_END_MARKER``, which is the boundary the prefix's rule is written against.  A canonical
+        peer turn is no owner task to re-animate: its body reaches a model only as its own admitted row.
         """
-        if inflight is None or not compressed:
+        if inflight is None or not compressed or peer_metadata(inflight) is not None:
             return compressed
 
         carrier_idx = -1

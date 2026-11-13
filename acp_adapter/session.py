@@ -472,25 +472,32 @@ class SessionManager:
         if row is None or row.get("source") != "acp":
             return None
 
-        # A previous adapter process stamped the row ended at its stdio
-        # shutdown (#118216); resuming the conversation reopens it, the same
-        # contract the TUI gateway's cold-resume path uses.
-        if row.get("ended_at") is not None:
-            try:
-                db.reopen_session(session_id)
-            except Exception:
-                logger.debug("Failed to reopen ACP session %s", session_id, exc_info=True)
-
         meta = _parse_model_config(row.get("model_config"))
         cwd, model = meta.get("cwd", "."), row.get("model") or None
 
         # repair_alternation: this list becomes the resumed agent's LIVE conversation; a durable
         # ``user;user`` violation in state.db would otherwise re-fire the pre-request repair every request.
+        from agent.canonical_peer import PeerProvenanceError
+
         try:
             history = db.get_messages_as_conversation(session_id, repair_alternation=True)
+        except PeerProvenanceError:
+            # A canonical peer row whose provenance is missing or unadmitted: refuse the resume rather
+            # than start an agent on a history that dropped (or could pass off) a peer as the owner.
+            logger.error("Refusing to resume ACP session %s: canonical peer provenance is invalid", session_id)
+            return None
         except Exception:
             logger.warning("Failed to load messages for ACP session %s", session_id, exc_info=True)
             history = []
+
+        # A previous adapter process stamped the row ended at its stdio shutdown (#118216); resuming
+        # the conversation reopens it (a refused resume never does), the same contract the TUI
+        # gateway's cold-resume path uses.
+        if row.get("ended_at") is not None:
+            try:
+                db.reopen_session(session_id)
+            except Exception:
+                logger.debug("Failed to reopen ACP session %s", session_id, exc_info=True)
 
         try:
             agent = self._make_agent(
