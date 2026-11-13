@@ -1285,3 +1285,11 @@ class CanonicalReceiptCoordinator:
                     proof.session_key, run_generation=run_generation
                 )
             self._runner._turn_leases.release(lease)
+            if run_generation is not None:
+                # In the same synchronous step, so no other event is admitted first: an owner
+                # follow-up queued behind this peer turn takes the session now. Never let it mask
+                # this event's answer.
+                try:
+                    self._runner._dispatch_queued_turn_after_peer_turn(proof.session_key)
+                except Exception:
+                    logger.exception("Failed to start the follow-up queued behind a canonical peer turn")

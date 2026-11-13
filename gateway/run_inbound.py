@@ -676,28 +676,6 @@ class GatewayInboundMixin:
         # — that copy was never consumed and grew unbounded.
         running_agent.interrupt(_interrupt_text)
 
-    # Poll interval while a follow-up waits behind a canonical peer turn.
-    _CANONICAL_PEER_WAIT_POLL_SECONDS = 0.1
-
-    async def _hm_wait_behind_canonical_peer_turn(self, event: "MessageEvent", _quick_key: str) -> None:
-        """Hold a follow-up that arrives during a canonical peer turn until that turn ends, so it
-        runs as its own turn and is answered to its sender. Every busy mode would otherwise put it
-        into the peer turn (steer, redirect, interrupt), or queue it where nothing drains it until
-        the peer turn ends while the adapter re-dispatches it in a loop. Recognized slash commands
-        keep their busy handling (/stop, /new, /status ...). The adapter's session guard stays with
-        this task meanwhile, so later follow-ups queue behind it through the busy handler. A drain
-        ends the wait: the busy path's drain branch then queues it for after the restart or says it
-        is refused, where a task still waiting here would be cancelled with nothing kept."""
-        from hermes_cli.commands import resolve_command
-        _cmd = event.get_command()
-        if _cmd and resolve_command(_cmd):
-            return
-        if not self._canonical_peer_turn_running(_quick_key):
-            return
-        logger.info("Follow-up for session %s waits for the running canonical peer turn to end", _quick_key)
-        while self._canonical_peer_turn_running(_quick_key) and not self._draining:
-            await asyncio.sleep(self._CANONICAL_PEER_WAIT_POLL_SECONDS)
-
     async def _hm_handle_running_session_message(
         self, event: "MessageEvent", source: SessionSource, _quick_key: str
     ) -> Optional[str]:
@@ -1302,8 +1280,26 @@ class GatewayInboundMixin:
 
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """Handle an incoming message from any platform: auth → command check → running-agent
-        interrupt → get/create session → build context → run agent → return response."""
+        interrupt → get/create session → build context → run agent → return response.
+
+        A follow-up a canonical peer turn handed the session to on release arrives with the slot
+        reserved for it (``_dispatch_queued_turn_after_peer_turn``); if its turn never claims, the
+        reservation is released here, and while the gateway drains it stays queued for the restart."""
+        _reservation = self._turn_reservation_of(event)
+        if _reservation is None:
+            return await self._hm_handle_message(event, None)
+        try:
+            _result = await self._hm_handle_message(event, _reservation)
+        except BaseException:
+            self._end_unclaimed_reservation(event, _reservation)
+            raise
+        if self._end_unclaimed_reservation(event, _reservation):
+            return f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
+        return _result
+
+    async def _hm_handle_message(self, event: MessageEvent, _reservation: Optional[tuple]) -> Optional[str]:
         from gateway.run import _AGENT_PENDING_SENTINEL
+        _incoming = event  # admission may hand on a rewritten event; the reservation is this one's
         _admitted = await self._hm_admit_event(event)
         if _admitted is None:
             return None
@@ -1344,9 +1340,9 @@ class GatewayInboundMixin:
         self._hm_evict_idle_stale_agent(_quick_key)
         if self._is_session_running(_quick_key):
             self._hm_evict_reaped_agent(_quick_key)
-        if not _acp_managed:
-            await self._hm_wait_behind_canonical_peer_turn(event, _quick_key)
-        if self._is_session_running(_quick_key):
+        if not _acp_managed and _reservation is None and self._queues_behind_peer_turn(event, _quick_key):
+            return self._queue_behind_peer_turn(event, _quick_key)
+        if self._is_session_running(_quick_key) and _reservation is None:
             if _acp_managed:
                 return acp_managed_ingress.BUSY
             return await self._hm_handle_running_session_message(event, source, _quick_key)
@@ -1384,6 +1380,13 @@ class GatewayInboundMixin:
             event._acp_admission = _acp.admission
             event.text = _acp.admission.task_text
 
+        if _reservation is not None:
+            self._take_reserved_turn(_incoming, _reservation)
+        elif not _acp_managed and self._queues_behind_peer_turn(event, _quick_key):
+            # A canonical peer turn was admitted during the awaits above: claiming now would overwrite
+            # its running slot and generation and fail its answer (canonical_turn_interrupted).
+            return self._queue_behind_peer_turn(event, _quick_key)
+
         # Claim this session before any await: many awaits sit between here and _run_agent
         # registering the real AIAgent; without this sentinel a second message during any of them
         # passes the "already running" guard and spins up a duplicate agent for the same session.
@@ -1395,9 +1398,10 @@ class GatewayInboundMixin:
                 acp_managed_ingress.abort_claimed(event._acp_admission)
             return _limit_message
 
-        if not _acp_managed:
+        if not _acp_managed and _reservation is None:
             # A managed task must run as THIS turn: the rescue would park it behind an orphan, where
-            # it would later drain as an ordinary turn without its admission.
+            # it would later drain as an ordinary turn without its admission. A reserved follow-up is
+            # the FIFO head itself.
             event, source, is_internal = self._hm_rescue_orphaned_fifo(event, source, is_internal, _quick_key)
 
         _claim_state = self._session_state(_quick_key)

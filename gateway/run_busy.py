@@ -304,6 +304,137 @@ class GatewayBusySessionMixin:
         owner_key = getattr(getattr(leases.get(session_id), "holder", None), "owner_key", None)
         return isinstance(owner_key, str) and owner_key.startswith(self._CANONICAL_TURN_LEASE_PREFIX)
 
+    def _queues_behind_peer_turn(self, event: MessageEvent, session_key: str) -> bool:
+        """True when ``event`` must wait in the session's FIFO: a canonical peer turn is running, or
+        has handed the session to the queued follow-up that has not claimed it yet. Every message
+        but a recognized slash command (/stop, /new, /status ... keep their busy handling)."""
+        from gateway.run import _AGENT_PENDING_SENTINEL
+        from hermes_cli.commands import resolve_command
+        command = event.get_command()
+        if command and resolve_command(command):
+            return False
+        state = self._peek_session_state(session_key)
+        reserved = (state is not None and state.turn.agent is _AGENT_PENDING_SENTINEL
+                    and getattr(state.turn.event, "_turn_reservation", None) is not None)
+        return reserved or self._canonical_peer_turn_running(session_key)
+
+    def _defers_pending_drain(self, session_key: str) -> bool:
+        """True while the session's queued follow-ups wait for a canonical peer turn, which hands them
+        on itself when it releases the session (:meth:`_dispatch_queued_turn_after_peer_turn`). The
+        adapter leaves them queued meanwhile: a dispatched one would only find the session busy and
+        be queued again, in a loop."""
+        return self._canonical_peer_turn_running(session_key)
+
+    def _adapter_holding_pending(self, session_key: str) -> Any:
+        """The live adapter whose pending slot holds ``session_key``'s FIFO head, or None."""
+        for adapters in (self._primary_adapters(), *self._profile_adapters_map().values()):
+            for adapter in (adapters or {}).values():
+                if session_key in (getattr(adapter, "_pending_messages", None) or {}):
+                    return adapter
+        return None
+
+    def _dispatch_queued_turn_after_peer_turn(self, session_key: str) -> None:
+        """Hand the session to its queued follow-up the moment a canonical peer turn released it.
+
+        The canonical surface calls this in the synchronous step that released the running slot and
+        the turn lease, so nothing is admitted in between. The slot is reserved for the FIFO head with
+        the claim marker every admission checks (``_AGENT_PENDING_SENTINEL``), so a new peer event is
+        refused ``canonical_turn_busy`` until the head's own turn has claimed, and the adapter starts
+        that turn; when a live task still holds the adapter's session guard, that task dispatches the
+        head as it ends, as for any queued follow-up. The head stays queued until the claim
+        (:meth:`_take_reserved_turn`); a drain refuses the turn before it claims, and the head is
+        then kept for the restart flush (:meth:`_end_unclaimed_reservation`). Nothing happens while
+        the session is running anything else."""
+        from gateway.run import _AGENT_PENDING_SENTINEL
+        if self._is_session_running(session_key):
+            return
+        adapter = self._adapter_holding_pending(session_key)
+        if adapter is None:
+            return
+        head = adapter._pending_messages[session_key]
+        turn = self._session_state(session_key).turn
+        turn.agent, turn.event, turn.started_ts = _AGENT_PENDING_SENTINEL, head, time.time()
+        head._turn_reservation = (session_key, adapter)
+        logger.info("Session %s released by a canonical peer turn: reserved for its queued follow-up", session_key)
+        if session_key in adapter._active_sessions and not adapter._session_task_is_stale(session_key):
+            return
+        if not adapter._start_session_processing(head, session_key):
+            head._turn_reservation = None
+            self._release_running_agent_state(session_key)
+            return
+
+    def _turn_reservation_of(self, event: MessageEvent) -> Optional[tuple]:
+        """``(session_key, adapter)`` when the session's slot is reserved for this very event (read
+        before any await: admission may hand on a rewritten event)."""
+        from gateway.run import _AGENT_PENDING_SENTINEL
+        reservation = getattr(event, "_turn_reservation", None)
+        if not reservation:
+            return None
+        state = self._peek_session_state(reservation[0])
+        if state is None or state.turn.agent is not _AGENT_PENDING_SENTINEL or state.turn.event is not event:
+            return None
+        return reservation
+
+    def _take_reserved_turn(self, event: MessageEvent, reservation: tuple) -> None:
+        """Turn the reservation into this turn's own claim (synchronously, just before
+        ``_claim_active_session_slot``): the slot is cleared for the claim and the head leaves the
+        pending slot, the next queued event moving up into it."""
+        session_key, adapter = reservation
+        event._turn_reservation = None
+        state = self._peek_session_state(session_key)
+        if state is not None and state.turn.event is event:
+            state.turn.agent = None
+        if adapter._pending_messages.get(session_key) is event:
+            del adapter._pending_messages[session_key]
+            self._promote_queued_event(session_key, adapter, event)
+
+    def _end_unclaimed_reservation(self, event: MessageEvent, reservation: tuple) -> bool:
+        """After ``_handle_message`` returned for a reserved event: when its turn never claimed (it was
+        refused, failed or cancelled), release the reservation. The event leaves the queue, except
+        while the gateway drains: then it is kept at the queue head (handed back when the adapter's
+        drain had already taken it) for the restart flush, and True is returned."""
+        from gateway.run import _AGENT_PENDING_SENTINEL
+        if getattr(event, "_turn_reservation", None) is None:
+            return False  # claimed: the turn released its own slot
+        event._turn_reservation = None
+        session_key, adapter = reservation
+        state = self._peek_session_state(session_key)
+        if state is not None and state.turn.agent is _AGENT_PENDING_SENTINEL and state.turn.event is event:
+            self._release_running_agent_state(session_key)
+        if self._draining:
+            if adapter._pending_messages.get(session_key) is not event:
+                self._restore_undrained_pending_event(session_key, adapter, event)
+            return True
+        if adapter._pending_messages.get(session_key) is event:
+            del adapter._pending_messages[session_key]
+            self._promote_queued_event(session_key, adapter, event)
+        return False
+
+    def _queued_behind_peer_turn_ack(self, event: MessageEvent, session_key: str) -> Optional[str]:
+        """The busy queue ack for a follow-up queued behind a peer turn (same switch and 30 s
+        debounce as the busy handler's)."""
+        if os.environ.get("HERMES_GATEWAY_BUSY_ACK_ENABLED", "true").lower() != "true":
+            return None
+        state = self._session_state(session_key)
+        now = time.time()
+        if now - state.turn.busy_ack_ts < 30:
+            return None
+        state.turn.busy_ack_ts = now
+        return self._compose_busy_ack_message(
+            event, now, state, state.turn.agent, is_steer_mode=False, is_queue_mode=True,
+            is_redirect_mode=False, demoted_for_subagents=False, demoted_for_compression=False,
+        )
+
+    def _queue_behind_peer_turn(self, event: MessageEvent, session_key: str) -> Optional[str]:
+        """Queue ``event`` in the session's FIFO behind the running canonical peer turn, whatever the
+        busy mode: it is never steered, redirected or interrupting into a peer turn, whose answer goes
+        to the peer's thread (2026-11-13). The queue survives a restart and the peer turn hands it on
+        when it ends."""
+        if not self._queue_or_replace_pending_event(session_key, event):
+            return self._BUSY_QUEUE_FULL_MESSAGE
+        logger.info("Queued follow-up for session %s behind the running canonical peer turn", session_key)
+        return self._queued_behind_peer_turn_ack(event, session_key)
+
     @staticmethod
     def _agent_has_active_subagents(running_agent: Any) -> bool:
         """True when *running_agent* is driving subagents (callers demote interrupt → queue;
