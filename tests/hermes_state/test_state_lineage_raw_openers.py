@@ -3,7 +3,9 @@
 ``gateway.delivery_ledger._connect`` and ``tools.async_delegation._connect`` open the shared state.db
 through ``hermes_cli.sqlite_util.open_db``, whose ``initialize`` creates their tables. On a fenced
 store that DDL would land unfenced (DDL is never fenced), so ``open_db`` decodes the lineage first
-and a refused store keeps its bytes and its table set.
+and a refused store keeps its bytes and its table set. A raw opener never migrates: the fork's 1030
+store stays refused until a writable SessionDB open migrates it, and on the migrated store the raw
+writers' connections carry the fence UDF and SessionDB's per-connection serialization.
 """
 
 from __future__ import annotations
@@ -87,3 +89,33 @@ def test_open_db_refuses_a_fenced_state_db_and_leaves_other_names_alone(tmp_path
     conn = sqlite_util.open_db(other, db_label="kanban.db", wal=False, initialize=initialize)
     conn.close()
     assert created and "opener_table" in _tables(other)
+
+
+# ── A store this build migrated: raw writers register the fence UDF and write through the fences ──
+
+def test_both_raw_writers_write_to_a_migrated_store(monkeypatch, tmp_path):
+    from gateway import delivery_ledger
+    from hermes_state import SessionDB
+    import hermes_state_fence as fence
+    from tests.hermes_state.test_state_fence_migration import fork_1030_store
+    from tools import async_delegation
+
+    path = tmp_path / "home" / "state.db"
+    fork_1030_store(path)
+    SessionDB(db_path=path).close()  # the writable open migrates it; raw openers never do
+    monkeypatch.setattr(delivery_ledger, "_db_path", lambda: path)
+    monkeypatch.setattr(async_delegation, "_db_path", lambda: path)
+
+    delivery_ledger.record_obligation(obligation_id="ob-1", session_key="k", platform="p", chat_id="c",
+                                      thread_id=None, content="hello")
+    # async_delegations is governed: this INSERT runs the fence trigger at 1033.
+    async_delegation._persist_dispatch({"delegation_id": "d1", "session_key": "k", "dispatched_at": 1.0})
+
+    conn = sqlite_util.open_db(path, db_label="state.db")
+    try:
+        assert isinstance(conn, fence.SerializedConnectionMixin)
+        assert conn.execute("SELECT obligation_id FROM delivery_obligations").fetchall()[0][0] == "ob-1"
+        assert conn.execute("SELECT delegation_id FROM async_delegations").fetchall()[0][0] == "d1"
+    finally:
+        conn.close()
+    assert fence.probe_store_lineage(path).settled

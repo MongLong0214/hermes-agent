@@ -1,8 +1,9 @@
 """Pre-DDL lineage admission: a state.db this build cannot migrate is refused before any write.
 
 The fork line stamps ``schema_version`` as 1000 + its SCHEMA_VERSION and guards governed tables with
-turn-fence triggers. This build has no fence function and no migration for those stores, so opening
-one must raise ``IncompatibleSchemaError`` and leave the file exactly as it was: same bytes, same
+turn-fence triggers. This build migrates exactly one of those stores (the live fork's 1030, in a
+writable SessionDB open; ``test_state_fence_migration.py``) and opens its own 1033 store; opening any
+other must raise ``IncompatibleSchemaError`` and leave the file exactly as it was: same bytes, same
 mode, same inode, no sidecar, no quarantine copy. Fresh and pure-upstream stores open as before.
 
 Fixtures are synthesized here; none of them is a copy of a real store.
@@ -53,9 +54,9 @@ def live_fence_trigger_sql(table: str, operation: str, generation: int) -> str:
 
 
 def make_store(path: Path, *, versions=(1030,), version_decl="INTEGER NOT NULL", fences=1030,
-               journal="delete", extra_sql=()) -> Path:
+               journal="delete", extra_sql=(), post_sql=()) -> Path:
     """schema_version + sessions + messages (one row each) and, unless ``fences`` is None, the 8x3
-    fence triggers at that generation over stub governed tables."""
+    fence triggers at that generation over stub governed tables; ``post_sql`` runs after the fences."""
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, isolation_level=None)
     try:
@@ -74,6 +75,8 @@ def make_store(path: Path, *, versions=(1030,), version_decl="INTEGER NOT NULL",
                 conn.execute(f"CREATE TABLE IF NOT EXISTS {table} (id INTEGER PRIMARY KEY)")
                 for operation in OPERATIONS:
                     conn.execute(live_fence_trigger_sql(table, operation, fences))
+        for sql in post_sql:
+            conn.execute(sql)
     finally:
         conn.close()
     os.chmod(path, 0o644)  # not 0600, so a chmod by the opener would show
@@ -141,7 +144,25 @@ REFUSED = {
         lambda p: make_store(p, versions=(30, 31), fences=None), "SCHEMA_VERSION_UNREADABLE", None),
     "text_version": (
         lambda p: make_store(p, versions=("30",), version_decl="", fences=None), "SCHEMA_VERSION_UNREADABLE", None),
+    # Shapes next to the two this build admits (the fork's 1030, its own 1033): each stays refused.
+    "fenced_1031": (lambda p: make_store(p, versions=(1031,), fences=1031), "FENCE_GENERATION_MISMATCH", "fenced"),
+    "fenced_1030_fence_missing": (
+        lambda p: make_store(p, post_sql=("DROP TRIGGER turn_fence_messages_delete",)),
+        "FENCE_GENERATION_MISMATCH", "fenced"),
+    "fenced_1030_mixed_literals": (
+        lambda p: make_store(p, post_sql=(
+            "DROP TRIGGER turn_fence_sessions_insert", live_fence_trigger_sql("sessions", "INSERT", 1029))),
+        "FENCE_GENERATION_MISMATCH", "fenced"),
+    "fenced_1033_with_fork_fences": (
+        lambda p: make_store(p, versions=(1033,), fences=1030), "FENCE_GENERATION_MISMATCH", "fenced"),
+    "target_table_fenced_at_1030": (
+        lambda p: make_store(p, extra_sql=(
+            "CREATE TABLE runtime_epoch (singleton INTEGER PRIMARY KEY)",
+            live_fence_trigger_sql("runtime_epoch", "INSERT", 1030))),
+        "FENCE_GENERATION_MISMATCH", None),
 }
+# A writable open migrates the fork's 1030 store instead (test_state_fence_migration.py).
+WRITABLE_REFUSED = {name: entry for name, entry in REFUSED.items() if name != "fenced_1030"}
 
 
 @pytest.mark.parametrize("name", sorted(REFUSED))
@@ -166,7 +187,8 @@ def test_refused_lineages_raise_and_leave_the_file_byte_identical(tmp_path, name
     assert_untouched(db, before)
 
 
-def test_live_1030_refusal_message_names_the_unadmitted_migration(tmp_path):
+def test_live_1030_refusal_message_names_the_writable_open_that_migrates_it(tmp_path):
+    # Readers and raw openers never migrate; only a writable SessionDB open admits 1030.
     fence = _fence()
     db = make_store(tmp_path / "state.db")
 
@@ -177,9 +199,31 @@ def test_live_1030_refusal_message_names_the_unadmitted_migration(tmp_path):
     assert str(caught.value) == (
         "Session state turn-fence generation does not match this Hermes build "
         "(build generation 1033, stored generation 1030) "
-        "(fenced lineage at schema_version 1030; migration not admitted in this build); "
+        "(fenced lineage at schema_version 1030; only a writable session-store open migrates it); "
         "refusing to open it, and nothing was changed."
     )
+    assert fence.refuse_unadmitted_lineage(db, migrate=True).migratable
+
+
+def test_other_fenced_stamps_name_the_unadmitted_migration(tmp_path):
+    fence = _fence()
+    db = make_store(tmp_path / "state.db", versions=(1031,), fences=1031)
+
+    with pytest.raises(fence.IncompatibleSchemaError) as caught:
+        fence.refuse_unadmitted_lineage(db, migrate=True)
+
+    assert str(caught.value).endswith(
+        "(fenced lineage at schema_version 1031; migration not admitted in this build); "
+        "refusing to open it, and nothing was changed.")
+
+
+def test_incompatible_schema_error_lives_in_hermes_state_errors_and_is_re_exported():
+    import hermes_state_errors
+
+    fence = _fence()
+    assert fence.IncompatibleSchemaError is hermes_state_errors.IncompatibleSchemaError
+    assert fence.SCHEMA_INCOMPATIBLE_CAUSES is hermes_state_errors.SCHEMA_INCOMPATIBLE_CAUSES
+    assert hermes_state_errors.IncompatibleSchemaError.__module__ == "hermes_state_errors"
 
 
 def test_constants_follow_this_builds_schema_version():
@@ -287,9 +331,9 @@ def open_spies(monkeypatch):
     return calls
 
 
-@pytest.mark.parametrize("name", sorted(REFUSED))
+@pytest.mark.parametrize("name", sorted(WRITABLE_REFUSED))
 def test_writable_session_db_refuses_before_any_write(tmp_path, open_spies, name):
-    build, cause, _ = REFUSED[name]
+    build, cause, _ = WRITABLE_REFUSED[name]
     db = build(tmp_path / "store" / "state.db")
     open_spies.update(dict.fromkeys(open_spies, 0))  # some builders open a SessionDB themselves
     before = snapshot(db)
@@ -325,7 +369,7 @@ def test_read_only_session_db_refuses_before_serving_a_read(tmp_path, open_spies
 
 def test_wal_fixture_without_sidecars_is_probed_immutably_and_leaves_none(tmp_path, monkeypatch):
     fence = _fence()
-    db = make_store(tmp_path / "store" / "state.db", journal="wal")
+    db = make_store(tmp_path / "store" / "state.db", versions=(1031,), fences=1031, journal="wal")
     assert db.read_bytes()[18:20] == b"\x02\x02"  # WAL-mode header, no sidecar on disk
     before = snapshot(db)
     uris = []

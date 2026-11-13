@@ -66,7 +66,10 @@ from hermes_state_dbfile import (
     quarantine_invalid_state_db,
     RetiredGenerationCaptureError, capture_retired_wal_generation, refuse_deleted_wal_generation,
 )
-from hermes_state_fence import refuse_unadmitted_lineage
+from hermes_state_fence import (
+    fence_migration_admission, migrate_fenced_store, refuse_unadmitted_lineage, register_turn_fence_generation,
+    serialized_connection_factory,
+)
 from hermes_state_messages import SessionMessagesMixin
 from hermes_state_prune_rewrite import SessionPruneRewriteMixin
 from hermes_state_api_content import SessionApiContentMixin
@@ -786,8 +789,10 @@ class SessionDB(
         conn = _connect_tracked_db(
             read_only_db_uri(self.db_path), tracking_path=self.db_path, uri=True,
             check_same_thread=False, timeout=timeout, isolation_level=None,
+            factory=serialized_connection_factory(),
         )
         conn.row_factory = sqlite3.Row
+        register_turn_fence_generation(conn)
         return conn
 
     def _handle_quarantine_if_invalid(self, already_locked: bool = False) -> None:
@@ -817,11 +822,15 @@ class SessionDB(
         """Connect + WAL/pragma setup for a writer connection (no schema init). Short timeout:
         jittered application-level retry handles contention, not SQLite's busy handler;
         isolation_level=None: explicit BEGIN IMMEDIATE."""
+        # Serialized, with the fence UDF: a governed write on a fenced store runs that Python callback
+        # inside sqlite3_step, and an unserialized shared connection deadlocks on it (GIL vs. db mutex).
         conn = _connect_tracked_db(
             str(self.db_path), check_same_thread=False, timeout=1.0, isolation_level=None,
+            factory=serialized_connection_factory(),
         )
         try:
             conn.row_factory = sqlite3.Row
+            register_turn_fence_generation(conn)
             mode = apply_wal_with_fallback(conn, db_label="state.db")
             # "wal" is also the *assumed* mode when the on-disk probe was blocked by a concurrent opener
             # (#86515): the lock-free mode=ro read pool needs a confirmed WAL header, so confirm it here.
@@ -841,14 +850,20 @@ class SessionDB(
     def _connect_and_init(self) -> None:
         # Lineage first, SELECT-only on a read-only connection: a store this build cannot migrate
         # must come out of the open byte-identical, so nothing below (chmod, WAL, DDL) may run on it.
-        refuse_unadmitted_lineage(self.db_path)
-        # Refuse before sqlite3.connect (under the startup lock) so we cannot mint
-        # a replacement WAL while a live writer still holds a deleted sidecar inode.
-        refuse_deleted_wal_generation(self.db_path)
-        # Create/tighten the main database before sqlite3.connect() so a
-        # permissive process umask can never expose a fresh profile store.
-        _secure_state_db_files(self.db_path, create_main=True)
-        self._conn = self._open_writer_conn()
+        lineage = refuse_unadmitted_lineage(self.db_path, migrate=True)
+        # The fork's store is migrated under the profile's gateway.lock lease, taken before the first
+        # write and held through the migration's commit; every other lineage takes no lease.
+        with fence_migration_admission(self.db_path, lineage) as migrate:
+            # Refuse before sqlite3.connect (under the startup lock) so we cannot mint
+            # a replacement WAL while a live writer still holds a deleted sidecar inode.
+            refuse_deleted_wal_generation(self.db_path)
+            # Create/tighten the main database before sqlite3.connect() so a
+            # permissive process umask can never expose a fresh profile store.
+            _secure_state_db_files(self.db_path, create_main=True)
+            self._conn = self._open_writer_conn()
+            if migrate:
+                # Before _init_schema: its script and table rebuilds must meet this build's fences.
+                migrate_fenced_store(self, self._conn.cursor())
         self._init_schema()
 
     def _connect_and_init_with_lock_patience(self) -> None:

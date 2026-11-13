@@ -40,16 +40,26 @@ def open_db(
     from hermes_state_wal import apply_wal_with_fallback
 
     path = Path(path)
-    if path.name == "state.db":
+    shared_state = path.name == "state.db"
+    connect_kwargs = {}
+    if shared_state:
         # The shared session store: refuse a lineage this build cannot migrate before the connect,
-        # WAL switch or ``initialize`` DDL can change a byte of it (raw openers share this path).
-        from hermes_state_fence import refuse_unadmitted_lineage
+        # WAL switch or ``initialize`` DDL can change a byte of it (raw openers share this path). A
+        # raw opener never migrates; on a store this build fenced its writes need the fence UDF, on a
+        # connection serialized like SessionDB's.
+        from hermes_state_fence import (
+            refuse_unadmitted_lineage, register_turn_fence_generation, serialized_connection_factory,
+        )
 
         refuse_unadmitted_lineage(path)
+        connect_kwargs["factory"] = serialized_connection_factory()
     path.parent.mkdir(parents=True, exist_ok=True)
     # Resolved at call time: fd-leak tests patch ``sqlite3.connect`` through the caller's module.
-    conn = sqlite3.connect(path, timeout=busy_timeout_ms / 1000, check_same_thread=check_same_thread)
+    conn = sqlite3.connect(path, timeout=busy_timeout_ms / 1000, check_same_thread=check_same_thread,
+                           **connect_kwargs)
     try:
+        if shared_state:
+            register_turn_fence_generation(conn)
         conn.row_factory = row_factory
         conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
         if wal:
