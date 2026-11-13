@@ -320,6 +320,7 @@ from hermes_cli.subcommands.clipboard import build_clipboard_parser
 from hermes_cli.subcommands.journey import build_journey_parser
 from hermes_cli.subcommands.computer_use import build_computer_use_parser
 from hermes_cli.subcommands.sessions import build_sessions_parser, cmd_sessions_lazy
+from hermes_cli.target_bind import build_target_parser
 from hermes_cli.subcommands.completion import build_completion_parser
 
 
@@ -3272,6 +3273,7 @@ def _build_cli_parser():
     build_update_parser(subparsers, cmd_update=cmd_update)
     build_uninstall_parser(subparsers, cmd_uninstall=cmd_uninstall)
     build_acp_parser(subparsers, cmd_acp=cmd_acp)
+    build_target_parser(subparsers)
     build_profile_parser(subparsers, cmd_profile=cmd_profile)
     build_completion_parser(subparsers, cmd_completion=cmd_completion, parser=parser)
     build_dashboard_parser(
