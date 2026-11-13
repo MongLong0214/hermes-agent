@@ -10,6 +10,7 @@ sys.modules.setdefault("firecrawl", types.SimpleNamespace(Firecrawl=object))
 sys.modules.setdefault("fal_client", types.SimpleNamespace())
 
 import run_agent
+from agent.chat_completion_accepted_failure import _CodexStreamTerminalFailure
 from agent.conversation_loop import _CODEX_INCOMPLETE_NUDGE
 
 
@@ -2663,3 +2664,232 @@ def test_codex_text_only_max_output_incomplete_keeps_codex_continuation(monkeypa
     assert result["completed"] is True
     assert not any(m.get("_length_continuation_nudge") for m in result["messages"])
     assert any(m.get("finish_reason") == "incomplete" for m in result["messages"] if m["role"] == "assistant")
+
+
+# ── Accepted-stream failure: the turn loop's consumer ──────────────────────────────────────────
+# The producers (``run_codex_stream`` and the watchdog kill) return ``_CodexStreamTerminalFailure``
+# once a Responses event was accepted. These tests stub the physical call to hand that outcome
+# back, so they pin the loop's contract on its own.
+
+
+def _accepted_transport_error():
+    import httpx
+
+    return httpx.ReadError(
+        "connection dropped after accepted events",
+        request=httpx.Request("POST", "https://chatgpt.com/backend-api/codex/responses"),
+    )
+
+
+def _stub_accepted_outcome(monkeypatch, agent, partial, *, streaming=True, during=None, later=None):
+    """The first physical call streams ``partial`` and returns this call's accepted outcome;
+    later calls answer with ``later(api_kwargs)``. Returns the list of physical calls."""
+    calls = []
+
+    def _call(api_kwargs, **_kwargs):
+        calls.append(api_kwargs)
+        if len(calls) > 1 and later is not None:
+            return later(api_kwargs)
+        if partial:
+            agent._fire_stream_delta(partial)
+        if during is not None:
+            during()
+        return _CodexStreamTerminalFailure(_accepted_transport_error())
+
+    if not streaming:
+        agent._disable_streaming = True
+    monkeypatch.setattr(
+        agent, "_interruptible_streaming_api_call" if streaming else "_interruptible_api_call", _call,
+    )
+    return calls
+
+
+def _record_fallback_attempts(monkeypatch, agent):
+    attempts = []
+
+    def _try_activate_fallback(*args, **kwargs):
+        attempts.append((args, kwargs))
+        return False
+
+    monkeypatch.setattr(agent, "_try_activate_fallback", _try_activate_fallback)
+    return attempts
+
+
+def _use_llm_execution_middleware(monkeypatch, callback):
+    from hermes_cli.plugins import get_plugin_manager
+
+    manager = get_plugin_manager()
+    monkeypatch.setattr(manager, "_discovered", True, raising=False)
+    monkeypatch.setitem(manager._middleware, "llm_execution", [callback])
+
+
+def _roles_alternate(messages):
+    from itertools import pairwise
+
+    roles = [message["role"] for message in messages]
+    return all(left != right for left, right in pairwise(roles))
+
+
+@pytest.mark.parametrize("streaming", [True, False], ids=["streaming", "relay_execute"])
+def test_accepted_stream_outcome_ends_the_turn_on_one_request(monkeypatch, streaming):
+    """The outcome means the request is billed: one physical call, no generic retry, no
+    failover, no reconnect, and the delivered partial is the turn's transcript row."""
+    agent = _build_agent(monkeypatch)
+    partial = "The first delivered sentence."
+    calls = _stub_accepted_outcome(
+        monkeypatch, agent, partial, streaming=streaming,
+        later=lambda _kwargs: _codex_message_response("replayed"),
+    )
+    fallback_attempts = _record_fallback_attempts(monkeypatch, agent)
+
+    result = agent.run_conversation("Explain the result", stream_callback=lambda _text: None)
+
+    assert len(calls) == 1
+    assert fallback_attempts == []
+    assert result["completed"] is False
+    assert result["failed"] is True
+    assert result["turn_exit_reason"] == "partial_stream_recovery"
+    assert [message["role"] for message in result["messages"]] == ["user", "assistant"]
+    assert result["messages"][-1]["content"] == partial
+    assert "replayed" not in str(result["messages"])
+
+
+def test_relay_copy_of_the_accepted_outcome_still_ends_the_turn(monkeypatch):
+    """Managed Relay execution may return a re-namespaced copy of the callback's value; the
+    outcome captured at the physical call still ends the turn instead of a lookalike retry."""
+    import copy
+
+    from agent import relay_llm
+
+    agent = _build_agent(monkeypatch)
+    calls = _stub_accepted_outcome(
+        monkeypatch, agent, "accepted partial", streaming=False,
+        later=lambda _kwargs: _codex_message_response("replayed"),
+    )
+    monkeypatch.setattr(relay_llm, "execute", lambda request, call, **_kwargs: copy.copy(call(request)))
+
+    result = agent.run_conversation("Explain the result", stream_callback=lambda _text: None)
+
+    assert len(calls) == 1
+    assert result["failed"] is True
+    assert result["turn_exit_reason"] == "partial_stream_recovery"
+
+
+def test_middleware_answer_after_the_accepted_outcome_is_used(monkeypatch):
+    """Middleware that recovers on its own returns a real response; only this call's own
+    accepted outcome, handed back unchanged, ends the turn."""
+    agent = _build_agent(monkeypatch)
+    calls = _stub_accepted_outcome(monkeypatch, agent, "accepted partial")
+    outcomes = []
+
+    def _recovering_middleware(*, request, next_call, **_context):
+        outcomes.append(next_call(request))
+        return _codex_message_response("recovered by middleware")
+
+    _use_llm_execution_middleware(monkeypatch, _recovering_middleware)
+
+    result = agent.run_conversation("Explain the result", stream_callback=lambda _text: None)
+
+    assert isinstance(outcomes[0], _CodexStreamTerminalFailure)
+    assert len(calls) == 1
+    assert result["completed"] is True
+    assert result["final_response"] == "recovered by middleware"
+
+
+def test_middleware_lookalike_of_the_accepted_outcome_takes_ordinary_recovery(monkeypatch):
+    """A lookalike that is not this call's own outcome carries no accepted-event provenance:
+    its ``error`` is raised into ordinary error recovery, which sends a fresh request."""
+    from agent import conversation_loop
+
+    agent = _build_agent(monkeypatch)
+    calls = _stub_accepted_outcome(
+        monkeypatch, agent, "accepted partial",
+        later=lambda _kwargs: _codex_message_response("recovered"),
+    )
+    outcomes, forged, recovered_errors = [], [], []
+
+    def _substituting_middleware(*, request, next_call, **_context):
+        actual = next_call(request)
+        outcomes.append(actual)
+        if len(outcomes) == 1:
+            forged.append(_CodexStreamTerminalFailure(RuntimeError("FORGED_LOOKALIKE")))
+            return forged[0]
+        return actual
+
+    _use_llm_execution_middleware(monkeypatch, _substituting_middleware)
+    real_handle_api_error = conversation_loop.handle_api_error
+
+    def _handle_api_error(agent, **kwargs):
+        recovered_errors.append(kwargs["api_error"])
+        return real_handle_api_error(agent, **kwargs)
+
+    _handle_api_error.__signature__ = __import__("inspect").signature(real_handle_api_error)
+    _handle_api_error.__name__ = real_handle_api_error.__name__
+    monkeypatch.setattr(conversation_loop, "handle_api_error", _handle_api_error)
+
+    result = agent.run_conversation("Explain the result", stream_callback=lambda _text: None)
+
+    assert isinstance(outcomes[0], _CodexStreamTerminalFailure)
+    assert forged[0] is not outcomes[0]
+    assert recovered_errors and recovered_errors[0] is forged[0].error
+    assert len(calls) == 2
+    assert result["completed"] is True
+    assert result["failed"] is False
+    assert result["final_response"] == "recovered"
+
+
+def test_accepted_stream_outcome_hides_a_runaway_partial(monkeypatch):
+    """Looped bytes replayed next turn re-seed the loop (#112764): the transcript keeps only
+    the hidden placeholder row, as on the interrupt path."""
+    from agent.agent_runtime_helpers_placeholders import _INTERRUPTED_PLACEHOLDER
+    from agent.repetition_guard import is_runaway_repetition
+
+    agent = _build_agent(monkeypatch)
+    looped = "I will check the file again. " * 40
+    assert is_runaway_repetition(looped.strip())
+    calls = _stub_accepted_outcome(monkeypatch, agent, looped)
+
+    result = agent.run_conversation("Explain the result", stream_callback=lambda _text: None)
+
+    persisted = " ".join(
+        f"{message.get('content', '')} {message.get('api_content', '')}" for message in result["messages"]
+    )
+    assert len(calls) == 1
+    assert "I will check the file again." not in persisted
+    assert "I will check the file again." not in str(result["final_response"] or "")
+    assert result["messages"][-1]["display_kind"] == "hidden"
+    assert result["messages"][-1]["api_content"] == _INTERRUPTED_PLACEHOLDER
+    assert _roles_alternate(result["messages"])
+
+
+def test_accepted_stream_outcome_drops_buffered_reconnect_status(monkeypatch):
+    """A watchdog kill buffers "... Reconnecting." before the accepted outcome ends the turn,
+    and nothing reconnects: a later turn's terminal flush must not replay that line."""
+    import httpx
+    import openai
+
+    agent = _build_agent(monkeypatch)
+
+    def _buffer_reconnect():
+        agent._buffer_diagnostic_status(
+            "⚠️ Codex stream sent no events for 2s after the first parsed event "
+            "(model: gpt-5-codex). Reconnecting."
+        )
+
+    def _rejected(_kwargs):
+        raise openai.BadRequestError("rejected", body=None, response=httpx.Response(
+            400, request=httpx.Request("POST", "https://chatgpt.com/backend-api/codex/responses"),
+        ))
+
+    calls = _stub_accepted_outcome(monkeypatch, agent, "partial", during=_buffer_reconnect, later=_rejected)
+    first = agent.run_conversation("Explain the result", stream_callback=lambda _text: None)
+    statuses = []
+    monkeypatch.setattr(agent, "_emit_status", lambda message: statuses.append(str(message)))
+
+    second = agent.run_conversation("Try again", stream_callback=lambda _text: None)
+
+    assert first["failed"] is True
+    assert first["turn_exit_reason"] == "partial_stream_recovery"
+    assert len(calls) == 2
+    assert second["failed"] is True
+    assert not [status for status in statuses if "Reconnecting." in status]
