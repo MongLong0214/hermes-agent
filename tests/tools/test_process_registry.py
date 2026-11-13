@@ -1148,6 +1148,145 @@ class TestPopenLeakOnSetupFailure:
         assert terminate.call_count == 1, "post-Popen setup failure must terminate the orphan"
         assert terminate.call_args[0][0] == 9999
 
+
+def _token_processes(token: str) -> list:
+    """Live, non-zombie processes whose argv carries *token* as an element of its own
+    (the interpreter itself, not the shell whose ``-c`` string mentions it)."""
+    import psutil
+
+    found = []
+    for proc in psutil.process_iter(["cmdline", "status"]):
+        if token in (proc.info["cmdline"] or []) and proc.info["status"] != psutil.STATUS_ZOMBIE:
+            found.append(proc)
+    return found
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="ptyprocess is POSIX-only")
+class TestPtyPostSpawnFailure:
+    """A PTY child that started, followed by a failed setup step, is reaped before the pipe
+    fallback runs the same command again; one that cannot be reaped refuses the fallback and
+    stays tracked. Real processes: the command is a sleeping interpreter carrying a token."""
+
+    @pytest.fixture()
+    def harness(self, registry, monkeypatch):
+        import psutil
+        import uuid
+        from contextlib import suppress
+        from ptyprocess import PtyProcess
+
+        token = f"e2p17-{uuid.uuid4().hex}"
+        state = {"ptys": [], "pipe_spawns": [], "groups": [], "refuse_terminate": False, "fail_at": "reader"}
+        real_pty_spawn = PtyProcess.spawn.__func__
+
+        def pty_spawn(cls, *args, **kwargs):
+            pty = real_pty_spawn(cls, *args, **kwargs)
+            state["ptys"].append(pty)
+            if state["refuse_terminate"]:
+                pty.terminate = lambda force=False: False  # signal refused: the child keeps running
+            return pty
+
+        real_spawn_job = registry._spawn_job
+
+        def spawn_job(session, argv, persist_on_release, **kwargs):
+            # Whether each PTY child still existed (alive or an unreaped zombie) at this moment.
+            state["pipe_spawns"].append([psutil.pid_exists(p.pid) for p in state["ptys"]])
+            return real_spawn_job(session, argv, persist_on_release, **kwargs)
+
+        real_track, real_own = registry._track_started, registry._own_pty_job
+
+        def track_started(session, reader_target, reader_name, extra_args=()):
+            if state["fail_at"] == "reader" and reader_name.startswith("proc-pty-reader-"):
+                raise RuntimeError("can't start new thread")
+            return real_track(session, reader_target, reader_name, extra_args)
+
+        def own_pty_job(session, pty_proc):
+            if state["fail_at"] == "owner":
+                raise OSError("owner-death supervisor unreachable")
+            return real_own(session, pty_proc)
+
+        monkeypatch.setattr(PtyProcess, "spawn", classmethod(pty_spawn))
+        monkeypatch.setattr(registry, "_spawn_job", spawn_job)
+        monkeypatch.setattr(registry, "_track_started", track_started)
+        monkeypatch.setattr(registry, "_own_pty_job", own_pty_job)
+        monkeypatch.setattr(
+            "hermes_cli.process_identity._update_supervised_pgids",
+            lambda verb, pgids: state["groups"].append((verb, list(pgids))))
+        command = f"{shlex.quote(sys.executable)} -c 'import time; time.sleep(30)' {token}"
+        try:
+            yield token, state, command
+        finally:
+            for sid in list(registry._running):
+                registry.kill_process(sid)
+            for pty in state["ptys"]:
+                pty.__dict__.pop("terminate", None)
+                with suppress(Exception):
+                    pty.terminate(force=True)
+                with suppress(Exception):
+                    pty.close(force=True)
+            for proc in _token_processes(token):
+                with suppress(psutil.Error):
+                    proc.kill()
+
+    @pytest.mark.parametrize("fail_at", ["reader", "owner"])
+    def test_started_pty_child_is_reaped_before_the_pipe_fallback(self, registry, harness, tmp_path, fail_at):
+        import psutil
+
+        token, state, command = harness
+        state["fail_at"] = fail_at
+        session = registry.spawn_local(command, cwd=str(tmp_path), use_pty=True)
+
+        assert len(state["ptys"]) == 1
+        pty_pid = state["ptys"][0].pid
+        assert state["pipe_spawns"] == [[False]], "the PTY child still existed when the pipe copy started"
+        assert session._pty is None and session.process is not None
+        assert session.pty_fallback.startswith("the PTY spawn failed")
+        # The dead PTY group is no longer covered by the owner-death supervisor; the pipe job's is.
+        pty_groups = [("register", [pty_pid]), ("unregister", [pty_pid])] if fail_at == "reader" else []
+        assert state["groups"] == [*pty_groups, ("register", [session.process.pid])]
+
+        assert _wait_until(lambda: len(_token_processes(token)) == 1, timeout=10.0)
+        time.sleep(1.0)  # a surviving PTY shell would have started its own copy by now
+        root = psutil.Process(session.process.pid)
+        pipe_tree = {root.pid, *(child.pid for child in root.children(recursive=True))}
+        live = _token_processes(token)
+        assert len(live) == 1 and live[0].pid in pipe_tree, [p.cmdline() for p in live]
+
+        # A later kill reaches the tracked pipe job, not the reaped PTY handle.
+        assert registry.kill_process(session.id)["status"] == "killed"
+        assert _wait_until(lambda: not _token_processes(token), timeout=10.0)
+
+    def test_unreapable_pty_child_refuses_the_fallback_and_stays_killable(self, registry, harness, tmp_path):
+        token, state, command = harness
+        state["refuse_terminate"] = True
+
+        with pytest.raises(RuntimeError, match="PTY child could not be reaped; refusing pipe fallback"):
+            registry.spawn_local(command, cwd=str(tmp_path), use_pty=True)
+
+        assert state["pipe_spawns"] == [], "a second copy of the command was started"
+        (pty,) = state["ptys"]
+        assert pty.isalive()
+        # Still tracked and still covered by the owner-death supervisor.
+        (session,) = registry._running.values()
+        assert registry.get(session.id) is session and session._pty is pty
+        assert state["groups"] == [("register", [pty.pid])]
+
+        del pty.terminate  # the signal works again
+        assert registry.kill_process(session.id)["status"] == "killed"
+        assert not pty.isalive()
+        assert state["groups"] == [("register", [pty.pid]), ("unregister", [pty.pid])]
+        assert _wait_until(lambda: not _token_processes(token), timeout=10.0)
+
+    def test_pty_spawn_without_a_setup_failure_is_unchanged(self, registry, harness, tmp_path):
+        token, state, _command = harness
+        state["fail_at"] = None
+        session = registry.spawn_local(f"echo {token}", cwd=str(tmp_path), use_pty=True)
+
+        assert _wait_until(lambda: registry.poll(session.id)["status"] == "exited", timeout=10.0)
+        poll = registry.poll(session.id)
+        assert poll["exit_code"] == 0 and token in poll["output_preview"]
+        assert state["pipe_spawns"] == [] and session.pty_fallback == ""
+        assert len(state["ptys"]) == 1 and session.pid == state["ptys"][0].pid
+
 # =========================================================================
 # Spawn rewrite regression (issue #68915)
 # =========================================================================
@@ -2528,6 +2667,44 @@ class TestSystemdCgroupIsolation:
 
         stop_unit.assert_called_once()
         pipe_spawn.assert_not_called()
+
+    @pytest.mark.platforms("linux")
+    def test_pty_refusal_still_stops_scope_before_raising(
+        self, registry, monkeypatch, _gateway_identity
+    ):
+        """A started PTY child that refuses termination still has its scope stopped before
+        the fallback is refused, and the session stays reachable."""
+        from ptyprocess import PtyProcess
+
+        fake_pty = MagicMock()
+        fake_pty.pid = 4321
+        fake_pty.terminate.return_value = False
+        fake_pty.isalive.return_value = True
+
+        broken_reader = MagicMock()
+        broken_reader.start.side_effect = RuntimeError("reader failed")
+
+        monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/bin/bash")
+        monkeypatch.setattr(
+            "tools.process_registry._systemd_run_user_scope_available", lambda: True,
+        )
+        monkeypatch.setattr(
+            "gateway.restart.is_gateway_supervisor_process", lambda environ=None: True,
+        )
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run")
+
+        with patch.object(PtyProcess, "spawn", return_value=fake_pty), \
+            patch("subprocess.Popen") as popen, \
+            patch("tools.process_registry._stop_systemd_unit", return_value=True) as stop_unit, \
+            patch("threading.Thread", return_value=broken_reader), \
+            patch.object(registry, "_write_checkpoint"):
+            with pytest.raises(RuntimeError, match="PTY child could not be reaped"):
+                registry.spawn_local("codex", cwd="/tmp", use_pty=True)
+
+        stop_unit.assert_called_once()
+        popen.assert_not_called()
+        (session,) = registry._running.values()
+        assert registry.get(session.id) is session and session._pty is fake_pty
 
     def test_worker_memory_limit_honors_local_guard_mb_override(self, monkeypatch):
         import tools.process_registry as pr
