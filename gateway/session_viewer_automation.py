@@ -25,7 +25,7 @@ _CALLS = {
                        "clear_subgoals", "add_gate", "remove_gate", "clear_gates", "wait_on", "wait_on_session",
                        "wait_for_seconds", "stop_waiting", "is_waiting", "evaluate_after_turn", "command"}),
     "loop": frozenset({"state", "set", "pause", "resume", "clear", "fire_tick", "abandon_tick", "complete_tick",
-                       "goal_blocks_tick"}),
+                       "complete_exhausted_tick", "goal_blocks_tick"}),
     "heartbeat": frozenset({"state", "set", "pause", "resume", "clear", "due_prompt", "abandon_fire"}),
 }
 _READS = frozenset({"state", "is_waiting", "goal_blocks_tick"})

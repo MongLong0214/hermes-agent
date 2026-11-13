@@ -957,10 +957,6 @@ gateway:
     auto_reset_notice: |
       ◐ Session réinitialisée après un arrêt. Historique de conversation effacé.
       Utilisez /resume pour parcourir et restaurer une session précédente.
-    auto_reset_context_exhausted: |2-
-
-
-      🔄 Session réinitialisée automatiquement — la conversation a dépassé la taille maximale du contexte et n'a pas pu être compressée davantage. Votre prochain message démarrera une nouvelle session.
     info_model: "◆ Modèle : `{model}`"
     info_provider: "◆ Fournisseur : {provider}"
     info_context: "◆ Contexte : {tokens} tokens ({source})"

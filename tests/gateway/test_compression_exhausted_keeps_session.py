@@ -1,7 +1,7 @@
 """A gateway turn that exhausts context compression keeps its conversation.
 
-The auto-reset (``reset_and_rehome_messages`` + a conversation-scope clear) replaced the chat's
-session with a fresh one, so the existing conversation and everything scoped to it were dropped.
+The auto-reset (a route rotation that re-homed queued messages + a conversation-scope clear) replaced
+the chat's session with a fresh one, so the existing conversation and everything scoped to it were dropped.
 Now the session stays: same ``session_id``, no new session row, nothing re-homed, queued messages
 stay queued on it. The unanswered ask the agent flushed at turn start is retracted owner-side once
 the turn lease is released (otherwise the next ask merges into it and it replays on every later
@@ -56,8 +56,6 @@ async def gw(monkeypatch):
     def no_rotation(*_a, **_k):
         raise AssertionError("compression exhaustion must not reset or re-home the session")
 
-    from gateway import session_automation
-    monkeypatch.setattr(session_automation, "reset_and_rehome_messages", no_rotation)
     monkeypatch.setattr(runner.session_store, "reset_session", no_rotation)
     try:
         yield SimpleNamespace(runner=runner, adapter=adapter, authority=authority, source=source,
@@ -136,9 +134,10 @@ async def test_the_reply_points_at_compress_and_claims_no_reset(gw):
 
     response, _entry = await _exhausted_turn(gw, dict(EXHAUSTED, final_response=copy))
     assert response == copy
-    reset_notice = t("gateway.session.auto_reset_context_exhausted").strip()
-    assert reset_notice not in response
     assert "fresh session" not in response.lower()
+    # The auto-reset notice is gone from the catalog: ``t`` falls back to the bare key.
+    key = "gateway.session.auto_reset_context_exhausted"
+    assert t(key) == key
 
 
 @pytest.mark.asyncio

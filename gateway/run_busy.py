@@ -201,19 +201,22 @@ class GatewayBusySessionMixin:
     def _defer_past_exhaustion_reset(
         self, result: Any, adapter: Any, source: SessionSource, session_key: str, pending_event: MessageEvent,
     ) -> None:
-        """Leave the post-turn drain to the fresh session after a compression-exhausted turn.
+        """Leave the post-turn drain to the outer handler after a compression-exhausted turn.
 
-        The outer handler owns the reset: the exact queued event goes back in the head slot so the
-        adapter's post-handler drain starts it on the fresh session (never promoted or prepared on the
-        exhausted one). An accepted leftover /steer was already taken out of the agent's buffer, so it
-        keeps its usual place ahead of that event instead of vanishing.
+        The session is kept. An in-handler follow-up would run on this turn's ``result["messages"]``,
+        unanswered ask included, before the outer handler persists the turn and retracts that ask
+        (``_hmwa_retract_exhausted_turn``). So the exact queued event goes back in the head slot and the
+        adapter's post-handler drain starts it after that, on the same session (never promoted or
+        prepared inside the exhausted turn). An accepted leftover /steer was already taken out of the
+        agent's buffer, so it keeps its usual place ahead of that event instead of vanishing.
         """
         leftover_steer = (result.get("pending_steer") or "").strip()
         if leftover_steer:
             self._session_state(session_key).conversation.queued_events.insert(0, pending_event)
             pending_event = self._carry_over_event(session_key, source, leftover_steer)
         adapter._pending_messages[session_key] = pending_event
-        logger.info("Deferring queued follow-up for session %s until after its compression-exhausted reset", session_key)
+        logger.info("Deferring queued follow-up for session %s until its compression-exhausted turn is persisted",
+                    session_key)
 
     def _merge_leftover_steer(
         self, result: Any, adapter: Any, source: SessionSource, session_key: Optional[str],

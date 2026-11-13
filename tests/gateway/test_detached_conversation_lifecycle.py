@@ -27,9 +27,9 @@ async def _moved_on(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_the_chats_context_exhaustion_reset_moves_the_old_conversation_off_the_chat(monkeypatch):
-    """F1: the auto-reset after context exhaustion rotates the chat to B without a /new. The app's
-    next prompt on A runs in A, and the chat gets nothing of it."""
+async def test_the_chats_context_exhaustion_keeps_the_chat_on_its_conversation(monkeypatch):
+    """F1: context exhaustion is not a /new. The chat stays on A (its route is never rotated), the
+    chat is told what happened, and the chat's next message and the app's next prompt both run in A."""
     from gateway.session_results import execution_result
     runner, adapter, authority, source, sent, ran, _gates = await _gateway(monkeypatch)
     lane = runner.session_store._generate_session_key(source)
@@ -40,18 +40,22 @@ async def test_the_chats_context_exhaustion_reset_moves_the_old_conversation_off
     async def exhausting(event, source, session_entry, session_key, *args):
         if event.text != 'too big':
             return await prepare(event, source, session_entry, session_key, *args)
-        execution_result.get()['result'] = {'final_response': 'Context too large', 'messages': []}
-        entry = await runner._hmwa_rotate_exhausted_session(session_entry, session_key, source)
-        return 'Context too large', entry
+        ran.append((event.text, session_entry.session_id, session_key))
+        result = {'final_response': 'Context too large', 'failed': True, 'compression_exhausted': True,
+                  'messages': []}
+        execution_result.get()['result'] = result
+        return await runner._hmwa_compression_exhaustion_reset(
+            result, 'Context too large', session_entry, session_key, source)
     monkeypatch.setattr(runner, '_hmwa_prepare_turn', exhausting)
     await _chat(adapter, source, sent, 'too big')
-    await async_wait_until(lambda: runner.session_store.peek_session_id(lane) != ref_a.session_id,
-                           what='the route to rotate')
-    chat_replies = len(sent)
+    assert sent[-1] == 'Context too large'
+    assert runner.session_store.peek_session_id(lane) == ref_a.session_id
 
+    await _chat(adapter, source, sent, 'next')
+    assert ran[-1] == ('next', ref_a.session_id, lane)
     assert await _app_turn(authority, ref_a, 'app prompt on A') == ('terminal', 'completed')
-    assert ran[-1][:2] == ('app prompt on A', ref_a.session_id) and ran[-1][2] != lane
-    assert sent[chat_replies:] == [], f'the chat got the old conversation\'s reply: {sent[chat_replies:]}'
+    assert ran[-1][:2] == ('app prompt on A', ref_a.session_id)
+    assert runner.session_store.peek_session_id(lane) == ref_a.session_id
 
 
 @pytest.mark.asyncio

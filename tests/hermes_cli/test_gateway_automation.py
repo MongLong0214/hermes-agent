@@ -15,8 +15,14 @@ class _Conn:
         self.closed = False
 
     def call(self, method, **params):
-        from gateway.session_viewer_automation import invoke
+        from gateway.session_viewer_automation import _parse, invoke
+        from hermes_cli.gateway_client import GatewayClientError
+        from hermes_state_runtime import RuntimeStoreError
         self.calls.append((params['kind'], params['call']))
+        try:
+            _parse(params)  # the gateway's own allow-list: a call it refuses never reaches a manager
+        except RuntimeStoreError as exc:
+            raise GatewayClientError(str(exc)) from exc
         return invoke(SimpleNamespace(), params['kind'], params['session_id'], params['call'],
                       params['args'], params['kwargs'])
 
@@ -79,6 +85,27 @@ def test_idle_polls_cost_no_round_trip(cli):
     loop.set('check', interval_seconds=60, times=1)
     assert loop.is_due() and loop.fire_tick().startswith('[/loop wakeup #1')
     assert loop.complete_tick('done')['message'] == '✓ Loop finished — ran 1/1 times.'
+
+
+def test_an_exhausted_loop_tick_is_bounded_over_the_gateway(cli):
+    """A wakeup turn that exhausted compression is settled by the gateway's bounded call, never judged
+    (``LoopManager.complete_exhausted_tick``): one more tick, then the loop pauses. Before, the proxy had
+    no such call and the gateway refused it, so the CLI fell back to ``complete_tick("")`` forever."""
+    import time
+    from hermes_cli.loops import load_loop, save_loop
+    loop = cli.cli._get_loop_manager()
+    loop.set('check the build', interval_seconds=60)
+    for status in ('active', 'paused'):
+        state = load_loop('sid-1')
+        state.next_due_at = time.time() - 1  # the interval passes
+        save_loop('sid-1', state)
+        assert loop.fire_tick().startswith('[/loop wakeup')
+        cli.cli._last_turn_compression_exhausted = True
+        cli.cli._maybe_complete_loop_tick_after_turn()
+        assert loop.state.status == status and load_loop('sid-1').status == status
+    assert load_loop('sid-1').paused_reason == 'context compression exhausted twice consecutively'
+    assert cli.cli._loop_compression_recovery is None
+    assert ('loop', 'complete_exhausted_tick') in cli.conn.calls and ('loop', 'complete_tick') not in cli.conn.calls
 
 
 def test_the_watchdog_fires_a_heartbeat_another_viewer_resumed(cli, monkeypatch):

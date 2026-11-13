@@ -193,9 +193,6 @@ class SessionAuthority:
         # owner's life (one int per chat that ever got one): an input or command turn holding an older
         # value never commits, and a reset entry could read as an old epoch again.
         self._route_epochs = {}
-        # route -> the compression-exhaustion auto-reset its LOCAL turn deferred: the store refuses a
-        # reset while that turn's admission is started, so the drain runs it once the turn settles.
-        self.deferred_resets = {}
 
     def authorize(self, actor, ref, capability):
         """Every handler calls this first, so a later ``self.sessions[ref.session_id]`` is
@@ -1345,13 +1342,9 @@ class SessionAuthority:
             try:
                 response, outcome = await self._execute_claimed(ref, live, row)
                 if outcome == 'settled_unknown':
-                    self.deferred_resets.pop(live.route, None)  # no settlement follows, as below
                     continue
             except BaseException as exc:
-                # No settlement follows (a lost managed worker, a cancelled drain): the turn is never
-                # replayed, so its deferred reset is dropped (the next turn re-detects the overflow),
-                # never left to fire after a later settled turn with a stale entry.
-                self.deferred_resets.pop(live.route, None)
+                # No settlement follows (a lost managed worker, a cancelled drain): the turn is never replayed.
                 from gateway.session_ingress import fire_post_delivery
                 await fire_post_delivery(self, admission_id)  # cancelled mid-turn: as an adapter task's finally
                 if isinstance(exc, ManagedExecutionUnknown):
@@ -1374,17 +1367,6 @@ class SessionAuthority:
                 raise
             if not advance:
                 return
-
-    @staticmethod
-    async def _run_deferred_reset(route, reset):
-        """The auto-reset the settled turn deferred (``_hmwa_defer_exhaustion_reset``), before its
-        waiter wakes: a delivery retry or the next DM then reads the fresh target."""
-        if reset is not None:
-            try:
-                await reset()
-            except Exception:
-                import logging
-                logging.getLogger(__name__).exception('Deferred auto-reset of %s failed', route)
 
     async def _resolve_settled_waiter(self, admission_id, response):
         """Hand the settled reply to its waiter. The adapter sending it adopted the turn's crash marker
