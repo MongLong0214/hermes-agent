@@ -72,6 +72,15 @@ _SHADOWED_CHECKPOINT_ROWS_SQL = ("SELECT id, codex_reasoning_items FROM messages
     "AND role = 'assistant' AND id < ? AND codex_reasoning_items LIKE '%\"compaction\"%'")
 _SET_CODEX_REASONING_SQL = "UPDATE messages SET codex_reasoning_items = ? WHERE id = ?"
 _INVALID = object()  # _json_or sentinel where the fallback must be distinguishable from JSON null
+# /reload-mcp's transcript notice (gateway/run_turn.py): a user-role row the model reads with its next
+# turn, but no principal's message, so it never makes the history unanswered.
+MCP_RELOAD_NOTICE_DISPLAY_KIND = "mcp_reload_notice"
+MCP_RELOAD_NOTICE_METADATA = {"system_notice": "mcp_reload"}
+# Notices written before they were typed carry no kind and no metadata: only the exact text the gateway
+# writes counts, never a longer message that merely contains it.
+_LEGACY_MCP_RELOAD_NOTICE_RE = re.compile(
+    r"\[IMPORTANT: MCP servers have been reloaded\. .*"
+    r"The tool list for this conversation has been updated accordingly\.\]")
 
 
 def _json_or(raw: Any, fallback: Any, warning: str) -> Any:
@@ -554,20 +563,33 @@ class SessionMessagesMixin:
     def open_user_tail_is_delivery_only(self, session_id: str) -> bool:
         """True when the open user tail (active user rows after the newest assistant/tool row) holds
         only recorded delegation deliveries (``async_delegation_complete`` / ``hidden``), which
-        ``append_delegation_delivery`` writes between client turns to be read with the next one.
-        Such rows are no principal's message, so they do not make the history unanswered."""
+        ``append_delegation_delivery`` writes between client turns to be read with the next one, and
+        /reload-mcp notices. Such rows are no principal's message, so they do not make the history
+        unanswered."""
         # ``hidden`` also marks ordinary off-screen user prompts (#102 r1 H102-01): only a row that
         # carries the delivery's own delegation_id, as append_delegation_delivery writes it, counts.
         rows = self._read_all(
-            "SELECT role, display_kind, json_extract(display_metadata, '$.delegation_id') "
+            "SELECT role, display_kind, json_extract(display_metadata, '$.delegation_id'), "
+            "json_extract(display_metadata, '$.system_notice'), display_metadata, content "
             "FROM messages WHERE session_id = ? AND active = 1 "
             "AND role NOT IN ('session_meta', 'system') AND id > coalesce((SELECT max(id) FROM messages "
             "WHERE session_id = ? AND active = 1 AND role IN ('assistant', 'tool')), 0) ORDER BY id",
             (session_id, session_id))
         return bool(rows) and all(
-            role == "user" and kind in ("async_delegation_complete", "hidden")
-            and isinstance(delegation_id, str) and delegation_id.strip()
-            for role, kind, delegation_id in rows)
+            role == "user" and (
+                (kind in ("async_delegation_complete", "hidden")
+                 and isinstance(delegation_id, str) and bool(delegation_id.strip()))
+                or self._is_mcp_reload_notice(kind, notice, metadata, content))
+            for role, kind, delegation_id, notice, metadata, content in rows)
+
+    def _is_mcp_reload_notice(self, kind: Any, notice: Any, metadata: Any, content: Any) -> bool:
+        """A /reload-mcp notice row: typed with its kind and marker, or legacy (no kind, no metadata)
+        with exactly the notice's text."""
+        if kind == MCP_RELOAD_NOTICE_DISPLAY_KIND:
+            return notice == MCP_RELOAD_NOTICE_METADATA["system_notice"]
+        text = self._decode_content(content)
+        return (not kind and not metadata and isinstance(text, str)
+                and _LEGACY_MCP_RELOAD_NOTICE_RE.fullmatch(text) is not None)
 
     def get_message_role(self, session_id: str, row_id: int) -> Optional[str]:
         """Role of the active message at *row_id* in *session_id*, or ``None``."""

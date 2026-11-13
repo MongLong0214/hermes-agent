@@ -174,3 +174,29 @@ async def test_reload_mcp_preserves_per_agent_toolset_overrides():
     assert captured_calls, "get_tool_definitions was never called to refresh the cache"
     assert captured_calls[0]["enabled_toolsets"] == ["safe"]
     assert captured_calls[0]["disabled_toolsets"] == ["terminal"]
+
+
+@pytest.mark.asyncio
+async def test_reload_mcp_notice_is_typed_as_a_system_notice():
+    """The transcript notice stays a user-role row with the same text at the tail (the model reads it
+    with the next turn; the prompt-cache prefix is untouched) but is typed ``mcp_reload_notice`` with
+    its marker, so a canonical (Buzz/ACP) turn does not count it as an unanswered principal message."""
+    runner = _make_runner_with_cached_agents(num_agents=0)
+
+    with (
+        patch("tools.mcp_tool_lifecycle.shutdown_mcp_servers"),
+        patch("tools.mcp_tool_discovery.discover_mcp_tools", return_value=["HassTurnOn"]),
+        patch.dict("tools.mcp_tool._servers", {"homeassistant": object()}, clear=True),
+        patch("model_tools.get_tool_definitions", return_value=[]),
+    ):
+        await runner._execute_mcp_reload(_make_event())
+
+    [(args, _kwargs)] = runner.session_store.append_to_transcript.call_args_list
+    assert args[0] == "sess-1"
+    assert args[1] == {
+        "role": "user",
+        "content": "[IMPORTANT: MCP servers have been reloaded. Reconnected servers: homeassistant. "
+                   "1 MCP tool(s) now available. The tool list for this conversation has been updated accordingly.]",
+        "display_kind": "mcp_reload_notice",
+        "display_metadata": {"system_notice": "mcp_reload"},
+    }

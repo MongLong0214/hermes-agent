@@ -2888,9 +2888,14 @@ class GatewayTurnMixin:
             ]
             tool_summary = f"{len(new_tools)} MCP tool(s) now available" if new_tools else "No MCP tools available"
             change_detail = ". ".join(change_parts) + ". " if change_parts else ""
+            from hermes_state_messages import MCP_RELOAD_NOTICE_DISPLAY_KIND, MCP_RELOAD_NOTICE_METADATA
             reload_msg = {
                 "role": "user",
                 "content": f"[IMPORTANT: MCP servers have been reloaded. {change_detail}{tool_summary}. The tool list for this conversation has been updated accordingly.]",
+                # A system notice, not a principal's message: a canonical (Buzz/ACP) turn may follow it
+                # without the history counting as unanswered (open_user_tail_is_delivery_only).
+                "display_kind": MCP_RELOAD_NOTICE_DISPLAY_KIND,
+                "display_metadata": dict(MCP_RELOAD_NOTICE_METADATA),
             }
             with suppress(Exception):  # Best-effort; don't fail the reload over a transcript write
                 session_entry = await self.async_session_store.get_or_create_session(event.source)
