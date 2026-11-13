@@ -40,9 +40,37 @@ def _redact_telegram_error_text(error: object, proxy_url: str | None = None) -> 
         return f"<{type(error).__name__}>" if error is not None else text
     try:
         from agent.redact import redact_sensitive_text
-        return redact_sensitive_text(text, force=True)
+        # redact_url_credentials: httpx/PTB errors can echo a proxy URL's userinfo or a generic
+        # ``?access_token=`` query param, which the default pattern pass leaves (partly) visible.
+        return redact_sensitive_text(text, force=True, redact_url_credentials=True)
     except Exception:
         return "<telegram error redacted>"
+
+
+class _RedactTelegramLogRecord(logging.Filter):
+    """Force-redact every record this module emits, traceback included. Redacting only the message
+    is not enough: ``exc_info=True`` makes logging append the raw exception text, and a Bot API
+    URL in it carries the token; some sites also pass the raw exception as a message argument.
+    ``exc_info`` stays on the record (a traceback-bearing record is still recognisable as one):
+    ``Formatter.format`` renders the cached ``exc_text`` set here instead of re-formatting it."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+            if message:
+                record.msg, record.args = _redact_telegram_error_text(message), None
+            if record.exc_info:
+                record.exc_text = _redact_telegram_error_text(logging.Formatter().formatException(record.exc_info))
+        # health: allow BLE001 -- a filter that raises breaks the caller's log call and one that logs recurses; fail closed
+        except Exception:
+            # Unformattable (args that do not match the message) or unrenderable traceback: keep the record,
+            # drop the text redaction could not vouch for (logging's own error dump would print the raw args).
+            record.msg, record.args = "<telegram log record redacted>", None
+            record.exc_info = record.exc_text = None
+        return True
+
+
+logger.addFilter(_RedactTelegramLogRecord())
 
 
 def _consume_abandoned_task(task: asyncio.Task) -> None:
