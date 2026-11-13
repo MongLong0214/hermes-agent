@@ -20,7 +20,8 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 # Queue terminal status -> ledger delivery_outcome. ``unknown`` (owner died mid-send, never
-# retried) is surfaced as a failure: the user cannot be told the result arrived.
+# retried) is surfaced as a failure: the user cannot be told the result arrived. A drain's own
+# send that began and never confirmed is ``unknown`` too, but settles ``uncertain`` (terminal_outcome).
 _LEDGER_OUTCOME = {
     "delivered": "delivered", "suppressed": "suppressed", "failed": "failed", "unknown": "failed",
 }
@@ -53,22 +54,27 @@ def _settle_job_record(job_id: str, execution_id: str, delivery_error: Optional[
     return bool(_with_job(job_id, apply, missing=False))
 
 
-def _terminal(execution_id: str) -> Optional[tuple[str, Optional[str]]]:
+def terminal_outcome(execution_id: str) -> Optional[tuple[str, Optional[str]]]:
     """``(ledger_outcome, delivery_error)`` once the queue row is terminal, else None."""
-    from cron.delivery_queue import get_status
+    from cron.delivery_queue import UNCERTAIN_SEND_ERROR, get_status
 
     row = get_status(str(execution_id))
     if not row or row["status"] not in _LEDGER_OUTCOME:
         return None
+    error = row.get("error")
+    if row["status"] == "unknown" and str(error or "").startswith(UNCERTAIN_SEND_ERROR):
+        # Began, never confirmed, never resent: neither delivered nor failed. A partial error after
+        # the prefix may carry provider text, so the job record gets only the fixed text.
+        return "uncertain", (UNCERTAIN_SEND_ERROR if error != UNCERTAIN_SEND_ERROR else None)
     delivery_error = None
     if row["status"] in ("failed", "unknown"):
-        delivery_error = str(row.get("error") or f"delivery {row['status']}")
+        delivery_error = str(error or f"delivery {row['status']}")
     return _LEDGER_OUTCOME[row["status"]], delivery_error
 
 
 def settled_outcome(execution_id: str) -> Optional[str]:
     """The ledger outcome a drain already reached for *execution_id* (None while queued)."""
-    terminal = _terminal(execution_id)
+    terminal = terminal_outcome(execution_id)
     return terminal[0] if terminal else None
 
 
@@ -76,7 +82,7 @@ def settle_queued_delivery(job_id: Optional[str], execution_id: Optional[str]) -
     """Apply the queue's terminal outcome for *execution_id*; False while still in flight."""
     if not job_id or not execution_id:
         return False
-    terminal = _terminal(str(execution_id))
+    terminal = terminal_outcome(str(execution_id))
     if terminal is None:
         return False
     from cron.executions import settle_delivery_outcome

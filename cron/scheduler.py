@@ -533,7 +533,7 @@ from cron.executions import (
     get_execution, mark_execution_handoff_pending, mark_execution_running,
     recover_interrupted_executions, settle_unstarted_execution, terminalize_dead_owner)
 from cron.scheduler_liveness import ExecutionProgressStamper, _inactivity_watchdog_loop
-from cron.scheduler_bookkeeping import _classify_delivery_outcome
+from cron.scheduler_bookkeeping import _classify_delivery_outcome, uncertain_job_delivery_error
 from cron.cancellation import (CancelRequest, _CancelEventLike, _CombinedCancelEvent, cancel_reason,
                                clear_cancel, finish_lost_execution,
                                run_job_unless_cancelled as _run_job_unless_cancelled)
@@ -3195,10 +3195,11 @@ def _deliver_crash_failure(
         delivery_error=delivery_error, should_deliver=True, unresolved_origin=unresolved_origin,
         normalized_deliver=normalized_deliver, incident_acked=False, success=False,
         delivery_queued=job.get("last_delivery_queued"),
-        notification_suppressed=bool(job.get("_notification_all_targets_suppressed")))
+        notification_suppressed=bool(job.get("_notification_all_targets_suppressed")),
+        delivery_uncertain=bool(job.get("_delivery_uncertain")))
     if delivery_outcome in ("delivered", "not_configured"):
         _mark_incident_alerted(failure_incident_id)
-    return delivery_error, delivery_outcome
+    return uncertain_job_delivery_error(delivery_error, delivery_outcome == "uncertain"), delivery_outcome
 
 
 

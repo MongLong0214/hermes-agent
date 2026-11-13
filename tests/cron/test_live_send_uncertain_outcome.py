@@ -4,9 +4,9 @@ When the live adapter's send had begun but did not confirm within the timeout, t
 correctly refused a standalone resend (it could duplicate the message), but then reported the
 target as delivered: the continuation sessions were seeded as for a confirmed send and nothing was
 written to ``last_delivery_unverified``. These tests drive a real gateway loop whose send stalls
-past a shortened confirmation timeout, through the real job store. (``run_one_job`` hands its
-send to the durable delivery queue, whose drain calls ``_deliver_result``; the queue's own
-uncertain handling is covered separately.)
+past a shortened confirmation timeout, through the real job store, execution ledger and durable
+delivery queue. ``run_one_job`` hands an agent run's send to the queue, whose gateway drain calls
+``_deliver_result``; a script run and a crash notice send directly.
 """
 import asyncio
 import threading
@@ -15,7 +15,7 @@ from types import SimpleNamespace
 import pytest
 
 from agent.monitoring.cron_health import project_execution_event
-from cron import jobs, scheduler, scheduler_delivery
+from cron import delivery_queue, executions, jobs, scheduler, scheduler_delivery
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 
 
@@ -154,3 +154,145 @@ def test_mixed_targets_uncertain_and_failed_keeps_both(stalled_live_send, monkey
     assert calls.standalone and all("456" in str(args) for args in calls.standalone), \
         "123 must never be resent"
     assert job.get("_delivery_uncertain") == ["telegram:123"]
+
+
+def _run_then_drain(calls, monkeypatch, job, *, drain_timing="after_run"):
+    """Run an agent job (it only queues its send), and let the gateway drain the row through the
+    stalled live adapter: after the run, or before the run's own bookkeeping lands."""
+    if drain_timing == "before_bookkeeping":
+        real_enqueue = delivery_queue.enqueue
+
+        def enqueue_then_drain(*args, **kwargs):
+            queued = real_enqueue(*args, **kwargs)
+            assert scheduler.drain_delivery_queue(calls.adapters, calls.loop) == 1
+            return queued
+
+        monkeypatch.setattr(delivery_queue, "enqueue", enqueue_then_drain)
+    scheduler.run_one_job(job)
+    if drain_timing == "after_run":
+        assert calls.live == [], "the run only queues; the gateway drain sends"
+        assert scheduler.drain_delivery_queue(calls.adapters, calls.loop) == 1
+    execution = executions.latest_execution(job["id"])
+    return execution, delivery_queue.get_status(execution["id"])
+
+
+@pytest.mark.parametrize("drain_timing", ["after_run", "before_bookkeeping"])
+def test_queued_send_that_began_unconfirmed_is_recorded_uncertain(
+        stalled_live_send, monkeypatch, drain_timing):
+    """The drained row ends ``unknown`` and is never replayed; the run is neither delivered nor
+    failed: ledger ``uncertain``, job ``ok`` with no delivery error, the target unverified."""
+    calls = stalled_live_send
+    monkeypatch.setattr(
+        scheduler, "run_job", lambda job, **kwargs: (True, "output", "the brief", None))
+    job = jobs.create_job(prompt="fixture only", schedule="every 1h", deliver="telegram:123")
+
+    execution, queued = _run_then_drain(calls, monkeypatch, job, drain_timing=drain_timing)
+
+    assert queued["status"] == "unknown", queued
+    assert queued["error"] == delivery_queue.UNCERTAIN_SEND_ERROR, queued
+    assert len(calls.live) == 1
+    _assert_uncertain_not_delivered(job["id"], calls)
+    assert execution["delivery_outcome"] == "uncertain", execution
+    saved = jobs.get_job(job["id"])
+    assert (saved["last_status"], saved["last_delivery_error"]) == ("ok", None), saved
+    assert scheduler.drain_delivery_queue(calls.adapters, calls.loop) == 0
+    assert len(calls.live) == 1, "an uncertain queued send is never replayed"
+
+
+def test_queued_uncertain_send_with_skipped_media_stays_unknown(
+        stalled_live_send, media_brief, monkeypatch):
+    calls = stalled_live_send
+    monkeypatch.setattr(
+        scheduler, "run_job", lambda job, **kwargs: (True, "output", media_brief, None))
+    job = jobs.create_job(prompt="fixture only", schedule="every 1h", deliver="telegram:123")
+
+    execution, queued = _run_then_drain(calls, monkeypatch, job)
+
+    assert queued["status"] == "unknown", queued
+    assert queued["error"].startswith(delivery_queue.UNCERTAIN_SEND_ERROR + "; "), queued
+    assert "media attachment" in queued["error"], "the skipped attachment was dropped"
+    assert len(calls.live) == 1
+    _assert_uncertain_not_delivered(job["id"], calls)
+    assert execution["delivery_outcome"] == "uncertain", execution
+    saved = jobs.get_job(job["id"])
+    assert saved["last_status"] == "delivery_failed", saved
+    assert saved["last_delivery_error"] == delivery_queue.UNCERTAIN_SEND_ERROR, saved
+
+
+def _one_target_refuses(calls, monkeypatch, provider_text):
+    stalled = calls.adapters[Platform.TELEGRAM].send
+
+    async def live_send(chat_id, content, metadata=None):
+        if str(chat_id) == "456":
+            raise RuntimeError(provider_text)
+        return await stalled(chat_id, content, metadata)
+
+    async def standalone_fails(*args, **kwargs):
+        calls.standalone.append(args)
+        return {"error": provider_text}
+
+    calls.adapters[Platform.TELEGRAM] = SimpleNamespace(send=live_send)
+    monkeypatch.setattr("tools.send_message_tool._send_to_platform", standalone_fails)
+
+
+PROVIDER_TEXT = 'Bad Request: chat not found {"ok":false,"error_code":400}'
+
+
+def test_queued_mixed_targets_keep_provider_text_off_the_job_record(stalled_live_send, monkeypatch):
+    """One target began and never confirmed, another was refused with a provider body: the run is
+    still uncertain, the refusal stays on the private queue row, and the job record says only the
+    fixed uncertain text."""
+    calls = stalled_live_send
+    _one_target_refuses(calls, monkeypatch, PROVIDER_TEXT)
+    monkeypatch.setattr(
+        scheduler, "run_job", lambda job, **kwargs: (True, "output", "the brief", None))
+    job = jobs.create_job(
+        prompt="fixture only", schedule="every 1h", deliver="telegram:123,telegram:456")
+
+    execution, queued = _run_then_drain(calls, monkeypatch, job)
+
+    assert calls.standalone and all("456" in str(args) for args in calls.standalone), \
+        "123 must never be resent"
+    assert queued["status"] == "unknown" and "chat not found" in queued["error"], queued
+    assert execution["delivery_outcome"] == "uncertain", execution
+    saved = jobs.get_job(job["id"])
+    assert saved["last_status"] == "delivery_failed", saved
+    assert saved["last_delivery_error"] == delivery_queue.UNCERTAIN_SEND_ERROR, saved
+
+
+def test_direct_send_that_began_unconfirmed_is_recorded_uncertain(stalled_live_send, monkeypatch):
+    """A script run sends directly through the live adapter: same outcome on the ledger, and the
+    other target's provider text does not reach the job record."""
+    calls = stalled_live_send
+    _one_target_refuses(calls, monkeypatch, PROVIDER_TEXT)
+    monkeypatch.setattr(
+        scheduler, "run_job", lambda job, **kwargs: (True, "output", "the brief", None))
+    job = jobs.create_job(
+        prompt="fixture only", schedule="every 1h", deliver="telegram:123,telegram:456")
+
+    assert scheduler.run_one_job(
+        dict(job, no_agent=True), adapters=calls.adapters, loop=calls.loop) is True
+
+    assert delivery_queue.get_status(executions.latest_execution(job["id"])["id"]) is None
+    assert calls.standalone and all("456" in str(args) for args in calls.standalone), \
+        "123 must never be resent"
+    assert calls.seeded == [], "an unconfirmed send must not seed continuation sessions"
+    assert executions.latest_execution(job["id"])["delivery_outcome"] == "uncertain"
+    saved = jobs.get_job(job["id"])
+    assert saved["last_delivery_error"] == delivery_queue.UNCERTAIN_SEND_ERROR, saved
+
+
+def test_crash_notice_that_began_unconfirmed_is_recorded_uncertain(stalled_live_send, monkeypatch):
+    calls = stalled_live_send
+
+    def crash(job, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(scheduler, "run_job", crash)
+    job = jobs.create_job(prompt="fixture only", schedule="every 1h", deliver="telegram:123")
+
+    assert scheduler.run_one_job(job, adapters=calls.adapters, loop=calls.loop) is False
+
+    _assert_uncertain_not_delivered(job["id"], calls)
+    assert executions.latest_execution(job["id"])["delivery_outcome"] == "uncertain"
+    assert jobs.get_job(job["id"])["last_delivery_error"] is None

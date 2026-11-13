@@ -237,3 +237,107 @@ class TestShutdownDeliversNoticeBeforeDisconnect:
         assert events.index("cron_notice") < events.index("disconnect"), (
             f"notice sent after adapter teardown — it would be lost: {events}"
         )
+
+
+class TestDeliveryErrorIsRecordedWhenTheNoticeCannotBeSent:
+    """``_consume_interrupted_flag`` skips ``finish_completed_run``: shutdown already wrote this
+    run's ``last_status``, and a second ``mark_job_run`` would skip a fire or retire the job early.
+    The interrupted tail still records what happened to the notice."""
+
+    def _job(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        from cron.executions import create_execution
+        from cron.jobs import create_job, get_job
+
+        job = create_job(prompt="x", schedule="every 5m", name="interrupted")
+        return get_job(job["id"]), create_execution(job["id"], source="direct")
+
+    def test_interrupted_run_records_delivery_error_without_mark_job_run(self, tmp_path, monkeypatch):
+        from cron.jobs import get_job
+        from cron.scheduler_bookkeeping import finish_interrupted_run
+
+        before, execution = self._job(tmp_path, monkeypatch)
+
+        finish_interrupted_run(before, execution["id"], "telegram: 502 Bad Gateway")
+
+        after = get_job(before["id"])
+        # Raw until the closed public copy lands (E3-L2).
+        assert after["last_delivery_error"] == "telegram: 502 Bad Gateway"
+        assert after["repeat"] == before["repeat"] and after["next_run_at"] == before["next_run_at"]
+
+    def test_interrupted_uncertain_send_records_no_provider_text(self, tmp_path, monkeypatch):
+        from cron import delivery_queue
+        from cron.executions import get_execution
+        from cron.jobs import get_job
+        from cron.scheduler_bookkeeping import finish_interrupted_run
+
+        before, execution = self._job(tmp_path, monkeypatch)
+        job = dict(before, _delivery_uncertain=["telegram:123"])
+
+        finish_interrupted_run(job, execution["id"], 'telegram:456: Bad Request: chat not found {"ok":false}')
+
+        after = get_job(before["id"])
+        assert "chat not found" not in str(after["last_delivery_error"]), after
+        assert after["last_delivery_error"] == delivery_queue.UNCERTAIN_SEND_ERROR
+        assert get_execution(execution["id"])["delivery_outcome"] == "uncertain"
+        assert after["repeat"] == before["repeat"] and after["next_run_at"] == before["next_run_at"]
+
+
+class TestInterruptedRunKeepsItsQueuedNoticeOutcome:
+    """An interrupted agent run hands its failure notice to the delivery queue like any run, but
+    only ``finish_completed_run`` settled a queued send, so the notice's outcome was lost."""
+
+    def _interrupted_run(self, tmp_path, monkeypatch, send_result, *, drain_first):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        from cron import delivery_queue, executions, jobs, scheduler
+        from gateway.config import GatewayConfig, PlatformConfig
+
+        config = GatewayConfig()
+        config.platforms[Platform.TELEGRAM] = PlatformConfig(enabled=True)
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: config)
+
+        async def send(platform, pconfig, chat_id, text, **kwargs):
+            return send_result
+
+        monkeypatch.setattr("tools.send_message_tool._send_to_platform", send)
+        monkeypatch.setattr(scheduler, "run_job", lambda job, **kw: (True, "raw", "the result", None))
+        if drain_first:
+            real_enqueue = delivery_queue.enqueue
+
+            def enqueue_then_drain(*args, **kwargs):
+                queued = real_enqueue(*args, **kwargs)
+                assert scheduler.drain_delivery_queue({}, None) == 1
+                return queued
+
+            monkeypatch.setattr(delivery_queue, "enqueue", enqueue_then_drain)
+        marks = []
+        real_mark = scheduler.mark_job_run
+        monkeypatch.setattr(
+            scheduler, "mark_job_run", lambda *a, **k: marks.append(a) or real_mark(*a, **k))
+        job = jobs.create_job(prompt="p", schedule="every 1h", deliver="telegram:fixture")
+        before = jobs.get_job(job["id"])
+        scheduler._interrupted_job_ids.add(scheduler._inflight_key(job["id"]))
+
+        assert scheduler.run_one_job(job) is True
+
+        assert marks == [], "shutdown already advanced this run"
+        after = jobs.get_job(job["id"])
+        assert after["repeat"] == before["repeat"] and after["next_run_at"] == before["next_run_at"]
+        return after, executions.latest_execution(job["id"])
+
+    def test_refused_notice_drained_before_the_tail_is_recorded(self, tmp_path, monkeypatch):
+        after, execution = self._interrupted_run(
+            tmp_path, monkeypatch, {"success": False, "error": "transport refused"}, drain_first=True)
+
+        assert "transport refused" in (after["last_delivery_error"] or ""), after
+        assert execution["delivery_outcome"] == "failed", execution
+
+    def test_notice_still_queued_settles_the_ledger_when_drained(self, tmp_path, monkeypatch):
+        from cron import executions, scheduler
+
+        _after, execution = self._interrupted_run(
+            tmp_path, monkeypatch, {"success": True, "message_id": "r"}, drain_first=False)
+
+        assert execution["delivery_outcome"] == "queued", execution
+        assert scheduler.drain_delivery_queue({}, None) == 1
+        assert executions.get_execution(execution["id"])["delivery_outcome"] == "delivered"

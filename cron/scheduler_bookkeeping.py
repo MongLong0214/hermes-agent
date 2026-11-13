@@ -13,10 +13,32 @@ def fail_empty_response(d, final_response):
         d.error = EMPTY_RESPONSE_ERROR
 
 
+def uncertain_job_delivery_error(delivery_error, uncertain: bool):
+    """What the job record says about a send that began and never confirmed: only the fixed text,
+    and only when part of it did fail. The partial (another target's refusal, a skipped attachment)
+    can carry provider text; it stays in the log and on the private queue row."""
+    if not uncertain:
+        return delivery_error
+    from cron.delivery_queue import UNCERTAIN_SEND_ERROR
+    return UNCERTAIN_SEND_ERROR if delivery_error else None
+
+
 def finish_interrupted_run(job, execution_id, delivery_error):
-    """Shutdown already advanced this run; update a failed notice without spending another fire."""
+    """Shutdown already advanced this run; update a failed notice without spending another fire.
+
+    A notice handed to the delivery queue is settled by ``finish_completed_run`` on every other
+    path, so this tail takes the outcome a drain already reached, or leaves the ledger ``queued``
+    for the drain that does."""
     from cron import scheduler
     logger = scheduler.logger
+    delivery_outcome = None
+    if job.get("_delivery_uncertain"):
+        delivery_outcome = "uncertain"
+        delivery_error = uncertain_job_delivery_error(delivery_error, True)
+    elif (job.get("last_delivery_queued") or {}).get("canonical"):
+        from cron.delivery_outcome import terminal_outcome
+        delivery_outcome, queued_error = terminal_outcome(execution_id) or ("queued", None)
+        delivery_error = delivery_error or queued_error
     if delivery_error:
         try:
             from cron.jobs import update_job
@@ -24,14 +46,19 @@ def finish_interrupted_run(job, execution_id, delivery_error):
         except Exception as exc:
             logger.debug('Failed recording delivery_error for interrupted job %s: %s', job['id'], exc, exc_info=True)
     scheduler.finish_execution(execution_id, success=False,
-                               error='Interrupted by gateway shutdown before terminal completion.')
+                               error='Interrupted by gateway shutdown before terminal completion.',
+                               delivery_outcome=delivery_outcome)
 
 
 def _classify_delivery_outcome(
     *, delivery_error, should_deliver: bool, unresolved_origin: bool,
     normalized_deliver: str, incident_acked: bool, success: bool,
-    delivery_queued=None, notification_suppressed: bool = False,
+    delivery_queued=None, notification_suppressed: bool = False, delivery_uncertain: bool = False,
 ) -> str:
+    if should_deliver and delivery_uncertain:
+        # A send began and never confirmed; it was not resent (it may have landed). Ahead of
+        # delivery_error: a partial failure must not turn a possibly-landed message into "failed".
+        return "uncertain"
     if delivery_error:
         return "failed"
     if should_deliver and delivery_queued:
@@ -60,7 +87,8 @@ def finish_completed_run(d, fire_owner: Optional[str], execution_id: str, *, rec
         from cron.jobs import update_job
         update_job(job["id"], {"last_delivery_queued": None})
         job["last_delivery_queued"] = None
-    mark_kwargs: dict = {"delivery_error": d.delivery_error}
+    uncertain = bool(job.get("_delivery_uncertain"))
+    mark_kwargs: dict = {"delivery_error": uncertain_job_delivery_error(d.delivery_error, uncertain)}
     from cron.scheduler_authority import journal_path
     journal = journal_path(job['id'], execution_id)
     if not job.get('no_agent'):
@@ -96,6 +124,7 @@ def finish_completed_run(d, fire_owner: Optional[str], execution_id: str, *, rec
         delivery_error=d.delivery_error,
         delivery_queued=job.get("last_delivery_queued"),
         notification_suppressed=bool(job.get("_notification_all_targets_suppressed")),
+        delivery_uncertain=uncertain,
         should_deliver=d.should_deliver,
         unresolved_origin=d.unresolved_origin,
         # Read the lane the notice was actually routed through (failure_deliver on failure).
