@@ -2319,6 +2319,7 @@ CompressedUserTurnOutcome = Literal["inserted", "merged", "already_present", "pl
 
 def _insert_real_user_anchor(messages: list, anchor: dict) -> CompressedUserTurnOutcome:
     """Insert the latest human turn without breaking role alternation."""
+    from agent.canonical_peer import peer_metadata
     from agent.context_compressor import _DB_PERSISTED_MARKER, ContextCompressor
 
     def _role(msg: Any) -> Optional[str]:
@@ -2329,22 +2330,21 @@ def _insert_real_user_anchor(messages: list, anchor: dict) -> CompressedUserTurn
         messages.insert(index, anchor)
         return "inserted"
 
-    # Preferred anchor: the summary boundary — first assistant message not preceded
-    # by a user turn. Left neighbour is then non-user, right is an assistant.
+    # Preferred anchor: the summary boundary (first assistant not preceded by a user turn; right neighbour assistant).
     for index, message in enumerate(messages):
         if _role(message) == "assistant" and (index == 0 or _role(messages[index - 1]) != "user"):
             return _place(index)
-    # Every assistant is user-preceded (or there are none). Appending is safe whenever the transcript does not already
-    # end with a user turn. Never merge into a summary either: its prefix must stay at message start for summary
-    # detection; repair_message_sequence merges adjacent user turns summary-first.
+    # Every assistant is user-preceded (or there are none): append unless the transcript ends with a user turn. Never
+    # merge into a summary (its prefix must stay first for detection; repair_message_sequence merges summary-first) nor
+    # a peer anchor, which stays its own structured row (the per-call wire copy merges the user;user pair later).
     if (
         not messages
         or _role(messages[-1]) != "user"
         or ContextCompressor._is_context_summary_content(_message_text(messages[-1]))
+        or peer_metadata(anchor) is not None
     ):
         return _place(len(messages))
-    # Trailing user-role scaffolding (e.g. the todo snapshot): merge instead
-    # of inserting a consecutive same-role message (#55677 strict templates).
+    # Trailing user-role scaffolding (e.g. the todo snapshot): merge, never a consecutive same-role row (#55677).
     _merge_anchor_into_user_message(messages[-1], anchor)
     messages[-1][_DB_PERSISTED_MARKER] = True
     return "merged"

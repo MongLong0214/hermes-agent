@@ -662,6 +662,7 @@ def _prune_unanswered_tool_calls(messages: list[dict]) -> tuple[list[dict], int]
 
 def _merge_consecutive_users(messages: list[dict]) -> tuple[list[dict], int]:
     """Pass 3: merge consecutive plain-text user messages (no user input lost)."""
+    from agent.canonical_peer import peer_metadata
     from agent.context_compressor import _DB_PERSISTED_MARKER, split_user_originated_turn
     from agent.conversation_compression_archive import MERGED_DURABLE_ROWS
     from hermes_state import SessionDB
@@ -685,6 +686,9 @@ def _merge_consecutive_users(messages: list[dict]) -> tuple[list[dict], int]:
             and prev.get("display_kind") != STEER_DISPLAY_KIND
             # Only merge plain-text content; leave multimodal (list or undecodable sentinel) content alone.
             and _plain_text(prev.get("content", "")) and _plain_text(msg.get("content", ""))
+            # A canonical peer row stays its own structured message, either way round (the per-call
+            # wire copy merges later, already rendered); malformed provenance raises here.
+            and peer_metadata(prev) is None and peer_metadata(msg) is None
         ):
             prev_content, new_content = prev.get("content", ""), msg.get("content", "")
             merged_content = (
@@ -704,19 +708,14 @@ def _merge_consecutive_users(messages: list[dict]) -> tuple[list[dict], int]:
                 prev[MERGED_TURN_PREFIX] = prev_content
             # Merged content invalidates the api_content sidecar; drop it so replay cannot use stale bytes.
             drop_stale_api_content(prev)
-            # A display-marker row (e.g. a model-switch marker persisted as role=user on
-            # purpose, #48338) merging with a plain user row must not bury the plain row's
-            # addressable identity: keeping the marker's display_kind hides the merged pair
-            # from every user-turn index used for rewind/submit addressing (display rows are
-            # excluded), so the plain row's durable id becomes unresolvable and the client's
-            # next prompt.submit fails closed with the input silently dropped (#94486). Keep
-            # the pair addressable instead: drop the display classification and carry the
-            # plain row's id, retiring the marker's own id onto the absorbed list. display_kind
-            # never reaches providers (stripped from every outgoing copy), so the merged
-            # turn's wire payload is unchanged. Deliberate scope: when BOTH rows carry
-            # display_kind (two consecutive model-switch markers) the pair keeps the first
-            # marker's classification and id — no plain row is swallowed there, so no
-            # addressable turn is lost.
+            # A display-marker row (e.g. a model-switch marker persisted as role=user on purpose,
+            # #48338) merging with a plain user row must not bury the plain row's addressable
+            # identity: the marker's display_kind hides the pair from every user-turn index used for
+            # rewind/submit addressing, so the plain row's id becomes unresolvable and the next
+            # prompt.submit fails closed with the input silently dropped (#94486). So drop the
+            # classification, carry the plain row's id and retire the marker's onto the absorbed
+            # list; display_kind never reaches providers, so the wire payload is unchanged. Two
+            # consecutive markers keep the first's classification and id: no plain row is lost.
             if prev.get("display_kind") and not msg.get("display_kind"):
                 marker_row_id = prev.get("_row_id")
                 prev.pop("display_kind", None)

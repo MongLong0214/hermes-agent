@@ -3,7 +3,8 @@
 Core subset: the closed metadata shape, the rendering, the sidecar trust rule and the admission
 ledger record (agent/canonical_peer.py). Render subset: every turn-assembly path (the request
 builder, the iteration summary, the codex history seed, the turn prologue's semantic consumers)
-sends a peer row as its rendering, never as the owner's words.
+sends a peer row as its rendering, never as the owner's words. Guard subset: history repair and
+the compaction anchor keep a peer row its own structured message.
 """
 
 from __future__ import annotations
@@ -316,3 +317,54 @@ def test_live_peer_turn_feeds_semantic_consumers_the_quoted_rendering(agent_db):
     assert live[PEER_SIDECAR_VERIFIED_KEY] is True
     follow_up = ctx.messages + [{"role": "assistant", "content": "ok"}, {"role": "user", "content": "next"}]
     assert _api(agent, follow_up, len(follow_up) - 1)[ctx.current_turn_user_idx + 1]["content"] == live["api_content"]
+
+
+# ── guards: a peer row is never welded onto owner text ─────────────────────
+
+@pytest.mark.parametrize("order", ["peer_then_owner", "owner_then_peer"])
+def test_alternation_repair_keeps_a_peer_row_as_its_own_structured_message(order):
+    from agent.agent_runtime_helpers import repair_message_sequence
+
+    peer, owner = _loaded_peer_row(), {"role": "user", "content": "owner text"}
+    messages = [peer, owner] if order == "peer_then_owner" else [owner, peer]
+    expected = [dict(m) for m in messages]
+    assert repair_message_sequence(None, messages) == 0
+    assert messages == expected
+    assert peer_metadata(peer) == _peer() and peer["content"] == BODY and peer["api_content"] == _rendered()
+
+
+def test_alternation_repair_still_merges_two_owner_rows():
+    from agent.agent_runtime_helpers import repair_message_sequence
+
+    messages = [{"role": "user", "content": "one"}, {"role": "user", "content": "two"}]
+    assert repair_message_sequence(None, messages) == 1
+    assert [m["content"] for m in messages] == ["one\n\ntwo"]
+
+
+def test_alternation_repair_refuses_a_half_marked_row_rather_than_merging_it_as_the_owner():
+    from agent.agent_runtime_helpers import repair_message_sequence
+
+    messages = [{"role": "user", "content": "owner text"}, _loaded_peer_row(display_metadata=None)]
+    with pytest.raises(PeerProvenanceError):
+        repair_message_sequence(None, messages)
+
+
+def test_compaction_anchor_keeps_a_peer_anchor_structured_beside_user_scaffolding():
+    from agent.conversation_compression import _insert_real_user_anchor
+
+    scaffold = {"role": "user", "content": "todo", "_todo_snapshot_synthetic": True}
+    messages = [{"role": "user", "content": "x", "_todo_snapshot_synthetic": True},
+                {"role": "assistant", "content": "a"}, scaffold]
+    anchor = _loaded_peer_row()
+    assert _insert_real_user_anchor(messages, anchor) == "inserted"
+    assert scaffold["content"] == "todo" and scaffold["_todo_snapshot_synthetic"] is True
+    assert messages[-1] is anchor and peer_metadata(anchor) == _peer() and anchor["content"] == BODY
+
+
+def test_compaction_anchor_still_folds_an_owner_anchor_into_user_scaffolding():
+    from agent.conversation_compression import _insert_real_user_anchor
+
+    scaffold = {"role": "user", "content": "todo", "_todo_snapshot_synthetic": True}
+    messages = [{"role": "user", "content": "x"}, {"role": "assistant", "content": "a"}, scaffold]
+    assert _insert_real_user_anchor(messages, {"role": "user", "content": "owner ask"}) == "merged"
+    assert scaffold["content"] == "owner ask\n\ntodo"
