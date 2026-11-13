@@ -1442,6 +1442,14 @@ class GatewayInboundMixin:
             except Exception as _goal_exc:
                 logger.debug("post-turn hook failed: %s", _goal_exc)
             return _agent_result
+        except BaseException:
+            # A drain cut this turn off. Until its durable marker exists nothing else holds the
+            # message (the queue gave it up at the claim, the transcript row comes later still);
+            # a managed /acp task is never re-run as ordinary text.
+            if (self._draining and not is_internal and not _acp_managed
+                    and getattr(event, "_gateway_active_turn_token", None) is None):
+                await self._keep_cut_off_message_for_restart(event, source, _quick_key)
+            raise
         finally:
             # One-shot restore (/moa, /model --once) must run on EVERY exit path (success,
             # exception, interrupt); the generation guard makes a displaced turn's finalizer a no-op.
@@ -1467,6 +1475,26 @@ class GatewayInboundMixin:
                 # Turn lease is keyed by (routing key, run generation) so this unwind can only free
                 # the lease its own turn acquired, never a newer turn's.
                 self._release_turn_lease(_quick_key, _run_generation)
+
+    async def _keep_cut_off_message_for_restart(self, event: MessageEvent, source: SessionSource,
+                                                session_key: str) -> None:
+        """Keep the message of a turn a drain cut off after its claim and before its durable
+        active-turn marker: back at the session's queue head, where the shutdown flush writes it
+        out as it does a queued follow-up, and the session marked resume_pending, so the next
+        process replays the flush and its auto-resume turn answers it once."""
+        adapter = self._delivery_adapter_for(source)
+        if adapter is None:
+            logger.warning("Restart cut off a turn on %s before it owned its message; no adapter "
+                           "holds a queue for it", session_key)
+            return
+        self._restore_undrained_pending_event(session_key, adapter, event)
+        logger.info("Restart cut off a turn on %s before it owned its message: kept for the next process",
+                    session_key)
+        reason = "restart_timeout" if self._restart_requested else "shutdown_timeout"
+        try:
+            await self.async_session_store.mark_resume_pending(session_key, reason)
+        except Exception as exc:
+            logger.warning("Could not mark %s resume_pending for its kept message: %s", session_key, exc)
 
     def _restore_pending_one_turn_model_override(self, session_key: str, run_generation: int | None = None) -> None:
         """Restore the per-session model override captured by ``/model --once`` or ``/moa``.

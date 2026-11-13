@@ -1660,6 +1660,12 @@ class GatewayStartupMixin:
         await self._await_startup_boot_sends(
             planned_restart_notification_pending=_planned_restart_notification_pending(),
         )
+        # The previous process's shutdown flush goes into its sessions first, so a resumed turn answers
+        # a message the restart kept (a queued follow-up, or a turn cut off before it owned its message)
+        # instead of that message landing after its reply, unanswered.
+        with _log_suppressed(logging.WARNING, "Shutdown-flush recovery before auto-resume failed", exc_info=True):
+            from gateway.shutdown_flush import recover_pending_to_db
+            recover_pending_to_db(session_resolver=self.session_store.resolve_session_id_for_key)
         # Auto-resume restart-interrupted sessions (ledger-answered ones were cleared above); a failed
         # auto-resume stays visible on the next user message.
         self._schedule_resume_pending_sessions()

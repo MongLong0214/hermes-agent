@@ -47,6 +47,7 @@ class _Actor(_CachedActor):
         super().__init__(session_id, db)
         self.steered, self.redirected, self.interrupted = [], [], []
         self.hold = None  # (entered, release) events: block the next turn mid-run
+        self.histories = []  # the conversation history each turn was handed
 
     def steer(self, text):
         self.steered.append(text)
@@ -64,6 +65,7 @@ class _Actor(_CachedActor):
         return {}
 
     def run_conversation(self, text, *, conversation_history, task_id, **kwargs):
+        self.histories.append(list(conversation_history))
         hold, self.hold = self.hold, None
         if hold is not None:
             entered, release = hold
@@ -533,9 +535,10 @@ def test_a_restart_after_the_claim_before_the_turn_marker_matches_an_ordinary_ow
         ingress, send, monkeypatch, path):
     """Review r3 comparison: an owner turn that has claimed the session and pauses at topic recovery
     (``_hmwa_resolve_session``, before the turn lease and the durable active-turn marker that
-    ``_mark_durable_active_turn`` writes after it) when stop(restart=True) runs. For an ordinary owner
-    message on an idle session that window already keeps nothing: no queue entry to flush, no
-    marker, no transcript row. The message handed on by a peer turn is measured against it."""
+    ``_mark_durable_active_turn`` writes after it) when stop(restart=True) runs. Neither the marker
+    nor a transcript row exists yet, so the cut-off turn hands its message back to the queue head
+    and the shutdown flush writes it out, for an ordinary owner message on an idle session as for
+    the message handed on by a peer turn."""
     flushed = _capture_shutdown_flush(monkeypatch)
     h = _Harness(ingress, send, monkeypatch, "queue")
     h.runner._restart_drain_timeout = 0.5
@@ -568,7 +571,201 @@ def test_a_restart_after_the_claim_before_the_turn_marker_matches_an_ordinary_ow
                 any(_OWNER_TEXT in str(row.get("content")) for row in rows), _OWNER_TEXT in h.actor.calls)
 
     # (flushed for the next process, durable turn marker, owner transcript row, turn ran)
-    assert asyncio.run(exercise()) == (False, False, False, False)
+    assert asyncio.run(exercise()) == (True, False, False, False)
+
+
+# Every await between the owner turn's claim (gateway/run_inbound.py, _claim_active_session_slot) and
+# its durable active-turn marker, in the order an owner DM reaches them: _hmwa_resolve_session, then
+# _hmwa_prepare_turn up to _mark_durable_active_turn. Not on this path: the strict and pinned
+# lookups (internally routed events), the topic-binding heal (topic lanes) and the auto-reset notice.
+_CLAIM_TO_MARKER_AWAITS = ("topic_recovery", "session_lookup", "topic_lane_check", "heartbeat_owner",
+                           "session_open", "turn_lease", "marker_write")
+
+
+def _pause_owner_turn_at(h, monkeypatch, at):
+    """Hold the first call through ``at`` once armed. Returns (arm, paused, release)."""
+    import gateway.run_heartbeat_acceptance as heartbeat
+
+    armed, paused, thread_gate, loop_gate = [], [], threading.Event(), asyncio.Event()
+
+    def blocking(fn):  # a call the turn awaits through asyncio.to_thread
+        def held(*args, **kwargs):
+            if armed and not paused and threading.current_thread() is not threading.main_thread():
+                paused.append(at)
+                thread_gate.wait(30)
+            return fn(*args, **kwargs)
+        return held
+
+    def awaited(fn):
+        async def held(*args, **kwargs):
+            if armed and not paused:
+                paused.append(at)
+                await loop_gate.wait()
+            return await fn(*args, **kwargs)
+        return held
+
+    runner, store = h.runner, h.runner.session_store
+    owner, name, wrap = {
+        "topic_recovery": (runner, "_recover_telegram_topic_thread_id", blocking),
+        "session_lookup": (store, "get_or_create_session", blocking),
+        "topic_lane_check": (runner, "_is_telegram_topic_lane", blocking),
+        "heartbeat_owner": (heartbeat, "resolve_heartbeat_owner", awaited),
+        "session_open": (runner, "_hmwa_open_session", awaited),
+        "turn_lease": (runner, "_hmwa_acquire_turn_lease", awaited),
+        "marker_write": (store, "mark_turn_active", blocking),
+    }[at]
+    monkeypatch.setattr(owner, name, wrap(getattr(owner, name)))
+
+    def release():
+        thread_gate.set()
+        loop_gate.set()
+    return lambda: armed.append(True), paused, release
+
+
+async def _owner_turn_started(h, path, arm):
+    """Warm the session, then start the owner turn: on an idle session, or queued behind a peer turn
+    and handed the session when it ends."""
+    await h.warm()
+    if path == "queued_behind_peer":
+        peer = await h.peer_turn_running()
+        await h.adapter.handle_message(h.owner_event())
+        await h.wait(lambda: h.queued() == [_OWNER_TEXT], "the owner message to be queued")
+        arm()
+        h.release.set()
+        assert (await peer)[0] == 200
+    else:
+        arm()
+        await h.adapter.handle_message(h.owner_event())
+
+
+def _next_process(ingress, send, monkeypatch):
+    """The next process over the same home: a fresh runner's startup wiring, which replays the
+    shutdown flush and runs auto-resume behind the startup-restore gate as start() does (its
+    post-connect services are not under test), then the replay gateway/run.py runs after start()
+    returns. start() does not hold the resumed turn until then (it awaits its runtime-status flush
+    meanwhile), so that turn has run by the time of the late replay. Returns the harness."""
+    nxt = _Harness(ingress, send, monkeypatch, "queue")
+    # The real admission: it tells the internal resume event apart from inbound, which the startup
+    # restore gate queues and the slot pre-claimed for the resume turn would busy-queue.
+    monkeypatch.delattr(nxt.runner, "_hm_admit_event")
+
+    async def no_services(connected_count):
+        return None
+    monkeypatch.setattr(nxt.runner, "_start_post_connect_services", no_services)
+    nxt.runner._startup_restore_in_progress = True  # set by start() before any adapter connects
+    nxt.runner._startup_restore_queue, nxt.runner._startup_restore_tasks = [], []
+
+    async def start():
+        await asyncio.wait_for(nxt.runner._start_finish_wiring(0), 60)
+        await nxt.settle()
+    asyncio.run(start())
+    from gateway.shutdown_flush import recover_pending_to_db
+    recover_pending_to_db(session_resolver=nxt.runner.session_store.resolve_session_id_for_key)
+    return nxt
+
+
+def _answered_once(ingress, nxt):
+    """The next process ran one turn, handed the owner's message once as a user row, replied once to
+    the owner, and kept no flush file; the transcript holds the message once."""
+    [history] = nxt.actor.histories
+    rows = nxt.runner.session_store.load_transcript(ingress.entry.session_id)
+    flush_dir = ingress.home / "pending_messages"
+    return (sum(m.get("role") == "user" and m.get("content") == _OWNER_TEXT for m in history),
+            sum(r.get("role") == "user" and r.get("content") == _OWNER_TEXT for r in rows),
+            len(nxt.owner_replies()), sorted(flush_dir.iterdir()) if flush_dir.exists() else [])
+
+
+@pytest.mark.parametrize("at", _CLAIM_TO_MARKER_AWAITS)
+@pytest.mark.parametrize("path", ["ordinary", "queued_behind_peer"])
+def test_a_restart_between_the_claim_and_the_turn_marker_keeps_the_owner_message_for_the_next_process(
+        ingress, send, monkeypatch, path, at):
+    """stop(restart=True) while the claimed owner turn waits at any await before its durable marker:
+    the turn hands the message back to the queue head for the shutdown flush and marks the session
+    resume_pending, and the next process replays the flush before auto-resume, whose turn answers it
+    once."""
+    h = _Harness(ingress, send, monkeypatch, "queue")
+    h.runner._restart_drain_timeout = 0.5
+    arm, paused, release = _pause_owner_turn_at(h, monkeypatch, at)
+
+    async def cut_off():
+        await _owner_turn_started(h, path, arm)
+        await h.wait(lambda: paused, f"the claimed owner turn to pause at {at}")
+        claimed = h.runner._session_state(h.key).turn.event
+        assert getattr(claimed, "text", None) == _OWNER_TEXT and h.queued() == []
+        try:
+            await asyncio.wait_for(h.runner.stop(restart=True), 60)
+        finally:
+            release()
+
+    asyncio.run(cut_off())
+    assert _OWNER_TEXT not in h.actor.calls  # it did not run in the process that stopped
+    assert _answered_once(ingress, _next_process(ingress, send, monkeypatch)) == (1, 1, 1, [])
+
+
+@pytest.mark.parametrize("path", ["ordinary", "queued_behind_peer"])
+def test_from_its_turn_marker_on_a_cut_off_turn_hands_nothing_back(ingress, send, monkeypatch, path):
+    """The consume point: once ``_mark_durable_active_turn`` has written the marker the turn owns the
+    message, so a restart that cuts it off hands nothing back and the shutdown flush never holds a
+    copy beside the user row the turn's agent writes. The marker carries no text: cut off here,
+    before that row, the message is not answered by the next process either."""
+    flushed = _capture_shutdown_flush(monkeypatch)
+    h = _Harness(ingress, send, monkeypatch, "queue")
+    h.runner._restart_drain_timeout = 0.5
+    gate, owned = asyncio.Event(), []
+    mark = h.runner._mark_durable_active_turn
+
+    async def marked(event, session_key):
+        written = await mark(event, session_key)
+        if event.text == _OWNER_TEXT:
+            owned.append(written)
+            await gate.wait()
+        return written
+    monkeypatch.setattr(h.runner, "_mark_durable_active_turn", marked)
+
+    async def cut_off():
+        await _owner_turn_started(h, path, lambda: None)
+        await h.wait(lambda: owned, "the owner turn to write its durable marker")
+        await asyncio.wait_for(h.runner.stop(restart=True), 60)
+
+    asyncio.run(cut_off())
+    assert owned == [True]
+    assert _OWNER_TEXT not in flushed and _OWNER_TEXT not in h.actor.calls
+
+
+@pytest.mark.parametrize("path", ["ordinary", "queued_behind_peer"])
+def test_a_restart_after_the_turn_wrote_its_row_answers_that_row_once(ingress, send, monkeypatch, path):
+    """Cut off by a restart while its agent runs, its marker and user row written, the turn flushes
+    nothing, and the next process answers that one row once."""
+    h = _Harness(ingress, send, monkeypatch, "queue")
+    h.runner._restart_drain_timeout = 0.5
+    entered, release, marked = threading.Event(), threading.Event(), []
+
+    def own_the_message(actor):
+        run = actor.run_conversation
+
+        def running(text, *, conversation_history, task_id, **kwargs):
+            if kwargs.get("persist_user_message", text) == _OWNER_TEXT:
+                entry = h.runner.session_store.lookup_by_session_key_existing(h.key)
+                marked.append(getattr(entry, "active_turn_token", None) is not None)
+                actor._session_db.append_message(session_id=task_id, role="user", content=_OWNER_TEXT)
+                entered.set()
+                release.wait(30)
+            return run(text, conversation_history=conversation_history, task_id=task_id, **kwargs)
+        monkeypatch.setattr(actor, "run_conversation", running)
+
+    async def cut_off():
+        await h.warm()
+        own_the_message(h.actor)
+        await _owner_turn_started(h, path, lambda: None)
+        await h.wait(entered.is_set, "the owner turn's agent to run")
+        try:
+            await asyncio.wait_for(h.runner.stop(restart=True), 60)
+        finally:
+            release.set()
+
+    asyncio.run(cut_off())
+    assert marked == [True]
+    assert _answered_once(ingress, _next_process(ingress, send, monkeypatch)) == (1, 1, 1, [])
 
 
 @pytest.mark.parametrize("mode", ["steer", "interrupt"])
