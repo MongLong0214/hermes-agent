@@ -6,6 +6,8 @@ stdout drain thread used by ``BaseEnvironment._wait_for_process``.
 """
 
 import codecs
+import contextlib
+import logging
 import os
 import subprocess
 import threading
@@ -18,6 +20,8 @@ from hermes_constants import get_hermes_home
 from tools.environments.fd_wait import open_fd_waiter
 from tools.tool_output_truncate import head_tail_split, truncation_notice
 from hermes_cli._subprocess_compat import windows_hide_flags
+
+logger = logging.getLogger(__name__)
 
 
 class PostSpawnExecutionError(RuntimeError):
@@ -259,6 +263,33 @@ def _pipe_stdin(proc: subprocess.Popen, data: str) -> None:
     thread.start()
 
 
+def _stop_unwaited_spawn(proc, kill: Callable[[subprocess.Popen], None]) -> None:
+    """Stop a command spawned but never handed to a waiter (its stdin failed right after ``Popen``):
+    ``kill`` its group (the start-time PID-reuse guard of the kill path still applies), close its
+    pipes, reap it, and release its owner-death coverage once the group is empty (a group we failed
+    to stop stays covered)."""
+    try:
+        kill(proc)
+    except Exception:
+        logger.warning("could not stop pid %s after its stdin failed", getattr(proc, "pid", None), exc_info=True)
+    for pipe in (proc.stdin, proc.stdout):
+        if pipe is not None:
+            with contextlib.suppress(Exception):
+                pipe.close()
+    with contextlib.suppress(Exception):
+        proc.wait(timeout=1.0)
+    if (owned_pgid := getattr(proc, "_hermes_owned_pgid", None)) is not None:
+        from hermes_cli.process_identity import release_process_group_once_empty
+        proc._hermes_owned_pgid = None
+        release_process_group_once_empty(owned_pgid, proc=proc)
+
+
+def _kill_spawned_tree(proc) -> None:
+    """The local backend's start-time-checked tree kill (imported here: local imports this module)."""
+    from tools.environments.local import _kill_process_tree
+    _kill_process_tree(proc)
+
+
 def _popen_bash(cmd: list[str], stdin_data: str | None = None, **kwargs) -> subprocess.Popen:
     """Spawn a subprocess with standard stdout/stderr/stdin setup; *stdin_data* is written
     asynchronously via :func:`_pipe_stdin`. Backends with special Popen needs (e.g. local's
@@ -275,7 +306,10 @@ def _popen_bash(cmd: list[str], stdin_data: str | None = None, **kwargs) -> subp
         try:
             _pipe_stdin(proc, stdin_data)
         except Exception as exc:
-            # Popen already succeeded, so the shell exists and may be running: not retryable.
+            # Popen already succeeded, so the shell exists and may be running: not retryable. Nothing
+            # will wait on it, so stop it here. The client shares the caller's process group unless
+            # ``start_new_session`` was passed; the tree kill then stops it by PID, never that group.
+            _stop_unwaited_spawn(proc, _kill_spawned_tree)
             raise PostSpawnExecutionError(str(exc)) from exc
     return proc
 

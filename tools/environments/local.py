@@ -19,10 +19,9 @@ from pathlib import Path
 
 from hermes_constants import get_process_hermes_home
 from tools.environments.base import BaseEnvironment
-from tools.environments.base_output import PostSpawnExecutionError, _pipe_stdin
+from tools.environments.base_output import PostSpawnExecutionError, _pipe_stdin, _stop_unwaited_spawn
 from hermes_cli._subprocess_compat import windows_hide_flags
-from hermes_cli.process_identity import (
-    own_process_groups, release_process_group_once_empty, release_process_groups)
+from hermes_cli.process_identity import own_process_groups, release_process_groups
 from tools.environments.local_env_policy import (
     _ALWAYS_STRIP_FOLDED, _ALWAYS_STRIP_KEYS, _HERMES_PROVIDER_ENV_BLOCKLIST, _HERMES_PROVIDER_ENV_FORCE_PREFIX,
     _is_hermes_internal_secret, _is_provider_env_blocklisted, _is_terminal_first_party_env,
@@ -1048,6 +1047,15 @@ def _kill_process_windows(proc) -> None:
         proc.wait(timeout=2.0)
 
 
+def _kill_process_tree(proc) -> None:
+    """Kill the entire process group (all children); the process alone if the group kill fails."""
+    try:
+        (_kill_process_windows if _IS_WINDOWS else _kill_process_group_posix)(proc)
+    except OSError:  # ProcessLookupError / PermissionError included
+        with contextlib.suppress(Exception):
+            proc.kill()
+
+
 class LocalEnvironment(BaseEnvironment):
     """Run commands directly on the host: every execute() spawns a fresh bash;
     the session snapshot preserves exported env vars across calls (unless
@@ -1187,27 +1195,9 @@ class LocalEnvironment(BaseEnvironment):
             except Exception as exc:
                 # Popen already succeeded, so the shell exists and may already be running: a caller
                 # must not retry this as a pre-spawn failure. Nothing will wait on it, so stop it here.
-                self._stop_unwaited_spawn(proc)
+                _stop_unwaited_spawn(proc, self._kill_process)
                 raise PostSpawnExecutionError(str(exc)) from exc
         return proc
-
-    def _stop_unwaited_spawn(self, proc) -> None:
-        """Stop a command ``_run_bash`` spawned but cannot hand to a waiter: kill its group (the
-        start-time PID-reuse guard still applies), close its pipes, reap it, and release its
-        owner-death coverage once the group is empty (a group we failed to stop stays covered)."""
-        try:
-            self._kill_process(proc)
-        except Exception:
-            logger.warning("could not stop pid %s after its stdin failed", proc.pid, exc_info=True)
-        for pipe in (proc.stdin, proc.stdout):
-            if pipe is not None:
-                with contextlib.suppress(Exception):
-                    pipe.close()
-        with contextlib.suppress(Exception):
-            proc.wait(timeout=1.0)
-        if (owned_pgid := getattr(proc, "_hermes_owned_pgid", None)) is not None:
-            proc._hermes_owned_pgid = None
-            release_process_group_once_empty(owned_pgid, proc=proc)
 
     def _wait_for_process(self, proc, *args, **kwargs) -> dict:
         """Base wait, then hand the command's group back from the owner-death supervisor: once the
@@ -1223,11 +1213,7 @@ class LocalEnvironment(BaseEnvironment):
 
     def _kill_process(self, proc):
         """Kill the entire process group (all children)."""
-        try:
-            (_kill_process_windows if _IS_WINDOWS else _kill_process_group_posix)(proc)
-        except OSError:  # ProcessLookupError / PermissionError included
-            with contextlib.suppress(Exception):
-                proc.kill()
+        _kill_process_tree(proc)
 
     def _force_kill_process(self, proc):
         """SIGKILL the whole group with no TERM grace or wait: the caller os._exit()s next."""
