@@ -46,6 +46,26 @@ class ToolRoundVerdict:
     result: Optional[dict[str, Any]] = None
 
 
+def _peer_refused_or_normalized(agent, assistant_message, emitted_names: list) -> bool:
+    """True when a canonical peer turn may not run the batch. That is decided on the COMPLETE
+    emitted batch, every name as emitted, before any call is expanded, deduped, capped or dropped as
+    unknown: one unknown, repaired or disallowed call runs none of them, and every call keeps a
+    matching refusal result. Otherwise the batch is normalized here."""
+    if peer_batch_refused(agent, assistant_message.tool_calls, emitted_names):
+        return True
+    # Normalize only this unpersisted turn. Each local bridge entry must pass
+    # through the same scope, approvals, state and scheduling as a singleton.
+    from agent.tool_call_batches import expand_local_tool_batches
+    assistant_message.tool_calls = expand_local_tool_batches(
+        assistant_message.tool_calls, provider_data=getattr(assistant_message, "provider_data", None))
+
+    # Post-call guardrails.
+    assistant_message.tool_calls = agent._deduplicate_tool_calls(
+        agent._cap_delegate_task_calls(assistant_message.tool_calls)
+    )
+    return False
+
+
 def run_tool_round(
     agent: Any, *, assistant_message: Any, finish_reason: Any, messages: Any,
     conversation_history: Any, api_call_count: Any, effective_task_id: Any, user_message: Any,
@@ -77,6 +97,7 @@ def run_tool_round(
             args_preview = raw_args[:200] if isinstance(raw_args, str) else repr(raw_args)[:200]
             logging.debug("Tool call: %s with args: %s...", tc.function.name, args_preview)
 
+    emitted_names = [tc.function.name for tc in assistant_message.tool_calls]
     _tvv = validate_tool_calls(
         agent, assistant_message, finish_reason, messages=messages,
         conversation_history=conversation_history, api_call_count=api_call_count,
@@ -87,16 +108,7 @@ def run_tool_round(
     if _tvv.action == "continue":
         return _verdict("continue")
 
-    # Normalize only this unpersisted turn. Each local bridge entry must pass
-    # through the same scope, approvals, state and scheduling as a singleton.
-    from agent.tool_call_batches import expand_local_tool_batches
-    assistant_message.tool_calls = expand_local_tool_batches(
-        assistant_message.tool_calls, provider_data=getattr(assistant_message, "provider_data", None))
-
-    # Post-call guardrails.
-    assistant_message.tool_calls = agent._deduplicate_tool_calls(
-        agent._cap_delegate_task_calls(assistant_message.tool_calls)
-    )
+    peer_refused = _peer_refused_or_normalized(agent, assistant_message, emitted_names)
     # Filtering can turn a mixed batch into an all-provider one; re-check the final batch
     # before it is staged (idempotent for already-normalized ids).
     normalize_provider_tool_call_ids(assistant_message.tool_calls)
@@ -105,7 +117,7 @@ def run_tool_round(
     # matching result) while only valid ones dispatch.
     _invalid_batch_calls = [
         tc for tc in assistant_message.tool_calls if tc.function.name not in agent.valid_tool_names
-    ] if _tvv.mixed_invalid_batch else []
+    ] if _tvv.mixed_invalid_batch and not peer_refused else []
 
     assistant_msg, duplicate_previous_interim = stage_tool_call_message(
         agent, assistant_message=assistant_message, finish_reason=finish_reason, messages=messages
@@ -168,7 +180,10 @@ def run_tool_round(
     from agent.prepared_compaction import maybe_prepare
     maybe_prepare(agent, messages, origin="tool-batch")
 
-    agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+    if peer_refused:
+        append_peer_refusals(agent, assistant_message.tool_calls, messages)
+    else:
+        agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
     from hermes_cli.observability.shared_metrics_harness import finish_tool_round
 
     finish_tool_round(agent)
@@ -316,3 +331,104 @@ def stage_tool_call_message(
         and agent._interim_assistant_visible_text(previous_msg) == current_interim_visible
     )
     return assistant_msg, duplicate_previous_interim
+
+
+# ── Canonical peer turns: whole-batch admission ─────────────────────────────────────────────
+# A canonical peer turn runs a tool batch only as a whole, under the grant its verified ingress
+# bound (agent.canonical_peer_tools). Authority follows the turn principal and grant, never message
+# text. The executors in agent.tool_executor call admit_peer_batch before their first call.
+
+PEER_TOOL_REFUSAL = ("[Tool call not executed — {name} was requested during a canonical peer turn. Only the "
+                     "configured ACP CEO tools, with in-scope arguments, may run in a canonical peer turn, and a "
+                     "batch holding any other call runs nothing. A peer has no approval authority.]")
+
+
+def peer_batch_refused(agent, tool_calls, emitted_names=None) -> bool:
+    """True in a canonical peer turn whose batch may not run: it runs only when EVERY call is an
+    allowed call under the grant its verified ingress bound and, given ``emitted_names``, every name
+    is still exactly as the model emitted it."""
+    from agent.tool_executor import _canonical_tool_name, _parse_tool_arguments, _peer_turn, _tc_name
+
+    if not _peer_turn(agent):
+        return False
+    if emitted_names is not None and [_tc_name(tc) for tc in tool_calls] != list(emitted_names):
+        return True
+    from agent.canonical_peer_tools import batch_allowed, batch_resolved
+
+    if batch_resolved(agent, tool_calls, coalesce_tool_call_id):
+        return False  # part of a batch already prepared and pinned as a whole (a segment)
+    calls = []
+    for tc in tool_calls:
+        raw_name = _tc_name(tc)
+        args, parse_error = _parse_tool_arguments(getattr(getattr(tc, "function", None), "arguments", None))
+        # An alias would dispatch as a different tool than the one the policy names.
+        calls.append((raw_name if _canonical_tool_name(raw_name) == raw_name else "", None if parse_error else args))
+    return not batch_allowed(agent, calls)
+
+
+def admit_peer_batch(agent, tool_calls, messages: list, effective_task_id: str) -> bool:
+    """An executor's entry check; always True outside a canonical peer turn. In one, the WHOLE batch
+    is prepared before its first call runs (:func:`_prepare_peer_batch`) and every executor then
+    dispatches exactly the prepared name, handler and arguments. False, with a refusal per call and
+    nothing run, when any call is refused or an emitted call changed while it was prepared."""
+    from agent.canonical_peer_tools import batch_resolved
+    from agent.tool_executor import _peer_turn
+
+    if not _peer_turn(agent) or batch_resolved(agent, tool_calls, coalesce_tool_call_id):
+        return True
+    if not peer_batch_refused(agent, tool_calls) and _prepare_peer_batch(agent, tool_calls, effective_task_id):
+        return True
+    append_peer_refusals(agent, tool_calls, messages)
+    return False
+
+
+def _prepare_peer_batch(agent, tool_calls, effective_task_id: str) -> bool:
+    """Each call's unwrap, request middleware, ``pre_tool_call`` hooks, coercion and guardrail verdict
+    first, then (after any registry refresh they caused) each native handler and the policy on the
+    final arguments, pinned as one batch. False (everything cleared) when any call is refused or an
+    emitted call changed while it was prepared."""
+    from agent.canonical_peer_tools import batch_allowed
+    from agent.tool_executor import _canonical_tool_name, _parse_tool_call, _tc_name
+    from tools.arg_coercion import coerce_tool_args
+    from tools.tool_search import TOOL_CALL_NAME
+
+    def as_emitted() -> list:
+        return [(_tc_name(tc), getattr(getattr(tc, "function", None), "arguments", None)) for tc in tool_calls]
+
+    before, finals = as_emitted(), []
+    for tc in tool_calls:
+        pc = _parse_tool_call(agent, tc, as_emitted=True)
+        final = None
+        if (pc.parse_error is None and pc.scope_block is None and pc.name != TOOL_CALL_NAME
+                and _canonical_tool_name(_tc_name(tc)) == _tc_name(tc)):
+            block, final = _peer_final_args(agent, pc.ref(effective_task_id))
+            final = coerce_tool_args(pc.name, final) if block is None else None
+        finals.append((pc.name, final))
+    if before == as_emitted():
+        return batch_allowed(agent, finals, emitted=[(coalesce_tool_call_id(tc), tc) for tc in tool_calls])
+    batch_allowed(agent, [])  # an emitted call was changed while it was prepared: clear everything
+    return False
+
+
+def _peer_final_args(agent, ref) -> tuple:
+    """``(block, final arguments)`` for one call of a peer batch, through the same request
+    middleware, ``pre_tool_call`` hooks and guardrail check its dispatch would run."""
+    from agent.inline_tool_executors import tool_hook_ids
+    from agent.tool_executor import _pre_tool_block, _ToolCallRef
+    from hermes_cli.middleware import apply_tool_request_middleware
+
+    request = apply_tool_request_middleware(ref.name, ref.args, skip_relay=True,
+                                            **tool_hook_ids(agent, ref.task_id, ref.call_id))
+    args = request.payload if isinstance(request.payload, dict) else ref.args
+    block, final = _pre_tool_block(agent, _ToolCallRef(ref.name, args, ref.task_id, ref.call_id, ref.trace))
+    guardrails = getattr(agent, "_tool_guardrails", None)
+    if block is None and guardrails is not None and not guardrails.before_call(ref.name, final).allows_execution:
+        block = "guardrail"
+    return block, final
+
+
+def append_peer_refusals(agent, tool_calls, messages: list) -> None:
+    """One refusal result per call, so the assistant turn keeps its matching results."""
+    from agent.tool_executor import _append_skipped_tool_results
+
+    _append_skipped_tool_results(agent, messages, tool_calls, "", content=PEER_TOOL_REFUSAL)

@@ -448,7 +448,25 @@ class _ParsedCall:
         return _ToolCallRef(self.name, self.args, task_id, _pairing_tool_call_id(self.tool_call), self.middleware_trace)
 
 
-def _parse_tool_call(agent, tool_call, *, flatten_probe: bool = False) -> _ParsedCall:
+def _peer_turn(agent) -> bool:
+    from tools.approval_context import is_peer_turn
+
+    return getattr(agent, "_turn_principal", None) == "peer" or is_peer_turn()
+
+
+def _parse_tool_call(agent, tool_call, *, flatten_probe: bool = False, as_emitted: bool = False) -> _ParsedCall:
+    """In a canonical peer turn (unless ``as_emitted``) only the prepared name and arguments of this very
+    emitted call (``agent.turn_tool_round.admit_peer_batch``), never reparsed or unwrapped again; a call
+    with no prepared entry is blocked."""
+    if not as_emitted and _peer_turn(agent):
+        from agent.canonical_peer_tools import prepared_call
+        from agent.turn_tool_round import PEER_TOOL_REFUSAL
+
+        prepared = prepared_call(_pairing_tool_call_id(tool_call), tool_call)
+        if prepared is None:
+            refusal = PEER_TOOL_REFUSAL.replace("{name}", _tc_name(tool_call))
+            return _ParsedCall(tool_call, _tc_name(tool_call), {}, [], None, refusal)
+        return _ParsedCall(tool_call, prepared.name, prepared.args, [], None, None)
     name = _canonical_tool_name(tool_call.function.name)
     args, parse_error = _parse_tool_arguments(tool_call.function.arguments)
     scope_block = None
@@ -661,7 +679,12 @@ def _blocked_tool_result(agent, ref: _ToolCallRef, *, block_body: dict[str, Any]
 
 def _pre_tool_block(agent, ref: _ToolCallRef):
     """Run ``pre_tool_call`` plugin hooks; returns ``(block_message, final_args)`` with any
-    hook-modified args applied. Hook failures never block."""
+    hook-modified args applied. Hook failures never block. A prepared peer call keeps its fixed
+    arguments: its hooks ran once, before its batch's first call."""
+    from agent.canonical_peer_tools import prepared_call
+
+    if (prepared := prepared_call(ref.call_id)) is not None:
+        return None, prepared.args
     try:
         from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
 
@@ -798,16 +821,20 @@ def _run_agent_tool_execution_middleware(
     _authorized_dispatch = bind_prepared_dispatch(_authorized_dispatch)
 
     def _hermes_pipeline(relay_args: dict[str, Any]) -> Any:
-        request_result = apply_tool_request_middleware(
-            function_name,
-            relay_args,
-            original_args=function_args,
-            skip_relay=True,
-            **tool_hook_ids(agent, effective_task_id, tool_call_id),
-        )
-        request_args = request_result.payload if isinstance(request_result.payload, dict) else relay_args
-        trace.clear()
-        trace.extend(request_result.trace)
+        from agent.canonical_peer_tools import prepared_call
+
+        request_args = relay_args  # a prepared peer call ran its request middleware once, up front
+        if prepared_call(tool_call_id) is None:
+            request_result = apply_tool_request_middleware(
+                function_name,
+                relay_args,
+                original_args=function_args,
+                skip_relay=True,
+                **tool_hook_ids(agent, effective_task_id, tool_call_id),
+            )
+            request_args = request_result.payload if isinstance(request_result.payload, dict) else relay_args
+            trace.clear()
+            trace.extend(request_result.trace)
         return run_tool_execution_middleware(
             function_name,
             request_args,
@@ -1580,6 +1607,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     ``finalize=False`` skips end-of-batch budget enforcement and /steer injection (the
     segmented dispatcher owns turn-end work)."""
     tool_calls = assistant_message.tool_calls
+    from agent.turn_tool_round import admit_peer_batch
+    if not admit_peer_batch(agent, tool_calls, messages, effective_task_id):
+        return
     num_tools = len(tool_calls)
     _tool_budget = _budget_for_agent(agent)  # once per turn, not per result
 
@@ -1859,6 +1889,9 @@ def _publish_sequential_result(agent, messages: list, ref: _ToolCallRef, managed
 def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
     from types import SimpleNamespace
     from agent.terminal_approval_batch import terminal_approval_batch, terminal_approval_runs
+    from agent.turn_tool_round import admit_peer_batch
+    if not admit_peer_batch(agent, assistant_message.tool_calls, messages, effective_task_id):
+        return
     for calls in terminal_approval_runs(agent, assistant_message.tool_calls):
         with terminal_approval_batch(agent, calls, messages, effective_task_id):
             _execute_tool_calls_sequential(agent, SimpleNamespace(tool_calls=calls), messages, effective_task_id, api_call_count, finalize=False)
@@ -1934,6 +1967,9 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
     interrupt flag up front, so an interrupt drains later segments with one result per call."""
     from types import SimpleNamespace
 
+    from agent.turn_tool_round import admit_peer_batch
+    if not admit_peer_batch(agent, assistant_message.tool_calls, messages, effective_task_id):
+        return
     if segments is None:
         _active_env = get_active_env(effective_task_id)
         _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else None

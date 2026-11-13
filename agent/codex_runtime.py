@@ -750,6 +750,13 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
                               turn_id: Any = None) -> dict[str, Any]:
     """Hand the turn to a ``codex app-server`` subprocess and project its events into ``messages``.
     Returns the chat_completions result shape. The user message is ALREADY in ``messages`` — never append it again."""
+    # The app-server executes its own exec, patch and MCP tools and asks its own approvals outside
+    # Hermes' tool loop, where a canonical peer turn's restriction cannot be enforced: refused before
+    # any request (the canonical ingress refuses such a turn before it is claimed; this is the last line).
+    from agent.tool_executor import _peer_turn
+
+    if _peer_turn(agent):
+        raise PermissionError("canonical_peer_runtime_refused")
     # Defense in depth for compression.checkpoint_required: agent init refuses the combination, but
     # api_mode is mutable. Explicit-True check matches compress_context().
     if getattr(agent, "compression_checkpoint_required", False) is True:
