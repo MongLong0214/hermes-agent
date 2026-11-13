@@ -1830,8 +1830,8 @@ def _deliver_result(
     standalone fallback. ``for_failure=True`` routes failure-category notices through the job's
     ``failure_deliver`` override when present (NS-788). Returns None on success, else an error.
 
-    ``job["_delivery_uncertain"]`` lists live sends that began but never confirmed (never resent,
-    so neither delivered nor failed)."""
+    ``job["_delivery_uncertain"]`` lists live or queued sends that began but never confirmed (never
+    resent, so neither delivered nor failed)."""
     job.pop("_delivery_uncertain", None)
     job.pop("_bot_chat_delivery_receipts", None)
     job.pop("_notification_all_targets_suppressed", None)
@@ -1860,6 +1860,20 @@ def _deliver_result(
         from cron.jobs import get_job
         refreshed = get_job(job["id"]) or {}
         job["last_delivery_queued"] = refreshed.get("last_delivery_queued")
+        if delivery_status and delivery_status["status"] == "unknown":
+            # The gateway began the send and never confirmed it (confirmation timeout, gateway exit,
+            # wait timeout): never replayed, and not a failure either — record it as uncertain.
+            logger.warning("Job '%s': queued delivery %s outcome uncertain (not resent): %s",
+                           job["id"], external_execution, error)
+            job["_delivery_uncertain"] = [{"queue": external_execution}]
+            # Fixed text only: the row's error can carry a partial with provider text.
+            _record_delivery_verification(job, refreshed.get("last_delivery_unverified") or [
+                f"queued delivery {external_execution} (send began, not confirmed; not resent)"])
+            # Keep only a partial error the gateway reported alongside it (skipped media, another
+            # target); the uncertainty itself is not a delivery error.
+            from cron.delivery_queue import UNCERTAIN_SEND_ERROR
+            partial = (error or "").partition(f"{UNCERTAIN_SEND_ERROR}; ")
+            error = partial[2] if not partial[0] and partial[1] else None
         return error
 
     from gateway.config import load_gateway_config

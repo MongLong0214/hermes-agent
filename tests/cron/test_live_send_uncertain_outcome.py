@@ -9,6 +9,7 @@ delivery queue. ``run_one_job`` hands an agent run's send to the queue, whose ga
 ``_deliver_result``; a script run and a crash notice send directly.
 """
 import asyncio
+import json
 import threading
 from types import SimpleNamespace
 
@@ -296,3 +297,120 @@ def test_crash_notice_that_began_unconfirmed_is_recorded_uncertain(stalled_live_
     _assert_uncertain_not_delivered(job["id"], calls)
     assert executions.latest_execution(job["id"])["delivery_outcome"] == "uncertain"
     assert jobs.get_job(job["id"])["last_delivery_error"] is None
+
+
+# A restart-safe worker has no live adapters: a script run's send and a crash notice ride the
+# durable queue, and the worker waits for the gateway's drain (enqueue_and_wait). The drained row
+# says the send began and never confirmed; the worker must book that as uncertain too.
+
+
+def _in_restart_safe_worker(calls, monkeypatch, job):
+    """Make this process *job*'s restart-safe worker; its queued send is drained by the gateway
+    (the stalled live adapter) before the worker waits on the row."""
+    execution = executions.create_execution(job["id"], source="fixture")
+    job["execution_id"] = execution["id"]
+    monkeypatch.setenv("_HERMES_CRON_EXTERNAL_WORKER", execution["id"])
+    real_wait = delivery_queue.enqueue_and_wait
+
+    def drain_then_wait(execution_id, queued_job, content, *, for_failure=False):
+        delivery_queue.enqueue(execution_id, queued_job, content, for_failure=for_failure)
+        assert scheduler.drain_delivery_queue(calls.adapters, calls.loop) == 1
+        return real_wait(execution_id, queued_job, content, for_failure=for_failure)
+
+    monkeypatch.setattr(delivery_queue, "enqueue_and_wait", drain_then_wait)
+    return execution["id"]
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_worker_script_send_that_began_unconfirmed_is_recorded_uncertain(
+        stalled_live_send, monkeypatch, mixed):
+    calls = stalled_live_send
+    deliver = "telegram:123"
+    if mixed:
+        _one_target_refuses(calls, monkeypatch, PROVIDER_TEXT)
+        deliver += ",telegram:456"
+    monkeypatch.setattr(
+        scheduler, "run_job", lambda job, **kwargs: (True, "output", "the brief", None))
+    job = jobs.create_job(prompt="fixture only", schedule="every 1h", deliver=deliver)
+    execution_id = _in_restart_safe_worker(calls, monkeypatch, job)
+
+    assert scheduler.run_one_job(dict(job, no_agent=True)) is True
+
+    assert delivery_queue.get_status(execution_id)["status"] == "unknown"
+    assert len(calls.live) == 1 and calls.seeded == []
+    assert all("456" in str(args) for args in calls.standalone), "123 must never be resent"
+    assert executions.get_execution(execution_id)["delivery_outcome"] == "uncertain"
+    saved = jobs.get_job(job["id"])
+    assert "chat not found" not in json.dumps(saved), "the queue row's text reached jobs.json"
+    if mixed:
+        assert (saved["last_status"], saved["last_delivery_error"]) == (
+            "delivery_failed", delivery_queue.UNCERTAIN_SEND_ERROR), saved
+    else:
+        assert (saved["last_status"], saved["last_delivery_error"]) == ("ok", None), saved
+
+
+def test_worker_crash_notice_that_began_unconfirmed_is_recorded_uncertain(
+        stalled_live_send, monkeypatch):
+    calls = stalled_live_send
+
+    def crash(job, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(scheduler, "run_job", crash)
+    job = jobs.create_job(prompt="fixture only", schedule="every 1h", deliver="telegram:123")
+    execution_id = _in_restart_safe_worker(calls, monkeypatch, job)
+
+    assert scheduler.run_one_job(job) is False
+
+    _assert_uncertain_not_delivered(job["id"], calls)
+    assert executions.get_execution(execution_id)["delivery_outcome"] == "uncertain"
+    assert jobs.get_job(job["id"])["last_delivery_error"] is None
+
+
+def test_worker_wait_timeout_mid_send_is_uncertain_with_fixed_text(stalled_live_send, monkeypatch):
+    """The worker gave up while a gateway was mid-send (the row is fenced ``unknown`` and never
+    resent): uncertain, and the unverified entry the worker writes is fixed text, not the row's."""
+    calls = stalled_live_send
+    job = jobs.create_job(prompt="fixture only", schedule="every 1h", deliver="telegram:123")
+    execution = executions.create_execution(job["id"], source="fixture")
+    job["execution_id"] = execution["id"]
+    monkeypatch.setenv("_HERMES_CRON_EXTERNAL_WORKER", execution["id"])
+    real_wait = delivery_queue.enqueue_and_wait
+
+    def claimed_then_timed_out(execution_id, queued_job, content, *, for_failure=False):
+        delivery_queue.enqueue(execution_id, queued_job, content, for_failure=for_failure)
+        assert delivery_queue.claim_next()["execution_id"] == execution_id  # a gateway began it
+        delivery_queue._ACTIVE_DELIVERIES.discard(execution_id)
+        return real_wait(execution_id, queued_job, content, for_failure=for_failure, timeout=0)
+
+    monkeypatch.setattr(delivery_queue, "enqueue_and_wait", claimed_then_timed_out)
+
+    assert scheduler._deliver_result(job, "the brief") is None
+
+    assert delivery_queue.get_status(execution["id"])["status"] == "unknown"
+    assert job["_delivery_uncertain"] == [{"queue": execution["id"]}]
+    assert jobs.get_job(job["id"])["last_delivery_unverified"] == [
+        f"queued delivery {execution['id']} (send began, not confirmed; not resent)"]
+
+
+def test_interrupted_run_notice_drained_later_records_only_the_fixed_text(
+        stalled_live_send, monkeypatch):
+    """Shutdown booked the run without its execution id; the drain that settles the queued notice
+    later still writes the job's delivery error, and only the fixed uncertain text."""
+    calls = stalled_live_send
+    _one_target_refuses(calls, monkeypatch, PROVIDER_TEXT)
+    monkeypatch.setattr(
+        scheduler, "run_job", lambda job, **kwargs: (True, "output", "the brief", None))
+    job = jobs.create_job(
+        prompt="fixture only", schedule="every 1h", deliver="telegram:123,telegram:456")
+    before = jobs.get_job(job["id"])
+    scheduler._interrupted_job_ids.add(scheduler._inflight_key(job["id"]))
+
+    execution, queued = _run_then_drain(calls, monkeypatch, job)
+
+    assert queued["status"] == "unknown" and "chat not found" in queued["error"], queued
+    assert execution["delivery_outcome"] == "uncertain", execution
+    saved = jobs.get_job(job["id"])
+    assert saved["last_delivery_error"] == delivery_queue.UNCERTAIN_SEND_ERROR, saved
+    assert "chat not found" not in json.dumps(saved), saved
+    assert saved["repeat"] == before["repeat"] and saved["next_run_at"] == before["next_run_at"]

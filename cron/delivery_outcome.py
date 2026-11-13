@@ -54,6 +54,32 @@ def _settle_job_record(job_id: str, execution_id: str, delivery_error: Optional[
     return bool(_with_job(job_id, apply, missing=False))
 
 
+def record_interrupted_completion(job_id: str, execution_id: str) -> bool:
+    """Name *execution_id* as the job's latest completion without advancing the job.
+
+    Shutdown books an interrupted run through ``mark_job_run`` with no execution id, so the drain
+    that settles its queued notice later finds no completion to fence on and only the ledger
+    settles. Recorded the way ``mark_job_run`` records it, while *execution_id* is still the
+    ledger's latest attempt for the job; a replay of this completion is then a no-op."""
+    from cron.executions import latest_execution
+    from cron.jobs import _with_job, save_jobs
+    from cron.scheduler_authority import replayable_completions
+
+    latest = latest_execution(job_id)
+    if latest is None or latest.get("id") != execution_id:
+        return False
+
+    def apply(jobs, _i, job):
+        completions = job.get("canonical_completions") or []
+        if execution_id not in completions:
+            job["canonical_completions"] = [
+                *replayable_completions(job_id, completions), execution_id]
+            save_jobs(jobs)
+        return True
+
+    return bool(_with_job(job_id, apply, missing=False))
+
+
 def terminal_outcome(execution_id: str) -> Optional[tuple[str, Optional[str]]]:
     """``(ledger_outcome, delivery_error)`` once the queue row is terminal, else None."""
     from cron.delivery_queue import UNCERTAIN_SEND_ERROR, get_status

@@ -341,3 +341,44 @@ class TestInterruptedRunKeepsItsQueuedNoticeOutcome:
         assert execution["delivery_outcome"] == "queued", execution
         assert scheduler.drain_delivery_queue({}, None) == 1
         assert executions.get_execution(execution["id"])["delivery_outcome"] == "delivered"
+
+    def test_refused_notice_drained_after_the_tail_records_the_job_error(self, tmp_path, monkeypatch):
+        """Shutdown books the run without its execution id, so the drain's job-record write found no
+        completion to fence on: only the ledger settled."""
+        from cron import executions, jobs, scheduler
+
+        after, execution = self._interrupted_run(
+            tmp_path, monkeypatch, {"success": False, "error": "transport refused"}, drain_first=False)
+        assert execution["delivery_outcome"] == "queued", execution
+        assert after["last_delivery_error"] is None, after
+
+        assert scheduler.drain_delivery_queue({}, None) == 1
+
+        assert executions.get_execution(execution["id"])["delivery_outcome"] == "failed"
+        settled = jobs.get_job(after["id"])
+        # Raw until the closed public copy lands (E3-L2), as on the drain-first path above.
+        assert "transport refused" in (settled["last_delivery_error"] or ""), settled
+        assert (settled["repeat"], settled["next_run_at"]) == (after["repeat"], after["next_run_at"])
+
+    def test_notice_drained_while_the_tail_runs_is_still_recorded(self, tmp_path, monkeypatch):
+        """The drain finishes after the tail found the row still queued and before the tail booked
+        the ledger, so neither side saw the other's write; the tail settles once more after it."""
+        from cron import delivery_outcome, scheduler
+
+        real = delivery_outcome.terminal_outcome
+        drained = []
+
+        def look_then_drain(execution_id):
+            seen = real(execution_id)
+            if not drained:
+                drained.append("draining")
+                drained[0] = scheduler.drain_delivery_queue({}, None)
+            return seen
+
+        monkeypatch.setattr(delivery_outcome, "terminal_outcome", look_then_drain)
+        after, execution = self._interrupted_run(
+            tmp_path, monkeypatch, {"success": False, "error": "transport refused"}, drain_first=False)
+
+        assert drained == [1]
+        assert execution["delivery_outcome"] == "failed", execution
+        assert "transport refused" in (after["last_delivery_error"] or ""), after

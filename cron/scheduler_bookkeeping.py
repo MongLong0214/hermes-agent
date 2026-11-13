@@ -45,9 +45,20 @@ def finish_interrupted_run(job, execution_id, delivery_error):
             update_job(job['id'], {'last_delivery_error': delivery_error})
         except Exception as exc:
             logger.debug('Failed recording delivery_error for interrupted job %s: %s', job['id'], exc, exc_info=True)
+    if delivery_outcome == "queued":
+        # Shutdown booked this run without its id; name it so the drain can write the job record.
+        try:
+            from cron.delivery_outcome import record_interrupted_completion
+            record_interrupted_completion(job['id'], execution_id)
+        except Exception as exc:
+            logger.debug('Failed recording completion for interrupted job %s: %s', job['id'], exc, exc_info=True)
     scheduler.finish_execution(execution_id, success=False,
                                error='Interrupted by gateway shutdown before terminal completion.',
                                delivery_outcome=delivery_outcome)
+    if delivery_outcome == "queued":
+        # A drain that finished after the look above found neither the ledger row nor the completion.
+        from cron.delivery_outcome import settle_quietly
+        settle_quietly(job['id'], execution_id)
 
 
 def _classify_delivery_outcome(
